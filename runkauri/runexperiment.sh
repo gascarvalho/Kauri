@@ -9,7 +9,7 @@ ORIGINAL_STRING=thecmd
 QTY1_STRING=theqty1
 QTY2_STRING=theqty2
 
-FILENAME2="experiments"
+FILENAME2="experiments-v2"
 LINES=$(cat $FILENAME2 | grep "^[^#;]")
 
 # Each LINE in the experiment file is one experimental setup
