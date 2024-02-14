@@ -5,14 +5,17 @@ do
   for i in {1..1}
   do
         docker stack deploy -c hotstuff${j}.yaml hotstuff1 &
-        sleep 410
+        sleep 440
 
         for container in $(docker ps -q -f name="server")
         do
-                docker exec -it $container bash -c "cd libhotstuff && tac log* | grep -m1 'commit <block'"
-                docker exec -it $container bash -c "cd libhotstuff && tac log* | grep -m1 'x now state'"
-
-                break
+                if [ ! $(docker exec -it $container bash -c "cd Kauri && test -e log0") ]
+                then
+                  docker exec -it $container bash -c "cd Kauri && tac log* | grep -m1 'commit <block'"
+                  docker exec -it $container bash -c "cd Kauri && tac log* | grep -m1 'x now state'"
+                  docker exec -it $container bash -c "cd Kauri && tac log* | grep -m1 'Average'"
+                  break
+                fi
         done
 
         docker stack rm hotstuff1

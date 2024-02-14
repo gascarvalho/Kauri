@@ -26,8 +26,9 @@ do
         # Collect and print results.
         for container in $(docker ps -q -f name="server")
         do
-                docker exec -it $container bash -c "cd Kauri-Public && tac log* | grep -m1 'commit <block'"
-                docker exec -it $container bash -c "cd Kauri-Public && tac log* | grep -m1 'x now state'"
+                docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'commit <block'"
+                docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'x now state'"
+                docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'Average'"
                 break
         done
 
