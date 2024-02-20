@@ -774,6 +774,24 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
 
     std::set<uint16_t> children;
 
+    HOTSTUFF_LOG_PROTO("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA CalcTree")
+    HOTSTUFF_LOG_PROTO("The replicas are:")
+
+    for item : replicas {
+        std::cout << item.to_string() << std::endl;
+    }
+
+    HOTSTUFF_LOG_PROTO("Or maybe...")
+
+    for (size_t i = 0; i < size; i++) {
+
+        auto cert_hash = std::move(std::get<2>(global_replicas[i]));
+        salticidae::PeerId peer{cert_hash};
+
+        std::cout << peer.to_string() << std::endl;
+    }
+
+
     if (startup) {
         global_replicas = std::move(replicas);
     }
