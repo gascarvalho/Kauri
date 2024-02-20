@@ -150,6 +150,11 @@ bool HotStuffBase::on_deliver_blk(const block_t &blk) {
         }
         blk_delivery_waiting.erase(it);
     }
+
+    if(delivered == 100) {
+        get_pace_maker()->impeach();
+    }
+
     return res;
 }
 

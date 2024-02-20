@@ -17,8 +17,6 @@
 
 #include <cassert>
 #include <stack>
-#include <include/hotstuff/liveness.h>
-#include <salticidae/type.h>
 
 #include "hotstuff/util.h"
 #include "hotstuff/consensus.h"
@@ -29,8 +27,6 @@
 #define LOG_PROTO HOTSTUFF_LOG_PROTO
 
 namespace hotstuff {
-
-int total_delivered = 0;
 
 /* The core logic of HotStuff, is fairly simple :). */
 /*** begin HotStuff protocol logic ***/
@@ -101,10 +97,23 @@ bool HotStuffCore::on_deliver_blk(const block_t &blk) {
     tails.insert(blk);
 
     blk->delivered = true;
-    total_delivered++;
 
-    if (total_delivered == 100) {
-        get_pace_maker()->impeach();
+    if (blk->height > 50) {
+        struct timeval end;
+        gettimeofday(&end, NULL);
+        auto hash = blk->hash;
+        proposal_time[blk->hash] = end;
+
+        if (blk->qc_ref) {
+            auto it = proposal_time.find(blk->qc_ref->hash);
+            if (it != proposal_time.end()) {
+                struct timeval start = it->second;
+                long ms = ((end.tv_sec - start.tv_sec) * 1000000 + end.tv_usec - start.tv_usec) / 1000;
+                processed_blocks++;
+                summed_latency += ms;
+                HOTSTUFF_LOG_PROTO("Average: %d", summed_latency / processed_blocks);
+            }
+        }
     }
 
     HOTSTUFF_LOG_PROTO("deliver %s", std::string(*blk).c_str());
@@ -257,10 +266,14 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
         LOG_PROTO("not in storage!");
     }
 
+    LOG_PROTO("before On receive vote");
+
     on_receive_vote(
             Vote(id, bnew_hash,
                  create_part_cert(*priv_key, bnew_hash), this));
+    LOG_PROTO("after On receive vote");
     on_propose_(prop);
+    LOG_PROTO("after on propose");
 
     return prop;
 }
@@ -271,11 +284,6 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
     sanity_check_delivered(bnew);
     update(bnew);
     bool opinion = false;
-
-    if (bnew->height > 50) {
-        inc_time();
-    }
-
     if (bnew->height > vheight)
     {
         if (bnew->qc_ref && bnew->qc_ref->height > b_lock->height)
@@ -317,6 +325,8 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
     block_t blk = get_delivered_blk(vote.blk_hash);
     assert(vote.cert);
 
+    LOG_WARN("after delivered check!");
+
     if (!blk->voted.insert(vote.voter).second)
     {
         LOG_WARN("duplicate vote for %s from %d", get_hex10(vote.blk_hash).c_str(), vote.voter);
@@ -324,7 +334,7 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
     }
 
     if (vote.voter != get_id()) return;
-    if (blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority)) return;
+    if (blk->qc != nullptr && blk->qc->has_n(config.nmajority)) return;
 
     //std::cout << "self vote" << std::endl;
     auto &qc = blk->self_qc;
@@ -407,11 +417,6 @@ void HotStuffCore::on_qc_finish(const block_t &blk) {
     auto it = qc_waiting.find(blk);
     if (it != qc_waiting.end())
     {
-        if (first) {
-            gettimeofday(&start_time, NULL);
-            first = false;
-        }
-
         HOTSTUFF_LOG_PROTO("async_qc_finish %s", blk->get_hash().to_hex().c_str());
 
         it->second.resolve();
