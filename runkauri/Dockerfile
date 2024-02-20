@@ -4,7 +4,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -y install git gcc g++ make cmake lib
 RUN git clone https://github.com/aixoss/gmp && cd gmp && ./configure && make install
 RUN git clone https://github.com/AlphaVideo/MSc-Kauri.git && cd MSc-Kauri && git checkout experimental-reconfiguration && git submodule update --init --recursive && git submodule update --recursive --remote
 RUN cd MSc-Kauri && git pull
-RUN cd MSc-Kauri && cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON -DHOTSTUFF_DEBUG_LOG=ON && make
+RUN cd MSc-Kauri && cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON -DHOTSTUFF_DEBUG_LOG=ON -DHOTSTUFF_NORMAL_LOG=ON && make
 
 ADD ./server.sh /
 
