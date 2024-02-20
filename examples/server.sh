@@ -78,9 +78,13 @@ sudo tc qdisc add dev eth0 root netem delay ${latency}ms limit 400000 rate ${ban
 
 sleep 30
 
-if [ ${id} == 0 ]; then
-  gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx 0 --iter -900 --max-async 900 > clientlog0 2>&1 &
-fi
+# Launch client only for id = 0 
+#if [ ${id} == 0 ]; then
+#  gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx 0 --iter -900 --max-async 900 > clientlog0 2>&1 &
+#fi
+
+# Launch client only for everyone 
+gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -900 --max-async 900 > clientlog0 2>&1 &
 
 sleep 300
 
