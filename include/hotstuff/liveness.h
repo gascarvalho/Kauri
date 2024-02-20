@@ -266,9 +266,11 @@ class PaceMakerDummyFixed: public PaceMakerDummy {
 class PaceMakerDummyFixedTwo: public PaceMakerDummy {
     /** timer event.*/
     TimerEvent timer;
+    TimerEvent forced_reconfig_timer;
     double base_timeout;
     double prop_delay;
     double timeout;
+    double forced_timeout = 120;
 
     bool delaying_proposal = false;
 
@@ -283,7 +285,11 @@ public:
             base_timeout(base_timeout),
             timeout(base_timeout),
             prop_delay(prop_delay),
-            ec(std::move(ec)), proposer(0) {}
+            ec(std::move(ec)), proposer(0) {
+
+                forced_reconfig_timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer_forced, this, _1));
+                forced_reconfig_timer.add(forced_timeout);
+            }
 
     ReplicaID get_proposer() override {
         return proposer;
@@ -319,6 +325,38 @@ public:
 
         HOTSTUFF_LOG_PROTO("Finished recalculating tree!");
         HOTSTUFF_LOG_PROTO("-------------------------------");
+    }
+
+    void set_proposer_forced(TimerEvent &) {
+        HOTSTUFF_LOG_PROTO("== BEGINNING FORCED RECONFIGURATION ==");
+
+        proposer++;
+        timeout *= 2;
+        if (timeout > 10.0) {
+            timeout = 10.0;
+        }
+        HOTSTUFF_LOG_PROTO("-------------------------------");
+        HOTSTUFF_LOG_PROTO("Timeout reached!!!");
+
+        vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
+        hsc->calcTree(std::move(reps), false);
+
+        if (get_proposer() == hsc->get_id()) {
+            HOTSTUFF_LOG_PROTO("Elected itself as a new Leader!");
+            delaying_proposal = true;
+            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::unlock, this, _1));
+            timer.add(prop_delay);
+        } else {
+            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer, this, _1));
+            timer.add(timeout);
+        }
+
+        HOTSTUFF_LOG_PROTO("Finished recalculating tree!");
+        HOTSTUFF_LOG_PROTO("-------------------------------");
+
+        // forced_reconfig_timer.del()
+        // forced_reconfig_timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer_forced, this, _1));
+        // forced_reconfig_timer.add(forced_timeout);
     }
 
     void unlock(TimerEvent &) {
