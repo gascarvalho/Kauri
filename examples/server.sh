@@ -84,7 +84,7 @@ sleep 30
 #fi
 
 # Launch client only for everyone 
-gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -900 --max-async 900 > clientlog0 2>&1 &
+gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -900 --max-async 900 > clientlog${id} 2>&1 &
 
 sleep 300
 
