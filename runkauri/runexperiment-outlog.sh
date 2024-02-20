@@ -40,7 +40,7 @@ do
         do
                 if [ ! $(docker exec -it $container bash -c "cd MSc-Kauri && test -e log0") ]
                 then
-                  docker exec -it $container bash -c "cd MSc-Kauri && cat log*" > results.txt
+                  docker exec -it $container bash -c "cd MSc-Kauri && cat log*" > log$(date +%T).txt
                   break
                 fi
         done
