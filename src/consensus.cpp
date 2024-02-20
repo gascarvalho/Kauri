@@ -30,6 +30,8 @@
 
 namespace hotstuff {
 
+int total_delivered = 0;
+
 /* The core logic of HotStuff, is fairly simple :). */
 /*** begin HotStuff protocol logic ***/
 HotStuffCore::HotStuffCore(ReplicaID id,
@@ -99,6 +101,12 @@ bool HotStuffCore::on_deliver_blk(const block_t &blk) {
     tails.insert(blk);
 
     blk->delivered = true;
+    total_delivered++;
+
+    if (total_delivered == 100) {
+        get_pace_maker()->impeach();
+    }
+
     HOTSTUFF_LOG_PROTO("deliver %s", std::string(*blk).c_str());
     return true;
 }
