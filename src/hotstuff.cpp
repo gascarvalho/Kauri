@@ -783,12 +783,13 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
     auto offset = 0;
     auto size = global_replicas.size();
     if (!startup) {
-        std::cout << global_replicas.size() << std::endl;
-        global_replicas.erase(global_replicas.begin());
-        size = global_replicas.size();
-        std::cout << size << std::endl;
-        offset = get_pace_maker()->get_proposer();
-        failures++;
+        // TODO: Check replica erasing behaviour in detail
+        // std::cout << global_replicas.size() << std::endl;
+        // global_replicas.erase(global_replicas.begin());
+        // size = global_replicas.size();
+        // std::cout << size << std::endl;
+        // offset = get_pace_maker()->get_proposer();
+        // failures++;
     }
     else {
         for (size_t i = 0; i < size; i++) {
