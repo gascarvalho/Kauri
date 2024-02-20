@@ -919,6 +919,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
 
 void HotStuffBase::beat() {
     pmaker->beat().then([this](ReplicaID proposer) {
+        HOTSTUFF_LOG_DEBUG("Sending beat to proposer %d", proposer);
         if (piped_queue.size() > get_config().async_blocks + 1) {
             return;
         }

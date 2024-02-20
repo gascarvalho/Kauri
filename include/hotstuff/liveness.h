@@ -423,6 +423,7 @@ class PMRoundRobinProposer: virtual public PaceMaker {
     }
 
     void on_exp_timeout(TimerEvent &) {
+        HOTSTUFF_LOG_DEBUG("[Pacemaker]: EXP Timeout!");
         if (proposer == hsc->get_id())
             do_new_consensus(0, std::vector<uint256_t>{});
         timer = TimerEvent(ec, [this](TimerEvent &){ rotate(); });
@@ -432,12 +433,13 @@ class PMRoundRobinProposer: virtual public PaceMaker {
     /* role transitions */
 
     void rotate() {
+        HOTSTUFF_LOG_DEBUG("[Pacemaker]: INITIATING rotation...");
         reg_proposal();
         reg_receive_proposal();
         prop_blk.clear();
         rotating = true;
         proposer = (proposer + 1) % hsc->get_config().nreplicas;
-        HOTSTUFF_LOG_PROTO("Pacemaker: rotate to %d", proposer);
+        HOTSTUFF_LOG_PROTO("[Pacemaker]: rotate to %d", proposer);
         pm_qc_finish.reject();
         pm_wait_propose.reject();
         pm_qc_manual.reject();
@@ -448,8 +450,9 @@ class PMRoundRobinProposer: virtual public PaceMaker {
     }
 
     void stop_rotate() {
+        HOTSTUFF_LOG_DEBUG("[Pacemaker]: STOPPING rotation...");
         timer.del();
-        HOTSTUFF_LOG_PROTO("Pacemaker: stop rotation at %d", proposer);
+        HOTSTUFF_LOG_PROTO("[Pacemaker]: stop rotation at %d", proposer);
         pm_qc_finish.reject();
         pm_wait_propose.reject();
         pm_qc_manual.reject();
@@ -464,7 +467,7 @@ class PMRoundRobinProposer: virtual public PaceMaker {
             hs->get_tcall().async_call([this, hs](salticidae::ThreadCall::Handle &) {
                 auto &pending = hs->get_decision_waiting();
                 if (!pending.size()) return;
-                HOTSTUFF_LOG_PROTO("reproposing pending commands");
+                HOTSTUFF_LOG_PROTO("[Pacemaker]: reproposing pending commands");
                 std::vector<uint256_t> cmds;
                 for (auto &p: pending)
                     cmds.push_back(p.first);
@@ -475,6 +478,7 @@ class PMRoundRobinProposer: virtual public PaceMaker {
 
     protected:
     void on_consensus(const block_t &blk) override {
+        HOTSTUFF_LOG_DEBUG("[Pacemaker]: Reached function 'on_consensus'");
         timer.del();
         exp_timeout = base_timeout;
         if (prop_blk[proposer] == blk) {
