@@ -789,7 +789,7 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
         // global_replicas.erase(global_replicas.begin());
         // size = global_replicas.size();
         // std::cout << size << std::endl;
-        // offset = get_pace_maker()->get_proposer();
+        offset = get_pace_maker()->get_proposer();
         //failures++;
     }
     else {
@@ -831,7 +831,7 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
         }
 
         const size_t remaining = size - i;
-        HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: Remaining nodes to assign: %lu", i, remaining);
+        //HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: Remaining nodes to assign: %lu", i, remaining);
 
         const size_t max_fanout = ceil(remaining / processesOnLevel);
         auto curr_fanout = std::min(max_fanout, fanout);
