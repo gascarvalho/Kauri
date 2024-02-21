@@ -800,7 +800,7 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
             valid_tls_certs.insert(cert_hash);
             auto &addr = std::get<0>(global_replicas[i]);
 
-            HOTSTUFF_LOG_PROTO("[RecalcTree]: Adding replica %s", get_hex10(peer).c_str());
+            HOTSTUFF_LOG_PROTO("[CalcTree] [STARTUP]: Adding replica %s", get_hex10(peer).c_str());
 
             HotStuffCore::add_replica(i, peer, std::move(std::get<1>(global_replicas[i])));
             if (addr != listen_addr) {
@@ -822,18 +822,23 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
         HOTSTUFF_LOG_PROTO("Falling Back to Star");
     }
 
+    HOTSTUFF_LOG_PROTO("[CalcTree]: BEGINNING TREE CONSTRUCTION");
+
     size_t i = 0;
     while (i < size) {
         if (done) {
             break;
         }
+
         const size_t remaining = size - i;
+        HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: Remaining nodes to assign: %lu", i, remaining);
 
         const size_t max_fanout = ceil(remaining / processesOnLevel);
         auto curr_fanout = std::min(max_fanout, fanout);
 
         auto parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
         salticidae::PeerId parent_peer{parent_cert_hash};
+        HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: Decided on Parent: %s", i, get_hex10(parent_peer).c_str());
 
         auto start = i + processesOnLevel;
         for (auto counter = 1; counter <= processesOnLevel; counter++) {
@@ -848,6 +853,8 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
                 auto cert_hash = std::move(std::get<2>(global_replicas[j]));
                 salticidae::PeerId peer{cert_hash};
 
+                HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: Decided on Child %s for Parent %s", i, get_hex10(peer).c_str(), get_hex10(parent_peer).c_str());
+
                 if (id == i + offset) {
                     HOTSTUFF_LOG_PROTO("Adding Child Process: %lld", j);
                     children.insert(j);
@@ -859,13 +866,17 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
                     children.insert(j);
                 }
             }
+
             start += curr_fanout;
             i++;
             parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
             salticidae::PeerId temp_parent_peer{parent_cert_hash};
             parent_peer = temp_parent_peer;
         }
+
         processesOnLevel = std::min(curr_fanout * processesOnLevel, remaining);
+        HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: New processes on Level: %lu", i, processesOnLevel);
+
     }
     
     HOTSTUFF_LOG_PROTO("total children: %d", children.size());
