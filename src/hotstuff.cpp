@@ -782,13 +782,13 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
     // }
 
     HOTSTUFF_LOG_PROTO("Or maybe...");
-
+    auto size = global_replicas.size();
     for (size_t i = 0; i < size; i++) {
 
         auto cert_hash = std::move(std::get<2>(global_replicas[i]));
         salticidae::PeerId peer{cert_hash};
 
-        //std::cout << peer << std::endl;
+        std::cout << peer << std::endl;
     }
 
 
