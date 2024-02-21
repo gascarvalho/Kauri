@@ -788,7 +788,7 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
         auto cert_hash = std::move(std::get<2>(global_replicas[i]));
         salticidae::PeerId peer{cert_hash};
 
-        std::cout << peer.to_string() << std::endl;
+        std::cout << peer << std::endl;
     }
 
 
