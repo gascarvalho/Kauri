@@ -357,6 +357,7 @@ public:
         // forced_reconfig_timer.del()
         // forced_reconfig_timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer_forced, this, _1));
         // forced_reconfig_timer.add(forced_timeout);
+        schedule_next();
     }
 
     void unlock(TimerEvent &) {
