@@ -777,9 +777,9 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
     HOTSTUFF_LOG_PROTO("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA CalcTree");
     HOTSTUFF_LOG_PROTO("The replicas are:");
 
-    for item : replicas {
-        std::cout << item.to_string() << std::endl;
-    }
+    // for item : replicas {
+    //     std::cout << item.to_string() << std::endl;
+    // }
 
     HOTSTUFF_LOG_PROTO("Or maybe...");
 
