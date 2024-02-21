@@ -347,8 +347,8 @@ public:
             timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::unlock, this, _1));
             timer.add(prop_delay);
         } else {
-            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer, this, _1));
-            timer.add(timeout);
+            // timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer, this, _1));
+            // timer.add(timeout);
         }
 
         HOTSTUFF_LOG_PROTO("Finished recalculating tree!");

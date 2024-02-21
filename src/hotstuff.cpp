@@ -875,7 +875,7 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
         }
 
         processesOnLevel = std::min(curr_fanout * processesOnLevel, remaining);
-        HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: New processes on Level: %lu", i, processesOnLevel);
+        //HOTSTUFF_LOG_PROTO("[CalcTree][Iteration %lld]: New processes on Level: %lu", i, processesOnLevel);
 
     }
     
