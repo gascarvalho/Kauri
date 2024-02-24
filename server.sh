@@ -19,8 +19,10 @@ service1="server1-$KAURI_UUID"
 # cd MSc-Kauri && git pull && git submodule update --recursive --remote
 # git checkout latest
 
+cd MSc-Kauri
+
 # Do a quick compile of the branch
-git cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON && make
+#git cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON && make
 
 sleep 30
 
