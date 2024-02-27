@@ -264,7 +264,7 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
     update(bnew);
     bool opinion = false;
 
-    if (bnew->height > 50) {
+    if (bnew->height > 20) {
         inc_time();
     }
 

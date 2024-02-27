@@ -12,6 +12,8 @@ QTY2_STRING=theqty2
 FILENAME2="experiments-v2"
 LINES=$(cat $FILENAME2 | grep "^[^#;]")
 
+#LOG_NUM=1
+
 # Each LINE in the experiment file is one experimental setup
 for LINE in $LINES
 do
@@ -28,21 +30,20 @@ do
   echo "*** This setup needs ${split[3]} physical machines! ***"
   echo '**********************************************'
 
-  for i in {1..5}
+  for i in {1..1}
   do
         # Deploy experiment
         docker stack deploy -c kauri-temp.yaml kauriservice &
-        # Docker startup time + 5*60s of experiment runtime
-        sleep 450
+        # Docker startup time 100s + 1*60s of experiment runtime
+        sleep 160
         
         # Collect and print results.
         for container in $(docker ps -q -f name="server")
         do
                 if [ ! $(docker exec -it $container bash -c "cd MSc-Kauri && test -e log0") ]
                 then
-                  docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'commit <block'"
-                  docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'x now state'"
-                  docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'Average'"
+                  docker exec -it $container bash -c "cd MSc-Kauri && cat log*" > log_$(date +%T).txt
+                  #LOG_NUM=$((LOG_NUM+1))
                   break
                 fi
         done

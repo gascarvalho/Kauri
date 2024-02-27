@@ -271,6 +271,7 @@ class PaceMakerDummyFixedTwo: public PaceMakerDummy {
     double timeout;
 
     bool delaying_proposal = false;
+    bool first_timeout = true;
 
     EventContext ec;
 
@@ -295,8 +296,12 @@ public:
         });
     }
 
-    void set_proposer(TimerEvent &) {
-        proposer++;
+    void proposer_timeout(TimerEvent &) {
+        set_proposer();
+    }
+
+    void set_proposer() {
+        proposer = (proposer + 1) % hsc->get_config().nreplicas;
         timeout *= 2;
         if (timeout > 10.0) {
             timeout = 10.0;
@@ -313,7 +318,7 @@ public:
             timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::unlock, this, _1));
             timer.add(prop_delay);
         } else {
-            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer, this, _1));
+            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::proposer_timeout, this, _1));
             timer.add(timeout);
         }
 
@@ -328,10 +333,15 @@ public:
     }
 
     void inc_time() override {
-        HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
-        timer.del();
-        timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::set_proposer, this, _1));
-        timer.add(timeout);
+        if (first_timeout) {
+            first_timeout = false;
+            set_proposer();
+        } else {
+            HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
+            timer.del();
+            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::proposer_timeout, this, _1));
+            timer.add(timeout);
+        }
     }
 
     void schedule_next() override {

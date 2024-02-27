@@ -16,13 +16,15 @@ service="server-$KAURI_UUID"
 service1="server1-$KAURI_UUID"
 
 # Make sure correct branch is selected for crypto
-cd MSc-Kauri && git pull && git submodule update --recursive --remote
-git checkout latest
+# cd MSc-Kauri && git pull && git submodule update --recursive --remote
+# git checkout latest
+
+cd MSc-Kauri
 
 # Do a quick compile of the branch
-git pull && cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON && make
+#git cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON && make
 
-sleep 30
+#sleep 30
 
 id=0
 i=0
@@ -88,7 +90,7 @@ sleep 25
 # Start Client on all machines
 gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -900 --max-async 900 > clientlog${id} 2>&1 &
 
-sleep 300
+sleep 120
 
 killall hotstuff-client &
 killall hotstuff-app &

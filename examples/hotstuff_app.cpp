@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
 
     auto opt_blk_size = Config::OptValInt::create(1);
     auto opt_parent_limit = Config::OptValInt::create(-1);
-    auto opt_stat_period = Config::OptValDouble::create(120);
+    auto opt_stat_period = Config::OptValDouble::create(15);
     auto opt_replicas = Config::OptValStrVec::create();
     auto opt_idx = Config::OptValInt::create(0);
     auto opt_client_port = Config::OptValInt::create(-1);
@@ -240,10 +240,14 @@ int main(int argc, char **argv) {
 
     auto parent_limit = opt_parent_limit->get();
     hotstuff::pacemaker_bt pmaker;
-    if (opt_pace_maker->get() == "dummy")
+    if (opt_pace_maker->get() == "dummy") {
+        HOTSTUFF_LOG_PROTO("Starting Pacemaker as a dummy!");
         pmaker = new hotstuff::PaceMakerDummyFixedTwo(ec, parent_limit, opt_base_timeout->get(), opt_prop_delay->get());
-    else
+    }
+    else {
+        HOTSTUFF_LOG_PROTO("Starting Pacemaker as a Roundrobin!");
         pmaker = new hotstuff::PaceMakerRR(ec, parent_limit, opt_base_timeout->get(), opt_prop_delay->get());
+    }
 
     HotStuffApp::Net::Config repnet_config;
     ClientNetwork<opcode_t>::Config clinet_config;

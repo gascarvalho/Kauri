@@ -40,9 +40,7 @@ do
         do
                 if [ ! $(docker exec -it $container bash -c "cd MSc-Kauri && test -e log0") ]
                 then
-                  docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'commit <block'"
-                  docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'x now state'"
-                  docker exec -it $container bash -c "cd MSc-Kauri && tac log* | grep -m1 'Average'"
+                  docker exec -it $container bash -c "cd MSc-Kauri && cat log* | pastebinit -b dpaste.com"
                   break
                 fi
         done
