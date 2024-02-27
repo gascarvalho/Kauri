@@ -214,7 +214,7 @@ class HotStuffBase: public HotStuffCore {
 
     void do_broadcast_proposal(const Proposal &) override;
     void do_vote(Proposal, const Vote &) override;
-    void inc_time() override;
+    void inc_time(bool force) override;
     void do_decide(Finality &&) override;
     void do_consensus(const block_t &blk) override;
 

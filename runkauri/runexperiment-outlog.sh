@@ -35,7 +35,7 @@ do
         # Deploy experiment
         docker stack deploy -c kauri-temp.yaml kauriservice &
         # Docker startup time 100s + 1*60s of experiment runtime
-        sleep 160
+        sleep 280
         
         # Collect and print results.
         for container in $(docker ps -q -f name="server")

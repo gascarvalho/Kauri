@@ -182,7 +182,7 @@ protected:
     /**
      * Increment timer to mark receival.
      */
-    virtual void inc_time() { };
+    virtual void inc_time(bool force) { };
 
     /* The user plugs in the detailed instances for those
      * polymorphic data types. */

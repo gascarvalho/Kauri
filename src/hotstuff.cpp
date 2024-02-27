@@ -24,6 +24,7 @@
 
 using salticidae::static_pointer_cast;
 
+#define LOG_PROTO HOTSTUFF_LOG_PROTO
 #define LOG_INFO HOTSTUFF_LOG_INFO
 #define LOG_DEBUG HOTSTUFF_LOG_DEBUG
 #define LOG_WARN HOTSTUFF_LOG_WARN
@@ -722,8 +723,8 @@ void HotStuffBase::do_broadcast_proposal(const Proposal &prop) {
     pn.multicast_msg(MsgPropose(prop), std::vector(childPeers.begin(), childPeers.end()));
 }
 
-void HotStuffBase::inc_time() {
-    pmaker->inc_time();
+void HotStuffBase::inc_time(bool force) {
+    pmaker->inc_time(force);
 }
 
 void HotStuffBase::do_vote(Proposal prop, const Vote &vote) {
@@ -766,6 +767,8 @@ void HotStuffBase::do_decide(Finality &&fin) {
 HotStuffBase::~HotStuffBase() {}
 
 void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
+    
+    LOG_PROTO("CALCULATING A NEW TREE WITH startup=%s", startup ? "true" : "false");
 
     std::set<uint16_t> children;
 

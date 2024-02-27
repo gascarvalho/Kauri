@@ -53,7 +53,7 @@ class PaceMaker {
     virtual void impeach() {}
     virtual void on_consensus(const block_t &) {}
     virtual size_t get_pending_size() = 0;
-    virtual void inc_time() { };
+    virtual void inc_time(bool force) { };
 
     virtual block_t get_current_proposal() { }
 };
@@ -271,7 +271,7 @@ class PaceMakerDummyFixedTwo: public PaceMakerDummy {
     double timeout;
 
     bool delaying_proposal = false;
-    bool first_timeout = true;
+    //bool first_timeout = true;
 
     EventContext ec;
 
@@ -332,9 +332,8 @@ public:
         HOTSTUFF_LOG_PROTO("Unlocking Proposer!!!");
     }
 
-    void inc_time() override {
-        if (first_timeout) {
-            first_timeout = false;
+    void inc_time(bool force) override {
+        if (force) {
             set_proposer();
         } else {
             HOTSTUFF_LOG_PROTO("Inc time %f", timeout);

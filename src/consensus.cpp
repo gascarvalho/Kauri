@@ -264,8 +264,11 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
     update(bnew);
     bool opinion = false;
 
-    if (bnew->height > 20) {
-        inc_time();
+    if (bnew->height != 0 && bnew->height % 30 == 0) {
+        inc_time(true);
+    }
+    else if (bnew->height > 30) {
+        inc_time(false);
     }
 
     if (bnew->height > vheight)
