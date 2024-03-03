@@ -307,7 +307,7 @@ public:
             timeout = 10.0;
         }
         HOTSTUFF_LOG_PROTO("-------------------------------");
-        HOTSTUFF_LOG_PROTO("Timeout reached!!!");
+        HOTSTUFF_LOG_PROTO("[PMAKER] Timeout reached!!!");
 
         vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
         hsc->calcTree(std::move(reps), false);
@@ -322,7 +322,7 @@ public:
             timer.add(timeout);
         }
 
-        HOTSTUFF_LOG_PROTO("Finished recalculating tree!");
+        HOTSTUFF_LOG_PROTO("[PMAKER] Finished recalculating tree!");
         HOTSTUFF_LOG_PROTO("-------------------------------");
     }
 

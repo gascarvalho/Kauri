@@ -109,6 +109,7 @@ public:
      * @param startup if being called during startup.
      */
     virtual void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
+    virtual void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
 
     /** Call to set the fanout. */
     void set_fanout(int32_t fanout);

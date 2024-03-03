@@ -192,6 +192,7 @@ class HotStuffBase: public HotStuffCore {
 
     mutable PeerId parentPeer;
     mutable std::set<PeerId> childPeers;
+    mutable size_t myGlobalId;
 
     vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> global_replicas;
 
@@ -243,6 +244,7 @@ class HotStuffBase: public HotStuffCore {
     void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                 bool ec_loop = false);
     void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
+    void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
     void beat();
 
     size_t size() const { return peers.size(); }
