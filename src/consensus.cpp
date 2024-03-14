@@ -217,11 +217,21 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
     /* broadcast to other replicas */
     do_broadcast_proposal(prop);
 
-    if (id == 0) {
+    if (is_proposer(id)) {
         gettimeofday(&timeEnd, NULL);
         long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);
         stats.insert(std::make_pair(bnew->hash, usec));
     }
+
+    if (b_normal_height != 0 && b_normal_height % 30 == 0) {
+        if (is_proposer(id))
+            LOG_PROTO("IM PROPOSER AND IM FORCING RECONFIG AAAAAAAAAAAAAAAAAAAAA (on_propose)");
+        else
+            LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
+        inc_time(true);
+    }
+    // else if (bnew->height > 30)
+    //     inc_time(false);
 
     return bnew;
 }
@@ -264,13 +274,6 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
     update(bnew);
     bool opinion = false;
 
-    if (bnew->height != 0 && bnew->height % 30 == 0) {
-        inc_time(true);
-    }
-    else if (bnew->height > 30) {
-        inc_time(false);
-    }
-
     if (bnew->height > vheight)
     {
         if (bnew->qc_ref && bnew->qc_ref->height > b_lock->height)
@@ -298,11 +301,25 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
     }
 
     on_receive_proposal_(prop);
+
     if (opinion && !vote_disabled) {
         do_vote(prop,
                 Vote(id, bnew->get_hash(),
                      create_part_cert(*priv_key, bnew->get_hash()), this));
     }
+
+    if (bnew->height != 0 && bnew->height % 30 == 0) {
+        if (is_proposer(id))
+            LOG_PROTO("IM PROPOSER AND IM FORCING RECONFIG AAAAAAAAAAAAAAAAAAAAA (on_receive_proposal)");
+        else
+            LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
+        inc_time(true);
+    }
+    // else if (bnew->height > 30) {
+    //     inc_time(false);
+    // }
+
+    //update(bnew);
 }
 
 void HotStuffCore::on_receive_vote(const Vote &vote) {
@@ -335,6 +352,17 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
         qc->compute();
         update_hqc(blk, qc);
         on_qc_finish(blk);
+
+        // if (blk->height != 0 && blk->height % 30 == 0) {
+        //     if (is_proposer(id))
+        //         LOG_PROTO("IM PROPOSER AND IM FORCING RECONFIG AAAAAAAAAAAAAAAAAAAAA (on_receive_proposal)");
+        //     else
+        //         LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", blk->height);
+        //     inc_time(true);
+        // }
+        // else if (bnew->height > 30) {
+        //     inc_time(false);
+        // }
     }
 }
 

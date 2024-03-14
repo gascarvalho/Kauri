@@ -214,6 +214,14 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     const PeerId &peer = conn->get_peer_id();
     if (peer.is_null()) return;
     auto stream = msg.serialized;
+    auto &prop = msg.proposal;
+    msg.postponed_parse(this);
+
+    if (prop.proposer != pmaker->get_proposer()) {
+        HOTSTUFF_LOG_PROTO("PROPOSAL RECEIVED FROM NON-PROPOSER REPLICA!");
+        HOTSTUFF_LOG_PROTO("Proposal from: %d but Current proposer: %d", prop.proposer, pmaker->get_proposer());
+        return;
+    }
 
     if (!childPeers.empty()) {
         MsgPropose relay = MsgPropose(stream, true);
@@ -221,9 +229,6 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
             pn.send_msg(relay, peerId);
         }
     }
-
-    msg.postponed_parse(this);
-    auto &prop = msg.proposal;
 
     block_t blk = prop.blk;
     if (!blk) return;
@@ -319,8 +324,10 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
         }
 
         std::cout <<  " send relay message: " << msg.vote.blk_hash.to_hex().c_str() <<  std::endl;
-        pn.send_msg(MsgRelay(VoteRelay(msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
+        if(!parentPeer.is_null()) 
+            pn.send_msg(MsgRelay(VoteRelay(msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
         async_deliver_blk(msg.vote.blk_hash, peer);
+        
         return;
     }
 
@@ -469,7 +476,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                     throw std::runtime_error("Invalid Sigs in intermediate signature!");
                 }
                 std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
-                pn.send_msg(MsgRelay(VoteRelay(v->blk_hash, cert.get()->clone(), this)), parentPeer);
+                if(!parentPeer.is_null())
+                     pn.send_msg(MsgRelay(VoteRelay(v->blk_hash, cert.get()->clone(), this)), parentPeer);
                 return;
             }
 
@@ -727,6 +735,10 @@ void HotStuffBase::inc_time(bool force) {
     pmaker->inc_time(force);
 }
 
+bool HotStuffBase::is_proposer(int id) {
+    return id == pmaker->get_proposer();
+}
+
 void HotStuffBase::do_vote(Proposal prop, const Vote &vote) {
     pmaker->beat_resp(prop.proposer).then([this, vote, prop](ReplicaID proposer) {
 
@@ -737,7 +749,8 @@ void HotStuffBase::do_vote(Proposal prop, const Vote &vote) {
 
         if (childPeers.empty()) {
             //HOTSTUFF_LOG_PROTO("send vote");
-            pn.send_msg(MsgVote(vote), parentPeer);
+            if(!parentPeer.is_null()) 
+                pn.send_msg(MsgVote(vote), parentPeer);
         } else {
             block_t blk = get_delivered_blk(vote.blk_hash);
             if (blk->self_qc == nullptr)
@@ -816,6 +829,7 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
 
             // Add all replicas except myself to my peer array and peer network/stack
             if (addr != listen_addr) {
+                HOTSTUFF_PROTO_LOG("[STARTUP] Adding peer with id %llu and IP %s to network.", i, addr);
                 peers.push_back(peer);
                 pn.add_peer(peer);
                 pn.set_peer_addr(peer, addr);
@@ -927,6 +941,9 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     if (startup) {
         global_replicas = std::move(replicas);
     }
+    else {
+        //failures++;
+    }
 
     // Reset children peer list
     childPeers.clear();
@@ -957,9 +974,9 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
             3rd arg = PubKey
             */
             HotStuffCore::add_replica(i, peer, std::move(std::get<1>(global_replicas[i])));
-
             // Add all replicas except myself to my peer array and peer network/stack
             if (addr != listen_addr) {
+                HOTSTUFF_LOG_PROTO("[STARTUP] Adding peer with id %llu and IP %s to network.", i, std::string(addr).c_str());
                 peers.push_back(peer);
                 pn.add_peer(peer);
                 pn.set_peer_addr(peer, addr);
@@ -979,7 +996,7 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     offset = get_pace_maker()->get_proposer();
 
-    std::unordered_map<int, std::vector<size_t>> set_trees;
+    std::unordered_map<size_t, std::vector<size_t>> set_trees;
 
     set_trees[0] = {0, 1, 2, 3, 4, 5, 6};
     set_trees[1] = {1, 2, 3, 4, 5, 6, 0};
@@ -997,38 +1014,49 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     // New Parent
     if (my_new_idx == 0) {
-        parentPeer = nullptr; // Indicates no parent
+        parentPeer = noParent; // Indicates no parent (may be wrong)
         HOTSTUFF_LOG_PROTO("I have no parent (am proposer)");
+        // auto my_cert_hash = std::move(std::get<2>(global_replicas[myGlobalId]));
+        // salticidae::PeerId me{my_cert_hash};
+        // parentPeer = me;
     }
     else {
-        auto parent_id = std::floor((my_new_idx - 1) / 2);
-        auto parent_cert_hash = std::move(std::get<2>(global_replicas[new_tree[parent_id]]));
+        auto parent_idx = std::floor((my_new_idx - 1) / 2);
+        auto parent_cert_hash = std::move(std::get<2>(global_replicas[new_tree[parent_idx]]));
         salticidae::PeerId parent_peer{parent_cert_hash};
+        //std::cout << "Parent peer: " << parent_peer.to_hex() << std::endl;
         parentPeer = parent_peer;
-        HOTSTUFF_LOG_PROTO("My parent's id: %lld", new_tree[parent_id]);
+        HOTSTUFF_LOG_PROTO("My parent's id: %lld", new_tree[parent_idx]);
     }
 
     // Left Child
-    auto left_child_id = 2 * my_new_idx + 1;
-    if (left_child_id < size) {
-        auto left_cert_hash = std::move(std::get<2>(global_replicas[new_tree[left_child_id]]));
+    auto left_child_idx = 2 * my_new_idx + 1;
+    if (left_child_idx < size) {
+        children.insert(new_tree[left_child_idx]);
+        auto left_cert_hash = std::move(std::get<2>(global_replicas[new_tree[left_child_idx]]));
         salticidae::PeerId left_child{left_cert_hash};
         childPeers.insert(left_child);
-        HOTSTUFF_LOG_PROTO("My left child's id: %lld", new_tree[left_child_id]);
+        HOTSTUFF_LOG_PROTO("My left child's id: %lld", new_tree[left_child_idx]);
     }
     else
         HOTSTUFF_LOG_PROTO("I have no left child.");
 
     // Right Child
-    auto right_child_id = 2 * my_new_idx + 2;
-    if (right_child_id < size) {
-        auto right_cert_hash = std::move(std::get<2>(global_replicas[new_tree[right_child_id]]));
+    auto right_child_idx = 2 * my_new_idx + 2;
+    if (right_child_idx < size) {
+        children.insert(new_tree[right_child_idx]);
+        auto right_cert_hash = std::move(std::get<2>(global_replicas[new_tree[right_child_idx]]));
         salticidae::PeerId right_child{right_cert_hash};
         childPeers.insert(right_child);
-        HOTSTUFF_LOG_PROTO("My right child's id: %lld", new_tree[right_child_id]);
+        HOTSTUFF_LOG_PROTO("My right child's id: %lld", new_tree[right_child_idx]);
     }
     else
         HOTSTUFF_LOG_PROTO("I have no right child.");
+
+    // if (childPeers.find(parentPeer) != childPeers.end()) {
+    //     HOTSTUFF_LOG_PROTO("AAAAAAAAAAAAAAAAAAA");
+    //     children.insert(1);
+    // }
 
     // // My parent
     // auto parent_id = (myGlobalId - offset) % size;
@@ -1054,6 +1082,8 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     // salticidae::PeerId right_child{right_cert_hash};
     // childPeers.insert(right_child);
 
+    numberOfChildren = children.size();
+
     DataStream str;
     str << "Calculated Tree: { ";
     for (int i = 0; i < size; ++i) {
@@ -1067,7 +1097,7 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
 void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop) {
 
-    HotStuffBase::calcTree(std::move(replicas), true);
+    HotStuffBase::calcTreeForced(std::move(replicas), true);
     for (const PeerId& peer : peers) {
             pn.conn_peer(peer);
     }

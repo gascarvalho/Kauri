@@ -271,7 +271,7 @@ class PaceMakerDummyFixedTwo: public PaceMakerDummy {
     double timeout;
 
     bool delaying_proposal = false;
-    //bool first_timeout = true;
+    bool already_reconfigured = false;
 
     EventContext ec;
 
@@ -281,8 +281,8 @@ public:
     PaceMakerDummyFixedTwo(EventContext ec, int32_t parent_limit,
                          double base_timeout, double prop_delay):
             PaceMakerDummy(parent_limit),
-            base_timeout(base_timeout),
-            timeout(base_timeout),
+            base_timeout(10),
+            timeout(10),
             prop_delay(prop_delay),
             ec(std::move(ec)), proposer(0) {}
 
@@ -303,14 +303,14 @@ public:
     void set_proposer() {
         proposer = (proposer + 1) % hsc->get_config().nreplicas;
         timeout *= 2;
-        if (timeout > 10.0) {
-            timeout = 10.0;
+        if (timeout > (base_timeout * pow(2,4))) {
+            timeout = (base_timeout * pow(2,4));
         }
         HOTSTUFF_LOG_PROTO("-------------------------------");
         HOTSTUFF_LOG_PROTO("[PMAKER] Timeout reached!!!");
 
         vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
-        hsc->calcTree(std::move(reps), false);
+        hsc->calcTreeForced(std::move(reps), false);
 
         if (get_proposer() == hsc->get_id()) {
             HOTSTUFF_LOG_PROTO("Elected itself as a new Leader!");
@@ -333,7 +333,8 @@ public:
     }
 
     void inc_time(bool force) override {
-        if (force) {
+        if (force && !already_reconfigured) {
+            already_reconfigured = true;
             set_proposer();
         } else {
             HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
@@ -347,6 +348,11 @@ public:
         if (!delaying_proposal) {
             PMWaitQC::schedule_next();
         }
+    }
+
+    void on_consensus(const block_t &blk) override {
+        timer.del();
+        already_reconfigured = false;
     }
 };
 
@@ -548,6 +554,273 @@ struct PaceMakerRR: public PMHighTail, public PMRoundRobinProposer {
         PMRoundRobinProposer::init();
     }
 };
+
+/** PaceMakerDummy that rotates every X blocks. */
+class PaceMakerRotating: public PaceMakerDummy {
+    /** timer event.*/
+    TimerEvent timer;
+    double base_timeout;
+    double prop_delay;
+    double timeout;
+
+    //bool delaying_proposal = false;
+    bool already_reconfigured = false;
+
+    EventContext ec;
+
+    ReplicaID proposer;
+
+    std::unordered_map<ReplicaID, block_t> prop_blk;
+    bool rotating;
+
+    /* extra state needed for a proposer */
+    std::queue<promise_t> pending_beats;
+    block_t last_proposed;
+    bool locked;
+    promise_t pm_qc_finish;
+    promise_t pm_wait_propose;
+    promise_t pm_qc_manual;
+
+public:
+    PaceMakerRotating(EventContext ec, int32_t parent_limit,
+                         double base_timeout, double prop_delay):
+            PaceMakerDummy(parent_limit),
+            base_timeout(10),
+            timeout(10),
+            prop_delay(3),
+            ec(std::move(ec)), proposer(0) {}
+
+    ReplicaID get_proposer() override {
+        return proposer;
+    }
+
+    // promise_t beat_resp(ReplicaID) override {
+    //     return promise_t([this](promise_t &pm) {
+    //         pm.resolve(proposer);
+    //     });
+    // }
+
+    void proposer_timeout(TimerEvent &) {
+        set_proposer();
+    }
+
+    void rotate_end(TimerEvent &) {
+        stop_rotate();
+    }
+
+     void on_exp_timeout(TimerEvent &) {
+        if (proposer == hsc->get_id())
+            do_new_consensus(0, std::vector<uint256_t>{});
+        timer = TimerEvent(ec, [this](TimerEvent &){ set_proposer(); });
+        timer.add(prop_delay);
+    }
+
+    void set_proposer() {
+
+        reg_proposal();
+        reg_receive_proposal();
+        prop_blk.clear();
+        rotating = true;
+
+        proposer = (proposer + 1) % hsc->get_config().nreplicas;
+        timeout *= 2;
+        if (timeout > (base_timeout * pow(2,4))) {
+            timeout = (base_timeout * pow(2,4));
+        }
+
+        pm_qc_finish.reject();
+        pm_wait_propose.reject();
+        pm_qc_manual.reject();
+        
+        HOTSTUFF_LOG_PROTO("-------------------------------");
+        HOTSTUFF_LOG_PROTO("[PMAKER] Timeout reached!!!");
+
+        vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
+        hsc->calcTreeForced(std::move(reps), false);
+
+        //if (get_proposer() == hsc->get_id()) {
+        HOTSTUFF_LOG_PROTO("Elected itself as a new Leader!");
+        //delaying_proposal = true;
+        timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerRotating::on_exp_timeout, this, _1));
+        timer.add(timeout);
+        //} 
+        // else {
+        //     timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerRotating::proposer_timeout, this, _1));
+        //     timer.add(timeout);
+        // }
+
+        HOTSTUFF_LOG_PROTO("[PMAKER] Finished recalculating tree!");
+        HOTSTUFF_LOG_PROTO("-------------------------------");
+    }
+
+    // void unlock(TimerEvent &) {
+    //     timer.del();
+    //     //timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerRotating::proposer_timeout, this, _1));
+    //     //timer.add(timeout);
+    //     delaying_proposal = false;
+    //     HOTSTUFF_LOG_PROTO("Unlocking Proposer!!!");
+    //     //do_new_consensus(0, std::vector<uint256_t>{});
+    // }
+
+    void inc_time(bool force) override {
+        
+        if (force && !already_reconfigured) {
+            already_reconfigured = true;
+            set_proposer();
+        } else {
+            HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
+            timer.del();
+            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerRotating::proposer_timeout, this, _1));
+            timer.add(timeout);
+        }
+    }
+
+    // void schedule_next() override {
+    //     if (!delaying_proposal) {
+    //         PMWaitQC::schedule_next();
+    //     }
+    // }
+
+    // Attempting to fix rotation ---------------------------------------------------------------
+
+    size_t get_pending_size() override { return pending_beats.size(); }
+
+    promise_t beat() override {
+        if (!rotating && proposer == hsc->get_id())
+        {
+            promise_t pm;
+            pending_beats.push(pm);
+            proposer_schedule_next();
+            return pm;
+        }
+        else
+            return promise_t([proposer=proposer](promise_t &pm) {
+                pm.resolve(proposer);
+            });
+    }
+
+    promise_t beat_resp(ReplicaID last_proposer) override {
+        return promise_t([this](promise_t &pm) {
+            pm.resolve(proposer);
+        });
+    }
+
+    void reg_proposal() {
+        hsc->async_wait_proposal().then([this](const Proposal &prop) {
+            auto &pblk = prop_blk[hsc->get_id()];
+            if (!pblk) pblk = prop.blk;
+            if (rotating) reg_proposal();
+        });
+    }
+
+    void reg_receive_proposal() {
+        hsc->async_wait_receive_proposal().then([this](const Proposal &prop) {
+            auto &pblk = prop_blk[prop.proposer];
+            if (!pblk) pblk = prop.blk;
+            if (rotating) reg_receive_proposal();
+        });
+    }
+
+    void proposer_schedule_next() {
+        if (!pending_beats.empty() && !locked)
+        {
+            auto pm = pending_beats.front();
+            pending_beats.pop();
+            pm_qc_finish.reject();
+            (pm_qc_finish = hsc->async_qc_finish(last_proposed))
+                .then([this, pm]() {
+                    HOTSTUFF_LOG_PROTO("got QC, propose a new block");
+                    pm.resolve(proposer);
+                });
+            locked = true;
+        }
+    }
+
+    void proposer_update_last_proposed() {
+        pm_wait_propose.reject();
+        (pm_wait_propose = hsc->async_wait_proposal()).then(
+                [this](const Proposal &prop) {
+            last_proposed = prop.blk;
+            locked = false;
+            proposer_schedule_next();
+            proposer_update_last_proposed();
+        });
+    }
+
+    void do_new_consensus(int x, const std::vector<uint256_t> &cmds) {
+        auto blk = hsc->on_propose(cmds, get_parents(), bytearray_t());
+        pm_qc_manual.reject();
+        (pm_qc_manual = hsc->async_qc_finish(blk))
+            .then([this, x]() {
+                HOTSTUFF_LOG_PROTO("Pacemaker: got QC for block %d", x);
+#ifdef HOTSTUFF_TWO_STEP
+                if (x >= 2) return;
+#else
+
+                if (x >= 3) return;
+#endif
+                do_new_consensus(x + 1, std::vector<uint256_t>{});
+            });
+    }
+
+    void on_consensus(const block_t &blk) override {
+        timer.del();
+        already_reconfigured = false;
+        timeout = base_timeout;
+
+        if (prop_blk[proposer] == blk) {
+            stop_rotate();
+        }
+    }
+
+    /* role transitions */
+
+    void stop_rotate() {
+        timer.del();
+        HOTSTUFF_LOG_PROTO("Pacemaker: stop rotation at %d", proposer);
+        pm_qc_finish.reject();
+        pm_wait_propose.reject();
+        pm_qc_manual.reject();
+        rotating = false;
+        locked = false;
+        //delaying_proposal = false;
+        last_proposed = hsc->get_genesis();
+        proposer_update_last_proposed();
+        if (proposer == hsc->get_id())
+        {
+            auto hs = static_cast<hotstuff::HotStuffBase *>(hsc);
+            hs->do_elected();
+            hs->get_tcall().async_call([this, hs](salticidae::ThreadCall::Handle &) {
+                auto &pending = hs->get_decision_waiting();
+                if (!pending.size()) return;
+                HOTSTUFF_LOG_PROTO("reproposing pending commands");
+                std::vector<uint256_t> cmds;
+                for (auto &p: pending)
+                    cmds.push_back(p.first);
+                do_new_consensus(0, cmds);
+            });
+        }
+    }
+
+    void init() {
+        stop_rotate();
+        HOTSTUFF_LOG_PROTO("PaceMakerRotating base_timeout: %llu", base_timeout);
+    }
+
+    void init(HotStuffCore *hsc) override {
+        PaceMaker::init(hsc);
+        PMHighTail::init();
+        PaceMakerRotating::init();
+    }
+
+    void impeach() override {
+        if (rotating) return;
+        set_proposer();
+        HOTSTUFF_LOG_INFO("schedule to impeach the proposer");
+    }
+
+};
+
 
 }
 

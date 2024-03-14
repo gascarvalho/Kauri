@@ -185,6 +185,8 @@ protected:
      */
     virtual void inc_time(bool force) { };
 
+    virtual bool is_proposer(int id) { };
+
     /* The user plugs in the detailed instances for those
      * polymorphic data types. */
     public:
@@ -229,6 +231,7 @@ protected:
     Proposal process_block(const block_t& bnew, bool adjustHeight);
 
     void calcTree(bool b);
+    void calcTreeForced(bool b);
 
     bool first = true;
 };
@@ -419,7 +422,94 @@ struct Finality: public Serializable {
         }
     };
 
+    /**
+     * Kauri tree
+     * Abstraction of a tree to be used in Kauri
+     * Assumes a balanced tree of constant fanout
+    */
+    struct Tree: public Serializable {
 
+        /** Identifier for the tree */
+        uint32_t tid;
+        /** Fanout of the tree */
+        uint8_t fanout;
+        /** List containing node arrangement*/
+        std::vector<uint32_t> tree_array;
+
+        public:
+
+        Tree(const uint32_t tid,
+            const uint8_t fanout,
+            std::vector<uint32_t> &&tree_array):
+        tid(tid),
+        fanout(fanout), 
+        tree_array(std::move(tree_array)) {}
+
+
+        /**
+         * Returns the tree identifier
+        */
+        const uint32_t &get_tid() const { return tid; }
+
+        /**
+         * Returns the tree fanout
+        */
+        const uint8_t &get_fanout() const { return fanout; }
+
+        /**
+         * Returns the tree array list
+        */
+        const std::vector<uint32_t> &get_tree() const {
+            return tree_array;
+        }
+
+        /**
+         * Returns the size of the tree list
+        */
+        const size_t &get_tree_size() const {
+            return tree_array.size();
+        }
+
+        /**
+         * Returns the size of the tree list
+        */
+        const uint32_t &get_tree_root() const {
+            return tree_array[0];
+        }
+
+
+        void serialize(DataStream &s) const override {
+            s << tid << fanout;
+
+            // Serialize the vector
+            s << htole((uint32_t)tree_array.size());
+            for (const auto &elem: tree_array)
+                s << elem;
+        }
+
+        void unserialize(DataStream &s) override {
+            s >> tid >> fanout;
+
+            // Unserialize the vector
+            uint32_t n;
+            s >> n;
+            n = letoh(n);
+            tree_array.resize(n);
+            for (auto &elem: tree_array)
+                s >> elem;
+        }
+
+        operator std::string () const {
+            DataStream s;
+            s << "<tree "
+              << "tid=" << std::to_string(tid) << " " 
+              << "tree_size=" << std::to_string(tree_array.size()) << " "
+              << "fanout=" << std::to_string(fanout) << " "
+              << "root_node=" << std::to_string(tree_array[0]) << ">";
+            return s;
+        }
+
+    };
 }
 
 #endif

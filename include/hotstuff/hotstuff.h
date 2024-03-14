@@ -191,6 +191,7 @@ class HotStuffBase: public HotStuffCore {
     mutable std::unordered_map<const PeerId, uint32_t> part_fetched_replica;
 
     mutable PeerId parentPeer;
+    mutable PeerId noParent;
     mutable std::set<PeerId> childPeers;
     mutable size_t myGlobalId;
 
@@ -216,6 +217,7 @@ class HotStuffBase: public HotStuffCore {
     void do_broadcast_proposal(const Proposal &) override;
     void do_vote(Proposal, const Vote &) override;
     void inc_time(bool force) override;
+    bool is_proposer(int id) override;
     void do_decide(Finality &&) override;
     void do_consensus(const block_t &blk) override;
 
