@@ -325,7 +325,7 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
 
         std::cout <<  " send relay message: " << msg.vote.blk_hash.to_hex().c_str() <<  std::endl;
         if(!parentPeer.is_null()) 
-            pn.send_msg(MsgRelay(VoteRelay(msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
+            pn.send_msg(MsgRelay(VoteRelay(get_tree_id(), msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
         async_deliver_blk(msg.vote.blk_hash, peer);
         
         return;
@@ -477,7 +477,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                 }
                 std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
                 if(!parentPeer.is_null())
-                     pn.send_msg(MsgRelay(VoteRelay(v->blk_hash, cert.get()->clone(), this)), parentPeer);
+                     pn.send_msg(MsgRelay(VoteRelay(get_tree_id(), v->blk_hash, cert.get()->clone(), this)), parentPeer);
                 return;
             }
 
@@ -777,6 +777,10 @@ void HotStuffBase::do_decide(Finality &&fin) {
     }
 }
 
+uint32_t HotStuffBase::get_tree_id() {
+    return current_tree.get_tid();
+}
+
 HotStuffBase::~HotStuffBase() {}
 
 void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas) {
@@ -1021,10 +1025,11 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     HOTSTUFF_LOG_PROTO("My id: %lld", myGlobalId);
 
+    /* Update the current tree */
     offset = get_pace_maker()->get_proposer();
-
-    auto current_tree = system_trees[offset];
-    auto new_tree = current_tree.get_tree();
+    current_tree = system_trees[offset];
+    
+    auto new_tree = current_tree.get_tree_array();
 
     // Find my index in the new tree
     auto it = std::find(new_tree.begin(), new_tree.end(), myGlobalId);
@@ -1140,7 +1145,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
         {
             ReplicaID proposer = pmaker->get_proposer();
             if (proposer != get_id()) {
-                e.second(Finality(id, 0, 0, 0, e.first, uint256_t()));
+                e.second(Finality(id, get_tree_id(), 0, 0, 0, e.first, uint256_t()));
                 continue;
             }
 
@@ -1150,11 +1155,11 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
                 if (it == decision_waiting.end())
                     it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
                 
-                e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
+                e.second(Finality(id, get_tree_id(), 0, 0, 0, cmd_hash, uint256_t()));
                 cmd_pending_buffer.push_back(cmd_hash);
             }
             else {
-                e.second(Finality(id, 0, 0, 0, e.first, uint256_t()));
+                e.second(Finality(id, get_tree_id(), 0, 0, 0, e.first, uint256_t()));
             }
 
             if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
@@ -1211,7 +1216,7 @@ void HotStuffBase::beat() {
                                                              nullptr));
                     piped_queue.push_back(piped_block->hash);
 
-                    Proposal prop(id, piped_block, nullptr);
+                    Proposal prop(id, get_tree_id(), piped_block, nullptr);
                     HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
                     /* broadcast to other replicas */
                     gettimeofday(&last_block_time, NULL);

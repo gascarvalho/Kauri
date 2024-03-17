@@ -165,7 +165,7 @@ void HotStuffCore::update(const block_t &nblk) {
         do_consensus(blk);
         LOG_PROTO("commit %s", std::string(*blk).c_str());
         for (size_t i = 0; i < blk->cmds.size(); i++)
-            do_decide(Finality(id, 1, i, blk->height,
+            do_decide(Finality(id, get_tree_id(), 1, i, blk->height,
                                 blk->cmds[i], blk->get_hash()));
     }
     b_exec = blk;
@@ -246,7 +246,7 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
     on_deliver_blk(bnew);
     LOG_PROTO("before update");
     update(bnew);
-    Proposal prop(id, bnew, nullptr);
+    Proposal prop(id, get_tree_id(), bnew, nullptr);
     //std::cout << "prop" << std::endl;
     /* self-vote */
     if (adjustHeight) {
@@ -260,7 +260,7 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
     }
 
     on_receive_vote(
-            Vote(id, bnew_hash,
+            Vote(id, get_tree_id(), bnew_hash,
                  create_part_cert(*priv_key, bnew_hash), this));
     on_propose_(prop);
 
@@ -304,7 +304,7 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
 
     if (opinion && !vote_disabled) {
         do_vote(prop,
-                Vote(id, bnew->get_hash(),
+                Vote(id, get_tree_id(), bnew->get_hash(),
                      create_part_cert(*priv_key, bnew->get_hash()), this));
     }
 

@@ -189,6 +189,11 @@ protected:
 
     virtual bool is_proposer(int id) { };
 
+    /**
+     * Get the id of the current tree
+    */
+    virtual uint32_t get_tree_id() { };
+
     /* The user plugs in the detailed instances for those
      * polymorphic data types. */
     public:
@@ -242,6 +247,8 @@ protected:
 /** Abstraction for proposal messages. */
 struct Proposal: public Serializable {
     ReplicaID proposer;
+    /** tree used for the message*/
+    uint32_t tid;
     /** block being proposed */
     block_t blk;
     /** handle of the core object to allow polymorphism. The user should use
@@ -250,19 +257,23 @@ struct Proposal: public Serializable {
 
     Proposal(): blk(nullptr), hsc(nullptr) {}
     Proposal(ReplicaID proposer,
+            uint32_t tid,
             const block_t &blk,
             HotStuffCore *hsc):
         proposer(proposer),
+        tid(tid),
         blk(blk), hsc(hsc) {}
 
     void serialize(DataStream &s) const override {
         s << proposer
+          << tid
           << *blk;
     }
 
     void unserialize(DataStream &s) override {
         assert(hsc != nullptr);
         s >> proposer;
+        s >> tid;
         Block _blk;
         _blk.unserialize(s, hsc);
         blk = hsc->storage->add_blk(std::move(_blk), hsc->get_config());
@@ -272,7 +283,8 @@ struct Proposal: public Serializable {
         DataStream s;
         s << "<proposal "
           << "rid=" << std::to_string(proposer) << " "
-          << "blk=" << get_hex10(blk->get_hash()) << ">";
+          << "blk=" << get_hex10(blk->get_hash()) << " "
+          << "tid=" << std::to_string(tid) << ">";
         return s;
     }
 };
@@ -280,6 +292,8 @@ struct Proposal: public Serializable {
 /** Abstraction for vote messages. */
 struct Vote: public Serializable {
     ReplicaID voter;
+    /** tree used for the message*/
+    uint32_t tid;
     /** block being voted */
     uint256_t blk_hash;
     /** proof of validity for the vote */
@@ -290,15 +304,18 @@ struct Vote: public Serializable {
 
     Vote(): cert(nullptr), hsc(nullptr) {}
     Vote(ReplicaID voter,
+        uint32_t tid,
         const uint256_t &blk_hash,
         part_cert_bt &&cert,
         HotStuffCore *hsc):
         voter(voter),
+        tid(tid),
         blk_hash(blk_hash),
         cert(std::move(cert)), hsc(hsc) { }
 
     Vote(const Vote &other):
         voter(other.voter),
+        tid(other.tid),
         blk_hash(other.blk_hash),
         cert(other.cert ? other.cert->clone() : nullptr),
         hsc(other.hsc) {}
@@ -306,12 +323,12 @@ struct Vote: public Serializable {
     Vote(Vote &&other) = default;
     
     void serialize(DataStream &s) const override {
-        s << voter << blk_hash << *cert;
+        s << voter << tid << blk_hash << *cert;
     }
 
     void unserialize(DataStream &s) override {
         assert(hsc != nullptr);
-        s >> voter >> blk_hash;
+        s >> voter >> tid >> blk_hash;
         cert = hsc->parse_part_cert(s);
     }
 
@@ -332,13 +349,16 @@ struct Vote: public Serializable {
         DataStream s;
         s << "<vote "
           << "rid=" << std::to_string(voter) << " "
-          << "blk=" << get_hex10(blk_hash) << ">";
+          << "blk=" << get_hex10(blk_hash) << " "
+          << "tid=" << std::to_string(tid) << ">";
         return s;
     }
 };
 
 struct Finality: public Serializable {
     ReplicaID rid;
+    /** tree used for the message*/
+    uint32_t tid;
     int8_t decision;
     uint32_t cmd_idx;
     uint32_t cmd_height;
@@ -348,24 +368,25 @@ struct Finality: public Serializable {
     public:
     Finality() = default;
     Finality(ReplicaID rid,
+            uint32_t tid,
             int8_t decision,
             uint32_t cmd_idx,
             uint32_t cmd_height,
             uint256_t cmd_hash,
             uint256_t blk_hash):
-        rid(rid), decision(decision),
+        rid(rid), tid(tid), decision(decision),
         cmd_idx(cmd_idx), cmd_height(cmd_height),
         cmd_hash(cmd_hash), blk_hash(blk_hash) {}
 
     void serialize(DataStream &s) const override {
-        s << rid << decision
+        s << rid << tid << decision
           << cmd_idx << cmd_height
           << cmd_hash;
         if (decision == 1) s << blk_hash;
     }
 
     void unserialize(DataStream &s) override {
-        s >> rid >> decision
+        s >> rid >> tid >> decision
           >> cmd_idx >> cmd_height
           >> cmd_hash;
         if (decision == 1) s >> blk_hash;
@@ -378,13 +399,16 @@ struct Finality: public Serializable {
           << "cmd_idx=" << std::to_string(cmd_idx) << " "
           << "cmd_height=" << std::to_string(cmd_height) << " "
           << "cmd=" << get_hex10(cmd_hash) << " "
-          << "blk=" << get_hex10(blk_hash) << ">";
+          << "blk=" << get_hex10(blk_hash) << " " 
+          << "tid=" << std::to_string(tid) << ">";
         return s;
     }
 };
 
 /** Abstraction for vote relay messages. */
     struct VoteRelay: public Serializable {
+        /** tree used for the message*/
+        uint32_t tid;
         /** block being voted */
         uint256_t blk_hash;
         /** proof of validity for the vote */
@@ -394,13 +418,15 @@ struct Finality: public Serializable {
         HotStuffCore *hsc;
 
         VoteRelay(): cert(nullptr), hsc(nullptr) {}
-        VoteRelay(const uint256_t &blk_hash,
+        VoteRelay(uint32_t tid, const uint256_t &blk_hash,
                   quorum_cert_bt &&cert,
              HotStuffCore *hsc):
+                tid(tid),
                 blk_hash(blk_hash),
                 cert(std::move(cert)), hsc(hsc) {}
 
         VoteRelay(const VoteRelay &other):
+                tid(other.tid),
                 blk_hash(other.blk_hash),
                 cert(other.cert ? other.cert->clone() : nullptr),
                 hsc(other.hsc) {}
@@ -408,19 +434,20 @@ struct Finality: public Serializable {
         VoteRelay(VoteRelay &&other) = default;
 
         void serialize(DataStream &s) const override {
-            s << blk_hash << *cert;
+            s << tid << blk_hash << *cert;
         }
 
         void unserialize(DataStream &s) override {
             assert(hsc != nullptr);
-            s >> blk_hash;
+            s >> tid >> blk_hash;
             cert = hsc->parse_quorum_cert(s);
         }
 
         operator std::string () const {
             DataStream s;
             s << "<voterelay "
-              << " blk=" << get_hex10(blk_hash) << ">";
+              << "blk=" << get_hex10(blk_hash) << " "
+              << "tid=" << std::to_string(tid) << ">";
             return s;
         }
     };
@@ -462,7 +489,7 @@ struct Finality: public Serializable {
         /**
          * Returns the tree array list
         */
-        const std::vector<uint32_t> &get_tree() const {
+        const std::vector<uint32_t> &get_tree_array() const {
             return tree_array;
         }
 

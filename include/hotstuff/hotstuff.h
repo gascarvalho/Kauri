@@ -203,6 +203,7 @@ class HotStuffBase: public HotStuffCore {
     vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> global_replicas;
 
     std::unordered_map<size_t, Tree> system_trees;
+    Tree current_tree;
 
     /* communication */
 
@@ -229,6 +230,7 @@ class HotStuffBase: public HotStuffCore {
     bool is_proposer(int id) override;
     void do_decide(Finality &&) override;
     void do_consensus(const block_t &blk) override;
+    uint32_t get_tree_id() override;
 
     protected:
 
