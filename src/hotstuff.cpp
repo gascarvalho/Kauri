@@ -779,6 +779,33 @@ void HotStuffBase::do_decide(Finality &&fin) {
 
 HotStuffBase::~HotStuffBase() {}
 
+void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas) {
+    // TODO: Make this dynamic and from a config file
+
+    size_t fanout = config.fanout;
+    size_t system_size = replicas.size();
+
+    /* A tree for each replica, where they are the proposer */
+    for (size_t tid = 0; tid < system_size; tid++) {
+
+        std::vector<uint32_t> new_tree_array;
+        for (int i = 0; i < system_size; ++i) {
+            new_tree_array.push_back(((i + tid) % system_size));
+        }
+        
+        system_trees[tid] = Tree(tid, fanout, new_tree_array);
+    }
+
+    // system_trees[0] = {0, 1, 2, 3, 4, 5, 6};
+    // system_trees[1] = {1, 2, 3, 4, 5, 6, 0};
+    // system_trees[2] = {2, 3, 4, 5, 6, 0, 1};
+    // system_trees[3] = {3, 4, 5, 6, 0, 1, 2};
+    // system_trees[4] = {4, 5, 6, 0 ,1, 2, 3};
+    // system_trees[5] = {5, 6, 0, 1, 2, 3, 4};
+    // system_trees[6] = {6, 0, 1, 2, 3, 4, 5};
+
+}
+
 void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
     
     LOG_PROTO("=========================== HotStuff Base Tree Calculation =================================\n");
@@ -996,17 +1023,8 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     offset = get_pace_maker()->get_proposer();
 
-    std::unordered_map<size_t, std::vector<size_t>> set_trees;
-
-    set_trees[0] = {0, 1, 2, 3, 4, 5, 6};
-    set_trees[1] = {1, 2, 3, 4, 5, 6, 0};
-    set_trees[2] = {2, 3, 4, 5, 6, 0, 1};
-    set_trees[3] = {3, 4, 5, 6, 0, 1, 2};
-    set_trees[4] = {4, 5, 6, 0 ,1, 2, 3};
-    set_trees[5] = {5, 6, 0, 1, 2, 3, 4};
-    set_trees[6] = {6, 0, 1, 2, 3, 4, 5};
-
-    auto new_tree = set_trees[offset];
+    auto current_tree = system_trees[offset];
+    auto new_tree = current_tree.get_tree();
 
     // Find my index in the new tree
     auto it = std::find(new_tree.begin(), new_tree.end(), myGlobalId);
@@ -1096,6 +1114,10 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 } 
 
 void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop) {
+
+    /* tree config */
+
+    HotStuffBase::treeConfig(std::move(replicas));
 
     HotStuffBase::calcTreeForced(std::move(replicas), true);
     for (const PeerId& peer : peers) {

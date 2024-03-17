@@ -33,6 +33,7 @@ struct Proposal;
 struct Vote;
 struct Finality;
 struct VoteRelay;
+struct Tree;
 
 /** Abstraction for HotStuff protocol state machine (without network implementation). */
 class HotStuffCore {
@@ -110,6 +111,7 @@ public:
      */
     virtual void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
     virtual void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
+    virtual void treeConfig() {}
 
     /** Call to set the fanout. */
     void set_fanout(int32_t fanout);
@@ -230,6 +232,7 @@ protected:
 
     Proposal process_block(const block_t& bnew, bool adjustHeight);
 
+    void treeConfig(bool b);
     void calcTree(bool b);
     void calcTreeForced(bool b);
 
@@ -437,13 +440,13 @@ struct Finality: public Serializable {
         std::vector<uint32_t> tree_array;
 
         public:
-
+        Tree() = default;
         Tree(const uint32_t tid,
             const uint8_t fanout,
-            std::vector<uint32_t> &&tree_array):
+            const std::vector<uint32_t> &tree_array):
         tid(tid),
         fanout(fanout), 
-        tree_array(std::move(tree_array)) {}
+        tree_array(tree_array) {}
 
 
         /**

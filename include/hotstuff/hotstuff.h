@@ -164,7 +164,9 @@ class HotStuffBase: public HotStuffCore {
     BlockProfiler blk_profiler;
 #endif
     pacemaker_bt pmaker;
+
     /* queues for async tasks */
+    
     std::unordered_map<const uint256_t, BlockFetchContext> blk_fetch_waiting;
     std::unordered_map<const uint256_t, BlockDeliveryContext> blk_delivery_waiting;
     std::unordered_map<const uint256_t, commit_cb_t> decision_waiting;
@@ -174,6 +176,7 @@ class HotStuffBase: public HotStuffCore {
     std::vector<uint256_t> final_buffer;
 
     /* statistics */
+
     uint64_t fetched;
     uint64_t delivered;
     uint64_t failures;
@@ -190,12 +193,18 @@ class HotStuffBase: public HotStuffCore {
     mutable double part_delivery_time_max;
     mutable std::unordered_map<const PeerId, uint32_t> part_fetched_replica;
 
+    /* trees and peers */
+
     mutable PeerId parentPeer;
     mutable PeerId noParent;
     mutable std::set<PeerId> childPeers;
     mutable size_t myGlobalId;
 
     vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> global_replicas;
+
+    std::unordered_map<size_t, Tree> system_trees;
+
+    /* communication */
 
     void on_fetch_cmd(const command_t &cmd);
     void on_fetch_blk(const block_t &blk);
@@ -245,6 +254,7 @@ class HotStuffBase: public HotStuffCore {
     void exec_command(uint256_t cmd_hash, commit_cb_t callback);
     void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                 bool ec_loop = false);
+    void treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
     void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
     void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
     void beat();
