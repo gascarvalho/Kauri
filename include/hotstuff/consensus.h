@@ -529,6 +529,15 @@ struct Finality: public Serializable {
                 s >> elem;
         }
 
+        std::string get_tree_array_string() {
+            DataStream s;
+            s << "{ ";
+            for (auto &elem: tree_array)
+                s << std::to_string(elem) << " ";
+            s << "}";
+            return std::string(s);
+        }
+
         operator std::string () const {
             DataStream s;
             s << "<tree "

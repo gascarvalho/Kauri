@@ -796,9 +796,14 @@ void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256
         for (int i = 0; i < system_size; ++i) {
             new_tree_array.push_back(((i + tid) % system_size));
         }
-        
-        system_trees[tid] = Tree(tid, fanout, new_tree_array);
+
+        system_trees[tid] = TreeNetwork(Tree(tid, fanout, new_tree_array), std::move(replicas), id);
     }
+
+    // This version doesn't remove replicas from the tree
+    // Instead, simply switch to pre-mediated tree according to the oracle's "offset"
+    // The default tree is seen as a vector from [0, ..., N]
+    // An offset of x means x shift lefts in the looping vector
 
     // system_trees[0] = {0, 1, 2, 3, 4, 5, 6};
     // system_trees[1] = {1, 2, 3, 4, 5, 6, 0};
@@ -964,27 +969,17 @@ void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t
 
 void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
 
-    LOG_PROTO("=========================== HotStuff Base Tree Calculation [FORCED] =================================\n");
-    LOG_PROTO("[ReplicaID %lld] CALCULATING A NEW TREE WITH startup=%s", id, startup ? "true" : "false");
-
-    std::set<uint16_t> children;
+    LOG_PROTO("\n=========================== Kauri Tree Calculation =================================\n");
+    LOG_PROTO("[ReplicaID %lld] CALCULATING A NEW TREE %s", id, startup ? "(STARTUP)" : "");
 
     if (startup) {
-        global_replicas = std::move(replicas);
-    }
-    else {
-        //failures++;
-    }
 
-    // Reset children peer list
-    childPeers.clear();
-
-    auto offset = 0;
-    auto size = global_replicas.size();
-
-    if (startup) {
         // STARTUP
+        global_replicas = std::move(replicas);
+        auto size = global_replicas.size();
+
         for (size_t i = 0; i < size; i++) {
+            auto x = 0;
 
             // Get the certificate hash from the replica vector
             auto cert_hash = std::move(std::get<2>(global_replicas[i]));
@@ -999,10 +994,10 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
             auto &addr = std::get<0>(global_replicas[i]);
 
             /* 
-            Add the replica to the system's config
-            i = replica id (0 to N)
-            peer = peer id
-            3rd arg = PubKey
+                Add the replica to the system's config
+                i = replica id (0 to N)
+                peer = peer id
+                3rd arg = PubKey
             */
             HotStuffCore::add_replica(i, peer, std::move(std::get<1>(global_replicas[i])));
             // Add all replicas except myself to my peer array and peer network/stack
@@ -1012,69 +1007,74 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
                 pn.add_peer(peer);
                 pn.set_peer_addr(peer, addr);
             }
-            else {
-                myGlobalId = i;
-            }
         }
+
+        treeConfig(std::move(global_replicas));
     }
 
-    // This version doesn't remove replicas from the tree
-    // Instead, simply switch to pre-mediated tree according to the oracle's "offset"
-    // The default tree is seen as a vector from [0, ..., N]
-    // An offset of x means x shift lefts in the looping vector
-
-    HOTSTUFF_LOG_PROTO("My id: %lld", myGlobalId);
+    // Reset children peer list
+    // childPeers.clear();
+    // std::set<uint16_t> children;
+    // auto offset = 0;
+    // auto size = global_replicas.size();
 
     /* Update the current tree */
-    offset = get_pace_maker()->get_proposer();
-    current_tree = system_trees[offset];
+    auto offset = get_pace_maker()->get_proposer();
+    auto current_tree_network = system_trees[offset];
+    current_tree = current_tree_network.get_tree();
+
+    parentPeer = current_tree_network.get_parentPeer();
+    childPeers = current_tree_network.get_childPeers();
+    numberOfChildren = current_tree_network.get_numberOfChildren();
+
+    //HOTSTUFF_LOG_PROTO("The current system tree is given by: %s", std::string(current_tree).c_str());
     
-    auto new_tree = current_tree.get_tree_array();
+    // auto new_tree = current_tree.get_tree_array();
 
-    // Find my index in the new tree
-    auto it = std::find(new_tree.begin(), new_tree.end(), myGlobalId);
-    auto my_new_idx = std::distance(new_tree.begin(), it);
+    // // Find my index in the new tree
+    // auto it = std::find(new_tree.begin(), new_tree.end(), myGlobalId);
+    // auto my_new_idx = std::distance(new_tree.begin(), it);
 
-    // New Parent
-    if (my_new_idx == 0) {
-        parentPeer = noParent; // Indicates no parent (may be wrong)
-        HOTSTUFF_LOG_PROTO("I have no parent (am proposer)");
-        // auto my_cert_hash = std::move(std::get<2>(global_replicas[myGlobalId]));
-        // salticidae::PeerId me{my_cert_hash};
-        // parentPeer = me;
-    }
-    else {
-        auto parent_idx = std::floor((my_new_idx - 1) / 2);
-        auto parent_cert_hash = std::move(std::get<2>(global_replicas[new_tree[parent_idx]]));
-        salticidae::PeerId parent_peer{parent_cert_hash};
-        //std::cout << "Parent peer: " << parent_peer.to_hex() << std::endl;
-        parentPeer = parent_peer;
-        HOTSTUFF_LOG_PROTO("My parent's id: %lld", new_tree[parent_idx]);
-    }
+    // // New Parent
+    // if (my_new_idx == 0) {
+    //     parentPeer = noParent; // Indicates no parent (may be wrong)
+    //     HOTSTUFF_LOG_PROTO("I have no parent (am proposer)");
+    //     // auto my_cert_hash = std::move(std::get<2>(global_replicas[myGlobalId]));
+    //     // salticidae::PeerId me{my_cert_hash};
+    //     // parentPeer = me;
+    // }
+    // else {
+    //     auto parent_idx = std::floor((my_new_idx - 1) / 2);
+    //     auto parent_cert_hash = std::move(std::get<2>(global_replicas[new_tree[parent_idx]]));
+    //     salticidae::PeerId parent_peer{parent_cert_hash};
+    //     //std::cout << "Parent peer: " << parent_peer.to_hex() << std::endl;
+    //     parentPeer = parent_peer;
+    //     HOTSTUFF_LOG_PROTO("My parent's id: %lld", new_tree[parent_idx]);
+    // }
 
-    // Left Child
-    auto left_child_idx = 2 * my_new_idx + 1;
-    if (left_child_idx < size) {
-        children.insert(new_tree[left_child_idx]);
-        auto left_cert_hash = std::move(std::get<2>(global_replicas[new_tree[left_child_idx]]));
-        salticidae::PeerId left_child{left_cert_hash};
-        childPeers.insert(left_child);
-        HOTSTUFF_LOG_PROTO("My left child's id: %lld", new_tree[left_child_idx]);
-    }
-    else
-        HOTSTUFF_LOG_PROTO("I have no left child.");
+    // // Left Child
+    // auto left_child_idx = 2 * my_new_idx + 1;
+    // if (left_child_idx < size) {
+    //     children.insert(new_tree[left_child_idx]);
+    //     auto left_cert_hash = std::move(std::get<2>(global_replicas[new_tree[left_child_idx]]));
+    //     salticidae::PeerId left_child{left_cert_hash};
+    //     childPeers.insert(left_child);
+    //     HOTSTUFF_LOG_PROTO("My left child's id: %lld", new_tree[left_child_idx]);
+    // }
+    // else
+    //     HOTSTUFF_LOG_PROTO("I have no left child.");
 
-    // Right Child
-    auto right_child_idx = 2 * my_new_idx + 2;
-    if (right_child_idx < size) {
-        children.insert(new_tree[right_child_idx]);
-        auto right_cert_hash = std::move(std::get<2>(global_replicas[new_tree[right_child_idx]]));
-        salticidae::PeerId right_child{right_cert_hash};
-        childPeers.insert(right_child);
-        HOTSTUFF_LOG_PROTO("My right child's id: %lld", new_tree[right_child_idx]);
-    }
-    else
-        HOTSTUFF_LOG_PROTO("I have no right child.");
+    // // Right Child
+    // auto right_child_idx = 2 * my_new_idx + 2;
+    // if (right_child_idx < size) {
+    //     children.insert(new_tree[right_child_idx]);
+    //     auto right_cert_hash = std::move(std::get<2>(global_replicas[new_tree[right_child_idx]]));
+    //     salticidae::PeerId right_child{right_cert_hash};
+    //     childPeers.insert(right_child);
+    //     HOTSTUFF_LOG_PROTO("My right child's id: %lld", new_tree[right_child_idx]);
+    // }
+    // else
+    //     HOTSTUFF_LOG_PROTO("I have no right child.");
 
     // if (childPeers.find(parentPeer) != childPeers.end()) {
     //     HOTSTUFF_LOG_PROTO("AAAAAAAAAAAAAAAAAAA");
@@ -1105,24 +1105,24 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     // salticidae::PeerId right_child{right_cert_hash};
     // childPeers.insert(right_child);
 
-    numberOfChildren = children.size();
+    // numberOfChildren = children.size();
 
-    DataStream str;
-    str << "Calculated Tree: { ";
-    for (int i = 0; i < size; ++i) {
-        str << std::to_string((i + offset) % size) << ", ";
-    }
-    str << "}";
+    // DataStream str;
+    // str << "Calculated Tree: { ";
+    // for (int i = 0; i < size; ++i) {
+    //     str << std::to_string((i + offset) % size) << ", ";
+    // }
+    // str << "}";
 
-    std::cout << std::string(str) << std::endl;
-    LOG_PROTO("=========================== Finished Tree Calculation [FORCED] =================================\n");
+    // std::cout << std::string(str) << std::endl;
+    HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
+
+    LOG_PROTO("\n=========================== Finished Tree Calculation =================================\n");
 } 
 
 void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop) {
 
     /* tree config */
-
-    HotStuffBase::treeConfig(std::move(replicas));
 
     HotStuffBase::calcTreeForced(std::move(replicas), true);
     for (const PeerId& peer : peers) {

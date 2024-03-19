@@ -38,6 +38,107 @@ using salticidae::_2;
 const double ent_waiting_timeout = 10;
 const double double_inf = 1e10;
 
+
+/** Struct that keeps the network information of its tree */
+struct TreeNetwork {
+
+    /** While a Tree is the same for every replica,
+        A TreeNetwork is relative, depending on 
+        the replica's position in a tree **/
+
+    Tree tree;
+    size_t myTreeId;    // My identifier in the tree array
+    mutable PeerId parentPeer;   // My parent peer in the tree
+    mutable std::set<PeerId> childPeers; // My children peers in the tree
+    uint16_t numberOfChildren; // How many children I have
+    DataStream info;
+
+    public:
+    TreeNetwork() = default;
+    TreeNetwork(const Tree t, 
+                const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, 
+                const uint16_t myReplicaId) : tree(t) {
+
+
+        info << "\tMy id: " << std::to_string(myReplicaId) << "\n";
+
+        auto tree_array = tree.get_tree_array();
+        auto fanout = tree.get_fanout();
+        auto size = tree_array.size();
+
+        // Find my position in the tree
+        auto it = std::find(tree_array.begin(), tree_array.end(), myReplicaId);
+        auto my_idx = std::distance(tree_array.begin(), it);
+
+        // Parent Peer (if any)
+        if (my_idx != 0) {
+            auto parent_idx = std::floor((my_idx - 1) / fanout);
+            auto parent_cert_hash = std::move(std::get<2>(replicas[tree_array[parent_idx]]));
+            salticidae::PeerId parent_peer{parent_cert_hash};
+            parentPeer = parent_peer;
+            info << "\tMy parent: " << std::to_string(tree_array[parent_idx]) << "\n";
+        }
+        else
+            info << "\tI have no parent (am root)\n";
+
+        /** TODO: Un-hard-code all of this!! */
+
+        // Left Child (if any)
+        auto left_child_idx = 2 * my_idx + 1;
+        if (left_child_idx < size) {
+            auto left_cert_hash = std::move(std::get<2>(replicas[tree_array[left_child_idx]]));
+            salticidae::PeerId left_child{left_cert_hash};
+            childPeers.insert(left_child);
+            info << "\tMy left child: " << std::to_string(tree_array[left_child_idx]) << "\n";
+        }
+        else
+            info << "\tI have no left child\n";
+       
+
+        // Right Child (if any)
+        auto right_child_idx = 2 * my_idx + 2;
+        if (right_child_idx < size) {
+            auto right_cert_hash = std::move(std::get<2>(replicas[tree_array[right_child_idx]]));
+            salticidae::PeerId right_child{right_cert_hash};
+            childPeers.insert(right_child);
+            info << "\tMy right child: " << std::to_string(tree_array[right_child_idx]) << "\n";
+        }
+        else
+            info << "\tI have no right child\n";
+
+        // Store remainder state
+        numberOfChildren = childPeers.size();
+        myTreeId = my_idx;
+
+    }
+
+    /**
+    * Returns the network's Tree
+    */
+    const Tree &get_tree() const { return tree; }
+
+    const size_t &get_myTreeId() const { return myTreeId; }
+
+    const PeerId &get_parentPeer() const { return parentPeer; }
+
+    const std::set<PeerId> &get_childPeers() const { return childPeers; }
+
+    const uint16_t &get_numberOfChildren() const { return numberOfChildren; }
+
+    operator std::string() {
+
+        DataStream s;
+
+        s << "\nTree Network {\n";
+        s << std::string(info).c_str();
+        s << "\tTree Array:" << tree.get_tree_array_string().c_str() << "\n";
+        s << "}\n";
+
+        return s;
+    }
+    
+};
+
 /** Network message format for HotStuff. */
 struct MsgPropose {
     static const opcode_t opcode = 0x0;
@@ -198,12 +299,12 @@ class HotStuffBase: public HotStuffCore {
     mutable PeerId parentPeer;
     mutable PeerId noParent;
     mutable std::set<PeerId> childPeers;
-    mutable size_t myGlobalId;
 
     vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> global_replicas;
 
-    std::unordered_map<size_t, Tree> system_trees;
-    Tree current_tree;
+    //std::unordered_map<size_t, Tree> system_trees;
+    std::unordered_map<size_t, TreeNetwork> system_trees;
+    mutable Tree current_tree;
 
     /* communication */
 
