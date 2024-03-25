@@ -217,9 +217,14 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     auto &prop = msg.proposal;
     msg.postponed_parse(this);
 
-    if (prop.proposer != pmaker->get_proposer()) {
+    /** Treat proposal in relation to its tree */
+    auto msg_tree = system_trees[prop.tid];
+    auto childPeers = msg_tree.get_childPeers();
+    auto tree_proposer = msg_tree.get_tree().get_tree_root();
+
+    if (prop.proposer != tree_proposer) {
         HOTSTUFF_LOG_PROTO("PROPOSAL RECEIVED FROM NON-PROPOSER REPLICA!");
-        HOTSTUFF_LOG_PROTO("Proposal from: %d but Current proposer: %d", prop.proposer, pmaker->get_proposer());
+        HOTSTUFF_LOG_PROTO("Proposal from: %d but tree's proposer is: %d", prop.proposer, tree_proposer);
         return;
     }
 
@@ -249,7 +254,17 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
     msg.postponed_parse(this);
     //HOTSTUFF_LOG_PROTO("received vote");
 
-    if (id == pmaker->get_proposer() && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end()) {
+    /** Treat vote in relation to its tree */
+    auto msg_tree_id = msg.vote.tid;
+    auto msg_tree = system_trees[msg_tree_id];
+    auto parentPeer = msg_tree.get_parentPeer();
+    auto childPeers = msg_tree.get_childPeers();
+    auto numberOfChildren = msg_tree.get_numberOfChildren();
+    auto tree_proposer = msg_tree.get_tree().get_tree_root();
+
+    HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received VOTE message in tid=%d from ReplicaId %d", msg_tree_id, peer_id_map.at(peer));
+
+    if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end()) {
         HOTSTUFF_LOG_PROTO("piped block");
         block_t blk = storage->find_blk(msg.vote.blk_hash);
         if (!blk->delivered) {
@@ -268,8 +283,8 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
         std::cout << "create cert: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
     }
 
-    std::cout << "vote handler: " << msg.vote.blk_hash.to_hex() << " " << std::endl;
-    //HOTSTUFF_LOG_PROTO("vote handler %d %d", config.nmajority, config.nreplicas);
+    std::cout << "vote handler: received vote for block " << msg.vote.blk_hash.to_hex() << " " << std::endl;
+    //HOTSTUFF_LOG_PROTO("vote handler: Majority Necessary: %d | Total Replicas: %d", config.nmajority, config.nreplicas);
 
     if (blk->self_qc->has_n(config.nmajority)) {
         HOTSTUFF_LOG_PROTO("bye vote handler");
@@ -283,7 +298,7 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
         return;
     }
 
-    if (id != pmaker->get_proposer() ) {
+    if (id != tree_proposer) {
         auto &cert = blk->self_qc;
 
 
@@ -294,8 +309,11 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
         cert->add_part(config, msg.vote.voter, *msg.vote.cert);
 
         if (!cert->has_n(numberOfChildren + 1)) {
+            HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Don't have all my children's votes, returning...");
             return;
         }
+
+        HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got all children votes (%d) + my own! Total: %d", numberOfChildren, cert->get_sigs_n());
         std::cout <<  " got enough votes: " << msg.vote.blk_hash.to_hex().c_str() <<  std::endl;
 
         if (!piped_queue.empty()) {
@@ -324,8 +342,12 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
         }
 
         std::cout <<  " send relay message: " << msg.vote.blk_hash.to_hex().c_str() <<  std::endl;
-        if(!parentPeer.is_null()) 
-            pn.send_msg(MsgRelay(VoteRelay(get_tree_id(), msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
+        if(!parentPeer.is_null()) {
+
+            HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got enough votes, sending VOTE-RELAY in tid=%d to ReplicaId %d with a cert of size %d", msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
+
+            pn.send_msg(MsgRelay(VoteRelay(msg_tree_id, msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
+        }
         async_deliver_blk(msg.vote.blk_hash, peer);
         
         return;
@@ -335,8 +357,8 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
     RcObj<Vote> v(new Vote(std::move(msg.vote)));
     promise::all(std::vector<promise_t>{
         async_deliver_blk(v->blk_hash, peer),
-        id == pmaker->get_proposer() ? v->verify(vpool) : promise_t([](promise_t &pm) { pm.resolve(true); }),
-    }).then([this, blk, v=std::move(v), timeStart](const promise::values_t values) {
+        id == tree_proposer ? v->verify(vpool) : promise_t([](promise_t &pm) { pm.resolve(true); }),
+    }).then([this, blk, v=std::move(v), timeStart, tree_proposer](const promise::values_t values) {
         if (!promise::any_cast<bool>(values[1]))
             LOG_WARN("invalid vote from %d", v->voter);
         auto &cert = blk->self_qc;
@@ -346,7 +368,7 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
         if (cert != nullptr && cert->get_obj_hash() == blk->get_hash()) {
             if (cert->has_n(config.nmajority)) {
                 cert->compute();
-                if (id != pmaker->get_proposer() && !cert->verify(config)) {
+                if (id != tree_proposer && !cert->verify(config)) {
                     throw std::runtime_error("Invalid Sigs in intermediate signature!");
                 }
                 //HOTSTUFF_LOG_PROTO("Majority reached, go");
@@ -391,7 +413,17 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
     msg.postponed_parse(this);
     //std::cout << "vote relay handler: " << msg.vote.blk_hash.to_hex() << std::endl;
 
-    if (id == pmaker->get_proposer() && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end()) {
+    /** Treat vote relay in relation to its tree */
+    auto msg_tree_id = msg.vote.tid;
+    auto msg_tree = system_trees[msg_tree_id];
+    auto parentPeer = msg_tree.get_parentPeer();
+    auto childPeers = msg_tree.get_childPeers();
+    auto numberOfChildren = msg_tree.get_numberOfChildren();
+    auto tree_proposer = msg_tree.get_tree().get_tree_root();
+
+    HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Received VOTE-RELAY message in tid=%d from ReplicaId %d with a cert of size %d", msg_tree_id, peer_id_map.at(peer), msg.vote.cert->get_sigs_n());
+
+    if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end()) {
         HOTSTUFF_LOG_PROTO("piped block");
         block_t blk = storage->find_blk(msg.vote.blk_hash);
         if (!blk->delivered) {
@@ -411,7 +443,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
 
     if (blk->self_qc->has_n(config.nmajority)) {
         std::cout << "bye vote relay handler: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
-        if (id == pmaker->get_proposer() && blk->hash == piped_queue.front()) {
+        if (id == tree_proposer && blk->hash == piped_queue.front()) {
             piped_queue.pop_front();
             HOTSTUFF_LOG_PROTO("Reset Piped block");
 
@@ -449,12 +481,12 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
 
     std::cout << "vote relay handler: " << msg.vote.blk_hash.to_hex() << " " << std::endl;
 
-    //auto &vote = msg.vote;
-    RcObj<VoteRelay> v(new VoteRelay(std::move(msg.vote)));
+    auto &vote = msg.vote;
+    RcObj<VoteRelay> v(new VoteRelay(std::move(vote)));
     promise::all(std::vector<promise_t>{
             async_deliver_blk(v->blk_hash, peer),
             v->cert->verify(config, vpool),
-    }).then([this, blk, v=std::move(v), timeStart](const promise::values_t& values) {
+    }).then([this, blk, v=std::move(v), timeStart, tree_proposer, parentPeer, numberOfChildren, msg_tree_id](const promise::values_t& values) {
         struct timeval timeEnd;
 
         if (!promise::any_cast<bool>(values[1]))
@@ -462,28 +494,37 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
         auto &cert = blk->self_qc;
 
         if (cert != nullptr && cert->get_obj_hash() == blk->get_hash() && !cert->has_n(config.nmajority)) {
-            if (id != pmaker->get_proposer() && cert->has_n(numberOfChildren + 1))
+
+
+            if (id != tree_proposer && cert->has_n(numberOfChildren + 1))
             {
                 return;
             }
 
             cert->merge_quorum(*v->cert);
 
-            if (id != pmaker->get_proposer()) {
+            if (id != tree_proposer) {
                 if (!cert->has_n(numberOfChildren + 1)) return;
                 cert->compute();
                 if (!cert->verify(config)) {
                     throw std::runtime_error("Invalid Sigs in intermediate signature!");
                 }
                 std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
-                if(!parentPeer.is_null())
-                     pn.send_msg(MsgRelay(VoteRelay(get_tree_id(), v->blk_hash, cert.get()->clone(), this)), parentPeer);
+                if(!parentPeer.is_null()) {
+
+                    HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Sending VOTE-RELAY in tid=%d to ReplicaId %d with a cert of size %d", msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
+
+                    pn.send_msg(MsgRelay(VoteRelay(msg_tree_id, v->blk_hash, cert.get()->clone(), this)), parentPeer);
+                }
+
                 return;
             }
 
             //HOTSTUFF_LOG_PROTO("got %s", std::string(*v).c_str());
+            HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Checking if our certificate has a majority of %llu", config.nmajority);
 
             if (!cert->has_n(config.nmajority)) {
+                HOTSTUFF_LOG_PROTO("[RELAY HANDLER] No majority in cert! Current: %llu | Necessary: %llu", cert->get_sigs_n(), config.nmajority);
                 /*if (id == get_pace_maker()->get_proposer()) {
                     gettimeofday(&timeEnd, NULL);
                     long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);
@@ -493,6 +534,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                 }*/
                 return;
             }
+
+            HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Majority in cert reached! Current: %llu | Necessary: %llu", cert->get_sigs_n(), config.nmajority);
 
             cert->compute();
             if (!cert->verify(config)) {
@@ -728,6 +771,7 @@ HotStuffBase::HotStuffBase(uint32_t blk_size,
 }
 
 void HotStuffBase::do_broadcast_proposal(const Proposal &prop) {
+    auto childPeers = current_tree_network.get_childPeers();
     pn.multicast_msg(MsgPropose(prop), std::vector(childPeers.begin(), childPeers.end()));
 }
 
@@ -739,18 +783,32 @@ bool HotStuffBase::is_proposer(int id) {
     return id == pmaker->get_proposer();
 }
 
+void HotStuffBase::proposer_base_deliver(const block_t &blk) {
+    this->on_deliver_blk(blk);
+}
+
 void HotStuffBase::do_vote(Proposal prop, const Vote &vote) {
     pmaker->beat_resp(prop.proposer).then([this, vote, prop](ReplicaID proposer) {
 
-        if (proposer == get_id())
+        /** Treat vote to proposal in relation to its tree */
+        auto msg_tree_id = prop.tid;
+        auto msg_tree = system_trees[msg_tree_id];
+        auto parentPeer = msg_tree.get_parentPeer();
+        auto childPeers = msg_tree.get_childPeers();
+        auto tree_proposer = msg_tree.get_tree().get_tree_root();
+
+        if (tree_proposer == get_id())
         {
             return;
         }
 
         if (childPeers.empty()) {
             //HOTSTUFF_LOG_PROTO("send vote");
-            if(!parentPeer.is_null()) 
+            if(!parentPeer.is_null())  {
+
+                HOTSTUFF_LOG_PROTO("[CONSENSUS] Sending VOTE in tid=%d to ReplicaId %d", msg_tree_id, peer_id_map.at(parentPeer));
                 pn.send_msg(MsgVote(vote), parentPeer);
+            }
         } else {
             block_t blk = get_delivered_blk(vote.blk_hash);
             if (blk->self_qc == nullptr)
@@ -777,6 +835,9 @@ void HotStuffBase::do_decide(Finality &&fin) {
     }
 }
 
+/**
+ * Get the current tree id. Used for proposals.
+*/
 uint32_t HotStuffBase::get_tree_id() {
     return current_tree.get_tid();
 }
@@ -817,154 +878,154 @@ void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256
 
 void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
     
-    LOG_PROTO("=========================== HotStuff Base Tree Calculation =================================\n");
-    LOG_PROTO("[ReplicaID %lld] CALCULATING A NEW TREE WITH startup=%s", id, startup ? "true" : "false");
+    // LOG_PROTO("=========================== HotStuff Base Tree Calculation =================================\n");
+    // LOG_PROTO("[ReplicaID %lld] CALCULATING A NEW TREE WITH startup=%s", id, startup ? "true" : "false");
 
-    std::set<uint16_t> children;
+    // std::set<uint16_t> children;
 
-    if (startup) {
-        global_replicas = std::move(replicas);
-    }
+    // if (startup) {
+    //     global_replicas = std::move(replicas);
+    // }
 
-    childPeers.clear();
+    // childPeers.clear();
 
-    auto offset = 0;
-    auto size = global_replicas.size();
+    // auto offset = 0;
+    // auto size = global_replicas.size();
 
-    if (!startup) {
-        std::cout << "Total global replicas: " << global_replicas.size() << std::endl;
-        global_replicas.erase(global_replicas.begin());
-        size = global_replicas.size();
-        std::cout << "Size after prune : " << size << std::endl;
-        offset = get_pace_maker()->get_proposer();
-        failures++;
-    }
-    else {
-        // STARTUP
-        for (size_t i = 0; i < size; i++) {
+    // if (!startup) {
+    //     std::cout << "Total global replicas: " << global_replicas.size() << std::endl;
+    //     global_replicas.erase(global_replicas.begin());
+    //     size = global_replicas.size();
+    //     std::cout << "Size after prune : " << size << std::endl;
+    //     offset = get_pace_maker()->get_proposer();
+    //     failures++;
+    // }
+    // else {
+    //     // STARTUP
+    //     for (size_t i = 0; i < size; i++) {
 
-            // Get the certificate hash from the replica vector
-            auto cert_hash = std::move(std::get<2>(global_replicas[i]));
+    //         // Get the certificate hash from the replica vector
+    //         auto cert_hash = std::move(std::get<2>(global_replicas[i]));
 
-            // Get the peer id from the certificate hash
-            salticidae::PeerId peer{cert_hash};
+    //         // Get the peer id from the certificate hash
+    //         salticidae::PeerId peer{cert_hash};
 
-            // Add the certificate hash to the set of valid TLS certificates
-            valid_tls_certs.insert(cert_hash);
+    //         // Add the certificate hash to the set of valid TLS certificates
+    //         valid_tls_certs.insert(cert_hash);
 
-            // Get the net address from the replica vector
-            auto &addr = std::get<0>(global_replicas[i]);
+    //         // Get the net address from the replica vector
+    //         auto &addr = std::get<0>(global_replicas[i]);
 
-            /* 
-            Add the replica to the system's config
-            i = replica id (0 to N)
-            peer = peer id
-            3rd arg = PubKey
-            */
-            HotStuffCore::add_replica(i, peer, std::move(std::get<1>(global_replicas[i])));
+    //         /* 
+    //         Add the replica to the system's config
+    //         i = replica id (0 to N)
+    //         peer = peer id
+    //         3rd arg = PubKey
+    //         */
+    //         HotStuffCore::add_replica(i, peer, std::move(std::get<1>(global_replicas[i])));
 
-            // Add all replicas except myself to my peer array and peer network/stack
-            if (addr != listen_addr) {
-                HOTSTUFF_PROTO_LOG("[STARTUP] Adding peer with id %llu and IP %s to network.", i, addr);
-                peers.push_back(peer);
-                pn.add_peer(peer);
-                pn.set_peer_addr(peer, addr);
-            }
-        }
-    }
+    //         // Add all replicas except myself to my peer array and peer network/stack
+    //         if (addr != listen_addr) {
+    //             HOTSTUFF_PROTO_LOG("[STARTUP] Adding peer with id %llu and IP %s to network.", i, addr);
+    //             peers.push_back(peer);
+    //             pn.add_peer(peer);
+    //             pn.set_peer_addr(peer, addr);
+    //         }
+    //     }
+    // }
 
-    size_t fanout = config.fanout;
+    // size_t fanout = config.fanout;
 
-    // Processes on this layer of the tree
-    auto processesOnLevel = 1;  /* <- 1 because of root */
-    bool done = false;
+    // // Processes on this layer of the tree
+    // auto processesOnLevel = 1;  /* <- 1 because of root */
+    // bool done = false;
 
-    if (failures > fanout) {
-        config.fanout = size;
-        fanout = size;
-        config.async_blocks = 0;
-        HOTSTUFF_LOG_PROTO("Falling Back to Star");
-    }
+    // if (failures > fanout) {
+    //     config.fanout = size;
+    //     fanout = size;
+    //     config.async_blocks = 0;
+    //     HOTSTUFF_LOG_PROTO("Falling Back to Star");
+    // }
 
-    // i will represent the "parent id"
-    size_t i = 0;
-    while (i < size) {
-        HOTSTUFF_LOG_PROTO("Iteration w/ i: %lld", i);
+    // // i will represent the "parent id"
+    // size_t i = 0;
+    // while (i < size) {
+    //     HOTSTUFF_LOG_PROTO("Iteration w/ i: %lld", i);
 
-        if (done) {
-            HOTSTUFF_LOG_PROTO("Done!");
-            break;
-        }
+    //     if (done) {
+    //         HOTSTUFF_LOG_PROTO("Done!");
+    //         break;
+    //     }
 
-        // In case there are not enough processes to fill node's children (max_fanout < fanout)
-        const size_t remaining = size - i;
-        const size_t max_fanout = ceil(remaining / processesOnLevel);
-        auto curr_fanout = std::min(max_fanout, fanout);
+    //     // In case there are not enough processes to fill node's children (max_fanout < fanout)
+    //     const size_t remaining = size - i;
+    //     const size_t max_fanout = ceil(remaining / processesOnLevel);
+    //     auto curr_fanout = std::min(max_fanout, fanout);
 
-        //Get parent peerid for current i iteration
-        auto parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
-        salticidae::PeerId parent_peer{parent_cert_hash};
+    //     //Get parent peerid for current i iteration
+    //     auto parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
+    //     salticidae::PeerId parent_peer{parent_cert_hash};
 
-        // Start is an index for the tree given by the iteration and how many processes are on the layer
-        auto start = i + processesOnLevel;
+    //     // Start is an index for the tree given by the iteration and how many processes are on the layer
+    //     auto start = i + processesOnLevel;
 
-        HOTSTUFF_LOG_PROTO("START: %lld", start);
+    //     HOTSTUFF_LOG_PROTO("START: %lld", start);
 
-        for (auto counter = 1; counter <= processesOnLevel; counter++) {
+    //     for (auto counter = 1; counter <= processesOnLevel; counter++) {
 
-            HOTSTUFF_LOG_PROTO("Iteration 'counter': %lld for <= ProcessesOnLevel: %lld", counter, processesOnLevel);
+    //         HOTSTUFF_LOG_PROTO("Iteration 'counter': %lld for <= ProcessesOnLevel: %lld", counter, processesOnLevel);
 
-            if (done) {
-                break;
-            }
+    //         if (done) {
+    //             break;
+    //         }
 
-            for (size_t j = start; j < start + curr_fanout; j++) {
+    //         for (size_t j = start; j < start + curr_fanout; j++) {
                 
-                if (j >= size) {
-                    done = true;
-                    break;
-                }
+    //             if (j >= size) {
+    //                 done = true;
+    //                 break;
+    //             }
 
-                HOTSTUFF_LOG_PROTO("Iteration j: %lld for < (start + curr_fanout): %lld + %lld" , j, start, curr_fanout);
+    //             HOTSTUFF_LOG_PROTO("Iteration j: %lld for < (start + curr_fanout): %lld + %lld" , j, start, curr_fanout);
 
-                auto cert_hash = std::move(std::get<2>(global_replicas[j]));
-                salticidae::PeerId peer{cert_hash};
+    //             auto cert_hash = std::move(std::get<2>(global_replicas[j]));
+    //             salticidae::PeerId peer{cert_hash};
 
-                if (id == i + offset) {
-                    HOTSTUFF_LOG_PROTO("My ReplicaID %lld is equal to i (%lld) + offset (%lld) ", id, i, offset);
-                    HOTSTUFF_LOG_PROTO("Inserted replica with id = j = %lld into 'children' and my own 'childPeers", j);
-                    children.insert(j);
-                    childPeers.insert(peer);
-                } else if (id == j + offset) {
-                    HOTSTUFF_LOG_PROTO("My ReplicaID %lld is equal to j (%lld) + offset (%lld) ", id, j, offset);
-                    HOTSTUFF_LOG_PROTO("Previously mentioned parent_peer (id=%lld) set as my own parent!", i);
-                    parentPeer = parent_peer;
-                } else if (childPeers.find(parent_peer) != childPeers.end()) {
-                    HOTSTUFF_LOG_PROTO("Inserted replica with id = j = %lld into 'children'", j);
-                    children.insert(j);
-                }
-            }
+    //             if (id == i + offset) {
+    //                 HOTSTUFF_LOG_PROTO("My ReplicaID %lld is equal to i (%lld) + offset (%lld) ", id, i, offset);
+    //                 HOTSTUFF_LOG_PROTO("Inserted replica with id = j = %lld into 'children' and my own 'childPeers", j);
+    //                 children.insert(j);
+    //                 childPeers.insert(peer);
+    //             } else if (id == j + offset) {
+    //                 HOTSTUFF_LOG_PROTO("My ReplicaID %lld is equal to j (%lld) + offset (%lld) ", id, j, offset);
+    //                 HOTSTUFF_LOG_PROTO("Previously mentioned parent_peer (id=%lld) set as my own parent!", i);
+    //                 parentPeer = parent_peer;
+    //             } else if (childPeers.find(parent_peer) != childPeers.end()) {
+    //                 HOTSTUFF_LOG_PROTO("Inserted replica with id = j = %lld into 'children'", j);
+    //                 children.insert(j);
+    //             }
+    //         }
 
-            // Start moves ahead a set of children (fanout)
-            start += curr_fanout;
+    //         // Start moves ahead a set of children (fanout)
+    //         start += curr_fanout;
 
-            // Update parent id and parent peer
-            i++;
-            parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
-            salticidae::PeerId temp_parent_peer{parent_cert_hash};
-            parent_peer = temp_parent_peer;
+    //         // Update parent id and parent peer
+    //         i++;
+    //         parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
+    //         salticidae::PeerId temp_parent_peer{parent_cert_hash};
+    //         parent_peer = temp_parent_peer;
 
-            HOTSTUFF_LOG_PROTO("Incremented i to %lld and used it to obtain new parent peer.", i);
-        }
+    //         HOTSTUFF_LOG_PROTO("Incremented i to %lld and used it to obtain new parent peer.", i);
+    //     }
 
-        processesOnLevel = std::min(curr_fanout * processesOnLevel, remaining);
-        HOTSTUFF_LOG_PROTO("ProcessesOnLevel now: %lld", processesOnLevel);
-    }
+    //     processesOnLevel = std::min(curr_fanout * processesOnLevel, remaining);
+    //     HOTSTUFF_LOG_PROTO("ProcessesOnLevel now: %lld", processesOnLevel);
+    // }
     
-    HOTSTUFF_LOG_PROTO("total children: %d", children.size());
-    numberOfChildren = children.size();
+    // HOTSTUFF_LOG_PROTO("total children: %d", children.size());
+    // numberOfChildren = children.size();
 
-    LOG_PROTO("=========================== Finished Tree Calculation =================================\n");
+    // LOG_PROTO("=========================== Finished Tree Calculation =================================\n");
 }
 
 void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
@@ -1002,10 +1063,11 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
             HotStuffCore::add_replica(i, peer, std::move(std::get<1>(global_replicas[i])));
             // Add all replicas except myself to my peer array and peer network/stack
             if (addr != listen_addr) {
-                HOTSTUFF_LOG_PROTO("[STARTUP] Adding peer with id %llu and IP %s to network.", i, std::string(addr).c_str());
+                HOTSTUFF_LOG_PROTO("[STARTUP] Adding Peer with PeerId %s, ReplicaId %llu and IP %s to network.", peer.to_hex().c_str(), i, std::string(addr).c_str());
                 peers.push_back(peer);
                 pn.add_peer(peer);
                 pn.set_peer_addr(peer, addr);
+                peer_id_map.insert(std::make_pair(peer, i));
             }
         }
 
@@ -1020,12 +1082,12 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     /* Update the current tree */
     auto offset = get_pace_maker()->get_proposer();
-    auto current_tree_network = system_trees[offset];
+    current_tree_network = system_trees[offset];
     current_tree = current_tree_network.get_tree();
 
-    parentPeer = current_tree_network.get_parentPeer();
-    childPeers = current_tree_network.get_childPeers();
-    numberOfChildren = current_tree_network.get_numberOfChildren();
+    // parentPeer = current_tree_network.get_parentPeer();
+    // childPeers = current_tree_network.get_childPeers();
+    // numberOfChildren = current_tree_network.get_numberOfChildren();
 
     //HOTSTUFF_LOG_PROTO("The current system tree is given by: %s", std::string(current_tree).c_str());
     
@@ -1143,6 +1205,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
         std::pair<uint256_t, commit_cb_t> e;
         while (q.try_dequeue(e))
         {
+            /** TODO: Check Finality constructor's dynamics with get_tree_id()*/
             ReplicaID proposer = pmaker->get_proposer();
             if (proposer != get_id()) {
                 e.second(Finality(id, get_tree_id(), 0, 0, 0, e.first, uint256_t()));

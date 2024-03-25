@@ -243,7 +243,8 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
         bnew->self_qc = create_quorum_cert(bnew_hash);
     }
 
-    on_deliver_blk(bnew);
+    proposer_base_deliver(bnew);
+    //on_deliver_blk(bnew);
     LOG_PROTO("before update");
     update(bnew);
     Proposal prop(id, get_tree_id(), bnew, nullptr);
@@ -268,7 +269,7 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
 }
 
 void HotStuffCore::on_receive_proposal(const Proposal &prop) {
-    LOG_PROTO("got %s", std::string(prop).c_str());
+    LOG_PROTO("[CONSENSUS] Got PROPOSAL in tid=%d: %s", prop.tid, std::string(prop).c_str());
     block_t bnew = prop.blk;
     sanity_check_delivered(bnew);
     update(bnew);
@@ -309,10 +310,8 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
     }
 
     if (bnew->height != 0 && bnew->height % 30 == 0) {
-        if (is_proposer(id))
-            LOG_PROTO("IM PROPOSER AND IM FORCING RECONFIG AAAAAAAAAAAAAAAAAAAAA (on_receive_proposal)");
-        else
-            LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
+       
+        LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
         inc_time(true);
     }
     // else if (bnew->height > 30) {
@@ -323,7 +322,7 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
 }
 
 void HotStuffCore::on_receive_vote(const Vote &vote) {
-    LOG_PROTO("got %s", std::string(vote).c_str());
+    LOG_PROTO("[CONSENSUS] Got VOTE in tid=%d: %s", vote.tid, std::string(vote).c_str());
     LOG_PROTO("y now state: %s", std::string(*this).c_str());
 
     block_t blk = get_delivered_blk(vote.blk_hash);
@@ -368,8 +367,12 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
 
 /*** end HotStuff protocol logic ***/
 void HotStuffCore::on_init(uint32_t nfaulty) {
-
     config.nmajority = config.nreplicas - nfaulty;
+    //config.nmajority = nfaulty*2 + 1;
+    HOTSTUFF_LOG_PROTO("N_Replicas: %d", config.nreplicas);
+    HOTSTUFF_LOG_PROTO("Maximum Faults: %d", nfaulty);
+    HOTSTUFF_LOG_PROTO("Majority Necessary for Quorums: %d", config.nmajority);
+
     b0->qc = create_quorum_cert(b0->get_hash());
     //b0->qc->compute();
     b0->self_qc = b0->qc->clone();

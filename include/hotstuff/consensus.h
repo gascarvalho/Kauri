@@ -90,7 +90,7 @@ bool rdy = false;
 
 public:
     BoxObj<EntityStorage> storage;
-    uint16_t numberOfChildren;
+    //uint16_t numberOfChildren;
 
     HotStuffCore(ReplicaID id, privkey_bt &&priv_key);
     virtual ~HotStuffCore() {
@@ -188,6 +188,8 @@ protected:
     virtual void inc_time(bool force) { };
 
     virtual bool is_proposer(int id) { };
+
+    virtual void proposer_base_deliver(const block_t &blk) { };
 
     /**
      * Get the id of the current tree

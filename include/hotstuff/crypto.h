@@ -64,6 +64,7 @@ class QuorumCert: public Serializable, public Cloneable {
     virtual void add_part(const ReplicaConfig &config, ReplicaID replica, const PartCert &pc) = 0;
     virtual void merge_quorum(const QuorumCert &qc) = 0;
     virtual bool has_n(uint32_t n) = 0;
+    virtual size_t get_sigs_n() = 0;
     virtual void compute() = 0;
     virtual promise_t verify(const ReplicaConfig &config, VeriPool &vpool) = 0;
     virtual bool verify(const ReplicaConfig &config) = 0;
@@ -205,6 +206,10 @@ class QuorumCertDummy: public QuorumCert {
     bool has_n(const uint32_t n) override
     {
         return qty >= n;
+    }
+    size_t get_sigs_n() override 
+    {
+        return qty;
     }
     void compute() override {}
     bool verify(const ReplicaConfig &) override { return true; }
@@ -508,6 +513,9 @@ class QuorumCertSecp256k1: public QuorumCert {
     bool has_n(const uint32_t n) override {
         //std::cout << std::to_string(sigs.size()) << " " << std::to_string(n) << std::endl;
         return sigs.size() >= n;
+    }
+    size_t get_sigs_n() override {
+        return sigs.size();
     }
 
     void compute() override {}
@@ -1065,6 +1073,10 @@ class QuorumCertSecp256k1: public QuorumCert {
         bool has_n(const uint32_t t) override {
             //HOTSTUFF_LOG_PROTO("check %d of %d, sigs: %d", n, t, sigs.size());
             return n >= t;
+        }
+
+        size_t get_sigs_n() override {
+            return n;
         }
 
         void compute() override {

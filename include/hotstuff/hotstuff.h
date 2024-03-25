@@ -106,8 +106,12 @@ struct TreeNetwork {
         else
             info << "\tI have no right child\n";
 
+
         // Store remainder state
-        numberOfChildren = childPeers.size();
+
+        numberOfChildren = countChildren(my_idx, size);
+        info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
+
         myTreeId = my_idx;
 
     }
@@ -132,9 +136,37 @@ struct TreeNetwork {
         s << "\nTree Network {\n";
         s << std::string(info).c_str();
         s << "\tTree Array:" << tree.get_tree_array_string().c_str() << "\n";
-        s << "}\n";
+        s << "}";
 
         return s;
+    }
+
+    private:
+
+    int countChildren(int index, int treeSize) {
+        int childrenCount = 0;
+
+        // Calculate the index of the first child of the current node
+        int firstChildIndex = 2 * index + 1;
+
+        // Check if the first child index is within the bounds of the array
+        if (firstChildIndex < treeSize) {
+            childrenCount++; // Increment count for the first child
+            // Recursively count the number of children nodes below the first child
+            childrenCount += countChildren(firstChildIndex, treeSize);
+        }
+
+        // Calculate the index of the second child of the current node
+        int secondChildIndex = 2 * index + 2;
+
+        // Check if the second child index is within the bounds of the array
+        if (secondChildIndex < treeSize) {
+            childrenCount++; // Increment count for the second child
+            // Recursively count the number of children nodes below the second child
+            childrenCount += countChildren(secondChildIndex, treeSize);
+        }
+
+        return childrenCount;
     }
     
 };
@@ -254,6 +286,7 @@ class HotStuffBase: public HotStuffCore {
     salticidae::ThreadCall tcall;
     VeriPool vpool;
     std::vector<PeerId> peers;
+    std::unordered_map<PeerId, size_t> peer_id_map; /* PeerId to ReplicaId map*/
 
     private:
     /** whether libevent handle is owned by itself */
@@ -296,14 +329,15 @@ class HotStuffBase: public HotStuffCore {
 
     /* trees and peers */
 
-    mutable PeerId parentPeer;
-    mutable PeerId noParent;
-    mutable std::set<PeerId> childPeers;
+    // mutable PeerId parentPeer;
+    // mutable PeerId noParent;
+    // mutable std::set<PeerId> childPeers;
 
     vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> global_replicas;
 
     //std::unordered_map<size_t, Tree> system_trees;
     std::unordered_map<size_t, TreeNetwork> system_trees;
+    mutable TreeNetwork current_tree_network;
     mutable Tree current_tree;
 
     /* communication */
@@ -329,6 +363,7 @@ class HotStuffBase: public HotStuffCore {
     void do_vote(Proposal, const Vote &) override;
     void inc_time(bool force) override;
     bool is_proposer(int id) override;
+    void proposer_base_deliver(const block_t &blk) override;
     void do_decide(Finality &&) override;
     void do_consensus(const block_t &blk) override;
     uint32_t get_tree_id() override;
