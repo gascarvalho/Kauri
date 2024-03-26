@@ -1291,6 +1291,14 @@ void HotStuffBase::beat() {
                         stats.insert(std::make_pair(piped_block->hash, usec));
                     }*/
                     piped_submitted = false;
+
+                    if (piped_block->get_height() != 0 && piped_block->get_height() % 30 == 0) {
+                        LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (bnew height is %llu)", piped_block->get_height());
+                        inc_time(true);
+                    }
+                    else if (piped_block->get_height() > 30 ) {
+                        inc_time(false);
+                    }
                 }
             } else {
                 gettimeofday(&last_block_time, NULL);

@@ -224,14 +224,11 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
     }
 
     if (b_normal_height != 0 && b_normal_height % 30 == 0) {
-        if (is_proposer(id))
-            LOG_PROTO("IM PROPOSER AND IM FORCING RECONFIG AAAAAAAAAAAAAAAAAAAAA (on_propose)");
-        else
-            LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
+        LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
         inc_time(true);
     }
-    // else if (bnew->height > 30)
-    //     inc_time(false);
+    else if (b_normal_height > 30)
+        inc_time(false);
 
     return bnew;
 }
@@ -243,8 +240,8 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
         bnew->self_qc = create_quorum_cert(bnew_hash);
     }
 
-    proposer_base_deliver(bnew);
-    //on_deliver_blk(bnew);
+    //proposer_base_deliver(bnew);
+    on_deliver_blk(bnew);
     LOG_PROTO("before update");
     update(bnew);
     Proposal prop(id, get_tree_id(), bnew, nullptr);
@@ -314,9 +311,9 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
         LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
         inc_time(true);
     }
-    // else if (bnew->height > 30) {
-    //     inc_time(false);
-    // }
+    else if (bnew->height > 30) {
+        inc_time(false);
+    }
 
     //update(bnew);
 }
@@ -367,8 +364,8 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
 
 /*** end HotStuff protocol logic ***/
 void HotStuffCore::on_init(uint32_t nfaulty) {
-    config.nmajority = config.nreplicas - nfaulty;
-    //config.nmajority = nfaulty*2 + 1;
+    //config.nmajority = config.nreplicas - nfaulty;
+    config.nmajority = nfaulty*2 + 1;
     HOTSTUFF_LOG_PROTO("N_Replicas: %d", config.nreplicas);
     HOTSTUFF_LOG_PROTO("Maximum Faults: %d", nfaulty);
     HOTSTUFF_LOG_PROTO("Majority Necessary for Quorums: %d", config.nmajority);

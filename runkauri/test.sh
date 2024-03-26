@@ -17,6 +17,11 @@ mkdir -p $LOG_FOLDER # Create the log folder if it doesn't exist
 
 TIMESTAMP=$(date +%F_%T)
 
+# Function to log messages
+logger() {
+  echo "$(date +"%Y-%m-%d %T") - $1"
+}
+
 # Each LINE in the experiment file is one experimental setup
 for LINE in $FLINES
 do
@@ -34,10 +39,12 @@ do
 
   for i in {1..1}
   do
+
     # Deploy experiment
-    docker stack deploy -c kauri-temp.yaml kauriservice &
+    docker stack deploy --with-registry-auth -c kauri-temp.yaml kauriservice &
+     
     # Docker startup time 100s + 1*60s of experiment runtime
-    sleep 280
+    sleep 400
 
     replica_index=0
     # Collect and print results.
@@ -47,7 +54,9 @@ do
       if [ ! $(docker exec -it $container bash -c "cd MSc-Kauri && test -e log0") ]
       then
         LOG_FILE="${LOG_FOLDER}/log_${TIMESTAMP}_${replica_index}.txt"
+
         docker exec -it $container bash -c "cd MSc-Kauri && cat log*" > $LOG_FILE
+
       fi
     done
 

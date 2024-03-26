@@ -297,15 +297,19 @@ public:
     }
 
     void proposer_timeout(TimerEvent &) {
-        set_proposer();
+        set_proposer(true);
     }
 
-    void set_proposer() {
+    void set_proposer(bool isTimeout) {
         proposer = (proposer + 1) % hsc->get_config().nreplicas;
-        timeout *= 2;
-        if (timeout > (base_timeout * pow(2,4))) {
-            timeout = (base_timeout * pow(2,4));
+
+        if(isTimeout) {
+             timeout *= 2;
+            if (timeout > (base_timeout * pow(2,4))) {
+                timeout = (base_timeout * pow(2,4));
+            }
         }
+
         HOTSTUFF_LOG_PROTO("-------------------------------");
         HOTSTUFF_LOG_PROTO("[PMAKER] Timeout reached!!!");
 
@@ -333,9 +337,9 @@ public:
     }
 
     void inc_time(bool force) override {
-        if (force && !already_reconfigured) {
-            already_reconfigured = true;
-            set_proposer();
+        if (force) {
+            //already_reconfigured = true;
+            set_proposer(false);
         } else {
             HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
             timer.del();
@@ -352,7 +356,7 @@ public:
 
     void on_consensus(const block_t &blk) override {
         timer.del();
-        already_reconfigured = false;
+        //already_reconfigured = false;
     }
 };
 
