@@ -24,7 +24,7 @@ cd MSc-Kauri
 # Do a quick compile of the branch
 #git cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED=ON -DHOTSTUFF_PROTO_LOG=ON && make
 
-#sleep 30
+sleep 30
 
 id=0
 i=0
