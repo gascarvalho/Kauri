@@ -1038,6 +1038,7 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
         // STARTUP
         global_replicas = std::move(replicas);
         auto size = global_replicas.size();
+        lastCheckedHeight = 0;
 
         for (size_t i = 0; i < size; i++) {
             auto x = 0;
@@ -1084,6 +1085,9 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     auto offset = get_pace_maker()->get_proposer();
     current_tree_network = system_trees[offset];
     current_tree = current_tree_network.get_tree();
+
+    /* Set when the tree will change */
+    current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
     // parentPeer = current_tree_network.get_parentPeer();
     // childPeers = current_tree_network.get_childPeers();
@@ -1178,9 +1182,15 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     // std::cout << std::string(str) << std::endl;
     HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
+    HOTSTUFF_LOG_PROTO("Next forced reconfiguration will happen at %llu.", current_tree_network.get_target());
 
     LOG_PROTO("\n=========================== Finished Tree Calculation =================================\n");
-} 
+}
+
+bool HotStuffBase::isTreeSwitch(int bheight) {
+    lastCheckedHeight = bheight;
+    return bheight == current_tree_network.get_target();
+}
 
 void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop) {
 
@@ -1292,11 +1302,13 @@ void HotStuffBase::beat() {
                     }*/
                     piped_submitted = false;
 
-                    if (piped_block->get_height() != 0 && piped_block->get_height() % 30 == 0) {
-                        LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (bnew height is %llu)", piped_block->get_height());
+
+                    // TREE ROTATION FOR PROPOSER CASE 2
+                    if (isTreeSwitch(piped_block->get_height())) {
+                        LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (piped block height is now %llu)", piped_block->get_height());
                         inc_time(true);
                     }
-                    else if (piped_block->get_height() > 30 ) {
+                    else if (piped_block->get_height() > config.tree_switch_period ) {
                         inc_time(false);
                     }
                 }

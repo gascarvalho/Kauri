@@ -51,7 +51,8 @@ struct TreeNetwork {
     mutable PeerId parentPeer;   // My parent peer in the tree
     mutable std::set<PeerId> childPeers; // My children peers in the tree
     uint16_t numberOfChildren; // How many children I have
-    DataStream info;
+    DataStream info; // Debug info
+    size_t switchTarget; // The block height at which to switch this tree
 
     public:
     TreeNetwork() = default;
@@ -128,6 +129,10 @@ struct TreeNetwork {
     const std::set<PeerId> &get_childPeers() const { return childPeers; }
 
     const uint16_t &get_numberOfChildren() const { return numberOfChildren; }
+
+    const size_t &get_target() const { return switchTarget; }
+
+    const void set_target(const size_t target) { switchTarget = target; };
 
     operator std::string() {
 
@@ -339,6 +344,7 @@ class HotStuffBase: public HotStuffCore {
     std::unordered_map<size_t, TreeNetwork> system_trees;
     mutable TreeNetwork current_tree_network;
     mutable Tree current_tree;
+    size_t lastCheckedHeight;
 
     /* communication */
 
@@ -395,6 +401,7 @@ class HotStuffBase: public HotStuffCore {
     void treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
     void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
     void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
+    bool isTreeSwitch(int bheight);
     void beat();
 
     size_t size() const { return peers.size(); }
@@ -486,6 +493,10 @@ class HotStuff: public HotStuffBase {
 
     void set_piped_latency(int32_t piped_latency, int32_t async_blocks) {
         HotStuffBase::set_piped_latency(piped_latency, async_blocks);
+    }
+
+    void set_tree_period(size_t nblocks) {
+        HotStuffBase::set_tree_period(nblocks);
     }
 };
 

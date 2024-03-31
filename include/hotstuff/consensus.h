@@ -111,13 +111,17 @@ public:
      */
     virtual void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
     virtual void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
-    virtual void treeConfig() {}
+    virtual void treeConfig() { }
+    virtual bool isTreeSwitch(int bheight) { }
 
     /** Call to set the fanout. */
     void set_fanout(int32_t fanout);
 
     /** Call to set the piped latency */
     void set_piped_latency(int32_t piped_latency, int32_t async_blocks);
+
+    /** Call to set when the tree is switched (every x blocks) */
+    void set_tree_period(size_t nblocks);
 
     /**
      * A block is only delivered if itself is fetched, the block for the

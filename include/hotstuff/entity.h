@@ -67,6 +67,8 @@ class ReplicaConfig {
     int32_t piped_latency;
     int32_t async_blocks;
 
+    size_t tree_switch_period;
+
     ReplicaConfig(): nreplicas(0), nmajority(0) {}
 
     void add_replica(ReplicaID rid, const ReplicaInfo &info) {

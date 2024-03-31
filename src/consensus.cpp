@@ -223,11 +223,12 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
         stats.insert(std::make_pair(bnew->hash, usec));
     }
 
-    if (b_normal_height != 0 && b_normal_height % 30 == 0) {
-        LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
+    // TREE ROTATION FOR PROPOSER CASE 1
+    if (isTreeSwitch(b_normal_height)) {
+        LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (block height is now %llu)", bnew->height);
         inc_time(true);
     }
-    else if (b_normal_height > 30)
+    else if (b_normal_height > config.tree_switch_period)
         inc_time(false);
 
     return bnew;
@@ -306,12 +307,18 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
                      create_part_cert(*priv_key, bnew->get_hash()), this));
     }
 
-    if (bnew->height != 0 && bnew->height % 30 == 0) {
+    //UNCOMMENT TO TEST TIMEOUT
+    // if(id == 0 && bnew->height == 45) {
+    //     sleep(15);
+    // }
+
+    // TREE ROTATION FOR NON-PROPOSERS 
+    if (isTreeSwitch(bnew->height)) {
        
-        LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", bnew->height);
+        LOG_PROTO("Forcing a reconfiguration! (block height is now %llu)", bnew->height);
         inc_time(true);
     }
-    else if (bnew->height > 30) {
+    else if (bnew->height > config.tree_switch_period) {
         inc_time(false);
     }
 
@@ -497,6 +504,10 @@ void HotStuffCore::set_fanout(int32_t fanout) {
 void HotStuffCore::set_piped_latency(int32_t piped_latency, int32_t async_blocks) {
     config.piped_latency = piped_latency;
     config.async_blocks = async_blocks;
+}
+
+void HotStuffCore::set_tree_period(size_t nblocks) {
+    config.tree_switch_period = nblocks;
 }
 
 }
