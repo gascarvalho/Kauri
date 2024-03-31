@@ -82,31 +82,21 @@ struct TreeNetwork {
         else
             info << "\tI have no parent (am root)\n";
 
-        /** TODO: Un-hard-code all of this!! */
+        // Add every possible child, considering fanout
+        for(auto i = 1; i <= fanout; i++) {
+            auto child_idx = fanout * my_idx + i;
 
-        // Left Child (if any)
-        auto left_child_idx = 2 * my_idx + 1;
-        if (left_child_idx < size) {
-            auto left_cert_hash = std::move(std::get<2>(replicas[tree_array[left_child_idx]]));
-            salticidae::PeerId left_child{left_cert_hash};
-            childPeers.insert(left_child);
-            info << "\tMy left child: " << std::to_string(tree_array[left_child_idx]) << "\n";
+            //If within bounds of array, child exists
+            if (child_idx < size) {
+                auto child_cert_hash = std::move(std::get<2>(replicas[tree_array[child_idx]]));
+                salticidae::PeerId child_peer{child_cert_hash};
+                childPeers.insert(child_peer);
+                info << "\tI have child: " << std::to_string(tree_array[child_idx]) << "\n";
+            }
         }
-        else
-            info << "\tI have no left child\n";
-       
 
-        // Right Child (if any)
-        auto right_child_idx = 2 * my_idx + 2;
-        if (right_child_idx < size) {
-            auto right_cert_hash = std::move(std::get<2>(replicas[tree_array[right_child_idx]]));
-            salticidae::PeerId right_child{right_cert_hash};
-            childPeers.insert(right_child);
-            info << "\tMy right child: " << std::to_string(tree_array[right_child_idx]) << "\n";
-        }
-        else
-            info << "\tI have no right child\n";
-
+        if(childPeers.size() == 0)
+            info << "\tI have no children\n";
 
         // Store remainder state
 
@@ -150,25 +140,18 @@ struct TreeNetwork {
 
     int countChildren(int index, int treeSize) {
         int childrenCount = 0;
+        auto fanout = tree.get_fanout();
 
-        // Calculate the index of the first child of the current node
-        int firstChildIndex = 2 * index + 1;
+        for(auto i = 1; i <= fanout; i++) {
 
-        // Check if the first child index is within the bounds of the array
-        if (firstChildIndex < treeSize) {
-            childrenCount++; // Increment count for the first child
-            // Recursively count the number of children nodes below the first child
-            childrenCount += countChildren(firstChildIndex, treeSize);
-        }
+            auto child_idx = fanout * index + i;
 
-        // Calculate the index of the second child of the current node
-        int secondChildIndex = 2 * index + 2;
-
-        // Check if the second child index is within the bounds of the array
-        if (secondChildIndex < treeSize) {
-            childrenCount++; // Increment count for the second child
-            // Recursively count the number of children nodes below the second child
-            childrenCount += countChildren(secondChildIndex, treeSize);
+            //If within bounds of array, child exists
+            if (child_idx < treeSize) {
+                childrenCount++; // Increment count for the child
+                // Recursively count the number of children nodes below the child
+                childrenCount += countChildren(child_idx, treeSize);
+            }
         }
 
         return childrenCount;

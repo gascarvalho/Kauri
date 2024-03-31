@@ -1182,7 +1182,7 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     // std::cout << std::string(str) << std::endl;
     HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
-    HOTSTUFF_LOG_PROTO("Next forced reconfiguration will happen at %llu.", current_tree_network.get_target());
+    HOTSTUFF_LOG_PROTO("Next forced reconfiguration will happen at block %llu.", current_tree_network.get_target());
 
     LOG_PROTO("\n=========================== Finished Tree Calculation =================================\n");
 }
