@@ -222,9 +222,10 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     auto childPeers = msg_tree.get_childPeers();
     auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
-    if (prop.proposer != tree_proposer) {
+    /* Has to be the proposer of its tree AND additionally has to be the CURRENT proposer! */
+    if (prop.proposer != tree_proposer && is_proposer(prop.proposer)) {
         HOTSTUFF_LOG_PROTO("PROPOSAL RECEIVED FROM NON-PROPOSER REPLICA!");
-        HOTSTUFF_LOG_PROTO("Proposal from: %d but tree's proposer is: %d", prop.proposer, tree_proposer);
+        HOTSTUFF_LOG_PROTO("Proposal from: %d but current tree's proposer is: %llu", prop.proposer, current_tree.get_tree_root());
         return;
     }
 
