@@ -19,6 +19,8 @@
 
 #include <random>
 #include <future>
+#include <iostream>
+#include <fstream>
 #include "hotstuff/client.h"
 #include "hotstuff/liveness.h"
 
@@ -551,6 +553,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
 
                     std::cout << "go to town: " << std::endl;
 
+                    HOTSTUFF_LOG_PROTO("[TEST] vrh case 1");
+
                     update_hqc(blk, cert);
                     on_qc_finish(blk);
 
@@ -588,6 +592,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                     else {
                         std::cout << "go to town: " << std::endl;
 
+                        HOTSTUFF_LOG_PROTO("[TEST] vrh case 2");
+
                         update_hqc(blk, cert);
                         on_qc_finish(blk);
                     }
@@ -596,6 +602,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
             else
             {
                 std::cout << "go to town: " << std::endl;
+
+                HOTSTUFF_LOG_PROTO("[TEST] vrh case 3");
 
                 update_hqc(blk, cert);
                 on_qc_finish(blk);
@@ -846,34 +854,60 @@ uint32_t HotStuffBase::get_tree_id() {
 HotStuffBase::~HotStuffBase() {}
 
 void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas) {
-    // TODO: Make this dynamic and from a config file
 
-    size_t fanout = config.fanout;
-    size_t system_size = replicas.size();
+    /** Default algorithm will create 1 tree for each replica. 
+     * Each replica will be the proposer of its own tree.
+     * Trees are filled from left to right with the replica vector.
+     * Replica vector is a vector from smallest to largest id.
+     * Each subsequent tree will be shifted by 1 to the left.
+    */
+    if(config.treegen_algo == "default") {
+        size_t fanout = config.fanout;
+        size_t system_size = replicas.size();
 
-    /* A tree for each replica, where they are the proposer */
-    for (size_t tid = 0; tid < system_size; tid++) {
+        /* A tree for each replica, where they are the proposer */
+        for (size_t tid = 0; tid < system_size; tid++) {
 
-        std::vector<uint32_t> new_tree_array;
-        for (int i = 0; i < system_size; ++i) {
-            new_tree_array.push_back(((i + tid) % system_size));
+            std::vector<uint32_t> new_tree_array;
+            for (int i = 0; i < system_size; ++i) {
+                new_tree_array.push_back(((i + tid) % system_size));
+            }
+
+            system_trees[tid] = TreeNetwork(Tree(tid, fanout, new_tree_array), std::move(replicas), id);
         }
-
-        system_trees[tid] = TreeNetwork(Tree(tid, fanout, new_tree_array), std::move(replicas), id);
     }
 
-    // This version doesn't remove replicas from the tree
-    // Instead, simply switch to pre-mediated tree according to the oracle's "offset"
-    // The default tree is seen as a vector from [0, ..., N]
-    // An offset of x means x shift lefts in the looping vector
+    /** File algorithm will obtain the trees from a file.
+     * File trees are formatted as follows:
+     * TIDs are attributted in order from 0 to N
+    */
+    else if(config.treegen_algo == "file") {
+        std::ifstream file(config.treegen_fpath);
+        std::string line;
+        size_t tid = 0;
 
-    // system_trees[0] = {0, 1, 2, 3, 4, 5, 6};
-    // system_trees[1] = {1, 2, 3, 4, 5, 6, 0};
-    // system_trees[2] = {2, 3, 4, 5, 6, 0, 1};
-    // system_trees[3] = {3, 4, 5, 6, 0, 1, 2};
-    // system_trees[4] = {4, 5, 6, 0 ,1, 2, 3};
-    // system_trees[5] = {5, 6, 0, 1, 2, 3, 4};
-    // system_trees[6] = {6, 0, 1, 2, 3, 4, 5};
+        if (!file.is_open()) {
+            std::string str = "treeConfig: Provided treegen file path is invalid! Failed to open file " + config.treegen_fpath;
+            throw std::runtime_error(str);
+        }
+
+        while (std::getline(file, line)) {
+            std::istringstream iss(line);
+            std::vector<uint32_t> new_tree_array;
+            uint32_t replica_id;
+
+            while (iss >> replica_id) {
+                new_tree_array.push_back(replica_id);
+            }
+
+            system_trees[tid] = TreeNetwork(Tree(tid, config.fanout, new_tree_array), std::move(replicas), id);
+            tid++;
+        }
+    }
+
+    else {
+        throw std::runtime_error("treeConfig: Invalid tree generation algorithm!");
+    }
 
 }
 
@@ -1034,6 +1068,8 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     LOG_PROTO("\n=========================== Kauri Tree Calculation =================================\n");
     LOG_PROTO("[ReplicaID %lld] CALCULATING A NEW TREE %s", id, startup ? "(STARTUP)" : "");
 
+    auto offset = 0;
+
     if (startup) {
 
         // STARTUP
@@ -1076,110 +1112,14 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
         treeConfig(std::move(global_replicas));
     }
 
-    // Reset children peer list
-    // childPeers.clear();
-    // std::set<uint16_t> children;
-    // auto offset = 0;
-    // auto size = global_replicas.size();
-
     /* Update the current tree */
-    auto offset = get_pace_maker()->get_proposer();
+    
+    offset = get_pace_maker()->get_current_tid();
     current_tree_network = system_trees[offset];
     current_tree = current_tree_network.get_tree();
 
     /* Set when the tree will change */
     current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
-
-    // parentPeer = current_tree_network.get_parentPeer();
-    // childPeers = current_tree_network.get_childPeers();
-    // numberOfChildren = current_tree_network.get_numberOfChildren();
-
-    //HOTSTUFF_LOG_PROTO("The current system tree is given by: %s", std::string(current_tree).c_str());
-    
-    // auto new_tree = current_tree.get_tree_array();
-
-    // // Find my index in the new tree
-    // auto it = std::find(new_tree.begin(), new_tree.end(), myGlobalId);
-    // auto my_new_idx = std::distance(new_tree.begin(), it);
-
-    // // New Parent
-    // if (my_new_idx == 0) {
-    //     parentPeer = noParent; // Indicates no parent (may be wrong)
-    //     HOTSTUFF_LOG_PROTO("I have no parent (am proposer)");
-    //     // auto my_cert_hash = std::move(std::get<2>(global_replicas[myGlobalId]));
-    //     // salticidae::PeerId me{my_cert_hash};
-    //     // parentPeer = me;
-    // }
-    // else {
-    //     auto parent_idx = std::floor((my_new_idx - 1) / 2);
-    //     auto parent_cert_hash = std::move(std::get<2>(global_replicas[new_tree[parent_idx]]));
-    //     salticidae::PeerId parent_peer{parent_cert_hash};
-    //     //std::cout << "Parent peer: " << parent_peer.to_hex() << std::endl;
-    //     parentPeer = parent_peer;
-    //     HOTSTUFF_LOG_PROTO("My parent's id: %lld", new_tree[parent_idx]);
-    // }
-
-    // // Left Child
-    // auto left_child_idx = 2 * my_new_idx + 1;
-    // if (left_child_idx < size) {
-    //     children.insert(new_tree[left_child_idx]);
-    //     auto left_cert_hash = std::move(std::get<2>(global_replicas[new_tree[left_child_idx]]));
-    //     salticidae::PeerId left_child{left_cert_hash};
-    //     childPeers.insert(left_child);
-    //     HOTSTUFF_LOG_PROTO("My left child's id: %lld", new_tree[left_child_idx]);
-    // }
-    // else
-    //     HOTSTUFF_LOG_PROTO("I have no left child.");
-
-    // // Right Child
-    // auto right_child_idx = 2 * my_new_idx + 2;
-    // if (right_child_idx < size) {
-    //     children.insert(new_tree[right_child_idx]);
-    //     auto right_cert_hash = std::move(std::get<2>(global_replicas[new_tree[right_child_idx]]));
-    //     salticidae::PeerId right_child{right_cert_hash};
-    //     childPeers.insert(right_child);
-    //     HOTSTUFF_LOG_PROTO("My right child's id: %lld", new_tree[right_child_idx]);
-    // }
-    // else
-    //     HOTSTUFF_LOG_PROTO("I have no right child.");
-
-    // if (childPeers.find(parentPeer) != childPeers.end()) {
-    //     HOTSTUFF_LOG_PROTO("AAAAAAAAAAAAAAAAAAA");
-    //     children.insert(1);
-    // }
-
-    // // My parent
-    // auto parent_id = (myGlobalId - offset) % size;
-    // if (parent_id < 0) { parent_id += size; }
-
-    // auto parent_cert_hash = std::move(std::get<2>(global_replicas[myGlobalId]));
-    // salticidae::PeerId parent_peer{parent_cert_hash};
-    // parentPeer = parent_peer;
-
-    // // My left child
-    // auto left_child_id =  (2 * (myGlobalId - offset) + 1) % size;
-    // if (left_child_id < 0) { left_child_id += size; }
-
-    // auto left_cert_hash = std::move(std::get<2>(global_replicas[left_child_id]));
-    // salticidae::PeerId left_child{left_cert_hash};
-    // childPeers.insert(left_child);
-
-    // // My right child
-    // auto right_child_id = (2 * (myGlobalId - offset) + 2) % size;
-    // if (right_child_id < 0) { right_child_id += size; }
-
-    // auto right_cert_hash = std::move(std::get<2>(global_replicas[right_child_id]));
-    // salticidae::PeerId right_child{right_cert_hash};
-    // childPeers.insert(right_child);
-
-    // numberOfChildren = children.size();
-
-    // DataStream str;
-    // str << "Calculated Tree: { ";
-    // for (int i = 0; i < size; ++i) {
-    //     str << std::to_string((i + offset) % size) << ", ";
-    // }
-    // str << "}";
 
     // std::cout << std::string(str) << std::endl;
     HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
@@ -1208,6 +1148,11 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
         LOG_WARN("too few replicas in the system to tolerate any failure");
     on_init(nfaulty);
     pmaker->init(this);
+
+    // TODO: Due to how the system is deployed, use this to correctly setup the PM's first proposer
+    get_pace_maker()->update_tree_proposer();
+    get_pace_maker()->setup();
+
     if (ec_loop)
         ec.dispatch();
 
@@ -1252,6 +1197,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
 
 void HotStuffBase::beat() {
     pmaker->beat().then([this](ReplicaID proposer) {
+        HOTSTUFF_LOG_PROTO("[TEST] Entered beat");
         if (piped_queue.size() > get_config().async_blocks + 1) {
             return;
         }
@@ -1267,6 +1213,7 @@ void HotStuffBase::beat() {
             block_t current = pmaker->get_current_proposal();
 
             if (piped_queue.size() < get_config().async_blocks && current != get_genesis()) {
+                HOTSTUFF_LOG_PROTO("[PIPELINING] Current piped queue: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);
 
                 if (piped_queue.empty() && ((current_time.tv_sec - last_block_time.tv_sec) * 1000000 + current_time.tv_usec -last_block_time.tv_usec) / 1000 < config.piped_latency) {
                     HOTSTUFF_LOG_PROTO("omitting propose");
@@ -1318,6 +1265,7 @@ void HotStuffBase::beat() {
                 on_propose(final_buffer, std::move(parents));
             }
         }
+        HOTSTUFF_LOG_PROTO("[TEST] Leaving beat");
     });
 }
 }

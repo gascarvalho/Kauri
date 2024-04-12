@@ -113,6 +113,9 @@ public:
     virtual void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
     virtual void treeConfig() { }
     virtual bool isTreeSwitch(int bheight) { }
+    virtual size_t get_total_system_trees() { }
+    virtual ReplicaID get_system_tree_root(int tid) { }
+    virtual ReplicaID get_current_system_tree_root() { }
 
     /** Call to set the fanout. */
     void set_fanout(int32_t fanout);
@@ -122,6 +125,9 @@ public:
 
     /** Call to set when the tree is switched (every x blocks) */
     void set_tree_period(size_t nblocks);
+
+    /** Call to set how the trees will be generated */
+    void set_tree_generation(std::string genAlgo, std::string fpath);
 
     /**
      * A block is only delivered if itself is fetched, the block for the

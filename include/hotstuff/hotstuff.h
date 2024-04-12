@@ -71,6 +71,8 @@ struct TreeNetwork {
         auto it = std::find(tree_array.begin(), tree_array.end(), myReplicaId);
         auto my_idx = std::distance(tree_array.begin(), it);
 
+        info << "\tTID: " << std::to_string(t.get_tid()) << "\n";
+
         // Parent Peer (if any)
         if (my_idx != 0) {
             auto parent_idx = std::floor((my_idx - 1) / fanout);
@@ -102,6 +104,7 @@ struct TreeNetwork {
 
         numberOfChildren = countChildren(my_idx, size);
         info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
+        
 
         myTreeId = my_idx;
 
@@ -391,6 +394,10 @@ class HotStuffBase: public HotStuffCore {
     const auto &get_decision_waiting() const { return decision_waiting; }
     ThreadCall &get_tcall() { return tcall; }
     PaceMaker *get_pace_maker() { return pmaker.get(); }
+    size_t get_total_system_trees() { return system_trees.size(); }
+    ReplicaID get_system_tree_root(int tid) { return system_trees[tid].get_tree().get_tree_root(); }
+    ReplicaID get_current_system_tree_root() { return current_tree.get_tree_root(); }
+    TreeNetwork get_current_tree_network() { return current_tree_network; }
     void print_stat() const;
     virtual void do_elected() {}
 //#ifdef HOTSTUFF_AUTOCLI
@@ -480,6 +487,10 @@ class HotStuff: public HotStuffBase {
 
     void set_tree_period(size_t nblocks) {
         HotStuffBase::set_tree_period(nblocks);
+    }
+
+    void set_tree_generation(std::string genAlgo, std::string fpath) {
+        HotStuffBase::set_tree_generation(genAlgo, fpath);
     }
 };
 

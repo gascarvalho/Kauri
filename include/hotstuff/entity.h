@@ -68,6 +68,8 @@ class ReplicaConfig {
     int32_t async_blocks;
 
     size_t tree_switch_period;
+    std::string treegen_algo;
+    std::string treegen_fpath;
 
     ReplicaConfig(): nreplicas(0), nmajority(0) {}
 

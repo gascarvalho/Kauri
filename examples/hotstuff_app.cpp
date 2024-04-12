@@ -132,6 +132,7 @@ class HotStuffApp: public HotStuff {
     void set_fanout(int32_t fanout);
     void set_piped_latency(int32_t piped_latency, int32_t async_blocks);
     void set_tree_period(size_t nblocks);
+    void set_tree_generation(std::string genAlgo, std::string fpath);
     void stop();
 };
 
@@ -163,7 +164,7 @@ int main(int argc, char **argv) {
     auto opt_pace_maker = Config::OptValStr::create("dummy");
     auto opt_fixed_proposer = Config::OptValInt::create(1);
     auto opt_base_timeout = Config::OptValDouble::create(10);
-    auto opt_prop_delay = Config::OptValDouble::create(5);
+    auto opt_prop_delay = Config::OptValDouble::create(2);
     auto opt_imp_timeout = Config::OptValDouble::create(15);
     auto opt_nworker = Config::OptValInt::create(1);
     auto opt_repnworker = Config::OptValInt::create(2);
@@ -179,6 +180,8 @@ int main(int argc, char **argv) {
     auto opt_async_blocks = Config::OptValInt::create(0); // 0 by default
 
     auto opt_tree_switch_period = Config::OptValDouble::create(30);
+    auto opt_tree_generation = Config::OptValStr::create("file");
+    auto opt_tree_generation_fpath = Config::OptValStr::create("treegen.conf");
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
     config.add_opt("parent-limit", opt_parent_limit, Config::SET_VAL);
@@ -208,6 +211,8 @@ int main(int argc, char **argv) {
     config.add_opt("async_blocks", opt_async_blocks, Config::SET_VAL, 'A', "Async blocks to pipeline");
 
     config.add_opt("tree-switch-period", opt_tree_switch_period, Config::SET_VAL, 'T', "Period (in blocks) for switching the system's tree");
+    config.add_opt("tree-generation", opt_tree_generation, Config::SET_VAL, 'G', "Tree generation algorithm (default, file)");
+    config.add_opt("tree-generation-fpath", opt_tree_generation_fpath, Config::SET_VAL, 'g', "File path for the tree generation when file is selected");
 
     EventContext ec;
     config.parse(argc, argv);
@@ -247,7 +252,7 @@ int main(int argc, char **argv) {
     hotstuff::pacemaker_bt pmaker;
     if (opt_pace_maker->get() == "dummy") {
         HOTSTUFF_LOG_PROTO("Starting Pacemaker as a dummy!");
-        pmaker = new hotstuff::PaceMakerDummyFixedTwo(ec, parent_limit, opt_base_timeout->get(), opt_prop_delay->get());
+        pmaker = new hotstuff::PaceMakerRotating(ec, parent_limit, opt_base_timeout->get(), opt_prop_delay->get());
     }
     else {
         HOTSTUFF_LOG_PROTO("Starting Pacemaker as a Roundrobin!");
@@ -299,6 +304,7 @@ int main(int argc, char **argv) {
 
     papp->set_fanout(opt_fanout->get());
     papp->set_piped_latency(opt_piped_latency->get(), opt_async_blocks->get());
+    papp->set_tree_generation(opt_tree_generation->get(), opt_tree_generation_fpath->get());
     papp->set_tree_period(opt_tree_switch_period->get());
 
     auto shutdown = [&](int) { papp->stop(); };
@@ -443,3 +449,8 @@ void HotStuffApp::set_piped_latency(int32_t piped_latency, int32_t async_blocks)
 void HotStuffApp::set_tree_period(size_t nblocks) {
     HotStuff::set_tree_period(nblocks);
 }
+
+void HotStuffApp::set_tree_generation(std::string genAlgo, std::string fpath) {
+    HotStuff::set_tree_generation(genAlgo, fpath);
+}
+

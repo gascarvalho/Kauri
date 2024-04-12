@@ -416,6 +416,27 @@ void HotStuffCore::add_replica(ReplicaID rid, const PeerId &peer_id,
 
 promise_t HotStuffCore::async_qc_finish(const block_t &blk) {
     //std::cout << "test " << blk->voted.size() << " " << blk->self_qc->has_n(config.nmajority) << std::endl;
+    HOTSTUFF_LOG_PROTO("[TEST] Entered async_qc_finish with voted size %d", blk->voted.size());
+
+    if(blk->self_qc != nullptr)
+        HOTSTUFF_LOG_PROTO("blk->self_qc NOT null");
+    else
+        HOTSTUFF_LOG_PROTO("blk->self_qc null");
+
+    if(blk->self_qc->has_n(config.nmajority))
+        HOTSTUFF_LOG_PROTO("blk->self_qc HAS nmajority");
+    else
+        HOTSTUFF_LOG_PROTO("blk->self_qc DOES NOT HAVE nmajority");
+
+    if(blk->voted.empty())
+        HOTSTUFF_LOG_PROTO("blk->voted IS empty");
+    else
+        HOTSTUFF_LOG_PROTO("blk->voted IS NOT empty");
+
+    if(blk->voted.size() >= config.nmajority)
+        HOTSTUFF_LOG_PROTO("blk->voted size >= nmajority");
+    else
+        HOTSTUFF_LOG_PROTO("blk->voted size < nmajority");
 
     if ((blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority) && !blk->voted.empty()) || blk->voted.size() >= config.nmajority) {
         HOTSTUFF_LOG_PROTO("async_qc_finish %s", blk->get_hash().to_hex().c_str());
@@ -427,13 +448,16 @@ promise_t HotStuffCore::async_qc_finish(const block_t &blk) {
 
     auto it = qc_waiting.find(blk);
     if (it == qc_waiting.end()) {
+        HOTSTUFF_LOG_PROTO("[TEST] inserting into qc_waiting blk %s", blk->get_hash().to_hex().c_str());
         it = qc_waiting.insert(std::make_pair(blk, promise_t())).first;
     }
 
+    HOTSTUFF_LOG_PROTO("[TEST] Leaving async_qc_finish");
     return it->second;
 }
 
 void HotStuffCore::on_qc_finish(const block_t &blk) {
+    HOTSTUFF_LOG_PROTO("[TEST] Entered on_qc_finish");
     auto it = qc_waiting.find(blk);
     if (it != qc_waiting.end())
     {
@@ -508,6 +532,11 @@ void HotStuffCore::set_piped_latency(int32_t piped_latency, int32_t async_blocks
 
 void HotStuffCore::set_tree_period(size_t nblocks) {
     config.tree_switch_period = nblocks;
+}
+
+void HotStuffCore::set_tree_generation(std::string genAlgo, std::string fpath) {
+    config.treegen_algo = genAlgo;
+    config.treegen_fpath = fpath;
 }
 
 }
