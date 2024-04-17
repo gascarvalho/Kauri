@@ -141,6 +141,9 @@ struct TreeNetwork {
 
     private:
 
+    /**
+     * Recursively counts the number of children nodes below a given index, returning the sub-tree total of child nodes
+    */
     int countChildren(int index, int treeSize) {
         int childrenCount = 0;
         auto fanout = tree.get_fanout();
@@ -151,7 +154,9 @@ struct TreeNetwork {
 
             //If within bounds of array, child exists
             if (child_idx < treeSize) {
+
                 childrenCount++; // Increment count for the child
+                
                 // Recursively count the number of children nodes below the child
                 childrenCount += countChildren(child_idx, treeSize);
             }
@@ -295,6 +300,7 @@ class HotStuffBase: public HotStuffCore {
     std::unordered_map<const uint256_t, BlockFetchContext> blk_fetch_waiting;
     std::unordered_map<const uint256_t, BlockDeliveryContext> blk_delivery_waiting;
     std::unordered_map<const uint256_t, commit_cb_t> decision_waiting;
+    std::unordered_map<const uint256_t, uint32_t> decision_made;
     using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
     cmd_queue_t cmd_pending;
     std::vector<uint256_t> cmd_pending_buffer;
@@ -384,11 +390,11 @@ class HotStuffBase: public HotStuffCore {
     void exec_command(uint256_t cmd_hash, commit_cb_t callback);
     void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                 bool ec_loop = false);
-    void treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
-    void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
-    void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
+    void tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
+    void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
     bool isTreeSwitch(int bheight);
     void beat();
+    block_t repropose_beat(const std::vector<uint256_t> &cmds);
 
     size_t size() const { return peers.size(); }
     const auto &get_decision_waiting() const { return decision_waiting; }

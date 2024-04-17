@@ -66,6 +66,7 @@ using pacemaker_bt = BoxObj<PaceMaker>;
 /** Parent selection implementation for PaceMaker: select the highest tail that
  * follows the current hqc block. */
 class PMHighTail: public virtual PaceMaker {
+    public:
     block_t hqc_tail;
     const int32_t parent_limit;         /**< maximum number of parents */
 
@@ -176,6 +177,7 @@ class PMWaitQC: public virtual PaceMaker {
                 if (hsc->piped_queue.size() < hsc->get_config().async_blocks
                 && !hsc->piped_submitted
                 && ((current_time.tv_sec - hsc->last_block_time.tv_sec) * 1000000 + current_time.tv_usec - hsc->last_block_time.tv_usec) / 1000 > hsc->get_config().piped_latency) {
+                    HOTSTUFF_LOG_PROTO("schedule_next: popping beat as piped block");
                     HOTSTUFF_LOG_PROTO("Extra block");
                     auto pm = pending_beats.front();
                     pending_beats.pop();
@@ -188,6 +190,7 @@ class PMWaitQC: public virtual PaceMaker {
                     block_t piped_block = hsc->storage->find_blk(hsc->piped_queue.back());
                     if ( piped_block->get_height() > hsc->get_config().async_blocks + 10 && hsc->b_normal_height < piped_block->get_height() - (hsc->get_config().async_blocks + 10)
                             && ((current_time.tv_sec - hsc->last_block_time.tv_sec) * 1000000 + current_time.tv_usec - hsc->last_block_time.tv_usec) / 1000 > hsc->get_config().piped_latency) {
+                        HOTSTUFF_LOG_PROTO("schedule_next: popping beat as piped recovery block");
                         HOTSTUFF_LOG_PROTO("Extra recovery block %d %d", hsc->b_normal_height, piped_block->get_height());
 
                         auto pm = pending_beats.front();
@@ -197,7 +200,7 @@ class PMWaitQC: public virtual PaceMaker {
                     }
                 }
             } else {
-                HOTSTUFF_LOG_PROTO("schedule_next: popping beat to async_qc_finish");
+                HOTSTUFF_LOG_PROTO("schedule_next: popping beat as normal block");
                 auto pm = pending_beats.front();
                 pending_beats.pop();
                 hsc->async_qc_finish(last_proposed)
@@ -288,10 +291,11 @@ class PaceMakerDummyFixed: public PaceMakerDummy {
     }
 };
 
-/** PaceMakerDummy with a fixed proposer. */
-class PaceMakerDummyFixedTwo: public PaceMakerDummy {
+/** PaceMaker that switches alongside the scheduled trees. */
+class PaceMakerMultitree: public PaceMakerDummy {
     /** timer event.*/
     TimerEvent timer;
+    TimerEvent timeout_timer;
     double base_timeout;
     double prop_delay;
     double timeout;
@@ -304,9 +308,11 @@ class PaceMakerDummyFixedTwo: public PaceMakerDummy {
     ReplicaID proposer;
     size_t current_tid;
 
+    promise_t pm_qc_manual;
+
 
 public:
-    PaceMakerDummyFixedTwo(EventContext ec, int32_t parent_limit,
+    PaceMakerMultitree(EventContext ec, int32_t parent_limit,
                          double base_timeout, double prop_delay):
             PaceMakerDummy(parent_limit),
             base_timeout(10),
@@ -331,9 +337,16 @@ public:
 
     void set_proposer(bool isTimeout) {
 
+        HOTSTUFF_LOG_PROTO("-------------------------------");
+        HOTSTUFF_LOG_PROTO("[PMAKER] %s reached!!!", isTimeout ? "Reconfiguration" : "Timeout");
+
+        HOTSTUFF_LOG_PROTO("Previous: proposer=%d and tid=%d", proposer, current_tid);
+
         /** Rotation happens according to the total trees in the system */
         current_tid = (current_tid + 1) % hsc->get_total_system_trees();
         update_tree_proposer();
+
+        HOTSTUFF_LOG_PROTO("NOW: proposer=%d and tid=%d", proposer, current_tid);
 
         if(isTimeout) {
              timeout *= 2;
@@ -342,19 +355,17 @@ public:
             }
         }
 
-        HOTSTUFF_LOG_PROTO("-------------------------------");
-        HOTSTUFF_LOG_PROTO("[PMAKER] Timeout reached!!!");
-
         vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
-        hsc->calcTreeForced(std::move(reps), false);
+        hsc->tree_scheduler(std::move(reps), false);
 
         if (get_proposer() == hsc->get_id()) {
-            HOTSTUFF_LOG_PROTO("Elected itself as a new Leader!");
+            HOTSTUFF_LOG_PROTO("Elected itself as a new leader!");
             delaying_proposal = true;
-            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::unlock, this, _1));
+            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::unlock, this, _1));
             timer.add(prop_delay);
         } else {
-            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::proposer_timeout, this, _1));
+            HOTSTUFF_LOG_PROTO("Not the leader!");
+            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
             timer.add(timeout);
         }
 
@@ -364,6 +375,7 @@ public:
 
     void unlock(TimerEvent &) {
         timer.del();
+        do_new_consensus(0, std::vector<uint256_t>{});
         delaying_proposal = false;
         HOTSTUFF_LOG_PROTO("Unlocking Proposer!!!");
     }
@@ -373,10 +385,12 @@ public:
             //already_reconfigured = true;
             set_proposer(false);
         } else {
-            HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
-            timer.del();
-            timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerDummyFixedTwo::proposer_timeout, this, _1));
-            timer.add(timeout);
+            if(!delaying_proposal) {
+                HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
+                timer.del();
+                timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
+                timer.add(timeout);
+            }
         }
     }
 
@@ -387,7 +401,7 @@ public:
     }
 
     void on_consensus(const block_t &blk) override {
-        timer.del();
+        //timer.del();
         //already_reconfigured = false;
     }
 
@@ -398,6 +412,22 @@ public:
     void update_tree_proposer() override {
         proposer = hsc->get_system_tree_root(current_tid);
         HOTSTUFF_LOG_PROTO("[PMAKER] Updated tree proposer to %d", proposer);
+    }
+
+    void do_new_consensus(int x, const std::vector<uint256_t> &cmds) {
+        auto blk = hsc->on_propose(cmds, get_parents(), bytearray_t());
+        pm_qc_manual.reject();
+        (pm_qc_manual = hsc->async_qc_finish(blk))
+            .then([this, x]() {
+                HOTSTUFF_LOG_PROTO("Pacemaker: got QC for block %d", x);
+#ifdef HOTSTUFF_TWO_STEP
+                if (x >= 2) return;
+#else
+
+                if (x >= 3) return;
+#endif
+                do_new_consensus(x + 1, std::vector<uint256_t>{});
+            });
     }
 };
 
@@ -599,325 +629,6 @@ struct PaceMakerRR: public PMHighTail, public PMRoundRobinProposer {
         PMRoundRobinProposer::init();
     }
 };
-
-/** PaceMakerDummy that rotates every X blocks. */
-class PaceMakerRotating: public PaceMakerDummy {
-    /** timer event.*/
-    TimerEvent timer;
-    double base_timeout;
-    double exp_timeout;
-    double prop_delay;
-    double timeout;
-
-    bool delaying_proposal = false;
-
-    EventContext ec;
-
-    ReplicaID proposer;
-    size_t current_tid;
-
-    std::unordered_map<ReplicaID, block_t> prop_blk;
-    bool rotating;
-
-    /* extra state needed for a proposer */
-    std::queue<promise_t> pending_beats;
-    block_t last_proposed;
-    bool locked;
-    promise_t pm_qc_finish;
-    promise_t pm_wait_propose;
-    promise_t pm_qc_manual;
-    promise_t pm_qc_piped;
-
-public:
-    PaceMakerRotating(EventContext ec, int32_t parent_limit,
-                         double base_timeout, double prop_delay):
-            PaceMakerDummy(parent_limit),
-            rotating(false),
-            locked(false),
-            base_timeout(10),
-            timeout(10),
-            exp_timeout(base_timeout),
-            prop_delay(3),
-            ec(std::move(ec)), proposer(0),
-            current_tid(0) {}
-
-    size_t get_pending_size() override { return pending_beats.size(); }
-
-    /**
-     * "Stop" state at initial proposer
-    */
-    void setup() {
-        exp_timeout = base_timeout;
-        stop_rotate();
-    }
-
-    void stop_rotate() {
-        timer.del();
-
-        HOTSTUFF_LOG_PROTO("Pacemaker: stop rotation at %d", proposer);
-        pm_qc_finish.reject();
-        pm_wait_propose.reject();
-        pm_qc_manual.reject();
-        pm_qc_piped.reject();
-        rotating = false;
-        locked = false;
-        last_proposed = hsc->get_genesis();
-        proposer_update_last_proposed();
-        if (proposer == hsc->get_id())
-        {
-            auto hs = static_cast<hotstuff::HotStuffBase *>(hsc);
-            hs->do_elected();
-            hs->get_tcall().async_call([this, hs](salticidae::ThreadCall::Handle &) {
-                auto &pending = hs->get_decision_waiting();
-                if (!pending.size()) return;
-                HOTSTUFF_LOG_PROTO("reproposing pending commands");
-                std::vector<uint256_t> cmds;
-                for (auto &p: pending)
-                    cmds.push_back(p.first);
-                do_new_consensus(0, cmds);
-            });
-        }
-    }
-
-    void do_new_consensus(int x, const std::vector<uint256_t> &cmds) {
-        auto blk = hsc->on_propose(cmds, get_parents(), bytearray_t());
-        pm_qc_manual.reject();
-        (pm_qc_manual = hsc->async_qc_finish(blk))
-            .then([this, x]() {
-                HOTSTUFF_LOG_PROTO("Pacemaker: got QC for block %d", x);
-#ifdef HOTSTUFF_TWO_STEP
-                if (x >= 2 + hsc->get_config().async_blocks) return;
-#else
-
-                if (x >= 3 + hsc->get_config().async_blocks) return;
-#endif
-                do_new_consensus(x + 1, std::vector<uint256_t>{});
-            });
-    }
-
-    void proposer_update_last_proposed() {
-        pm_wait_propose.reject();
-        (pm_wait_propose = hsc->async_wait_proposal()).then(
-                [this](const Proposal &prop) {
-            last_proposed = prop.blk;
-            locked = false;
-            proposer_schedule_next();
-            proposer_update_last_proposed();
-        });
-    }
-
-    void proposer_schedule_next() {
-        if (!delaying_proposal) {
-            if (!pending_beats.empty())
-            {
-
-                if (locked) {
-                    struct timeval current_time;
-                    gettimeofday(&current_time, NULL);
-
-                    if (hsc->piped_queue.size() < hsc->get_config().async_blocks
-                    && !hsc->piped_submitted
-                    && ((current_time.tv_sec - hsc->last_block_time.tv_sec) * 1000000 + current_time.tv_usec - hsc->last_block_time.tv_usec) / 1000 > hsc->get_config().piped_latency) {
-                        HOTSTUFF_LOG_PROTO("Extra block");
-                        auto pm = pending_beats.front();
-                        pending_beats.pop();
-                        pm_qc_piped.reject();
-                        hsc->piped_submitted = true;
-
-                        (pm_qc_piped = hsc->async_qc_finish(last_proposed))
-                            .then([this, pm]() {
-                                pm.resolve(proposer);
-                            });
-
-                        return;
-                    }
-
-                    if (!hsc->piped_queue.empty() && hsc->b_normal_height > 0) {
-                        block_t piped_block = hsc->storage->find_blk(hsc->piped_queue.back());
-                        if ( piped_block->get_height() > hsc->get_config().async_blocks + 10 && hsc->b_normal_height < piped_block->get_height() - (hsc->get_config().async_blocks + 10)
-                                && ((current_time.tv_sec - hsc->last_block_time.tv_sec) * 1000000 + current_time.tv_usec - hsc->last_block_time.tv_usec) / 1000 > hsc->get_config().piped_latency) {
-                            HOTSTUFF_LOG_PROTO("Extra recovery block %d %d", hsc->b_normal_height, piped_block->get_height());
-
-                            auto pm = pending_beats.front();
-                            pending_beats.pop();
-                            pm_qc_piped.reject();
-                            hsc->piped_submitted = true;
-
-                            (pm_qc_piped = hsc->async_qc_finish(last_proposed))
-                                .then([this, pm]() {
-                                    pm.resolve(proposer);
-                                });
-                        }
-                    }
-                }
-
-                else {
-                    auto pm = pending_beats.front();
-                    pending_beats.pop();
-                    pm_qc_finish.reject();
-                    pm_qc_piped.reject();
-                    (pm_qc_finish = hsc->async_qc_finish(last_proposed))
-                        .then([this, pm]() {
-                            HOTSTUFF_LOG_PROTO("got QC, propose a new block");
-                            pm.resolve(proposer);
-                        });
-                    locked = true;
-                }
-            }
-            else
-            {
-                std::cout << "not enough client tx" << std::endl;
-            }
-        }
-    }
-
-
-    /**
-     * Rotate = reconfiguration call
-     * Needs to maintain proper state
-    */
-    void rotate() {
-        reg_proposal();
-        reg_receive_proposal();
-        prop_blk.clear();
-        rotating = true;
-
-        /** Rotation happens according to the total trees in the system */
-        current_tid = (current_tid + 1) % hsc->get_total_system_trees();
-        update_tree_proposer();
-
-        HOTSTUFF_LOG_PROTO("-------------------------------");
-        HOTSTUFF_LOG_PROTO("[PMAKER] Timeout reached!!!");
-        HOTSTUFF_LOG_PROTO("[PMAKER] Rotate to %d", proposer);
-
-        /** Actual tree reconfiguration */
-        vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
-        hsc->calcTreeForced(std::move(reps), false);
-
-        pm_qc_finish.reject();
-        pm_wait_propose.reject();
-        pm_qc_manual.reject();
-        pm_qc_piped.reject();
-
-        // start timer
-        timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerRotating::on_exp_timeout, this, _1));
-        timer.add(exp_timeout);
-
-        /** Hard cap on exp_timeout */
-        if (exp_timeout > (base_timeout * pow(2,4))) {
-            exp_timeout = (base_timeout * pow(2,4));
-        }
-        else
-            exp_timeout *= 2;
-
-        HOTSTUFF_LOG_PROTO("[PMAKER] Finished recalculating tree!");
-        HOTSTUFF_LOG_PROTO("-------------------------------");
-    }
-
-    void reg_proposal() {
-        hsc->async_wait_proposal().then([this](const Proposal &prop) {
-            auto &pblk = prop_blk[hsc->get_id()];
-            if (!pblk) pblk = prop.blk;
-            if (rotating) reg_proposal();
-        });
-    }
-
-    void reg_receive_proposal() {
-        hsc->async_wait_receive_proposal().then([this](const Proposal &prop) {
-            auto &pblk = prop_blk[prop.proposer];
-            if (!pblk) pblk = prop.blk;
-            if (rotating) reg_receive_proposal();
-        });
-    }
-
-    void on_exp_timeout(TimerEvent &) {
-        if (proposer == hsc->get_id()) {
-            do_new_consensus(0, std::vector<uint256_t>{});
-        }
-        timer = TimerEvent(ec, [this](TimerEvent &){ rotate(); });
-        timer.add(prop_delay);
-    }
-
-    ReplicaID get_proposer() override {
-        return proposer;
-    }
-
-
-    promise_t beat_resp(ReplicaID) override {
-        return promise_t([this](promise_t &pm) {
-            HOTSTUFF_LOG_PROTO("[TEST] Responding to beat");
-            pm.resolve(proposer);
-        });
-    }
-
-
-    void inc_time(bool force) override {
-        if (force) {
-            //if (rotating) stop_rotate(true);
-            timer.del();
-            rotate();
-        } else {
-            HOTSTUFF_LOG_PROTO("Inc time %f", exp_timeout);
-            timer.add(exp_timeout);
-        }
-    }
-
-    promise_t beat() override {
-        if (proposer == hsc->get_id())
-        {
-            promise_t pm;
-            pending_beats.push(pm);
-            proposer_schedule_next();
-            return pm;
-        }
-        else
-            return promise_t([proposer=proposer](promise_t &pm) {
-                pm.resolve(proposer);
-            });
-    }
-
-    /**
-     * On consensus stop the timer, rotation and reset the exp_timeout
-    */
-    void on_consensus(const block_t &blk) override {
-        timer.del();
-        exp_timeout = base_timeout;
-        if (prop_blk[proposer] == blk) {
-            stop_rotate();
-        }
-    }
-
-    size_t get_current_tid() override {
-        return current_tid;
-    }
-
-    void update_tree_proposer() override {
-        proposer = hsc->get_system_tree_root(current_tid);
-        HOTSTUFF_LOG_PROTO("[PMAKER] Updated tree proposer to %d", proposer);
-    }
-
-    // void impeach() override {
-    //     if (rotating) return;
-    //     rotate();
-    //     HOTSTUFF_LOG_INFO("schedule to impeach the proposer");
-    // }
-
-};
-
-
-
-// struct PaceMakerRR2: public PMHighTail, public PaceMakerRotating {
-//     PaceMakerRR2(EventContext ec, int32_t parent_limit,
-//                 double base_timeout = 1, double prop_delay = 1):
-//         PMHighTail(parent_limit),
-//         PaceMakerRotating(ec, base_timeout, prop_delay) {}
-
-//     void init(HotStuffCore *hsc) override {
-//         PaceMaker::init(hsc);
-//         PMHighTail::init();
-//         PaceMakerRotating::init();
-//     }
-// };
 
 
 }

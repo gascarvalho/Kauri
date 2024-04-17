@@ -120,15 +120,21 @@ void HotStuffCore::update(const block_t &nblk) {
     /* decided blk could possible be incomplete due to pruning */
     if (blk2->decision) return;
     update_hqc(blk2, nblk->qc);
+    
+    std::cout <<  "update: step 1 done" <<  std::endl;
 
     const block_t &blk1 = blk2->qc_ref;
     if (blk1 == nullptr) return;
     if (blk1->decision) return;
     if (blk1->height > b_lock->height) b_lock = blk1;
 
+    std::cout <<  "update: step 2 done" <<  std::endl;
+
     const block_t &blk = blk1->qc_ref;
     if (blk == nullptr) return;
     if (blk->decision) return;
+
+    std::cout <<  "update: step 3 done" <<  std::endl;
 
     /* commit requires direct parent */
     if (blk2->parents[0] != blk1 || blk1->parents[0] != blk) return;
@@ -147,6 +153,9 @@ void HotStuffCore::update(const block_t &nblk) {
     /* commit requires direct parent */
     if (blk1->parents[0] != blk) return;
 #endif
+
+    std::cout <<  "update: able to commit" <<  std::endl;
+    
     /* otherwise commit */
     std::vector<block_t> commit_queue;
     block_t b;
@@ -158,12 +167,15 @@ void HotStuffCore::update(const block_t &nblk) {
         throw std::runtime_error("safety breached :( " +
                                 std::string(*blk) + " " +
                                 std::string(*b_exec));
+
     for (auto it = commit_queue.rbegin(); it != commit_queue.rend(); it++)
     {
         const block_t &blk = *it;
         blk->decision = 1;
         do_consensus(blk);
         LOG_PROTO("commit %s", std::string(*blk).c_str());
+        decided_blk_counter++;
+        HOTSTUFF_LOG_PROTO("[CONSENSUS][Blk_Counter=%d] Reached consensus for blk %s", decided_blk_counter, get_hex(blk->hash).c_str()); 
         for (size_t i = 0; i < blk->cmds.size(); i++)
             do_decide(Finality(id, get_tree_id(), 1, i, blk->height,
                                 blk->cmds[i], blk->get_hash()));
@@ -416,27 +428,29 @@ void HotStuffCore::add_replica(ReplicaID rid, const PeerId &peer_id,
 
 promise_t HotStuffCore::async_qc_finish(const block_t &blk) {
     //std::cout << "test " << blk->voted.size() << " " << blk->self_qc->has_n(config.nmajority) << std::endl;
-    HOTSTUFF_LOG_PROTO("[TEST] Entered async_qc_finish with voted size %d", blk->voted.size());
+    // HOTSTUFF_LOG_PROTO("[TEST] Entered async_qc_finish with voted size %d", blk->voted.size());
 
-    if(blk->self_qc != nullptr)
-        HOTSTUFF_LOG_PROTO("blk->self_qc NOT null");
-    else
-        HOTSTUFF_LOG_PROTO("blk->self_qc null");
+    // if(blk->self_qc != nullptr) {
+    //     HOTSTUFF_LOG_PROTO("blk->self_qc NOT null");
 
-    if(blk->self_qc->has_n(config.nmajority))
-        HOTSTUFF_LOG_PROTO("blk->self_qc HAS nmajority");
-    else
-        HOTSTUFF_LOG_PROTO("blk->self_qc DOES NOT HAVE nmajority");
+    //     if(blk->self_qc->has_n(config.nmajority))
+    //         HOTSTUFF_LOG_PROTO("blk->self_qc HAS nmajority");
+    //     else
+    //         HOTSTUFF_LOG_PROTO("blk->self_qc DOES NOT HAVE nmajority");
+    // }
+    // else
+    //     HOTSTUFF_LOG_PROTO("blk->self_qc null");
 
-    if(blk->voted.empty())
-        HOTSTUFF_LOG_PROTO("blk->voted IS empty");
-    else
-        HOTSTUFF_LOG_PROTO("blk->voted IS NOT empty");
 
-    if(blk->voted.size() >= config.nmajority)
-        HOTSTUFF_LOG_PROTO("blk->voted size >= nmajority");
-    else
-        HOTSTUFF_LOG_PROTO("blk->voted size < nmajority");
+    // if(blk->voted.empty())
+    //     HOTSTUFF_LOG_PROTO("blk->voted IS empty");
+    // else
+    //     HOTSTUFF_LOG_PROTO("blk->voted IS NOT empty");
+
+    // if(blk->voted.size() >= config.nmajority)
+    //     HOTSTUFF_LOG_PROTO("blk->voted size >= nmajority");
+    // else
+    //     HOTSTUFF_LOG_PROTO("blk->voted size < nmajority");
 
     if ((blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority) && !blk->voted.empty()) || blk->voted.size() >= config.nmajority) {
         HOTSTUFF_LOG_PROTO("async_qc_finish %s", blk->get_hash().to_hex().c_str());
@@ -448,16 +462,15 @@ promise_t HotStuffCore::async_qc_finish(const block_t &blk) {
 
     auto it = qc_waiting.find(blk);
     if (it == qc_waiting.end()) {
-        HOTSTUFF_LOG_PROTO("[TEST] inserting into qc_waiting blk %s", blk->get_hash().to_hex().c_str());
+        //HOTSTUFF_LOG_PROTO("[TEST] inserting into qc_waiting blk %s", blk->get_hash().to_hex().c_str());
         it = qc_waiting.insert(std::make_pair(blk, promise_t())).first;
     }
 
-    HOTSTUFF_LOG_PROTO("[TEST] Leaving async_qc_finish");
     return it->second;
 }
 
 void HotStuffCore::on_qc_finish(const block_t &blk) {
-    HOTSTUFF_LOG_PROTO("[TEST] Entered on_qc_finish");
+    //HOTSTUFF_LOG_PROTO("[TEST] Entered on_qc_finish");
     auto it = qc_waiting.find(blk);
     if (it != qc_waiting.end())
     {

@@ -277,8 +277,9 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
     }
 
     block_t blk = get_potentially_not_delivered_blk(msg.vote.blk_hash);
+    //AFTER HERE, BLOCK MUST BE DELIVERED ALREADY!!
 
-    if (!blk->delivered && blk->self_qc == nullptr) {
+    if (blk->self_qc == nullptr) {
         blk->self_qc = create_quorum_cert(blk->get_hash());
         part_cert_bt part = create_part_cert(*priv_key, blk->get_hash());
         blk->self_qc->add_part(config, id, *part);
@@ -436,7 +437,9 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
     }
 
     block_t blk = get_potentially_not_delivered_blk(msg.vote.blk_hash);
-    if (!blk->delivered && blk->self_qc == nullptr) {
+    //AFTER HERE, BLOCK MUST BE DELIVERED ALREADY!!
+
+    if (blk->self_qc == nullptr) {
         blk->self_qc = create_quorum_cert(blk->get_hash());
         part_cert_bt part = create_part_cert(*priv_key, blk->get_hash());
         blk->self_qc->add_part(config, id, *part);
@@ -479,6 +482,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
             stats[blk->hash] = stats[blk->hash] + usec;
             HOTSTUFF_LOG_PROTO("result: %s, %s ", blk->hash.to_hex().c_str(), std::to_string(stats[blk->parent_hashes[0]]).c_str());
         }*/
+
         return;
     }
 
@@ -553,8 +557,6 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
 
                     std::cout << "go to town: " << std::endl;
 
-                    HOTSTUFF_LOG_PROTO("[TEST] vrh case 1");
-
                     update_hqc(blk, cert);
                     on_qc_finish(blk);
 
@@ -592,8 +594,6 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                     else {
                         std::cout << "go to town: " << std::endl;
 
-                        HOTSTUFF_LOG_PROTO("[TEST] vrh case 2");
-
                         update_hqc(blk, cert);
                         on_qc_finish(blk);
                     }
@@ -602,8 +602,6 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
             else
             {
                 std::cout << "go to town: " << std::endl;
-
-                HOTSTUFF_LOG_PROTO("[TEST] vrh case 3");
 
                 update_hqc(blk, cert);
                 on_qc_finish(blk);
@@ -842,6 +840,9 @@ void HotStuffBase::do_decide(Finality &&fin) {
         it->second(std::move(fin));
         decision_waiting.erase(it);
     }
+    else {
+        decision_made[fin.cmd_hash] = fin.cmd_height;
+    }
 }
 
 /**
@@ -853,7 +854,7 @@ uint32_t HotStuffBase::get_tree_id() {
 
 HotStuffBase::~HotStuffBase() {}
 
-void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas) {
+void HotStuffBase::tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas) {
 
     /** Default algorithm will create 1 tree for each replica. 
      * Each replica will be the proposer of its own tree.
@@ -878,7 +879,8 @@ void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256
     }
 
     /** File algorithm will obtain the trees from a file.
-     * File trees are formatted as follows:
+     * File trees are formatted so that every line is the sequential ids of a tree
+     * Each line is a new TID
      * TIDs are attributted in order from 0 to N
     */
     else if(config.treegen_algo == "file") {
@@ -887,7 +889,7 @@ void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256
         size_t tid = 0;
 
         if (!file.is_open()) {
-            std::string str = "treeConfig: Provided treegen file path is invalid! Failed to open file " + config.treegen_fpath;
+            std::string str = "tree_config: Provided treegen file path is invalid! Failed to open file " + config.treegen_fpath;
             throw std::runtime_error(str);
         }
 
@@ -906,167 +908,16 @@ void HotStuffBase::treeConfig(std::vector<std::tuple<NetAddr, pubkey_bt, uint256
     }
 
     else {
-        throw std::runtime_error("treeConfig: Invalid tree generation algorithm!");
+        throw std::runtime_error("tree_config: Invalid tree generation algorithm!");
     }
 
 }
 
-void HotStuffBase::calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
-    
-    // LOG_PROTO("=========================== HotStuff Base Tree Calculation =================================\n");
-    // LOG_PROTO("[ReplicaID %lld] CALCULATING A NEW TREE WITH startup=%s", id, startup ? "true" : "false");
 
-    // std::set<uint16_t> children;
+void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
 
-    // if (startup) {
-    //     global_replicas = std::move(replicas);
-    // }
-
-    // childPeers.clear();
-
-    // auto offset = 0;
-    // auto size = global_replicas.size();
-
-    // if (!startup) {
-    //     std::cout << "Total global replicas: " << global_replicas.size() << std::endl;
-    //     global_replicas.erase(global_replicas.begin());
-    //     size = global_replicas.size();
-    //     std::cout << "Size after prune : " << size << std::endl;
-    //     offset = get_pace_maker()->get_proposer();
-    //     failures++;
-    // }
-    // else {
-    //     // STARTUP
-    //     for (size_t i = 0; i < size; i++) {
-
-    //         // Get the certificate hash from the replica vector
-    //         auto cert_hash = std::move(std::get<2>(global_replicas[i]));
-
-    //         // Get the peer id from the certificate hash
-    //         salticidae::PeerId peer{cert_hash};
-
-    //         // Add the certificate hash to the set of valid TLS certificates
-    //         valid_tls_certs.insert(cert_hash);
-
-    //         // Get the net address from the replica vector
-    //         auto &addr = std::get<0>(global_replicas[i]);
-
-    //         /* 
-    //         Add the replica to the system's config
-    //         i = replica id (0 to N)
-    //         peer = peer id
-    //         3rd arg = PubKey
-    //         */
-    //         HotStuffCore::add_replica(i, peer, std::move(std::get<1>(global_replicas[i])));
-
-    //         // Add all replicas except myself to my peer array and peer network/stack
-    //         if (addr != listen_addr) {
-    //             HOTSTUFF_PROTO_LOG("[STARTUP] Adding peer with id %llu and IP %s to network.", i, addr);
-    //             peers.push_back(peer);
-    //             pn.add_peer(peer);
-    //             pn.set_peer_addr(peer, addr);
-    //         }
-    //     }
-    // }
-
-    // size_t fanout = config.fanout;
-
-    // // Processes on this layer of the tree
-    // auto processesOnLevel = 1;  /* <- 1 because of root */
-    // bool done = false;
-
-    // if (failures > fanout) {
-    //     config.fanout = size;
-    //     fanout = size;
-    //     config.async_blocks = 0;
-    //     HOTSTUFF_LOG_PROTO("Falling Back to Star");
-    // }
-
-    // // i will represent the "parent id"
-    // size_t i = 0;
-    // while (i < size) {
-    //     HOTSTUFF_LOG_PROTO("Iteration w/ i: %lld", i);
-
-    //     if (done) {
-    //         HOTSTUFF_LOG_PROTO("Done!");
-    //         break;
-    //     }
-
-    //     // In case there are not enough processes to fill node's children (max_fanout < fanout)
-    //     const size_t remaining = size - i;
-    //     const size_t max_fanout = ceil(remaining / processesOnLevel);
-    //     auto curr_fanout = std::min(max_fanout, fanout);
-
-    //     //Get parent peerid for current i iteration
-    //     auto parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
-    //     salticidae::PeerId parent_peer{parent_cert_hash};
-
-    //     // Start is an index for the tree given by the iteration and how many processes are on the layer
-    //     auto start = i + processesOnLevel;
-
-    //     HOTSTUFF_LOG_PROTO("START: %lld", start);
-
-    //     for (auto counter = 1; counter <= processesOnLevel; counter++) {
-
-    //         HOTSTUFF_LOG_PROTO("Iteration 'counter': %lld for <= ProcessesOnLevel: %lld", counter, processesOnLevel);
-
-    //         if (done) {
-    //             break;
-    //         }
-
-    //         for (size_t j = start; j < start + curr_fanout; j++) {
-                
-    //             if (j >= size) {
-    //                 done = true;
-    //                 break;
-    //             }
-
-    //             HOTSTUFF_LOG_PROTO("Iteration j: %lld for < (start + curr_fanout): %lld + %lld" , j, start, curr_fanout);
-
-    //             auto cert_hash = std::move(std::get<2>(global_replicas[j]));
-    //             salticidae::PeerId peer{cert_hash};
-
-    //             if (id == i + offset) {
-    //                 HOTSTUFF_LOG_PROTO("My ReplicaID %lld is equal to i (%lld) + offset (%lld) ", id, i, offset);
-    //                 HOTSTUFF_LOG_PROTO("Inserted replica with id = j = %lld into 'children' and my own 'childPeers", j);
-    //                 children.insert(j);
-    //                 childPeers.insert(peer);
-    //             } else if (id == j + offset) {
-    //                 HOTSTUFF_LOG_PROTO("My ReplicaID %lld is equal to j (%lld) + offset (%lld) ", id, j, offset);
-    //                 HOTSTUFF_LOG_PROTO("Previously mentioned parent_peer (id=%lld) set as my own parent!", i);
-    //                 parentPeer = parent_peer;
-    //             } else if (childPeers.find(parent_peer) != childPeers.end()) {
-    //                 HOTSTUFF_LOG_PROTO("Inserted replica with id = j = %lld into 'children'", j);
-    //                 children.insert(j);
-    //             }
-    //         }
-
-    //         // Start moves ahead a set of children (fanout)
-    //         start += curr_fanout;
-
-    //         // Update parent id and parent peer
-    //         i++;
-    //         parent_cert_hash = std::move(std::get<2>(global_replicas[i]));
-    //         salticidae::PeerId temp_parent_peer{parent_cert_hash};
-    //         parent_peer = temp_parent_peer;
-
-    //         HOTSTUFF_LOG_PROTO("Incremented i to %lld and used it to obtain new parent peer.", i);
-    //     }
-
-    //     processesOnLevel = std::min(curr_fanout * processesOnLevel, remaining);
-    //     HOTSTUFF_LOG_PROTO("ProcessesOnLevel now: %lld", processesOnLevel);
-    // }
-    
-    // HOTSTUFF_LOG_PROTO("total children: %d", children.size());
-    // numberOfChildren = children.size();
-
-    // LOG_PROTO("=========================== Finished Tree Calculation =================================\n");
-}
-
-void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {
-
-    LOG_PROTO("\n=========================== Kauri Tree Calculation =================================\n");
-    LOG_PROTO("[ReplicaID %lld] CALCULATING A NEW TREE %s", id, startup ? "(STARTUP)" : "");
+    LOG_PROTO("\n=========================== Kauri Tree Scheduler =================================\n");
+    LOG_PROTO("[ReplicaID %lld] SCHEDULING A NEW TREE %s", id, startup ? "(STARTUP)" : "");
 
     auto offset = 0;
 
@@ -1109,7 +960,7 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
             }
         }
 
-        treeConfig(std::move(global_replicas));
+        tree_config(std::move(global_replicas));
     }
 
     /* Update the current tree */
@@ -1123,21 +974,24 @@ void HotStuffBase::calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     // std::cout << std::string(str) << std::endl;
     HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
-    HOTSTUFF_LOG_PROTO("Next forced reconfiguration will happen at block %llu.", current_tree_network.get_target());
+    HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());
 
-    LOG_PROTO("\n=========================== Finished Tree Calculation =================================\n");
+    LOG_PROTO("\n=========================== Finished Tree Switch =================================\n");
 }
 
 bool HotStuffBase::isTreeSwitch(int bheight) {
-    lastCheckedHeight = bheight;
+    if(bheight > lastCheckedHeight) {
+        lastCheckedHeight = bheight;
+    }
+    
     return bheight == current_tree_network.get_target();
 }
 
 void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop) {
 
-    /* tree config */
+    /* Initial tree config */
 
-    HotStuffBase::calcTreeForced(std::move(replicas), true);
+    HotStuffBase::tree_scheduler(std::move(replicas), true);
     for (const PeerId& peer : peers) {
             pn.conn_peer(peer);
     }
@@ -1149,7 +1003,8 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
     on_init(nfaulty);
     pmaker->init(this);
 
-    // TODO: Due to how the system is deployed, use this to correctly setup the PM's first proposer
+    // TODO: Make this less ugly
+    // Due to how the system is deployed, this is an alternative to correctly setup the PM's first proposer
     get_pace_maker()->update_tree_proposer();
     get_pace_maker()->setup();
 
@@ -1171,6 +1026,13 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
             if (cmd_pending_buffer.size() < blk_size && final_buffer.empty()) {
                 const auto &cmd_hash = e.first;
                 auto it = decision_waiting.find(cmd_hash);
+
+                if (decision_made.count(cmd_hash)) {
+                    uint32_t height = decision_made[cmd_hash];
+                    e.second(Finality(id, get_tree_id(), 0, 0, height, cmd_hash, uint256_t()));
+                    continue;
+                }
+
                 if (it == decision_waiting.end())
                     it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
                 
@@ -1196,8 +1058,10 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
 }
 
 void HotStuffBase::beat() {
+    
+    /** Ask pmaker to know if we're a proposer or not. If we are, we propose */
+
     pmaker->beat().then([this](ReplicaID proposer) {
-        HOTSTUFF_LOG_PROTO("[TEST] Entered beat");
         if (piped_queue.size() > get_config().async_blocks + 1) {
             return;
         }
@@ -1265,7 +1129,65 @@ void HotStuffBase::beat() {
                 on_propose(final_buffer, std::move(parents));
             }
         }
-        HOTSTUFF_LOG_PROTO("[TEST] Leaving beat");
     });
 }
+
+block_t HotStuffBase::repropose_beat(const std::vector<uint256_t> &cmds) {
+    
+    struct timeval timeStart, timeEnd;
+    gettimeofday(&timeStart, NULL);
+
+    auto parents = pmaker->get_parents();
+
+    struct timeval current_time;
+    gettimeofday(&current_time, NULL);
+    block_t current = pmaker->get_current_proposal();
+
+    if (piped_queue.size() < get_config().async_blocks && current != get_genesis()) {
+        HOTSTUFF_LOG_PROTO("[PIPELINING] Current piped queue: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);
+
+        if (piped_queue.empty() && ((current_time.tv_sec - last_block_time.tv_sec) * 1000000 + current_time.tv_usec -last_block_time.tv_usec) / 1000 < config.piped_latency) {
+            HOTSTUFF_LOG_PROTO("omitting propose");
+        } else {
+            block_t highest = current;
+            for (auto p_hash : piped_queue) {
+                block_t block = storage->find_blk(p_hash);
+                if (block->height > highest->height) {
+                    highest = block;
+                }
+            }
+
+            if (parents[0]->height < highest->height) {
+                parents.insert(parents.begin(), highest);
+            }
+
+            block_t piped_block = storage->add_blk(new Block(parents, cmds,
+                                                    hqc.second->clone(), bytearray_t(),
+                                                    parents[0]->height + 1,
+                                                    current,
+                                                    nullptr));
+            piped_queue.push_back(piped_block->hash);
+
+            Proposal prop(id, get_tree_id(), piped_block, nullptr);
+            HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
+            /* broadcast to other replicas */
+            gettimeofday(&last_block_time, NULL);
+            do_broadcast_proposal(prop);
+
+            /*if (id == get_pace_maker()->get_proposer()) {
+                gettimeofday(&timeEnd, NULL);
+                long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);
+                stats.insert(std::make_pair(piped_block->hash, usec));
+            }*/
+            piped_submitted = false;
+
+            return piped_block;
+        }
+    } 
+    else {
+        gettimeofday(&last_block_time, NULL);
+        return on_propose(cmds, std::move(parents));
+    }
+}
+
 }

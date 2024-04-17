@@ -46,6 +46,9 @@ class HotStuffCore {
     /**< private key for signing votes */
     std::set<block_t> tails;   /**< set of tail blocks */
     /**< replica configuration */
+
+    uint64_t decided_blk_counter = 0; /** for simple stat print */
+
     /* === async event queues === */
 
     std::unordered_map<block_t, promise_t> qc_waiting;
@@ -109,9 +112,8 @@ public:
      * @param replicas necessary set of processes.
      * @param startup if being called during startup.
      */
-    virtual void calcTree(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
-    virtual void calcTreeForced(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
-    virtual void treeConfig() { }
+    virtual void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
+    virtual void tree_config() { }
     virtual bool isTreeSwitch(int bheight) { }
     virtual size_t get_total_system_trees() { }
     virtual ReplicaID get_system_tree_root(int tid) { }
@@ -249,9 +251,8 @@ protected:
 
     Proposal process_block(const block_t& bnew, bool adjustHeight);
 
-    void treeConfig(bool b);
-    void calcTree(bool b);
-    void calcTreeForced(bool b);
+    void tree_config(bool b);
+    void tree_scheduler(bool b);
 
     bool first = true;
 };
