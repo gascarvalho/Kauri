@@ -92,14 +92,14 @@ bool try_send(bool check = true) {
 
 void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     auto &fin = msg.fin;
-    HOTSTUFF_LOG_DEBUG("got %s", std::string(msg.fin).c_str());
+    HOTSTUFF_LOG_INFO("got %s", std::string(msg.fin).c_str());
     const uint256_t &cmd_hash = fin.cmd_hash;
     auto it = waiting.find(cmd_hash);
     auto &et = it->second.et;
     if (it == waiting.end()) return;
     et.stop();
 #ifndef HOTSTUFF_ENABLE_BENCHMARK
-    HOTSTUFF_LOG_INFO("got %s, wall: %.3f, cpu: %.3f",
+    HOTSTUFF_LOG_INFO("fin %s has wall: %.3f, cpu: %.3f",
                         std::string(fin).c_str(),
                         et.elapsed_sec, et.cpu_elapsed_sec);
 #else

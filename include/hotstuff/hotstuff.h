@@ -397,6 +397,7 @@ class HotStuffBase: public HotStuffCore {
     block_t repropose_beat(const std::vector<uint256_t> &cmds);
 
     size_t size() const { return peers.size(); }
+    uint32_t get_blk_size() { return blk_size; };
     const auto &get_decision_waiting() const { return decision_waiting; }
     ThreadCall &get_tcall() { return tcall; }
     PaceMaker *get_pace_maker() { return pmaker.get(); }

@@ -115,6 +115,7 @@ public:
     virtual void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
     virtual void tree_config() { }
     virtual bool isTreeSwitch(int bheight) { }
+    virtual uint32_t get_blk_size() { }
     virtual size_t get_total_system_trees() { }
     virtual ReplicaID get_system_tree_root(int tid) { }
     virtual ReplicaID get_current_system_tree_root() { }
@@ -181,6 +182,12 @@ public:
 
     // Start time.
     mutable struct timeval start_time;
+
+    uint64_t summed_latency;
+    uint64_t processed_blocks;
+
+    std::unordered_map<const uint256_t, timeval> proposal_time;
+
 protected:
     /** Called by HotStuffCore upon the decision being made for cmd. */
     virtual void do_decide(Finality &&fin) = 0;
@@ -274,8 +281,7 @@ struct Proposal: public Serializable {
             const block_t &blk,
             HotStuffCore *hsc):
         proposer(proposer),
-        tid(tid),
-        blk(blk), hsc(hsc) {}
+        tid(tid), blk(blk), hsc(hsc) {}
 
     void serialize(DataStream &s) const override {
         s << proposer
@@ -419,51 +425,51 @@ struct Finality: public Serializable {
 };
 
 /** Abstraction for vote relay messages. */
-    struct VoteRelay: public Serializable {
-        /** tree used for the message*/
-        uint32_t tid;
-        /** block being voted */
-        uint256_t blk_hash;
-        /** proof of validity for the vote */
-        quorum_cert_bt cert;
+struct VoteRelay: public Serializable {
+    /** tree used for the message*/
+    uint32_t tid;
+    /** block being voted */
+    uint256_t blk_hash;
+    /** proof of validity for the vote */
+    quorum_cert_bt cert;
 
-        /** handle of the core object to allow polymorphism */
-        HotStuffCore *hsc;
+    /** handle of the core object to allow polymorphism */
+    HotStuffCore *hsc;
 
-        VoteRelay(): cert(nullptr), hsc(nullptr) {}
-        VoteRelay(uint32_t tid, const uint256_t &blk_hash,
-                  quorum_cert_bt &&cert,
-             HotStuffCore *hsc):
-                tid(tid),
-                blk_hash(blk_hash),
-                cert(std::move(cert)), hsc(hsc) {}
+    VoteRelay(): cert(nullptr), hsc(nullptr) {}
+    VoteRelay(uint32_t tid, const uint256_t &blk_hash,
+            quorum_cert_bt &&cert,
+        HotStuffCore *hsc):
+            tid(tid),
+            blk_hash(blk_hash),
+            cert(std::move(cert)), hsc(hsc) {}
 
-        VoteRelay(const VoteRelay &other):
-                tid(other.tid),
-                blk_hash(other.blk_hash),
-                cert(other.cert ? other.cert->clone() : nullptr),
-                hsc(other.hsc) {}
+    VoteRelay(const VoteRelay &other):
+            tid(other.tid),
+            blk_hash(other.blk_hash),
+            cert(other.cert ? other.cert->clone() : nullptr),
+            hsc(other.hsc) {}
 
-        VoteRelay(VoteRelay &&other) = default;
+    VoteRelay(VoteRelay &&other) = default;
 
-        void serialize(DataStream &s) const override {
-            s << tid << blk_hash << *cert;
-        }
+    void serialize(DataStream &s) const override {
+        s << tid << blk_hash << *cert;
+    }
 
-        void unserialize(DataStream &s) override {
-            assert(hsc != nullptr);
-            s >> tid >> blk_hash;
-            cert = hsc->parse_quorum_cert(s);
-        }
+    void unserialize(DataStream &s) override {
+        assert(hsc != nullptr);
+        s >> tid >> blk_hash;
+        cert = hsc->parse_quorum_cert(s);
+    }
 
-        operator std::string () const {
-            DataStream s;
-            s << "<voterelay "
-              << "blk=" << get_hex10(blk_hash) << " "
-              << "tid=" << std::to_string(tid) << ">";
-            return s;
-        }
-    };
+    operator std::string () const {
+        DataStream s;
+        s << "<voterelay "
+        << "blk=" << get_hex10(blk_hash) << " "
+        << "tid=" << std::to_string(tid) << ">";
+        return s;
+    }
+};
 
     /**
      * Kauri tree

@@ -99,6 +99,25 @@ bool HotStuffCore::on_deliver_blk(const block_t &blk) {
     tails.insert(blk);
 
     blk->delivered = true;
+
+    if (blk->height > 5) {
+        struct timeval end;
+        gettimeofday(&end, NULL);
+        auto hash = blk->hash;
+        proposal_time[blk->hash] = end;
+
+        if (blk->qc_ref) {
+            auto it = proposal_time.find(blk->qc_ref->hash);
+            if (it != proposal_time.end()) {
+                struct timeval start = it->second;
+                long ms = ((end.tv_sec - start.tv_sec) * 1000000 + end.tv_usec - start.tv_usec) / 1000;
+                processed_blocks++;
+                summed_latency += ms;
+                HOTSTUFF_LOG_PROTO("[TIME] Average latency per block (%lu tx): %d ms", get_blk_size(), summed_latency / processed_blocks);
+            }
+        }
+    }
+
     HOTSTUFF_LOG_PROTO("deliver %s", std::string(*blk).c_str());
     return true;
 }
@@ -112,6 +131,7 @@ void HotStuffCore::update_hqc(const block_t &_hqc, const quorum_cert_bt &qc) {
 }
 
 void HotStuffCore::update(const block_t &nblk) {
+
     /* nblk = b*, blk2 = b'', blk1 = b', blk = b */
 #ifndef HOTSTUFF_TWO_STEP
     /* three-step HotStuff */
@@ -121,23 +141,31 @@ void HotStuffCore::update(const block_t &nblk) {
     if (blk2->decision) return;
     update_hqc(blk2, nblk->qc);
     
-    std::cout <<  "update: step 1 done" <<  std::endl;
+    std::cout <<  "update: step 1 done (pre-commit/hqc update)" <<  std::endl;
 
     const block_t &blk1 = blk2->qc_ref;
     if (blk1 == nullptr) return;
     if (blk1->decision) return;
     if (blk1->height > b_lock->height) b_lock = blk1;
 
-    std::cout <<  "update: step 2 done" <<  std::endl;
+    std::cout <<  "update: step 2 done (commit/b_lock update)" <<  std::endl;
 
     const block_t &blk = blk1->qc_ref;
     if (blk == nullptr) return;
     if (blk->decision) return;
 
-    std::cout <<  "update: step 3 done" <<  std::endl;
+    HOTSTUFF_LOG_PROTO("Tail - nblk *****************************");
+    HOTSTUFF_LOG_PROTO("blk2: %s", std::string(*blk2).c_str());
+    HOTSTUFF_LOG_PROTO("blk1: %s", std::string(*blk1).c_str());
+    HOTSTUFF_LOG_PROTO("blk: %s", std::string(*blk).c_str());
+    HOTSTUFF_LOG_PROTO("Rest of blockchain *********************");
 
     /* commit requires direct parent */
-    if (blk2->parents[0] != blk1 || blk1->parents[0] != blk) return;
+    if (blk2->parents[0] != blk1 || blk1->parents[0] != blk) {
+        std::cout <<  "update: no direct parent for step 3 " <<  std::endl;
+        return;
+    }
+    
 #else
     /* two-step HotStuff */
     const block_t &blk1 = nblk->qc_ref;
@@ -151,11 +179,14 @@ void HotStuffCore::update(const block_t &nblk) {
     if (blk->decision) return;
 
     /* commit requires direct parent */
-    if (blk1->parents[0] != blk) return;
+    if (blk1->parents[0] != blk) {
+        std::cout <<  "update: no direct parent for step 3 " <<  std::endl;
+        return;
+    }
 #endif
 
-    std::cout <<  "update: able to commit" <<  std::endl;
-    
+    std::cout <<  "update: step 3 able to decide (decide/b_exec update)" <<  std::endl;
+
     /* otherwise commit */
     std::vector<block_t> commit_queue;
     block_t b;
@@ -180,7 +211,9 @@ void HotStuffCore::update(const block_t &nblk) {
             do_decide(Finality(id, get_tree_id(), 1, i, blk->height,
                                 blk->cmds[i], blk->get_hash()));
     }
+
     b_exec = blk;
+    
 }
 
 block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
@@ -270,6 +303,7 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
         LOG_PROTO("not in storage!");
     }
 
+    // Vote for own proposed block
     on_receive_vote(
             Vote(id, get_tree_id(), bnew_hash,
                  create_part_cert(*priv_key, bnew_hash), this));
@@ -338,7 +372,8 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
 }
 
 void HotStuffCore::on_receive_vote(const Vote &vote) {
-    LOG_PROTO("[CONSENSUS] Got VOTE in tid=%d: %s", vote.tid, std::string(vote).c_str());
+    // In current implementation, only the proposer's vote uses this function
+    LOG_PROTO("[CONSENSUS] Applying own vote in tid=%d: %s", vote.tid, std::string(vote).c_str());
     LOG_PROTO("y now state: %s", std::string(*this).c_str());
 
     block_t blk = get_delivered_blk(vote.blk_hash);
@@ -367,17 +402,6 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
         qc->compute();
         update_hqc(blk, qc);
         on_qc_finish(blk);
-
-        // if (blk->height != 0 && blk->height % 30 == 0) {
-        //     if (is_proposer(id))
-        //         LOG_PROTO("IM PROPOSER AND IM FORCING RECONFIG AAAAAAAAAAAAAAAAAAAAA (on_receive_proposal)");
-        //     else
-        //         LOG_PROTO("Forcing a reconfiguration! (bnew height is %llu)", blk->height);
-        //     inc_time(true);
-        // }
-        // else if (bnew->height > 30) {
-        //     inc_time(false);
-        // }
     }
 }
 

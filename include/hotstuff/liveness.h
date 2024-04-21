@@ -301,7 +301,6 @@ class PaceMakerMultitree: public PaceMakerDummy {
     double timeout;
 
     bool delaying_proposal = false;
-    bool already_reconfigured = false;
 
     EventContext ec;
 
@@ -337,6 +336,8 @@ public:
 
     void set_proposer(bool isTimeout) {
 
+        delaying_proposal = true;
+
         HOTSTUFF_LOG_PROTO("-------------------------------");
         HOTSTUFF_LOG_PROTO("[PMAKER] %s reached!!!", isTimeout ? "Reconfiguration" : "Timeout");
 
@@ -360,11 +361,11 @@ public:
 
         if (get_proposer() == hsc->get_id()) {
             HOTSTUFF_LOG_PROTO("Elected itself as a new leader!");
-            delaying_proposal = true;
             timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::unlock, this, _1));
             timer.add(prop_delay);
         } else {
             HOTSTUFF_LOG_PROTO("Not the leader!");
+            delaying_proposal = false;
             timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
             timer.add(timeout);
         }
@@ -374,6 +375,7 @@ public:
     }
 
     void unlock(TimerEvent &) {
+        HOTSTUFF_LOG_PROTO("TIMER DELETE: UNLOCK");
         timer.del();
         do_new_consensus(0, std::vector<uint256_t>{});
         delaying_proposal = false;
@@ -382,7 +384,6 @@ public:
 
     void inc_time(bool force) override {
         if (force) {
-            //already_reconfigured = true;
             set_proposer(false);
         } else {
             if(!delaying_proposal) {
@@ -415,6 +416,8 @@ public:
     }
 
     void do_new_consensus(int x, const std::vector<uint256_t> &cmds) {
+        //auto hs = static_cast<hotstuff::HotStuffBase *>(hsc);
+        //auto blk = hs->repropose_beat(cmds);
         auto blk = hsc->on_propose(cmds, get_parents(), bytearray_t());
         pm_qc_manual.reject();
         (pm_qc_manual = hsc->async_qc_finish(blk))

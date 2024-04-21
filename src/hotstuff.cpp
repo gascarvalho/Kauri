@@ -1013,36 +1013,43 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
 
     cmd_pending_buffer.reserve(blk_size);
     cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
-        std::pair<uint256_t, commit_cb_t> e;
+        std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
         while (q.try_dequeue(e))
         {
             /** TODO: Check Finality constructor's dynamics with get_tree_id()*/
             ReplicaID proposer = pmaker->get_proposer();
+
+            // Command not finalized, go to the next loop
             if (proposer != get_id()) {
                 e.second(Finality(id, get_tree_id(), 0, 0, 0, e.first, uint256_t()));
                 continue;
             }
 
+            // Check if the command has already been processed or is waiting to be processed
             if (cmd_pending_buffer.size() < blk_size && final_buffer.empty()) {
                 const auto &cmd_hash = e.first;
                 auto it = decision_waiting.find(cmd_hash);
 
                 if (decision_made.count(cmd_hash)) {
+                    // Registers the height of the decision through callback function
                     uint32_t height = decision_made[cmd_hash];
                     e.second(Finality(id, get_tree_id(), 0, 0, height, cmd_hash, uint256_t()));
                     continue;
                 }
 
+                // If the command is not in the decision_waiting map, insert it
                 if (it == decision_waiting.end())
                     it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
                 
+                // Command is pending, add it to the pending buffer
                 e.second(Finality(id, get_tree_id(), 0, 0, 0, cmd_hash, uint256_t()));
                 cmd_pending_buffer.push_back(cmd_hash);
-            }
+            } 
             else {
                 e.second(Finality(id, get_tree_id(), 0, 0, 0, e.first, uint256_t()));
             }
 
+            // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
             if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
                 if (final_buffer.empty())
                 {
@@ -1132,62 +1139,64 @@ void HotStuffBase::beat() {
     });
 }
 
-block_t HotStuffBase::repropose_beat(const std::vector<uint256_t> &cmds) {
+// block_t HotStuffBase::repropose_beat(const std::vector<uint256_t> &cmds) {
+
+//     pmaker->beat();
     
-    struct timeval timeStart, timeEnd;
-    gettimeofday(&timeStart, NULL);
+//     struct timeval timeStart, timeEnd;
+//     gettimeofday(&timeStart, NULL);
 
-    auto parents = pmaker->get_parents();
+//     auto parents = pmaker->get_parents();
 
-    struct timeval current_time;
-    gettimeofday(&current_time, NULL);
-    block_t current = pmaker->get_current_proposal();
+//     struct timeval current_time;
+//     gettimeofday(&current_time, NULL);
+//     block_t current = pmaker->get_current_proposal();
 
-    if (piped_queue.size() < get_config().async_blocks && current != get_genesis()) {
-        HOTSTUFF_LOG_PROTO("[PIPELINING] Current piped queue: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);
+//     if (piped_queue.size() < get_config().async_blocks && current != get_genesis()) {
+//         HOTSTUFF_LOG_PROTO("[PIPELINING] Current piped queue: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);
 
-        if (piped_queue.empty() && ((current_time.tv_sec - last_block_time.tv_sec) * 1000000 + current_time.tv_usec -last_block_time.tv_usec) / 1000 < config.piped_latency) {
-            HOTSTUFF_LOG_PROTO("omitting propose");
-        } else {
-            block_t highest = current;
-            for (auto p_hash : piped_queue) {
-                block_t block = storage->find_blk(p_hash);
-                if (block->height > highest->height) {
-                    highest = block;
-                }
-            }
+//         if (piped_queue.empty() && ((current_time.tv_sec - last_block_time.tv_sec) * 1000000 + current_time.tv_usec -last_block_time.tv_usec) / 1000 < config.piped_latency) {
+//             HOTSTUFF_LOG_PROTO("omitting propose");
+//         } else {
+//             block_t highest = current;
+//             for (auto p_hash : piped_queue) {
+//                 block_t block = storage->find_blk(p_hash);
+//                 if (block->height > highest->height) {
+//                     highest = block;
+//                 }
+//             }
 
-            if (parents[0]->height < highest->height) {
-                parents.insert(parents.begin(), highest);
-            }
+//             if (parents[0]->height < highest->height) {
+//                 parents.insert(parents.begin(), highest);
+//             }
 
-            block_t piped_block = storage->add_blk(new Block(parents, cmds,
-                                                    hqc.second->clone(), bytearray_t(),
-                                                    parents[0]->height + 1,
-                                                    current,
-                                                    nullptr));
-            piped_queue.push_back(piped_block->hash);
+//             block_t piped_block = storage->add_blk(new Block(parents, cmds,
+//                                                     hqc.second->clone(), bytearray_t(),
+//                                                     parents[0]->height + 1,
+//                                                     current,
+//                                                     nullptr));
+//             piped_queue.push_back(piped_block->hash);
 
-            Proposal prop(id, get_tree_id(), piped_block, nullptr);
-            HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
-            /* broadcast to other replicas */
-            gettimeofday(&last_block_time, NULL);
-            do_broadcast_proposal(prop);
+//             Proposal prop(id, get_tree_id(), piped_block, nullptr);
+//             HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
+//             /* broadcast to other replicas */
+//             gettimeofday(&last_block_time, NULL);
+//             do_broadcast_proposal(prop);
 
-            /*if (id == get_pace_maker()->get_proposer()) {
-                gettimeofday(&timeEnd, NULL);
-                long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);
-                stats.insert(std::make_pair(piped_block->hash, usec));
-            }*/
-            piped_submitted = false;
+//             /*if (id == get_pace_maker()->get_proposer()) {
+//                 gettimeofday(&timeEnd, NULL);
+//                 long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);
+//                 stats.insert(std::make_pair(piped_block->hash, usec));
+//             }*/
+//             piped_submitted = false;
 
-            return piped_block;
-        }
-    } 
-    else {
-        gettimeofday(&last_block_time, NULL);
-        return on_propose(cmds, std::move(parents));
-    }
-}
+//             return piped_block;
+//         }
+//     } 
+//     else {
+//         gettimeofday(&last_block_time, NULL);
+//         return on_propose(cmds, std::move(parents));
+//     }
+// }
 
 }
