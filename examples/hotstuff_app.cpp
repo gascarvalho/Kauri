@@ -106,6 +106,7 @@ class HotStuffApp: public HotStuff {
     }
 
     void state_machine_execute(const Finality &fin) override {
+        HOTSTUFF_LOG_DEBUG("executing command: %s", std::string(fin));
         reset_imp_timer();
     }
 
@@ -364,7 +365,7 @@ void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn
     const NetAddr addr = conn->get_addr();
     auto cmd = parse_cmd(msg.serialized);
     const auto &cmd_hash = cmd->get_hash();
-    HOTSTUFF_LOG_DEBUG("processing %s", std::string(*cmd).c_str());
+    HOTSTUFF_LOG_DEBUG("processing command %s", std::string(*cmd).c_str());
     exec_command(cmd_hash, [this, addr](Finality fin) {
         resp_queue.enqueue(std::make_pair(fin, addr));
     });

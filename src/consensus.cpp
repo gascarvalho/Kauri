@@ -477,7 +477,7 @@ promise_t HotStuffCore::async_qc_finish(const block_t &blk) {
     //     HOTSTUFF_LOG_PROTO("blk->voted size < nmajority");
 
     if ((blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority) && !blk->voted.empty()) || blk->voted.size() >= config.nmajority) {
-        HOTSTUFF_LOG_PROTO("async_qc_finish %s", blk->get_hash().to_hex().c_str());
+        HOTSTUFF_LOG_PROTO("async_qc_finish %.10s", blk->get_hash().to_hex().c_str());
 
         return promise_t([](promise_t &pm) {
             pm.resolve();

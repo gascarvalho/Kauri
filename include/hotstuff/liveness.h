@@ -377,7 +377,7 @@ public:
     void unlock(TimerEvent &) {
         HOTSTUFF_LOG_PROTO("TIMER DELETE: UNLOCK");
         timer.del();
-        do_new_consensus(0, std::vector<uint256_t>{});
+        //do_new_consensus(0, std::vector<uint256_t>{});
         delaying_proposal = false;
         HOTSTUFF_LOG_PROTO("Unlocking Proposer!!!");
     }

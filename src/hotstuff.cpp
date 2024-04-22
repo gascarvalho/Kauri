@@ -1016,12 +1016,14 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
         std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
         while (q.try_dequeue(e))
         {
-            /** TODO: Check Finality constructor's dynamics with get_tree_id()*/
+            /** Note: We have to send temporary Finality messages to clients 
+             * so that they send more commands to fill our blocks!*/
+
             ReplicaID proposer = pmaker->get_proposer();
 
-            // Command not finalized, go to the next loop
+            // Reply with -1 if we're not the proposer
             if (proposer != get_id()) {
-                e.second(Finality(id, get_tree_id(), 0, 0, 0, e.first, uint256_t()));
+                e.second(Finality(id, get_tree_id(), -1, 0, 0, e.first, uint256_t()));
                 continue;
             }
 
@@ -1031,9 +1033,9 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
                 auto it = decision_waiting.find(cmd_hash);
 
                 if (decision_made.count(cmd_hash)) {
-                    // Registers the height of the decision through callback function
+                    // Reply with -2 if we already know the height of the command
                     uint32_t height = decision_made[cmd_hash];
-                    e.second(Finality(id, get_tree_id(), 0, 0, height, cmd_hash, uint256_t()));
+                    e.second(Finality(id, get_tree_id(), -2, 0, height, cmd_hash, uint256_t()));
                     continue;
                 }
 
@@ -1041,16 +1043,18 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
                 if (it == decision_waiting.end())
                     it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
                 
-                // Command is pending, add it to the pending buffer
-                e.second(Finality(id, get_tree_id(), 0, 0, 0, cmd_hash, uint256_t()));
+                // Reply with -3 if we're proposer and now the command is pending
+                e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
                 cmd_pending_buffer.push_back(cmd_hash);
             } 
             else {
-                e.second(Finality(id, get_tree_id(), 0, 0, 0, e.first, uint256_t()));
+                // Reply with -4 otherwise
+                e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
             }
 
             // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
             if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
+
                 if (final_buffer.empty())
                 {
                     final_buffer = std::move(cmd_pending_buffer);
@@ -1068,7 +1072,7 @@ void HotStuffBase::beat() {
     
     /** Ask pmaker to know if we're a proposer or not. If we are, we propose */
 
-    pmaker->beat().then([this](ReplicaID proposer) {
+    pmaker->beat().then([this, cmds = std::move(final_buffer)](ReplicaID proposer) {
         if (piped_queue.size() > get_config().async_blocks + 1) {
             return;
         }
@@ -1101,7 +1105,7 @@ void HotStuffBase::beat() {
                         parents.insert(parents.begin(), highest);
                     }
 
-                    block_t piped_block = storage->add_blk(new Block(parents, final_buffer,
+                    block_t piped_block = storage->add_blk(new Block(parents, cmds,
                                                              hqc.second->clone(), bytearray_t(),
                                                              parents[0]->height + 1,
                                                              current,
@@ -1133,7 +1137,7 @@ void HotStuffBase::beat() {
                 }
             } else {
                 gettimeofday(&last_block_time, NULL);
-                on_propose(final_buffer, std::move(parents));
+                on_propose(cmds, std::move(parents));
             }
         }
     });

@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <random>
+#include <queue>
 #include <signal.h>
 #include <sys/time.h>
 
@@ -60,17 +61,14 @@ struct Request {
 using Net = salticidae::MsgNetwork<opcode_t>;
 
 std::unordered_map<ReplicaID, Net::conn_t> conns;
-std::unordered_map<const uint256_t, Request> waiting;
+size_t waiting_receival = 0;
+std::unordered_map<const uint256_t, Request> waiting_finalized;
 std::vector<NetAddr> replicas;
 std::vector<std::pair<struct timeval, double>> elapsed;
 Net mn(ec, Net::Config());
 
-void connect_all() {
-    conns.insert(std::make_pair(0, mn.connect_sync(replicas[cid])));
-}
-
 bool try_send(bool check = true) {
-    if ((!check || waiting.size() < max_async_num ) && max_iter_num)
+    if ((!check || waiting_receival < max_async_num ) && max_iter_num)
     {
         auto cmd = new CommandDummy(cid, cnt++);
         MsgReqCmd msg(*cmd);
@@ -81,7 +79,8 @@ bool try_send(bool check = true) {
         HOTSTUFF_LOG_INFO("send new cmd %.10s",
                             get_hex(cmd->get_hash()).c_str());
 #endif
-        waiting.insert(std::make_pair(
+        waiting_receival++;
+        waiting_finalized.insert(std::make_pair(
             cmd->get_hash(), Request(cmd)));
         if (max_iter_num > 0)
             max_iter_num--;
@@ -92,23 +91,27 @@ bool try_send(bool check = true) {
 
 void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     auto &fin = msg.fin;
-    HOTSTUFF_LOG_INFO("got %s", std::string(msg.fin).c_str());
-    const uint256_t &cmd_hash = fin.cmd_hash;
-    auto it = waiting.find(cmd_hash);
-    auto &et = it->second.et;
-    if (it == waiting.end()) return;
-    et.stop();
-#ifndef HOTSTUFF_ENABLE_BENCHMARK
-    HOTSTUFF_LOG_INFO("fin %s has wall: %.3f, cpu: %.3f",
-                        std::string(fin).c_str(),
-                        et.elapsed_sec, et.cpu_elapsed_sec);
-#else
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
-#endif
+
+    if (fin.decision == 1) {
+        HOTSTUFF_LOG_INFO("got %s", std::string(msg.fin).c_str());
+        const uint256_t &cmd_hash = fin.cmd_hash;
+        auto it = waiting_finalized.find(cmd_hash);
+        auto &et = it->second.et;
+        if (it == waiting_finalized.end()) return;
+        et.stop();
+    #ifndef HOTSTUFF_ENABLE_BENCHMARK
+        HOTSTUFF_LOG_INFO("fin %s has wall: %.3f, cpu: %.3f",
+                            std::string(fin).c_str(),
+                            et.elapsed_sec, et.cpu_elapsed_sec);
+    #else
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
+    #endif
+        waiting_finalized.erase(it);
+    } // else, ignore print from intermediate decision
     usleep(10);
-    waiting.erase(it);
+    waiting_receival--;
     while (try_send());
 }
 
@@ -125,6 +128,7 @@ int main(int argc, char **argv) {
     auto opt_max_iter_num = Config::OptValInt::create(100);
     auto opt_max_async_num = Config::OptValInt::create(10);
     auto opt_cid = Config::OptValInt::create(-1);
+    auto opt_client_target = Config::OptValStr::create("global");
 
     auto shutdown = [&](int) { ec.stop(); };
     salticidae::SigEvent ev_sigint(ec, shutdown);
@@ -140,6 +144,7 @@ int main(int argc, char **argv) {
     config.add_opt("replica", opt_replicas, Config::APPEND);
     config.add_opt("iter", opt_max_iter_num, Config::SET_VAL);
     config.add_opt("max-async", opt_max_async_num, Config::SET_VAL);
+    config.add_opt("client-target", opt_client_target, Config::SET_VAL, 'x', "specify the replicas the client will communicate with (local, global)");
     config.parse(argc, argv);
     auto idx = opt_idx->get();
     max_iter_num = opt_max_iter_num->get();
@@ -165,7 +170,22 @@ int main(int argc, char **argv) {
 
     nfaulty = (replicas.size() - 1) / 3;
     HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
-    connect_all();
+    std::cout << "I am client with id = " << cid << std::endl;
+    
+
+    if(opt_client_target->get() == "local") {
+        // Connect client to same id replica only
+        conns.insert(std::make_pair(0, mn.connect_sync(replicas[cid])));
+    }
+    else if (opt_client_target->get() == "global") {
+        // Connect client to all replicas
+        for (size_t i = 0; i < replicas.size(); i++)
+            conns.insert(std::make_pair(i, mn.connect_sync(replicas[i])));
+    }
+    else {
+        throw std::invalid_argument("client-target must be either local or global");
+    }
+
     while (try_send());
     ec.dispatch();
 
