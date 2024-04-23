@@ -24,51 +24,57 @@ def str2datetime(s):
     dt = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S")
     return dt.replace(microsecond=int(parts[1]))
 
-
-def plot_thr(fname):
+def plot_thr(fname, x, y):
     import matplotlib.pyplot as plt
-    x = range(len(values))
-    y = values
-    plt.xlabel(r"time")
-    plt.ylabel(r"tx/sec")
+    plt.xlabel(r"time (s)")
+    plt.ylabel(r"average tx/sec")
     plt.plot(x, y)
-    plt.show()
+    plt.xlim(left=0)
+    plt.ylim(bottom=0)
     plt.savefig(fname)
+    plt.show()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--interval', type=float, default=1, required=False)
+    parser.add_argument('--blksize', type=float, required=True);
     parser.add_argument('--output', type=str, default="hist.png", required=False)
     parser.add_argument('--plot', action='store_true')
+    parser.add_argument('--file', type=str, required=True)
     args = parser.parse_args()
-    commit_pat = re.compile('([^[].*) \[hotstuff info\] ([0-9.]*)$')
+    commit_pat = re.compile('([^[].*) \[hotstuff proto\] commit (.*)')
     interval = args.interval
     begin_time = None
     next_begin_time = None
     cnt = 0
-    lats = []
     timestamps = []
     values = []
-    for line in sys.stdin:
-        m = commit_pat.match(line)
-        if m:
-            timestamps.append(str2datetime(m.group(1)))
-            lats.append(float(m.group(2)))
-    timestamps.sort()
-    for timestamp in timestamps:
-        if begin_time is None:
-            begin_time = timestamp
-            next_begin_time = timestamp + timedelta(seconds=interval)
-        while timestamp >= next_begin_time:
-            begin_time = next_begin_time
-            next_begin_time += timedelta(seconds=interval)
-            values.append(cnt)
-            cnt = 0
-        cnt += 1
-    values.append(cnt)
-    print(values)
-    print("lat = {:.3f}ms".format(sum(lats) / len(lats) * 1e3))
-    lats, _ = remove_outliers(lats)
-    print("lat = {:.3f}ms".format(sum(lats) / len(lats) * 1e3))
-    if args.plot:
-        plot_thr(args.output)
+    with open(args.file, 'r') as file:
+        lines = file.readlines()
+        for line in lines:
+            m = commit_pat.match(line)
+            if m:
+                timestamps.append(str2datetime(m.group(1)))
+        timestamps.sort()
+        for timestamp in timestamps:
+            if begin_time is None:
+                begin_time = timestamp
+                next_begin_time = begin_time + timedelta(seconds=interval)
+            while timestamp >= next_begin_time:
+                elapsed_time = (next_begin_time - begin_time).total_seconds()
+                values.append(cnt / elapsed_time)
+                begin_time = next_begin_time
+                next_begin_time += timedelta(seconds=interval)
+                cnt = 0
+            cnt += args.blksize
+        
+        # Add the final value after the loop ends
+        elapsed_time = (next_begin_time - begin_time).total_seconds()
+        values.append(cnt / elapsed_time)
+        
+        x = [i * interval for i in range(len(values))]
+        
+        print(values)
+        
+        if args.plot:
+            plot_thr(args.output, x, values)

@@ -63,12 +63,13 @@ using Net = salticidae::MsgNetwork<opcode_t>;
 std::unordered_map<ReplicaID, Net::conn_t> conns;
 size_t waiting_receival = 0;
 std::unordered_map<const uint256_t, Request> waiting_finalized;
+std::unordered_map<const uint256_t, Request> waiting;
 std::vector<NetAddr> replicas;
 std::vector<std::pair<struct timeval, double>> elapsed;
 Net mn(ec, Net::Config());
 
 bool try_send(bool check = true) {
-    if ((!check || waiting_receival < max_async_num ) && max_iter_num)
+    if ((!check || waiting.size() < max_async_num ) && max_iter_num)
     {
         auto cmd = new CommandDummy(cid, cnt++);
         MsgReqCmd msg(*cmd);
@@ -79,8 +80,10 @@ bool try_send(bool check = true) {
         HOTSTUFF_LOG_INFO("send new cmd %.10s",
                             get_hex(cmd->get_hash()).c_str());
 #endif
-        waiting_receival++;
         waiting_finalized.insert(std::make_pair(
+            cmd->get_hash(), Request(cmd)));
+
+        waiting.insert(std::make_pair(
             cmd->get_hash(), Request(cmd)));
         if (max_iter_num > 0)
             max_iter_num--;
@@ -91,16 +94,18 @@ bool try_send(bool check = true) {
 
 void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
     auto &fin = msg.fin;
+    //Ignore intermediate decisions
+    //HOTSTUFF_LOG_INFO("got %s", std::string(msg.fin).c_str());
 
-    if (fin.decision == 1) {
-        HOTSTUFF_LOG_INFO("got %s", std::string(msg.fin).c_str());
+    if(fin.decision == 1) {
         const uint256_t &cmd_hash = fin.cmd_hash;
         auto it = waiting_finalized.find(cmd_hash);
         auto &et = it->second.et;
         if (it == waiting_finalized.end()) return;
         et.stop();
+
     #ifndef HOTSTUFF_ENABLE_BENCHMARK
-        HOTSTUFF_LOG_INFO("fin %s has wall: %.3f, cpu: %.3f",
+        HOTSTUFF_LOG_INFO("got fin %s with wall: %.3f, cpu: %.3f",
                             std::string(fin).c_str(),
                             et.elapsed_sec, et.cpu_elapsed_sec);
     #else
@@ -108,10 +113,17 @@ void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
         gettimeofday(&tv, nullptr);
         elapsed.push_back(std::make_pair(tv, et.elapsed_sec));
     #endif
-        waiting_finalized.erase(it);
-    } // else, ignore print from intermediate decision
+
+        return;
+    }
+
+    const uint256_t &cmd_hash = fin.cmd_hash;
+    auto it = waiting.find(cmd_hash);
+    if (it == waiting.end()) return;
     usleep(10);
-    waiting_receival--;
+    
+    waiting_finalized.insert(*it);
+    waiting.erase(it);
     while (try_send());
 }
 

@@ -160,11 +160,12 @@ void HotStuffCore::update(const block_t &nblk) {
     HOTSTUFF_LOG_PROTO("blk: %s", std::string(*blk).c_str());
     HOTSTUFF_LOG_PROTO("Rest of blockchain *********************");
 
+    /** TODO: due to inplace Kauri pipeline system, this system needs to be reworked to keep in mind the pipeline gaps*/
     /* commit requires direct parent */
-    if (blk2->parents[0] != blk1 || blk1->parents[0] != blk) {
-        std::cout <<  "update: no direct parent for step 3 " <<  std::endl;
-        return;
-    }
+    // if (blk2->parents[0] != blk1 || blk1->parents[0] != blk) {
+    //     std::cout <<  "update: no direct parent for step 3 " <<  std::endl;
+    //     return;
+    // }
     
 #else
     /* two-step HotStuff */
@@ -206,7 +207,6 @@ void HotStuffCore::update(const block_t &nblk) {
         do_consensus(blk);
         LOG_PROTO("commit %s", std::string(*blk).c_str());
         decided_blk_counter++;
-        HOTSTUFF_LOG_PROTO("[CONSENSUS][Blk_Counter=%d] Reached consensus for blk %s", decided_blk_counter, get_hex(blk->hash).c_str()); 
         for (size_t i = 0; i < blk->cmds.size(); i++)
             do_decide(Finality(id, get_tree_id(), 1, i, blk->height,
                                 blk->cmds[i], blk->get_hash()));

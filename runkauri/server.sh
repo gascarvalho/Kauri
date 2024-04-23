@@ -80,7 +80,7 @@ sudo tc qdisc add dev eth0 root netem delay ${latency}ms limit 400000 rate ${ban
 
 sleep 25
 
-# Start Client on Host Machine
+# # Start Client on Host Machine
 # if [ ${id} == 0 ]; then
 #   gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -900 --max-async 900 > clientlog0 2>&1 &
 # fi

@@ -48,7 +48,7 @@ do
     docker stack deploy --with-registry-auth -c kauri-temp.yaml kauriservice &
      
     # Docker startup time 100s + 1*60s of experiment runtime
-    sleep 400
+    sleep 500
 
     replica_index=0
     # Collect and print results.
