@@ -10,10 +10,18 @@ pipelatency=$4
 latency=$5
 bandwidth=$6
 blocksize=$7
+nservices=$8
+myservice=$9
 
-# Get Service-name
-service="server-$KAURI_UUID"
-service1="server1-$KAURI_UUID"
+# If not provided, nservices is set to 2: internal and leaf node services
+if [ -z "$nservices" ]; then
+  nservices=2
+fi
+
+# If not provided, it means that it's a Kollaps experiment
+if [ -z "$KAURI_UUID" ]; then
+  KAURI_UUID=$KOLLAPS_UUID
+fi
 
 # Make sure correct branch is selected for crypto
 # cd MSc-Kauri && git pull && git submodule update --recursive --remote
@@ -31,37 +39,32 @@ i=0
 
 # Go through the list of servers of the given services to identify the number of servers and the id of this server.
 
-
-for ip in $(dig A $service1 +short | sort -u)
+for j in $(seq 1 $nservices)
 do
-  for myip in $(ifconfig -a | awk '$1 == "inet" {print $2}')
+  service="server$j-$KAURI_UUID"  
+  for ip in $(dig A $service +short | sort -u)
   do
-    if [ ${ip} == ${myip} ]
-    then
-      id=${i}
-      echo "This is: ${ip}"
-    fi
+    for myip in $(ifconfig -a | awk '$1 == "inet" {print $2}')
+    do
+      if [ ${ip} == ${myip} ]
+      then
+        id=${i}
+        echo "This is: ${ip}"
+      fi
+    done
+    ((i++))
   done
-  ((i++))
-done
-for ip in $(dig A $service +short | sort -u)
-do
-  for myip in $(ifconfig -a | awk '$1 == "inet" {print $2}')
-  do
-    if [ ${ip} == ${myip} ]
-    then
-      id=${i}
-      echo "This is: ${ip}"
-    fi
-  done
-  ((i++))
 done
 
 sleep 20
 
-# Store all services in the list of IPs (first internal nodes then the leaf nodes)
-dig A $service1 +short | sort -u | sed -e 's/$/ 1/' > ips
-dig A $service +short | sort -u | sed -e 's/$/ 1/' >> ips
+# Store all services in the list of IPs, from smallest id service (e.g. first internal nodes then the leaf nodes)
+touch ips
+for j in $(seq 1 $nservices)
+do
+  service="server$j-$KAURI_UUID"
+  dig A $service +short | sort -u | sed -e 's/$/ 1/' >> ips
+done
 
 sleep 5
 
@@ -70,10 +73,14 @@ python3 scripts/gen_conf.py --ips "ips" --crypto $crypto --fanout $fanout --pipe
 
 sleep 20
 
-echo "Starting Application: #${i}"
+echo "Starting Application: #${id}" > log${id}
+
+if ! [ -z "$myservice" ]; then
+  echo "My Kollaps service is ${myservice}" >> log${id}
+fi
 
 # Startup Kauri
-gdb -ex r -ex bt -ex q --args ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf > log${id} 2>&1 &
+gdb -ex r -ex bt -ex q --args ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >> log${id} 2>&1 &
 
 sleep 40
 

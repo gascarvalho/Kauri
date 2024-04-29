@@ -778,6 +778,7 @@ HotStuffBase::HotStuffBase(uint32_t blk_size,
 }
 
 void HotStuffBase::do_broadcast_proposal(const Proposal &prop) {
+    //HOTSTUFF_LOG_PROTO("Broadcasting proposal of size %llu bytes.", sizeof(prop));
     auto childPeers = current_tree_network.get_childPeers();
     pn.multicast_msg(MsgPropose(prop), std::vector(childPeers.begin(), childPeers.end()));
 }

@@ -5,7 +5,7 @@ trap "docker stack rm kauriservice" EXIT
 FILENAME=kauri.yaml
 EXPORT_FILENAME=kauri-temp.yaml
 
-ORIGINAL_STRING=thecmd
+COMMAND_STRING=thecmd
 QTY1_STRING=theqty1
 QTY2_STRING=theqty2
 
@@ -33,7 +33,7 @@ do
   echo $LINE
   IFS=':' read -ra split <<< "$LINE"
 
-  sed  "s/${ORIGINAL_STRING}/${split[0]}/g" $FILENAME > $EXPORT_FILENAME
+  sed  "s/${COMMAND_STRING}/${split[0]}/g" $FILENAME > $EXPORT_FILENAME
   sed  -i "s/${QTY1_STRING}/${split[1]}/g" $EXPORT_FILENAME
   sed  -i "s/${QTY2_STRING}/${split[2]}/g" $EXPORT_FILENAME
 

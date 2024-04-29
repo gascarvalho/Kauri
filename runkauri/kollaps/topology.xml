@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<experiment boot="kollaps:2.0">
+    <services>
+        <!-- definition of the services (containers),  -->
+        <!-- kollaps dashboard to controll the experiments, should be present in all deployments -->
+        <service name="dashboard" image="kollaps/dashboard:1.0" supervisor="true" port="8088"/>
+
+        <!-- the "command" can be used to pass parameters to the container entrypoints.
+             Currently it represents:
+             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services] -->
+
+        <!-- Each Kauri server service definition will have a different performance to a different region switch 
+             This way, we can represent different "clusters" -->
+        <service name="server1" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','7','1']"/>
+        <service name="server2" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','7','2']"/>
+        <service name="server3" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','7','3']"/>
+        <service name="server4" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','7','4']"/>
+        <service name="server5" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','7','5']"/>
+        <service name="server6" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','7','6']"/>
+        <service name="server7" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','7','7']"/>
+    </services>
+    <bridges>
+        <!-- Definition of the network elements (routers and switches) -->
+        <!-- Bridge == switch -->
+        <bridge name="C1"/>
+        <bridge name="C2"/>
+        <bridge name="C3"/>
+        <bridge name="C4"/>
+        <bridge name="C5"/>
+        <bridge name="C6"/>
+        <bridge name="C7"/>
+    </bridges>
+    <links>
+        <!-- Intra-cluster behaviour (should be much better than inter) -->
+        <link origin="C1" dest="server1" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+        <link origin="C2" dest="server2" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+        <link origin="C3" dest="server3" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+        <link origin="C4" dest="server4" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+        <link origin="C5" dest="server5" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+        <link origin="C6" dest="server6" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+        <link origin="C7" dest="server7" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+
+        <!-- Inter-cluster behaviour -->
+        <link origin="C1" dest="C2" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C3" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C4" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C5" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C6" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C7" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+
+        <link origin="C2" dest="C3" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C4" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C5" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C6" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C7" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+
+        <link origin="C3" dest="C4" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+        <link origin="C3" dest="C5" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+        <link origin="C3" dest="C6" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
+        <link origin="C3" dest="C7" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
+
+        <link origin="C4" dest="C5" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C4" dest="C6" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C4" dest="C7" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        
+        <link origin="C5" dest="C6" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C5" dest="C7" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+
+        <link origin="C6" dest="C7" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+    </links>
+    <dynamic>
+        <!-- schedulle the dynamics of the experiment. These apply to services and links, see documentation for more details.
+             This section can be ommited in which case all the services will be started at the beginning of the experiment -->
+
+        <!-- were we start three instances of the "server" service -->
+        <schedule name="server1"  time="0.0" action="join" amount="1"/>
+        <schedule name="server2"  time="0.0" action="join" amount="1"/>
+        <schedule name="server3"  time="0.0" action="join" amount="1"/>
+        <schedule name="server4"  time="0.0" action="join" amount="1"/>
+        <schedule name="server5"  time="0.0" action="join" amount="1"/>
+        <schedule name="server6"  time="0.0" action="join" amount="1"/>
+        <schedule name="server7"  time="0.0" action="join" amount="1"/>
+
+        <schedule name="server1"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server2"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server3"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server4"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server5"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server6"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server7"  time="380.0" action="leave" amount="1"/>
+    </dynamic>
+</experiment>
