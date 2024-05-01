@@ -7,7 +7,7 @@
 
         <!-- the "command" can be used to pass parameters to the container entrypoints.
              Currently it represents:
-             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services] -->
+             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
 
         <!-- Each Kauri server service definition will have a different performance to a different region switch 
              This way, we can represent different "clusters" -->
@@ -32,41 +32,41 @@
     </bridges>
     <links>
         <!-- Intra-cluster behaviour (should be much better than inter) -->
-        <link origin="C1" dest="server1" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
-        <link origin="C2" dest="server2" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
-        <link origin="C3" dest="server3" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
-        <link origin="C4" dest="server4" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
-        <link origin="C5" dest="server5" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
-        <link origin="C6" dest="server6" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
-        <link origin="C7" dest="server7" latency="1" upload="200Mbps" download="200Mbps" network="kauri_network"/>
+        <link origin="C1" dest="server1" latency="1" upload="300Mbps" download="300Mbps" network="kauri_network"/>
+        <link origin="C2" dest="server2" latency="1" upload="300Mbps" download="300Mbps" network="kauri_network"/>
+        <link origin="C3" dest="server3" latency="1" upload="300Mbps" download="300Mbps" network="kauri_network"/>
+        <link origin="C4" dest="server4" latency="1" upload="300Mbps" download="300Mbps" network="kauri_network"/>
+        <link origin="C5" dest="server5" latency="1" upload="300Mbps" download="300Mbps" network="kauri_network"/>
+        <link origin="C6" dest="server6" latency="1" upload="300Mbps" download="300Mbps" network="kauri_network"/>
+        <link origin="C7" dest="server7" latency="1" upload="300Mbps" download="300Mbps" network="kauri_network"/>
 
         <!-- Inter-cluster behaviour -->
-        <link origin="C1" dest="C2" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
-        <link origin="C1" dest="C3" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
-        <link origin="C1" dest="C4" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
-        <link origin="C1" dest="C5" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
-        <link origin="C1" dest="C6" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
-        <link origin="C1" dest="C7" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C2" latency="18" upload="150Mbps" download="150Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C3" latency="18" upload="150Mbps" download="150Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C4" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C5" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C6" latency="200" upload="16Mbps" download="16Mbps" network="kauri_network"/>
+        <link origin="C1" dest="C7" latency="200" upload="16Mbps" download="16Mbps" network="kauri_network"/>
 
-        <link origin="C2" dest="C3" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
-        <link origin="C2" dest="C4" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
-        <link origin="C2" dest="C5" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
-        <link origin="C2" dest="C6" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
-        <link origin="C2" dest="C7" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C3" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C4" latency="18" upload="150Mbps" download="150Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C5" latency="18" upload="150Mbps" download="150Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C6" latency="200" upload="16Mbps" download="16Mbps" network="kauri_network"/>
+        <link origin="C2" dest="C7" latency="200" upload="16Mbps" download="16Mbps" network="kauri_network"/>
 
-        <link origin="C3" dest="C4" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
-        <link origin="C3" dest="C5" latency="150" upload="32Mbps" download="32Mbps" network="kauri_network"/>
-        <link origin="C3" dest="C6" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
-        <link origin="C3" dest="C7" latency="22" upload="130Mbps" download="130Mbps" network="kauri_network"/>
+        <link origin="C3" dest="C4" latency="200" upload="16Mbps" download="16Mbps" network="kauri_network"/>
+        <link origin="C3" dest="C5" latency="200" upload="16Mbps" download="16Mbps" network="kauri_network"/>
+        <link origin="C3" dest="C6" latency="18" upload="150Mbps" download="150Mbps" network="kauri_network"/>
+        <link origin="C3" dest="C7" latency="18" upload="150Mbps" download="150Mbps" network="kauri_network"/>
 
-        <link origin="C4" dest="C5" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
-        <link origin="C4" dest="C6" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
-        <link origin="C4" dest="C7" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C4" dest="C5" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
+        <link origin="C4" dest="C6" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
+        <link origin="C4" dest="C7" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
         
-        <link origin="C5" dest="C6" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
-        <link origin="C5" dest="C7" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C5" dest="C6" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
+        <link origin="C5" dest="C7" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
 
-        <link origin="C6" dest="C7" latency="66" upload="75Mbps" download="75Mbps" network="kauri_network"/>
+        <link origin="C6" dest="C7" latency="100" upload="50Mbps" download="50Mbps" network="kauri_network"/>
     </links>
     <dynamic>
         <!-- schedulle the dynamics of the experiment. These apply to services and links, see documentation for more details.

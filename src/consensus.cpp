@@ -313,7 +313,8 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
 }
 
 void HotStuffCore::on_receive_proposal(const Proposal &prop) {
-    LOG_PROTO("[CONSENSUS] Got PROPOSAL in tid=%d: %s", prop.tid, std::string(prop).c_str());
+    LOG_PROTO("[CONSENSUS] Got PROPOSAL in tid=%d: %s %s", prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
+
     block_t bnew = prop.blk;
     sanity_check_delivered(bnew);
     update(bnew);
@@ -372,12 +373,13 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
 }
 
 void HotStuffCore::on_receive_vote(const Vote &vote) {
-    // In current implementation, only the proposer's vote uses this function
-    LOG_PROTO("[CONSENSUS] Applying own vote in tid=%d: %s", vote.tid, std::string(vote).c_str());
     LOG_PROTO("y now state: %s", std::string(*this).c_str());
 
     block_t blk = get_delivered_blk(vote.blk_hash);
     assert(vote.cert);
+
+    // In current implementation, only the proposer's vote uses this function
+    LOG_PROTO("[CONSENSUS] Applying own vote in tid=%d: %s %s", vote.tid, std::string(vote).c_str(), std::string(*blk).c_str());
 
     if (!blk->voted.insert(vote.voter).second)
     {

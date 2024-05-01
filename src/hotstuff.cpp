@@ -238,6 +238,18 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         }
     }
 
+    /** Edge-case: 
+     * Received a valid propose from a valid proposer in their system tree (passes propose handler safety checks)
+     * However, it has arrived earlier than lower height blocks that would trigger a reconfiguration into the new tree
+     * Solution: wait for the system to process missing blocks and reconfigure
+    */
+
+    if(prop.tid != get_tree_id()) {
+        LOG_PROTO("[CONSENSUS] Proposal from future tree. Waiting for reconfiguration to complete.");
+        pending_proposals.emplace_back(std::move(msg), conn);
+        return;
+    }
+
     block_t blk = prop.blk;
     if (!blk) return;
 
@@ -246,6 +258,24 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     }).then([this, prop = std::move(prop)]() {
         on_receive_proposal(prop);
     });
+
+    /** We can resume pending proposals assuming previous proposal triggered tree switch */
+    while(!pending_proposals.empty()) {
+        auto pending_proposal = std::move(pending_proposals.front());
+        pending_proposals.erase(pending_proposals.begin());
+
+        auto &pending_prop = pending_proposal.first.proposal;
+        block_t pending_blk = pending_prop.blk;
+        if (!pending_blk) return;
+
+        const PeerId &pending_peer = pending_proposal.second->get_peer_id();
+
+        promise::all(std::vector<promise_t>{
+            async_deliver_blk(pending_blk->get_hash(), pending_peer)
+        }).then([this, pending_prop = std::move(pending_prop)]() {
+            on_receive_proposal(pending_prop);
+        });
+    }
 }
 
 void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
@@ -814,7 +844,7 @@ void HotStuffBase::do_vote(Proposal prop, const Vote &vote) {
             //HOTSTUFF_LOG_PROTO("send vote");
             if(!parentPeer.is_null())  {
 
-                HOTSTUFF_LOG_PROTO("[CONSENSUS] Sending VOTE in tid=%d to ReplicaId %d", msg_tree_id, peer_id_map.at(parentPeer));
+                HOTSTUFF_LOG_PROTO("[CONSENSUS] Sending VOTE in tid=%d to ReplicaId %d for block %s", msg_tree_id, peer_id_map.at(parentPeer), std::string(*prop.blk).c_str());
                 pn.send_msg(MsgVote(vote), parentPeer);
             }
         } else {
@@ -985,7 +1015,7 @@ bool HotStuffBase::isTreeSwitch(int bheight) {
         lastCheckedHeight = bheight;
     }
     
-    return bheight == current_tree_network.get_target();
+    return lastCheckedHeight == current_tree_network.get_target();
 }
 
 void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop) {
@@ -1012,7 +1042,9 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
     if (ec_loop)
         ec.dispatch();
 
-    cmd_pending_buffer.reserve(blk_size);
+    max_cmd_pending_size = blk_size * 100; // Hold up till 100 block worth of commands
+    final_buffer.reserve(blk_size);
+    cmd_pending_buffer.reserve(max_cmd_pending_size);
     cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
         std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
         while (q.try_dequeue(e))
@@ -1029,7 +1061,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
             }
 
             // Check if the command has already been processed or is waiting to be processed
-            if (cmd_pending_buffer.size() < blk_size && final_buffer.empty()) {
+            if (cmd_pending_buffer.size() < max_cmd_pending_size) {
                 const auto &cmd_hash = e.first;
                 auto it = decision_waiting.find(cmd_hash);
 
@@ -1044,21 +1076,24 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
                 if (it == decision_waiting.end())
                     it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
                 
-                // Reply with -3 if we're proposer and now the command is pending
+                // Reply with -3 if we're proposer and now the command is now pending
                 e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
                 cmd_pending_buffer.push_back(cmd_hash);
             } 
             else {
-                // Reply with -4 otherwise
+                // Reply with -4 otherwise (max pending size reached, command won't be processed, client must resubmit if they wish)
                 e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
             }
 
             // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
             if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
 
-                if (final_buffer.empty())
-                {
-                    final_buffer = std::move(cmd_pending_buffer);
+                // Pass a block of commands to the final buffer
+                if (final_buffer.empty()) {
+                    std::move(std::make_move_iterator(cmd_pending_buffer.begin()), 
+                              std::make_move_iterator(cmd_pending_buffer.begin() + blk_size), std::back_inserter(final_buffer));
+                    cmd_pending_buffer.erase(cmd_pending_buffer.begin(), cmd_pending_buffer.begin() + blk_size);
+                    HOTSTUFF_LOG_PROTO("Filled Propose Final Buffer (%lu commands); Commands Still Pending: %lu", final_buffer.size(), cmd_pending_buffer.size());
                 }
 
                 beat();
@@ -1073,7 +1108,7 @@ void HotStuffBase::beat() {
     
     /** Ask pmaker to know if we're a proposer or not. If we are, we propose */
 
-    pmaker->beat().then([this, cmds = std::move(final_buffer)](ReplicaID proposer) {
+    pmaker->beat().then([this](ReplicaID proposer) {
         if (piped_queue.size() > get_config().async_blocks + 1) {
             return;
         }
@@ -1105,7 +1140,7 @@ void HotStuffBase::beat() {
                     if (parents[0]->height < highest->height) {
                         parents.insert(parents.begin(), highest);
                     }
-
+                    auto cmds = std::move(final_buffer);
                     block_t piped_block = storage->add_blk(new Block(parents, cmds,
                                                              hqc.second->clone(), bytearray_t(),
                                                              parents[0]->height + 1,
@@ -1138,6 +1173,7 @@ void HotStuffBase::beat() {
                 }
             } else {
                 gettimeofday(&last_block_time, NULL);
+                auto cmds = std::move(final_buffer);
                 on_propose(cmds, std::move(parents));
             }
         }

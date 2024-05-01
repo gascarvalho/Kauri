@@ -304,6 +304,7 @@ class HotStuffBase: public HotStuffCore {
     using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
     cmd_queue_t cmd_pending;
     std::vector<uint256_t> cmd_pending_buffer;
+    uint64_t max_cmd_pending_size;
     std::vector<uint256_t> final_buffer;
 
     /* statistics */
@@ -336,7 +337,8 @@ class HotStuffBase: public HotStuffCore {
     std::unordered_map<size_t, TreeNetwork> system_trees;
     mutable TreeNetwork current_tree_network;
     mutable Tree current_tree;
-    size_t lastCheckedHeight;
+    uint32_t lastCheckedHeight;
+    std::vector<std::pair<MsgPropose, Net::conn_t>>  pending_proposals;
 
     /* communication */
 

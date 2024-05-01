@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<experiment boot="kollaps:2.0">
+    <services>
+        <!-- definition of the services (containers),  -->
+        <!-- kollaps dashboard to controll the experiments, should be present in all deployments -->
+        <service name="dashboard" image="kollaps/dashboard:1.0" supervisor="true" port="8088"/>
+
+        <!-- the "command" can be used to pass parameters to the container entrypoints.
+             Currently it represents:
+             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
+
+        <service name="server1" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','1']"/>
+        <service name="server2" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','2']"/>
+        <service name="server3" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','3']"/>
+    </services>
+    <bridges>
+        <!-- Definition of the network elements (routers and switches) -->
+        <!-- Bridge == switch -->
+    </bridges>
+    <links>
+        <!-- Intra-cluster behaviour (should be much better than inter) -->
+        <link origin="server1" dest="server1" latency="1" upload="500Mbps" download="500Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server2" latency="1" upload="500Mbps" download="500Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server3" latency="1" upload="500Mbps" download="500Mbps" network="kauri_network"/>
+
+        <!-- Inter-cluster behaviour -->
+        <link origin="server1" dest="server2" latency="60" upload="30Mbps" download="30Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server3" latency="200" upload="5Mbps" download="5Mbps" network="kauri_network"/>
+
+        <link origin="server2" dest="server3" latency="60" upload="30Mbps" download="30Mbps" network="kauri_network"/>
+
+      
+    </links>
+    <dynamic>
+        <!-- schedulle the dynamics of the experiment. These apply to services and links, see documentation for more details.
+             This section can be ommited in which case all the services will be started at the beginning of the experiment -->
+
+        <!-- were we start three instances of the "server" service -->
+        <schedule name="server1"  time="0.0" action="join" amount="5"/>
+        <schedule name="server2"  time="0.0" action="join" amount="5"/>
+        <schedule name="server3"  time="0.0" action="join" amount="5"/>
+
+        <schedule name="server1"  time="380.0" action="leave" amount="5"/>
+        <schedule name="server2"  time="380.0" action="leave" amount="5"/>
+        <schedule name="server3"  time="380.0" action="leave" amount="5"/>
+    </dynamic>
+</experiment>

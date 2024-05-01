@@ -316,7 +316,7 @@ public:
             PaceMakerDummy(parent_limit),
             base_timeout(10),
             timeout(10),
-            prop_delay(prop_delay),
+            prop_delay(0),
             ec(std::move(ec)), proposer(0), 
             current_tid(0) {}
 
