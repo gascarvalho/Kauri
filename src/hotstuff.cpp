@@ -224,8 +224,9 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     auto childPeers = msg_tree.get_childPeers();
     auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
-    /* Has to be the proposer of its tree AND additionally has to be the CURRENT proposer! */
-    if (prop.proposer != tree_proposer && is_proposer(prop.proposer)) {
+    /* A VALID proposal has to be from the respective tree's AND additionally has to be the CURRENT proposer. 
+    This catches the case where it is neither. */
+    if (prop.proposer != tree_proposer && !is_proposer(prop.proposer)) {
         HOTSTUFF_LOG_PROTO("PROPOSAL RECEIVED FROM NON-PROPOSER REPLICA!");
         HOTSTUFF_LOG_PROTO("Proposal from: %d but current tree's proposer is: %llu", prop.proposer, current_tree.get_tree_root());
         return;
@@ -238,14 +239,14 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         }
     }
 
-    /** Edge-case: 
+    /** Edge-case: Valid tree proposer but not the current tree proposer
      * Received a valid propose from a valid proposer in their system tree (passes propose handler safety checks)
      * However, it has arrived earlier than lower height blocks that would trigger a reconfiguration into the new tree
      * Solution: wait for the system to process missing blocks and reconfigure
     */
 
     if(prop.tid != get_tree_id()) {
-        LOG_PROTO("[CONSENSUS] Proposal from future tree. Waiting for reconfiguration to complete.");
+        LOG_PROTO("[PROP HANDLER] Proposal from future tree: %s Waiting for reconfiguration to complete.", std::string(prop).c_str());
         pending_proposals.emplace_back(std::move(msg), conn);
         return;
     }
@@ -262,6 +263,12 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     /** We can resume pending proposals assuming previous proposal triggered tree switch */
     while(!pending_proposals.empty()) {
         auto pending_proposal = std::move(pending_proposals.front());
+
+        if(pending_proposal.first.proposal.tid != get_tree_id()) {
+            return;
+        }
+
+        LOG_PROTO("[PROP HANDLER] Popping pending proposal: %s", std::string(pending_proposal.first.proposal).c_str());
         pending_proposals.erase(pending_proposals.begin());
 
         auto &pending_prop = pending_proposal.first.proposal;
@@ -817,8 +824,8 @@ void HotStuffBase::inc_time(bool force) {
     pmaker->inc_time(force);
 }
 
-bool HotStuffBase::is_proposer(int id) {
-    return id == pmaker->get_proposer();
+bool HotStuffBase::is_proposer(int rid) {
+    return rid == pmaker->get_proposer();
 }
 
 void HotStuffBase::proposer_base_deliver(const block_t &blk) {
