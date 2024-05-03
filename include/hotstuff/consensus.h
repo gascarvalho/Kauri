@@ -482,6 +482,8 @@ struct VoteRelay: public Serializable {
         uint32_t tid;
         /** Fanout of the tree */
         uint8_t fanout;
+        /** Pipeline-stretch to use with tree*/
+        uint8_t pipe_stretch;
         /** List containing node arrangement*/
         std::vector<uint32_t> tree_array;
 
@@ -489,9 +491,11 @@ struct VoteRelay: public Serializable {
         Tree() = default;
         Tree(const uint32_t tid,
             const uint8_t fanout,
+            const uint8_t pipe_stretch,
             const std::vector<uint32_t> &tree_array):
         tid(tid),
-        fanout(fanout), 
+        fanout(fanout),
+        pipe_stretch(pipe_stretch), 
         tree_array(tree_array) {}
 
 
@@ -504,6 +508,11 @@ struct VoteRelay: public Serializable {
          * Returns the tree fanout
         */
         const uint8_t &get_fanout() const { return fanout; }
+
+        /**
+         * Returns the tree pipeline-stretch
+        */
+        const uint8_t &get_pipeline_stretch() const { return pipe_stretch; }
 
         /**
          * Returns the tree array list
@@ -528,7 +537,7 @@ struct VoteRelay: public Serializable {
 
 
         void serialize(DataStream &s) const override {
-            s << tid << fanout;
+            s << tid << fanout << pipe_stretch;
 
             // Serialize the vector
             s << htole((uint32_t)tree_array.size());
@@ -537,7 +546,7 @@ struct VoteRelay: public Serializable {
         }
 
         void unserialize(DataStream &s) override {
-            s >> tid >> fanout;
+            s >> tid >> fanout >> pipe_stretch;
 
             // Unserialize the vector
             uint32_t n;
@@ -563,6 +572,7 @@ struct VoteRelay: public Serializable {
               << "tid=" << std::to_string(tid) << " " 
               << "tree_size=" << std::to_string(tree_array.size()) << " "
               << "fanout=" << std::to_string(fanout) << " "
+              << "pipe_stretch=" << std::to_string(pipe_stretch) << " "
               << "root_node=" << std::to_string(tree_array[0]) << ">";
             return s;
         }

@@ -39,7 +39,7 @@ const double ent_waiting_timeout = 10;
 const double double_inf = 1e10;
 
 
-/** Struct that keeps the network information of its tree */
+/** Struct that keeps the node's relative network information of a tree */
 struct TreeNetwork {
 
     /** While a Tree is the same for every replica,
@@ -61,7 +61,7 @@ struct TreeNetwork {
                 const uint16_t myReplicaId) : tree(t) {
 
 
-        info << "\tMy id: " << std::to_string(myReplicaId) << "\n";
+        info << "\tTree Data: " << std::string(t) << "\n";
 
         auto tree_array = tree.get_tree_array();
         auto fanout = tree.get_fanout();
@@ -70,8 +70,6 @@ struct TreeNetwork {
         // Find my position in the tree
         auto it = std::find(tree_array.begin(), tree_array.end(), myReplicaId);
         auto my_idx = std::distance(tree_array.begin(), it);
-
-        info << "\tTID: " << std::to_string(t.get_tid()) << "\n";
 
         // Parent Peer (if any)
         if (my_idx != 0) {
@@ -84,6 +82,7 @@ struct TreeNetwork {
         else
             info << "\tI have no parent (am root)\n";
 
+        std::string tmp = "\tMy children are: ";
         // Add every possible child, considering fanout
         for(auto i = 1; i <= fanout; i++) {
             auto child_idx = fanout * my_idx + i;
@@ -93,20 +92,26 @@ struct TreeNetwork {
                 auto child_cert_hash = std::move(std::get<2>(replicas[tree_array[child_idx]]));
                 salticidae::PeerId child_peer{child_cert_hash};
                 childPeers.insert(child_peer);
-                info << "\tI have child: " << std::to_string(tree_array[child_idx]) << "\n";
+                tmp.append(std::to_string(tree_array[child_idx])).append(", ");
             }
         }
 
-        if(childPeers.size() == 0)
+        if(childPeers.size() == 0) {
             info << "\tI have no children\n";
+        }
+        else {
+            tmp = tmp.substr(0, tmp.size()-2);
+            info << tmp << "\n";
+        }
 
         // Store remainder state
 
         numberOfChildren = countChildren(my_idx, size);
         info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
         
-
         myTreeId = my_idx;
+        info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
+        info << "\tMy ID in the tree: " << std::to_string(myTreeId) << "\n";
 
     }
 

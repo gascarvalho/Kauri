@@ -901,7 +901,6 @@ void HotStuffBase::tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint25
      * Each subsequent tree will be shifted by 1 to the left.
     */
     if(config.treegen_algo == "default") {
-        size_t fanout = config.fanout;
         size_t system_size = replicas.size();
 
         /* A tree for each replica, where they are the proposer */
@@ -912,12 +911,18 @@ void HotStuffBase::tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint25
                 new_tree_array.push_back(((i + tid) % system_size));
             }
 
-            system_trees[tid] = TreeNetwork(Tree(tid, fanout, new_tree_array), std::move(replicas), id);
+            // This algorithm assumes constant fanout and pipeline-stretch
+            system_trees[tid] = TreeNetwork(Tree(tid, config.fanout, config.async_blocks, new_tree_array), 
+                                            std::move(replicas), id);
         }
     }
 
     /** File algorithm will obtain the trees from a file.
-     * File trees are formatted so that every line is the sequential ids of a tree
+     * File trees are formatted so:
+     * - 1st arg: fan:m where m is the tree's fanout
+     * - 2nd arg: pipe:k where k is the tree's pipeline-stretch 
+     * - Remainder of line: sequential ids of tree's replicas
+     * 
      * Each line is a new TID
      * TIDs are attributted in order from 0 to N
     */
@@ -933,14 +938,39 @@ void HotStuffBase::tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint25
 
         while (std::getline(file, line)) {
             std::istringstream iss(line);
+            std::string tmp;
+            std::string delimiter = ":";
+            std::string token;
             std::vector<uint32_t> new_tree_array;
             uint32_t replica_id;
+            uint8_t fanout;
+            uint8_t pipe_stretch;
+
+            /* Fanout */
+            iss >> tmp;
+            token = tmp.substr(0, tmp.find(delimiter));
+            if(token == "fan") {
+                fanout = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
+            }
+            else {
+                throw std::runtime_error("tree_config: Provided treegen file has invalid tree fanout!");
+            }
+
+            /* Pipeline Stretch */
+            iss >> tmp;
+            token = tmp.substr(0, tmp.find(delimiter));
+            if(token == "pipe") {
+                pipe_stretch = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
+            }
+            else {
+                throw std::runtime_error("tree_config: Provided treegen file has invalid tree pipeline-stretch!");
+            }
 
             while (iss >> replica_id) {
                 new_tree_array.push_back(replica_id);
             }
 
-            system_trees[tid] = TreeNetwork(Tree(tid, config.fanout, new_tree_array), std::move(replicas), id);
+            system_trees[tid] = TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id);
             tid++;
         }
     }
@@ -1002,15 +1032,17 @@ void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     }
 
     /* Update the current tree */
-    
     offset = get_pace_maker()->get_current_tid();
     current_tree_network = system_trees[offset];
     current_tree = current_tree_network.get_tree();
 
+    /* Adjust fanout and pipeline stretch accordingly */
+    config.async_blocks = current_tree.get_pipeline_stretch();
+    config.fanout = current_tree.get_fanout();
+
     /* Set when the tree will change */
     current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
-    // std::cout << std::string(str) << std::endl;
     HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
     HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());
 
@@ -1049,7 +1081,8 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
     if (ec_loop)
         ec.dispatch();
 
-    max_cmd_pending_size = blk_size * 100; // Hold up till 100 block worth of commands
+    //max_cmd_pending_size = blk_size * 100; // Hold up till 100 block worth of commands
+    max_cmd_pending_size = blk_size; // Hold up till 1 block worth of commands
     final_buffer.reserve(blk_size);
     cmd_pending_buffer.reserve(max_cmd_pending_size);
     cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
