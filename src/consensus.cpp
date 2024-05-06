@@ -505,7 +505,7 @@ void HotStuffCore::on_qc_finish(const block_t &blk) {
             first = false;
         }
 
-        HOTSTUFF_LOG_PROTO("async_qc_finish %s", blk->get_hash().to_hex().c_str());
+        HOTSTUFF_LOG_PROTO("on_qc_finish %.10s", blk->get_hash().to_hex().c_str());
 
         it->second.resolve();
         qc_waiting.erase(it);

@@ -232,7 +232,37 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         return;
     }
 
+    LOG_PROTO("[PROP HANDLER] Got PROPOSAL in tid=%d: %s %s", prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
+
+    /** We can resume pending proposals assuming previous proposal triggered tree switch */
+    while(!pending_proposals.empty()) {
+        auto pending_proposal = std::move(pending_proposals.front());
+
+        if(pending_proposal.first.proposal.tid != get_tree_id()) {
+            break;
+        }
+
+        LOG_PROTO("[PROP HANDLER] Popping pending proposal: %s", std::string(pending_proposal.first.proposal).c_str());
+        pending_proposals.erase(pending_proposals.begin());
+
+        auto &pending_prop = pending_proposal.first.proposal;
+        block_t pending_blk = pending_prop.blk;
+        if (!pending_blk){
+            LOG_PROTO("[PROP HANDLER] Pending block is null!");
+            break;
+        }
+
+        const PeerId &pending_peer = pending_proposal.second->get_peer_id();
+
+        promise::all(std::vector<promise_t>{
+            async_deliver_blk(pending_blk->get_hash(), pending_peer)
+        }).then([this, pending_prop = std::move(pending_prop)]() {
+            on_receive_proposal(pending_prop);
+        });
+    }
+
     if (!childPeers.empty()) {
+        LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in tid=%d", prop.tid);
         MsgPropose relay = MsgPropose(stream, true);
         for (const PeerId &peerId : childPeers) {
             pn.send_msg(relay, peerId);
@@ -273,7 +303,10 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
 
         auto &pending_prop = pending_proposal.first.proposal;
         block_t pending_blk = pending_prop.blk;
-        if (!pending_blk) return;
+        if (!pending_blk){
+            LOG_PROTO("[PROP HANDLER] Pending block is null!");
+            return;
+        }
 
         const PeerId &pending_peer = pending_proposal.second->get_peer_id();
 
@@ -283,6 +316,7 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
             on_receive_proposal(pending_prop);
         });
     }
+
 }
 
 void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
@@ -490,15 +524,39 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
             piped_queue.pop_front();
             HOTSTUFF_LOG_PROTO("Reset Piped block");
 
+            auto curr_blk = blk;
             if (!rdy_queue.empty()) {
-                auto curr_blk = blk;
-                bool foundChildren = true;
+                HOTSTUFF_LOG_PROTO("Resolving rdy queue (case 1)");
+
+                bool frontsMatch = true;
+                while(frontsMatch && !rdy_queue.empty()) {
+                    if(rdy_queue.front() == piped_queue.front()) {
+                        HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
+                        rdy_queue.pop_front();
+                        piped_queue.pop_front();
+
+                        update_hqc(blk, blk->self_qc);
+                        on_qc_finish(blk);
+                    }
+                    else {
+                        frontsMatch = false;
+                    }
+                }
+
+                bool foundChildren;
+                if(rdy_queue.empty()) {
+                    foundChildren = false; // Job is done
+                }
+                else {
+                    foundChildren = true;
+                }
+
                 while (foundChildren) {
                     foundChildren = false;
                     for (const auto &hash : rdy_queue) {
                         block_t rdy_blk = storage->find_blk(hash);
                         if (rdy_blk->get_parent_hashes()[0] == curr_blk->hash) {
-                            HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %s", hash.to_hex().c_str());
+                            HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
                             rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
                             piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
 
@@ -597,15 +655,39 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                     update_hqc(blk, cert);
                     on_qc_finish(blk);
 
+                    auto curr_blk = blk;
                     if (!rdy_queue.empty()) {
-                        auto curr_blk = blk;
-                        bool foundChildren = true;
+                        HOTSTUFF_LOG_PROTO("Resolving rdy queue (case 2)");
+
+                        bool frontsMatch = true;
+                        while(frontsMatch && !rdy_queue.empty()) {
+                            if(rdy_queue.front() == piped_queue.front()) {
+                                HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
+                                rdy_queue.pop_front();
+                                piped_queue.pop_front();
+
+                                update_hqc(blk, blk->self_qc);
+                                on_qc_finish(blk);
+                            }
+                            else {
+                                frontsMatch = false;
+                            }
+                        }
+
+                        bool foundChildren;
+                        if(rdy_queue.empty()) {
+                            foundChildren = false; // Job is done
+                        }
+                        else {
+                            foundChildren = true;
+                        }
+
                         while (foundChildren) {
                             foundChildren = false;
                             for (const auto &hash : rdy_queue) {
                                 block_t rdy_blk = storage->find_blk(hash);
                                 if (rdy_blk->get_parent_hashes()[0] == curr_blk->hash) {
-                                    HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %s", hash.to_hex().c_str());
+                                    HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
                                     rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
                                     piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
 
@@ -622,8 +704,23 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                 else {
                     auto place = std::find(piped_queue.begin(), piped_queue.end(), blk->hash);
                     if (place != piped_queue.end()) {
-                        HOTSTUFF_LOG_PROTO("Failed resetting piped block, wasn't front! Adding to rdy_queue %s", blk->hash.to_hex().c_str());
+                        HOTSTUFF_LOG_PROTO("Failed resetting piped block, wasn't front! Adding to rdy_queue %.10s", blk->hash.to_hex().c_str());
+
+                        std::string piped_queue_str = "";
+                        for(auto &hash : piped_queue) {
+                            piped_queue_str += "|" + hash.to_hex().substr(0, 10) + "| ";
+                        }
+
+                        HOTSTUFF_LOG_PROTO("Piped queue has size %d: Front-> %s", piped_queue.size(), piped_queue_str.c_str());
+
                         rdy_queue.push_back(blk->hash);
+
+                        std::string rdy_queue_str = "";
+                        for(auto &hash : rdy_queue) {
+                            rdy_queue_str += "|" + hash.to_hex().substr(0, 10) + "| ";
+                        }
+
+                        HOTSTUFF_LOG_PROTO("Rdy queue is now: Front-> %s", rdy_queue_str.c_str());
 
                         // Don't finish this block until the previous one was finished.
                         return;
@@ -633,6 +730,52 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
 
                         update_hqc(blk, cert);
                         on_qc_finish(blk);
+
+                        auto curr_blk = blk;
+                        if (!rdy_queue.empty()) {
+                            HOTSTUFF_LOG_PROTO("Resolving rdy queue (case 3)");
+
+                           bool frontsMatch = true;
+                            while(frontsMatch && !rdy_queue.empty()) {
+                                if(rdy_queue.front() == piped_queue.front()) {
+                                    HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
+                                    rdy_queue.pop_front();
+                                    piped_queue.pop_front();
+
+                                    update_hqc(blk, blk->self_qc);
+                                    on_qc_finish(blk);
+                                }
+                                else {
+                                    frontsMatch = false;
+                                }
+                            }
+
+                            bool foundChildren;
+                            if(rdy_queue.empty()) {
+                                foundChildren = false; // Job is done
+                            }
+                            else {
+                                foundChildren = true;
+                            }
+
+                            while (foundChildren) {
+                                foundChildren = false;
+                                for (const auto &hash : rdy_queue) {
+                                    block_t rdy_blk = storage->find_blk(hash);
+                                    if (rdy_blk->get_parent_hashes()[0] == curr_blk->hash) {
+                                        HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
+                                        rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
+                                        piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
+
+                                        update_hqc(rdy_blk, rdy_blk->self_qc);
+                                        on_qc_finish(rdy_blk);
+                                        foundChildren = true;
+                                        curr_blk = rdy_blk;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -642,6 +785,53 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
 
                 update_hqc(blk, cert);
                 on_qc_finish(blk);
+
+                auto curr_blk = blk;
+                if (!rdy_queue.empty()) {
+                    HOTSTUFF_LOG_PROTO("Resolving rdy queue (case 4)");
+
+                    
+                    bool frontsMatch = true;
+                    while(frontsMatch && !rdy_queue.empty()) {
+                        if(rdy_queue.front() == piped_queue.front()) {
+                            HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
+                            rdy_queue.pop_front();
+                            piped_queue.pop_front();
+
+                            update_hqc(blk, blk->self_qc);
+                            on_qc_finish(blk);
+                        }
+                        else {
+                            frontsMatch = false;
+                        }
+                    }
+
+                    bool foundChildren;
+                    if(rdy_queue.empty()) {
+                        foundChildren = false; // Job is done
+                    }
+                    else {
+                        foundChildren = true;
+                    }
+
+                    while (foundChildren) {
+                        foundChildren = false;
+                        for (const auto &hash : rdy_queue) {
+                            block_t rdy_blk = storage->find_blk(hash);
+                            if (rdy_blk->get_parent_hashes()[0] == curr_blk->hash) {
+                                HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
+                                rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
+                                piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
+
+                                update_hqc(rdy_blk, rdy_blk->self_qc);
+                                on_qc_finish(rdy_blk);
+                                foundChildren = true;
+                                curr_blk = rdy_blk;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             
             /*if (id == get_pace_maker()->get_proposer()) {
@@ -1150,6 +1340,7 @@ void HotStuffBase::beat() {
 
     pmaker->beat().then([this](ReplicaID proposer) {
         if (piped_queue.size() > get_config().async_blocks + 1) {
+            HOTSTUFF_LOG_PROTO("[PIPELINING] Piped queue is full! Current size: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);
             return;
         }
 
