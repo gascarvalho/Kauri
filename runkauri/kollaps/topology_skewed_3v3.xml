@@ -9,9 +9,9 @@
              Currently it represents:
              [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
 
-        <service name="server1" image="kauri" share="false" command="['bls','2','1','0','0','1000','1000','3','1']"/>
-        <service name="server2" image="kauri" share="false" command="['bls','2','1','0','0','1000','1000','3','2']"/>
-        <service name="server3" image="kauri" share="false" command="['bls','2','1','0','0','1000','1000','3','3']"/>
+        <service name="server1" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','1']"/>
+        <service name="server2" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','2']"/>
+        <service name="server3" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','3']"/>
     </services>
     <bridges>
         <!-- Definition of the network elements (routers and switches) -->
@@ -19,15 +19,15 @@
     </bridges>
     <links>
         <!-- Intra-cluster behaviour (should be much better than inter) -->
-        <link origin="server1" dest="server1" latency="1" upload="500Mbps" download="500Mbps" network="kauri_network"/>
-        <link origin="server2" dest="server2" latency="1" upload="500Mbps" download="500Mbps" network="kauri_network"/>
-        <link origin="server3" dest="server3" latency="1" upload="500Mbps" download="500Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server1" latency="1" upload="1000Mbps" download="1000Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server2" latency="1" upload="1000Mbps" download="1000Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server3" latency="1" upload="1000Mbps" download="1000Mbps" network="kauri_network"/>
 
         <!-- Inter-cluster behaviour -->
-        <link origin="server1" dest="server2" latency="60" upload="30Mbps" download="30Mbps" network="kauri_network"/>
-        <link origin="server1" dest="server3" latency="200" upload="5Mbps" download="5Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server2" latency="20" upload="250Mbps" download="250Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server3" latency="150" upload="20Mbps" download="20Mbps" network="kauri_network"/>
 
-        <link origin="server2" dest="server3" latency="60" upload="30Mbps" download="30Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server3" latency="20" upload="250Mbps" download="250Mbps" network="kauri_network"/>
 
       
     </links>

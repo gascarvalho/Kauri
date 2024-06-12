@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<experiment boot="kollaps:2.0">
+    <services>
+        <!-- definition of the services (containers),  -->
+        <!-- kollaps dashboard to controll the experiments, should be present in all deployments -->
+        <service name="dashboard" image="kollaps/dashboard:1.0" supervisor="true" port="8088"/>
+
+        <!-- the "command" can be used to pass parameters to the container entrypoints.
+             Currently it represents:
+             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
+
+        <service name="server1" image="kauri" share="false" command="['bls','2','1','1','1','50','1000','1','1']"/>
+    </services>
+    <bridges>
+        <!-- Definition of the network elements (routers and switches) -->
+        <!-- Bridge == switch -->
+        <bridge name="switch"/>
+    </bridges>
+    <links>
+        <!-- Intra-cluster behaviour -->
+        <link origin="switch" dest="server1" latency="25" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+      
+    </links>
+    <dynamic>
+        <!-- schedulle the dynamics of the experiment. These apply to services and links, see documentation for more details.
+             This section can be ommited in which case all the services will be started at the beginning of the experiment -->
+
+        <!-- were we start three instances of the "server" service -->
+        <schedule name="server1"  time="0.0" action="join" amount="15"/>
+
+        <schedule name="server1"  time="380.0" action="leave" amount="15"/>
+    </dynamic>
+</experiment>

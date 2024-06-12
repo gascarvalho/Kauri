@@ -2,29 +2,29 @@ version: "3.3"
 services:
   bootstrapper:
     image: kollaps:2.0
-    command: ["-s", "caf97411-4f05-4aef-b71d-2c2c9f7c95d8"]
+    command: ["-s", "773dbcfb-1f45-4e13-b49a-69fd0c2e45cb"]
     deploy:
       mode: global
     environment:
-      KOLLAPS_UUID: 'caf97411-4f05-4aef-b71d-2c2c9f7c95d8'
+      KOLLAPS_UUID: '773dbcfb-1f45-4e13-b49a-69fd0c2e45cb'
       KOLLAPS_ORCHESTRATOR: swarm
       NUMBER_OF_GODS: 1
       POOL_PERIOD: 0.05
       MAX_FLOW_AGE: 2
     labels:
-      bootcaf97411-4f05-4aef-b71d-2c2c9f7c95d8: "true"
+      boot773dbcfb-1f45-4e13-b49a-69fd0c2e45cb: "true"
     volumes:
       - '/lib/modules:/lib/modules/'
       - '/usr/src:/usr/src/'
       - '/sys/:/sys/'
-      - '/home/tomas/thesis/MSc-Kauri/runkauri/kollaps/topology_skewed_3v2.xml:/topology.xml'
+      - '/home/tomas/thesis/MSc-Kauri/runkauri/kollaps/topology_inforum5.xml:/topology.xml'
       - type: bind
         source: /var/run/docker.sock
         target: /var/run/docker.sock
     networks:
       - KollapsNet
 
-  dashboard-caf97411-4f05-4aef-b71d-2c2c9f7c95d8:
+  dashboard-773dbcfb-1f45-4e13-b49a-69fd0c2e45cb:
     image: kollaps/dashboard:1.0
     ports:
       - "8088:8088"
@@ -32,56 +32,24 @@ services:
     deploy:
       replicas: 1
     environment:
-      KOLLAPS_UUID: 'caf97411-4f05-4aef-b71d-2c2c9f7c95d8'
+      KOLLAPS_UUID: '773dbcfb-1f45-4e13-b49a-69fd0c2e45cb'
       KOLLAPS_ORCHESTRATOR: swarm
     networks:
       - KollapsNet
       - outside
 
-  server1-caf97411-4f05-4aef-b71d-2c2c9f7c95d8:
+  server1-773dbcfb-1f45-4e13-b49a-69fd0c2e45cb:
     image: kauri
     entrypoint: ["/bin/sh", "-c", "mkfifo /tmp/Kollaps_hang; exec /bin/sh <> /tmp/Kollaps_hang #"]
-    command: ['bls','2','1','10','100','25','1000','3','1']
+    command: ['bls','2','1','1','1','50','1000','1','1']
     hostname: server1
     labels:
-      caf97411-4f05-4aef-b71d-2c2c9f7c95d8: "true"
+      773dbcfb-1f45-4e13-b49a-69fd0c2e45cb: "true"
     deploy:
-      replicas: 5
+      replicas: 15
       endpoint_mode: dnsrr
     environment:
-      KOLLAPS_UUID: 'caf97411-4f05-4aef-b71d-2c2c9f7c95d8'
-      KOLLAPS_ORCHESTRATOR: swarm
-    networks:
-      - KollapsNet
-
-  server2-caf97411-4f05-4aef-b71d-2c2c9f7c95d8:
-    image: kauri
-    entrypoint: ["/bin/sh", "-c", "mkfifo /tmp/Kollaps_hang; exec /bin/sh <> /tmp/Kollaps_hang #"]
-    command: ['bls','2','1','10','100','25','1000','3','2']
-    hostname: server2
-    labels:
-      caf97411-4f05-4aef-b71d-2c2c9f7c95d8: "true"
-    deploy:
-      replicas: 5
-      endpoint_mode: dnsrr
-    environment:
-      KOLLAPS_UUID: 'caf97411-4f05-4aef-b71d-2c2c9f7c95d8'
-      KOLLAPS_ORCHESTRATOR: swarm
-    networks:
-      - KollapsNet
-
-  server3-caf97411-4f05-4aef-b71d-2c2c9f7c95d8:
-    image: kauri
-    entrypoint: ["/bin/sh", "-c", "mkfifo /tmp/Kollaps_hang; exec /bin/sh <> /tmp/Kollaps_hang #"]
-    command: ['bls','2','1','10','100','25','1000','3','3']
-    hostname: server3
-    labels:
-      caf97411-4f05-4aef-b71d-2c2c9f7c95d8: "true"
-    deploy:
-      replicas: 5
-      endpoint_mode: dnsrr
-    environment:
-      KOLLAPS_UUID: 'caf97411-4f05-4aef-b71d-2c2c9f7c95d8'
+      KOLLAPS_UUID: '773dbcfb-1f45-4e13-b49a-69fd0c2e45cb'
       KOLLAPS_ORCHESTRATOR: swarm
     networks:
       - KollapsNet

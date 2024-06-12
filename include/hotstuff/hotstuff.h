@@ -401,6 +401,7 @@ class HotStuffBase: public HotStuffCore {
     void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
     bool isTreeSwitch(int bheight);
     void beat();
+    void print_pipe_queues(bool printPiped, bool printRdy);
     block_t repropose_beat(const std::vector<uint256_t> &cmds);
 
     size_t size() const { return peers.size(); }

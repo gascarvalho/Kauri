@@ -244,8 +244,19 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
 
         LOG_PROTO("[PROP HANDLER] Popping pending proposal: %s", std::string(pending_proposal.first.proposal).c_str());
         pending_proposals.erase(pending_proposals.begin());
-
         auto &pending_prop = pending_proposal.first.proposal;
+
+        auto pending_msg_tree = system_trees[pending_prop.tid];
+        auto pending_childPeers = pending_msg_tree.get_childPeers();
+
+        if (!pending_childPeers.empty()) {
+            LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
+            MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
+            for (const PeerId &peerId : pending_childPeers) {
+                pn.send_msg(relay, peerId);
+            }
+        }
+
         block_t pending_blk = pending_prop.blk;
         if (!pending_blk){
             LOG_PROTO("[PROP HANDLER] Pending block is null!");
@@ -261,13 +272,6 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         });
     }
 
-    if (!childPeers.empty()) {
-        LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in tid=%d", prop.tid);
-        MsgPropose relay = MsgPropose(stream, true);
-        for (const PeerId &peerId : childPeers) {
-            pn.send_msg(relay, peerId);
-        }
-    }
 
     /** Edge-case: Valid tree proposer but not the current tree proposer
      * Received a valid propose from a valid proposer in their system tree (passes propose handler safety checks)
@@ -281,8 +285,19 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         return;
     }
 
+    if (!childPeers.empty()) {
+        LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in tid=%d", prop.tid);
+        MsgPropose relay = MsgPropose(stream, true);
+        for (const PeerId &peerId : childPeers) {
+            pn.send_msg(relay, peerId);
+        }
+    }
+
     block_t blk = prop.blk;
-    if (!blk) return;
+    if (!blk) {
+        LOG_PROTO("[PROP HANDLER] Proposal block is null!");
+        return;
+    }
 
     promise::all(std::vector<promise_t>{
         async_deliver_blk(blk->get_hash(), peer)
@@ -302,6 +317,18 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         pending_proposals.erase(pending_proposals.begin());
 
         auto &pending_prop = pending_proposal.first.proposal;
+
+        auto pending_msg_tree = system_trees[pending_prop.tid];
+        auto pending_childPeers = pending_msg_tree.get_childPeers();
+
+        if (!pending_childPeers.empty()) {
+            LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
+            MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
+            for (const PeerId &peerId : pending_childPeers) {
+                pn.send_msg(relay, peerId);
+            }
+        }
+
         block_t pending_blk = pending_prop.blk;
         if (!pending_blk){
             LOG_PROTO("[PROP HANDLER] Pending block is null!");
@@ -397,13 +424,15 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
                 block_t b = storage->find_blk(*hash);
                 if (b->delivered && b->qc->has_n(config.nmajority)) {
                     piped_queue.erase(hash);
-                    HOTSTUFF_LOG_PROTO("Confirm Piped block");
+                    HOTSTUFF_LOG_PROTO("Confirm Piped block %.10s", b->hash.to_hex().c_str());
+                    HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
                 }
             }
 
             if (blk->hash == piped_queue.front()){
                 piped_queue.pop_front();
-                HOTSTUFF_LOG_PROTO("Reset Piped block");
+                HOTSTUFF_LOG_PROTO("Reset Piped block %.10s", blk->hash.to_hex().c_str());
+                HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
             }
             else {
                 HOTSTUFF_LOG_PROTO("Failed resetting piped block, wasn't front!!!");
@@ -522,7 +551,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
         std::cout << "bye vote relay handler: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
         if (id == tree_proposer && blk->hash == piped_queue.front()) {
             piped_queue.pop_front();
-            HOTSTUFF_LOG_PROTO("Reset Piped block");
+            HOTSTUFF_LOG_PROTO("Reset Piped block %.10s", blk->hash.to_hex().c_str());
+            HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
             auto curr_blk = blk;
             if (!rdy_queue.empty()) {
@@ -534,6 +564,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                         HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
                         rdy_queue.pop_front();
                         piped_queue.pop_front();
+                        HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                         update_hqc(blk, blk->self_qc);
                         on_qc_finish(blk);
@@ -559,6 +590,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                             HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
                             rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
                             piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
+                            HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                             update_hqc(rdy_blk, rdy_blk->self_qc);
                             on_qc_finish(rdy_blk);
@@ -583,8 +615,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
 
     std::cout << "vote relay handler: " << msg.vote.blk_hash.to_hex() << " " << std::endl;
 
-    auto &vote = msg.vote;
-    RcObj<VoteRelay> v(new VoteRelay(std::move(vote)));
+    RcObj<VoteRelay> v(new VoteRelay(std::move(msg.vote)));
     promise::all(std::vector<promise_t>{
             async_deliver_blk(v->blk_hash, peer),
             v->cert->verify(config, vpool),
@@ -648,7 +679,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
             if (!piped_queue.empty()) {
                 if (blk->hash == piped_queue.front()) {
                     piped_queue.pop_front();
-                    HOTSTUFF_LOG_PROTO("Reset Piped block");
+                    HOTSTUFF_LOG_PROTO("Reset Piped block %.10s", blk->hash.to_hex().c_str());
+                    HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                     std::cout << "go to town: " << std::endl;
 
@@ -665,6 +697,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                                 HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
                                 rdy_queue.pop_front();
                                 piped_queue.pop_front();
+                                HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                                 update_hqc(blk, blk->self_qc);
                                 on_qc_finish(blk);
@@ -690,6 +723,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                                     HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
                                     rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
                                     piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
+                                    HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                                     update_hqc(rdy_blk, rdy_blk->self_qc);
                                     on_qc_finish(rdy_blk);
@@ -741,6 +775,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                                     HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
                                     rdy_queue.pop_front();
                                     piped_queue.pop_front();
+                                    HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                                     update_hqc(blk, blk->self_qc);
                                     on_qc_finish(blk);
@@ -766,6 +801,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                                         HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
                                         rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
                                         piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
+                                        HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                                         update_hqc(rdy_blk, rdy_blk->self_qc);
                                         on_qc_finish(rdy_blk);
@@ -797,6 +833,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                             HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", rdy_queue.front().to_hex().c_str());
                             rdy_queue.pop_front();
                             piped_queue.pop_front();
+                            HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                             update_hqc(blk, blk->self_qc);
                             on_qc_finish(blk);
@@ -822,6 +859,7 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
                                 HOTSTUFF_LOG_PROTO("Resolved block in rdy queue %.10s", hash.to_hex().c_str());
                                 rdy_queue.erase(std::find(rdy_queue.begin(), rdy_queue.end(), hash));
                                 piped_queue.erase(std::find(piped_queue.begin(), piped_queue.end(), hash));
+                                HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
 
                                 update_hqc(rdy_blk, rdy_blk->self_qc);
                                 on_qc_finish(rdy_blk);
@@ -1378,6 +1416,9 @@ void HotStuffBase::beat() {
                                                              current,
                                                              nullptr));
                     piped_queue.push_back(piped_block->hash);
+                    HOTSTUFF_LOG_PROTO("[PIPELINING] Pushed piped block into queue: %.10s", piped_block->hash.to_hex().c_str());
+                    print_pipe_queues(true, false);
+
 
                     Proposal prop(id, get_tree_id(), piped_block, nullptr);
                     HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
@@ -1409,6 +1450,29 @@ void HotStuffBase::beat() {
             }
         }
     });
+}
+
+void HotStuffBase::print_pipe_queues(bool printPiped, bool printRdy) {
+
+    if(printPiped) {
+        std::string piped_queue_str = "";
+        for(auto &hash : piped_queue) {
+            piped_queue_str += "|" + hash.to_hex().substr(0, 10) + "| ";
+        }
+
+        HOTSTUFF_LOG_PROTO("Piped queue has size %d: Front-> %s", piped_queue.size(), piped_queue_str.c_str());
+    }
+
+    if(printRdy) {
+        std::string rdy_queue_str = "";
+        for(auto &hash : rdy_queue) {
+            rdy_queue_str += "|" + hash.to_hex().substr(0, 10) + "| ";
+        }
+
+        HOTSTUFF_LOG_PROTO("Rdy queue has size %d: Front-> %s", rdy_queue.size(), rdy_queue_str.c_str());
+    }
+
+
 }
 
 // block_t HotStuffBase::repropose_beat(const std::vector<uint256_t> &cmds) {

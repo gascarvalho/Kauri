@@ -55,6 +55,9 @@ block_t HotStuffCore::get_potentially_not_delivered_blk(const uint256_t &blk_has
     block_t blk = storage->find_blk(blk_hash);
     if (blk == nullptr)
         throw std::runtime_error("block not delivered " + std::to_string(blk == nullptr));
+    else if (!blk->delivered)
+        on_deliver_blk(blk);
+    
     return blk;
 }
 
@@ -131,34 +134,60 @@ void HotStuffCore::update_hqc(const block_t &_hqc, const quorum_cert_bt &qc) {
 }
 
 void HotStuffCore::update(const block_t &nblk) {
+    std::cout << "Begin update fuction at Head -> nblk: " << std::string(*nblk).c_str() << std::endl;
 
     /* nblk = b*, blk2 = b'', blk1 = b', blk = b */
 #ifndef HOTSTUFF_TWO_STEP
     /* three-step HotStuff */
     const block_t &blk2 = nblk->qc_ref;
-    if (blk2 == nullptr) return;
+
+    if (blk2 == nullptr) {
+        std::cout << "nblk has no qc_ref: blk2 is null." << std::endl;
+        return;
+    }
+
+    //if(blk2->qc_ref != nullptr) { // Avoids b0 sigsegv on qc_ref
+        std::cout << "blk2: " << std::string(*blk2).c_str() << std::endl;
+    //}
+
     /* decided blk could possible be incomplete due to pruning */
-    if (blk2->decision) return;
-    update_hqc(blk2, nblk->qc);
+    if (blk2->decision) {
+        std::cout << "blk2->decision == 1, returning" << std::endl;
+        return;
+    }
     
+    update_hqc(blk2, nblk->qc);
     std::cout <<  "update: step 1 done (pre-commit/hqc update)" <<  std::endl;
 
     const block_t &blk1 = blk2->qc_ref;
-    if (blk1 == nullptr) return;
-    if (blk1->decision) return;
+    if (blk1 == nullptr) {
+        std::cout << "blk2 has no qc_ref: blk1 is null." << std::endl;
+        return;
+    }
+
+    std::cout << "blk1: " << std::string(*blk1).c_str() << std::endl;
+
+    if (blk1->decision) {
+        std::cout << "blk1->decision == 1, returning" << std::endl;
+        return;
+    }
     if (blk1->height > b_lock->height) b_lock = blk1;
 
     std::cout <<  "update: step 2 done (commit/b_lock update)" <<  std::endl;
 
     const block_t &blk = blk1->qc_ref;
-    if (blk == nullptr) return;
-    if (blk->decision) return;
+    if (blk == nullptr){
+        std::cout << "blk1 has no qc_ref: blk is null." << std::endl;
+        return;
+    }
 
-    HOTSTUFF_LOG_PROTO("Tail - nblk *****************************");
-    HOTSTUFF_LOG_PROTO("blk2: %s", std::string(*blk2).c_str());
-    HOTSTUFF_LOG_PROTO("blk1: %s", std::string(*blk1).c_str());
-    HOTSTUFF_LOG_PROTO("blk: %s", std::string(*blk).c_str());
-    HOTSTUFF_LOG_PROTO("Rest of blockchain *********************");
+    std::cout << "blk: " << std::string(*blk).c_str() << std::endl;
+
+    if (blk->decision) {
+        std::cout << "blk->decision == 1, returning" << std::endl;
+        return;
+    }
+
 
     /** TODO: due to inplace Kauri pipeline system, this system needs to be reworked to keep in mind the pipeline gaps*/
     /* commit requires direct parent */
@@ -317,6 +346,7 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
 
     block_t bnew = prop.blk;
     sanity_check_delivered(bnew);
+    LOG_PROTO("before update");
     update(bnew);
     bool opinion = false;
 

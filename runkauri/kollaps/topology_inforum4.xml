@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<experiment boot="kollaps:2.0">
+    <services>
+        <!-- definition of the services (containers),  -->
+        <!-- kollaps dashboard to control the experiments, should be present in all deployments -->
+        <service name="dashboard" image="kollaps/dashboard:1.0" supervisor="true" port="8088"/>
+
+        <!-- the "command" can be used to pass parameters to the container entrypoints.
+             Currently it represents:
+             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
+
+        <service name="server1" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','1']"/>
+        <service name="server2" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','2']"/>
+        <service name="server3" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','3']"/>
+        <service name="server4" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','4']"/>
+        <service name="server5" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','5']"/>
+        <service name="server6" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','6']"/>
+        <service name="server7" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','7']"/>
+        <service name="server8" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','8']"/>
+        <service name="server9" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','9']"/>
+        <service name="server10" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','10']"/>
+        <service name="server11" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','11']"/>
+        <service name="server12" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','12']"/>
+        <service name="server13" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','13']"/>
+        <service name="server14" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','14']"/>
+        <service name="server15" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','15']"/>
+    </services>
+    <bridges>
+        <!-- Definition of the network elements (routers and switches) -->
+        <!-- Bridge == switch -->
+    </bridges>
+    <links>
+        <!-- Intra-cluster behaviour -->
+        <link origin="server1" dest="server2" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server3" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server4" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server5" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server6" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server7" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server8" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server2" dest="server3" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server4" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server5" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server6" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server7" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server8" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server2" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server3" dest="server4" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server5" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server6" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server7" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server8" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server3" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server4" dest="server5" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server6" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server7" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server8" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server4" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server5" dest="server6" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server7" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server8" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server5" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server6" dest="server7" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server8" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server6" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server7" dest="server8" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server7" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server7" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server7" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server7" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server7" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server7" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server7" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server8" dest="server9" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server8" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server8" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server8" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server8" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server8" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server8" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server9" dest="server10" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server9" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server9" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server9" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server9" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server9" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server10" dest="server11" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server10" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server10" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server10" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server10" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server11" dest="server12" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server11" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server11" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server11" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server12" dest="server13" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server12" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server12" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server13" dest="server14" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server13" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+
+        <link origin="server14" dest="server15" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+    </links>
+    <dynamic>
+        <!-- schedule the dynamics of the experiment. These apply to services and links, see documentation for more details.
+             This section can be omitted in which case all the services will be started at the beginning of the experiment -->
+
+        <!-- where we start individual instances of the "server" service -->
+        <schedule name="server1"  time="0.0" action="join" amount="1"/>
+        <schedule name="server2"  time="0.0" action="join" amount="1"/>
+        <schedule name="server3"  time="0.0" action="join" amount="1"/>
+        <schedule name="server4"  time="0.0" action="join" amount="1"/>
+        <schedule name="server5"  time="0.0" action="join" amount="1"/>
+        <schedule name="server6"  time="0.0" action="join" amount="1"/>
+        <schedule name="server7"  time="0.0" action="join" amount="1"/>
+        <schedule name="server8"  time="0.0" action="join" amount="1"/>
+        <schedule name="server9"  time="0.0" action="join" amount="1"/>
+        <schedule name="server10"  time="0.0" action="join" amount="1"/>
+        <schedule name="server11"  time="0.0" action="join" amount="1"/>
+        <schedule name="server12"  time="0.0" action="join" amount="1"/>
+        <schedule name="server13"  time="0.0" action="join" amount="1"/>
+        <schedule name="server14"  time="0.0" action="join" amount="1"/>
+        <schedule name="server15"  time="0.0" action="join" amount="1"/>
+
+        <schedule name="server1"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server2"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server3"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server4"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server5"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server6"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server7"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server8"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server9"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server10"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server11"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server12"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server13"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server14"  time="380.0" action="leave" amount="1"/>
+        <schedule name="server15"  time="380.0" action="leave" amount="1"/>
+    </dynamic>
+</experiment>

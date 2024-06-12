@@ -110,8 +110,9 @@ namespace hotstuff {
     }
 
     promise_t QuorumCertAggBLS::verify(const ReplicaConfig &config, VeriPool &vpool) {
-        if (theSig == nullptr)
+        if (theSig == nullptr) {
             return promise_t([](promise_t &pm) { pm.resolve(false); });
+        }
         std::vector<promise_t> vpm;
 
         struct timeval timeStart,timeEnd;

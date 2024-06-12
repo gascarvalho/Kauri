@@ -155,6 +155,7 @@ class Block {
     Block(bool delivered, int8_t decision):
         qc(new QuorumCertDummy()),
         hash(salticidae::get_hash(*this)),
+        parents(std::vector<block_t>()),
         qc_ref(nullptr),
         self_qc(nullptr), height(0),
         delivered(delivered), decision(decision) {}
@@ -218,7 +219,7 @@ class Block {
         s << "<block "
           << "id="  << get_hex10(hash) << " "
           << "height=" << std::to_string(height) << " "
-          << "parent=" << get_hex10(parent_hashes[0]) << " "
+          << "parent=" << (parents.empty() ? "null" : get_hex10(parent_hashes[0])) << " "
           << "qc_ref=" << (qc_ref ? get_hex10(qc_ref->get_hash()) : "null") << ">";
         return s;
     }

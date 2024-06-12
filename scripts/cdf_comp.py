@@ -25,90 +25,71 @@ def str2datetime(s):
     dt = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S")
     return dt.replace(microsecond=int(parts[1]))
 
-def plot_hist(fname, x, y):
+def plot_hist(fname, x, y, avg_tx_sec, reconfig_x):
     plt.xlabel(r"time (s)")
     plt.ylabel(r"tx")
-    plt.suptitle("Average Transactions commited per time interval", fontsize=12)
+    plt.suptitle("Average Transactions committed per time interval", fontsize=12)
     plt.title("Sliding Window Size: {}s, Block size: {}txs".format(args.window_size, args.blksize), fontsize=10)
     plt.plot(x, y, marker='o', markersize=3.5)
-    #plt.plot(x, y)
     plt.xlim(left=0)
     plt.ylim(bottom=0)
 
-    # Reconfiguration lines
     for reconfig in reconfig_x:
         plt.axvline(x=reconfig, color='r', linestyle='--', linewidth=0.5)
-        # plt.text(reconfig, -.05, 'x='+str(reconfig), color='red', ha='center', va='top')
 
-    # Average transaction per second for whole experiment
-    plt.axhline(y=(total / total_time), color='g', linestyle='-', linewidth=1)
+    plt.axhline(y=avg_tx_sec, color='g', linestyle='-', linewidth=1)
     plt.text(0, avg_tx_sec, 'Average tx/sec=' + str(int(avg_tx_sec)), color='green', ha='left', va='bottom')
 
     plt.savefig(fname)
     plt.show()
 
-def plot_cdf(fname, x, y):
-    x = np.array(x)
-    y = np.array(y)
+def plot_cdf(fname, x1, y1, x2=None, y2=None):
+    x1 = np.array(x1)
+    y1 = np.array(y1)
 
-    # finding the PDF of the histogram using count values 
-    pdf = y / sum(y) 
+    pdf1 = y1 / sum(y1)
+    cdf1 = np.cumsum(pdf1)
+
+    #plt.plot(x1, pdf1, color="red", label="PDF File 1")
+    plt.plot(x1, cdf1, color="blue", label=args.labels[0])
     
-    # We can also find using the PDF values by looping and adding 
-    cdf = np.cumsum(pdf) 
+    if x2 is not None and y2 is not None:
+        x2 = np.array(x2)
+        y2 = np.array(y2)
 
-    print("PDF: ", pdf)
-    print("CDF: ", cdf)
-    print("Values: ", y)
-    print("Bin edges: ", x)
+        pdf2 = y2 / sum(y2)
+        cdf2 = np.cumsum(pdf2)
 
-    # Reconfiguration lines
-    for reconfig in reconfig_x:
-        plt.axvline(x=reconfig, color='r', linestyle='--', linewidth=0.5)
-        # plt.text(reconfig, -.05, 'x='+str(reconfig), color='red', ha='center', va='top')
+        #plt.plot(x2, pdf2, color="green", label="PDF File 2")
+        plt.plot(x2, cdf2, color="orange", label=args.labels[1])
 
-    plt.plot(x, pdf, color="red", label="PDF") 
-    plt.plot(x, cdf, label="CDF") 
     plt.legend()
-    plt.savefig(fname) 
+    plt.savefig(fname)
     plt.show()
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--window-size', type=float, default=1, required=False)
-    parser.add_argument('--blksize', type=float, required=True)
-    parser.add_argument('--output', type=str, default="hist.png", required=False)
-    parser.add_argument('--file', type=str, required=True)
-    parser.add_argument('--plot', type=str, default="hist", required=False)
-    parser.add_argument('--cutoff', type=float, default=9999, required=False)
-    args = parser.parse_args()
-    #commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver') #To count in special cases where chain is enforced later
+def process_file(file_path, window_size, blksize, cutoff):
     commit_pat = re.compile('([^[].*) \[hotstuff proto\] commit (.*)')
     reconfig_pat = re.compile('([^[].*) \[hotstuff proto\] \[PMAKER\] Timeout reached!!!')
     
-    window_size = args.window_size
-    begin_time = None
     timestamps = []
     rcf_timestamps = []
     reconfig_x = []
     values = []
 
-    with open(args.file, 'r') as file:
+    with open(file_path, 'r') as file:
         lines = file.readlines()
         for line in lines:
             m = commit_pat.match(line)
             rcf = reconfig_pat.match(line)
             if m:
                 timestamps.append(str2datetime(m.group(1)))
-                
             elif rcf:
                 rcf_timestamps.append(str2datetime(rcf.group(1)))
-            
+        
         timestamps.sort()
         rcf_timestamps.sort()
 
-    i = 0
-    j = 0
+    begin_time = None
     cnt = 0
     total = 0
     cutoff_time = None
@@ -116,7 +97,7 @@ if __name__ == '__main__':
     for timestamp in timestamps:
         if begin_time is None:
             begin_time = timestamp
-            cutoff_time = begin_time + timedelta(seconds=args.cutoff)
+            cutoff_time = begin_time + timedelta(seconds=cutoff)
 
         if timestamp > cutoff_time:
             break
@@ -125,16 +106,12 @@ if __name__ == '__main__':
             elapsed_time = (begin_time + timedelta(seconds=window_size) - begin_time).total_seconds()
             values.append(cnt / elapsed_time)
             begin_time += timedelta(seconds=window_size)
-            j += 1
             cnt = 0
-        cnt += args.blksize
-        total += args.blksize
+        cnt += blksize
+        total += blksize
 
-    # Add the final value after the loop ends
     elapsed_time = (begin_time + timedelta(seconds=window_size) - begin_time).total_seconds()
     values.append(cnt / elapsed_time)
-
-    #values = remove_outliers(values)[0]
 
     start_time = timestamps[0]
     end_time = timestamps[-1]
@@ -145,19 +122,36 @@ if __name__ == '__main__':
     total_time = (end_time - start_time).total_seconds()
     avg_tx_sec = total / total_time
 
-    # Calculate reconfiguration positions
     for rcf_timestamp in rcf_timestamps:
-
         if rcf_timestamp > cutoff_time:
             break
-
         elapsed_time = (rcf_timestamp - start_time).total_seconds()
         reconfig_x.append(elapsed_time)
 
     x = [i * window_size for i in range(len(values))]
+    return x, values, avg_tx_sec, reconfig_x
 
-    if(args.plot == "hist"):
-        plot_hist(args.output, x, values)
-    elif(args.plot == "cdf"):
-        plot_cdf(args.output, x, values)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--window-size', type=float, default=1, required=False)
+    parser.add_argument('--blksize', type=float, required=True)
+    parser.add_argument('--output', type=str, default="hist.png", required=False)
+    parser.add_argument('--file', type=str, required=True)
+    parser.add_argument('--file2', type=str, required=False)
+    parser.add_argument('--labels', type=str, nargs='+', required=True)
+    parser.add_argument('--plot', type=str, default="hist", required=False)
+    parser.add_argument('--cutoff', type=float, default=9999, required=False)
+    args = parser.parse_args()
 
+    if (len(args.labels) != 2):
+        print("The number of files and labels must match.")
+        sys.exit(1)
+    
+    x1, values1, avg_tx_sec1, reconfig_x1 = process_file(args.file, args.window_size, args.blksize, args.cutoff)
+
+    if args.file2:
+        x2, values2, avg_tx_sec2, reconfig_x2 = process_file(args.file2, args.window_size, args.blksize, args.cutoff)
+    else:
+        x2, values2, avg_tx_sec2, reconfig_x2 = None, None, None, None
+
+    plot_cdf(args.output, x1, values1, x2, values2)

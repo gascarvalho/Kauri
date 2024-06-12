@@ -9,9 +9,9 @@
              Currently it represents:
              [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
 
-        <service name="server1" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','1']"/>
-        <service name="server2" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','2']"/>
-        <service name="server3" image="kauri" share="false" command="['bls','2','1','10','100','25','1000','3','3']"/>
+        <service name="server1" image="kauri" share="false" command="['bls','2','1','10','100','25','500','3','1']"/>
+        <service name="server2" image="kauri" share="false" command="['bls','2','1','10','100','25','500','3','2']"/>
+        <service name="server3" image="kauri" share="false" command="['bls','2','1','10','100','25','500','3','3']"/>
     </services>
     <bridges>
         <!-- Definition of the network elements (routers and switches) -->
