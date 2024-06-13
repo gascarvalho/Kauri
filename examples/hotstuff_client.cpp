@@ -66,8 +66,7 @@ std::vector<std::pair<struct timeval, double>> elapsed;
 Net mn(ec, Net::Config());
 
 void connect_all() {
-    for (size_t i = 0; i < replicas.size(); i++)
-            conns.insert(std::make_pair(i, mn.connect_sync(replicas[i])));
+    conns.insert(std::make_pair(i, mn.connect_sync(replicas[0])));
 }
 
 bool try_send(bool check = true) {
