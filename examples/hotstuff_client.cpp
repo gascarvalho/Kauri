@@ -65,8 +65,8 @@ std::vector<NetAddr> replicas;
 std::vector<std::pair<struct timeval, double>> elapsed;
 Net mn(ec, Net::Config());
 
-void connect_all(int idx) {
-    conns.insert(std::make_pair(idx, mn.connect_sync(replicas[idx])));
+void connect_all() {
+    conns.insert(std::make_pair(0, mn.connect_sync(replicas[0])));
 }
 
 bool try_send(bool check = true) {
@@ -165,7 +165,7 @@ int main(int argc, char **argv) {
 
     nfaulty = (replicas.size() - 1) / 3;
     HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
-    connect_all(idx);
+    connect_all();
     while (try_send());
     ec.dispatch();
 
