@@ -9,7 +9,7 @@ ORIGINAL_STRING=thecmd
 QTY1_STRING=theqty1
 QTY2_STRING=theqty2
 
-FILENAME2="experiments-v2"
+FILENAME2="experiments"
 FLINES=$(cat $FILENAME2 | grep "^[^#;]")
 
 LOG_FOLDER="logs" # Define a folder to store logs

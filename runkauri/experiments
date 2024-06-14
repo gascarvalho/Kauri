@@ -1,7 +1,7 @@
 # type, fanout pipeline-depth pipeline-lat latency bandwidth block-size : number of internals : number of total : suggested physical machines
 # Figure 6
 
-['bls','2','2','10','100','25','1000']:7:8:1
+['bls','5','2','10','100','1000','1000']:15:24:1
 
 # ['bls','14','5','10','100','25','1000']:15:185:10
 # ['bls','14','5','10','50','100','1000']:15:185:10
