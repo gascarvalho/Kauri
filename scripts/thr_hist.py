@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+from scipy.interpolate import interp1d
 
 def remove_outliers(x, outlierConstant=1.5):
     a = np.array(x)
@@ -26,24 +27,40 @@ def str2datetime(s):
     return dt.replace(microsecond=int(parts[1]))
 
 def plot_hist(fname, x, y):
-    plt.xlabel(r"time (s)")
-    plt.ylabel(r"tx")
-    plt.suptitle("Average Transactions commited per time interval", fontsize=12)
-    plt.title("Sliding Window Size: {}s, Block size: {}txs".format(args.window_size, args.blksize), fontsize=10)
-    plt.plot(x, y, marker='o', markersize=3.5)
-    #plt.plot(x, y)
+    plt.rcParams["figure.figsize"] = (6, 3.9)
+    
+    plt.xlabel(r"tempo (s)")
+
+    if args.blksize is None:
+        plt.ylabel(r"blocos")
+        #plt.suptitle("Débito ao longo to tempo (bloco/s)", fontsize=12)
+        #plt.title("Sliding Window Size: {}s, Block size: {}txs".format(args.window_size, args.blksize), fontsize=10)
+    else:
+        plt.ylabel(r"tx")
+        #plt.suptitle("Débito ao longo to tempo (transação/s)", fontsize=12)
+        #plt.title("Sliding Window Size: {}s, Block size: {}txs".format(args.window_size, args.blksize), fontsize=10)
+
+
+    plt.plot(x, y, marker='o', markersize=3.5, label='bloco/s')
     plt.xlim(left=0)
     plt.ylim(bottom=0)
 
     # Reconfiguration lines
-    for reconfig in reconfig_x:
-        plt.axvline(x=reconfig, color='r', linestyle='--', linewidth=0.5)
-        # plt.text(reconfig, -.05, 'x='+str(reconfig), color='red', ha='center', va='top')
+    # for reconfig in reconfig_x:
+    #     plt.axvline(x=reconfig, color='r', linestyle='--', linewidth=0.5)
+    #     # plt.text(reconfig, -.05, 'x='+str(reconfig), color='red', ha='center', va='top')
+
+    # Reconfiguration markers
+    # Interpolate to find the y-values at the reconfiguration points
+    interp_func = interp1d(x, y, kind='linear', fill_value='extrapolate')
+    reconfig_y = interp_func(reconfig_x)
+    plt.plot(reconfig_x, reconfig_y, 'cD', label='reconfiguração')
 
     # Average transaction per second for whole experiment
     plt.axhline(y=(total / total_time), color='g', linestyle='-', linewidth=1)
-    plt.text(0, avg_tx_sec, 'Average tx/sec=' + str(int(avg_tx_sec)), color='green', ha='left', va='bottom')
+    plt.text(0, avg_tx_sec, 'Média=' + str(round(float(avg_tx_sec), 3)), color='green', ha='left', va='bottom', bbox=dict(facecolor='white', alpha=0.75), fontsize=10)
 
+    plt.legend()
     plt.savefig(fname)
     plt.show()
 
@@ -73,10 +90,48 @@ def plot_cdf(fname, x, y):
     plt.savefig(fname) 
     plt.show()
 
+import numpy as np
+
+def sliding_window_average(events, window_size, step_size):
+    """
+    Compute the sliding window average of events over time.
+
+    Parameters:
+    events (list of tuples): A list of (timestamp, value) tuples.
+    window_size (float): The size of the sliding window.
+    step_size (float): The step size for moving the window.
+
+    Returns:
+    list of tuples: A list of (timestamp, average_value) tuples representing the sliding window averages.
+    """
+    if not events:
+        return []
+
+    events.sort()  # Ensure events are sorted by timestamp
+    timestamps = [event[0] for event in events]
+    values = [event[1] for event in events]
+    
+    start_time = timestamps[0]
+    end_time = timestamps[-1]
+    
+    averages = []
+    current_time = start_time
+    
+    while current_time + window_size <= end_time:
+        window_end = current_time + window_size
+        window_values = [value for timestamp, value in events if current_time <= timestamp < window_end]
+        if window_values:
+            window_average = np.mean(window_values)
+            averages.append((current_time, window_average))
+        current_time += step_size
+    
+    return averages
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--window-size', type=float, default=1, required=False)
-    parser.add_argument('--blksize', type=float, required=True)
+    parser.add_argument('--blksize', type=float, required=False)
     parser.add_argument('--output', type=str, default="hist.png", required=False)
     parser.add_argument('--file', type=str, required=True)
     parser.add_argument('--plot', type=str, default="hist", required=False)
@@ -88,10 +143,14 @@ if __name__ == '__main__':
     
     window_size = args.window_size
     begin_time = None
+    blksize = args.blksize
     timestamps = []
     rcf_timestamps = []
     reconfig_x = []
     values = []
+
+    if blksize is None:
+        blksize = 1 #Graph with blocks committed instead
 
     with open(args.file, 'r') as file:
         lines = file.readlines()
@@ -107,12 +166,15 @@ if __name__ == '__main__':
         timestamps.sort()
         rcf_timestamps.sort()
 
+    begin_time = None
     i = 0
     j = 0
     cnt = 0
     total = 0
     cutoff_time = None
+    values = []
 
+    # Initialize begin_time and cutoff_time
     for timestamp in timestamps:
         if begin_time is None:
             begin_time = timestamp
@@ -121,20 +183,19 @@ if __name__ == '__main__':
         if timestamp > cutoff_time:
             break
 
+        # Move to the next window if current timestamp exceeds window end time
         while timestamp >= begin_time + timedelta(seconds=window_size):
             elapsed_time = (begin_time + timedelta(seconds=window_size) - begin_time).total_seconds()
             values.append(cnt / elapsed_time)
             begin_time += timedelta(seconds=window_size)
             j += 1
             cnt = 0
-        cnt += args.blksize
-        total += args.blksize
+        cnt += blksize
+        total += blksize
 
     # Add the final value after the loop ends
     elapsed_time = (begin_time + timedelta(seconds=window_size) - begin_time).total_seconds()
     values.append(cnt / elapsed_time)
-
-    #values = remove_outliers(values)[0]
 
     start_time = timestamps[0]
     end_time = timestamps[-1]
@@ -147,10 +208,8 @@ if __name__ == '__main__':
 
     # Calculate reconfiguration positions
     for rcf_timestamp in rcf_timestamps:
-
         if rcf_timestamp > cutoff_time:
             break
-
         elapsed_time = (rcf_timestamp - start_time).total_seconds()
         reconfig_x.append(elapsed_time)
 
