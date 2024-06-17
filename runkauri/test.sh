@@ -19,8 +19,6 @@ mkdir -p $LOG_FOLDER # Create the log folder if it doesn't exist
 mkdir -p $REPLICA_LOG_FOLDER # Subfolder for replica logs
 mkdir -p $CLIENT_LOG_FOLDER # Subfolder for client logs
 
-TIMESTAMP=$(date +%F_%T)
-
 # Function to log messages
 logger() {
   echo "$(date +"%Y-%m-%d %T") - $1"
@@ -43,6 +41,7 @@ do
 
   for i in {1..1}
   do
+    TIMESTAMP=$(date +%F_%T)
 
     # Deploy experiment
     docker stack deploy --with-registry-auth -c kauri-temp.yaml kauriservice &
