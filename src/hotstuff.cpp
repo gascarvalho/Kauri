@@ -23,6 +23,8 @@
 #include <fstream>
 #include "hotstuff/client.h"
 #include "hotstuff/liveness.h"
+#include <thread>
+#include <chrono>
 
 using salticidae::static_pointer_cast;
 
@@ -1313,63 +1315,76 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
     max_cmd_pending_size = blk_size; // Hold up till 1 block worth of commands
     final_buffer.reserve(blk_size);
     cmd_pending_buffer.reserve(max_cmd_pending_size);
-    cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
-        std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
-        while (q.try_dequeue(e))
-        {
-            /** Note: We have to send temporary Finality messages to clients 
-             * so that they send more commands to fill our blocks!*/
 
-            ReplicaID proposer = pmaker->get_proposer();
-
-            // Reply with -1 if we're not the proposer
-            if (proposer != get_id()) {
-                e.second(Finality(id, get_tree_id(), -1, 0, 0, e.first, uint256_t()));
-                continue;
-            }
-
-            // Check if the command has already been processed or is waiting to be processed
-            if (cmd_pending_buffer.size() < max_cmd_pending_size) {
-                const auto &cmd_hash = e.first;
-                auto it = decision_waiting.find(cmd_hash);
-
-                if (decision_made.count(cmd_hash)) {
-                    // Reply with -2 if we already know the height of the command
-                    uint32_t height = decision_made[cmd_hash];
-                    e.second(Finality(id, get_tree_id(), -2, 0, height, cmd_hash, uint256_t()));
-                    continue;
-                }
-
-                // If the command is not in the decision_waiting map, insert it
-                if (it == decision_waiting.end())
-                    it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
-                
-                // Reply with -3 if we're proposer and now the command is now pending
-                e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
-                cmd_pending_buffer.push_back(cmd_hash);
-            } 
-            else {
-                // Reply with -4 otherwise (max pending size reached, command won't be processed, client must resubmit if they wish)
-                e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
-            }
-
-            // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
-            if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
-
-                // Pass a block of commands to the final buffer
-                if (final_buffer.empty()) {
-                    std::move(std::make_move_iterator(cmd_pending_buffer.begin()), 
-                              std::make_move_iterator(cmd_pending_buffer.begin() + blk_size), std::back_inserter(final_buffer));
-                    cmd_pending_buffer.erase(cmd_pending_buffer.begin(), cmd_pending_buffer.begin() + blk_size);
-                    HOTSTUFF_LOG_PROTO("Filled Propose Final Buffer (%lu commands); Commands Still Pending: %lu", final_buffer.size(), cmd_pending_buffer.size());
-                }
-
-                beat();
-                return true;
-            }
+    ev_beat_timer = TimerEvent(ec, [this](TimerEvent &) {
+        for(size_t i = 0; i < blk_size; i++) {
+            uint256_t hash = salticidae::get_hash(i);
+            final_buffer.push_back(hash);
         }
-        return false;
+        beat();
+        ev_beat_timer.add(0.2);
     });
+    ev_beat_timer.add(0.2);
+
+    // cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
+    //     std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
+        
+        //while (q.try_dequeue(e))
+        //{
+            
+            // /** Note: We have to send temporary Finality messages to clients 
+            //  * so that they send more commands to fill our blocks!*/
+
+            // ReplicaID proposer = pmaker->get_proposer();
+
+            // // Reply with -1 if we're not the proposer
+            // if (proposer != get_id()) {
+            //     e.second(Finality(id, get_tree_id(), -1, 0, 0, e.first, uint256_t()));
+            //     continue;
+            // }
+
+            // // Check if the command has already been processed or is waiting to be processed
+            // if (cmd_pending_buffer.size() < max_cmd_pending_size) {
+            //     const auto &cmd_hash = e.first;
+            //     auto it = decision_waiting.find(cmd_hash);
+
+            //     if (decision_made.count(cmd_hash)) {
+            //         // Reply with -2 if we already know the height of the command
+            //         uint32_t height = decision_made[cmd_hash];
+            //         e.second(Finality(id, get_tree_id(), -2, 0, height, cmd_hash, uint256_t()));
+            //         continue;
+            //     }
+
+            //     // If the command is not in the decision_waiting map, insert it
+            //     if (it == decision_waiting.end())
+            //         it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
+                
+            //     // Reply with -3 if we're proposer and now the command is now pending
+            //     e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
+            //     cmd_pending_buffer.push_back(cmd_hash);
+            // } 
+            // else {
+            //     // Reply with -4 otherwise (max pending size reached, command won't be processed, client must resubmit if they wish)
+            //     e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
+            // }
+
+            // // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
+            // if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
+
+            //     // Pass a block of commands to the final buffer
+            //     if (final_buffer.empty()) {
+            //         std::move(std::make_move_iterator(cmd_pending_buffer.begin()), 
+            //                   std::make_move_iterator(cmd_pending_buffer.begin() + blk_size), std::back_inserter(final_buffer));
+            //         cmd_pending_buffer.erase(cmd_pending_buffer.begin(), cmd_pending_buffer.begin() + blk_size);
+            //         HOTSTUFF_LOG_PROTO("Filled Propose Final Buffer (%lu commands); Commands Still Pending: %lu", final_buffer.size(), cmd_pending_buffer.size());
+            //     }
+
+            //     beat();
+            //     return true;
+            // }
+        //}
+    //     return false;
+    // });
 }
 
 void HotStuffBase::beat() {

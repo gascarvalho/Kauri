@@ -38,7 +38,6 @@ using salticidae::_2;
 const double ent_waiting_timeout = 10;
 const double double_inf = 1e10;
 
-
 /** Struct that keeps the node's relative network information of a tree */
 struct TreeNetwork {
 
@@ -299,6 +298,7 @@ class HotStuffBase: public HotStuffCore {
     BlockProfiler blk_profiler;
 #endif
     pacemaker_bt pmaker;
+    TimerEvent ev_beat_timer;
 
     /* queues for async tasks */
     
