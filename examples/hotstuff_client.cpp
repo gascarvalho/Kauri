@@ -77,8 +77,8 @@ bool try_send(bool check = true) {
             mn.send_msg(msg, p.second);
 
 #ifndef HOTSTUFF_ENABLE_BENCHMARK
-        HOTSTUFF_LOG_INFO("send new cmd %.10s",
-                            get_hex(cmd->get_hash()).c_str());
+        // HOTSTUFF_LOG_INFO("send new cmd %.10s",
+        //                     get_hex(cmd->get_hash()).c_str());
 #endif
         waiting_finalized.insert(std::make_pair(
             cmd->get_hash(), Request(cmd)));
@@ -105,9 +105,9 @@ void client_resp_cmd_handler(MsgRespCmd &&msg, const Net::conn_t &) {
         et.stop();
 
     #ifndef HOTSTUFF_ENABLE_BENCHMARK
-        HOTSTUFF_LOG_INFO("got fin %s with wall: %.3f, cpu: %.3f",
-                            std::string(fin).c_str(),
-                            et.elapsed_sec, et.cpu_elapsed_sec);
+        // HOTSTUFF_LOG_INFO("got fin %s with wall: %.3f, cpu: %.3f",
+        //                     std::string(fin).c_str(),
+        //                     et.elapsed_sec, et.cpu_elapsed_sec);
     #else
         struct timeval tv;
         gettimeofday(&tv, nullptr);
@@ -140,7 +140,7 @@ int main(int argc, char **argv) {
     auto opt_max_iter_num = Config::OptValInt::create(100);
     auto opt_max_async_num = Config::OptValInt::create(10);
     auto opt_cid = Config::OptValInt::create(-1);
-    auto opt_client_target = Config::OptValStr::create("global");
+    auto opt_client_target = Config::OptValStr::create("local");
 
     auto shutdown = [&](int) { ec.stop(); };
     salticidae::SigEvent ev_sigint(ec, shutdown);
@@ -162,35 +162,61 @@ int main(int argc, char **argv) {
     max_iter_num = opt_max_iter_num->get();
     max_async_num = opt_max_async_num->get();
     std::vector<std::string> raw;
-    for (const auto &s: opt_replicas->get())
-    {
-        auto res = salticidae::trim_all(salticidae::split(s, ","));
-        if (res.size() < 1)
-            throw HotStuffError("format error");
-        raw.push_back(res[0]);
-    }
-
-    if (!(0 <= idx && (size_t)idx < raw.size() && raw.size() > 0))
-        throw std::invalid_argument("out of range");
-    cid = opt_cid->get() != -1 ? opt_cid->get() : idx;
-    for (const auto &p: raw)
-    {
-        auto _p = split_ip_port_cport(p);
-        size_t _;
-        replicas.push_back(NetAddr(NetAddr(_p.first).ip, htons(stoi(_p.second, &_))));
-    }
-
-    nfaulty = (replicas.size() - 1) / 3;
-    HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
-    std::cout << "I am client with id = " << cid << std::endl;
+    
+    //std::cout << "I am client with id = " << cid << std::endl;
     
 
     if(opt_client_target->get() == "local") {
         // Connect client to same id replica only
-        conns.insert(std::make_pair(0, mn.connect_sync(replicas[cid])));
+
+        for (const auto &s: opt_replicas->get())
+        {
+            auto res = salticidae::trim_all(salticidae::split(s, ","));
+            if (res.size() < 1)
+                throw HotStuffError("format error");
+            raw.push_back(res[0]);
+        }
+
+        if (!(0 <= idx && (size_t)idx < raw.size() && raw.size() > 0))
+            throw std::invalid_argument("out of range");
+        cid = opt_cid->get() != -1 ? opt_cid->get() : idx;
+        int i = 0;
+      
+        const auto my_replica = raw[cid];
+        auto _p = split_ip_port_cport(my_replica);
+        size_t _;
+        replicas.push_back(NetAddr(NetAddr(_p.first).ip, htons(stoi(_p.second, &_))));
+
+        HOTSTUFF_LOG_INFO("client sees replica num = %zu", replicas.size());
+
+        conns.insert(std::make_pair(0, mn.connect_sync(replicas[0])));
     }
     else if (opt_client_target->get() == "global") {
         // Connect client to all replicas
+
+        for (const auto &s: opt_replicas->get())
+        {
+            auto res = salticidae::trim_all(salticidae::split(s, ","));
+            if (res.size() < 1)
+                throw HotStuffError("format error");
+            raw.push_back(res[0]);
+        }
+
+        if (!(0 <= idx && (size_t)idx < raw.size() && raw.size() > 0))
+            throw std::invalid_argument("out of range");
+        cid = opt_cid->get() != -1 ? opt_cid->get() : idx;
+        for (const auto &p: raw)
+        {
+            auto _p = split_ip_port_cport(p);
+            size_t _;
+            replicas.push_back(NetAddr(NetAddr(_p.first).ip, htons(stoi(_p.second, &_))));
+        }
+
+        HOTSTUFF_LOG_INFO("client sees replica num = %zu", replicas.size());
+        nfaulty = (replicas.size() - 1) / 3;
+        //HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
+
+
         for (size_t i = 0; i < replicas.size(); i++)
             conns.insert(std::make_pair(i, mn.connect_sync(replicas[i])));
     }

@@ -315,11 +315,13 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
         bnew->self_qc = create_quorum_cert(bnew_hash);
     }
 
+    auto tid = get_tree_id();
+
     //proposer_base_deliver(bnew);
     on_deliver_blk(bnew);
     LOG_PROTO("before update");
     update(bnew);
-    Proposal prop(id, get_tree_id(), bnew, nullptr);
+    Proposal prop(id, tid, bnew, nullptr);
     //std::cout << "prop" << std::endl;
     /* self-vote */
     if (adjustHeight) {
@@ -334,7 +336,7 @@ Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
 
     // Vote for own proposed block
     on_receive_vote(
-            Vote(id, get_tree_id(), bnew_hash,
+            Vote(id, tid, bnew_hash,
                  create_part_cert(*priv_key, bnew_hash), this));
     on_propose_(prop);
 

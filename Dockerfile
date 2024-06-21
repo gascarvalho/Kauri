@@ -8,5 +8,6 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -y install git gcc g++ make cmake lib
 
 ADD . /MSc-Kauri
 ADD ./server.sh /
+ADD ./client.sh /
 
 ENTRYPOINT ["/bin/bash", "/server.sh"]

@@ -1,6 +1,7 @@
 import sys
 import re
 import argparse
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
@@ -127,6 +128,10 @@ def sliding_window_average(events, window_size, step_size):
     
     return averages
 
+def find_nearest(array, value):
+    array = np.asarray(array)
+    idx = (np.abs(array - value)).argmin()
+    return array[idx]
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -137,8 +142,8 @@ if __name__ == '__main__':
     parser.add_argument('--plot', type=str, default="hist", required=False)
     parser.add_argument('--cutoff', type=float, default=9999, required=False)
     args = parser.parse_args()
-    #commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver') #To count in special cases where chain is enforced later
-    commit_pat = re.compile('([^[].*) \[hotstuff proto\] commit (.*)')
+    commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver') #To count in special cases where chain is enforced later
+    #commit_pat = re.compile('([^[].*) \[hotstuff proto\] commit (.*)')
     reconfig_pat = re.compile('([^[].*) \[hotstuff proto\] \[PMAKER\] Timeout reached!!!')
     
     window_size = args.window_size
@@ -166,6 +171,9 @@ if __name__ == '__main__':
         timestamps.sort()
         rcf_timestamps.sort()
 
+    start_time = timestamps[0]
+    end_time = timestamps[-1]
+
     begin_time = None
     i = 0
     j = 0
@@ -173,6 +181,7 @@ if __name__ == '__main__':
     total = 0
     cutoff_time = None
     values = []
+    x = []
 
     # Initialize begin_time and cutoff_time
     for timestamp in timestamps:
@@ -185,8 +194,8 @@ if __name__ == '__main__':
 
         # Move to the next window if current timestamp exceeds window end time
         while timestamp >= begin_time + timedelta(seconds=window_size):
-            elapsed_time = (begin_time + timedelta(seconds=window_size) - begin_time).total_seconds()
-            values.append(cnt / elapsed_time)
+            x += [(begin_time - start_time).total_seconds()]
+            values.append(cnt / window_size)
             begin_time += timedelta(seconds=window_size)
             j += 1
             cnt = 0
@@ -194,11 +203,9 @@ if __name__ == '__main__':
         total += blksize
 
     # Add the final value after the loop ends
-    elapsed_time = (begin_time + timedelta(seconds=window_size) - begin_time).total_seconds()
-    values.append(cnt / elapsed_time)
-
-    start_time = timestamps[0]
-    end_time = timestamps[-1]
+    
+    values.append(cnt / window_size)
+    x += [(begin_time - start_time).total_seconds()]
 
     if end_time > cutoff_time:
         end_time = cutoff_time
@@ -211,9 +218,8 @@ if __name__ == '__main__':
         if rcf_timestamp > cutoff_time:
             break
         elapsed_time = (rcf_timestamp - start_time).total_seconds()
-        reconfig_x.append(elapsed_time)
-
-    x = [i * window_size for i in range(len(values))]
+        # Check if it's better to use find nearest or direct elapsed time
+        reconfig_x.append(find_nearest(x, elapsed_time))
 
     if(args.plot == "hist"):
         plot_hist(args.output, x, values)

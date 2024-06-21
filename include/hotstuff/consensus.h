@@ -113,6 +113,8 @@ public:
      * @param startup if being called during startup.
      */
     virtual void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
+    virtual void close_client(ReplicaID rid) { }
+    virtual void open_client(ReplicaID rid) { }
     virtual void tree_config() { }
     virtual bool isTreeSwitch(int bheight) { }
     virtual uint32_t get_blk_size() { }
@@ -260,6 +262,8 @@ protected:
 
     void tree_config(bool b);
     void tree_scheduler(bool b);
+    void close_client(bool b);
+    void open_client(bool b);
 
     bool first = true;
 };

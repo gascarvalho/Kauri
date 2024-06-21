@@ -343,6 +343,8 @@ public:
 
         HOTSTUFF_LOG_PROTO("Previous: proposer=%d and tid=%d", proposer, current_tid);
 
+        hsc->close_client(proposer);
+
         /** Rotation happens according to the total trees in the system */
         current_tid = (current_tid + 1) % hsc->get_total_system_trees();
         update_tree_proposer();
@@ -379,6 +381,7 @@ public:
         timer.del();
         //do_new_consensus(0, std::vector<uint256_t>{});
         delaying_proposal = false;
+        locked = false;
         HOTSTUFF_LOG_PROTO("Unlocking Proposer!!!");
     }
 

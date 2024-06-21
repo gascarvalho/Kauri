@@ -27,7 +27,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     commit_pat = re.compile('([^[].*) \[hotstuff proto\] commit (.*)')
-    interval = args.interval
+    interval = 5
 
     timestamps = []
 

@@ -2,29 +2,29 @@ version: "3.3"
 services:
   bootstrapper:
     image: kollaps:2.0
-    command: ["-s", "773dbcfb-1f45-4e13-b49a-69fd0c2e45cb"]
+    command: ["-s", "40e45366-f89a-434e-8209-a86d1d87111f"]
     deploy:
       mode: global
     environment:
-      KOLLAPS_UUID: '773dbcfb-1f45-4e13-b49a-69fd0c2e45cb'
+      KOLLAPS_UUID: '40e45366-f89a-434e-8209-a86d1d87111f'
       KOLLAPS_ORCHESTRATOR: swarm
       NUMBER_OF_GODS: 1
       POOL_PERIOD: 0.05
       MAX_FLOW_AGE: 2
     labels:
-      boot773dbcfb-1f45-4e13-b49a-69fd0c2e45cb: "true"
+      boot40e45366-f89a-434e-8209-a86d1d87111f: "true"
     volumes:
       - '/lib/modules:/lib/modules/'
       - '/usr/src:/usr/src/'
       - '/sys/:/sys/'
-      - '/home/tomas/thesis/MSc-Kauri/runkauri/kollaps/topology_inforum5.xml:/topology.xml'
+      - '/home/vagrant/MSc-Kauri/runkauri/kollaps/topology_inforum.xml:/topology.xml'
       - type: bind
         source: /var/run/docker.sock
         target: /var/run/docker.sock
     networks:
       - KollapsNet
 
-  dashboard-773dbcfb-1f45-4e13-b49a-69fd0c2e45cb:
+  dashboard-40e45366-f89a-434e-8209-a86d1d87111f:
     image: kollaps/dashboard:1.0
     ports:
       - "8088:8088"
@@ -32,24 +32,24 @@ services:
     deploy:
       replicas: 1
     environment:
-      KOLLAPS_UUID: '773dbcfb-1f45-4e13-b49a-69fd0c2e45cb'
+      KOLLAPS_UUID: '40e45366-f89a-434e-8209-a86d1d87111f'
       KOLLAPS_ORCHESTRATOR: swarm
     networks:
       - KollapsNet
       - outside
 
-  server1-773dbcfb-1f45-4e13-b49a-69fd0c2e45cb:
+  server1-40e45366-f89a-434e-8209-a86d1d87111f:
     image: kauri
     entrypoint: ["/bin/sh", "-c", "mkfifo /tmp/Kollaps_hang; exec /bin/sh <> /tmp/Kollaps_hang #"]
-    command: ['bls','2','1','1','1','50','1000','1','1']
+    command: ['bls','5','5','1','10','20','500']
     hostname: server1
     labels:
-      773dbcfb-1f45-4e13-b49a-69fd0c2e45cb: "true"
+      40e45366-f89a-434e-8209-a86d1d87111f: "true"
     deploy:
-      replicas: 15
+      replicas: 31
       endpoint_mode: dnsrr
     environment:
-      KOLLAPS_UUID: '773dbcfb-1f45-4e13-b49a-69fd0c2e45cb'
+      KOLLAPS_UUID: '40e45366-f89a-434e-8209-a86d1d87111f'
       KOLLAPS_ORCHESTRATOR: swarm
     networks:
       - KollapsNet

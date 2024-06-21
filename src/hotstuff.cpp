@@ -25,6 +25,7 @@
 #include "hotstuff/liveness.h"
 #include <thread>
 #include <chrono>
+#include <spawn.h>
 
 using salticidae::static_pointer_cast;
 
@@ -251,13 +252,13 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         auto pending_msg_tree = system_trees[pending_prop.tid];
         auto pending_childPeers = pending_msg_tree.get_childPeers();
 
-        if (!pending_childPeers.empty()) {
-            LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
-            MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
-            for (const PeerId &peerId : pending_childPeers) {
-                pn.send_msg(relay, peerId);
-            }
-        }
+        // if (!pending_childPeers.empty()) {
+        //     LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
+        //     MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
+        //     for (const PeerId &peerId : pending_childPeers) {
+        //         pn.send_msg(relay, peerId);
+        //     }
+        // }
 
         block_t pending_blk = pending_prop.blk;
         if (!pending_blk){
@@ -275,6 +276,14 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     }
 
 
+    if (!childPeers.empty()) {
+        LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in tid=%d", prop.tid);
+        MsgPropose relay = MsgPropose(stream, true);
+        for (const PeerId &peerId : childPeers) {
+            pn.send_msg(relay, peerId);
+        }
+    }
+
     /** Edge-case: Valid tree proposer but not the current tree proposer
      * Received a valid propose from a valid proposer in their system tree (passes propose handler safety checks)
      * However, it has arrived earlier than lower height blocks that would trigger a reconfiguration into the new tree
@@ -287,13 +296,6 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         return;
     }
 
-    if (!childPeers.empty()) {
-        LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in tid=%d", prop.tid);
-        MsgPropose relay = MsgPropose(stream, true);
-        for (const PeerId &peerId : childPeers) {
-            pn.send_msg(relay, peerId);
-        }
-    }
 
     block_t blk = prop.blk;
     if (!blk) {
@@ -323,13 +325,13 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
         auto pending_msg_tree = system_trees[pending_prop.tid];
         auto pending_childPeers = pending_msg_tree.get_childPeers();
 
-        if (!pending_childPeers.empty()) {
-            LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
-            MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
-            for (const PeerId &peerId : pending_childPeers) {
-                pn.send_msg(relay, peerId);
-            }
-        }
+        // if (!pending_childPeers.empty()) {
+        //     LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
+        //     MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
+        //     for (const PeerId &peerId : pending_childPeers) {
+        //         pn.send_msg(relay, peerId);
+        //     }
+        // }
 
         block_t pending_blk = pending_prop.blk;
         if (!pending_blk){
@@ -1277,6 +1279,53 @@ void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());
 
     LOG_PROTO("\n=========================== Finished Tree Switch =================================\n");
+
+    /* Proposer opens client for himself */
+    open_client(get_system_tree_root(offset));
+}
+
+void HotStuffBase::close_client(ReplicaID rid) {
+
+    // I was the previous proposer, kill client
+    if(rid == get_id()) {
+        int retval = kill(client_pid, SIGTERM);
+        if (retval == -1) {
+            perror("Error on killing client");
+        }
+        else {
+            HOTSTUFF_LOG_PROTO("Killed client.");
+        }         
+    }
+}
+
+void HotStuffBase::open_client(ReplicaID rid) {
+
+    // If I am proposer, start client
+    if(rid == get_id()) {
+
+        std::string id_str = std::to_string(get_id());
+
+        const char *program = "./examples/hotstuff-client"; // Adjust the path as necessary
+        char *const argv[] = {
+            (char *)program,
+            "--idx", 
+            (char *) id_str.c_str(),     
+            "--iter", 
+            "-900",
+            "--max-async",
+            "20",
+            NULL
+        };
+
+        //char *const argv[] = {(char *)client_prog, NULL};
+        char *const empty_environ[] = { NULL };
+
+        if (posix_spawn(&client_pid, program, NULL, NULL, argv, empty_environ) != 0) {
+            perror("posix_spawn: error starting up program");
+        }
+        
+        HOTSTUFF_LOG_PROTO("Successfully started client with pid=%d", client_pid);
+    }
 }
 
 bool HotStuffBase::isTreeSwitch(int bheight) {
@@ -1288,6 +1337,9 @@ bool HotStuffBase::isTreeSwitch(int bheight) {
 }
 
 void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop) {
+
+    /* ./examples/hotstuff-client */
+    //snprintf(client_prog, sizeof(client_prog), "./examples/hotstuff-client --idx %d --iter -1 --max-async 50 > clientlog%d &", get_id(), get_id());
 
     /* Initial tree config */
 
@@ -1316,75 +1368,123 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
     final_buffer.reserve(blk_size);
     cmd_pending_buffer.reserve(max_cmd_pending_size);
 
-    ev_beat_timer = TimerEvent(ec, [this](TimerEvent &) {
-        for(size_t i = 0; i < blk_size; i++) {
-            uint256_t hash = salticidae::get_hash(i);
-            final_buffer.push_back(hash);
-        }
-        beat();
-        ev_beat_timer.add(0.2);
-    });
-    ev_beat_timer.add(0.2);
+    // ev_beat_timer = TimerEvent(ec, [this](TimerEvent &) {
 
-    // cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
-    //     std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
-        
-        //while (q.try_dequeue(e))
-        //{
-            
-            // /** Note: We have to send temporary Finality messages to clients 
-            //  * so that they send more commands to fill our blocks!*/
+    //     if(final_buffer.empty()) {
+    //         for(size_t i = 0; i < blk_size; i++) {
+    //             uint256_t hash = salticidae::get_hash(i);
+    //             final_buffer.push_back(hash);
+    //         }
+    //     }
 
-            // ReplicaID proposer = pmaker->get_proposer();
+    //     if(pmaker->get_proposer() == get_id()) beat();
 
-            // // Reply with -1 if we're not the proposer
-            // if (proposer != get_id()) {
-            //     e.second(Finality(id, get_tree_id(), -1, 0, 0, e.first, uint256_t()));
-            //     continue;
-            // }
-
-            // // Check if the command has already been processed or is waiting to be processed
-            // if (cmd_pending_buffer.size() < max_cmd_pending_size) {
-            //     const auto &cmd_hash = e.first;
-            //     auto it = decision_waiting.find(cmd_hash);
-
-            //     if (decision_made.count(cmd_hash)) {
-            //         // Reply with -2 if we already know the height of the command
-            //         uint32_t height = decision_made[cmd_hash];
-            //         e.second(Finality(id, get_tree_id(), -2, 0, height, cmd_hash, uint256_t()));
-            //         continue;
-            //     }
-
-            //     // If the command is not in the decision_waiting map, insert it
-            //     if (it == decision_waiting.end())
-            //         it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
-                
-            //     // Reply with -3 if we're proposer and now the command is now pending
-            //     e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
-            //     cmd_pending_buffer.push_back(cmd_hash);
-            // } 
-            // else {
-            //     // Reply with -4 otherwise (max pending size reached, command won't be processed, client must resubmit if they wish)
-            //     e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
-            // }
-
-            // // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
-            // if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
-
-            //     // Pass a block of commands to the final buffer
-            //     if (final_buffer.empty()) {
-            //         std::move(std::make_move_iterator(cmd_pending_buffer.begin()), 
-            //                   std::make_move_iterator(cmd_pending_buffer.begin() + blk_size), std::back_inserter(final_buffer));
-            //         cmd_pending_buffer.erase(cmd_pending_buffer.begin(), cmd_pending_buffer.begin() + blk_size);
-            //         HOTSTUFF_LOG_PROTO("Filled Propose Final Buffer (%lu commands); Commands Still Pending: %lu", final_buffer.size(), cmd_pending_buffer.size());
-            //     }
-
-            //     beat();
-            //     return true;
-            // }
-        //}
-    //     return false;
+    //     ev_beat_timer.add(0.25);
     // });
+    // ev_beat_timer.add(10);
+
+    ev_check_pending = TimerEvent(ec, [this](TimerEvent &){
+        /*Take care of pending proposals*/
+        while(!pending_proposals.empty()) {
+            auto pending_proposal = std::move(pending_proposals.front());
+
+            if(pending_proposal.first.proposal.tid != get_tree_id()) {
+                break;
+            }
+
+            LOG_PROTO("[PROP HANDLER] Popping pending proposal: %s", std::string(pending_proposal.first.proposal).c_str());
+            pending_proposal = std::move(pending_proposals.front());
+            pending_proposals.erase(pending_proposals.begin());
+            auto &pending_prop = pending_proposal.first.proposal;
+
+            auto pending_msg_tree = system_trees[pending_prop.tid];
+            auto pending_childPeers = pending_msg_tree.get_childPeers();
+
+            // if (!pending_childPeers.empty()) {
+            //     LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
+            //     MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
+            //     for (const PeerId &peerId : pending_childPeers) {
+            //         pn.send_msg(relay, peerId);
+            //     }
+            // }
+
+            block_t pending_blk = pending_prop.blk;
+            if (!pending_blk){
+                LOG_PROTO("[PROP HANDLER] Pending block is null!");
+                break;
+            }
+
+            const PeerId &pending_peer = pending_proposal.second->get_peer_id();
+
+            promise::all(std::vector<promise_t>{
+                async_deliver_blk(pending_blk->get_hash(), pending_peer)
+            }).then([this, pending_prop = std::move(pending_prop)]() {
+                on_receive_proposal(pending_prop);
+            });
+        }
+        ev_check_pending.add(1);
+    });
+    ev_check_pending.add(1);
+
+    cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
+        std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
+        
+        while (q.try_dequeue(e))
+        {
+            
+            /** Note: We have to send temporary Finality messages to clients 
+             * so that they send more commands to fill our blocks!*/
+
+            ReplicaID proposer = pmaker->get_proposer();
+
+            // Reply with -1 if we're not the proposer
+            if (proposer != get_id()) {
+                e.second(Finality(id, get_tree_id(), -1, 0, 0, e.first, uint256_t()));
+                continue;
+            }
+
+            // Check if the command has already been processed or is waiting to be processed
+            if (cmd_pending_buffer.size() < max_cmd_pending_size) {
+                const auto &cmd_hash = e.first;
+                auto it = decision_waiting.find(cmd_hash);
+
+                if (decision_made.count(cmd_hash)) {
+                    // Reply with -2 if we already know the height of the command
+                    uint32_t height = decision_made[cmd_hash];
+                    e.second(Finality(id, get_tree_id(), -2, 0, height, cmd_hash, uint256_t()));
+                    continue;
+                }
+
+                // If the command is not in the decision_waiting map, insert it
+                if (it == decision_waiting.end())
+                    it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
+                
+                // Reply with -3 if we're proposer and now the command is now pending
+                e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
+                cmd_pending_buffer.push_back(cmd_hash);
+            } 
+            else {
+                // Reply with -4 otherwise (max pending size reached, command won't be processed, client must resubmit if they wish)
+                e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
+            }
+
+            // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
+            if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
+
+                // Pass a block of commands to the final buffer
+                if (final_buffer.empty()) {
+                    std::move(std::make_move_iterator(cmd_pending_buffer.begin()), 
+                              std::make_move_iterator(cmd_pending_buffer.begin() + blk_size), std::back_inserter(final_buffer));
+                    //cmd_pending_buffer.erase(cmd_pending_buffer.begin(), cmd_pending_buffer.begin() + blk_size);
+                    HOTSTUFF_LOG_PROTO("Filled Propose Final Buffer (%lu commands); Commands Still Pending: %lu", final_buffer.size(), cmd_pending_buffer.size());
+                }
+
+                if(pmaker->get_proposer() == get_id()) beat();
+                return true;
+            }
+        }
+        return false;
+    });
 }
 
 void HotStuffBase::beat() {
@@ -1397,7 +1497,11 @@ void HotStuffBase::beat() {
             return;
         }
 
+        // HOTSTUFF_LOG_PROTO("[INSIDE] Current proposer: %d", proposer);
+        // HOTSTUFF_LOG_PROTO("[INSIDE] get_id: %d", get_id());
+
         if (proposer == get_id()) {
+            //HOTSTUFF_LOG_PROTO("BEAT AS PROPOSER");
             struct timeval timeStart, timeEnd;
             gettimeofday(&timeStart, NULL);
 

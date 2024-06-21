@@ -2,6 +2,7 @@ version: "3.3"
 services:
   server1-becd9691-b958-47c3-9ac3-688ca48fb6d6:
     image: kauri
+    entrypoint: ["/bin/bash", "/server.sh"]
     command: thecmd
     hostname: server1
     cap_add:
@@ -18,6 +19,7 @@ services:
 
   server2-becd9691-b958-47c3-9ac3-688ca48fb6d6:
     image: kauri
+    entrypoint: ["/bin/bash", "/server.sh"]
     command: thecmd
     hostname: server2
     cap_add:
@@ -31,6 +33,23 @@ services:
       KAURI_UUID: 'becd9691-b958-47c3-9ac3-688ca48fb6d6'
     networks:
       - KauriNet
+
+  # client-becd9691-b958-47c3-9ac3-688ca48fb6d6:
+  #   image: kauri
+  #   entrypoint: ["/bin/bash", "/client.sh"]
+  #   command: thecmd
+  #   hostname: client
+  #   cap_add:
+  #     - NET_ADMIN
+  #   labels:
+  #     becd9691-b958-47c3-9ac3-688ca48fb6d6: "true"
+  #   deploy:
+  #     replicas: 1
+  #     endpoint_mode: dnsrr
+  #   environment:
+  #     KAURI_UUID: 'becd9691-b958-47c3-9ac3-688ca48fb6d6'
+  #   networks:
+  #     - KauriNet
 
 networks:
   KauriNet:

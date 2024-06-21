@@ -9,7 +9,7 @@
              Currently it represents:
              [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
 
-        <service name="server1" image="kauri" share="false" command="['bls','2','1','1','1','50','500','1','1']"/>
+        <service name="server1" image="kauri" share="false" command="['bls','5','5','1','10','20','500']"/>
     </services>
     <bridges>
         <!-- Definition of the network elements (routers and switches) -->
@@ -17,7 +17,7 @@
     </bridges>
     <links>
         <!-- Intra-cluster behaviour -->
-        <link origin="server1" dest="server1" latency="50" upload="20Mbps" download="20Mbps" network="kauri_network"/>
+        <link origin="server1" dest="server1" latency="60" upload="50Mbps" download="50Mbps" network="kauri_network"/>
       
     </links>
     <dynamic>
@@ -25,8 +25,8 @@
              This section can be ommited in which case all the services will be started at the beginning of the experiment -->
 
         <!-- were we start three instances of the "server" service -->
-        <schedule name="server1"  time="0.0" action="join" amount="15"/>
+        <schedule name="server1"  time="0.0" action="join" amount="31"/>
 
-        <schedule name="server1"  time="380.0" action="leave" amount="15"/>
+        <schedule name="server1"  time="380.0" action="leave" amount="31"/>
     </dynamic>
 </experiment>

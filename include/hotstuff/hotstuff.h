@@ -288,6 +288,9 @@ class HotStuffBase: public HotStuffCore {
     std::vector<PeerId> peers;
     std::unordered_map<PeerId, size_t> peer_id_map; /* PeerId to ReplicaId map*/
 
+    pid_t client_pid;
+    char client_prog[256];
+
     private:
     /** whether libevent handle is owned by itself */
     bool ec_loop;
@@ -299,6 +302,7 @@ class HotStuffBase: public HotStuffCore {
 #endif
     pacemaker_bt pmaker;
     TimerEvent ev_beat_timer;
+    TimerEvent ev_check_pending;
 
     /* queues for async tasks */
     
@@ -399,6 +403,8 @@ class HotStuffBase: public HotStuffCore {
                 bool ec_loop = false);
     void tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
     void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
+    void close_client(ReplicaID rid);
+    void open_client(ReplicaID rid);
     bool isTreeSwitch(int bheight);
     void beat();
     void print_pipe_queues(bool printPiped, bool printRdy);

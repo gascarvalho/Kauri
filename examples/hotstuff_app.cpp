@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
     auto opt_piped_latency = Config::OptValInt::create(10); // 10ms by default
     auto opt_async_blocks = Config::OptValInt::create(0); // 0 by default
 
-    auto opt_tree_switch_period = Config::OptValDouble::create(5000);
+    auto opt_tree_switch_period = Config::OptValDouble::create(99999);
     auto opt_tree_generation = Config::OptValStr::create("default");
     auto opt_tree_generation_fpath = Config::OptValStr::create("treegen.conf");
 
@@ -349,7 +349,7 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
             try {
                 cn.send_msg(MsgRespCmd(std::move(p.first)), p.second);
             } catch (std::exception &err) {
-                HOTSTUFF_LOG_WARN("unable to send to the client: %s", err.what());
+                //HOTSTUFF_LOG_WARN("unable to send to the client: %s", err.what());
             }
         }
         return false;
