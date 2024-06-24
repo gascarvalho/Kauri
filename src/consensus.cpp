@@ -104,19 +104,20 @@ bool HotStuffCore::on_deliver_blk(const block_t &blk) {
     blk->delivered = true;
 
     if (blk->height > 5) {
-        struct timeval end;
-        gettimeofday(&end, NULL);
+        salticidae::ElapsedTime blk_et;
         auto hash = blk->hash;
-        proposal_time[blk->hash] = end;
+        proposal_time[blk->hash] = blk_et;
+        proposal_time[blk->hash].start();
 
         if (blk->qc_ref) {
             auto it = proposal_time.find(blk->qc_ref->hash);
             if (it != proposal_time.end()) {
-                struct timeval start = it->second;
-                long ms = ((end.tv_sec - start.tv_sec) * 1000000 + end.tv_usec - start.tv_usec) / 1000;
+                it->second.stop();
+                long ms = it->second.elapsed_sec * 1000;
                 processed_blocks++;
                 summed_latency += ms;
                 HOTSTUFF_LOG_PROTO("[TIME] Average latency per block (%lu tx): %d ms", get_blk_size(), summed_latency / processed_blocks);
+                HOTSTUFF_LOG_PROTO("[TIME] Stats for last block: wall: %.4f, cpu: %.4f", it->second.elapsed_sec, it->second.cpu_elapsed_sec);
             }
         }
     }

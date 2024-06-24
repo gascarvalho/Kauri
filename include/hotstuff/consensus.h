@@ -187,8 +187,9 @@ public:
 
     uint64_t summed_latency;
     uint64_t processed_blocks;
+    salticidae::ElapsedTime et;
 
-    std::unordered_map<const uint256_t, timeval> proposal_time;
+    std::unordered_map<const uint256_t, salticidae::ElapsedTime> proposal_time;
 
 protected:
     /** Called by HotStuffCore upon the decision being made for cmd. */
