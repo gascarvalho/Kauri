@@ -33,9 +33,9 @@ def plot_hist(fname, data, labels, window_size, blksize):
     plt.xlabel(r"tempo (s)")
     
     if args.blksize is None:
-        plt.ylabel(r"blocos")
+        plt.ylabel(r"blocos/s")
     else:
-        plt.ylabel(r"tx")
+        plt.ylabel(r"tx/s")
 
     colors = list(mcolors.TABLEAU_COLORS)
     for i, (x, y, reconfig_x, avg_tx_sec, total, total_time) in enumerate(data):
@@ -70,6 +70,7 @@ if __name__ == '__main__':
     parser.add_argument('--files', type=str, nargs='+', required=True)
     parser.add_argument('--labels', type=str, nargs='+', required=False)
     parser.add_argument('--cutoff', type=float, default=9999, required=False)
+    parser.add_argument('--warmup', type=float, default=0, required=False)
     args = parser.parse_args()
     commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver')
     reconfig_pat = re.compile('([^[].*) \[hotstuff proto\] \[PMAKER\] Timeout reached!!!')
@@ -99,6 +100,9 @@ if __name__ == '__main__':
                 
         timestamps.sort()
         rcf_timestamps.sort()
+
+        timestamps = [ts for ts in timestamps if ts > (timestamps[0] + timedelta(seconds=args.warmup))]
+        rcf_timestamps = [ts for ts in rcf_timestamps if ts > timestamps[0]]
 
         start_time = timestamps[0]
         end_time = timestamps[-1]

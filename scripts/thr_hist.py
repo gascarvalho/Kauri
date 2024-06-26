@@ -33,11 +33,11 @@ def plot_hist(fname, x, y):
     plt.xlabel(r"tempo (s)")
 
     if args.blksize is None:
-        plt.ylabel(r"blocos")
+        plt.ylabel(r"blocos/s")
         #plt.suptitle("Débito ao longo to tempo (bloco/s)", fontsize=12)
         #plt.title("Sliding Window Size: {}s, Block size: {}txs".format(args.window_size, args.blksize), fontsize=10)
     else:
-        plt.ylabel(r"tx")
+        plt.ylabel(r"tx/s")
         #plt.suptitle("Débito ao longo to tempo (transação/s)", fontsize=12)
         #plt.title("Sliding Window Size: {}s, Block size: {}txs".format(args.window_size, args.blksize), fontsize=10)
 
@@ -141,6 +141,7 @@ if __name__ == '__main__':
     parser.add_argument('--file', type=str, required=True)
     parser.add_argument('--plot', type=str, default="hist", required=False)
     parser.add_argument('--cutoff', type=float, default=9999, required=False)
+    parser.add_argument('--warmup', type=float, default=0, required=False)
     args = parser.parse_args()
     commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver') #To count in special cases where chain is enforced later
     #commit_pat = re.compile('([^[].*) \[hotstuff proto\] commit (.*)')
@@ -170,6 +171,9 @@ if __name__ == '__main__':
             
         timestamps.sort()
         rcf_timestamps.sort()
+
+    timestamps = [ts for ts in timestamps if ts > (timestamps[0] + timedelta(seconds=args.warmup))]
+    rcf_timestamps = [ts for ts in rcf_timestamps if ts > timestamps[0]]
 
     start_time = timestamps[0]
     end_time = timestamps[-1]
