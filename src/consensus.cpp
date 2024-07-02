@@ -303,7 +303,7 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
         LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (block height is now %llu)", bnew->height);
         inc_time(true);
     }
-    else if (b_normal_height > config.tree_switch_period)
+    else if (b_normal_height > config.tree_switch_period) //TODO: WARMUP PARAMETER
         inc_time(false);
 
     return bnew;

@@ -1273,7 +1273,11 @@ void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     config.fanout = current_tree.get_fanout();
 
     /* Set when the tree will change */
-    current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
+
+    if(startup) //TODO: WARMUP PARAMETER
+        current_tree_network.set_target(300);
+    else
+        current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
     HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
     HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());

@@ -7,7 +7,8 @@
 
         <!-- the "command" can be used to pass parameters to the container entrypoints.
              Currently it represents:
-             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice] -->
+             [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size, total-services, myservice]
+             latency and bandwidth parameters deprecated and no longer relevant -->
 
         <service name="server1" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','1']"/>
         <service name="server2" image="kauri" share="false" command="['bls','2','1','1','1','50','500','15','2']"/>
