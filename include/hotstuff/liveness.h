@@ -337,13 +337,15 @@ public:
     void set_proposer(bool isTimeout) {
 
         delaying_proposal = true;
+        // std::queue<promise_t> empty;
+        // std::swap( pending_beats, empty );
 
         HOTSTUFF_LOG_PROTO("-------------------------------");
         HOTSTUFF_LOG_PROTO("[PMAKER] %s reached!!!", isTimeout ? "Reconfiguration" : "Timeout");
 
         HOTSTUFF_LOG_PROTO("Previous: proposer=%d and tid=%d", proposer, current_tid);
 
-        hsc->close_client(proposer);
+        //hsc->close_client(proposer);
 
         /** Rotation happens according to the total trees in the system */
         current_tid = (current_tid + 1) % hsc->get_total_system_trees();

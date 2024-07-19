@@ -1274,8 +1274,23 @@ void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     /* Set when the tree will change */
 
-    if(startup) //TODO: WARMUP PARAMETER
-        current_tree_network.set_target(300);
+    // if(startup) { //TODO: WARMUP PARAMETER
+    //     current_tree_network.set_target(300);
+
+    //     // ev_end_warmup = TimerEvent(ec, [this](TimerEvent &){
+    //     //     HOTSTUFF_LOG_PROTO("[WARMUP] Ended warmup, tree switch will happen at %d", lastCheckedHeight + config.tree_switch_period);
+    //     //     current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
+    //     // });
+    //     // ev_end_warmup.add(90);
+    // }
+    // else
+    //     current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
+
+    if(warmup_counter < system_trees.size()) {
+        // Do 1 block for each tree in schedule to warmup
+        current_tree_network.set_target(lastCheckedHeight + 10);
+        warmup_counter++;
+    }
     else
         current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
@@ -1285,7 +1300,7 @@ void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uin
     LOG_PROTO("\n=========================== Finished Tree Switch =================================\n");
 
     /* Proposer opens client for himself */
-    open_client(get_system_tree_root(offset));
+    //open_client(get_system_tree_root(offset));
 }
 
 void HotStuffBase::close_client(ReplicaID rid) {
@@ -1372,20 +1387,20 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
     final_buffer.reserve(blk_size);
     cmd_pending_buffer.reserve(max_cmd_pending_size);
 
-    // ev_beat_timer = TimerEvent(ec, [this](TimerEvent &) {
+    ev_beat_timer = TimerEvent(ec, [this](TimerEvent &) {
 
-    //     if(final_buffer.empty()) {
-    //         for(size_t i = 0; i < blk_size; i++) {
-    //             uint256_t hash = salticidae::get_hash(i);
-    //             final_buffer.push_back(hash);
-    //         }
-    //     }
+        if(final_buffer.empty()) {
+            for(size_t i = 0; i < blk_size; i++) {
+                uint256_t hash = salticidae::get_hash(i);
+                final_buffer.push_back(hash);
+            }
+        }
 
-    //     if(pmaker->get_proposer() == get_id()) beat();
+        if(pmaker->get_proposer() == get_id()) beat();
 
-    //     ev_beat_timer.add(0.25);
-    // });
-    // ev_beat_timer.add(10);
+        ev_beat_timer.add(0.1);
+    });
+    ev_beat_timer.add(10);
 
     ev_check_pending = TimerEvent(ec, [this](TimerEvent &){
         /*Take care of pending proposals*/
@@ -1430,71 +1445,95 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
     });
     ev_check_pending.add(1);
 
-    cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
-        std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
+
+    // /** Alternative to clients: Locally generated blocks */
+    // sleep(15); // Wait for connections to setup
+    // while(true) {
+
+    //     if(beating) continue;
+
+    //     ReplicaID proposer = pmaker->get_proposer();
+    //     if (proposer != get_id()) {
+    //             continue;
+    //     }
+
+    //     if(final_buffer.empty()) {
+    //         for(size_t i = 0; i < blk_size; i++) {
+    //             uint256_t hash = salticidae::get_hash(i);
+    //             final_buffer.push_back(hash);
+    //         }
+    //         if(pmaker->get_proposer() == get_id()) beat();
+    //     }
+    //     else {
+    //         continue;
+    //     }
+
+    // }
+
+    // cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
+    //     std::pair<uint256_t, commit_cb_t> e; // e.first = cmd_hash, e.second = finality callback function
         
-        while (q.try_dequeue(e))
-        {
+    //     while (q.try_dequeue(e))
+    //     {
             
-            /** Note: We have to send temporary Finality messages to clients 
-             * so that they send more commands to fill our blocks!*/
+    //         /** Note: We have to send temporary Finality messages to clients 
+    //          * so that they send more commands to fill our blocks!*/
 
-            ReplicaID proposer = pmaker->get_proposer();
+    //         ReplicaID proposer = pmaker->get_proposer();
 
-            // Reply with -1 if we're not the proposer
-            if (proposer != get_id()) {
-                e.second(Finality(id, get_tree_id(), -1, 0, 0, e.first, uint256_t()));
-                continue;
-            }
+    //         // Reply with -1 if we're not the proposer
+    //         if (proposer != get_id()) {
+    //             e.second(Finality(id, get_tree_id(), -1, 0, 0, e.first, uint256_t()));
+    //             continue;
+    //         }
 
-            // Check if the command has already been processed or is waiting to be processed
-            if (cmd_pending_buffer.size() < max_cmd_pending_size) {
-                const auto &cmd_hash = e.first;
-                auto it = decision_waiting.find(cmd_hash);
+    //         // Check if the command has already been processed or is waiting to be processed
+    //         if (cmd_pending_buffer.size() < max_cmd_pending_size) {
+    //             const auto &cmd_hash = e.first;
+    //             auto it = decision_waiting.find(cmd_hash);
 
-                if (decision_made.count(cmd_hash)) {
-                    // Reply with -2 if we already know the height of the command
-                    uint32_t height = decision_made[cmd_hash];
-                    e.second(Finality(id, get_tree_id(), -2, 0, height, cmd_hash, uint256_t()));
-                    continue;
-                }
+    //             if (decision_made.count(cmd_hash)) {
+    //                 // Reply with -2 if we already know the height of the command
+    //                 uint32_t height = decision_made[cmd_hash];
+    //                 e.second(Finality(id, get_tree_id(), -2, 0, height, cmd_hash, uint256_t()));
+    //                 continue;
+    //             }
 
-                // If the command is not in the decision_waiting map, insert it
-                if (it == decision_waiting.end())
-                    it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
+    //             // If the command is not in the decision_waiting map, insert it
+    //             if (it == decision_waiting.end())
+    //                 it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
                 
-                // Reply with -3 if we're proposer and now the command is now pending
-                e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
-                cmd_pending_buffer.push_back(cmd_hash);
-            } 
-            else {
-                // Reply with -4 otherwise (max pending size reached, command won't be processed, client must resubmit if they wish)
-                e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
-            }
+    //             // Reply with -3 if we're proposer and now the command is now pending
+    //             e.second(Finality(id, get_tree_id(), -3, 0, 0, cmd_hash, uint256_t()));
+    //             cmd_pending_buffer.push_back(cmd_hash);
+    //         } 
+    //         else {
+    //             // Reply with -4 otherwise (max pending size reached, command won't be processed, client must resubmit if they wish)
+    //             e.second(Finality(id, get_tree_id(), -4, 0, 0, e.first, uint256_t()));
+    //         }
 
-            // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
-            if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
+    //         // Transfer the pending buffer into the final buffer. Beat while final buffer has commands
+    //         if (cmd_pending_buffer.size() >= blk_size || !final_buffer.empty()) {
 
-                // Pass a block of commands to the final buffer
-                if (final_buffer.empty()) {
-                    std::move(std::make_move_iterator(cmd_pending_buffer.begin()), 
-                              std::make_move_iterator(cmd_pending_buffer.begin() + blk_size), std::back_inserter(final_buffer));
-                    cmd_pending_buffer.erase(cmd_pending_buffer.begin(), cmd_pending_buffer.begin() + blk_size);
-                    HOTSTUFF_LOG_PROTO("Filled Propose Final Buffer (%lu commands); Commands Still Pending: %lu", final_buffer.size(), cmd_pending_buffer.size());
+    //             // Pass a block of commands to the final buffer
+    //             if (final_buffer.empty()) {
+    //                 std::move(std::make_move_iterator(cmd_pending_buffer.begin()), 
+    //                           std::make_move_iterator(cmd_pending_buffer.begin() + blk_size), std::back_inserter(final_buffer));
+    //                 cmd_pending_buffer.erase(cmd_pending_buffer.begin(), cmd_pending_buffer.begin() + blk_size);
+    //                 HOTSTUFF_LOG_PROTO("Filled Propose Final Buffer (%lu commands); Commands Still Pending: %lu", final_buffer.size(), cmd_pending_buffer.size());
 
-                    if(pmaker->get_proposer() == get_id()) beat();
-                    return true;
-                }
-            }
-        }
-        return false;
-    });
+    //                 if(pmaker->get_proposer() == get_id()) beat();
+    //                 return true;
+    //             }
+    //         }
+    //     }
+    //     return false;
+    // });
 }
 
 void HotStuffBase::beat() {
     
     /** Ask pmaker to know if we're a proposer or not. If we are, we propose */
-
     pmaker->beat().then([this](ReplicaID proposer) {
         if (piped_queue.size() > get_config().async_blocks + 1) {
             HOTSTUFF_LOG_PROTO("[PIPELINING] Piped queue is full! Current size: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);

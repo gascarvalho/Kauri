@@ -303,6 +303,8 @@ class HotStuffBase: public HotStuffCore {
     pacemaker_bt pmaker;
     TimerEvent ev_beat_timer;
     TimerEvent ev_check_pending;
+    TimerEvent ev_end_warmup;
+    size_t warmup_counter = 0;
 
     /* queues for async tasks */
     
