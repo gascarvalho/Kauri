@@ -259,7 +259,7 @@ protected:
     operator std::string () const;
     void set_vote_disabled(bool f) { vote_disabled = f; }
 
-    Proposal process_block(const block_t& bnew, bool adjustHeight);
+    Proposal process_block(const block_t& bnew, bool adjustHeight, int tid);
 
     void tree_config(bool b);
     void tree_scheduler(bool b);
