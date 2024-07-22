@@ -83,7 +83,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup', type=float, default=0, required=False)
     parser.add_argument('--moving-average-window', type=int, default=1, required=False)
     args = parser.parse_args()
-    commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver')
+    commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver(.*)')
     reconfig_pat = re.compile('([^[].*) \[hotstuff proto\] \[PMAKER\] Timeout reached!!!')
     
     window_size = args.window_size

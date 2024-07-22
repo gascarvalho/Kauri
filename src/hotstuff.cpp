@@ -114,7 +114,7 @@ void HotStuffBase::on_fetch_blk(const block_t &blk) {
 }
 
 bool HotStuffBase::on_deliver_blk(const block_t &blk) {
-    HOTSTUFF_LOG_PROTO("Base deliver");
+    HOTSTUFF_LOG_PROTO("Base deliver for %.10s", get_hex10(blk->hash).c_str());
 
     const uint256_t &blk_hash = blk->get_hash();
     bool valid;
@@ -373,7 +373,8 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
         HOTSTUFF_LOG_PROTO("piped block");
         block_t blk = storage->find_blk(msg.vote.blk_hash);
         if (!blk->delivered) {
-            process_block(blk, false);
+            on_deliver_blk(blk);
+            process_block(blk, false, msg_tree_id);
             HOTSTUFF_LOG_PROTO("Normalized piped block");
         }
     }
@@ -535,7 +536,8 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
         HOTSTUFF_LOG_PROTO("piped block");
         block_t blk = storage->find_blk(msg.vote.blk_hash);
         if (!blk->delivered) {
-            process_block(blk, false);
+            on_deliver_blk(blk);
+            process_block(blk, false, msg_tree_id);
             HOTSTUFF_LOG_PROTO("Normalized piped block");
         }
     }
@@ -1398,7 +1400,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
 
         if(pmaker->get_proposer() == get_id()) beat();
 
-        ev_beat_timer.add(0.1);
+        ev_beat_timer.add(0.05);
     });
     ev_beat_timer.add(10);
 

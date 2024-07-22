@@ -64,18 +64,18 @@ block_t HotStuffCore::get_potentially_not_delivered_blk(const uint256_t &blk_has
 block_t HotStuffCore::get_delivered_blk(const uint256_t &blk_hash) {
     block_t blk = storage->find_blk(blk_hash);
     if (blk == nullptr || !blk->delivered) {
-        HOTSTUFF_LOG_PROTO("block %s not delivered", get_hex10(blk_hash).c_str());
+        HOTSTUFF_LOG_PROTO("block %.10s not delivered", get_hex10(blk_hash).c_str());
         throw std::runtime_error("block not delivered ");
     }
     return blk;
 }
 
 bool HotStuffCore::on_deliver_blk(const block_t &blk) {
-    HOTSTUFF_LOG_PROTO("Core deliver");
+    HOTSTUFF_LOG_PROTO("Core deliver for %.10s", get_hex10(blk->hash).c_str());
 
     if (blk->delivered)
     {
-        LOG_WARN("attempt to deliver a block twice");
+        LOG_WARN("attempt to deliver a block twice: %.10s", get_hex10(blk->hash).c_str());
         return false;
     }
     blk->parents.clear();
@@ -288,7 +288,8 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
     b_normal_height = bnew->get_height();
 
     LOG_PROTO("propose %s", std::string(*bnew).c_str());
-    Proposal prop = process_block(bnew, true);
+    on_deliver_blk(bnew);
+    Proposal prop = process_block(bnew, true, get_tree_id());
     /* broadcast to other replicas */
     do_broadcast_proposal(prop);
 
@@ -309,17 +310,15 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
     return bnew;
 }
 
-Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight)
+Proposal HotStuffCore::process_block(const block_t& bnew, bool adjustHeight, int tid)
 {
     const uint256_t bnew_hash = bnew->get_hash();
     if (bnew->self_qc == nullptr) {
         bnew->self_qc = create_quorum_cert(bnew_hash);
     }
 
-    auto tid = get_tree_id();
-
     //proposer_base_deliver(bnew);
-    on_deliver_blk(bnew);
+    //on_deliver_blk(bnew);
     LOG_PROTO("before update");
     update(bnew);
     Proposal prop(id, tid, bnew, nullptr);
