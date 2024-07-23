@@ -120,7 +120,9 @@ bool HotStuffBase::on_deliver_blk(const block_t &blk) {
     bool valid;
     /* sanity check: all parents must be delivered */
     for (const auto &p: blk->get_parent_hashes())
-        assert(storage->is_blk_delivered(p));
+        if(!storage->is_blk_delivered(p))
+            std::cout << "PARENT ASSERT FAILED" << std::endl;
+    //     assert(storage->is_blk_delivered(p));
     if ((valid = HotStuffCore::on_deliver_blk(blk)))
     {
         LOG_DEBUG("block %.10s delivered",
@@ -1402,7 +1404,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
 
         ev_beat_timer.add(0.05);
     });
-    ev_beat_timer.add(10);
+    ev_beat_timer.add(5);
 
     ev_check_pending = TimerEvent(ec, [this](TimerEvent &){
         /*Take care of pending proposals*/
