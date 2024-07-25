@@ -121,8 +121,8 @@ bool HotStuffBase::on_deliver_blk(const block_t &blk) {
     /* sanity check: all parents must be delivered */
     for (const auto &p: blk->get_parent_hashes())
         if(!storage->is_blk_delivered(p))
-            std::cout << "PARENT ASSERT FAILED" << std::endl;
-    //     assert(storage->is_blk_delivered(p));
+            //std::cout << "PARENT ASSERT FAILED" << std::endl;
+            assert(storage->is_blk_delivered(p));
     if ((valid = HotStuffCore::on_deliver_blk(blk)))
     {
         LOG_DEBUG("block %.10s delivered",
@@ -374,9 +374,9 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
     if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end()) {
         HOTSTUFF_LOG_PROTO("piped block");
         block_t blk = storage->find_blk(msg.vote.blk_hash);
-        if (!blk->delivered) {
-            on_deliver_blk(blk);
+        if (!blk->piped_delivered) {
             process_block(blk, false, msg_tree_id);
+            blk->piped_delivered = true;
             HOTSTUFF_LOG_PROTO("Normalized piped block");
         }
     }
@@ -537,9 +537,9 @@ void HotStuffBase::vote_relay_handler(MsgRelay &&msg, const Net::conn_t &conn) {
     if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end()) {
         HOTSTUFF_LOG_PROTO("piped block");
         block_t blk = storage->find_blk(msg.vote.blk_hash);
-        if (!blk->delivered) {
-            on_deliver_blk(blk);
+        if (!blk->piped_delivered) {
             process_block(blk, false, msg_tree_id);
+            blk->piped_delivered = true;
             HOTSTUFF_LOG_PROTO("Normalized piped block");
         }
     }
@@ -1590,8 +1590,8 @@ void HotStuffBase::beat() {
                     HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
                     /* broadcast to other replicas */
                     gettimeofday(&last_block_time, NULL);
+                    on_deliver_blk(piped_block);
                     do_broadcast_proposal(prop);
-
                     /*if (id == get_pace_maker()->get_proposer()) {
                         gettimeofday(&timeEnd, NULL);
                         long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);

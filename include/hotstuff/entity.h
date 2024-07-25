@@ -141,6 +141,7 @@ class Block {
     quorum_cert_bt self_qc;
     uint32_t height;
     bool delivered;
+    bool piped_delivered;
     int8_t decision;
 
     std::unordered_set<ReplicaID> voted;
@@ -150,7 +151,7 @@ class Block {
         qc(nullptr),
         qc_ref(nullptr),
         self_qc(nullptr), height(0),
-        delivered(false), decision(0) {}
+        delivered(false), piped_delivered(false), decision(0) {}
 
     Block(bool delivered, int8_t decision):
         qc(new QuorumCertDummy()),
@@ -158,7 +159,7 @@ class Block {
         parents(std::vector<block_t>()),
         qc_ref(nullptr),
         self_qc(nullptr), height(0),
-        delivered(delivered), decision(decision) {}
+        delivered(delivered), piped_delivered(false), decision(decision) {}
 
     Block(const std::vector<block_t> &parents,
         const std::vector<uint256_t> &cmds,
@@ -178,6 +179,7 @@ class Block {
             self_qc(std::move(self_qc)),
             height(height),
             delivered(0),
+            piped_delivered(0),
             decision(decision) {}
 
     void serialize(DataStream &s) const;
