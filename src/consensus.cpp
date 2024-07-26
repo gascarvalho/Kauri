@@ -304,7 +304,7 @@ block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
         LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (block height is now %llu)", bnew->height);
         inc_time(true);
     }
-    else if (b_normal_height > config.tree_switch_period) //TODO: WARMUP PARAMETER
+    else if (b_normal_height > get_total_system_trees()) //TODO: WARMUP PARAMETER
         inc_time(false);
 
     return bnew;
@@ -397,7 +397,7 @@ void HotStuffCore::on_receive_proposal(const Proposal &prop) {
         LOG_PROTO("Forcing a reconfiguration! (block height is now %llu)", bnew->height);
         inc_time(true);
     }
-    else if (bnew->height > config.tree_switch_period) {
+    else if (bnew->height > get_total_system_trees()) {
         inc_time(false);
     }
 

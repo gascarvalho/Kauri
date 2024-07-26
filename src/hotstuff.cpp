@@ -1292,7 +1292,7 @@ void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uin
 
     if(warmup_counter < system_trees.size()) {
         // Do 1 block for each tree in schedule to warmup
-        current_tree_network.set_target(lastCheckedHeight + 10);
+        current_tree_network.set_target(lastCheckedHeight + 1);
         warmup_counter++;
     }
     else
@@ -1605,7 +1605,7 @@ void HotStuffBase::beat() {
                         LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (piped block height is now %llu)", piped_block->get_height());
                         inc_time(true);
                     }
-                    else if (piped_block->get_height() > config.tree_switch_period ) {
+                    else if (piped_block->get_height() >  get_total_system_trees()) {
                         inc_time(false);
                     }
                 }
