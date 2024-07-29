@@ -1404,7 +1404,7 @@ void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> 
 
         ev_beat_timer.add(0.05);
     });
-    ev_beat_timer.add(5);
+    ev_beat_timer.add(10);
 
     ev_check_pending = TimerEvent(ec, [this](TimerEvent &){
         /*Take care of pending proposals*/

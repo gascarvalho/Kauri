@@ -167,10 +167,10 @@ int main(int argc, char **argv) {
     auto opt_base_timeout = Config::OptValDouble::create(10);
     auto opt_prop_delay = Config::OptValDouble::create(1);
     auto opt_imp_timeout = Config::OptValDouble::create(10);
-    auto opt_nworker = Config::OptValInt::create(1);
+    auto opt_nworker = Config::OptValInt::create(2);
     auto opt_repnworker = Config::OptValInt::create(2);
     auto opt_repburst = Config::OptValInt::create(10000);
-    auto opt_clinworker = Config::OptValInt::create(2);
+    auto opt_clinworker = Config::OptValInt::create(1);
     auto opt_cliburst = Config::OptValInt::create(10000);
     auto opt_notls = Config::OptValFlag::create(false);
 
@@ -307,6 +307,12 @@ int main(int argc, char **argv) {
     papp->set_piped_latency(opt_piped_latency->get(), opt_async_blocks->get());
     papp->set_tree_generation(opt_tree_generation->get(), opt_tree_generation_fpath->get());
     papp->set_tree_period(opt_tree_switch_period->get());
+
+    HOTSTUFF_LOG_INFO("*** thread info ***");
+    HOTSTUFF_LOG_INFO("Verification workers = %lu", opt_nworker->get());
+    HOTSTUFF_LOG_INFO("Replica workers = %lu", opt_repnworker->get());
+    HOTSTUFF_LOG_INFO("Replica burst = %lu", opt_repburst->get());
+    HOTSTUFF_LOG_INFO("*******************");
 
     auto shutdown = [&](int) { papp->stop(); };
     salticidae::SigEvent ev_sigint(ec, shutdown);

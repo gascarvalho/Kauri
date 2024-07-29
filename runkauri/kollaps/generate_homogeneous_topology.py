@@ -17,7 +17,7 @@ def create_experiment_xml(N, L, B):
     for i in range(1, N+1):
         ET.SubElement(services, 'service', {
             'name': f'server{i}', 'image': 'kauri', 'share': 'false', 
-            'command': f"['bls','6','3','1','1','50','500','{N}','{i}']"
+            'command': f"['bls','3','1','1','1','50','500','{N}','{i}']"
         })
 
     # Create bridges element
@@ -56,7 +56,7 @@ def create_experiment_xml(N, L, B):
     return xml_str
 
 # Example usage:
-N = 43
+N = 14
 L = 50  # Latency
 B = "750Kbps"  # Bandwidth
 
