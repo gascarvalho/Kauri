@@ -1,4 +1,4 @@
-# type, fanout pipeline-depth pipeline-lat latency bandwidth block-size : number of internals : number of total : suggested physical machines
+# [type, fanout, pipeline-depth, pipeline-lat, latency, bandwidth, block-size] : number of internals : number of leafes : suggested physical machines
 
 # No pipeline
 #['bls','2','0','10','100','25','1000']:3:4:1
@@ -7,7 +7,7 @@
 #['bls','2','0','10','100','25','1000']:31:32:1
 
 #Pipeline
-#['bls','2','1','10','100','25','1000']:3:4:1
+['bls','2','1','10','100','25','1000']:3:4:1
 #['bls','2','3','10','100','25','1000']:3:4:1
 #['bls','2','1','1','10','100','500']:7:8:1
 #['bls','5','5','1','10','100','1000']:15:16:1
@@ -16,7 +16,7 @@
 
 #Mixed fanouts
 #['bls','5','3','10','100','25','1000']:15:16:1
-['bls','6','1','10','100','25','1000']:7:36:1
+#['bls','6','1','10','100','25','1000']:7:36:1
 #['bls','8','1','10','100','25','1000']:9:64:1
 
 #No simulated network
