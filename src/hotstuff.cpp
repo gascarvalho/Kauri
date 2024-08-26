@@ -1130,6 +1130,10 @@ HotStuffBase::~HotStuffBase() {}
 
 void HotStuffBase::tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas) {
 
+    LOG_PROTO("\n=========================== Delivering Epoch =================================\n");
+
+    std::vector<TreeNetwork> trees;
+
     /** Default algorithm will create 1 tree for each replica. 
      * Each replica will be the proposer of its own tree.
      * Trees are filled from left to right with the replica vector.
@@ -1147,10 +1151,18 @@ void HotStuffBase::tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint25
                 new_tree_array.push_back(((i + tid) % system_size));
             }
 
-            // This algorithm assumes constant fanout and pipeline-stretch
-            system_trees[tid] = TreeNetwork(Tree(tid, config.fanout, config.async_blocks, new_tree_array), 
+            auto new_tree = TreeNetwork(Tree(tid, config.fanout, config.async_blocks, new_tree_array), 
                                             std::move(replicas), id);
+
+            // This algorithm assumes constant fanout and pipeline-stretch
+            system_trees[tid] = new_tree;
+            trees.push_back(new_tree);
         }
+
+        auto new_epoch = Epoch(0, trees);
+
+
+        LOG_PROTO("DELIVERING EPOCH %d", new_epoch.get_epoch_num());
     }
 
     /** File algorithm will obtain the trees from a file.

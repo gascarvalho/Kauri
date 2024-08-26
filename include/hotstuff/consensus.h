@@ -27,461 +27,476 @@
 #include "hotstuff/entity.h"
 #include "hotstuff/crypto.h"
 
-namespace hotstuff {
+namespace hotstuff
+{
 
-struct Proposal;
-struct Vote;
-struct Finality;
-struct VoteRelay;
-struct Tree;
+    struct Proposal;
+    struct Vote;
+    struct Finality;
+    struct VoteRelay;
+    struct Tree;
 
-/** Abstraction for HotStuff protocol state machine (without network implementation). */
-class HotStuffCore {
-    block_t b0;                                  /** the genesis block */
-    /* === state variables === */
-    /**< highest QC */
-    block_t b_lock;                            /**< locked block */
-    block_t b_exec;                            /**< last executed block */
-    /**< height of the block last voted for */
-    /**< private key for signing votes */
-    std::set<block_t> tails;   /**< set of tail blocks */
-    /**< replica configuration */
+    /** Abstraction for HotStuff protocol state machine (without network implementation). */
+    class HotStuffCore
+    {
+        block_t b0; /** the genesis block */
+        /* === state variables === */
+        /**< highest QC */
+        block_t b_lock; /**< locked block */
+        block_t b_exec; /**< last executed block */
+        /**< height of the block last voted for */
+        /**< private key for signing votes */
+        std::set<block_t> tails; /**< set of tail blocks */
+        /**< replica configuration */
 
-    uint64_t decided_blk_counter = 0; /** for simple stat print */
+        uint64_t decided_blk_counter = 0; /** for simple stat print */
 
-    /* === async event queues === */
+        /* === async event queues === */
 
-    std::unordered_map<block_t, promise_t> qc_waiting;
-    promise_t propose_waiting;
-    promise_t receive_proposal_waiting;
-    promise_t hqc_update_waiting;
-    /* == feature switches == */
-    /** always vote negatively, useful for some PaceMakers */
-    bool vote_disabled;
+        std::unordered_map<block_t, promise_t> qc_waiting;
+        promise_t propose_waiting;
+        promise_t receive_proposal_waiting;
+        promise_t hqc_update_waiting;
+        /* == feature switches == */
+        /** always vote negatively, useful for some PaceMakers */
+        bool vote_disabled;
 
-    void sanity_check_delivered(const block_t &blk);
+        void sanity_check_delivered(const block_t &blk);
 
-    void on_hqc_update();
+        void on_hqc_update();
 
-    void on_receive_proposal_(const Proposal &prop);
+        void on_receive_proposal_(const Proposal &prop);
 
     protected:
-    ReplicaID id;                  /**< identity of the replica itself */
+        ReplicaID id; /**< identity of the replica itself */
 
-    block_t get_delivered_blk(const uint256_t &blk_hash);
+        block_t get_delivered_blk(const uint256_t &blk_hash);
 
-    block_t get_potentially_not_delivered_blk(const uint256_t &blk_hash);
+        block_t get_potentially_not_delivered_blk(const uint256_t &blk_hash);
 
-    ReplicaConfig config;
+        ReplicaConfig config;
 
-    void update_hqc(const block_t &_hqc, const quorum_cert_bt &qc);
+        void update_hqc(const block_t &_hqc, const quorum_cert_bt &qc);
 
-    void on_qc_finish(const block_t &blk);
+        void on_qc_finish(const block_t &blk);
 
-/* === auxilliary variables === */
-privkey_bt priv_key;
-/** block containing the QC for the highest block having one */
-std::pair<block_t, quorum_cert_bt> hqc;
-/** Add an additional block commit.*/
-bool rdy = false;
+        /* === auxilliary variables === */
+        privkey_bt priv_key;
+        /** block containing the QC for the highest block having one */
+        std::pair<block_t, quorum_cert_bt> hqc;
+        /** Add an additional block commit.*/
+        bool rdy = false;
 
-    void update(const block_t &nblk);
+        void update(const block_t &nblk);
 
-    uint32_t vheight;
+        uint32_t vheight;
 
-    void on_propose_(const Proposal &prop);
-
-public:
-    BoxObj<EntityStorage> storage;
-    //uint16_t numberOfChildren;
-
-    HotStuffCore(ReplicaID id, privkey_bt &&priv_key);
-    virtual ~HotStuffCore() {
-        b0->qc_ref = nullptr;
-    }
-
-    /* Inputs of the state machine triggered by external events, should called
-     * by the class user, with proper invariants. */
-
-    /** Call to initialize the protocol, should be called once before all other
-     * functions. */
-    void on_init(uint32_t nfaulty);
-
-    /**
-     * Tree calculation.
-     * @param replicas necessary set of processes.
-     * @param startup if being called during startup.
-     */
-    virtual void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) { }
-    virtual void close_client(ReplicaID rid) { }
-    virtual void open_client(ReplicaID rid) { }
-    virtual void tree_config() { }
-    virtual bool isTreeSwitch(int bheight) { }
-    virtual uint32_t get_blk_size() { }
-    virtual size_t get_total_system_trees() { }
-    virtual ReplicaID get_system_tree_root(int tid) { }
-    virtual ReplicaID get_current_system_tree_root() { }
-
-    /** Call to set the fanout. */
-    void set_fanout(int32_t fanout);
-
-    /** Call to set the piped latency */
-    void set_piped_latency(int32_t piped_latency, int32_t async_blocks);
-
-    /** Call to set when the tree is switched (every x blocks) */
-    void set_tree_period(size_t nblocks);
-
-    /** Call to set how the trees will be generated */
-    void set_tree_generation(std::string genAlgo, std::string fpath);
-
-    /**
-     * A block is only delivered if itself is fetched, the block for the
-     * contained qc is fetched and all parents are delivered. The user should
-     * always ensure this invariant. The invalid blocks will be dropped by this
-     * function.
-     * @return true if valid */
-    bool on_deliver_blk(const block_t &blk);
-
-    /** Call upon the delivery of a proposal message.
-     * The block mentioned in the message should be already delivered. */
-    void on_receive_proposal(const Proposal &prop);
-
-    /** Call upon the delivery of a vote message.
-     * The block mentioned in the message should be already delivered. */
-    void on_receive_vote(const Vote &vote);
-
-    /** Call to submit new commands to be decided (executed). "Parents" must
-     * contain at least one block, and the first block is the actual parent,
-     * while the others are uncles/aunts */
-    block_t on_propose(const std::vector<uint256_t> &cmds,
-                    const std::vector<block_t> &parents,
-                    bytearray_t &&extra = bytearray_t());
-
-    /* Functions required to construct concrete instances for abstract classes.
-     * */
-
-    /* Outputs of the state machine triggering external events.  The virtual
-     * functions should be implemented by the user to specify the behavior upon
-     * the events. */
-
-    // Pipelined block hash.
-    std::deque<uint256_t> piped_queue;
-
-    // Pipelined block hash.
-    std::deque<uint256_t> rdy_queue;
-
-    // Last regular block height.
-    int b_normal_height = 0;
-
-    /* Block hex to us time spent on block*/
-    std::map<uint256_t, long> stats;
-
-    // If already a piped block was submitted.
-    bool piped_submitted = false;
-
-    // Last sent out block time.
-    mutable struct timeval last_block_time;
-
-    // Start time.
-    mutable struct timeval start_time;
-
-    uint64_t summed_latency;
-    uint64_t processed_blocks;
-    salticidae::ElapsedTime et;
-
-    std::unordered_map<const uint256_t, salticidae::ElapsedTime> proposal_time;
-
-protected:
-    /** Called by HotStuffCore upon the decision being made for cmd. */
-    virtual void do_decide(Finality &&fin) = 0;
-    virtual void do_consensus(const block_t &blk) = 0;
-    /** Called by HotStuffCore upon broadcasting a new proposal.
-     * The user should send the proposal message to all replicas except for
-     * itself. */
-    virtual void do_broadcast_proposal(const Proposal &prop) = 0;
-    /** Called upon sending out a new vote to the next proposer.  The user
-     * should send the vote message to a *good* proposer to have good liveness,
-     * while safety is always guaranteed by HotStuffCore. */
-    virtual void do_vote(Proposal last_proposer, const Vote &vote) = 0;
-
-    /**
-     * Increment timer to mark receival.
-     */
-    virtual void inc_time(bool force) { };
-
-    virtual bool is_proposer(int id) { };
-
-    virtual void proposer_base_deliver(const block_t &blk) { };
-
-    /**
-     * Get the id of the current tree
-    */
-    virtual uint32_t get_tree_id() { };
-
-    /* The user plugs in the detailed instances for those
-     * polymorphic data types. */
-    public:
-    /** Create a partial certificate that proves the vote for a block. */
-    virtual part_cert_bt create_part_cert(const PrivKey &priv_key, const uint256_t &blk_hash) = 0;
-    /** Create a partial certificate from its seralized form. */
-    virtual part_cert_bt parse_part_cert(DataStream &s) = 0;
-    /** Create a quorum certificate that proves 2f+1 votes for a block. */
-    virtual quorum_cert_bt create_quorum_cert(const uint256_t &blk_hash) = 0;
-    /** Create a quorum certificate from its serialized form. */
-    virtual quorum_cert_bt parse_quorum_cert(DataStream &s) = 0;
-    /** Create a command object from its serialized form. */
-    //virtual command_t parse_cmd(DataStream &s) = 0;
+        void on_propose_(const Proposal &prop);
 
     public:
-    /** Add a replica to the current configuration. This should only be called
-     * before running HotStuffCore protocol. */
-    void add_replica(ReplicaID rid, const PeerId &peer_id, pubkey_bt &&pub_key);
-    /** Try to prune blocks lower than last committed height - staleness. */
-    void prune(uint32_t staleness);
+        BoxObj<EntityStorage> storage;
+        // uint16_t numberOfChildren;
 
-    /* PaceMaker can use these functions to monitor the core protocol state
-     * transition */
-    /** Get a promise resolved when the block gets a QC. */
-    promise_t async_qc_finish(const block_t &blk);
-    /** Get a promise resolved when a new block is proposed. */
-    promise_t async_wait_proposal();
-    /** Get a promise resolved when a new proposal is received. */
-    promise_t async_wait_receive_proposal();
-    /** Get a promise resolved when hqc is updated. */
-    promise_t async_hqc_update();
+        HotStuffCore(ReplicaID id, privkey_bt &&priv_key);
+        virtual ~HotStuffCore()
+        {
+            b0->qc_ref = nullptr;
+        }
 
-    /* Other useful functions */
-    const block_t &get_genesis() const { return b0; }
-    const block_t &get_hqc() { return hqc.first; }
-    const ReplicaConfig &get_config() const { return config; }
-    ReplicaID get_id() const { return id; }
-    const std::set<block_t> get_tails() const { return tails; }
-    operator std::string () const;
-    void set_vote_disabled(bool f) { vote_disabled = f; }
+        /* Inputs of the state machine triggered by external events, should called
+         * by the class user, with proper invariants. */
 
-    Proposal process_block(const block_t& bnew, bool adjustHeight, int tid);
+        /** Call to initialize the protocol, should be called once before all other
+         * functions. */
+        void on_init(uint32_t nfaulty);
 
-    void tree_config(bool b);
-    void tree_scheduler(bool b);
-    void close_client(bool b);
-    void open_client(bool b);
+        /**
+         * Tree calculation.
+         * @param replicas necessary set of processes.
+         * @param startup if being called during startup.
+         */
+        virtual void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup) {}
+        virtual void close_client(ReplicaID rid) {}
+        virtual void open_client(ReplicaID rid) {}
+        virtual void tree_config() {}
+        virtual bool isTreeSwitch(int bheight) {}
+        virtual uint32_t get_blk_size() {}
+        virtual size_t get_total_system_trees() {}
+        virtual ReplicaID get_system_tree_root(int tid) {}
+        virtual ReplicaID get_current_system_tree_root() {}
 
-    bool first = true;
-};
+        /** Call to set the fanout. */
+        void set_fanout(int32_t fanout);
 
-/** Abstraction for proposal messages. */
-struct Proposal: public Serializable {
-    ReplicaID proposer;
-    /** tree used for the message*/
-    uint32_t tid;
-    /** block being proposed */
-    block_t blk;
-    /** handle of the core object to allow polymorphism. The user should use
-     * a pointer to the object of the class derived from HotStuffCore */
-    HotStuffCore *hsc;
+        /** Call to set the piped latency */
+        void set_piped_latency(int32_t piped_latency, int32_t async_blocks);
 
-    Proposal(): blk(nullptr), hsc(nullptr) {}
-    Proposal(ReplicaID proposer,
-            uint32_t tid,
-            const block_t &blk,
-            HotStuffCore *hsc):
-        proposer(proposer),
-        tid(tid), blk(blk), hsc(hsc) {}
+        /** Call to set when the tree is switched (every x blocks) */
+        void set_tree_period(size_t nblocks);
 
-    void serialize(DataStream &s) const override {
-        s << proposer
-          << tid
-          << *blk;
-    }
+        /** Call to set how the trees will be generated */
+        void set_tree_generation(std::string genAlgo, std::string fpath);
 
-    void unserialize(DataStream &s) override {
-        assert(hsc != nullptr);
-        s >> proposer;
-        s >> tid;
-        Block _blk;
-        _blk.unserialize(s, hsc);
-        blk = hsc->storage->add_blk(std::move(_blk), hsc->get_config());
-    }
+        /**
+         * A block is only delivered if itself is fetched, the block for the
+         * contained qc is fetched and all parents are delivered. The user should
+         * always ensure this invariant. The invalid blocks will be dropped by this
+         * function.
+         * @return true if valid */
+        bool on_deliver_blk(const block_t &blk);
 
-    operator std::string () const {
-        DataStream s;
-        s << "<proposal "
-          << "rid=" << std::to_string(proposer) << " "
-          << "blk=" << get_hex10(blk->get_hash()) << " "
-          << "tid=" << std::to_string(tid) << ">";
-        return s;
-    }
-};
+        /** Call upon the delivery of a proposal message.
+         * The block mentioned in the message should be already delivered. */
+        void on_receive_proposal(const Proposal &prop);
 
-/** Abstraction for vote messages. */
-struct Vote: public Serializable {
-    ReplicaID voter;
-    /** tree used for the message*/
-    uint32_t tid;
-    /** block being voted */
-    uint256_t blk_hash;
-    /** proof of validity for the vote */
-    part_cert_bt cert;
-    
-    /** handle of the core object to allow polymorphism */
-    HotStuffCore *hsc;
+        /** Call upon the delivery of a vote message.
+         * The block mentioned in the message should be already delivered. */
+        void on_receive_vote(const Vote &vote);
 
-    Vote(): cert(nullptr), hsc(nullptr) {}
-    Vote(ReplicaID voter,
-        uint32_t tid,
-        const uint256_t &blk_hash,
-        part_cert_bt &&cert,
-        HotStuffCore *hsc):
-        voter(voter),
-        tid(tid),
-        blk_hash(blk_hash),
-        cert(std::move(cert)), hsc(hsc) { }
+        /** Call to submit new commands to be decided (executed). "Parents" must
+         * contain at least one block, and the first block is the actual parent,
+         * while the others are uncles/aunts */
+        block_t on_propose(const std::vector<uint256_t> &cmds,
+                           const std::vector<block_t> &parents,
+                           bytearray_t &&extra = bytearray_t());
 
-    Vote(const Vote &other):
-        voter(other.voter),
-        tid(other.tid),
-        blk_hash(other.blk_hash),
-        cert(other.cert ? other.cert->clone() : nullptr),
-        hsc(other.hsc) {}
+        /* Functions required to construct concrete instances for abstract classes.
+         * */
 
-    Vote(Vote &&other) = default;
-    
-    void serialize(DataStream &s) const override {
-        s << voter << tid << blk_hash << *cert;
-    }
+        /* Outputs of the state machine triggering external events.  The virtual
+         * functions should be implemented by the user to specify the behavior upon
+         * the events. */
 
-    void unserialize(DataStream &s) override {
-        assert(hsc != nullptr);
-        s >> voter >> tid >> blk_hash;
-        cert = hsc->parse_part_cert(s);
-    }
+        // Pipelined block hash.
+        std::deque<uint256_t> piped_queue;
 
-    bool verify() const {
-        assert(hsc != nullptr);
-        return cert->verify(hsc->get_config().get_pubkey(voter)) &&
-                cert->get_obj_hash() == blk_hash;
-    }
+        // Pipelined block hash.
+        std::deque<uint256_t> rdy_queue;
 
-    promise_t verify(VeriPool &vpool) const {
-        assert(hsc != nullptr);
-        return cert->verify(hsc->get_config().get_pubkey(voter), vpool).then([this](bool result) {
-            return result && cert->get_obj_hash() == blk_hash;
-        });
-    }
+        // Last regular block height.
+        int b_normal_height = 0;
 
-    operator std::string () const {
-        DataStream s;
-        s << "<vote "
-          << "rid=" << std::to_string(voter) << " "
-          << "blk=" << get_hex10(blk_hash) << " "
-          << "tid=" << std::to_string(tid) << ">";
-        return s;
-    }
-};
+        /* Block hex to us time spent on block*/
+        std::map<uint256_t, long> stats;
 
-struct Finality: public Serializable {
-    ReplicaID rid;
-    /** tree used for the message*/
-    uint32_t tid;
-    int8_t decision;
-    uint32_t cmd_idx;
-    uint32_t cmd_height;
-    uint256_t cmd_hash;
-    uint256_t blk_hash;
-    
+        // If already a piped block was submitted.
+        bool piped_submitted = false;
+
+        // Last sent out block time.
+        mutable struct timeval last_block_time;
+
+        // Start time.
+        mutable struct timeval start_time;
+
+        uint64_t summed_latency;
+        uint64_t processed_blocks;
+        salticidae::ElapsedTime et;
+
+        std::unordered_map<const uint256_t, salticidae::ElapsedTime> proposal_time;
+
+    protected:
+        /** Called by HotStuffCore upon the decision being made for cmd. */
+        virtual void do_decide(Finality &&fin) = 0;
+        virtual void do_consensus(const block_t &blk) = 0;
+        /** Called by HotStuffCore upon broadcasting a new proposal.
+         * The user should send the proposal message to all replicas except for
+         * itself. */
+        virtual void do_broadcast_proposal(const Proposal &prop) = 0;
+        /** Called upon sending out a new vote to the next proposer.  The user
+         * should send the vote message to a *good* proposer to have good liveness,
+         * while safety is always guaranteed by HotStuffCore. */
+        virtual void do_vote(Proposal last_proposer, const Vote &vote) = 0;
+
+        /**
+         * Increment timer to mark receival.
+         */
+        virtual void inc_time(bool force) {};
+
+        virtual bool is_proposer(int id) {};
+
+        virtual void proposer_base_deliver(const block_t &blk) {};
+
+        /**
+         * Get the id of the current tree
+         */
+        virtual uint32_t get_tree_id() {};
+
+        /* The user plugs in the detailed instances for those
+         * polymorphic data types. */
     public:
-    Finality() = default;
-    Finality(ReplicaID rid,
-            uint32_t tid,
-            int8_t decision,
-            uint32_t cmd_idx,
-            uint32_t cmd_height,
-            uint256_t cmd_hash,
-            uint256_t blk_hash):
-        rid(rid), tid(tid), decision(decision),
-        cmd_idx(cmd_idx), cmd_height(cmd_height),
-        cmd_hash(cmd_hash), blk_hash(blk_hash) {}
+        /** Create a partial certificate that proves the vote for a block. */
+        virtual part_cert_bt create_part_cert(const PrivKey &priv_key, const uint256_t &blk_hash) = 0;
+        /** Create a partial certificate from its seralized form. */
+        virtual part_cert_bt parse_part_cert(DataStream &s) = 0;
+        /** Create a quorum certificate that proves 2f+1 votes for a block. */
+        virtual quorum_cert_bt create_quorum_cert(const uint256_t &blk_hash) = 0;
+        /** Create a quorum certificate from its serialized form. */
+        virtual quorum_cert_bt parse_quorum_cert(DataStream &s) = 0;
+        /** Create a command object from its serialized form. */
+        // virtual command_t parse_cmd(DataStream &s) = 0;
 
-    void serialize(DataStream &s) const override {
-        s << rid << tid << decision
-          << cmd_idx << cmd_height
-          << cmd_hash;
-        if (decision == 1) s << blk_hash;
-    }
+    public:
+        /** Add a replica to the current configuration. This should only be called
+         * before running HotStuffCore protocol. */
+        void add_replica(ReplicaID rid, const PeerId &peer_id, pubkey_bt &&pub_key);
+        /** Try to prune blocks lower than last committed height - staleness. */
+        void prune(uint32_t staleness);
 
-    void unserialize(DataStream &s) override {
-        s >> rid >> tid >> decision
-          >> cmd_idx >> cmd_height
-          >> cmd_hash;
-        if (decision == 1) s >> blk_hash;
-    }
+        /* PaceMaker can use these functions to monitor the core protocol state
+         * transition */
+        /** Get a promise resolved when the block gets a QC. */
+        promise_t async_qc_finish(const block_t &blk);
+        /** Get a promise resolved when a new block is proposed. */
+        promise_t async_wait_proposal();
+        /** Get a promise resolved when a new proposal is received. */
+        promise_t async_wait_receive_proposal();
+        /** Get a promise resolved when hqc is updated. */
+        promise_t async_hqc_update();
 
-    operator std::string () const {
-        DataStream s;
-        s << "<fin "
-          << "decision=" << std::to_string(decision) << " "
-          << "cmd_idx=" << std::to_string(cmd_idx) << " "
-          << "cmd_height=" << std::to_string(cmd_height) << " "
-          << "cmd=" << get_hex10(cmd_hash) << " "
-          << "blk=" << get_hex10(blk_hash) << " " 
-          << "tid=" << std::to_string(tid) << ">";
-        return s;
-    }
-};
+        /* Other useful functions */
+        const block_t &get_genesis() const { return b0; }
+        const block_t &get_hqc() { return hqc.first; }
+        const ReplicaConfig &get_config() const { return config; }
+        ReplicaID get_id() const { return id; }
+        const std::set<block_t> get_tails() const { return tails; }
+        operator std::string() const;
+        void set_vote_disabled(bool f) { vote_disabled = f; }
 
-/** Abstraction for vote relay messages. */
-struct VoteRelay: public Serializable {
-    /** tree used for the message*/
-    uint32_t tid;
-    /** block being voted */
-    uint256_t blk_hash;
-    /** proof of validity for the vote */
-    quorum_cert_bt cert;
+        Proposal process_block(const block_t &bnew, bool adjustHeight, int tid);
 
-    /** handle of the core object to allow polymorphism */
-    HotStuffCore *hsc;
+        void tree_config(bool b);
+        void tree_scheduler(bool b);
+        void close_client(bool b);
+        void open_client(bool b);
 
-    VoteRelay(): cert(nullptr), hsc(nullptr) {}
-    VoteRelay(uint32_t tid, const uint256_t &blk_hash,
-            quorum_cert_bt &&cert,
-        HotStuffCore *hsc):
-            tid(tid),
-            blk_hash(blk_hash),
-            cert(std::move(cert)), hsc(hsc) {}
+        bool first = true;
+    };
 
-    VoteRelay(const VoteRelay &other):
-            tid(other.tid),
-            blk_hash(other.blk_hash),
-            cert(other.cert ? other.cert->clone() : nullptr),
-            hsc(other.hsc) {}
+    /** Abstraction for proposal messages. */
+    struct Proposal : public Serializable
+    {
+        ReplicaID proposer;
+        /** tree used for the message*/
+        uint32_t tid;
+        /** block being proposed */
+        block_t blk;
+        /** handle of the core object to allow polymorphism. The user should use
+         * a pointer to the object of the class derived from HotStuffCore */
+        HotStuffCore *hsc;
 
-    VoteRelay(VoteRelay &&other) = default;
+        Proposal() : blk(nullptr), hsc(nullptr) {}
+        Proposal(ReplicaID proposer,
+                 uint32_t tid,
+                 const block_t &blk,
+                 HotStuffCore *hsc) : proposer(proposer),
+                                      tid(tid), blk(blk), hsc(hsc) {}
 
-    void serialize(DataStream &s) const override {
-        s << tid << blk_hash << *cert;
-    }
+        void serialize(DataStream &s) const override
+        {
+            s << proposer
+              << tid
+              << *blk;
+        }
 
-    void unserialize(DataStream &s) override {
-        assert(hsc != nullptr);
-        s >> tid >> blk_hash;
-        cert = hsc->parse_quorum_cert(s);
-    }
+        void unserialize(DataStream &s) override
+        {
+            assert(hsc != nullptr);
+            s >> proposer;
+            s >> tid;
+            Block _blk;
+            _blk.unserialize(s, hsc);
+            blk = hsc->storage->add_blk(std::move(_blk), hsc->get_config());
+        }
 
-    operator std::string () const {
-        DataStream s;
-        s << "<voterelay "
-        << "blk=" << get_hex10(blk_hash) << " "
-        << "tid=" << std::to_string(tid) << ">";
-        return s;
-    }
-};
+        operator std::string() const
+        {
+            DataStream s;
+            s << "<proposal "
+              << "rid=" << std::to_string(proposer) << " "
+              << "blk=" << get_hex10(blk->get_hash()) << " "
+              << "tid=" << std::to_string(tid) << ">";
+            return s;
+        }
+    };
+
+    /** Abstraction for vote messages. */
+    struct Vote : public Serializable
+    {
+        ReplicaID voter;
+        /** tree used for the message*/
+        uint32_t tid;
+        /** block being voted */
+        uint256_t blk_hash;
+        /** proof of validity for the vote */
+        part_cert_bt cert;
+
+        /** handle of the core object to allow polymorphism */
+        HotStuffCore *hsc;
+
+        Vote() : cert(nullptr), hsc(nullptr) {}
+        Vote(ReplicaID voter,
+             uint32_t tid,
+             const uint256_t &blk_hash,
+             part_cert_bt &&cert,
+             HotStuffCore *hsc) : voter(voter),
+                                  tid(tid),
+                                  blk_hash(blk_hash),
+                                  cert(std::move(cert)), hsc(hsc) {}
+
+        Vote(const Vote &other) : voter(other.voter),
+                                  tid(other.tid),
+                                  blk_hash(other.blk_hash),
+                                  cert(other.cert ? other.cert->clone() : nullptr),
+                                  hsc(other.hsc) {}
+
+        Vote(Vote &&other) = default;
+
+        void serialize(DataStream &s) const override
+        {
+            s << voter << tid << blk_hash << *cert;
+        }
+
+        void unserialize(DataStream &s) override
+        {
+            assert(hsc != nullptr);
+            s >> voter >> tid >> blk_hash;
+            cert = hsc->parse_part_cert(s);
+        }
+
+        bool verify() const
+        {
+            assert(hsc != nullptr);
+            return cert->verify(hsc->get_config().get_pubkey(voter)) &&
+                   cert->get_obj_hash() == blk_hash;
+        }
+
+        promise_t verify(VeriPool &vpool) const
+        {
+            assert(hsc != nullptr);
+            return cert->verify(hsc->get_config().get_pubkey(voter), vpool).then([this](bool result)
+                                                                                 { return result && cert->get_obj_hash() == blk_hash; });
+        }
+
+        operator std::string() const
+        {
+            DataStream s;
+            s << "<vote "
+              << "rid=" << std::to_string(voter) << " "
+              << "blk=" << get_hex10(blk_hash) << " "
+              << "tid=" << std::to_string(tid) << ">";
+            return s;
+        }
+    };
+
+    struct Finality : public Serializable
+    {
+        ReplicaID rid;
+        /** tree used for the message*/
+        uint32_t tid;
+        int8_t decision;
+        uint32_t cmd_idx;
+        uint32_t cmd_height;
+        uint256_t cmd_hash;
+        uint256_t blk_hash;
+
+    public:
+        Finality() = default;
+        Finality(ReplicaID rid,
+                 uint32_t tid,
+                 int8_t decision,
+                 uint32_t cmd_idx,
+                 uint32_t cmd_height,
+                 uint256_t cmd_hash,
+                 uint256_t blk_hash) : rid(rid), tid(tid), decision(decision),
+                                       cmd_idx(cmd_idx), cmd_height(cmd_height),
+                                       cmd_hash(cmd_hash), blk_hash(blk_hash) {}
+
+        void serialize(DataStream &s) const override
+        {
+            s << rid << tid << decision
+              << cmd_idx << cmd_height
+              << cmd_hash;
+            if (decision == 1)
+                s << blk_hash;
+        }
+
+        void unserialize(DataStream &s) override
+        {
+            s >> rid >> tid >> decision >> cmd_idx >> cmd_height >> cmd_hash;
+            if (decision == 1)
+                s >> blk_hash;
+        }
+
+        operator std::string() const
+        {
+            DataStream s;
+            s << "<fin "
+              << "decision=" << std::to_string(decision) << " "
+              << "cmd_idx=" << std::to_string(cmd_idx) << " "
+              << "cmd_height=" << std::to_string(cmd_height) << " "
+              << "cmd=" << get_hex10(cmd_hash) << " "
+              << "blk=" << get_hex10(blk_hash) << " "
+              << "tid=" << std::to_string(tid) << ">";
+            return s;
+        }
+    };
+
+    /** Abstraction for vote relay messages. */
+    struct VoteRelay : public Serializable
+    {
+        /** tree used for the message*/
+        uint32_t tid;
+        /** block being voted */
+        uint256_t blk_hash;
+        /** proof of validity for the vote */
+        quorum_cert_bt cert;
+
+        /** handle of the core object to allow polymorphism */
+        HotStuffCore *hsc;
+
+        VoteRelay() : cert(nullptr), hsc(nullptr) {}
+        VoteRelay(uint32_t tid, const uint256_t &blk_hash,
+                  quorum_cert_bt &&cert,
+                  HotStuffCore *hsc) : tid(tid),
+                                       blk_hash(blk_hash),
+                                       cert(std::move(cert)), hsc(hsc) {}
+
+        VoteRelay(const VoteRelay &other) : tid(other.tid),
+                                            blk_hash(other.blk_hash),
+                                            cert(other.cert ? other.cert->clone() : nullptr),
+                                            hsc(other.hsc) {}
+
+        VoteRelay(VoteRelay &&other) = default;
+
+        void serialize(DataStream &s) const override
+        {
+            s << tid << blk_hash << *cert;
+        }
+
+        void unserialize(DataStream &s) override
+        {
+            assert(hsc != nullptr);
+            s >> tid >> blk_hash;
+            cert = hsc->parse_quorum_cert(s);
+        }
+
+        operator std::string() const
+        {
+            DataStream s;
+            s << "<voterelay "
+              << "blk=" << get_hex10(blk_hash) << " "
+              << "tid=" << std::to_string(tid) << ">";
+            return s;
+        }
+    };
 
     /**
      * Kauri tree
      * Abstraction of a tree to be used in Kauri
      * Assumes a balanced tree of constant fanout
-    */
-    struct Tree: public Serializable {
+     */
+    struct Tree : public Serializable
+    {
 
         /** Identifier for the tree */
         uint32_t tid;
@@ -492,65 +507,67 @@ struct VoteRelay: public Serializable {
         /** List containing node arrangement*/
         std::vector<uint32_t> tree_array;
 
-        public:
+    public:
         Tree() = default;
         Tree(const uint32_t tid,
-            const uint8_t fanout,
-            const uint8_t pipe_stretch,
-            const std::vector<uint32_t> &tree_array):
-        tid(tid),
-        fanout(fanout),
-        pipe_stretch(pipe_stretch), 
-        tree_array(tree_array) {}
-
+             const uint8_t fanout,
+             const uint8_t pipe_stretch,
+             const std::vector<uint32_t> &tree_array) : tid(tid),
+                                                        fanout(fanout),
+                                                        pipe_stretch(pipe_stretch),
+                                                        tree_array(tree_array) {}
 
         /**
          * Returns the tree identifier
-        */
+         */
         const uint32_t &get_tid() const { return tid; }
 
         /**
          * Returns the tree fanout
-        */
+         */
         const uint8_t &get_fanout() const { return fanout; }
 
         /**
          * Returns the tree pipeline-stretch
-        */
+         */
         const uint8_t &get_pipeline_stretch() const { return pipe_stretch; }
 
         /**
          * Returns the tree array list
-        */
-        const std::vector<uint32_t> &get_tree_array() const {
+         */
+        const std::vector<uint32_t> &get_tree_array() const
+        {
             return tree_array;
         }
 
         /**
          * Returns the size of the tree list
-        */
-        const size_t &get_tree_size() const {
+         */
+        const size_t &get_tree_size() const
+        {
             return tree_array.size();
         }
 
         /**
          * Returns the size of the tree list
-        */
-        const uint32_t &get_tree_root() const {
+         */
+        const uint32_t &get_tree_root() const
+        {
             return tree_array[0];
         }
 
-
-        void serialize(DataStream &s) const override {
+        void serialize(DataStream &s) const override
+        {
             s << tid << fanout << pipe_stretch;
 
             // Serialize the vector
             s << htole((uint32_t)tree_array.size());
-            for (const auto &elem: tree_array)
+            for (const auto &elem : tree_array)
                 s << elem;
         }
 
-        void unserialize(DataStream &s) override {
+        void unserialize(DataStream &s) override
+        {
             s >> tid >> fanout >> pipe_stretch;
 
             // Unserialize the vector
@@ -558,30 +575,31 @@ struct VoteRelay: public Serializable {
             s >> n;
             n = letoh(n);
             tree_array.resize(n);
-            for (auto &elem: tree_array)
+            for (auto &elem : tree_array)
                 s >> elem;
         }
 
-        std::string get_tree_array_string() {
+        std::string get_tree_array_string()
+        {
             DataStream s;
             s << "{ ";
-            for (auto &elem: tree_array)
+            for (auto &elem : tree_array)
                 s << std::to_string(elem) << " ";
             s << "}";
             return std::string(s);
         }
 
-        operator std::string () const {
+        operator std::string() const
+        {
             DataStream s;
             s << "<tree "
-              << "tid=" << std::to_string(tid) << " " 
+              << "tid=" << std::to_string(tid) << " "
               << "tree_size=" << std::to_string(tree_array.size()) << " "
               << "fanout=" << std::to_string(fanout) << " "
               << "pipe_stretch=" << std::to_string(pipe_stretch) << " "
               << "root_node=" << std::to_string(tree_array[0]) << ">";
             return s;
         }
-
     };
 }
 
