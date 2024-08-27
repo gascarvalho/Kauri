@@ -186,11 +186,19 @@ namespace hotstuff
         uint32_t epoch_num;             // Epoch number
         std::vector<TreeNetwork> trees; // Collection of trees
         mutable std::unordered_map<size_t, TreeNetwork> system_trees;
+        DataStream info;
 
     public:
         Epoch() = default;
         Epoch(uint32_t epoch_num, const std::vector<TreeNetwork> &trees) : epoch_num(epoch_num),
-                                                                           trees(trees) {}
+                                                                           trees(trees)
+        {
+
+            for (const TreeNetwork &tree : trees)
+            {
+                info << "\t\t" << std::string(tree.get_tree()) << "\n";
+            }
+        }
 
         const uint32_t &get_epoch_num() const { return epoch_num; }
 
@@ -204,6 +212,20 @@ namespace hotstuff
             }
 
             return system_trees;
+        }
+
+        operator std::string()
+        {
+
+            DataStream s;
+
+            s << "\nEPOCH  {\n";
+            s << "\t Epoch number: " << std::to_string(epoch_num) << "\n";
+            s << "\t Trees:\n"
+              << std::string(info).c_str() << "\n";
+            s << "}";
+
+            return s;
         }
     };
 
@@ -394,6 +416,11 @@ namespace hotstuff
         uint32_t lastCheckedHeight;
         std::vector<std::pair<MsgPropose, Net::conn_t>> pending_proposals;
 
+        /* Epoch */
+
+        mutable Epoch cur_epoch;
+        mutable Epoch on_hold_epoch;
+
         /* communication */
 
         void on_fetch_cmd(const command_t &cmd);
@@ -446,6 +473,7 @@ namespace hotstuff
         void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                    bool ec_loop = false);
         void tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
+        void read_epoch_from_file(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
         void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
         void close_client(ReplicaID rid);
         void open_client(ReplicaID rid);
@@ -563,6 +591,12 @@ namespace hotstuff
         void set_tree_generation(std::string genAlgo, std::string fpath)
         {
             HotStuffBase::set_tree_generation(genAlgo, fpath);
+        }
+
+        void set_new_epoch(std::string new_epoch)
+
+        {
+            HotStuffBase::set_new_epoch(new_epoch);
         }
     };
 

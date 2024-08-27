@@ -1316,8 +1316,72 @@ namespace hotstuff
             throw std::runtime_error("tree_config: Invalid tree generation algorithm!");
         }
 
-        auto curr_epoch = Epoch(0, default_trees); // TODO curr_epoch being a global_var to keep track of the epoch
-        system_trees = curr_epoch.get_system_trees();
+        cur_epoch = Epoch(0, default_trees);
+        system_trees = cur_epoch.get_system_trees();
+    }
+
+    // TO BE REMOVED JUST TEST
+    void HotStuffBase::read_epoch_from_file(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas)
+    {
+
+        std::vector<TreeNetwork> default_trees;
+        std::ifstream file(config.new_epoch);
+        std::string line;
+        size_t tid = 0;
+
+        if (!file.is_open())
+        {
+            std::string str = "tree_config: Provided treegen file path is invalid! Failed to open file " + config.new_epoch;
+            throw std::runtime_error(str);
+        }
+
+        while (std::getline(file, line))
+        {
+            std::istringstream iss(line);
+            std::string tmp;
+            std::string delimiter = ":";
+            std::string token;
+            std::vector<uint32_t> new_tree_array;
+            uint32_t replica_id;
+            uint8_t fanout;
+            uint8_t pipe_stretch;
+
+            /* Fanout */
+            iss >> tmp;
+            token = tmp.substr(0, tmp.find(delimiter));
+            if (token == "fan")
+            {
+                fanout = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
+            }
+            else
+            {
+                throw std::runtime_error("tree_config: Provided treegen file has invalid tree fanout!");
+            }
+
+            /* Pipeline Stretch */
+            iss >> tmp;
+            token = tmp.substr(0, tmp.find(delimiter));
+            if (token == "pipe")
+            {
+                pipe_stretch = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
+            }
+            else
+            {
+                throw std::runtime_error("tree_config: Provided treegen file has invalid tree pipeline-stretch!");
+            }
+
+            while (iss >> replica_id)
+            {
+                new_tree_array.push_back(replica_id);
+            }
+
+            default_trees.push_back(TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id));
+            tid++;
+            // system_trees[tid] = TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id);
+            // tid++;
+        }
+
+        on_hold_epoch = Epoch(cur_epoch.get_epoch_num() + 1, default_trees);
     }
 
     void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup)
@@ -1371,6 +1435,7 @@ namespace hotstuff
             }
 
             tree_config(std::move(global_replicas));
+            read_epoch_from_file(std::move(global_replicas));
         }
 
         /* Update the current tree */
@@ -1405,6 +1470,10 @@ namespace hotstuff
         else
             current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
+        /*See if the epochs are being initialized correctly */
+        HOTSTUFF_LOG_PROTO("%s", std::string(cur_epoch).c_str());
+        HOTSTUFF_LOG_PROTO("%s", std::string(on_hold_epoch).c_str());
+        /* ---------------------------------------------------------*/
         HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
         HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());
 

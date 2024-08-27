@@ -71,6 +71,8 @@ class ReplicaConfig {
     std::string treegen_algo;
     std::string treegen_fpath;
 
+    std::string new_epoch;
+
     ReplicaConfig(): nreplicas(0), nmajority(0) {}
 
     void add_replica(ReplicaID rid, const ReplicaInfo &info) {
