@@ -183,17 +183,28 @@ namespace hotstuff
     struct Epoch
     {
 
-        uint32_t epoch_num; //Epoch number
+        uint32_t epoch_num;             // Epoch number
         std::vector<TreeNetwork> trees; // Collection of trees
+        mutable std::unordered_map<size_t, TreeNetwork> system_trees;
 
     public:
         Epoch() = default;
         Epoch(uint32_t epoch_num, const std::vector<TreeNetwork> &trees) : epoch_num(epoch_num),
-                                                                    trees(trees) {}
+                                                                           trees(trees) {}
 
         const uint32_t &get_epoch_num() const { return epoch_num; }
 
         const std::vector<TreeNetwork> &get_trees() const { return trees; }
+
+        const std::unordered_map<size_t, TreeNetwork> &get_system_trees()
+        {
+            for (size_t i = 0; i < trees.size(); ++i)
+            {
+                system_trees[i] = trees[i];
+            }
+
+            return system_trees;
+        }
     };
 
     /** Network message format for HotStuff. */

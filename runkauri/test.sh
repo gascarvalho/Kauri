@@ -15,6 +15,7 @@ FLINES=$(cat $FILENAME2 | grep "^[^#;]")
 LOG_FOLDER="logs" # Define a folder to store logs
 REPLICA_LOG_FOLDER="${LOG_FOLDER}/replicas"
 CLIENT_LOG_FOLDER="${LOG_FOLDER}/clients"
+rm -f $REPLICA_LOG_FOLDER/*
 mkdir -p $LOG_FOLDER # Create the log folder if it doesn't exist
 mkdir -p $REPLICA_LOG_FOLDER # Subfolder for replica logs
 mkdir -p $CLIENT_LOG_FOLDER # Subfolder for client logs
