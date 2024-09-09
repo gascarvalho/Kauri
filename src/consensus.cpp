@@ -265,7 +265,7 @@ namespace hotstuff
             LOG_PROTO("commit %s", std::string(*blk).c_str());
             decided_blk_counter++;
             for (size_t i = 0; i < blk->cmds.size(); i++)
-                do_decide(Finality(id, get_tree_id(), 1, i, blk->height,
+                do_decide(Finality(id, get_cur_epoch_nr(), get_tree_id(), 1, i, blk->height,
                                    blk->cmds[i], blk->get_hash()));
         }
 
@@ -319,7 +319,7 @@ namespace hotstuff
 
         LOG_PROTO("propose %s", std::string(*bnew).c_str());
         on_deliver_blk(bnew);
-        Proposal prop = process_block(bnew, true, get_tree_id());
+        Proposal prop = process_block(bnew, true, get_tree_id(), get_cur_epoch_nr());
         /* broadcast to other replicas */
         do_broadcast_proposal(prop);
 
@@ -342,7 +342,7 @@ namespace hotstuff
         return bnew;
     }
 
-    Proposal HotStuffCore::process_block(const block_t &bnew, bool adjustHeight, int tid)
+    Proposal HotStuffCore::process_block(const block_t &bnew, bool adjustHeight, int tid, uint32_t epoch_nr)
     {
         const uint256_t bnew_hash = bnew->get_hash();
         if (bnew->self_qc == nullptr)
@@ -354,7 +354,7 @@ namespace hotstuff
         // on_deliver_blk(bnew);
         LOG_PROTO("before update");
         update(bnew);
-        Proposal prop(id, tid, bnew, nullptr);
+        Proposal prop(id, epoch_nr, tid, bnew, nullptr);
         // std::cout << "prop" << std::endl;
         /* self-vote */
         if (adjustHeight)
@@ -371,7 +371,7 @@ namespace hotstuff
 
         // Vote for own proposed block
         on_receive_vote(
-            Vote(id, tid, bnew_hash,
+            Vote(id, epoch_nr, tid, bnew_hash,
                  create_part_cert(*priv_key, bnew_hash), this));
         on_propose_(prop);
 
@@ -380,7 +380,7 @@ namespace hotstuff
 
     void HotStuffCore::on_receive_proposal(const Proposal &prop)
     {
-        LOG_PROTO("[CONSENSUS] Got PROPOSAL in tid=%d: %s %s", prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
+        LOG_PROTO("[CONSENSUS] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
 
         block_t bnew = prop.blk;
         sanity_check_delivered(bnew);
@@ -421,7 +421,7 @@ namespace hotstuff
         if (opinion && !vote_disabled)
         {
             do_vote(prop,
-                    Vote(id, get_tree_id(), bnew->get_hash(),
+                    Vote(id, get_cur_epoch_nr(), get_tree_id(), bnew->get_hash(),
                          create_part_cert(*priv_key, bnew->get_hash()), this));
         }
 
@@ -453,7 +453,7 @@ namespace hotstuff
         assert(vote.cert);
 
         // In current implementation, only the proposer's vote uses this function
-        LOG_PROTO("[CONSENSUS] Applying own vote in tid=%d: %s %s", vote.tid, std::string(vote).c_str(), std::string(*blk).c_str());
+        LOG_PROTO("[CONSENSUS] Applying own vote in epoch_nr=%d, tid=%d: %s %s", vote.epoch_nr, vote.tid, std::string(vote).c_str(), std::string(*blk).c_str());
 
         if (!blk->voted.insert(vote.voter).second)
         {

@@ -223,6 +223,11 @@ namespace hotstuff
          */
         virtual uint32_t get_tree_id() {};
 
+        /**
+         * Get the current epoch number
+         */
+        virtual uint32_t get_cur_epoch_nr() {};
+
         /* The user plugs in the detailed instances for those
          * polymorphic data types. */
     public:
@@ -264,7 +269,7 @@ namespace hotstuff
         operator std::string() const;
         void set_vote_disabled(bool f) { vote_disabled = f; }
 
-        Proposal process_block(const block_t &bnew, bool adjustHeight, int tid);
+        Proposal process_block(const block_t &bnew, bool adjustHeight, int tid, uint32_t epoch_nr);
 
         void tree_config(bool b);
         void tree_scheduler(bool b);
@@ -278,6 +283,8 @@ namespace hotstuff
     struct Proposal : public Serializable
     {
         ReplicaID proposer;
+        /* epoch that the given proposal refers to */
+        uint32_t epoch_nr;
         /** tree used for the message*/
         uint32_t tid;
         /** block being proposed */
@@ -288,14 +295,19 @@ namespace hotstuff
 
         Proposal() : blk(nullptr), hsc(nullptr) {}
         Proposal(ReplicaID proposer,
+                 uint32_t epoch_nr,
                  uint32_t tid,
                  const block_t &blk,
                  HotStuffCore *hsc) : proposer(proposer),
-                                      tid(tid), blk(blk), hsc(hsc) {}
+                                      epoch_nr(epoch_nr),
+                                      tid(tid),
+                                      blk(blk),
+                                      hsc(hsc) {}
 
         void serialize(DataStream &s) const override
         {
             s << proposer
+              << epoch_nr
               << tid
               << *blk;
         }
@@ -304,6 +316,7 @@ namespace hotstuff
         {
             assert(hsc != nullptr);
             s >> proposer;
+            s >> epoch_nr;
             s >> tid;
             Block _blk;
             _blk.unserialize(s, hsc);
@@ -316,7 +329,8 @@ namespace hotstuff
             s << "<proposal "
               << "rid=" << std::to_string(proposer) << " "
               << "blk=" << get_hex10(blk->get_hash()) << " "
-              << "tid=" << std::to_string(tid) << ">";
+              << "tid=" << std::to_string(tid) << " "
+              << "epoch_nr=" << std::to_string(epoch_nr) << ">";
             return s;
         }
     };
@@ -325,6 +339,8 @@ namespace hotstuff
     struct Vote : public Serializable
     {
         ReplicaID voter;
+        /** epoch used for the message*/
+        uint32_t epoch_nr;
         /** tree used for the message*/
         uint32_t tid;
         /** block being voted */
@@ -337,15 +353,18 @@ namespace hotstuff
 
         Vote() : cert(nullptr), hsc(nullptr) {}
         Vote(ReplicaID voter,
+             uint32_t epoch_nr,
              uint32_t tid,
              const uint256_t &blk_hash,
              part_cert_bt &&cert,
              HotStuffCore *hsc) : voter(voter),
+                                  epoch_nr(epoch_nr),
                                   tid(tid),
                                   blk_hash(blk_hash),
                                   cert(std::move(cert)), hsc(hsc) {}
 
         Vote(const Vote &other) : voter(other.voter),
+                                  epoch_nr(other.epoch_nr),
                                   tid(other.tid),
                                   blk_hash(other.blk_hash),
                                   cert(other.cert ? other.cert->clone() : nullptr),
@@ -355,13 +374,13 @@ namespace hotstuff
 
         void serialize(DataStream &s) const override
         {
-            s << voter << tid << blk_hash << *cert;
+            s << voter << epoch_nr << tid << blk_hash << *cert;
         }
 
         void unserialize(DataStream &s) override
         {
             assert(hsc != nullptr);
-            s >> voter >> tid >> blk_hash;
+            s >> voter >> epoch_nr >> tid >> blk_hash;
             cert = hsc->parse_part_cert(s);
         }
 
@@ -385,7 +404,8 @@ namespace hotstuff
             s << "<vote "
               << "rid=" << std::to_string(voter) << " "
               << "blk=" << get_hex10(blk_hash) << " "
-              << "tid=" << std::to_string(tid) << ">";
+              << "tid=" << std::to_string(tid) << " "
+              << "epoch_nr=" << std::to_string(epoch_nr) << ">";
             return s;
         }
     };
@@ -393,6 +413,8 @@ namespace hotstuff
     struct Finality : public Serializable
     {
         ReplicaID rid;
+        /** epoch used for the message*/
+        uint32_t epoch_nr;
         /** tree used for the message*/
         uint32_t tid;
         int8_t decision;
@@ -404,18 +426,19 @@ namespace hotstuff
     public:
         Finality() = default;
         Finality(ReplicaID rid,
+                 uint32_t epoch_nr,
                  uint32_t tid,
                  int8_t decision,
                  uint32_t cmd_idx,
                  uint32_t cmd_height,
                  uint256_t cmd_hash,
-                 uint256_t blk_hash) : rid(rid), tid(tid), decision(decision),
+                 uint256_t blk_hash) : rid(rid), epoch_nr(epoch_nr), tid(tid), decision(decision),
                                        cmd_idx(cmd_idx), cmd_height(cmd_height),
                                        cmd_hash(cmd_hash), blk_hash(blk_hash) {}
 
         void serialize(DataStream &s) const override
         {
-            s << rid << tid << decision
+            s << rid << epoch_nr << tid << decision
               << cmd_idx << cmd_height
               << cmd_hash;
             if (decision == 1)
@@ -424,7 +447,7 @@ namespace hotstuff
 
         void unserialize(DataStream &s) override
         {
-            s >> rid >> tid >> decision >> cmd_idx >> cmd_height >> cmd_hash;
+            s >> rid >> epoch_nr >> tid >> decision >> cmd_idx >> cmd_height >> cmd_hash;
             if (decision == 1)
                 s >> blk_hash;
         }
@@ -438,7 +461,8 @@ namespace hotstuff
               << "cmd_height=" << std::to_string(cmd_height) << " "
               << "cmd=" << get_hex10(cmd_hash) << " "
               << "blk=" << get_hex10(blk_hash) << " "
-              << "tid=" << std::to_string(tid) << ">";
+              << "tid=" << std::to_string(tid) << " "
+              << "epoch_nr=" << std::to_string(epoch_nr) << ">";
             return s;
         }
     };
@@ -446,6 +470,8 @@ namespace hotstuff
     /** Abstraction for vote relay messages. */
     struct VoteRelay : public Serializable
     {
+        /** epoch used for the message*/
+        uint32_t epoch_nr;
         /** tree used for the message*/
         uint32_t tid;
         /** block being voted */
@@ -457,13 +483,14 @@ namespace hotstuff
         HotStuffCore *hsc;
 
         VoteRelay() : cert(nullptr), hsc(nullptr) {}
-        VoteRelay(uint32_t tid, const uint256_t &blk_hash,
+        VoteRelay(uint32_t epoch_nr, uint32_t tid, const uint256_t &blk_hash,
                   quorum_cert_bt &&cert,
-                  HotStuffCore *hsc) : tid(tid),
+                  HotStuffCore *hsc) : epoch_nr(epoch_nr), tid(tid),
                                        blk_hash(blk_hash),
                                        cert(std::move(cert)), hsc(hsc) {}
 
-        VoteRelay(const VoteRelay &other) : tid(other.tid),
+        VoteRelay(const VoteRelay &other) : epoch_nr(other.epoch_nr),
+                                            tid(other.tid),
                                             blk_hash(other.blk_hash),
                                             cert(other.cert ? other.cert->clone() : nullptr),
                                             hsc(other.hsc) {}
@@ -472,13 +499,13 @@ namespace hotstuff
 
         void serialize(DataStream &s) const override
         {
-            s << tid << blk_hash << *cert;
+            s << epoch_nr << tid << blk_hash << *cert;
         }
 
         void unserialize(DataStream &s) override
         {
             assert(hsc != nullptr);
-            s >> tid >> blk_hash;
+            s >> epoch_nr >> tid >> blk_hash;
             cert = hsc->parse_quorum_cert(s);
         }
 
@@ -487,7 +514,8 @@ namespace hotstuff
             DataStream s;
             s << "<voterelay "
               << "blk=" << get_hex10(blk_hash) << " "
-              << "tid=" << std::to_string(tid) << ">";
+              << "tid=" << std::to_string(tid) << " "
+              << "epoch_nr=" << std::to_string(epoch_nr) << ">";
             return s;
         }
     };

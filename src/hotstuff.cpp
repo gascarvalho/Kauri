@@ -254,7 +254,7 @@ namespace hotstuff
             return;
         }
 
-        LOG_PROTO("[PROP HANDLER] Got PROPOSAL in tid=%d: %s %s", prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
+        LOG_PROTO("[PROP HANDLER] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
 
         /** We can resume pending proposals assuming previous proposal triggered tree switch */
         while (!pending_proposals.empty())
@@ -298,7 +298,7 @@ namespace hotstuff
 
         if (!childPeers.empty())
         {
-            LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in tid=%d", prop.tid);
+            LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in epoch_nr=%d, tid=%d", prop.epoch_nr, prop.tid);
             MsgPropose relay = MsgPropose(stream, true);
             for (const PeerId &peerId : childPeers)
             {
@@ -385,14 +385,17 @@ namespace hotstuff
         // HOTSTUFF_LOG_PROTO("received vote");
 
         /** Treat vote in relation to its tree */
+        auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
+
+        // TODO change the underneath code
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
         auto numberOfChildren = msg_tree.get_numberOfChildren();
         auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
-        HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received VOTE message in tid=%d from ReplicaId %d", msg_tree_id, peer_id_map.at(peer));
+        HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received VOTE message in epoch_nr=%d, tid=%d from ReplicaId %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer));
 
         if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end())
         {
@@ -400,7 +403,7 @@ namespace hotstuff
             block_t blk = storage->find_blk(msg.vote.blk_hash);
             if (!blk->piped_delivered)
             {
-                process_block(blk, false, msg_tree_id);
+                process_block(blk, false, msg_tree_id, msg_epoch_nr);
                 blk->piped_delivered = true;
                 HOTSTUFF_LOG_PROTO("Normalized piped block");
             }
@@ -491,9 +494,9 @@ namespace hotstuff
             if (!parentPeer.is_null())
             {
 
-                HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got enough votes, sending VOTE-RELAY in tid=%d to ReplicaId %d with a cert of size %d", msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
+                HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got enough votes, sending VOTE-RELAY in epoch_nr=%d, tid=%d to ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
 
-                pn.send_msg(MsgRelay(VoteRelay(msg_tree_id, msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
+                pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
             }
             async_deliver_blk(msg.vote.blk_hash, peer);
 
@@ -567,14 +570,17 @@ namespace hotstuff
         // std::cout << "vote relay handler: " << msg.vote.blk_hash.to_hex() << std::endl;
 
         /** Treat vote relay in relation to its tree */
+        auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
+
+        // TODO: change this underneath
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
         auto numberOfChildren = msg_tree.get_numberOfChildren();
         auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
-        HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Received VOTE-RELAY message in tid=%d from ReplicaId %d with a cert of size %d", msg_tree_id, peer_id_map.at(peer), msg.vote.cert->get_sigs_n());
+        HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Received VOTE-RELAY message in epoch_nr=%d, tid=%d from ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), msg.vote.cert->get_sigs_n());
 
         if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end())
         {
@@ -582,7 +588,7 @@ namespace hotstuff
             block_t blk = storage->find_blk(msg.vote.blk_hash);
             if (!blk->piped_delivered)
             {
-                process_block(blk, false, msg_tree_id);
+                process_block(blk, false, msg_tree_id, msg_epoch_nr);
                 blk->piped_delivered = true;
                 HOTSTUFF_LOG_PROTO("Normalized piped block");
             }
@@ -684,7 +690,7 @@ namespace hotstuff
                          async_deliver_blk(v->blk_hash, peer),
                          v->cert->verify(config, vpool),
                      })
-            .then([this, blk, v = std::move(v), timeStart, tree_proposer, parentPeer, numberOfChildren, msg_tree_id](const promise::values_t &values)
+            .then([this, blk, v = std::move(v), timeStart, tree_proposer, parentPeer, numberOfChildren, msg_tree_id, msg_epoch_nr](const promise::values_t &values)
                   {
         struct timeval timeEnd;
 
@@ -711,9 +717,9 @@ namespace hotstuff
                 std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
                 if(!parentPeer.is_null()) {
 
-                    HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Sending VOTE-RELAY in tid=%d to ReplicaId %d with a cert of size %d", msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
+                    HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Sending VOTE-RELAY in epoch_nr=%d, tid=%d to ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
 
-                    pn.send_msg(MsgRelay(VoteRelay(msg_tree_id, v->blk_hash, cert.get()->clone(), this)), parentPeer);
+                    pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, v->blk_hash, cert.get()->clone(), this)), parentPeer);
                 }
 
                 return;
@@ -1144,7 +1150,10 @@ namespace hotstuff
                                               {
 
         /** Treat vote to proposal in relation to its tree */
+        auto msg_epoch_nr = prop.epoch_nr;
         auto msg_tree_id = prop.tid;
+
+
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
@@ -1159,7 +1168,7 @@ namespace hotstuff
             //HOTSTUFF_LOG_PROTO("send vote");
             if(!parentPeer.is_null())  {
 
-                HOTSTUFF_LOG_PROTO("[CONSENSUS] Sending VOTE in tid=%d to ReplicaId %d for block %s", msg_tree_id, peer_id_map.at(parentPeer), std::string(*prop.blk).c_str());
+                HOTSTUFF_LOG_PROTO("[CONSENSUS] Sending VOTE in epoch_nr=%d, tid=%d to ReplicaId %d for block %s",msg_epoch_nr ,msg_tree_id, peer_id_map.at(parentPeer), std::string(*prop.blk).c_str());
                 pn.send_msg(MsgVote(vote), parentPeer);
             }
         } else {
@@ -1199,6 +1208,14 @@ namespace hotstuff
     uint32_t HotStuffBase::get_tree_id()
     {
         return current_tree.get_tid();
+    }
+
+    /**
+     * Get the current tree id. Used for proposals.
+     */
+    uint32_t HotStuffBase::get_cur_epoch_nr()
+    {
+        return cur_epoch.get_epoch_num();
     }
 
     HotStuffBase::~HotStuffBase() {}
@@ -1434,7 +1451,9 @@ namespace hotstuff
                 }
             }
 
+            // Creates a system_tree object based on a file or a an algorithm
             tree_config(std::move(global_replicas));
+            // Change from here justs reads a new epoch from file
             read_epoch_from_file(std::move(global_replicas));
         }
 
@@ -1481,6 +1500,28 @@ namespace hotstuff
 
         /* Proposer opens client for himself */
         // open_client(get_system_tree_root(offset));
+    }
+
+    void HotStuffBase::change_epoch()
+    {
+
+        LOG_PROTO("\n=========================== Strating Epoch Change =================================\n");
+
+        size_t offset = 0;
+
+        // Updates epoch
+        cur_epoch = on_hold_epoch;
+        on_hold_epoch = Epoch(cur_epoch.get_epoch_num() + 1);
+        ;
+
+        // Updates system trees
+        system_trees = cur_epoch.get_system_trees();
+        current_tree_network = system_trees[offset];
+
+        HOTSTUFF_LOG_PROTO("%s", std::string(cur_epoch).c_str());
+        HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
+
+        LOG_PROTO("\n=========================== Finished Epoch Switch =================================\n");
     }
 
     void HotStuffBase::close_client(ReplicaID rid)
@@ -1533,6 +1574,7 @@ namespace hotstuff
         }
     }
 
+    // Tree switch could be either a a normal tree switch or a epoch change (that is nothing more than also a tree switch)
     bool HotStuffBase::isTreeSwitch(int bheight)
     {
         if (bheight > lastCheckedHeight)
@@ -1540,7 +1582,8 @@ namespace hotstuff
             lastCheckedHeight = bheight;
         }
 
-        return lastCheckedHeight == current_tree_network.get_target();
+        // First condition to change epoch at block 150
+        return lastCheckedHeight == 150 || lastCheckedHeight == current_tree_network.get_target();
     }
 
     void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop)
@@ -1773,7 +1816,7 @@ namespace hotstuff
                     print_pipe_queues(true, false);
 
 
-                    Proposal prop(id, get_tree_id(), piped_block, nullptr);
+                    Proposal prop(id, get_cur_epoch_nr() ,get_tree_id(), piped_block, nullptr);
                     HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
                     /* broadcast to other replicas */
                     gettimeofday(&last_block_time, NULL);

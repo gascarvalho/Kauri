@@ -190,6 +190,9 @@ namespace hotstuff
 
     public:
         Epoch() = default;
+        Epoch(uint32_t epoch_num) : epoch_num(epoch_num)
+        {
+        }
         Epoch(uint32_t epoch_num, const std::vector<TreeNetwork> &trees) : epoch_num(epoch_num),
                                                                            trees(trees)
         {
@@ -212,6 +215,11 @@ namespace hotstuff
             }
 
             return system_trees;
+        }
+
+        void set_trees(const std::vector<TreeNetwork> &epoch_trees)
+        {
+            trees = epoch_trees;
         }
 
         operator std::string()
@@ -448,6 +456,7 @@ namespace hotstuff
         void do_decide(Finality &&) override;
         void do_consensus(const block_t &blk) override;
         uint32_t get_tree_id() override;
+        uint32_t get_cur_epoch_nr() override;
 
     protected:
         /** Called to replicate the execution of a command, the application should
@@ -475,6 +484,9 @@ namespace hotstuff
         void tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
         void read_epoch_from_file(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
         void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
+        // Updates vars related to epoch and trees
+        void change_epoch();
+        //------------------------------
         void close_client(ReplicaID rid);
         void open_client(ReplicaID rid);
         bool isTreeSwitch(int bheight);
