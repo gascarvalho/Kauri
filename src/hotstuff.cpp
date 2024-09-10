@@ -1333,6 +1333,7 @@ namespace hotstuff
             throw std::runtime_error("tree_config: Invalid tree generation algorithm!");
         }
 
+        epochs.push_back(Epoch(0, default_trees));
         cur_epoch = Epoch(0, default_trees);
         system_trees = cur_epoch.get_system_trees();
     }
@@ -1398,7 +1399,7 @@ namespace hotstuff
             // tid++;
         }
 
-        on_hold_epoch = Epoch(cur_epoch.get_epoch_num() + 1, default_trees);
+        epochs.push_back(Epoch(cur_epoch.get_epoch_num() + 1, default_trees));
     }
 
     void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup)
@@ -1458,8 +1459,13 @@ namespace hotstuff
         }
 
         /* Update the current tree */
+        auto current_epoch_nr = get_pace_maker()->get_current_epoch();
         offset = get_pace_maker()->get_current_tid();
+
+        system_trees = epochs[current_epoch_nr].get_system_trees();
         current_tree_network = system_trees[offset];
+
+        // current_tree_network = system_trees[offset];
         current_tree = current_tree_network.get_tree();
 
         /* Adjust fanout and pipeline stretch accordingly */
@@ -1512,7 +1518,6 @@ namespace hotstuff
         // Updates epoch
         cur_epoch = on_hold_epoch;
         on_hold_epoch = Epoch(cur_epoch.get_epoch_num() + 1);
-        ;
 
         // Updates system trees
         system_trees = cur_epoch.get_system_trees();

@@ -58,6 +58,7 @@ namespace hotstuff
         virtual size_t get_pending_size() = 0;
         virtual void inc_time(bool force) {}
         virtual size_t get_current_tid() {}
+        virtual size_t get_current_epoch() {}
         virtual void update_tree_proposer() {}
         virtual void setup() {}
 
@@ -324,6 +325,9 @@ namespace hotstuff
         ReplicaID proposer;
         size_t current_tid;
 
+        /* Keeps track of the current epoch*/
+        size_t current_epoch;
+
         promise_t pm_qc_manual;
 
     public:
@@ -332,8 +336,10 @@ namespace hotstuff
                                                                      base_timeout(10),
                                                                      timeout(10),
                                                                      prop_delay(0),
-                                                                     ec(std::move(ec)), proposer(0),
-                                                                     current_tid(0) {}
+                                                                     ec(std::move(ec)),
+                                                                     proposer(0),
+                                                                     current_tid(0),
+                                                                     current_epoch(0) {}
 
         ReplicaID get_proposer() override
         {
@@ -446,6 +452,11 @@ namespace hotstuff
         size_t get_current_tid() override
         {
             return current_tid;
+        }
+
+        size_t get_current_epoch() override
+        {
+            return current_epoch;
         }
 
         void update_tree_proposer() override

@@ -437,7 +437,7 @@ namespace hotstuff
             LOG_PROTO("Forcing a reconfiguration! (block height is now %llu)", bnew->height);
             inc_time(true);
         }
-        else if (bnew->height > get_total_system_trees())
+        else if (bnew->height > get_total_system_trees()) // WARMUP FINISHED
         {
             inc_time(false);
         }

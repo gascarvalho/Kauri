@@ -418,7 +418,10 @@ namespace hotstuff
         vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> global_replicas;
 
         // std::unordered_map<size_t, Tree> system_trees;
+        // TODO: deprecated
         std::unordered_map<size_t, TreeNetwork> system_trees;
+
+        std::vector<Epoch> epochs;
         mutable TreeNetwork current_tree_network;
         mutable Tree current_tree;
         uint32_t lastCheckedHeight;
@@ -426,6 +429,7 @@ namespace hotstuff
 
         /* Epoch */
 
+        // TODO: also becoming deprecated as we just need to store the indexes
         mutable Epoch cur_epoch;
         mutable Epoch on_hold_epoch;
 
