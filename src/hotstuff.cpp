@@ -240,6 +240,8 @@ namespace hotstuff
         auto &prop = msg.proposal;
         msg.postponed_parse(this);
 
+        auto system_trees = epochs[prop.epoch_nr].get_system_trees();
+
         /** Treat proposal in relation to its tree */
         auto msg_tree = system_trees[prop.tid];
         auto childPeers = msg_tree.get_childPeers();
@@ -388,7 +390,8 @@ namespace hotstuff
         auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
 
-        // TODO change the underneath code
+        auto system_trees = epochs[msg_epoch_nr].get_system_trees();
+
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
@@ -573,7 +576,9 @@ namespace hotstuff
         auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
 
-        // TODO: change this underneath
+        // Reply in the correct tree in the correct epoch
+        auto system_trees = epochs[msg_epoch_nr].get_system_trees();
+
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
@@ -1149,36 +1154,38 @@ namespace hotstuff
         pmaker->beat_resp(prop.proposer).then([this, vote, prop](ReplicaID proposer)
                                               {
 
-        /** Treat vote to proposal in relation to its tree */
-        auto msg_epoch_nr = prop.epoch_nr;
-        auto msg_tree_id = prop.tid;
+            /** Treat vote to proposal in relation to its tree */
+            auto msg_epoch_nr = prop.epoch_nr;
+            auto msg_tree_id = prop.tid;
 
+            //Reply to the correct tree in the correct epoch
+            auto system_trees = epochs[msg_epoch_nr].get_system_trees();
 
-        auto msg_tree = system_trees[msg_tree_id];
-        auto parentPeer = msg_tree.get_parentPeer();
-        auto childPeers = msg_tree.get_childPeers();
-        auto tree_proposer = msg_tree.get_tree().get_tree_root();
+            auto msg_tree = system_trees[msg_tree_id];
+            auto parentPeer = msg_tree.get_parentPeer();
+            auto childPeers = msg_tree.get_childPeers();
+            auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
-        if (tree_proposer == get_id())
-        {
-            return;
-        }
-
-        if (childPeers.empty()) {
-            //HOTSTUFF_LOG_PROTO("send vote");
-            if(!parentPeer.is_null())  {
-
-                HOTSTUFF_LOG_PROTO("[CONSENSUS] Sending VOTE in epoch_nr=%d, tid=%d to ReplicaId %d for block %s",msg_epoch_nr ,msg_tree_id, peer_id_map.at(parentPeer), std::string(*prop.blk).c_str());
-                pn.send_msg(MsgVote(vote), parentPeer);
-            }
-        } else {
-            block_t blk = get_delivered_blk(vote.blk_hash);
-            if (blk->self_qc == nullptr)
+            if (tree_proposer == get_id())
             {
-                blk->self_qc = create_quorum_cert(prop.blk->get_hash());
-                blk->self_qc->add_part(config, vote.voter, *vote.cert);
+                return;
             }
-        } });
+
+            if (childPeers.empty()) {
+                //HOTSTUFF_LOG_PROTO("send vote");
+                if(!parentPeer.is_null())  {
+
+                    HOTSTUFF_LOG_PROTO("[CONSENSUS] Sending VOTE in epoch_nr=%d, tid=%d to ReplicaId %d for block %s",msg_epoch_nr ,msg_tree_id, peer_id_map.at(parentPeer), std::string(*prop.blk).c_str());
+                    pn.send_msg(MsgVote(vote), parentPeer);
+                }
+            } else {
+                block_t blk = get_delivered_blk(vote.blk_hash);
+                if (blk->self_qc == nullptr)
+                {
+                    blk->self_qc = create_quorum_cert(prop.blk->get_hash());
+                    blk->self_qc->add_part(config, vote.voter, *vote.cert);
+                }
+            } });
     }
 
     void HotStuffBase::do_consensus(const block_t &blk)
@@ -1323,8 +1330,6 @@ namespace hotstuff
 
                 default_trees.push_back(TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id));
                 tid++;
-                // system_trees[tid] = TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id);
-                // tid++;
             }
         }
 
@@ -1393,11 +1398,9 @@ namespace hotstuff
 
             default_trees.push_back(TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id));
             tid++;
-            // system_trees[tid] = TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id);
-            // tid++;
         }
 
-        epochs.push_back(Epoch(cur_epoch.get_epoch_num() + 1, default_trees));
+        epochs.push_back(Epoch(epochs[0].get_epoch_num() + 1, default_trees));
     }
 
     void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup)
@@ -1462,8 +1465,6 @@ namespace hotstuff
 
         system_trees = epochs[current_epoch_nr].get_system_trees();
         current_tree_network = system_trees[offset];
-
-        // current_tree_network = system_trees[offset];
         current_tree = current_tree_network.get_tree();
 
         /* Adjust fanout and pipeline stretch accordingly */
@@ -1484,7 +1485,7 @@ namespace hotstuff
         // else
         //     current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
-        if (warmup_counter < system_trees.size())
+        if (warmup_counter < get_total_system_trees())
         {
             // Do 1 block for each tree in schedule to warmup
             current_tree_network.set_target(lastCheckedHeight + 1);
@@ -1494,8 +1495,8 @@ namespace hotstuff
             current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
         /*See if the epochs are being initialized correctly */
-        HOTSTUFF_LOG_PROTO("%s", std::string(cur_epoch).c_str());
-        HOTSTUFF_LOG_PROTO("%s", std::string(on_hold_epoch).c_str());
+        HOTSTUFF_LOG_PROTO("%s", std::string(epochs[0]).c_str());
+        HOTSTUFF_LOG_PROTO("%s", std::string(epochs[1]).c_str());
         /* ---------------------------------------------------------*/
         HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
         HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());
@@ -1640,45 +1641,49 @@ namespace hotstuff
 
         ev_check_pending = TimerEvent(ec, [this](TimerEvent &)
                                       {
-        /*Take care of pending proposals*/
-        while(!pending_proposals.empty()) {
-            auto pending_proposal = std::move(pending_proposals.front());
+                                          /*Take care of pending proposals*/
+                                          while (!pending_proposals.empty())
+                                          {
+                                              auto pending_proposal = std::move(pending_proposals.front());
 
-            if(pending_proposal.first.proposal.tid != get_tree_id()) {
-                break;
-            }
+                                              if (pending_proposal.first.proposal.tid != get_tree_id())
+                                              {
+                                                  break;
+                                              }
 
-            LOG_PROTO("[PROP HANDLER] Popping pending proposal: %s", std::string(pending_proposal.first.proposal).c_str());
-            pending_proposal = std::move(pending_proposals.front());
-            pending_proposals.erase(pending_proposals.begin());
-            auto &pending_prop = pending_proposal.first.proposal;
+                                              LOG_PROTO("[PROP HANDLER] Popping pending proposal: %s", std::string(pending_proposal.first.proposal).c_str());
+                                              pending_proposal = std::move(pending_proposals.front());
+                                              pending_proposals.erase(pending_proposals.begin());
+                                              auto &pending_prop = pending_proposal.first.proposal;
 
-            auto pending_msg_tree = system_trees[pending_prop.tid];
-            auto pending_childPeers = pending_msg_tree.get_childPeers();
+                                              // TODO: remove this i guess?
+                                              auto pending_msg_tree = system_trees[pending_prop.tid];
+                                              auto pending_childPeers = pending_msg_tree.get_childPeers();
 
-            // if (!pending_childPeers.empty()) {
-            //     LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
-            //     MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
-            //     for (const PeerId &peerId : pending_childPeers) {
-            //         pn.send_msg(relay, peerId);
-            //     }
-            // }
+                                              // if (!pending_childPeers.empty()) {
+                                              //     LOG_PROTO("[PROP HANDLER] Relaying pending proposal proposal to children in tid=%d", pending_prop.tid);
+                                              //     MsgPropose relay = MsgPropose(pending_proposal.first.serialized, true);
+                                              //     for (const PeerId &peerId : pending_childPeers) {
+                                              //         pn.send_msg(relay, peerId);
+                                              //     }
+                                              // }
 
-            block_t pending_blk = pending_prop.blk;
-            if (!pending_blk){
-                LOG_PROTO("[PROP HANDLER] Pending block is null!");
-                break;
-            }
+                                              block_t pending_blk = pending_prop.blk;
+                                              if (!pending_blk)
+                                              {
+                                                  LOG_PROTO("[PROP HANDLER] Pending block is null!");
+                                                  break;
+                                              }
 
-            const PeerId &pending_peer = pending_proposal.second->get_peer_id();
+                                              const PeerId &pending_peer = pending_proposal.second->get_peer_id();
 
-            promise::all(std::vector<promise_t>{
-                async_deliver_blk(pending_blk->get_hash(), pending_peer)
-            }).then([this, pending_prop = std::move(pending_prop)]() {
-                on_receive_proposal(pending_prop);
-            });
-        }
-        ev_check_pending.add(1); });
+                                              promise::all(std::vector<promise_t>{
+                                                               async_deliver_blk(pending_blk->get_hash(), pending_peer)})
+                                                  .then([this, pending_prop = std::move(pending_prop)]()
+                                                        { on_receive_proposal(pending_prop); });
+                                          }
+                                          ev_check_pending.add(1); });
+
         ev_check_pending.add(1);
 
         // /** Alternative to clients: Locally generated blocks */
