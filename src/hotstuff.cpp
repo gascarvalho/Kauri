@@ -1334,8 +1334,6 @@ namespace hotstuff
         }
 
         epochs.push_back(Epoch(0, default_trees));
-        cur_epoch = Epoch(0, default_trees);
-        system_trees = cur_epoch.get_system_trees();
     }
 
     // TO BE REMOVED JUST TEST
