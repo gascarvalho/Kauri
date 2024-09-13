@@ -323,6 +323,7 @@ namespace hotstuff
         /* broadcast to other replicas */
         do_broadcast_proposal(prop);
 
+        //Gather stats 
         if (is_proposer(id))
         {
             gettimeofday(&timeEnd, NULL);
@@ -330,14 +331,22 @@ namespace hotstuff
             stats.insert(std::make_pair(bnew->hash, usec));
         }
 
+
         // TREE ROTATION FOR PROPOSER CASE 1
-        if (isTreeSwitch(b_normal_height))
+        auto switch_type = isTreeSwitch(b_normal_height);
+
+        if (switch_type == TREE_SWITCH)
         {
-            LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (block height is now %llu)", bnew->height);
-            inc_time(true);
+            LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current tree! (block height is now %llu)", bnew->height);
+            inc_time(switch_type);
+        }
+        else if (switch_type == EPOCH_SWITCH)
+        {
+            LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current epoch! (block height is now %llu)", bnew->height);
+            inc_time(switch_type);
         }
         else if (b_normal_height > get_total_system_trees()) // TODO: WARMUP PARAMETER
-            inc_time(false);
+            inc_time(switch_type);
 
         return bnew;
     }
@@ -430,10 +439,27 @@ namespace hotstuff
         //      sleep(15);
         //  }
 
+
         // TREE ROTATION FOR NON-PROPOSERS
+        auto switch_type = isTreeSwitch(bnew->height);
+
+        if (switch_type == TREE_SWITCH)
+        {
+            LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current tree! (block height is now %llu)", bnew->height);
+            inc_time(switch_type);
+        }
+        else if (switch_type == EPOCH_SWITCH)
+        {
+            LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current epoch! (block height is now %llu)", bnew->height);
+            inc_time(switch_type);
+        }
+        else if (bnew->height > get_total_system_trees()) // TODO: WARMUP PARAMETER
+            inc_time(switch_type);
+
+
+        /** 
         if (isTreeSwitch(bnew->height))
         {
-
             LOG_PROTO("Forcing a reconfiguration! (block height is now %llu)", bnew->height);
             inc_time(true);
         }
@@ -441,6 +467,8 @@ namespace hotstuff
         {
             inc_time(false);
         }
+
+        */
 
         // update(bnew);
     }

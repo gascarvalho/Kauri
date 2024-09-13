@@ -56,7 +56,7 @@ namespace hotstuff
         virtual void impeach() {}
         virtual void on_consensus(const block_t &) {}
         virtual size_t get_pending_size() = 0;
-        virtual void inc_time(bool force) {}
+        virtual void inc_time(ReconfigurationType reconfig_type) {}
         virtual size_t get_current_tid() {}
         virtual size_t get_current_epoch() {}
         virtual void update_tree_proposer() {}
@@ -357,6 +357,17 @@ namespace hotstuff
             set_proposer(true);
         }
 
+        void set_new_epoch()
+        {
+
+            HOTSTUFF_LOG_PROTO("\n=========================== Changing Epoch =================================\n");
+
+            current_epoch += 1;
+            current_tid = 0;
+
+
+        }
+
         void set_proposer(bool isTimeout)
         {
 
@@ -417,8 +428,35 @@ namespace hotstuff
             HOTSTUFF_LOG_PROTO("Unlocking Proposer!!!");
         }
 
-        void inc_time(bool force) override
+        void inc_time(ReconfigurationType reconfig_type) override
         {
+            switch (reconfig_type)
+            {
+                case TREE_SWITCH:
+                    set_proposer(false);
+                    break;
+
+                case EPOCH_SWITCH:
+                    HOTSTUFF_LOG_PROTO("I'm about to change the epoch");
+                    break;
+
+                case NO_SWITCH:
+
+                    if (!delaying_proposal)
+                    {
+                        HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
+                        timer.del();
+                        timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
+                        timer.add(timeout);
+                    }
+                    break;
+            
+                default:
+                    HOTSTUFF_LOG_PROTO("Unknown Reconfiguration Type");
+                    break;
+            }
+
+            /** 
             if (force)
             {
                 set_proposer(false);
@@ -433,6 +471,7 @@ namespace hotstuff
                     timer.add(timeout);
                 }
             }
+            **/
         }
 
         void schedule_next() override

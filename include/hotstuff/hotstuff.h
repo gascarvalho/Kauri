@@ -454,7 +454,7 @@ namespace hotstuff
 
         void do_broadcast_proposal(const Proposal &) override;
         void do_vote(Proposal, const Vote &) override;
-        void inc_time(bool force) override;
+        void inc_time(ReconfigurationType reconfig_type) override;
         bool is_proposer(int id) override;
         void proposer_base_deliver(const block_t &blk) override;
         void do_decide(Finality &&) override;
@@ -493,7 +493,7 @@ namespace hotstuff
         //------------------------------
         void close_client(ReplicaID rid);
         void open_client(ReplicaID rid);
-        bool isTreeSwitch(int bheight);
+        ReconfigurationType isTreeSwitch(int bheight);
         void beat();
         void print_pipe_queues(bool printPiped, bool printRdy);
         block_t repropose_beat(const std::vector<uint256_t> &cmds);

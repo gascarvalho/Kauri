@@ -1134,9 +1134,9 @@ namespace hotstuff
         pn.multicast_msg(MsgPropose(prop), std::vector(childPeers.begin(), childPeers.end()));
     }
 
-    void HotStuffBase::inc_time(bool force)
+    void HotStuffBase::inc_time(ReconfigurationType reconfig_type)
     {
-        pmaker->inc_time(force);
+        pmaker->inc_time(reconfig_type);
     }
 
     bool HotStuffBase::is_proposer(int rid)
@@ -1579,15 +1579,20 @@ namespace hotstuff
     }
 
     // Tree switch could be either a a normal tree switch or a epoch change (that is nothing more than also a tree switch)
-    bool HotStuffBase::isTreeSwitch(int bheight)
+    ReconfigurationType HotStuffBase::isTreeSwitch(int bheight)
     {
         if (bheight > lastCheckedHeight)
         {
             lastCheckedHeight = bheight;
         }
 
-        // First condition to change epoch at block 150
-        return lastCheckedHeight == 150 || lastCheckedHeight == current_tree_network.get_target();
+        if (lastCheckedHeight == 150)
+            return EPOCH_SWITCH;
+
+        if (lastCheckedHeight == current_tree_network.get_target())
+            return TREE_SWITCH;
+
+        return NO_SWITCH;
     }
 
     void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop)
@@ -1837,8 +1842,24 @@ namespace hotstuff
                     }*/
                     piped_submitted = false;
 
-
                     // TREE ROTATION FOR PROPOSER CASE 2
+                    auto switch_type = isTreeSwitch(piped_block->get_height());
+
+                    if (switch_type == TREE_SWITCH)
+                    {
+                        LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current tree! (block height is now %llu)", piped_block->get_height());
+                        inc_time(switch_type);
+                    }
+                    else if (switch_type == EPOCH_SWITCH)
+                    {
+                        LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current epoch! (block height is now %llu)", piped_block->get_height());
+                        inc_time(switch_type);
+                    }
+                    else if (piped_block->get_height() >  get_total_system_trees()) // TODO: WARMUP PARAMETER
+                        inc_time(switch_type);
+                    
+
+                    /** 
                     if (isTreeSwitch(piped_block->get_height())) {
                         LOG_PROTO("[PROPOSER] Forcing a reconfiguration! (piped block height is now %llu)", piped_block->get_height());
                         inc_time(true);
@@ -1846,6 +1867,7 @@ namespace hotstuff
                     else if (piped_block->get_height() >  get_total_system_trees()) {
                         inc_time(false);
                     }
+                    */
                 }
             } else {
                 gettimeofday(&last_block_time, NULL);

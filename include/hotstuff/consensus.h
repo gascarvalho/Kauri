@@ -36,6 +36,14 @@ namespace hotstuff
     struct VoteRelay;
     struct Tree;
 
+    enum ReconfigurationType
+    {
+        NO_SWITCH,   // No switch happened
+        
+        TREE_SWITCH, // A tree switch happened
+        EPOCH_SWITCH // An epoch switch happened
+    };
+
     /** Abstraction for HotStuff protocol state machine (without network implementation). */
     class HotStuffCore
     {
@@ -119,7 +127,7 @@ namespace hotstuff
         virtual void close_client(ReplicaID rid) {}
         virtual void open_client(ReplicaID rid) {}
         virtual void tree_config() {}
-        virtual bool isTreeSwitch(int bheight) {}
+        virtual ReconfigurationType isTreeSwitch(int bheight) {}
         virtual uint32_t get_blk_size() {}
         virtual size_t get_total_system_trees() {}
         virtual ReplicaID get_system_tree_root(int tid) {}
@@ -212,7 +220,7 @@ namespace hotstuff
         /**
          * Increment timer to mark receival.
          */
-        virtual void inc_time(bool force) {};
+        virtual void inc_time(ReconfigurationType reconfig_type) {};
 
         virtual bool is_proposer(int id) {};
 
