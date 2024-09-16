@@ -1218,11 +1218,11 @@ namespace hotstuff
     }
 
     /**
-     * Get the current tree id. Used for proposals.
+     * Get the current epoch number
      */
     uint32_t HotStuffBase::get_cur_epoch_nr()
     {
-        return cur_epoch.get_epoch_num();
+        return pmaker->get_current_epoch();
     }
 
     HotStuffBase::~HotStuffBase() {}
@@ -1495,8 +1495,7 @@ namespace hotstuff
             current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
         /*See if the epochs are being initialized correctly */
-        HOTSTUFF_LOG_PROTO("%s", std::string(epochs[0]).c_str());
-        HOTSTUFF_LOG_PROTO("%s", std::string(epochs[1]).c_str());
+        HOTSTUFF_LOG_PROTO("%s", std::string(epochs[current_epoch_nr]).c_str());
         /* ---------------------------------------------------------*/
         HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
         HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());
@@ -1507,6 +1506,7 @@ namespace hotstuff
         // open_client(get_system_tree_root(offset));
     }
 
+    //TODO: this is not being used
     void HotStuffBase::change_epoch()
     {
 

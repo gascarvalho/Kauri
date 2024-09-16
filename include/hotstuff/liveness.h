@@ -354,7 +354,7 @@ namespace hotstuff
 
         void proposer_timeout(TimerEvent &)
         {
-            set_proposer(true);
+            set_proposer(true, false);
         }
 
         void set_new_epoch()
@@ -364,11 +364,9 @@ namespace hotstuff
 
             current_epoch += 1;
             current_tid = 0;
-
-
         }
 
-        void set_proposer(bool isTimeout)
+        void set_proposer(bool isTimeout, bool epoch_change)
         {
 
             delaying_proposal = true;
@@ -376,14 +374,16 @@ namespace hotstuff
             // std::swap( pending_beats, empty );
 
             HOTSTUFF_LOG_PROTO("-------------------------------");
-            HOTSTUFF_LOG_PROTO("[PMAKER] %s reached!!!", isTimeout ? "Reconfiguration" : "Timeout");
+            HOTSTUFF_LOG_PROTO("[PMAKER] %s reached!!!", isTimeout ? "Timeout" : "Reconfiguration");
 
             HOTSTUFF_LOG_PROTO("Previous: proposer=%d and tid=%d", proposer, current_tid);
 
             // hsc->close_client(proposer);
 
             /** Rotation happens according to the total trees in the system */
-            current_tid = (current_tid + 1) % hsc->get_total_system_trees();
+            if (!epoch_change)
+                current_tid = (current_tid + 1) % hsc->get_total_system_trees();
+
             update_tree_proposer();
 
             HOTSTUFF_LOG_PROTO("NOW: proposer=%d and tid=%d", proposer, current_tid);
@@ -432,31 +432,33 @@ namespace hotstuff
         {
             switch (reconfig_type)
             {
-                case TREE_SWITCH:
-                    set_proposer(false);
-                    break;
+            case TREE_SWITCH:
+                set_proposer(false, false);
+                break;
 
-                case EPOCH_SWITCH:
-                    HOTSTUFF_LOG_PROTO("I'm about to change the epoch");
-                    break;
+            case EPOCH_SWITCH:
+                set_new_epoch();
 
-                case NO_SWITCH:
+                set_proposer(false, true);
+                break;
 
-                    if (!delaying_proposal)
-                    {
-                        HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
-                        timer.del();
-                        timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
-                        timer.add(timeout);
-                    }
-                    break;
-            
-                default:
-                    HOTSTUFF_LOG_PROTO("Unknown Reconfiguration Type");
-                    break;
+            case NO_SWITCH:
+
+                if (!delaying_proposal)
+                {
+                    HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
+                    timer.del();
+                    timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
+                    timer.add(timeout);
+                }
+                break;
+
+            default:
+                HOTSTUFF_LOG_PROTO("Unknown Reconfiguration Type");
+                break;
             }
 
-            /** 
+            /**
             if (force)
             {
                 set_proposer(false);
