@@ -360,10 +360,11 @@ namespace hotstuff
         void set_new_epoch()
         {
 
-            HOTSTUFF_LOG_PROTO("\n=========================== Changing Epoch =================================\n");
-
+            HOTSTUFF_LOG_PROTO("Previous: epoch_nr:%d", current_epoch);
             current_epoch += 1;
             current_tid = 0;
+
+            HOTSTUFF_LOG_PROTO("Now: epoch_nr:%d", current_epoch);
         }
 
         void set_proposer(bool isTimeout, bool epoch_change)
@@ -376,7 +377,7 @@ namespace hotstuff
             HOTSTUFF_LOG_PROTO("-------------------------------");
             HOTSTUFF_LOG_PROTO("[PMAKER] %s reached!!!", isTimeout ? "Timeout" : "Reconfiguration");
 
-            HOTSTUFF_LOG_PROTO("Previous: proposer=%d and tid=%d", proposer, current_tid);
+            HOTSTUFF_LOG_PROTO("Previous: proposer=%d, tid=%d", proposer, current_tid);
 
             // hsc->close_client(proposer);
 
@@ -386,7 +387,7 @@ namespace hotstuff
 
             update_tree_proposer();
 
-            HOTSTUFF_LOG_PROTO("NOW: proposer=%d and tid=%d", proposer, current_tid);
+            HOTSTUFF_LOG_PROTO("NOW: proposer=%d, tid=%d", proposer, current_tid);
 
             if (isTimeout)
             {

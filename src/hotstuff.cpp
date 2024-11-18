@@ -107,6 +107,30 @@ namespace hotstuff
         cmd_pending.enqueue(std::make_pair(cmd_hash, callback));
     }
 
+    void HotStuffBase::set_epoch_command(const DataStream &epoch_data)
+    {
+
+        HOTSTUFF_LOG_INFO("Storing epoch as a byte[] to be held in the next block");
+
+        // Create a non-const copy of the DataStream to access data()
+        DataStream non_const_data = epoch_data;
+
+        // Access the buffer and size of the serialized data
+        const uint8_t *buffer = non_const_data.data();
+        size_t buffer_size = non_const_data.size();
+
+        // Assign the data to next_epoch_extra
+        has_next_epoch = true;
+        next_epoch_serialized = bytearray_t(buffer, buffer + buffer_size);
+
+        // Create the command and add its hash to final_buffer
+        // command_t epoch_command = create_epoch_command(epoch);
+
+        // final_buffer.push_back(epoch_command->get_hash());
+
+        // HOTSTUFF_LOG_INFO("Epoch command created with hash: %s", get_hex10(epoch_command->get_hash()).c_str());
+    }
+
     void HotStuffBase::on_fetch_blk(const block_t &blk)
     {
 #ifdef HOTSTUFF_BLK_PROFILE
@@ -239,6 +263,20 @@ namespace hotstuff
         auto stream = msg.serialized;
         auto &prop = msg.proposal;
         msg.postponed_parse(this);
+
+        // Log current epoch and tree IDs
+        LOG_PROTO("RECEIVED PROPOSE Current epoch_nr=%d, tid=%d", get_cur_epoch_nr(), get_tree_id());
+
+        // Check if the received epoch is known
+        if (prop.epoch_nr > get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for future epoch %d, but current epoch is %d", prop.epoch_nr, get_cur_epoch_nr());
+            return;
+        }
+        else if (prop.epoch_nr < get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for past epoch %d, but current epoch is %d", prop.epoch_nr, get_cur_epoch_nr());
+        }
 
         auto system_trees = epochs[prop.epoch_nr].get_system_trees();
 
@@ -384,11 +422,24 @@ namespace hotstuff
         if (peer.is_null())
             return;
         msg.postponed_parse(this);
-        // HOTSTUFF_LOG_PROTO("received vote");
 
         /** Treat vote in relation to its tree */
         auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
+
+        // Log current epoch and tree IDs
+        LOG_PROTO("RECEIVED VOTE Current epoch_nr=%d, tid=%d", get_cur_epoch_nr(), get_tree_id());
+
+        // Check if the received epoch is known
+        if (msg_epoch_nr > get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for future epoch %d, but current epoch is %d", msg_epoch_nr, get_cur_epoch_nr());
+            return;
+        }
+        else if (msg_epoch_nr < get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for past epoch %d, but current epoch is %d", msg_epoch_nr, get_cur_epoch_nr());
+        }
 
         auto system_trees = epochs[msg_epoch_nr].get_system_trees();
 
@@ -576,8 +627,23 @@ namespace hotstuff
         auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
 
+        // Log current epoch and tree IDs
+        LOG_PROTO("RECEIVED VOTE RELAY Current epoch_nr=%d, tid=%d", get_cur_epoch_nr(), get_tree_id());
+
+        // Check if the received epoch is known
+        if (msg_epoch_nr > get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for future epoch %d, but current epoch is %d", msg_epoch_nr, get_cur_epoch_nr());
+            return;
+        }
+        else if (msg_epoch_nr < get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for past epoch %d, but current epoch is %d", msg_epoch_nr, get_cur_epoch_nr());
+        }
+
         // Reply in the correct tree in the correct epoch
         auto system_trees = epochs[msg_epoch_nr].get_system_trees();
+        HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Received VOTE-RELAY message in epoch_nr=%d, tid=%d from ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), msg.vote.cert->get_sigs_n());
 
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
@@ -1256,15 +1322,7 @@ namespace hotstuff
 
                 default_trees.push_back(TreeNetwork(Tree(tid, config.fanout, config.async_blocks, new_tree_array),
                                                     std::move(replicas), id));
-
-                // This algorithm assumes constant fanout and pipeline-stretch
-                // system_trees[tid] = new_tree;
-                // trees.push_back(new_tree);
             }
-
-            // auto new_epoch = Epoch(0, trees);
-
-            // LOG_PROTO("DELIVERING EPOCH %d", new_epoch.get_epoch_num());
         }
 
         /** File algorithm will obtain the trees from a file.
@@ -1338,69 +1396,7 @@ namespace hotstuff
             throw std::runtime_error("tree_config: Invalid tree generation algorithm!");
         }
 
-        epochs.push_back(Epoch(0, default_trees));
-    }
-
-    // TO BE REMOVED JUST TEST
-    void HotStuffBase::read_epoch_from_file(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas)
-    {
-
-        std::vector<TreeNetwork> default_trees;
-        std::ifstream file(config.new_epoch);
-        std::string line;
-        size_t tid = 0;
-
-        if (!file.is_open())
-        {
-            std::string str = "tree_config: Provided treegen file path is invalid! Failed to open file " + config.new_epoch;
-            throw std::runtime_error(str);
-        }
-
-        while (std::getline(file, line))
-        {
-            std::istringstream iss(line);
-            std::string tmp;
-            std::string delimiter = ":";
-            std::string token;
-            std::vector<uint32_t> new_tree_array;
-            uint32_t replica_id;
-            uint8_t fanout;
-            uint8_t pipe_stretch;
-
-            /* Fanout */
-            iss >> tmp;
-            token = tmp.substr(0, tmp.find(delimiter));
-            if (token == "fan")
-            {
-                fanout = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
-            }
-            else
-            {
-                throw std::runtime_error("tree_config: Provided treegen file has invalid tree fanout!");
-            }
-
-            /* Pipeline Stretch */
-            iss >> tmp;
-            token = tmp.substr(0, tmp.find(delimiter));
-            if (token == "pipe")
-            {
-                pipe_stretch = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
-            }
-            else
-            {
-                throw std::runtime_error("tree_config: Provided treegen file has invalid tree pipeline-stretch!");
-            }
-
-            while (iss >> replica_id)
-            {
-                new_tree_array.push_back(replica_id);
-            }
-
-            default_trees.push_back(TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id));
-            tid++;
-        }
-
-        epochs.push_back(Epoch(epochs[0].get_epoch_num() + 1, default_trees));
+        epochs.push_back(Epoch(get_pace_maker()->get_current_epoch(), default_trees));
     }
 
     void HotStuffBase::tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup)
@@ -1455,8 +1451,6 @@ namespace hotstuff
 
             // Creates a system_tree object based on a file or a an algorithm
             tree_config(std::move(global_replicas));
-            // Change from here justs reads a new epoch from file
-            read_epoch_from_file(std::move(global_replicas));
         }
 
         /* Update the current tree */
@@ -1496,7 +1490,6 @@ namespace hotstuff
 
         /*See if the epochs are being initialized correctly */
         HOTSTUFF_LOG_PROTO("%s", std::string(epochs[current_epoch_nr]).c_str());
-        /* ---------------------------------------------------------*/
         HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
         HOTSTUFF_LOG_PROTO("Next tree switch will happen at block %llu.", current_tree_network.get_target());
 
@@ -1506,26 +1499,37 @@ namespace hotstuff
         // open_client(get_system_tree_root(offset));
     }
 
-    //TODO: this is not being used
-    void HotStuffBase::change_epoch()
+    // TODO: this is not being used
+    void HotStuffBase::apply_new_epoch(Epoch &epoch)
     {
+        LOG_PROTO("\n=========================== Starting Epoch Change =================================");
 
-        LOG_PROTO("\n=========================== Strating Epoch Change =================================\n");
+        // Log the epoch's main properties
+        LOG_PROTO("Epoch number: %d, Number of trees: %zu", epoch.get_epoch_num(), epoch.get_trees().size());
 
         size_t offset = 0;
 
-        // Updates epoch
-        cur_epoch = on_hold_epoch;
-        on_hold_epoch = Epoch(cur_epoch.get_epoch_num() + 1);
+        epoch.create_tree_networks(global_replicas, get_id());
 
-        // Updates system trees
-        system_trees = cur_epoch.get_system_trees();
-        current_tree_network = system_trees[offset];
+        // Initialize the tree networks within this epoch
+        LOG_PROTO("NEW EPOCH: ");
+        // Print the updated epoch
+        LOG_PROTO("%s\n", std::string(epoch).c_str());
 
-        HOTSTUFF_LOG_PROTO("%s", std::string(cur_epoch).c_str());
-        HOTSTUFF_LOG_PROTO("%s", std::string(current_tree_network).c_str());
+        epochs.push_back(epoch);
 
-        LOG_PROTO("\n=========================== Finished Epoch Switch =================================\n");
+        // Verify that system trees are correctly set up after network creation
+        auto system_trees = epoch.get_system_trees();
+        LOG_PROTO("System trees count: %zu", system_trees.size());
+        for (const auto &pair : system_trees)
+        {
+            LOG_PROTO("%s", std::string(pair.second).c_str());
+        }
+
+        // Increment time for the epoch switch and log the switch
+        inc_time(EPOCH_SWITCH);
+
+        LOG_PROTO("\n=========================== Finished Epoch Switch =================================");
     }
 
     void HotStuffBase::close_client(ReplicaID rid)
@@ -1585,9 +1589,6 @@ namespace hotstuff
         {
             lastCheckedHeight = bheight;
         }
-
-        if (lastCheckedHeight == 150)
-            return EPOCH_SWITCH;
 
         if (lastCheckedHeight == current_tree_network.get_target())
             return TREE_SWITCH;
@@ -1872,7 +1873,15 @@ namespace hotstuff
             } else {
                 gettimeofday(&last_block_time, NULL);
                 auto cmds = std::move(final_buffer);
-                on_propose(cmds, std::move(parents));
+                if(has_next_epoch)
+                {
+                    on_propose(cmds, std::move(parents), std::move(next_epoch_serialized));
+                    has_next_epoch = false;
+                    next_epoch_serialized.clear();
+                }else
+                {
+                    on_propose(cmds, std::move(parents));
+                }
             }
         } });
     }

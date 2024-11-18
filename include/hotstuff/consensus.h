@@ -29,6 +29,7 @@
 
 namespace hotstuff
 {
+    class Epoch;
 
     struct Proposal;
     struct Vote;
@@ -39,7 +40,6 @@ namespace hotstuff
     enum ReconfigurationType
     {
         NO_SWITCH,   // No switch happened
-        
         TREE_SWITCH, // A tree switch happened
         EPOCH_SWITCH // An epoch switch happened
     };
@@ -145,8 +145,6 @@ namespace hotstuff
         /** Call to set how the trees will be generated */
         void set_tree_generation(std::string genAlgo, std::string fpath);
 
-        void set_new_epoch(std::string new_epoch);
-
         /**
          * A block is only delivered if itself is fetched, the block for the
          * contained qc is fetched and all parents are delivered. The user should
@@ -230,6 +228,11 @@ namespace hotstuff
          * Get the id of the current tree
          */
         virtual uint32_t get_tree_id() {};
+
+        /**
+         * Sets up the new epoch
+         */
+        virtual void apply_new_epoch(Epoch &epoch) = 0;
 
         /**
          * Get the current epoch number
@@ -617,7 +620,7 @@ namespace hotstuff
                 s >> elem;
         }
 
-        std::string get_tree_array_string()
+        std::string get_tree_array_string() const
         {
             DataStream s;
             s << "{ ";

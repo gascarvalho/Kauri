@@ -50,10 +50,12 @@ using hotstuff::bytearray_t;
 using hotstuff::command_t;
 using hotstuff::CommandDummy;
 using hotstuff::DataStream;
+using hotstuff::Epoch;
 using hotstuff::EventContext;
 using hotstuff::Finality;
 using hotstuff::get_hash;
 using hotstuff::HotStuffError;
+using hotstuff::MsgDeployEpoch;
 using hotstuff::MsgReqCmd;
 using hotstuff::MsgRespCmd;
 using hotstuff::NetAddr;
@@ -93,7 +95,7 @@ class HotStuffApp : public HotStuff
     salticidae::BoxObj<salticidae::ThreadCall> resp_tcall;
     salticidae::BoxObj<salticidae::ThreadCall> req_tcall;
 
-    void client_request_cmd_handler(MsgReqCmd &&, const conn_t &);
+    void client_request_cmd_handler(MsgDeployEpoch &&, const conn_t &);
 
     static command_t parse_cmd(DataStream &s)
     {
@@ -138,7 +140,6 @@ public:
     void set_piped_latency(int32_t piped_latency, int32_t async_blocks);
     void set_tree_period(size_t nblocks);
     void set_tree_generation(std::string genAlgo, std::string fpath);
-    void set_new_epoch(std::string new_epoch);
     void stop();
 };
 
@@ -191,8 +192,6 @@ int main(int argc, char **argv)
     auto opt_tree_generation = Config::OptValStr::create("default");
     auto opt_tree_generation_fpath = Config::OptValStr::create("treegen.conf");
 
-    auto opt_new_epoch = Config::OptValStr::create("newepoch.conf");
-
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
     config.add_opt("parent-limit", opt_parent_limit, Config::SET_VAL);
     config.add_opt("stat-period", opt_stat_period, Config::SET_VAL);
@@ -223,8 +222,6 @@ int main(int argc, char **argv)
     config.add_opt("tree-switch-period", opt_tree_switch_period, Config::SET_VAL, 'T', "Period (in blocks) for switching the system's tree");
     config.add_opt("tree-generation", opt_tree_generation, Config::SET_VAL, 'G', "Tree generation algorithm (default, file)");
     config.add_opt("tree-generation-fpath", opt_tree_generation_fpath, Config::SET_VAL, 'g', "File path for the tree generation when file is selected");
-
-    config.add_opt("new-epoch", opt_new_epoch, Config::SET_VAL, 'e', "File with new epoch configuration");
 
     EventContext ec;
     config.parse(argc, argv);
@@ -323,7 +320,6 @@ int main(int argc, char **argv)
     papp->set_piped_latency(opt_piped_latency->get(), opt_async_blocks->get());
     papp->set_tree_generation(opt_tree_generation->get(), opt_tree_generation_fpath->get());
     papp->set_tree_period(opt_tree_switch_period->get());
-    papp->set_new_epoch(opt_new_epoch->get());
 
     HOTSTUFF_LOG_INFO("*** thread info ***");
     HOTSTUFF_LOG_INFO("Verification workers = %lu", opt_nworker->get());
@@ -385,14 +381,43 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
     cn.listen(clisten_addr);
 }
 
-void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn)
+// Helper function to convert NetAddr to string
+std::string netaddr_to_string(const salticidae::NetAddr &addr)
 {
+    struct in_addr ip_addr;
+    ip_addr.s_addr = addr.ip; // Set the IP address
+    std::stringstream ss;
+
+    // Convert IP to string and append port
+    ss << inet_ntoa(ip_addr) << ":" << ntohs(addr.port); // Convert port from network byte order
+    return ss.str();
+}
+
+void HotStuffApp::client_request_cmd_handler(MsgDeployEpoch &&msg, const conn_t &conn)
+{
+
     const NetAddr addr = conn->get_addr();
-    auto cmd = parse_cmd(msg.serialized);
-    const auto &cmd_hash = cmd->get_hash();
-    HOTSTUFF_LOG_DEBUG("processing command %s", std::string(*cmd).c_str());
-    exec_command(cmd_hash, [this, addr](Finality fin)
-                 { resp_queue.enqueue(std::make_pair(fin, addr)); });
+
+    // Log information about the received request and the client's address
+    HOTSTUFF_LOG_INFO("Received request from client at address: %s", netaddr_to_string(addr).c_str());
+
+    Epoch epoch;
+    DataStream s(msg.serialized); // Use the serialized data from MsgDeployEpoch
+    epoch.unserialize(s);         // Deserialize to get the Epoch object
+
+    // Log information about the received epoch
+    HOTSTUFF_LOG_INFO("Received new Epoch with number: %u", epoch.get_epoch_num());
+
+    DataStream epoch_stream;
+    epoch.serialize(epoch_stream);
+    set_epoch_command(epoch_stream);
+
+    // const NetAddr addr = conn->get_addr();
+    // auto cmd = parse_cmd(msg.serialized);
+    // const auto &cmd_hash = cmd->get_hash();
+    // HOTSTUFF_LOG_DEBUG("processing command %s", std::string(*cmd).c_str());
+    // exec_command(cmd_hash, [this, addr](Finality fin)
+    //              { resp_queue.enqueue(std::make_pair(fin, addr)); });
 }
 
 void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps)
@@ -485,9 +510,4 @@ void HotStuffApp::set_tree_period(size_t nblocks)
 void HotStuffApp::set_tree_generation(std::string genAlgo, std::string fpath)
 {
     HotStuff::set_tree_generation(genAlgo, fpath);
-}
-
-void HotStuffApp::set_new_epoch(std::string new_epoch)
-{
-    HotStuff::set_new_epoch(new_epoch);
 }

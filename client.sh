@@ -80,9 +80,12 @@ fi
 
 sleep 25
 
+sleep 100
+
 # Start Client on Host Machine
 #if [ ${id} == 0 ]; then
-  gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 5000 > clientlog0 2>&1 &
+  #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 5000 > clientlog0 2>&1 &
+  ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 5000 > clientlog0 2>&1 &
 #fi
 
 # Start Client on all machines

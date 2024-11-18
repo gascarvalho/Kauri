@@ -267,6 +267,24 @@ namespace hotstuff
             for (size_t i = 0; i < blk->cmds.size(); i++)
                 do_decide(Finality(id, get_cur_epoch_nr(), get_tree_id(), 1, i, blk->height,
                                    blk->cmds[i], blk->get_hash()));
+
+            if (!blk->extra.empty())
+            {
+                try
+                {
+                    DataStream s(blk->extra);
+                    Epoch new_epoch;
+                    new_epoch.unserialize(s);
+
+                    HOTSTUFF_LOG_INFO("Replica %d detected epoch change in block %s: Epoch %u", get_id(), get_hex10(blk->get_hash()).c_str(), new_epoch.get_epoch_num());
+
+                    apply_new_epoch(new_epoch);
+                }
+                catch (const std::exception &e)
+                {
+                    HOTSTUFF_LOG_WARN("Failed to deserialize epoch data in block extra: %s", e.what());
+                }
+            }
         }
 
         b_exec = blk;
@@ -290,8 +308,10 @@ namespace hotstuff
         {
             LOG_PROTO("b_piped is null");
             bnew = storage->add_blk(
-                new Block(parents, cmds,
-                          hqc.second->clone(), std::move(extra),
+                new Block(parents,
+                          cmds,
+                          hqc.second->clone(),
+                          std::move(extra),
                           parents[0]->height + 1,
                           hqc.first,
                           nullptr));
@@ -308,8 +328,10 @@ namespace hotstuff
             }
 
             bnew = storage->add_blk(
-                new Block(newParents, cmds,
-                          hqc.second->clone(), std::move(extra),
+                new Block(newParents,
+                          cmds,
+                          hqc.second->clone(),
+                          std::move(extra),
                           newParents[0]->height + 1,
                           hqc.first,
                           nullptr));
@@ -337,11 +359,6 @@ namespace hotstuff
         if (switch_type == TREE_SWITCH)
         {
             LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current tree! (block height is now %llu)", b_normal_height);
-            inc_time(switch_type);
-        }
-        else if (switch_type == EPOCH_SWITCH)
-        {
-            LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current epoch! (block height is now %llu)", b_normal_height);
             inc_time(switch_type);
         }
         else if (b_normal_height > get_total_system_trees()) // TODO: WARMUP PARAMETER
@@ -389,6 +406,19 @@ namespace hotstuff
     void HotStuffCore::on_receive_proposal(const Proposal &prop)
     {
         LOG_PROTO("[CONSENSUS] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
+
+        // Log current epoch and tree IDs
+        LOG_PROTO("Current epoch_nr=%d, tid=%d", get_cur_epoch_nr(), get_tree_id());
+
+        // Check if the received epoch is known
+        if (prop.epoch_nr > get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for future epoch %d, but current epoch is %d", prop.epoch_nr, get_cur_epoch_nr());
+        }
+        else if (prop.epoch_nr < get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for past epoch %d, but current epoch is %d", prop.epoch_nr, get_cur_epoch_nr());
+        }
 
         block_t bnew = prop.blk;
         sanity_check_delivered(bnew);
@@ -479,6 +509,19 @@ namespace hotstuff
 
         // In current implementation, only the proposer's vote uses this function
         LOG_PROTO("[CONSENSUS] Applying own vote in epoch_nr=%d, tid=%d: %s %s", vote.epoch_nr, vote.tid, std::string(vote).c_str(), std::string(*blk).c_str());
+
+        // Log current epoch and tree IDs
+        LOG_PROTO("Current epoch_nr=%d, tid=%d", get_cur_epoch_nr(), get_tree_id());
+
+        // Check if the received epoch is known
+        if (vote.epoch_nr > get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for future epoch %d, but current epoch is %d", vote.epoch_nr, get_cur_epoch_nr());
+        }
+        else if (vote.epoch_nr < get_cur_epoch_nr())
+        {
+            LOG_PROTO("Received proposal for past epoch %d, but current epoch is %d", vote.epoch_nr, get_cur_epoch_nr());
+        }
 
         if (!blk->voted.insert(vote.voter).second)
         {
@@ -693,10 +736,4 @@ namespace hotstuff
         config.treegen_algo = genAlgo;
         config.treegen_fpath = fpath;
     }
-
-    void HotStuffCore::set_new_epoch(std::string new_epoch)
-    {
-        config.new_epoch = new_epoch;
-    }
-
 }
