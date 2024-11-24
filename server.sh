@@ -85,7 +85,21 @@ fi
 # Startup Kauri (no gdb)
 ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >> log${id} 2>&1 &
 
-sleep 40
+
+# Add the failure simulation for Replica 0
+if [ ${id} == 0 ]; then
+  sleep 60  # Adjust this delay as needed
+  
+  # Kill the `hotstuff-app` process
+  app_pid=$(pgrep -f hotstuff-app)  # Find the PID of the process
+  if [ ! -z "$app_pid" ]; then
+    echo "Killing hotstuff-app process with PID: $app_pid for Replica 0" >> log${id}
+    kill -9 $app_pid  # Terminate the process
+  else
+    echo "No hotstuff-app process found to kill for Replica 0" >> log${id}
+  fi
+fi
+
 
 #Configure Network restrictions
 #sudo tc qdisc add dev eth0 root netem delay ${latency}ms limit 400000 rate ${bandwidth}mbit &
@@ -101,7 +115,7 @@ sleep 40
 # Start Client on all machines
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 50 > clientlog${id} 2>&1 &
 
-sleep 280
+sleep 300
 
 killall hotstuff-client &
 killall hotstuff-app &

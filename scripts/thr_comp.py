@@ -1,7 +1,6 @@
-import sys
 import re
 import argparse
-import math
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
@@ -51,6 +50,10 @@ def plot_hist(fname, data, labels, window_size, blksize):
         
         plt.axhline(y=(total / total_time), color=color, linestyle='-', linewidth=1)
         plt.text(142, avg_tx_sec, 'Média=' + str(round(float(avg_tx_sec), 3)), color=color, ha='left', va='bottom', bbox=dict(facecolor='white', alpha=0.75), fontsize=10)
+    
+    # for time, block_height in epoch_changes:
+    #     plt.axvline(x=time, color='black', linestyle='--', linewidth=1)
+    #     plt.text(time, 1.8, f"Epoch {block_height}", rotation=90, fontsize=8, va='bottom')
 
     plt.xlim(left=0)
     plt.ylim(bottom=1.5)
@@ -73,6 +76,8 @@ def calculate_trailing_moving_average(values, window_size):
     return averages
 
 if __name__ == '__main__':
+    
+    #log_dir = "../runkauri/logs/replicas"
     parser = argparse.ArgumentParser()
     parser.add_argument('--window-size', type=float, default=1, required=False)
     parser.add_argument('--blksize', type=float, required=False)
@@ -83,19 +88,30 @@ if __name__ == '__main__':
     parser.add_argument('--warmup', type=float, default=0, required=False)
     parser.add_argument('--moving-average-window', type=int, default=1, required=False)
     args = parser.parse_args()
+    
+    #files = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if os.path.isfile(os.path.join(log_dir, f))]
+    
+    #files.sort()
+     
+    #labels = [f"Replica {i}" for i in range(7)]
+    
     commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver(.*)')
     reconfig_pat = re.compile('([^[].*) \[hotstuff proto\] \[PMAKER\] Timeout reached!!!')
+    #epoch_change_pat = re.compile(r'([^[].*) \[hotstuff proto\] \[PROPOSER\] Forcing a reconfiguration for changing current epoch! \(block height is now (\d+)\)')
     
     window_size = args.window_size
     blksize = args.blksize
     data = []
+    #epoch_changes = []
+    
 
     if blksize is None:
         blksize = 1
 
-    for file in args.files:
+    for file in args.files:        
         timestamps = []
         rcf_timestamps = []
+        
         values = []
         x = []
 
@@ -104,19 +120,27 @@ if __name__ == '__main__':
             for line in lines:
                 m = commit_pat.match(line)
                 rcf = reconfig_pat.match(line)
+                #epoch = epoch_change_pat.match(line)
                 if m:
                     timestamps.append(str2datetime(m.group(1)))
                 elif rcf:
                     rcf_timestamps.append(str2datetime(rcf.group(1)))
+                # elif epoch:
+                #     epoch_time = str2datetime(epoch.group(1))
+                #     block_height = int(epoch.group(2))
+                #     epoch_changes.append((epoch_time, block_height))
                 
         timestamps.sort()
         rcf_timestamps.sort()
+        # epoch_changes.sort()
 
         timestamps = [ts for ts in timestamps if ts > (timestamps[0] + timedelta(seconds=args.warmup))]
         rcf_timestamps = [ts for ts in rcf_timestamps if ts > timestamps[0]]
 
         start_time = timestamps[0]
         end_time = timestamps[-1]
+        
+        # epoch_changes = [((time - start_time).total_seconds(), block_height) for time, block_height in epoch_changes]
 
         begin_time = None
         cnt = 0
@@ -162,5 +186,6 @@ if __name__ == '__main__':
         values = calculate_trailing_moving_average(values, moving_average_window)
 
         data.append((x, values, reconfig_x, avg_tx_sec, total, total_time))
-
-    plot_hist(args.output, data, args.labels, window_size, blksize)
+    
+        #plot_hist(args.output, data, labels, window_size, blksize, epoch_changes)
+        plot_hist(args.output, data, args.labels, window_size, blksize)

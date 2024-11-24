@@ -234,8 +234,10 @@ namespace hotstuff
     void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn)
     {
         const PeerId &peer = conn->get_peer_id();
+
         if (peer.is_null())
             return;
+
         auto stream = msg.serialized;
         auto &prop = msg.proposal;
         msg.postponed_parse(this);
@@ -257,6 +259,10 @@ namespace hotstuff
         }
 
         LOG_PROTO("[PROP HANDLER] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
+
+        auto tree_position = msg_tree.get_level(get_id());
+
+        LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d", get_id(), tree_position);
 
         /** We can resume pending proposals assuming previous proposal triggered tree switch */
         while (!pending_proposals.empty())
@@ -501,6 +507,7 @@ namespace hotstuff
 
                 pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
             }
+
             async_deliver_blk(msg.vote.blk_hash, peer);
 
             return;
@@ -1506,7 +1513,7 @@ namespace hotstuff
         // open_client(get_system_tree_root(offset));
     }
 
-    //TODO: this is not being used
+    // TODO: this is not being used
     void HotStuffBase::change_epoch()
     {
 
@@ -1586,7 +1593,7 @@ namespace hotstuff
             lastCheckedHeight = bheight;
         }
 
-        if (lastCheckedHeight == 150)
+        if (lastCheckedHeight == 1500)
             return EPOCH_SWITCH;
 
         if (lastCheckedHeight == current_tree_network.get_target())

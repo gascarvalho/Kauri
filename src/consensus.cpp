@@ -378,9 +378,8 @@ namespace hotstuff
         }
 
         // Vote for own proposed block
-        on_receive_vote(
-            Vote(id, epoch_nr, tid, bnew_hash,
-                 create_part_cert(*priv_key, bnew_hash), this));
+        on_receive_vote(Vote(id, epoch_nr, tid, bnew_hash,create_part_cert(*priv_key, bnew_hash), this));
+        
         on_propose_(prop);
 
         return prop;

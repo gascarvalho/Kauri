@@ -56,6 +56,9 @@ namespace hotstuff
         DataStream info;                     // Debug info
         size_t switchTarget;                 // The block height at which to switch this tree
 
+    private:
+        std::vector<uint32_t> tree_array;                    // Member variable to store the tree array
+        std::unordered_map<ReplicaID, size_t> id_to_pos_map; // Map for ReplicaID to position
     public:
         TreeNetwork() = default;
         TreeNetwork(const Tree t,
@@ -65,19 +68,28 @@ namespace hotstuff
 
             info << "\tTree Data: " << std::string(t) << "\n";
 
-            auto tree_array = tree.get_tree_array();
+            tree_array = tree.get_tree_array();
+
+            for (size_t i = 0; i < tree_array.size(); ++i)
+            {
+                id_to_pos_map[tree_array[i]] = i;
+            }
+
             auto fanout = tree.get_fanout();
             auto size = tree_array.size();
 
             // Find my position in the tree
-            auto it = std::find(tree_array.begin(), tree_array.end(), myReplicaId);
-            auto my_idx = std::distance(tree_array.begin(), it);
-
-            // Parent Peer (if any)
-            if (my_idx != 0)
+            auto it = id_to_pos_map.find(myReplicaId);
+            if (it == id_to_pos_map.end())
             {
-                auto parent_idx = std::floor((my_idx - 1) / fanout);
-                auto parent_cert_hash = std::move(std::get<2>(replicas[tree_array[parent_idx]]));
+                throw std::invalid_argument("My ReplicaID not found in the tree array.");
+            }
+
+            myTreeId = it->second;
+            if (myTreeId != 0)
+            {
+                auto parent_idx = std::floor((myTreeId - 1) / fanout);
+                auto parent_cert_hash = std::get<2>(replicas[tree_array[parent_idx]]);
                 salticidae::PeerId parent_peer{parent_cert_hash};
                 parentPeer = parent_peer;
                 info << "\tMy parent: " << std::to_string(tree_array[parent_idx]) << "\n";
@@ -89,36 +101,84 @@ namespace hotstuff
             // Add every possible child, considering fanout
             for (auto i = 1; i <= fanout; i++)
             {
-                auto child_idx = fanout * my_idx + i;
+                auto child_idx = fanout * myTreeId + i;
 
                 // If within bounds of array, child exists
                 if (child_idx < size)
                 {
-                    auto child_cert_hash = std::move(std::get<2>(replicas[tree_array[child_idx]]));
+                    auto child_cert_hash = std::get<2>(replicas[tree_array[child_idx]]);
                     salticidae::PeerId child_peer{child_cert_hash};
                     childPeers.insert(child_peer);
                     tmp.append(std::to_string(tree_array[child_idx])).append(", ");
                 }
             }
 
-            if (childPeers.size() == 0)
+            if (childPeers.empty())
             {
                 info << "\tI have no children\n";
             }
             else
             {
-                tmp = tmp.substr(0, tmp.size() - 2);
+                tmp = tmp.substr(0, tmp.size() - 2); // Remove trailing ", "
                 info << tmp << "\n";
             }
 
             // Store remainder state
-
-            numberOfChildren = countChildren(my_idx, size);
+            numberOfChildren = countChildren(myTreeId, size);
             info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
 
-            myTreeId = my_idx;
             info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
             info << "\tMy ID in the tree: " << std::to_string(myTreeId) << "\n";
+
+            // auto it = std::find(tree_array.begin(), tree_array.end(), myReplicaId);
+            // auto my_idx = std::distance(tree_array.begin(), it);
+
+            // // Parent Peer (if any)
+            // if (my_idx != 0)
+            // {
+            //     auto parent_idx = std::floor((my_idx - 1) / fanout);
+            //     auto parent_cert_hash = std::move(std::get<2>(replicas[tree_array[parent_idx]]));
+            //     salticidae::PeerId parent_peer{parent_cert_hash};
+            //     parentPeer = parent_peer;
+            //     info << "\tMy parent: " << std::to_string(tree_array[parent_idx]) << "\n";
+            // }
+            // else
+            //     info << "\tI have no parent (am root)\n";
+
+            // std::string tmp = "\tMy children are: ";
+            // // Add every possible child, considering fanout
+            // for (auto i = 1; i <= fanout; i++)
+            // {
+            //     auto child_idx = fanout * my_idx + i;
+
+            //     // If within bounds of array, child exists
+            //     if (child_idx < size)
+            //     {
+            //         auto child_cert_hash = std::move(std::get<2>(replicas[tree_array[child_idx]]));
+            //         salticidae::PeerId child_peer{child_cert_hash};
+            //         childPeers.insert(child_peer);
+            //         tmp.append(std::to_string(tree_array[child_idx])).append(", ");
+            //     }
+            // }
+
+            // if (childPeers.size() == 0)
+            // {
+            //     info << "\tI have no children\n";
+            // }
+            // else
+            // {
+            //     tmp = tmp.substr(0, tmp.size() - 2);
+            //     info << tmp << "\n";
+            // }
+
+            // // Store remainder state
+
+            // numberOfChildren = countChildren(my_idx, size);
+            // info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
+
+            // myTreeId = my_idx;
+            // info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
+            // info << "\tMy ID in the tree: " << std::to_string(myTreeId) << "\n";
         }
 
         /**
@@ -137,6 +197,41 @@ namespace hotstuff
         const size_t &get_target() const { return switchTarget; }
 
         const void set_target(const size_t target) { switchTarget = target; };
+
+        size_t get_level(ReplicaID rid) const
+        {
+            auto it = id_to_pos_map.find(rid);
+            if (it == id_to_pos_map.end())
+            {
+                throw std::invalid_argument("Replica ID not found in the tree network.");
+            }
+            size_t index = it->second;
+            size_t level = 0;
+            size_t nodes_in_level = 1;
+            size_t nodes_up_to_prev_level = 0;
+            size_t fanout = tree.get_fanout();
+
+            while (true)
+            {
+                if (index < nodes_up_to_prev_level + nodes_in_level)
+                    return level;
+                nodes_up_to_prev_level += nodes_in_level;
+                level++;
+                // Prevent overflow or excessive levels
+                // If fanout is 0, it's a single-node tree
+                if (fanout == 0)
+                    break;
+                nodes_in_level *= fanout;
+                // If nodes_in_level exceeds tree size, cap it
+                if (nodes_in_level > tree_array.size())
+                    nodes_in_level = tree_array.size() - nodes_up_to_prev_level;
+                // If we've covered all nodes, exit
+                if (nodes_up_to_prev_level >= tree_array.size())
+                    break;
+            }
+
+            throw std::logic_error("Failed to determine level.");
+        }
 
         operator std::string()
         {
