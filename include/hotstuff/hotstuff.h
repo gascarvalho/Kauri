@@ -516,6 +516,8 @@ namespace hotstuff
         // TODO: deprecated
         std::unordered_map<size_t, TreeNetwork> system_trees;
 
+        bool is_leaf;
+
         std::vector<Epoch> epochs;
         mutable TreeNetwork current_tree_network;
         mutable Tree current_tree;
@@ -585,6 +587,16 @@ namespace hotstuff
         void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
         // Updates vars related to epoch and trees
         void change_epoch();
+
+        // Timer-related members
+        mutable std::mutex timers_mutex;                                                        ///< Mutex to protect access to proposal_timers
+        std::unordered_map<uint256_t, std::shared_ptr<salticidae::TimerEvent>> proposal_timers; ///< Maps block hash to TimerEvent
+
+        // Helper functions
+        void start_proposal_timer(size_t tid, size_t epoch_nr, uint256_t blk_hash, double timeout_duration, size_t tree_level);
+        void stop_proposal_timer(const uint256_t &blk_hash);
+        void on_timer_expired(size_t tid, size_t epoch_nr, uint256_t blk_hash, uint32_t tree_level);
+        RcObj<VoteRelay> create_partial_vote_relay(size_t tid, size_t epoch_nr, const uint256_t &blk_hash);
         //------------------------------
         void close_client(ReplicaID rid);
         void open_client(ReplicaID rid);

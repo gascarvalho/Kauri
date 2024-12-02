@@ -260,9 +260,14 @@ namespace hotstuff
 
         LOG_PROTO("[PROP HANDLER] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
 
-        auto tree_position = msg_tree.get_level(get_id());
+        // auto level = msg_tree.get_level(get_id());
 
-        LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d", get_id(), tree_position);
+        // LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d", get_id(), level);
+
+        // if (!is_leaf)
+        //     start_proposal_timer(prop.tid, prop.epoch_nr, prop.blk->hash, 1, level);
+        // else
+        //     HOTSTUFF_LOG_PROTO("I'm (replica %d) leaf on this tree thus I'm not starting a timer for block %s", get_id(), std::string(*prop.blk).c_str());
 
         /** We can resume pending proposals assuming previous proposal triggered tree switch */
         while (!pending_proposals.empty())
@@ -466,6 +471,8 @@ namespace hotstuff
             HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got all children votes (%d) + my own! Total: %d", numberOfChildren, cert->get_sigs_n());
             std::cout << " got enough votes: " << msg.vote.blk_hash.to_hex().c_str() << std::endl;
 
+            //stop_proposal_timer(msg.vote.blk_hash);
+
             if (!piped_queue.empty())
             {
 
@@ -609,6 +616,7 @@ namespace hotstuff
         block_t blk = get_potentially_not_delivered_blk(msg.vote.blk_hash);
         // AFTER HERE, BLOCK MUST BE DELIVERED ALREADY!!
 
+        // NÃO FAZ SENTIDO SE NÃO NUNCA HAVERIA UM VOTE-RELAY??
         if (blk->self_qc == nullptr)
         {
             blk->self_qc = create_quorum_cert(blk->get_hash());
@@ -621,6 +629,7 @@ namespace hotstuff
         if (blk->self_qc->has_n(config.nmajority))
         {
             std::cout << "bye vote relay handler: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
+
             if (id == tree_proposer && blk->hash == piped_queue.front())
             {
                 piped_queue.pop_front();
@@ -644,6 +653,9 @@ namespace hotstuff
 
                             update_hqc(blk, blk->self_qc);
                             on_qc_finish(blk);
+
+                            // if (!is_leaf)
+                            //     stop_proposal_timer(blk->hash);
                         }
                         else
                         {
@@ -678,6 +690,10 @@ namespace hotstuff
                                 on_qc_finish(rdy_blk);
                                 foundChildren = true;
                                 curr_blk = rdy_blk;
+
+                                // if (!is_leaf)
+                                //     stop_proposal_timer(rdy_blk->hash);
+
                                 break;
                             }
                         }
@@ -706,8 +722,8 @@ namespace hotstuff
                   {
         struct timeval timeEnd;
 
-        if (!promise::any_cast<bool>(values[1]))
-            LOG_WARN ("invalid vote-relay");
+        if (!promise::any_cast<bool>(values[1]))LOG_WARN ("invalid vote-relay");
+        
         auto &cert = blk->self_qc;
 
         if (cert != nullptr && cert->get_obj_hash() == blk->get_hash() && !cert->has_n(config.nmajority)) {
@@ -718,22 +734,33 @@ namespace hotstuff
                 return;
             }
 
+            HOTSTUFF_LOG_PROTO("[HANDLER] Merging QuorumCert from VoteRelay. Current sigs: %d", blk->self_qc->get_sigs_n());
             cert->merge_quorum(*v->cert);
+            HOTSTUFF_LOG_PROTO("[HANDLER] Merged QC. New sigs: %d", blk->self_qc->get_sigs_n());
 
             if (id != tree_proposer) {
+                
                 if (!cert->has_n(numberOfChildren + 1)) return;
+                
                 cert->compute();
+                
                 if (!cert->verify(config)) {
                     throw std::runtime_error("Invalid Sigs in intermediate signature!");
                 }
+
+                //Received all child votes
+                // if(!is_leaf)
+                //     stop_proposal_timer(v->blk_hash);
+                
                 std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
+                
                 if(!parentPeer.is_null()) {
 
                     HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Sending VOTE-RELAY in epoch_nr=%d, tid=%d to ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
 
                     pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, v->blk_hash, cert.get()->clone(), this)), parentPeer);
                 }
-
+                
                 return;
             }
 
@@ -755,10 +782,14 @@ namespace hotstuff
             HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Majority in cert reached! Current: %llu | Necessary: %llu", cert->get_sigs_n(), config.nmajority);
 
             cert->compute();
+
             if (!cert->verify(config)) {
                 HOTSTUFF_LOG_PROTO("Error, Invalid Sig!!!");
                 return;
             }
+
+            //not sure if it's here
+            //stop_proposal_timer(v->blk_hash);
 
             if (!piped_queue.empty()) {
                 if (blk->hash == piped_queue.front()) {
@@ -1480,6 +1511,8 @@ namespace hotstuff
 
         /* Set when the tree will change */
 
+        is_leaf = current_tree_network.get_childPeers().empty();
+
         // if(startup) { //TODO: WARMUP PARAMETER
         //     current_tree_network.set_target(300);
 
@@ -1511,6 +1544,135 @@ namespace hotstuff
 
         /* Proposer opens client for himself */
         // open_client(get_system_tree_root(offset));
+    }
+
+    void HotStuffBase::start_proposal_timer(size_t tid, size_t epoch_nr, uint256_t blk_hash, double timeout_duration, size_t tree_level)
+    {
+        HOTSTUFF_LOG_PROTO("I'm (replica %d) starting a proposal timer for block %s at level %d with duration %.2f", get_id(), blk_hash.to_hex().c_str(), tree_level, timeout_duration);
+
+        auto callback_with_params = [this, tid, epoch_nr, blk_hash, tree_level](salticidae::TimerEvent &te)
+        {
+            this->on_timer_expired(tid, epoch_nr, blk_hash, tree_level);
+        };
+
+        // Create a new ProposalTimer
+        auto timer = std::make_shared<salticidae::TimerEvent>(ec, callback_with_params);
+
+        // Start the timer by adding the duration
+        timer->add(timeout_duration);
+
+        // Store the timer in the map
+        {
+            std::lock_guard<std::mutex> lock(timers_mutex);
+            proposal_timers.emplace(blk_hash, timer);
+        }
+
+        HOTSTUFF_LOG_PROTO("Timeout started");
+    }
+
+    void HotStuffBase::stop_proposal_timer(const uint256_t &blk_hash)
+    {
+        std::shared_ptr<salticidae::TimerEvent> timer;
+
+        // Retrieve and remove the timer from the map
+        {
+            std::lock_guard<std::mutex> lock(timers_mutex);
+            auto it = proposal_timers.find(blk_hash);
+            if (it != proposal_timers.end())
+            {
+                timer = it->second;
+                proposal_timers.erase(it);
+            }
+        }
+
+        // If the timer exists, stop it
+        if (timer)
+        {
+            timer->del(); // Stop the timer
+            std::cout << "[INFO] Timer stopped for block " << blk_hash.to_hex() << std::endl;
+        }
+    }
+
+    void HotStuffBase::on_timer_expired(size_t tid, size_t epoch_nr, uint256_t blk_hash, uint32_t tree_level)
+    {
+        HOTSTUFF_LOG_INFO("[TIMER] Timer expired for block %.10s at level %d", blk_hash.to_hex().c_str(), tree_level);
+
+        // Create a partial vote relay with the current signatures
+        RcObj<VoteRelay> partial_vote_relay = create_partial_vote_relay(tid, epoch_nr, blk_hash);
+        if (!partial_vote_relay)
+        {
+            LOG_WARN("Failed to create partial vote relay for block %.10s", blk_hash.to_hex().c_str());
+            return;
+        }
+
+        // Retrieve the tree information for this block
+        auto blk = storage->find_blk(blk_hash);
+        if (!blk)
+        {
+            LOG_WARN("Block not found during timer expiration: %.10s", blk_hash.to_hex().c_str());
+            return;
+        }
+
+        auto system_trees = epochs[epoch_nr].get_system_trees();
+        auto msg_tree = system_trees[tid];
+        auto parentPeer = msg_tree.get_parentPeer();
+
+        if (parentPeer.is_null())
+        {
+            LOG_WARN("Parent peer is null for block %.10s", blk_hash.to_hex().c_str());
+            return;
+        }
+
+        // Log the propagation of the partial vote relay
+        HOTSTUFF_LOG_PROTO("[TIMER EXPIRY] Propagating partial VOTE-RELAY for block %.10s to parent ReplicaId %d", blk_hash.to_hex().c_str(), peer_id_map.at(parentPeer));
+
+        // Send the partial vote relay upwards
+        pn.send_msg(MsgRelay(*partial_vote_relay), parentPeer);
+
+        // Clean up the timer
+        {
+            std::lock_guard<std::mutex> lock(timers_mutex);
+            auto it = proposal_timers.find(blk_hash);
+            if (it != proposal_timers.end())
+            {
+                it->second->del();         // Stop the timer
+                proposal_timers.erase(it); // Remove from the map
+            }
+        }
+    }
+
+    RcObj<VoteRelay> HotStuffBase::create_partial_vote_relay(size_t tid, size_t epoch_nr, const uint256_t &blk_hash)
+    {
+        block_t blk = storage->find_blk(blk_hash);
+
+        if (!blk)
+        {
+            HOTSTUFF_LOG_INFO("Block not found for hash: %s", blk_hash.to_hex().c_str());
+            return nullptr;
+        }
+
+        if (!blk->self_qc)
+        {
+            HOTSTUFF_LOG_INFO("Quorum Cert not found for block: %s", blk_hash.to_hex().c_str());
+            return nullptr;
+        }
+
+        blk->self_qc->compute();
+        if (!blk->self_qc->verify(config))
+        {
+            HOTSTUFF_LOG_PROTO("Error, Invalid Sig on creating_vote_relay!!!");
+            return nullptr;
+        }
+
+        // Create a new VoteRelay with the partial QC
+        RcObj<VoteRelay> partial_vote_relay(new VoteRelay(
+            epoch_nr,
+            tid,
+            blk->hash,
+            std::move(blk->self_qc),
+            this));
+
+        return partial_vote_relay;
     }
 
     // TODO: this is not being used
@@ -1593,8 +1755,8 @@ namespace hotstuff
             lastCheckedHeight = bheight;
         }
 
-        if (lastCheckedHeight == 1500)
-            return EPOCH_SWITCH;
+        // if (lastCheckedHeight == 250)
+        //     return EPOCH_SWITCH;
 
         if (lastCheckedHeight == current_tree_network.get_target())
             return TREE_SWITCH;
@@ -1838,6 +2000,10 @@ namespace hotstuff
 
                     Proposal prop(id, get_cur_epoch_nr() ,get_tree_id(), piped_block, nullptr);
                     HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
+
+                    // //Start a timer for a piped block
+                    // start_proposal_timer(get_tree_id(), get_cur_epoch_nr(),piped_block->hash, 2, 0);
+
                     /* broadcast to other replicas */
                     gettimeofday(&last_block_time, NULL);
                     on_deliver_blk(piped_block);
@@ -1969,5 +2135,4 @@ namespace hotstuff
     //         return on_propose(cmds, std::move(parents));
     //     }
     // }
-
 }

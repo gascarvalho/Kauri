@@ -27,7 +27,7 @@ def str2datetime(s):
     dt = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S")
     return dt.replace(microsecond=int(parts[1]))
 
-def plot_hist(fname, data, labels, window_size, blksize):
+def plot_hist(fname, data, labels, window_size, blksize, epoch_changes):
     plt.rcParams["figure.figsize"] = (10, 6)
     plt.xlabel(r"tempo (s)")
     
@@ -42,6 +42,16 @@ def plot_hist(fname, data, labels, window_size, blksize):
         color = colors[i]
         label = labels[i] if labels else f'Plot {i+1}'
         
+        # print("len x:")
+        # print(len(x))
+        # print(x[0])
+        # print(x[-1])
+        
+        # print("len y:")
+        # print(len(y))
+        # print(y[0])
+        # print(y[-1])
+        
         plt.plot(x, y, marker='o', markersize=3.5, label=label, color=color)
         
         interp_func = interp1d(x, y, kind='linear', fill_value='extrapolate')
@@ -51,9 +61,9 @@ def plot_hist(fname, data, labels, window_size, blksize):
         plt.axhline(y=(total / total_time), color=color, linestyle='-', linewidth=1)
         plt.text(142, avg_tx_sec, 'Média=' + str(round(float(avg_tx_sec), 3)), color=color, ha='left', va='bottom', bbox=dict(facecolor='white', alpha=0.75), fontsize=10)
     
-    # for time, block_height in epoch_changes:
-    #     plt.axvline(x=time, color='black', linestyle='--', linewidth=1)
-    #     plt.text(time, 1.8, f"Epoch {block_height}", rotation=90, fontsize=8, va='bottom')
+    for time, block_height in epoch_changes:
+        plt.axvline(x=time, color='black', linestyle='--', linewidth=1)
+        plt.text(time, 1.8, f"Epoch {block_height}", rotation=90, fontsize=8, va='bottom')
 
     plt.xlim(left=0)
     plt.ylim(bottom=1.5)
@@ -97,12 +107,12 @@ if __name__ == '__main__':
     
     commit_pat = re.compile('([^[].*) \[hotstuff proto\] Core deliver(.*)')
     reconfig_pat = re.compile('([^[].*) \[hotstuff proto\] \[PMAKER\] Timeout reached!!!')
-    #epoch_change_pat = re.compile(r'([^[].*) \[hotstuff proto\] \[PROPOSER\] Forcing a reconfiguration for changing current epoch! \(block height is now (\d+)\)')
+    epoch_change_pat = re.compile(r'([^[].*) \[hotstuff proto\] \[PROPOSER\] Forcing a reconfiguration for changing current epoch! \(block height is now (\d+)\)')
     
     window_size = args.window_size
     blksize = args.blksize
     data = []
-    #epoch_changes = []
+    epoch_changes = []
     
 
     if blksize is None:
@@ -120,19 +130,19 @@ if __name__ == '__main__':
             for line in lines:
                 m = commit_pat.match(line)
                 rcf = reconfig_pat.match(line)
-                #epoch = epoch_change_pat.match(line)
+                epoch = epoch_change_pat.match(line)
                 if m:
                     timestamps.append(str2datetime(m.group(1)))
                 elif rcf:
                     rcf_timestamps.append(str2datetime(rcf.group(1)))
-                # elif epoch:
-                #     epoch_time = str2datetime(epoch.group(1))
-                #     block_height = int(epoch.group(2))
-                #     epoch_changes.append((epoch_time, block_height))
+                elif epoch:
+                     epoch_time = str2datetime(epoch.group(1))
+                     block_height = int(epoch.group(2))
+                     epoch_changes.append((epoch_time, block_height))
                 
         timestamps.sort()
         rcf_timestamps.sort()
-        # epoch_changes.sort()
+        epoch_changes.sort()
 
         timestamps = [ts for ts in timestamps if ts > (timestamps[0] + timedelta(seconds=args.warmup))]
         rcf_timestamps = [ts for ts in rcf_timestamps if ts > timestamps[0]]
@@ -140,7 +150,7 @@ if __name__ == '__main__':
         start_time = timestamps[0]
         end_time = timestamps[-1]
         
-        # epoch_changes = [((time - start_time).total_seconds(), block_height) for time, block_height in epoch_changes]
+        epoch_changes = [((time - start_time).total_seconds(), block_height) for time, block_height in epoch_changes]
 
         begin_time = None
         cnt = 0
@@ -148,6 +158,11 @@ if __name__ == '__main__':
         cutoff_time = None
         values = []
         x = []
+        
+        print(timestamps[0])
+        print(timestamps[-1])
+        
+        print(len(timestamps))
 
         for timestamp in timestamps:
             if begin_time is None:
@@ -172,6 +187,7 @@ if __name__ == '__main__':
             end_time = cutoff_time
 
         total_time = (end_time - start_time).total_seconds()
+        print(total_time)
         avg_tx_sec = total / total_time
 
         reconfig_x = []
@@ -187,5 +203,5 @@ if __name__ == '__main__':
 
         data.append((x, values, reconfig_x, avg_tx_sec, total, total_time))
     
-        #plot_hist(args.output, data, labels, window_size, blksize, epoch_changes)
-        plot_hist(args.output, data, args.labels, window_size, blksize)
+        plot_hist(args.output, data, args.labels, window_size, blksize, epoch_changes)
+        #plot_hist(args.output, data, args.labels, window_size, blksize)

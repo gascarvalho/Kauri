@@ -38,8 +38,8 @@ namespace hotstuff
 
     enum ReconfigurationType
     {
-        NO_SWITCH,   // No switch happened
-        
+        NO_SWITCH, // No switch happened
+
         TREE_SWITCH, // A tree switch happened
         EPOCH_SWITCH // An epoch switch happened
     };
@@ -235,6 +235,8 @@ namespace hotstuff
          * Get the current epoch number
          */
         virtual uint32_t get_cur_epoch_nr() {};
+
+        virtual void start_proposal_timer(size_t tid, size_t epoch_nr, uint256_t blk_hash, double timeout_duration, size_t tree_level) = 0;
 
         /* The user plugs in the detailed instances for those
          * polymorphic data types. */

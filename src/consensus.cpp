@@ -320,6 +320,10 @@ namespace hotstuff
         LOG_PROTO("propose %s", std::string(*bnew).c_str());
         on_deliver_blk(bnew);
         Proposal prop = process_block(bnew, true, get_tree_id(), get_cur_epoch_nr());
+
+        // // Start a timer for a piped block
+        // start_proposal_timer(get_tree_id(), get_cur_epoch_nr(), bnew->hash, 2, 0);
+
         /* broadcast to other replicas */
         do_broadcast_proposal(prop);
 
@@ -378,8 +382,8 @@ namespace hotstuff
         }
 
         // Vote for own proposed block
-        on_receive_vote(Vote(id, epoch_nr, tid, bnew_hash,create_part_cert(*priv_key, bnew_hash), this));
-        
+        on_receive_vote(Vote(id, epoch_nr, tid, bnew_hash, create_part_cert(*priv_key, bnew_hash), this));
+
         on_propose_(prop);
 
         return prop;
