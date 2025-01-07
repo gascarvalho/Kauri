@@ -471,7 +471,7 @@ namespace hotstuff
             HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got all children votes (%d) + my own! Total: %d", numberOfChildren, cert->get_sigs_n());
             std::cout << " got enough votes: " << msg.vote.blk_hash.to_hex().c_str() << std::endl;
 
-            //stop_proposal_timer(msg.vote.blk_hash);
+            // stop_proposal_timer(msg.vote.blk_hash);
 
             if (!piped_queue.empty())
             {
@@ -1152,7 +1152,9 @@ namespace hotstuff
                                                                part_gened(0),
                                                                part_delivery_time(0),
                                                                part_delivery_time_min(double_inf),
-                                                               part_delivery_time_max(0)
+                                                               part_delivery_time_max(0),
+                                                               reconfig_count(0),
+                                                               warmup_finished(false)
     {
         /* register the handlers for msg from replicas */
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::propose_handler, this, _1, _2));
@@ -1525,14 +1527,35 @@ namespace hotstuff
         // else
         //     current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
 
-        if (warmup_counter < get_total_system_trees())
+        // if (warmup_counter < get_total_system_trees())
+        // {
+        //     // Do 1 block for each tree in schedule to warmup
+        //     current_tree_network.set_target(lastCheckedHeight + 1);
+        //     warmup_counter++;
+        // }
+        // else
+        //     current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
+
+        if (!warmup_finished)
         {
-            // Do 1 block for each tree in schedule to warmup
-            current_tree_network.set_target(lastCheckedHeight + 1);
-            warmup_counter++;
+            if (warmup_counter < get_total_system_trees())
+            {
+                current_tree_network.set_target(reconfig_count + 1);
+                warmup_counter++;
+            }
+            else
+            {
+                // Warmup just ended
+                reconfig_count = 0;
+                warmup_finished = true;
+                current_tree_network.set_target((reconfig_count + 1) * config.tree_switch_period);
+            }
         }
         else
-            current_tree_network.set_target(lastCheckedHeight + config.tree_switch_period);
+        {
+            // Normal logic
+            current_tree_network.set_target((reconfig_count + 1) * config.tree_switch_period);
+        }
 
         /*See if the epochs are being initialized correctly */
         HOTSTUFF_LOG_PROTO("%s", std::string(epochs[current_epoch_nr]).c_str());

@@ -87,18 +87,18 @@ fi
 
 
 # # Add the failure simulation for Replica 0
-# if [ ${id} == 0 ]; then
-#   sleep 30  # Adjust this delay as needed
+if [ ${id} == 0 ]; then
+  sleep 30  # Adjust this delay as needed
   
-#   # Kill the `hotstuff-app` process
-#   app_pid=$(pgrep -f hotstuff-app)  # Find the PID of the process
-#   if [ ! -z "$app_pid" ]; then
-#     echo "Killing hotstuff-app process with PID: $app_pid for Replica 0" >> log${id}
-#     kill -9 $app_pid  # Terminate the process
-#   else
-#     echo "No hotstuff-app process found to kill for Replica 0" >> log${id}
-#   fi
-# fi
+  # Kill the `hotstuff-app` process
+  app_pid=$(pgrep -f hotstuff-app)  # Find the PID of the process
+  if [ ! -z "$app_pid" ]; then
+    echo "Killing hotstuff-app process with PID: $app_pid for Replica 0" >> log${id}
+    kill -9 $app_pid  # Terminate the process
+  else
+    echo "No hotstuff-app process found to kill for Replica 0" >> log${id}
+  fi
+fi
 
 
 #Configure Network restrictions
@@ -115,7 +115,7 @@ fi
 # Start Client on all machines
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 50 > clientlog${id} 2>&1 &
 
-sleep 300
+sleep 240
 
 killall hotstuff-client &
 killall hotstuff-app &

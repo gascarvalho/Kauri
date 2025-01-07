@@ -530,6 +530,9 @@ namespace hotstuff
         mutable Epoch cur_epoch;
         mutable Epoch on_hold_epoch;
 
+        size_t reconfig_count;
+        bool warmup_finished;
+
         /* communication */
 
         void on_fetch_cmd(const command_t &cmd);
@@ -605,6 +608,7 @@ namespace hotstuff
         void print_pipe_queues(bool printPiped, bool printRdy);
         block_t repropose_beat(const std::vector<uint256_t> &cmds);
 
+        void increment_reconfig_count() { reconfig_count++; }
         size_t size() const { return peers.size(); }
         uint32_t get_blk_size() { return blk_size; };
         const auto &get_decision_waiting() const { return decision_waiting; }

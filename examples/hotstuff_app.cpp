@@ -188,7 +188,7 @@ int main(int argc, char **argv)
     auto opt_async_blocks = Config::OptValInt::create(0);      // 0 by default
 
     auto opt_tree_switch_period = Config::OptValDouble::create(100); // Period of each tree
-    auto opt_tree_generation = Config::OptValStr::create("default");
+    auto opt_tree_generation = Config::OptValStr::create("file");
     auto opt_tree_generation_fpath = Config::OptValStr::create("treegen.conf");
 
     auto opt_new_epoch = Config::OptValStr::create("newepoch.conf");

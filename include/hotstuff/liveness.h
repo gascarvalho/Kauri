@@ -216,9 +216,8 @@ namespace hotstuff
                     HOTSTUFF_LOG_PROTO("schedule_next: popping beat as normal block");
                     auto pm = pending_beats.front();
                     pending_beats.pop();
-                    hsc->async_qc_finish(last_proposed)
-                        .then([this, pm]()
-                              { pm.resolve(get_proposer()); });
+                    hsc->async_qc_finish(last_proposed).then([this, pm]()
+                                                             { pm.resolve(get_proposer()); });
                     locked = true;
                 }
             }
@@ -430,14 +429,21 @@ namespace hotstuff
 
         void inc_time(ReconfigurationType reconfig_type) override
         {
+
+            auto *hsb = dynamic_cast<HotStuffBase *>(hsc);
+
             switch (reconfig_type)
             {
             case TREE_SWITCH:
+
+                hsb->increment_reconfig_count();
                 set_proposer(false, false);
                 break;
 
             case EPOCH_SWITCH:
                 set_new_epoch();
+
+                hsb->increment_reconfig_count();
 
                 set_proposer(false, true);
                 break;
