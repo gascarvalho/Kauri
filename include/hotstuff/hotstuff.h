@@ -233,6 +233,11 @@ namespace hotstuff
             throw std::logic_error("Failed to determine level.");
         }
 
+        bool is_leaf() const
+        {
+            return childPeers.empty();
+        }
+
         operator std::string()
         {
 
@@ -515,6 +520,7 @@ namespace hotstuff
         // std::unordered_map<size_t, Tree> system_trees;
         // TODO: deprecated
         std::unordered_map<size_t, TreeNetwork> system_trees;
+        std::unordered_set<uint256_t> pass_trought_blks;
 
         bool is_leaf;
 

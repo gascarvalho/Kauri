@@ -86,6 +86,8 @@ namespace hotstuff
 
         void update_hqc(const block_t &_hqc, const quorum_cert_bt &qc);
 
+        bool is_ancestor(const block_t &maybe_ancestor, const block_t &descendant);
+
         void on_qc_finish(const block_t &blk);
 
         /* === auxilliary variables === */

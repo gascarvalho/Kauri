@@ -139,6 +139,20 @@ namespace hotstuff
         return true;
     }
 
+    bool HotStuffCore::is_ancestor(const block_t &maybe_ancestor, const block_t &descendant)
+    {
+        // quick approach, walk up parents of descendant until we match or reach genesis
+        for (block_t b = descendant; b->height >= maybe_ancestor->height;)
+        {
+            if (b == maybe_ancestor)
+                return true;
+            if (b->parents.empty())
+                break;         // reached genesis
+            b = b->parents[0]; // e.g., single-parent chain
+        }
+        return false;
+    }
+
     void HotStuffCore::update_hqc(const block_t &_hqc, const quorum_cert_bt &qc)
     {
         if (_hqc->height > hqc.first->height)
@@ -586,7 +600,15 @@ namespace hotstuff
         // else
         //     HOTSTUFF_LOG_PROTO("blk->voted size < nmajority");
 
-        if ((blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority) && !blk->voted.empty()) || blk->voted.size() >= config.nmajority)
+        // If this block is already decided (committed), we can immediately resolve.
+        if (blk->decision)
+        {
+            HOTSTUFF_LOG_PROTO("async_qc_finish: block %.10s is already decided, resolving now", blk->get_hash().to_hex().c_str());
+            return promise_t([](promise_t &pm)
+                             { pm.resolve(); });
+        }
+
+        if ((blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority) && !blk->voted.empty() && blk->self_qc->verify(config)) || blk->voted.size() >= config.nmajority)
         {
             HOTSTUFF_LOG_PROTO("async_qc_finish %.10s", blk->get_hash().to_hex().c_str());
 
@@ -657,9 +679,30 @@ namespace hotstuff
 
     void HotStuffCore::on_hqc_update()
     {
-        auto t = std::move(hqc_update_waiting);
+        // auto t = std::move(hqc_update_waiting);
+        // hqc_update_waiting = promise_t();
+        // t.resolve();
+
+        // standard code to handle the new HQC...
+        auto old = std::move(hqc_update_waiting);
         hqc_update_waiting = promise_t();
-        t.resolve();
+        old.resolve();
+
+        // Now check overshadowed blocks
+        for (auto it = qc_waiting.begin(); it != qc_waiting.end();)
+        {
+            block_t blk = it->first;
+            if (blk->height < hqc.first->height && !is_ancestor(blk, hqc.first))
+            {
+                HOTSTUFF_LOG_PROTO("Rejecting overshadowed block %.10s from qc_waiting",blk->hash.to_hex().c_str());
+                it->second.reject();
+                it = qc_waiting.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
     }
 
     HotStuffCore::operator std::string() const

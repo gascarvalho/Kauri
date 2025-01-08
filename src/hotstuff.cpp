@@ -260,14 +260,14 @@ namespace hotstuff
 
         LOG_PROTO("[PROP HANDLER] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
 
-        // auto level = msg_tree.get_level(get_id());
+        auto level = msg_tree.get_level(get_id());
 
-        // LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d", get_id(), level);
+        LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d", get_id(), level);
 
-        // if (!is_leaf)
-        //     start_proposal_timer(prop.tid, prop.epoch_nr, prop.blk->hash, 1, level);
-        // else
-        //     HOTSTUFF_LOG_PROTO("I'm (replica %d) leaf on this tree thus I'm not starting a timer for block %s", get_id(), std::string(*prop.blk).c_str());
+        if (!is_leaf)
+            start_proposal_timer(prop.tid, prop.epoch_nr, prop.blk->hash, 0.1, level);
+        else
+            HOTSTUFF_LOG_PROTO("I'm (replica %d) leaf on this tree thus I'm not starting a timer for block %s", get_id(), std::string(*prop.blk).c_str());
 
         /** We can resume pending proposals assuming previous proposal triggered tree switch */
         while (!pending_proposals.empty())
@@ -394,27 +394,28 @@ namespace hotstuff
         const auto &peer = conn->get_peer_id();
         if (peer.is_null())
             return;
-        msg.postponed_parse(this);
-        // HOTSTUFF_LOG_PROTO("received vote");
 
-        /** Treat vote in relation to its tree */
+        msg.postponed_parse(this);
+
+        /** Identify which tree this vote belongs to **/
         auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
+        auto blk_hash = msg.vote.blk_hash;
 
+        /** Retrieve tree & parent info **/
         auto system_trees = epochs[msg_epoch_nr].get_system_trees();
-
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
         auto numberOfChildren = msg_tree.get_numberOfChildren();
         auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
-        HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received VOTE message in epoch_nr=%d, tid=%d from ReplicaId %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer));
+        HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received VOTE message in epoch_nr=%d, tid=%d from ReplicaId %d for block %.10s", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), blk_hash.to_hex().c_str());
 
-        if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end())
+        if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), blk_hash) != piped_queue.end())
         {
             HOTSTUFF_LOG_PROTO("piped block");
-            block_t blk = storage->find_blk(msg.vote.blk_hash);
+            block_t blk = storage->find_blk(blk_hash);
             if (!blk->piped_delivered)
             {
                 process_block(blk, false, msg_tree_id, msg_epoch_nr);
@@ -423,8 +424,34 @@ namespace hotstuff
             }
         }
 
-        block_t blk = get_potentially_not_delivered_blk(msg.vote.blk_hash);
+        block_t blk = get_potentially_not_delivered_blk(blk_hash);
         // AFTER HERE, BLOCK MUST BE DELIVERED ALREADY!!
+
+        /** PASS-THROUGH MODE CHECK **/
+        if (pass_trought_blks.count(blk_hash) > 0)
+        {
+            HOTSTUFF_LOG_PROTO("[PASS-THRU] Found pass_through tag for blk=%.10s; building single partial QC and forwarding up if possible.", blk_hash.to_hex().c_str());
+
+            quorum_cert_bt single_qc = create_quorum_cert(blk_hash);
+            single_qc->add_part(config, msg.vote.voter, *msg.vote.cert);
+            single_qc->compute();
+
+            if (!single_qc->verify(config))
+            {
+                HOTSTUFF_LOG_PROTO("Error, invalid partial sig in pass-through mode for blk=%.10s!", blk_hash.to_hex().c_str());
+                return;
+            }
+
+            // If there's a parent to forward to, do so
+            if (!parentPeer.is_null())
+            {
+                HOTSTUFF_LOG_PROTO("[PASS-THRU] Forwarding single vote to parent for blk=%.10s ...", blk_hash.to_hex().c_str());
+                pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, blk_hash, single_qc->clone(), this)), parentPeer);
+            }
+
+            // Don’t do local QC merging for this block. Just return.
+            return;
+        }
 
         if (blk->self_qc == nullptr)
         {
@@ -432,15 +459,12 @@ namespace hotstuff
             part_cert_bt part = create_part_cert(*priv_key, blk->get_hash());
             blk->self_qc->add_part(config, id, *part);
 
-            std::cout << "create cert: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
+            std::cout << "[VOTE HANDLER] Created local self_qc for block: " << blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
         }
-
-        std::cout << "vote handler: received vote for block " << msg.vote.blk_hash.to_hex() << " " << std::endl;
-        // HOTSTUFF_LOG_PROTO("vote handler: Majority Necessary: %d | Total Replicas: %d", config.nmajority, config.nreplicas);
 
         if (blk->self_qc->has_n(config.nmajority))
         {
-            HOTSTUFF_LOG_PROTO("bye vote handler");
+            HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Already has nmajority for blk=%.10s, skipping...", blk_hash.to_hex().c_str());
             // std::cout << "bye vote handler: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
             /*if (id == get_pace_maker()->get_proposer()) {
                 gettimeofday(&timeEnd, NULL);
@@ -464,14 +488,14 @@ namespace hotstuff
 
             if (!cert->has_n(numberOfChildren + 1))
             {
-                HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Don't have all my children's votes, returning...");
+                HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Not enough child votes yet for blk=%.10s; returning...", blk_hash.to_hex().c_str());
                 return;
             }
 
-            HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got all children votes (%d) + my own! Total: %d", numberOfChildren, cert->get_sigs_n());
-            std::cout << " got enough votes: " << msg.vote.blk_hash.to_hex().c_str() << std::endl;
+            HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received all children votes (%d) + my own for blk=%.10s! Total signatures now: %d", numberOfChildren, blk_hash.to_hex().c_str(), cert->get_sigs_n());
 
-            // stop_proposal_timer(msg.vote.blk_hash);
+            if (!msg_tree.is_leaf())
+                stop_proposal_timer(blk_hash);
 
             if (!piped_queue.empty())
             {
@@ -502,20 +526,22 @@ namespace hotstuff
             cert->compute();
             if (!cert->verify(config))
             {
-                HOTSTUFF_LOG_PROTO("Error, Invalid Sig!!!");
+                HOTSTUFF_LOG_PROTO("Error, invalid aggregated multi-sig for blk=%.10s!", blk_hash.to_hex().c_str());
                 return;
             }
 
-            std::cout << " send relay message: " << msg.vote.blk_hash.to_hex().c_str() << std::endl;
+            std::cout << "[VOTE HANDLER] Sending VOTE-RELAY for blk= " << blk_hash.to_hex() << std::endl;
             if (!parentPeer.is_null())
             {
 
-                HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Got enough votes, sending VOTE-RELAY in epoch_nr=%d, tid=%d to ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
+                HOTSTUFF_LOG_PROTO("[VOTE HANDLER] VOTE-RELAY epoch=%d, tid=%d to parentReplicaId=%d, cert size=%d for blk=%.10s",
+                                   msg_epoch_nr, msg_tree_id, peer_id_map.at(parentPeer),
+                                   cert->get_sigs_n(), blk_hash.to_hex().c_str());
 
-                pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, msg.vote.blk_hash, blk->self_qc->clone(), this)), parentPeer);
+                pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, blk_hash, blk->self_qc->clone(), this)), parentPeer);
             }
 
-            async_deliver_blk(msg.vote.blk_hash, peer);
+            async_deliver_blk(blk_hash, peer);
 
             return;
         }
@@ -654,8 +680,8 @@ namespace hotstuff
                             update_hqc(blk, blk->self_qc);
                             on_qc_finish(blk);
 
-                            // if (!is_leaf)
-                            //     stop_proposal_timer(blk->hash);
+                            if (!is_leaf)
+                                stop_proposal_timer(blk->hash);
                         }
                         else
                         {
@@ -691,8 +717,8 @@ namespace hotstuff
                                 foundChildren = true;
                                 curr_blk = rdy_blk;
 
-                                // if (!is_leaf)
-                                //     stop_proposal_timer(rdy_blk->hash);
+                                if (!is_leaf)
+                                    stop_proposal_timer(rdy_blk->hash);
 
                                 break;
                             }
@@ -749,8 +775,8 @@ namespace hotstuff
                 }
 
                 //Received all child votes
-                // if(!is_leaf)
-                //     stop_proposal_timer(v->blk_hash);
+                if(!is_leaf)
+                    stop_proposal_timer(v->blk_hash);
                 
                 std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
                 
@@ -789,7 +815,7 @@ namespace hotstuff
             }
 
             //not sure if it's here
-            //stop_proposal_timer(v->blk_hash);
+            stop_proposal_timer(v->blk_hash);
 
             if (!piped_queue.empty()) {
                 if (blk->hash == piped_queue.front()) {
@@ -1652,6 +1678,9 @@ namespace hotstuff
         // Send the partial vote relay upwards
         pn.send_msg(MsgRelay(*partial_vote_relay), parentPeer);
 
+        // TAG THE BLOCK TO OPERATE IN A PASS-TROUGHT FASHION
+        pass_trought_blks.insert(blk_hash);
+
         // Clean up the timer
         {
             std::lock_guard<std::mutex> lock(timers_mutex);
@@ -1670,20 +1699,23 @@ namespace hotstuff
 
         if (!blk)
         {
-            HOTSTUFF_LOG_INFO("Block not found for hash: %s", blk_hash.to_hex().c_str());
+            HOTSTUFF_LOG_INFO("[TIMER EXPIRED] Block not found for hash: %s", blk_hash.to_hex().c_str());
             return nullptr;
         }
 
-        if (!blk->self_qc)
+        if (blk->self_qc == nullptr)
         {
-            HOTSTUFF_LOG_INFO("Quorum Cert not found for block: %s", blk_hash.to_hex().c_str());
-            return nullptr;
+            blk->self_qc = create_quorum_cert(blk->get_hash());
+            part_cert_bt part = create_part_cert(*priv_key, blk->get_hash());
+            blk->self_qc->add_part(config, id, *part);
+
+            HOTSTUFF_LOG_INFO("[TIMER EXPIRED] Creating cert for blk: %s", blk_hash.to_hex().c_str());
         }
 
         blk->self_qc->compute();
         if (!blk->self_qc->verify(config))
         {
-            HOTSTUFF_LOG_PROTO("Error, Invalid Sig on creating_vote_relay!!!");
+            HOTSTUFF_LOG_PROTO("[TIMER EXPIRED] Error, Invalid Sig on creating_vote_relay!!!");
             return nullptr;
         }
 
@@ -1692,7 +1724,7 @@ namespace hotstuff
             epoch_nr,
             tid,
             blk->hash,
-            std::move(blk->self_qc),
+            blk->self_qc->clone(),
             this));
 
         return partial_vote_relay;

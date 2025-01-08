@@ -389,11 +389,12 @@ namespace hotstuff
 
             if (isTimeout)
             {
+                // timeout *= 2;
+                // if (timeout > (base_timeout * pow(2, 4)))
+                // {
+                //     timeout = (base_timeout * pow(2, 4));
+                // }
                 timeout *= 2;
-                if (timeout > (base_timeout * pow(2, 4)))
-                {
-                    timeout = (base_timeout * pow(2, 4));
-                }
             }
 
             vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
