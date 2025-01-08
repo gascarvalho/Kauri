@@ -333,7 +333,7 @@ namespace hotstuff
         PaceMakerMultitree(EventContext ec, int32_t parent_limit,
                            double base_timeout, double prop_delay) : PaceMakerDummy(parent_limit),
                                                                      base_timeout(10),
-                                                                     timeout(10),
+                                                                     timeout(20),
                                                                      prop_delay(0),
                                                                      ec(std::move(ec)),
                                                                      proposer(0),
@@ -394,7 +394,7 @@ namespace hotstuff
                 // {
                 //     timeout = (base_timeout * pow(2, 4));
                 // }
-                timeout *= 2;
+                timeout = 20;
             }
 
             vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;

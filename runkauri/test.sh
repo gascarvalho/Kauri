@@ -51,7 +51,7 @@ for LINE in $FLINES; do
     docker stack deploy -c kauri-temp.yaml kauriservice &
 
     # Docker startup time 100s + 1*60s of experiment runtime
-    sleep 340
+    sleep 400
 
     replica_index=0
 

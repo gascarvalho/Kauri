@@ -264,8 +264,8 @@ namespace hotstuff
 
         LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d", get_id(), level);
 
-        if (!is_leaf)
-            start_proposal_timer(prop.tid, prop.epoch_nr, prop.blk->hash, 0.1, level);
+        if (!msg_tree.is_leaf())
+            start_proposal_timer(prop.tid, prop.epoch_nr, prop.blk->hash, 0.05, level);
         else
             HOTSTUFF_LOG_PROTO("I'm (replica %d) leaf on this tree thus I'm not starting a timer for block %s", get_id(), std::string(*prop.blk).c_str());
 
@@ -680,7 +680,7 @@ namespace hotstuff
                             update_hqc(blk, blk->self_qc);
                             on_qc_finish(blk);
 
-                            if (!is_leaf)
+                            if (!msg_tree.is_leaf())
                                 stop_proposal_timer(blk->hash);
                         }
                         else
@@ -717,7 +717,7 @@ namespace hotstuff
                                 foundChildren = true;
                                 curr_blk = rdy_blk;
 
-                                if (!is_leaf)
+                                if (!msg_tree.is_leaf())
                                     stop_proposal_timer(rdy_blk->hash);
 
                                 break;
@@ -775,8 +775,7 @@ namespace hotstuff
                 }
 
                 //Received all child votes
-                if(!is_leaf)
-                    stop_proposal_timer(v->blk_hash);
+                stop_proposal_timer(v->blk_hash);
                 
                 std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
                 
@@ -2052,12 +2051,8 @@ namespace hotstuff
                     HOTSTUFF_LOG_PROTO("[PIPELINING] Pushed piped block into queue: %.10s", piped_block->hash.to_hex().c_str());
                     print_pipe_queues(true, false);
 
-
                     Proposal prop(id, get_cur_epoch_nr() ,get_tree_id(), piped_block, nullptr);
                     HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
-
-                    // //Start a timer for a piped block
-                    // start_proposal_timer(get_tree_id(), get_cur_epoch_nr(),piped_block->hash, 2, 0);
 
                     /* broadcast to other replicas */
                     gettimeofday(&last_block_time, NULL);
