@@ -260,12 +260,14 @@ namespace hotstuff
 
         LOG_PROTO("[PROP HANDLER] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
 
-        auto level = msg_tree.get_level(get_id());
+        auto replica_level = msg_tree.get_level(get_id());
+        auto max_level = msg_tree.get_max_level();
+        auto timeout_duration = (max_level - replica_level) * 0.07;
 
-        LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d", get_id(), level);
+        LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d out of %d", get_id(), replica_level, max_level);
 
         if (!msg_tree.is_leaf())
-            start_proposal_timer(prop.tid, prop.epoch_nr, prop.blk->hash, 0.05, level);
+            start_proposal_timer(prop.tid, prop.epoch_nr, prop.blk->hash, timeout_duration, replica_level);
         else
             HOTSTUFF_LOG_PROTO("I'm (replica %d) leaf on this tree thus I'm not starting a timer for block %s", get_id(), std::string(*prop.blk).c_str());
 
@@ -612,13 +614,14 @@ namespace hotstuff
         msg.postponed_parse(this);
         // std::cout << "vote relay handler: " << msg.vote.blk_hash.to_hex() << std::endl;
 
-        /** Treat vote relay in relation to its tree */
+        HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Started. From peer=%d, block=%.10s", peer_id_map.at(peer), msg.vote.blk_hash.to_hex().c_str());
+
+        /** Identify which epoch/tree the vote is for */
         auto msg_epoch_nr = msg.vote.epoch_nr;
         auto msg_tree_id = msg.vote.tid;
+        auto blk_hash = msg.vote.blk_hash;
 
-        // Reply in the correct tree in the correct epoch
         auto system_trees = epochs[msg_epoch_nr].get_system_trees();
-
         auto msg_tree = system_trees[msg_tree_id];
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
@@ -627,10 +630,10 @@ namespace hotstuff
 
         HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Received VOTE-RELAY message in epoch_nr=%d, tid=%d from ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), msg.vote.cert->get_sigs_n());
 
-        if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), msg.vote.blk_hash) != piped_queue.end())
+        if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), blk_hash) != piped_queue.end())
         {
             HOTSTUFF_LOG_PROTO("piped block");
-            block_t blk = storage->find_blk(msg.vote.blk_hash);
+            block_t blk = storage->find_blk(blk_hash);
             if (!blk->piped_delivered)
             {
                 process_block(blk, false, msg_tree_id, msg_epoch_nr);
@@ -639,33 +642,36 @@ namespace hotstuff
             }
         }
 
-        block_t blk = get_potentially_not_delivered_blk(msg.vote.blk_hash);
+        block_t blk = get_potentially_not_delivered_blk(blk_hash);
         // AFTER HERE, BLOCK MUST BE DELIVERED ALREADY!!
 
         // NÃO FAZ SENTIDO SE NÃO NUNCA HAVERIA UM VOTE-RELAY??
         if (blk->self_qc == nullptr)
         {
+            HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Creating new self_qc for block=%.10s", blk->hash.to_hex().c_str());
             blk->self_qc = create_quorum_cert(blk->get_hash());
             part_cert_bt part = create_part_cert(*priv_key, blk->get_hash());
             blk->self_qc->add_part(config, id, *part);
 
-            std::cout << "create cert: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
+            // Debug printing the pointer, as you do below
+            std::cout << "[RELAY HANDLER] Created new self_qc for block="
+                      << blk_hash.to_hex() << " pointer=" << &blk->self_qc
+                      << std::endl;
         }
 
         if (blk->self_qc->has_n(config.nmajority))
         {
-            std::cout << "bye vote relay handler: " << msg.vote.blk_hash.to_hex() << " " << &blk->self_qc << std::endl;
+            HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Already has_n() -> Majority. block=%.10s", blk->hash.to_hex().c_str());
 
             if (id == tree_proposer && blk->hash == piped_queue.front())
             {
                 piped_queue.pop_front();
-                HOTSTUFF_LOG_PROTO("Reset Piped block %.10s", blk->hash.to_hex().c_str());
-                HOTSTUFF_LOG_PROTO("[PIPELINING] Removed piped block from queue! Piped queue size now: %d", piped_queue.size());
+                HOTSTUFF_LOG_PROTO("[PIPELINING] Popped front block=%.10s, new piped_queue_size=%zu", blk->hash.to_hex().c_str(), piped_queue.size());
 
                 auto curr_blk = blk;
                 if (!rdy_queue.empty())
                 {
-                    HOTSTUFF_LOG_PROTO("Resolving rdy queue (case 1)");
+                    HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Resolving rdy_queue for block=%.10s (case 1)", curr_blk->hash.to_hex().c_str());
 
                     bool frontsMatch = true;
                     while (frontsMatch && !rdy_queue.empty())
@@ -737,18 +743,40 @@ namespace hotstuff
             return;
         }
 
-        std::cout << "vote relay handler: " << msg.vote.blk_hash.to_hex() << " " << std::endl;
+        std::cout << "[RELAY HANDLER] Partial QC so far does NOT have a majority. block= "
+                  << blk_hash.to_hex() << std::endl;
 
         RcObj<VoteRelay> v(new VoteRelay(std::move(msg.vote)));
         promise::all(std::vector<promise_t>{
                          async_deliver_blk(v->blk_hash, peer),
                          v->cert->verify(config, vpool),
                      })
-            .then([this, blk, v = std::move(v), timeStart, tree_proposer, parentPeer, numberOfChildren, msg_tree_id, msg_epoch_nr](const promise::values_t &values)
+            .then([this, blk, v = std::move(v), timeStart, tree_proposer, parentPeer, numberOfChildren, msg_tree_id, msg_epoch_nr, peer](const promise::values_t &values)
                   {
         struct timeval timeEnd;
 
-        if (!promise::any_cast<bool>(values[1]))LOG_WARN ("invalid vote-relay");
+        auto blk_hash = blk->get_hash();
+ 
+        auto validSignature = promise::any_cast<bool>(values[1]);
+        if (!validSignature)
+        {
+            LOG_WARN("VoteRelay from new partial cert is invalid; ignoring.");
+            return;
+        }
+
+        // pass_through check:
+        if (pass_trought_blks.count(v->blk_hash) > 0)
+        {
+            HOTSTUFF_LOG_PROTO("[RELAY HANDLER] [PASS-THROUGH] aggregator on blk=%.10s, skipping local merging.",v->blk_hash.to_hex().c_str());
+     
+            if (!parentPeer.is_null())
+            {
+                HOTSTUFF_LOG_PROTO("[RELAY HANDLER] [PASS-THROUGH] forwarding aggregator up for blk=%.10s", v->blk_hash.to_hex().c_str());
+                pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, v->blk_hash, v->cert->clone(), this)),parentPeer);
+            }
+            return;
+        }
+        
         
         auto &cert = blk->self_qc;
 
@@ -760,29 +788,35 @@ namespace hotstuff
                 return;
             }
 
-            HOTSTUFF_LOG_PROTO("[HANDLER] Merging QuorumCert from VoteRelay. Current sigs: %d", blk->self_qc->get_sigs_n());
+            HOTSTUFF_LOG_PROTO("[HANDLER] Merging QuorumCert from VOTE-RELAY on block=%.10s. Current sigs_n=%d", blk->hash.to_hex().c_str(), blk->self_qc->get_sigs_n());
             cert->merge_quorum(*v->cert);
-            HOTSTUFF_LOG_PROTO("[HANDLER] Merged QC. New sigs: %d", blk->self_qc->get_sigs_n());
+            HOTSTUFF_LOG_PROTO("[HANDLER] After merging, block=%.10s sigs_n=%d", blk->hash.to_hex().c_str(), blk->self_qc->get_sigs_n());
 
             if (id != tree_proposer) {
                 
-                if (!cert->has_n(numberOfChildren + 1)) return;
+                // If not enough, just store it and wait
+                if (!cert->has_n(numberOfChildren + 1)) 
+                {
+                    HOTSTUFF_LOG_PROTO("[HANDLER] Still not enough child votes for block=%.10s, have %d needed=%d", blk->hash.to_hex().c_str(), cert->get_sigs_n(), numberOfChildren + 1);
+                    return;
+                }
                 
                 cert->compute();
                 
                 if (!cert->verify(config)) {
-                    throw std::runtime_error("Invalid Sigs in intermediate signature!");
+                    throw std::runtime_error("[HANDLER] Invalid merged sigs in intermediate QC for block= " + blk->hash.to_hex());
                 }
 
                 //Received all child votes
                 stop_proposal_timer(v->blk_hash);
                 
-                std::cout << "Send Vote Relay: " << v->blk_hash.to_hex() << std::endl;
+                std::cout << "[RELAY HANDLER] Sending aggregated VOTE-RELAY upwards. block= " 
+                        << v->blk_hash.to_hex() 
+                        << std::endl;
                 
                 if(!parentPeer.is_null()) {
 
-                    HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Sending VOTE-RELAY in epoch_nr=%d, tid=%d to ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(parentPeer), cert->get_sigs_n());
-
+                    HOTSTUFF_LOG_PROTO("[HANDLER] Sending VOTE-RELAY on block=%.10s, new cert_sigs=%d, to parentPeer ID=%d", v->blk_hash.to_hex().c_str(), cert->get_sigs_n(), peer_id_map.at(parentPeer));
                     pn.send_msg(MsgRelay(VoteRelay(msg_epoch_nr, msg_tree_id, v->blk_hash, cert.get()->clone(), this)), parentPeer);
                 }
                 
@@ -809,6 +843,7 @@ namespace hotstuff
             cert->compute();
 
             if (!cert->verify(config)) {
+                HOTSTUFF_LOG_PROTO("[HANDLER] Error: majority sig is invalid. block=%.10s", blk->hash.to_hex().c_str());
                 HOTSTUFF_LOG_PROTO("Error, Invalid Sig!!!");
                 return;
             }

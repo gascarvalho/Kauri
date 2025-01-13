@@ -233,6 +233,27 @@ namespace hotstuff
             throw std::logic_error("Failed to determine level.");
         }
 
+        size_t get_max_level() const
+        {
+            // Get the tree array (assuming it represents the nodes in breadth-first order)
+            auto tree_array = tree.get_tree_array();
+
+            // The fanout (number of children per node)
+            auto fanout = tree.get_fanout();
+
+            // Calculate the maximum level of the tree
+            size_t total_nodes = tree_array.size();
+            size_t max_level = 0;
+
+            while (total_nodes > 0)
+            {
+                total_nodes = (total_nodes - 1) / fanout; // Move up one level
+                max_level++;
+            }
+
+            return max_level;
+        }
+
         bool is_leaf() const
         {
             return childPeers.empty();
