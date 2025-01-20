@@ -1,5 +1,22 @@
 version: "3.3"
 services:
+  client-becd9691-b958-47c3-9ac3-688ca48fb6d6:
+    image: kauri
+    entrypoint: ["/bin/bash", "/client.sh"]
+    command: thecmd
+    hostname: client
+    cap_add:
+      - NET_ADMIN
+    labels:
+      becd9691-b958-47c3-9ac3-688ca48fb6d6: "true"
+    deploy:
+      replicas: 1
+      endpoint_mode: dnsrr
+    environment:
+      KAURI_UUID: 'becd9691-b958-47c3-9ac3-688ca48fb6d6'
+    networks:
+      - KauriNet
+
   server1-becd9691-b958-47c3-9ac3-688ca48fb6d6:
     image: kauri
     entrypoint: ["/bin/bash", "/server.sh"]
@@ -16,6 +33,8 @@ services:
       KAURI_UUID: 'becd9691-b958-47c3-9ac3-688ca48fb6d6'
     networks:
       - KauriNet
+    depends_on:
+      - client-becd9691-b958-47c3-9ac3-688ca48fb6d6
 
   server2-becd9691-b958-47c3-9ac3-688ca48fb6d6:
     image: kauri
@@ -33,23 +52,8 @@ services:
       KAURI_UUID: 'becd9691-b958-47c3-9ac3-688ca48fb6d6'
     networks:
       - KauriNet
-
-  # client-becd9691-b958-47c3-9ac3-688ca48fb6d6:
-  #   image: kauri
-  #   entrypoint: ["/bin/bash", "/client.sh"]
-  #   command: thecmd
-  #   hostname: client
-  #   cap_add:
-  #     - NET_ADMIN
-  #   labels:
-  #     becd9691-b958-47c3-9ac3-688ca48fb6d6: "true"
-  #   deploy:
-  #     replicas: 1
-  #     endpoint_mode: dnsrr
-  #   environment:
-  #     KAURI_UUID: 'becd9691-b958-47c3-9ac3-688ca48fb6d6'
-  #   networks:
-  #     - KauriNet
+    depends_on:
+      - client-becd9691-b958-47c3-9ac3-688ca48fb6d6
 
 networks:
   KauriNet:

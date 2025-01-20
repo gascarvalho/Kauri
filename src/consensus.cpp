@@ -286,6 +286,7 @@ namespace hotstuff
         b_exec = blk;
     }
 
+    //Leader proposal
     block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
                                      const std::vector<block_t> &parents,
                                      bytearray_t &&extra)
@@ -334,9 +335,6 @@ namespace hotstuff
         LOG_PROTO("propose %s", std::string(*bnew).c_str());
         on_deliver_blk(bnew);
         Proposal prop = process_block(bnew, true, get_tree_id(), get_cur_epoch_nr());
-
-        // // Start a timer for a piped block
-        // start_proposal_timer(get_tree_id(), get_cur_epoch_nr(), bnew->hash, 2, 0);
 
         /* broadcast to other replicas */
         do_broadcast_proposal(prop);
@@ -445,9 +443,7 @@ namespace hotstuff
 
         if (opinion && !vote_disabled)
         {
-            do_vote(prop,
-                    Vote(id, get_cur_epoch_nr(), get_tree_id(), bnew->get_hash(),
-                         create_part_cert(*priv_key, bnew->get_hash()), this));
+            do_vote(prop, Vote(id, get_cur_epoch_nr(), get_tree_id(), bnew->get_hash(), create_part_cert(*priv_key, bnew->get_hash()), this));
         }
 
         // UNCOMMENT TO TEST TIMEOUT
@@ -694,7 +690,7 @@ namespace hotstuff
             block_t blk = it->first;
             if (blk->height < hqc.first->height && !is_ancestor(blk, hqc.first))
             {
-                HOTSTUFF_LOG_PROTO("Rejecting overshadowed block %.10s from qc_waiting",blk->hash.to_hex().c_str());
+                HOTSTUFF_LOG_PROTO("Rejecting overshadowed block %.10s from qc_waiting", blk->hash.to_hex().c_str());
                 it->second.reject();
                 it = qc_waiting.erase(it);
             }

@@ -36,7 +36,7 @@ sleep 30
 
 id=0
 i=0
-client_service="client-$KAURI_UUID"  
+client_service="client-$KAURI_UUID"
 
 # # My client id
 # for ip in $(dig A $client_service +short | sort -u)
@@ -57,10 +57,9 @@ sleep 25
 
 # Store all services in the list of IPs, from smallest id service (e.g. first internal nodes then the leaf nodes)
 touch ips
-for j in $(seq 1 $nservices)
-do
+for j in $(seq 1 $nservices); do
   service="server$j-$KAURI_UUID"
-  dig A $service +short | sort -u | sed -e 's/$/ 1/' >> ips
+  dig A $service +short | sort -u | sed -e 's/$/ 1/' >>ips
 done
 
 sleep 5
@@ -68,11 +67,14 @@ sleep 5
 # Generate the HotStuff config file based on the given parameters
 python3 scripts/gen_conf.py --ips "ips" --crypto $crypto --fanout $fanout --pipedepth $pipedepth --pipelatency $pipelatency --block-size $blocksize
 
+# Capture container's IP and append to logs
+my_ip=$(hostname -I | awk '{print $1}')
+echo "Container IP: ${my_ip}" >>clientlog0
 
-echo "Starting Application: #${id}" > log${id}
+echo "Starting Reputation Server" >>clientlog0
 
 if ! [ -z "$myservice" ]; then
-  echo "My Kollaps service is ${myservice}" >> log${id}
+  echo "My Kollaps service is ${myservice}" >>log${id}
 fi
 
 #Configure Network restrictions
@@ -82,8 +84,10 @@ sleep 25
 
 # Start Client on Host Machine
 #if [ ${id} == 0 ]; then
-  gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 5000 > clientlog0 2>&1 &
+#gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 5000 > clientlog0 2>&1 &
 #fi
+
+./examples/hotstuff-client --idx ${id} --iter -10 --max-async 5000 >>clientlog0 2>&1 &
 
 # Start Client on all machines
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -900 --max-async 900 > clientlog${id} 2>&1 &

@@ -131,7 +131,8 @@ public:
                 const EventContext &ec,
                 size_t nworker,
                 const Net::Config &repnet_config,
-                const ClientNetwork<opcode_t>::Config &clinet_config);
+                const ClientNetwork<opcode_t>::Config &clinet_config,
+                NetAddr reputation_addr);
 
     void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps);
     void set_fanout(int32_t fanout);
@@ -139,6 +140,7 @@ public:
     void set_tree_period(size_t nblocks);
     void set_tree_generation(std::string genAlgo, std::string fpath);
     void set_new_epoch(std::string new_epoch);
+    void set_client_ip(std::string client_ip);
     void stop();
 };
 
@@ -160,6 +162,7 @@ int main(int argc, char **argv)
     elapsed.start();
 
     auto opt_blk_size = Config::OptValInt::create(1);
+    auto opt_client_ip = Config::OptValStr::create();
     auto opt_parent_limit = Config::OptValInt::create(-1);
     auto opt_stat_period = Config::OptValDouble::create(15);
     auto opt_replicas = Config::OptValStrVec::create();
@@ -194,6 +197,7 @@ int main(int argc, char **argv)
     auto opt_new_epoch = Config::OptValStr::create("newepoch.conf");
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
+    config.add_opt("client-ip", opt_client_ip, Config::SET_VAL);
     config.add_opt("parent-limit", opt_parent_limit, Config::SET_VAL);
     config.add_opt("stat-period", opt_stat_period, Config::SET_VAL);
     config.add_opt("replica", opt_replicas, Config::APPEND, 'a', "add an replica to the list");
@@ -308,7 +312,9 @@ int main(int argc, char **argv)
                            ec,
                            opt_nworker->get(),
                            repnet_config,
-                           clinet_config);
+                           clinet_config,
+                           NetAddr(opt_client_ip->get(), 50500));
+
     std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> reps;
     for (auto &r : replicas)
     {
@@ -355,13 +361,13 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
                          const EventContext &ec,
                          size_t nworker,
                          const Net::Config &repnet_config,
-                         const ClientNetwork<opcode_t>::Config &clinet_config) : HotStuff(blk_size, idx, raw_privkey,
-                                                                                          plisten_addr, std::move(pmaker), ec, nworker, repnet_config),
-                                                                                 stat_period(stat_period),
-                                                                                 impeach_timeout(impeach_timeout),
-                                                                                 ec(ec),
-                                                                                 cn(req_ec, clinet_config),
-                                                                                 clisten_addr(clisten_addr)
+                         const ClientNetwork<opcode_t>::Config &clinet_config,
+                         NetAddr reputation_addr) : HotStuff(blk_size, idx, raw_privkey, plisten_addr, std::move(pmaker), ec, nworker, repnet_config, reputation_addr),
+                                                    stat_period(stat_period),
+                                                    impeach_timeout(impeach_timeout),
+                                                    ec(ec),
+                                                    cn(req_ec, clinet_config),
+                                                    clisten_addr(clisten_addr)
 {
     /* prepare the thread used for sending back confirmations */
     resp_tcall = new salticidae::ThreadCall(resp_ec);
@@ -406,9 +412,9 @@ void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytea
     ev_stat_timer.add(stat_period);
     impeach_timer = TimerEvent(ec, [this](TimerEvent &)
                                {
-        if (get_decision_waiting().size())
-            get_pace_maker()->impeach();
-        reset_imp_timer(); });
+            if (get_decision_waiting().size())
+                get_pace_maker()->impeach();
+            reset_imp_timer(); });
     impeach_timer.add(impeach_timeout);
     HOTSTUFF_LOG_INFO("** starting the system with parameters **");
     HOTSTUFF_LOG_INFO("blk_size = %lu", blk_size);

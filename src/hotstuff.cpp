@@ -313,12 +313,14 @@ namespace hotstuff
 
         if (!childPeers.empty())
         {
-            LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in epoch_nr=%d, tid=%d", prop.epoch_nr, prop.tid);
-            MsgPropose relay = MsgPropose(stream, true);
-            for (const PeerId &peerId : childPeers)
-            {
-                pn.send_msg(relay, peerId);
-            }
+            // LOG_PROTO("[PROP HANDLER] Relaying current proposal to children in epoch_nr=%d, tid=%d", prop.epoch_nr, prop.tid);
+            // MsgPropose relay = MsgPropose(stream, true);
+            // for (const PeerId &peerId : childPeers)
+            // {
+            //     pn.send_msg(relay, peerId);
+            // }
+
+            do_broadcast_proposal(prop);
         }
 
         /** Edge-case: Valid tree proposer but not the current tree proposer
@@ -413,6 +415,9 @@ namespace hotstuff
         auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
         HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received VOTE message in epoch_nr=%d, tid=%d from ReplicaId %d for block %.10s", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), blk_hash.to_hex().c_str());
+
+        // Could be sooner
+        record_latency(msg_epoch_nr, msg_tree_id, peer, blk_hash);
 
         if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), blk_hash) != piped_queue.end())
         {
@@ -629,6 +634,9 @@ namespace hotstuff
         auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
         HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Received VOTE-RELAY message in epoch_nr=%d, tid=%d from ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), msg.vote.cert->get_sigs_n());
+
+        // Could be sooner
+        record_latency(msg_epoch_nr, msg_tree_id, peer, blk_hash);
 
         if (id == tree_proposer && !piped_queue.empty() && std::find(piped_queue.begin(), piped_queue.end(), blk_hash) != piped_queue.end())
         {
@@ -1194,27 +1202,28 @@ namespace hotstuff
                                pacemaker_bt pmaker,
                                EventContext ec,
                                size_t nworker,
-                               const Net::Config &netconfig) : HotStuffCore(rid, std::move(priv_key)),
-                                                               listen_addr(listen_addr),
-                                                               blk_size(blk_size),
-                                                               ec(ec),
-                                                               tcall(ec),
-                                                               vpool(ec, nworker),
-                                                               pn(ec, netconfig),
-                                                               pmaker(std::move(pmaker)),
-
-                                                               fetched(0), delivered(0),
-                                                               nsent(0), nrecv(0),
-                                                               part_parent_size(0),
-                                                               part_fetched(0),
-                                                               part_delivered(0),
-                                                               part_decided(0),
-                                                               part_gened(0),
-                                                               part_delivery_time(0),
-                                                               part_delivery_time_min(double_inf),
-                                                               part_delivery_time_max(0),
-                                                               reconfig_count(0),
-                                                               warmup_finished(false)
+                               const Net::Config &netconfig,
+                               NetAddr reputation_addr) : HotStuffCore(rid, std::move(priv_key)),
+                                                          listen_addr(listen_addr),
+                                                          blk_size(blk_size),
+                                                          ec(ec),
+                                                          tcall(ec),
+                                                          vpool(ec, nworker),
+                                                          pn(ec, netconfig),
+                                                          pmaker(std::move(pmaker)),
+                                                          fetched(0), delivered(0),
+                                                          nsent(0), nrecv(0),
+                                                          part_parent_size(0),
+                                                          part_fetched(0),
+                                                          part_delivered(0),
+                                                          part_decided(0),
+                                                          part_gened(0),
+                                                          part_delivery_time(0),
+                                                          part_delivery_time_min(double_inf),
+                                                          part_delivery_time_max(0),
+                                                          reconfig_count(0),
+                                                          warmup_finished(false),
+                                                          reputation_addr(reputation_addr)
     {
         /* register the handlers for msg from replicas */
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::propose_handler, this, _1, _2));
@@ -1225,13 +1234,33 @@ namespace hotstuff
         pn.reg_conn_handler(salticidae::generic_bind(&HotStuffBase::conn_handler, this, _1, _2));
         pn.start();
         pn.listen(listen_addr);
+
+        rn.start();
+
+        reputation_server_conn = rn.connect_sync(reputation_addr);
     }
 
     void HotStuffBase::do_broadcast_proposal(const Proposal &prop)
     {
-        // HOTSTUFF_LOG_PROTO("Broadcasting proposal of size %llu bytes.", sizeof(prop));
+        HOTSTUFF_LOG_PROTO("[BROADCASTING] Broadcasting proposal of size %llu bytes in epoch_nr:%d on tid=%d.", sizeof(prop), prop.epoch_nr, prop.tid);
         auto childPeers = current_tree_network.get_childPeers();
-        pn.multicast_msg(MsgPropose(prop), std::vector(childPeers.begin(), childPeers.end()));
+
+        auto blk_hash = prop.blk->get_hash();
+
+        for (const PeerId &childPeer : childPeers)
+        {
+
+            BlockPeerKey k(blk_hash, childPeer);
+
+            struct timeval time_start;
+            gettimeofday(&time_start, nullptr);
+
+            {
+                lat_start[k] = time_start;
+            }
+
+            pn.send_msg(MsgPropose(prop), childPeer);
+        }
     }
 
     void HotStuffBase::inc_time(ReconfigurationType reconfig_type)
@@ -1786,6 +1815,64 @@ namespace hotstuff
         LOG_PROTO("\n=========================== Finished Epoch Switch =================================\n");
     }
 
+    void HotStuffBase::record_latency(size_t epoch_nr, size_t tid, const PeerId &peer, const uint256_t &blk_hash)
+    {
+        HOTSTUFF_LOG_INFO("[REPORT] Recording latency for block:%.10s from replica %d", blk_hash.to_hex().c_str(), peer_id_map.at(peer));
+
+        BlockPeerKey k(blk_hash, peer);
+        auto it = lat_start.find(k);
+        if (it != lat_start.end())
+        {
+            struct timeval tv_end;
+            gettimeofday(&tv_end, nullptr);
+
+            auto tv_start = it->second;
+
+            // Print start and end time for debugging
+            HOTSTUFF_LOG_INFO("[REPORT] Start time: %ld.%06ld seconds", tv_start.tv_sec, tv_start.tv_usec);
+            HOTSTUFF_LOG_INFO("[REPORT] End time: %ld.%06ld seconds", tv_end.tv_sec, tv_end.tv_usec);
+
+            uint32_t elapsed_us = (tv_end.tv_sec - tv_start.tv_sec) * 1000000LL + (tv_end.tv_usec - tv_start.tv_usec);
+
+            std::cout << "[REPORT] took "
+                      << elapsed_us
+                      << " us to respond."
+                      << std::endl;
+
+            LatMeasure lat(peer_id_map.at(peer), epoch_nr, tid, elapsed_us);
+
+            peer_latencies.push_back(lat);
+
+            lat_start.erase(it); // done
+        }
+        else
+        {
+            HOTSTUFF_LOG_WARN("[REPORT] Start time not found for block:%.10s from replica %d", blk_hash.to_hex().c_str(), peer_id_map.at(peer));
+        }
+    }
+
+    void HotStuffBase::on_report_timer()
+    {
+
+        LatencyReport report(get_id(), peer_latencies);
+
+        if (reputation_server_conn != nullptr)
+        {
+            rn.send_msg(MsgLatencyReport(report), reputation_server_conn);
+            HOTSTUFF_LOG_INFO("[REPORT TIMER] Sent %zu latency reports to reputation server.", peer_latencies.size());
+        }
+        else
+        {
+            HOTSTUFF_LOG_WARN("[REPORT TIMER] Reputation server connection is null. Cannot send reports.");
+        }
+
+        // Clear the peer_latencies map after sending the reports
+        peer_latencies.clear();
+
+        // Schedule the next report
+        ev_report_timer.add(report_period);
+    }
+
     void HotStuffBase::close_client(ReplicaID rid)
     {
 
@@ -1887,19 +1974,24 @@ namespace hotstuff
         final_buffer.reserve(blk_size);
         cmd_pending_buffer.reserve(max_cmd_pending_size);
 
+        ev_report_timer = TimerEvent(ec, [this](TimerEvent &)
+                                     { this->on_report_timer(); });
+        ev_report_timer.add(report_period);
+
         ev_beat_timer = TimerEvent(ec, [this](TimerEvent &)
                                    {
 
-        if(final_buffer.empty()) {
-            for(size_t i = 0; i < blk_size; i++) {
-                uint256_t hash = salticidae::get_hash(i);
-                final_buffer.push_back(hash);
-            }
-        }
+                if(final_buffer.empty()) {
+                    for(size_t i = 0; i < blk_size; i++) {
+                        uint256_t hash = salticidae::get_hash(i);
+                        final_buffer.push_back(hash);
+                    }
+                }
 
-        if(pmaker->get_proposer() == get_id()) beat();
+                if(pmaker->get_proposer() == get_id()) beat();
 
-        ev_beat_timer.add(0.05); });
+                ev_beat_timer.add(0.05); });
+
         ev_beat_timer.add(10);
 
         ev_check_pending = TimerEvent(ec, [this](TimerEvent &)

@@ -39,15 +39,11 @@ i=0
 
 # Go through the list of servers of the given services to identify the number of servers and the id of this server.
 
-for j in $(seq 1 $nservices)
-do
-  service="server$j-$KAURI_UUID"  
-  for ip in $(dig A $service +short | sort -u)
-  do
-    for myip in $(ifconfig -a | awk '$1 == "inet" {print $2}')
-    do
-      if [ ${ip} == ${myip} ]
-      then
+for j in $(seq 1 $nservices); do
+  service="server$j-$KAURI_UUID"
+  for ip in $(dig A $service +short | sort -u); do
+    for myip in $(ifconfig -a | awk '$1 == "inet" {print $2}'); do
+      if [ ${ip} == ${myip} ]; then
         id=${i}
         echo "This is: ${ip}"
       fi
@@ -60,46 +56,48 @@ sleep 20
 
 # Store all services in the list of IPs, from smallest id service (e.g. first internal nodes then the leaf nodes)
 touch ips
-for j in $(seq 1 $nservices)
-do
+for j in $(seq 1 $nservices); do
   service="server$j-$KAURI_UUID"
-  dig A $service +short | sort -u | sed -e 's/$/ 1/' >> ips
+  dig A $service +short | sort -u | sed -e 's/$/ 1/' >>ips
 done
+
+client_service="client-$KAURI_UUID"
+client_ip=$(dig A "$client_service" +short | sort -u | head -n1)
 
 sleep 5
 
 # Generate the HotStuff config file based on the given parameters
-python3 scripts/gen_conf.py --ips "ips" --crypto $crypto --fanout $fanout --pipedepth $pipedepth --pipelatency $pipelatency --block-size $blocksize
+python3 scripts/gen_conf.py --ips "ips" --crypto $crypto --fanout $fanout --pipedepth $pipedepth --pipelatency $pipelatency --block-size $blocksize --client-ip $client_ip
 
 sleep 20
 
-echo "Starting Application: #${id}" > log${id}
+echo "Starting Application: #${id}" >log${id}
 
 if ! [ -z "$myservice" ]; then
-  echo "My Kollaps service is ${myservice}" >> log${id}
+  echo "My Kollaps service is ${myservice}" >>log${id}
 fi
 
+
+sleep 60
 # Startup Kauri
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >> log${id} 2>&1 &
 
 # Startup Kauri (no gdb)
-./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >> log${id} 2>&1 &
-
+./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >>log${id} 2>&1 &
 
 # # Add the failure simulation for Replica 0
 if [ ${id} == 0 ]; then
-  sleep 30  # Adjust this delay as needed
-  
+  sleep 30 # Adjust this delay as needed
+
   # Kill the `hotstuff-app` process
-  app_pid=$(pgrep -f hotstuff-app)  # Find the PID of the process
+  app_pid=$(pgrep -f hotstuff-app) # Find the PID of the process
   if [ ! -z "$app_pid" ]; then
-    echo "Killing hotstuff-app process with PID: $app_pid for Replica 0" >> log${id}
-    kill -9 $app_pid  # Terminate the process
+    echo "Killing hotstuff-app process with PID: $app_pid for Replica 0" >>log${id}
+    kill -9 $app_pid # Terminate the process
   else
-    echo "No hotstuff-app process found to kill for Replica 0" >> log${id}
+    echo "No hotstuff-app process found to kill for Replica 0" >>log${id}
   fi
 fi
-
 
 #Configure Network restrictions
 #sudo tc qdisc add dev eth0 root netem delay ${latency}ms limit 400000 rate ${bandwidth}mbit &

@@ -358,6 +358,99 @@ namespace hotstuff
         }
     };
 
+    struct BlockPeerKey
+    {
+        uint256_t blk_hash;
+        PeerId peer;
+
+        // Constructor
+        BlockPeerKey(const uint256_t &blk_hash, const PeerId &peer)
+            : blk_hash(blk_hash), peer(peer) {}
+
+        // Equality operator for map lookups
+        bool operator==(const BlockPeerKey &other) const
+        {
+            return blk_hash == other.blk_hash && peer == other.peer;
+        }
+
+        // Hash function for the map
+        struct Hash
+        {
+            std::size_t operator()(const BlockPeerKey &key) const
+            {
+                // Combine the hashes of blk_hash and peer
+                return std::hash<salticidae::uint256_t>()(key.blk_hash) ^
+                       (std::hash<salticidae::PeerId>()(key.peer) << 1);
+            }
+        };
+    };
+
+    //-----Report Stuff---
+
+    struct LatMeasure
+    {
+        ReplicaID child;
+        uint32_t epoch_nr; // epoch at the time of measurement
+        uint32_t tid;      // tree ID at the time of measurement
+        uint32_t latency_us;
+
+        LatMeasure() = default;
+
+        LatMeasure(ReplicaID child, uint32_t epoch_nr, uint32_t tid, uint32_t latency_us)
+            : child(child), epoch_nr(epoch_nr), tid(tid), latency_us(latency_us) {}
+    };
+
+    struct LatencyReport : public Serializable
+    {
+        ReplicaID reporter;
+        std::vector<LatMeasure> lats;
+
+        LatencyReport() = default;
+
+        // Convenient constructor
+        LatencyReport(ReplicaID reporter,
+                      const std::vector<LatMeasure> &lats)
+            : reporter(reporter),
+              lats(lats)
+        {
+        }
+
+        // Serialize the data into a DataStream
+        void serialize(DataStream &s) const override
+        {
+            s << reporter;
+
+            uint32_t count = static_cast<uint32_t>(lats.size());
+            s << count;
+            for (auto &item : lats)
+            {
+                s << item.child;
+                s << item.epoch_nr;
+                s << item.tid;
+                s << item.latency_us;
+            }
+        }
+
+        // Unserialize from a DataStream
+        void unserialize(DataStream &s) override
+        {
+            s >> reporter;
+
+            uint32_t count;
+            s >> count;
+            lats.resize(count);
+            for (uint32_t i = 0; i < count; i++)
+            {
+                s >> lats[i].child;
+                s >> lats[i].epoch_nr;
+                s >> lats[i].tid;
+                s >> lats[i].latency_us;
+            }
+        }
+    };
+
+    //-----------------
+
     /** Network message format for HotStuff. */
     struct MsgPropose
     {
@@ -485,6 +578,8 @@ namespace hotstuff
         pid_t client_pid;
         char client_prog[256];
 
+        std::string cip;
+
     private:
         /** whether libevent handle is owned by itself */
         bool ec_loop;
@@ -498,6 +593,10 @@ namespace hotstuff
         TimerEvent ev_beat_timer;
         TimerEvent ev_check_pending;
         TimerEvent ev_end_warmup;
+
+        TimerEvent ev_report_timer;
+        double report_period = 20.0;
+
         size_t warmup_counter = 0;
 
         /* queues for async tasks */
@@ -542,6 +641,15 @@ namespace hotstuff
         // TODO: deprecated
         std::unordered_map<size_t, TreeNetwork> system_trees;
         std::unordered_set<uint256_t> pass_trought_blks;
+
+        // Reports stuff
+        std::mutex metrics_lock;
+        std::unordered_map<BlockPeerKey, struct timeval, BlockPeerKey::Hash> lat_start; // track proposal time
+        std::vector<LatMeasure> peer_latencies;
+
+        NetAddr reputation_addr;
+        Net::MsgNet::conn_t reputation_server_conn;
+        Net rn = Net(ec, Net::Config());
 
         bool is_leaf;
 
@@ -602,7 +710,8 @@ namespace hotstuff
                      pacemaker_bt pmaker,
                      EventContext ec,
                      size_t nworker,
-                     const Net::Config &netconfig);
+                     const Net::Config &netconfi,
+                     NetAddr reputation_addr);
 
         ~HotStuffBase();
 
@@ -627,6 +736,11 @@ namespace hotstuff
         void stop_proposal_timer(const uint256_t &blk_hash);
         void on_timer_expired(size_t tid, size_t epoch_nr, uint256_t blk_hash, uint32_t tree_level);
         RcObj<VoteRelay> create_partial_vote_relay(size_t tid, size_t epoch_nr, const uint256_t &blk_hash);
+
+        // Reports functions
+        void record_latency(size_t epoch_nr, size_t tid, const PeerId &peer, const uint256_t &blk_hash);
+        void on_report_timer();
+
         //------------------------------
         void close_client(ReplicaID rid);
         void open_client(ReplicaID rid);
@@ -635,16 +749,16 @@ namespace hotstuff
         void print_pipe_queues(bool printPiped, bool printRdy);
         block_t repropose_beat(const std::vector<uint256_t> &cmds);
 
-        void increment_reconfig_count() { reconfig_count++; }
-        size_t size() const { return peers.size(); }
+        void increment_reconfig_count() { reconfig_count++; };
+        size_t size() const { return peers.size(); };
         uint32_t get_blk_size() { return blk_size; };
-        const auto &get_decision_waiting() const { return decision_waiting; }
-        ThreadCall &get_tcall() { return tcall; }
-        PaceMaker *get_pace_maker() { return pmaker.get(); }
-        size_t get_total_system_trees() { return system_trees.size(); }
-        ReplicaID get_system_tree_root(int tid) { return system_trees[tid].get_tree().get_tree_root(); }
-        ReplicaID get_current_system_tree_root() { return current_tree.get_tree_root(); }
-        TreeNetwork get_current_tree_network() { return current_tree_network; }
+        const auto &get_decision_waiting() const { return decision_waiting; };
+        ThreadCall &get_tcall() { return tcall; };
+        PaceMaker *get_pace_maker() { return pmaker.get(); };
+        size_t get_total_system_trees() { return system_trees.size(); };
+        ReplicaID get_system_tree_root(int tid) { return system_trees[tid].get_tree().get_tree_root(); };
+        ReplicaID get_current_system_tree_root() { return current_tree.get_tree_root(); };
+        TreeNetwork get_current_tree_network() { return current_tree_network; };
         void print_stat() const;
         virtual void do_elected() {}
         // #ifdef HOTSTUFF_AUTOCLI
@@ -706,14 +820,16 @@ namespace hotstuff
                  pacemaker_bt pmaker,
                  EventContext ec = EventContext(),
                  size_t nworker = 4,
-                 const Net::Config &netconfig = Net::Config()) : HotStuffBase(blk_size,
-                                                                              rid,
-                                                                              new PrivKeyType(raw_privkey),
-                                                                              listen_addr,
-                                                                              std::move(pmaker),
-                                                                              ec,
-                                                                              nworker,
-                                                                              netconfig) {}
+                 const Net::Config &netconfig = Net::Config(),
+                 NetAddr reputation_addr = NetAddr()) : HotStuffBase(blk_size,
+                                                                     rid,
+                                                                     new PrivKeyType(raw_privkey),
+                                                                     listen_addr,
+                                                                     std::move(pmaker),
+                                                                     ec,
+                                                                     nworker,
+                                                                     netconfig,
+                                                                     reputation_addr) {}
 
         void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &replicas, bool ec_loop = false)
         {
@@ -748,9 +864,13 @@ namespace hotstuff
         }
 
         void set_new_epoch(std::string new_epoch)
-
         {
             HotStuffBase::set_new_epoch(new_epoch);
+        }
+
+        void set_client_ip(std::string client_ip)
+        {
+            cip = client_ip;
         }
     };
 

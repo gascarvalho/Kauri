@@ -14,6 +14,7 @@ if __name__ == "__main__":
     parser.add_argument('--tls-keygen', type=str, default='./hotstuff-tls-keygen')
     parser.add_argument('--nodes', type=str, default='nodes.txt')
     parser.add_argument('--block-size', type=int, default=1000)
+    parser.add_argument('--client-ip', type=str, default=None)
     parser.add_argument('--pace-maker', type=str, default='dummy')
     parser.add_argument('--crypto', type=str, default='bls')
     parser.add_argument('--nworker', type=int, default=6)
@@ -71,6 +72,9 @@ if __name__ == "__main__":
         main_conf.write("nworker = {}\n".format(args.nworker))
     if not (args.pace_maker is None):
         main_conf.write("pace-maker = {}\n".format(args.pace_maker))
+    if args.client_ip is not None:
+        main_conf.write("client-ip = {}\n".format(args.client_ip))
+        
 
     main_conf.write("proposer = {}\n".format(0))
     main_conf.write("fan-out = {}\n".format(args.fanout))
