@@ -40,6 +40,118 @@ namespace hotstuff
     const double ent_waiting_timeout = 10;
     const double double_inf = 1e10;
 
+    /**
+     * Kauri tree
+     * Abstraction of a tree to be used in Kauri
+     * Assumes a balanced tree of constant fanout
+     */
+    struct Tree : public Serializable
+    {
+
+        /** Identifier for the tree */
+        uint32_t tid;
+        /** Fanout of the tree */
+        uint8_t fanout;
+        /** Pipeline-stretch to use with tree*/
+        uint8_t pipe_stretch;
+        /** List containing node arrangement*/
+        std::vector<uint32_t> tree_array;
+
+    public:
+        Tree() = default;
+        Tree(const uint32_t tid,
+             const uint8_t fanout,
+             const uint8_t pipe_stretch,
+             const std::vector<uint32_t> &tree_array) : tid(tid),
+                                                        fanout(fanout),
+                                                        pipe_stretch(pipe_stretch),
+                                                        tree_array(tree_array) {}
+
+        /**
+         * Returns the tree identifier
+         */
+        const uint32_t &get_tid() const { return tid; }
+
+        /**
+         * Returns the tree fanout
+         */
+        const uint8_t &get_fanout() const { return fanout; }
+
+        /**
+         * Returns the tree pipeline-stretch
+         */
+        const uint8_t &get_pipeline_stretch() const { return pipe_stretch; }
+
+        /**
+         * Returns the tree array list
+         */
+        const std::vector<uint32_t> &get_tree_array() const
+        {
+            return tree_array;
+        }
+
+        /**
+         * Returns the size of the tree list
+         */
+        const size_t &get_tree_size() const
+        {
+            return tree_array.size();
+        }
+
+        /**
+         * Returns the size of the tree list
+         */
+        const uint32_t &get_tree_root() const
+        {
+            return tree_array[0];
+        }
+
+        void serialize(DataStream &s) const override
+        {
+            s << tid << fanout << pipe_stretch;
+
+            // Serialize the vector
+            s << htole((uint32_t)tree_array.size());
+            for (const auto &elem : tree_array)
+                s << elem;
+        }
+
+        void unserialize(DataStream &s) override
+        {
+            s >> tid >> fanout >> pipe_stretch;
+
+            // Unserialize the vector
+            uint32_t n;
+            s >> n;
+            n = letoh(n);
+            tree_array.resize(n);
+            for (auto &elem : tree_array)
+                s >> elem;
+        }
+
+        std::string get_tree_array_string()
+        {
+            DataStream s;
+            s << "{ ";
+            for (auto &elem : tree_array)
+                s << std::to_string(elem) << " ";
+            s << "}";
+            return std::string(s);
+        }
+
+        operator std::string() const
+        {
+            DataStream s;
+            s << "<tree "
+              << "tid=" << std::to_string(tid) << " "
+              << "tree_size=" << std::to_string(tree_array.size()) << " "
+              << "fanout=" << std::to_string(fanout) << " "
+              << "pipe_stretch=" << std::to_string(pipe_stretch) << " "
+              << "root_node=" << std::to_string(tree_array[0]) << ">";
+            return s;
+        }
+    };
+
     /** Struct that keeps the node's relative network information of a tree */
     struct TreeNetwork
     {
@@ -61,124 +173,19 @@ namespace hotstuff
         std::unordered_map<ReplicaID, size_t> id_to_pos_map; // Map for ReplicaID to position
     public:
         TreeNetwork() = default;
+
+        TreeNetwork(const Tree &t,
+                    const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &replicas,
+                    const uint16_t myReplicaId) : tree(t)
+        {
+            initializeTreeNetwork(replicas, myReplicaId);
+        }
+
         TreeNetwork(const Tree t,
                     const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                     const uint16_t myReplicaId) : tree(t)
         {
-
-            info << "\tTree Data: " << std::string(t) << "\n";
-
-            tree_array = tree.get_tree_array();
-
-            for (size_t i = 0; i < tree_array.size(); ++i)
-            {
-                id_to_pos_map[tree_array[i]] = i;
-            }
-
-            auto fanout = tree.get_fanout();
-            auto size = tree_array.size();
-
-            // Find my position in the tree
-            auto it = id_to_pos_map.find(myReplicaId);
-            if (it == id_to_pos_map.end())
-            {
-                throw std::invalid_argument("My ReplicaID not found in the tree array.");
-            }
-
-            myTreeId = it->second;
-            if (myTreeId != 0)
-            {
-                auto parent_idx = std::floor((myTreeId - 1) / fanout);
-                auto parent_cert_hash = std::get<2>(replicas[tree_array[parent_idx]]);
-                salticidae::PeerId parent_peer{parent_cert_hash};
-                parentPeer = parent_peer;
-                info << "\tMy parent: " << std::to_string(tree_array[parent_idx]) << "\n";
-            }
-            else
-                info << "\tI have no parent (am root)\n";
-
-            std::string tmp = "\tMy children are: ";
-            // Add every possible child, considering fanout
-            for (auto i = 1; i <= fanout; i++)
-            {
-                auto child_idx = fanout * myTreeId + i;
-
-                // If within bounds of array, child exists
-                if (child_idx < size)
-                {
-                    auto child_cert_hash = std::get<2>(replicas[tree_array[child_idx]]);
-                    salticidae::PeerId child_peer{child_cert_hash};
-                    childPeers.insert(child_peer);
-                    tmp.append(std::to_string(tree_array[child_idx])).append(", ");
-                }
-            }
-
-            if (childPeers.empty())
-            {
-                info << "\tI have no children\n";
-            }
-            else
-            {
-                tmp = tmp.substr(0, tmp.size() - 2); // Remove trailing ", "
-                info << tmp << "\n";
-            }
-
-            // Store remainder state
-            numberOfChildren = countChildren(myTreeId, size);
-            info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
-
-            info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
-            info << "\tMy ID in the tree: " << std::to_string(myTreeId) << "\n";
-
-            // auto it = std::find(tree_array.begin(), tree_array.end(), myReplicaId);
-            // auto my_idx = std::distance(tree_array.begin(), it);
-
-            // // Parent Peer (if any)
-            // if (my_idx != 0)
-            // {
-            //     auto parent_idx = std::floor((my_idx - 1) / fanout);
-            //     auto parent_cert_hash = std::move(std::get<2>(replicas[tree_array[parent_idx]]));
-            //     salticidae::PeerId parent_peer{parent_cert_hash};
-            //     parentPeer = parent_peer;
-            //     info << "\tMy parent: " << std::to_string(tree_array[parent_idx]) << "\n";
-            // }
-            // else
-            //     info << "\tI have no parent (am root)\n";
-
-            // std::string tmp = "\tMy children are: ";
-            // // Add every possible child, considering fanout
-            // for (auto i = 1; i <= fanout; i++)
-            // {
-            //     auto child_idx = fanout * my_idx + i;
-
-            //     // If within bounds of array, child exists
-            //     if (child_idx < size)
-            //     {
-            //         auto child_cert_hash = std::move(std::get<2>(replicas[tree_array[child_idx]]));
-            //         salticidae::PeerId child_peer{child_cert_hash};
-            //         childPeers.insert(child_peer);
-            //         tmp.append(std::to_string(tree_array[child_idx])).append(", ");
-            //     }
-            // }
-
-            // if (childPeers.size() == 0)
-            // {
-            //     info << "\tI have no children\n";
-            // }
-            // else
-            // {
-            //     tmp = tmp.substr(0, tmp.size() - 2);
-            //     info << tmp << "\n";
-            // }
-
-            // // Store remainder state
-
-            // numberOfChildren = countChildren(my_idx, size);
-            // info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
-
-            // myTreeId = my_idx;
-            // info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
-            // info << "\tMy ID in the tree: " << std::to_string(myTreeId) << "\n";
+            initializeTreeNetwork(replicas, myReplicaId);
         }
 
         /**
@@ -299,14 +306,85 @@ namespace hotstuff
 
             return childrenCount;
         }
+
+        void initializeTreeNetwork(const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &replicas, const uint16_t myReplicaId)
+        {
+            info << "\tTree Data: " << std::string(tree) << "\n";
+
+            tree_array = tree.get_tree_array();
+
+            for (size_t i = 0; i < tree_array.size(); ++i)
+            {
+                id_to_pos_map[tree_array[i]] = i;
+            }
+
+            auto fanout = tree.get_fanout();
+            auto size = tree_array.size();
+
+            // Find my position in the tree
+            auto it = id_to_pos_map.find(myReplicaId);
+            if (it == id_to_pos_map.end())
+            {
+                throw std::invalid_argument("My ReplicaID not found in the tree array.");
+            }
+
+            myTreeId = it->second;
+            if (myTreeId != 0)
+            {
+                auto parent_idx = std::floor((myTreeId - 1) / fanout);
+                auto parent_cert_hash = std::get<2>(replicas[tree_array[parent_idx]]);
+                salticidae::PeerId parent_peer{parent_cert_hash};
+                parentPeer = parent_peer;
+                info << "\tMy parent: " << std::to_string(tree_array[parent_idx]) << "\n";
+            }
+            else
+                info << "\tI have no parent (am root)\n";
+
+            std::string tmp = "\tMy children are: ";
+            // Add every possible child, considering fanout
+            for (auto i = 1; i <= fanout; i++)
+            {
+                auto child_idx = fanout * myTreeId + i;
+
+                // If within bounds of array, child exists
+                if (child_idx < size)
+                {
+                    auto child_cert_hash = std::get<2>(replicas[tree_array[child_idx]]);
+                    salticidae::PeerId child_peer{child_cert_hash};
+                    childPeers.insert(child_peer);
+                    tmp.append(std::to_string(tree_array[child_idx])).append(", ");
+                }
+            }
+
+            if (childPeers.empty())
+            {
+                info << "\tI have no children\n";
+            }
+            else
+            {
+                tmp = tmp.substr(0, tmp.size() - 2); // Remove trailing ", "
+                info << tmp << "\n";
+            }
+
+            // Store remainder state
+            numberOfChildren = countChildren(myTreeId, size);
+            info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
+
+            info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
+            info << "\tMy ID in the tree: " << std::to_string(myTreeId) << "\n";
+        }
     };
 
-    struct Epoch
+    struct Epoch : public Serializable
     {
 
-        uint32_t epoch_num;             // Epoch number
-        std::vector<TreeNetwork> trees; // Collection of trees
+        uint32_t epoch_num; // Epoch number
+
+        std::vector<Tree> trees;                // Collection of trees
+        std::vector<TreeNetwork> tree_networks; // Collection of trees networks
+
         mutable std::unordered_map<size_t, TreeNetwork> system_trees;
+
         DataStream info;
 
     public:
@@ -314,33 +392,71 @@ namespace hotstuff
         Epoch(uint32_t epoch_num) : epoch_num(epoch_num)
         {
         }
-        Epoch(uint32_t epoch_num, const std::vector<TreeNetwork> &trees) : epoch_num(epoch_num),
-                                                                           trees(trees)
-        {
 
-            for (const TreeNetwork &tree : trees)
-            {
-                info << "\t\t" << std::string(tree.get_tree()) << "\n";
-            }
+        Epoch(uint32_t epoch_num, const std::vector<Tree> &trees) : epoch_num(epoch_num),
+                                                                    trees(trees)
+        {
+        }
+        Epoch(uint32_t epoch_num, const std::vector<TreeNetwork> &tree_networks) : epoch_num(epoch_num),
+                                                                                   tree_networks(tree_networks)
+        {
         }
 
         const uint32_t &get_epoch_num() const { return epoch_num; }
 
-        const std::vector<TreeNetwork> &get_trees() const { return trees; }
+        const std::vector<Tree> &get_trees() const { return trees; }
+
+        const std::vector<TreeNetwork> &get_tree_networks() const { return tree_networks; }
 
         const std::unordered_map<size_t, TreeNetwork> &get_system_trees()
         {
-            for (size_t i = 0; i < trees.size(); ++i)
+            for (size_t i = 0; i < tree_networks.size(); ++i)
             {
-                system_trees[i] = trees[i];
+                system_trees[i] = tree_networks[i];
             }
 
             return system_trees;
         }
 
-        void set_trees(const std::vector<TreeNetwork> &epoch_trees)
+        void create_tree_networks(const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &replicas, const uint16_t replica_id)
         {
-            trees = epoch_trees;
+
+            for (const auto &tree : trees)
+            {
+                TreeNetwork network(tree, replicas, replica_id);
+
+                tree_networks.push_back(network);
+            }
+        }
+
+        /**
+         * Serializes the Epoch instance to a DataStream
+         */
+        void serialize(DataStream &s) const override
+        {
+            s << epoch_num;
+
+            // Serialize the vector of trees
+            s << htole((uint32_t)trees.size());
+            for (const auto &tree : trees)
+                s << tree; // Assuming Tree has a serialize method or operator<<
+        }
+
+        /**
+         * Deserializes an Epoch instance from a DataStream
+         */
+        void unserialize(DataStream &s) override
+        {
+            s >> epoch_num;
+
+            // Deserialize the vector of trees
+            uint32_t num_trees;
+            s >> num_trees;
+            num_trees = letoh(num_trees);
+
+            trees.resize(num_trees);
+            for (auto &tree : trees)
+                s >> tree; // Assuming Tree has an unserialize method or operator>>
         }
 
         operator std::string()
@@ -350,13 +466,21 @@ namespace hotstuff
 
             s << "\nEPOCH  {\n";
             s << "\t Epoch number: " << std::to_string(epoch_num) << "\n";
-            s << "\t Trees:\n"
-              << std::string(info).c_str() << "\n";
+            s << "\t Trees:\n";
+
+            // Include details from the 'trees' vector
+            for (const auto &tree : trees)
+            {
+                s << "\t\t" << std::string(tree).c_str() << "\n";
+            }
+
             s << "}";
 
             return s;
         }
     };
+
+    //-----Report Stuff---
 
     struct BlockPeerKey
     {
@@ -385,8 +509,6 @@ namespace hotstuff
         };
     };
 
-    //-----Report Stuff---
-
     struct LatMeasure
     {
         ReplicaID child;
@@ -398,6 +520,19 @@ namespace hotstuff
 
         LatMeasure(ReplicaID child, uint32_t epoch_nr, uint32_t tid, uint32_t latency_us)
             : child(child), epoch_nr(epoch_nr), tid(tid), latency_us(latency_us) {}
+    };
+
+    struct TimeoutMeasure
+    {
+        ReplicaID non_responsive_replica;
+        uint32_t epoch_nr;
+        uint32_t tid;
+        // Possibly store how long we waited, or a timestamp, or # of attempts, etc.
+
+        TimeoutMeasure() = default;
+
+        TimeoutMeasure(ReplicaID non_responsive_replica, uint32_t epoch_nr, uint32_t tid)
+            : non_responsive_replica(non_responsive_replica), epoch_nr(epoch_nr), tid(tid) {}
     };
 
     struct LatencyReport : public Serializable
@@ -445,6 +580,54 @@ namespace hotstuff
                 s >> lats[i].epoch_nr;
                 s >> lats[i].tid;
                 s >> lats[i].latency_us;
+            }
+        }
+    };
+
+    struct TimeoutReport : public Serializable
+    {
+        ReplicaID reporter;
+        std::vector<TimeoutMeasure> timeouts;
+
+        TimeoutReport() = default;
+
+        // Convenient constructor
+        TimeoutReport(ReplicaID reporter,
+                      const std::vector<TimeoutMeasure> &timeouts)
+            : reporter(reporter),
+              timeouts(timeouts)
+        {
+        }
+
+        void serialize(DataStream &s) const override
+        {
+            s << reporter;
+
+            uint32_t count = static_cast<uint32_t>(timeouts.size());
+            s << count;
+
+            for (auto &tm : timeouts)
+            {
+                s << tm.non_responsive_replica;
+                s << tm.epoch_nr;
+                s << tm.tid;
+            }
+        }
+
+        // Unserialize from a DataStream
+        void unserialize(DataStream &s) override
+        {
+            s >> reporter;
+
+            uint32_t count;
+            s >> count;
+            timeouts.resize(count);
+
+            for (uint32_t i = 0; i < count; i++)
+            {
+                s >> timeouts[i].non_responsive_replica;
+                s >> timeouts[i].epoch_nr;
+                s >> timeouts[i].tid;
             }
         }
     };
@@ -595,7 +778,7 @@ namespace hotstuff
         TimerEvent ev_end_warmup;
 
         TimerEvent ev_report_timer;
-        double report_period = 20.0;
+        double report_period = 1.0;
 
         size_t warmup_counter = 0;
 
@@ -641,11 +824,13 @@ namespace hotstuff
         // TODO: deprecated
         std::unordered_map<size_t, TreeNetwork> system_trees;
         std::unordered_set<uint256_t> pass_trought_blks;
+        std::unordered_map<uint256_t, std::set<ReplicaID>> pending_votes;
 
         // Reports stuff
         std::mutex metrics_lock;
         std::unordered_map<BlockPeerKey, struct timeval, BlockPeerKey::Hash> lat_start; // track proposal time
         std::vector<LatMeasure> peer_latencies;
+        std::vector<TimeoutMeasure> child_timeouts;
 
         NetAddr reputation_addr;
         Net::MsgNet::conn_t reputation_server_conn;
@@ -735,6 +920,7 @@ namespace hotstuff
         void start_proposal_timer(size_t tid, size_t epoch_nr, uint256_t blk_hash, double timeout_duration, size_t tree_level);
         void stop_proposal_timer(const uint256_t &blk_hash);
         void on_timer_expired(size_t tid, size_t epoch_nr, uint256_t blk_hash, uint32_t tree_level);
+        std::set<ReplicaID> find_children_who_did_not_respond(const uint256_t &blk_hash);
         RcObj<VoteRelay> create_partial_vote_relay(size_t tid, size_t epoch_nr, const uint256_t &blk_hash);
 
         // Reports functions

@@ -92,7 +92,7 @@ sleep 25
 # Start Client on all machines
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -900 --max-async 900 > clientlog${id} 2>&1 &
 
-sleep 180
+sleep 300
 
 killall hotstuff-client &
 killall hotstuff-app &

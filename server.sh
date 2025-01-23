@@ -73,10 +73,11 @@ sleep 20
 
 echo "Starting Application: #${id}" >log${id}
 
+cat hotstuff.gen.conf >>log${id}
+
 if ! [ -z "$myservice" ]; then
   echo "My Kollaps service is ${myservice}" >>log${id}
 fi
-
 
 sleep 60
 # Startup Kauri

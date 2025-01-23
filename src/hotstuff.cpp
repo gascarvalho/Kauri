@@ -262,7 +262,7 @@ namespace hotstuff
 
         auto replica_level = msg_tree.get_level(get_id());
         auto max_level = msg_tree.get_max_level();
-        auto timeout_duration = (max_level - replica_level) * 0.07;
+        auto timeout_duration = (max_level - replica_level) * 0.2;
 
         LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d out of %d", get_id(), replica_level, max_level);
 
@@ -433,6 +433,17 @@ namespace hotstuff
 
         block_t blk = get_potentially_not_delivered_blk(blk_hash);
         // AFTER HERE, BLOCK MUST BE DELIVERED ALREADY!!
+
+        auto it = pending_votes.find(blk_hash);
+        if (it != pending_votes.end())
+        {
+            it->second.erase(peer_id_map.at(peer));
+
+            if (it->second.empty())
+            {
+                pending_votes.erase(it);
+            }
+        }
 
         /** PASS-THROUGH MODE CHECK **/
         if (pass_trought_blks.count(blk_hash) > 0)
@@ -652,6 +663,16 @@ namespace hotstuff
 
         block_t blk = get_potentially_not_delivered_blk(blk_hash);
         // AFTER HERE, BLOCK MUST BE DELIVERED ALREADY!!
+
+        auto it = pending_votes.find(blk_hash);
+        if (it != pending_votes.end())
+        {
+            it->second.erase(peer_id_map.at(peer));
+            if (it->second.empty())
+            {
+                pending_votes.erase(it);
+            }
+        }
 
         // NÃO FAZ SENTIDO SE NÃO NUNCA HAVERIA UM VOTE-RELAY??
         if (blk->self_qc == nullptr)
@@ -1236,16 +1257,23 @@ namespace hotstuff
         pn.listen(listen_addr);
 
         rn.start();
-
         reputation_server_conn = rn.connect_sync(reputation_addr);
     }
 
     void HotStuffBase::do_broadcast_proposal(const Proposal &prop)
     {
         HOTSTUFF_LOG_PROTO("[BROADCASTING] Broadcasting proposal of size %llu bytes in epoch_nr:%d on tid=%d.", sizeof(prop), prop.epoch_nr, prop.tid);
-        auto childPeers = current_tree_network.get_childPeers();
 
+        auto childPeers = current_tree_network.get_childPeers();
         auto blk_hash = prop.blk->get_hash();
+
+        {
+            pending_votes[blk_hash].clear();
+            for (const PeerId &childPeer : childPeers)
+            {
+                pending_votes[blk_hash].insert(peer_id_map.at(childPeer));
+            }
+        }
 
         for (const PeerId &childPeer : childPeers)
         {
@@ -1255,9 +1283,7 @@ namespace hotstuff
             struct timeval time_start;
             gettimeofday(&time_start, nullptr);
 
-            {
-                lat_start[k] = time_start;
-            }
+            lat_start[k] = time_start;
 
             pn.send_msg(MsgPropose(prop), childPeer);
         }
@@ -1744,6 +1770,45 @@ namespace hotstuff
         // TAG THE BLOCK TO OPERATE IN A PASS-TROUGHT FASHION
         pass_trought_blks.insert(blk_hash);
 
+        // Find missing children
+        std::set<ReplicaID> missing_children = find_children_who_did_not_respond(blk_hash);
+        if (!missing_children.empty())
+        {
+            std::vector<TimeoutMeasure> timeouts;
+            for (auto &r : missing_children)
+            {
+                TimeoutMeasure tm{r, static_cast<uint32_t>(epoch_nr), static_cast<uint32_t>(tid)};
+                timeouts.push_back(tm);
+            }
+
+            // Create and send a TimeoutReport immediately
+            TimeoutReport tr{get_id(), timeouts};
+
+            if (reputation_server_conn != nullptr)
+            {
+                pn.send_msg(MsgTimeoutReport(tr), reputation_server_conn);
+                HOTSTUFF_LOG_INFO("[TIMER EXPIRY] Sent TimeoutReport for block %.10s to reputation server.", blk_hash.to_hex().c_str());
+
+                for (const auto &timeout : timeouts)
+                {
+                    HOTSTUFF_LOG_INFO("[TIMER EXPIRY] Timeout for child: replica=%d, epoch=%d, tid=%d",
+                                      timeout.non_responsive_replica,
+                                      timeout.epoch_nr,
+                                      timeout.tid);
+                }
+            }
+            else
+            {
+                HOTSTUFF_LOG_WARN("[TIMER EXPIRY] Reputation server connection is null. Cannot send timeout report.");
+            }
+
+            pending_votes.erase(blk_hash);
+        }
+        else
+        {
+            HOTSTUFF_LOG_INFO("[TIMER EXPIRY] No children timeouts for block %.10s.", blk_hash.to_hex().c_str());
+        }
+
         // Clean up the timer
         {
             std::lock_guard<std::mutex> lock(timers_mutex);
@@ -1754,6 +1819,18 @@ namespace hotstuff
                 proposal_timers.erase(it); // Remove from the map
             }
         }
+    }
+
+    std::set<ReplicaID> HotStuffBase::find_children_who_did_not_respond(const uint256_t &blk_hash)
+    {
+        auto it = pending_votes.find(blk_hash);
+
+        if (it == pending_votes.end())
+        {
+            return {};
+        }
+
+        return it->second;
     }
 
     RcObj<VoteRelay> HotStuffBase::create_partial_vote_relay(size_t tid, size_t epoch_nr, const uint256_t &blk_hash)
@@ -1853,23 +1930,34 @@ namespace hotstuff
 
     void HotStuffBase::on_report_timer()
     {
+        HOTSTUFF_LOG_INFO("[REPORT TIMER] Timer triggered for sending reports to reputation server.");
 
-        LatencyReport report(get_id(), peer_latencies);
-
-        if (reputation_server_conn != nullptr)
+        if (!peer_latencies.empty())
         {
-            rn.send_msg(MsgLatencyReport(report), reputation_server_conn);
-            HOTSTUFF_LOG_INFO("[REPORT TIMER] Sent %zu latency reports to reputation server.", peer_latencies.size());
+            HOTSTUFF_LOG_INFO("[REPORT TIMER] Preparing latency report...");
+            LatencyReport report(get_id(), peer_latencies);
+
+            if (reputation_server_conn != nullptr)
+            {
+                rn.send_msg(MsgLatencyReport(report), reputation_server_conn);
+                HOTSTUFF_LOG_INFO("[REPORT TIMER] Sent %zu latency reports to reputation server.", peer_latencies.size());
+            }
+            else
+            {
+                HOTSTUFF_LOG_WARN("[REPORT TIMER] Reputation server connection is null. Cannot send reports.");
+            }
+
+            // Clear the peer_latencies map after sending the reports
+            HOTSTUFF_LOG_INFO("[REPORT TIMER] Clearing latency records after sending.");
+            peer_latencies.clear();
         }
         else
         {
-            HOTSTUFF_LOG_WARN("[REPORT TIMER] Reputation server connection is null. Cannot send reports.");
+            HOTSTUFF_LOG_INFO("[REPORT TIMER] No latencies to report. Skipping latency report.");
         }
 
-        // Clear the peer_latencies map after sending the reports
-        peer_latencies.clear();
-
         // Schedule the next report
+        HOTSTUFF_LOG_INFO("[REPORT TIMER] Scheduling the next report in %.2f seconds.", report_period);
         ev_report_timer.add(report_period);
     }
 

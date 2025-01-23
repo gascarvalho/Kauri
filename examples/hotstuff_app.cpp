@@ -54,6 +54,7 @@ using hotstuff::EventContext;
 using hotstuff::Finality;
 using hotstuff::get_hash;
 using hotstuff::HotStuffError;
+using hotstuff::MsgDeployEpoch;
 using hotstuff::MsgReqCmd;
 using hotstuff::MsgRespCmd;
 using hotstuff::NetAddr;
@@ -93,7 +94,7 @@ class HotStuffApp : public HotStuff
     salticidae::BoxObj<salticidae::ThreadCall> resp_tcall;
     salticidae::BoxObj<salticidae::ThreadCall> req_tcall;
 
-    void client_request_cmd_handler(MsgReqCmd &&, const conn_t &);
+    void epoch_handler(MsgDeployEpoch &&, const conn_t &);
 
     static command_t parse_cmd(DataStream &s)
     {
@@ -386,19 +387,22 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
         return false; });
 
     /* register the handlers for msg from clients */
-    cn.reg_handler(salticidae::generic_bind(&HotStuffApp::client_request_cmd_handler, this, _1, _2));
+    cn.reg_handler(salticidae::generic_bind(&HotStuffApp::epoch_handler, this, _1, _2));
     cn.start();
     cn.listen(clisten_addr);
 }
 
-void HotStuffApp::client_request_cmd_handler(MsgReqCmd &&msg, const conn_t &conn)
+void HotStuffApp::epoch_handler(MsgDeployEpoch &&msg, const conn_t &conn)
 {
     const NetAddr addr = conn->get_addr();
-    auto cmd = parse_cmd(msg.serialized);
-    const auto &cmd_hash = cmd->get_hash();
-    HOTSTUFF_LOG_DEBUG("processing command %s", std::string(*cmd).c_str());
-    exec_command(cmd_hash, [this, addr](Finality fin)
-                 { resp_queue.enqueue(std::make_pair(fin, addr)); });
+
+    HOTSTUFF_LOG_INFO("RECEIVED NEW EPOCH FROM %d", addr.ip);
+
+    // auto cmd = parse_cmd(msg.serialized);
+    // const auto &cmd_hash = cmd->get_hash();
+    // HOTSTUFF_LOG_DEBUG("processing command %s", std::string(*cmd).c_str());
+    // exec_command(cmd_hash, [this, addr](Finality fin)
+    //              { resp_queue.enqueue(std::make_pair(fin, addr)); });
 }
 
 void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps)

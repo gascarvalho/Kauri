@@ -46,6 +46,48 @@ namespace hotstuff
         }
     };
 
+    struct MsgTimeoutReport
+    {
+        static const opcode_t opcode = 0x8;
+
+        DataStream serialized;
+        TimeoutReport report;
+
+        MsgTimeoutReport(const TimeoutReport &report)
+        {
+            serialized << report;
+        }
+
+        MsgTimeoutReport(DataStream &&s)
+        {
+            unserialize(std::move(s));
+        }
+
+        void unserialize(DataStream &&s)
+        {
+            report.unserialize(s);
+        }
+    };
+
+    struct MsgDeployEpoch
+    {
+        static const opcode_t opcode = 0x10;
+        DataStream serialized;
+
+        MsgDeployEpoch(const Epoch &epoch) { epoch.serialize(serialized); }
+
+        MsgDeployEpoch(DataStream &&s) : serialized(std::move(s)) {}
+
+        Epoch get_epoch() const
+        {
+            Epoch epoch;
+            DataStream s = serialized;
+            epoch.unserialize(s);
+
+            return epoch;
+        }
+    };
+
     struct MsgReqCmd
     {
         static const opcode_t opcode = 0x4;
@@ -129,7 +171,6 @@ namespace hotstuff
             return true;
         }
     };
-
 }
 
 #endif

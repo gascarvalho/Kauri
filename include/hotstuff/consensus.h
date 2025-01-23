@@ -34,8 +34,7 @@ namespace hotstuff
     struct Vote;
     struct Finality;
     struct VoteRelay;
-    struct Tree;
-
+    
     enum ReconfigurationType
     {
         NO_SWITCH, // No switch happened
@@ -532,117 +531,6 @@ namespace hotstuff
         }
     };
 
-    /**
-     * Kauri tree
-     * Abstraction of a tree to be used in Kauri
-     * Assumes a balanced tree of constant fanout
-     */
-    struct Tree : public Serializable
-    {
-
-        /** Identifier for the tree */
-        uint32_t tid;
-        /** Fanout of the tree */
-        uint8_t fanout;
-        /** Pipeline-stretch to use with tree*/
-        uint8_t pipe_stretch;
-        /** List containing node arrangement*/
-        std::vector<uint32_t> tree_array;
-
-    public:
-        Tree() = default;
-        Tree(const uint32_t tid,
-             const uint8_t fanout,
-             const uint8_t pipe_stretch,
-             const std::vector<uint32_t> &tree_array) : tid(tid),
-                                                        fanout(fanout),
-                                                        pipe_stretch(pipe_stretch),
-                                                        tree_array(tree_array) {}
-
-        /**
-         * Returns the tree identifier
-         */
-        const uint32_t &get_tid() const { return tid; }
-
-        /**
-         * Returns the tree fanout
-         */
-        const uint8_t &get_fanout() const { return fanout; }
-
-        /**
-         * Returns the tree pipeline-stretch
-         */
-        const uint8_t &get_pipeline_stretch() const { return pipe_stretch; }
-
-        /**
-         * Returns the tree array list
-         */
-        const std::vector<uint32_t> &get_tree_array() const
-        {
-            return tree_array;
-        }
-
-        /**
-         * Returns the size of the tree list
-         */
-        const size_t &get_tree_size() const
-        {
-            return tree_array.size();
-        }
-
-        /**
-         * Returns the size of the tree list
-         */
-        const uint32_t &get_tree_root() const
-        {
-            return tree_array[0];
-        }
-
-        void serialize(DataStream &s) const override
-        {
-            s << tid << fanout << pipe_stretch;
-
-            // Serialize the vector
-            s << htole((uint32_t)tree_array.size());
-            for (const auto &elem : tree_array)
-                s << elem;
-        }
-
-        void unserialize(DataStream &s) override
-        {
-            s >> tid >> fanout >> pipe_stretch;
-
-            // Unserialize the vector
-            uint32_t n;
-            s >> n;
-            n = letoh(n);
-            tree_array.resize(n);
-            for (auto &elem : tree_array)
-                s >> elem;
-        }
-
-        std::string get_tree_array_string()
-        {
-            DataStream s;
-            s << "{ ";
-            for (auto &elem : tree_array)
-                s << std::to_string(elem) << " ";
-            s << "}";
-            return std::string(s);
-        }
-
-        operator std::string() const
-        {
-            DataStream s;
-            s << "<tree "
-              << "tid=" << std::to_string(tid) << " "
-              << "tree_size=" << std::to_string(tree_array.size()) << " "
-              << "fanout=" << std::to_string(fanout) << " "
-              << "pipe_stretch=" << std::to_string(pipe_stretch) << " "
-              << "root_node=" << std::to_string(tree_array[0]) << ">";
-            return s;
-        }
-    };
 }
 
 #endif
