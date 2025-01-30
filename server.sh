@@ -84,7 +84,7 @@ sleep 60
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >> log${id} 2>&1 &
 
 # Startup Kauri (no gdb)
-./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >>log${id} 2>&1 &
+gdb -ex r -ex bt -ex q --args ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >>log${id} 2>&1 &
 
 # # Add the failure simulation for Replica 0
 if [ ${id} == 0 ]; then
@@ -114,7 +114,7 @@ fi
 # Start Client on all machines
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 50 > clientlog${id} 2>&1 &
 
-sleep 300
+sleep 600
 
 killall hotstuff-client &
 killall hotstuff-app &

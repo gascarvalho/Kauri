@@ -34,7 +34,7 @@ namespace hotstuff
     struct Vote;
     struct Finality;
     struct VoteRelay;
-    
+
     enum ReconfigurationType
     {
         NO_SWITCH, // No switch happened
@@ -133,6 +133,8 @@ namespace hotstuff
         virtual size_t get_total_system_trees() {}
         virtual ReplicaID get_system_tree_root(int tid) {}
         virtual ReplicaID get_current_system_tree_root() {}
+
+        virtual void update_system_trees() {}
 
         /** Call to set the fanout. */
         void set_fanout(int32_t fanout);

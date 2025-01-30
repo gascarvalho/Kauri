@@ -107,6 +107,17 @@ namespace hotstuff
         cmd_pending.enqueue(std::make_pair(cmd_hash, callback));
     }
 
+    void HotStuffBase::stage_epoch(Epoch &epoch)
+    {
+
+        HOTSTUFF_LOG_INFO("STORING NEW EPOCH TO BE USED IN THE FUTURE");
+
+        epoch.create_tree_networks(global_replicas, get_id());
+        epochs.push_back(epoch);
+
+        HOTSTUFF_LOG_INFO("STORED NEW EPOCH READY TO DEPLOY IT IN FUTURE BLOCK");
+    }
+
     void HotStuffBase::on_fetch_blk(const block_t &blk)
     {
 #ifdef HOTSTUFF_BLK_PROFILE
@@ -262,7 +273,7 @@ namespace hotstuff
 
         auto replica_level = msg_tree.get_level(get_id());
         auto max_level = msg_tree.get_max_level();
-        auto timeout_duration = (max_level - replica_level) * 0.2;
+        auto timeout_duration = (max_level - replica_level) * 0.1;
 
         LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d out of %d", get_id(), replica_level, max_level);
 
@@ -1264,7 +1275,7 @@ namespace hotstuff
     {
         HOTSTUFF_LOG_PROTO("[BROADCASTING] Broadcasting proposal of size %llu bytes in epoch_nr:%d on tid=%d.", sizeof(prop), prop.epoch_nr, prop.tid);
 
-        auto childPeers = current_tree_network.get_childPeers();
+        auto childPeers = epochs[prop.epoch_nr].tree_networks[prop.tid].get_childPeers();
         auto blk_hash = prop.blk->get_hash();
 
         {
@@ -1611,7 +1622,7 @@ namespace hotstuff
             // Creates a system_tree object based on a file or a an algorithm
             tree_config(std::move(global_replicas));
             // Change from here justs reads a new epoch from file
-            read_epoch_from_file(std::move(global_replicas));
+            // read_epoch_from_file(std::move(global_replicas));
         }
 
         /* Update the current tree */
@@ -1625,10 +1636,6 @@ namespace hotstuff
         /* Adjust fanout and pipeline stretch accordingly */
         config.async_blocks = current_tree.get_pipeline_stretch();
         config.fanout = current_tree.get_fanout();
-
-        /* Set when the tree will change */
-
-        is_leaf = current_tree_network.get_childPeers().empty();
 
         // if(startup) { //TODO: WARMUP PARAMETER
         //     current_tree_network.set_target(300);
@@ -1979,6 +1986,11 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::update_system_trees()
+    {
+        system_trees = epochs[pmaker->get_current_epoch()].get_system_trees();
+    }
+
     void HotStuffBase::open_client(ReplicaID rid)
     {
 
@@ -2019,8 +2031,8 @@ namespace hotstuff
             lastCheckedHeight = bheight;
         }
 
-        // if (lastCheckedHeight == 250)
-        //     return EPOCH_SWITCH;
+        if (lastCheckedHeight == 1000)
+            return EPOCH_SWITCH;
 
         if (lastCheckedHeight == current_tree_network.get_target())
             return TREE_SWITCH;
@@ -2229,7 +2241,7 @@ namespace hotstuff
         // HOTSTUFF_LOG_PROTO("[INSIDE] get_id: %d", get_id());
 
         if (proposer == get_id()) {
-            //HOTSTUFF_LOG_PROTO("BEAT AS PROPOSER");
+            HOTSTUFF_LOG_PROTO("[BEAT] Proposer ID: %d, Current Replica ID: %d", proposer, get_id());
             struct timeval timeStart, timeEnd;
             gettimeofday(&timeStart, NULL);
 
@@ -2238,6 +2250,8 @@ namespace hotstuff
             struct timeval current_time;
             gettimeofday(&current_time, NULL);
             block_t current = pmaker->get_current_proposal();
+
+            HOTSTUFF_LOG_PROTO("[BEAT] Current Proposal Block Height: %llu", current->height);
 
             if (piped_queue.size() < get_config().async_blocks && current != get_genesis()) {
                 HOTSTUFF_LOG_PROTO("[PIPELINING] Current piped queue: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);

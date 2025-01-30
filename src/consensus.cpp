@@ -277,6 +277,21 @@ namespace hotstuff
             blk->decision = 1;
             do_consensus(blk);
             LOG_PROTO("commit %s", std::string(*blk).c_str());
+
+            // Clean piped_queue if the clock were undirectly committed 
+            auto it2 = std::find(piped_queue.begin(), piped_queue.end(), blk->get_hash());
+            if (it2 != piped_queue.end())
+            {
+                // Element found, safe to erase
+                piped_queue.erase(it2);
+                HOTSTUFF_LOG_PROTO("[DEBUG] Successfully removed block hash %.10s from piped_queue", blk->get_hash().to_hex().c_str());
+            }
+            else
+            {
+                // Element not found, log for debugging
+                HOTSTUFF_LOG_PROTO("[DEBUG] Block hash %.10s not found in piped_queue, skipping erase", blk->get_hash().to_hex().c_str());
+            }
+
             decided_blk_counter++;
             for (size_t i = 0; i < blk->cmds.size(); i++)
                 do_decide(Finality(id, get_cur_epoch_nr(), get_tree_id(), 1, i, blk->height,
@@ -286,7 +301,7 @@ namespace hotstuff
         b_exec = blk;
     }
 
-    //Leader proposal
+    // Leader proposal
     block_t HotStuffCore::on_propose(const std::vector<uint256_t> &cmds,
                                      const std::vector<block_t> &parents,
                                      bytearray_t &&extra)
@@ -443,7 +458,7 @@ namespace hotstuff
 
         if (opinion && !vote_disabled)
         {
-            do_vote(prop, Vote(id, get_cur_epoch_nr(), get_tree_id(), bnew->get_hash(), create_part_cert(*priv_key, bnew->get_hash()), this));
+            do_vote(prop, Vote(id, prop.epoch_nr, prop.tid, bnew->get_hash(), create_part_cert(*priv_key, bnew->get_hash()), this));
         }
 
         // UNCOMMENT TO TEST TIMEOUT

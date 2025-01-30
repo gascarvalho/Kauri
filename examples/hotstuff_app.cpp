@@ -396,7 +396,14 @@ void HotStuffApp::epoch_handler(MsgDeployEpoch &&msg, const conn_t &conn)
 {
     const NetAddr addr = conn->get_addr();
 
-    HOTSTUFF_LOG_INFO("RECEIVED NEW EPOCH FROM %d", addr.ip);
+    HOTSTUFF_LOG_INFO("RECEIVED NEW EPOCH FROM %zu", addr.ip);
+
+    auto new_epoch = msg.get_epoch();
+
+
+    HOTSTUFF_LOG_INFO("[EPOCH HANDLER] Received new epoch %s", std::string(new_epoch).c_str());
+
+    stage_epoch(new_epoch);
 
     // auto cmd = parse_cmd(msg.serialized);
     // const auto &cmd_hash = cmd->get_hash();

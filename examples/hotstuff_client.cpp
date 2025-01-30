@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <fstream>
+#include <sstream>
 
 #include "salticidae/type.h"
 #include "salticidae/netaddr.h"
@@ -49,6 +50,8 @@ using hotstuff::MsgTimeoutReport;
 using hotstuff::NetAddr;
 using hotstuff::opcode_t;
 using hotstuff::ReplicaID;
+using hotstuff::TimeoutMeasure;
+using hotstuff::TimeoutReport;
 using hotstuff::Tree;
 using hotstuff::TreeNetwork;
 using hotstuff::uint256_t;
@@ -513,6 +516,38 @@ void try_connect_to_replicas(salticidae::TimerEvent &te, int unused)
     }
 }
 
+void replay_mock_timeouts(const std::string &file_name)
+{
+
+    std::ifstream in(file_name);
+    if (!in.is_open())
+    {
+        std::cerr << "Cannot open mock report file: " << file_name << std::endl;
+        return;
+    }
+
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.empty() || line[0] == '#')
+            continue; // skip comments
+
+        std::istringstream iss(line);
+        uint32_t reporter, target, epoch, tid;
+        char comma;
+        iss >> reporter >> comma >> target >> comma >> epoch >> comma >> tid;
+
+        TimeoutMeasure tm{target, epoch, tid};
+        std::vector<hotstuff::TimeoutMeasure> vec{tm};
+        TimeoutReport r{(ReplicaID)reporter, vec};
+
+        MsgTimeoutReport msg(std::move(r));
+
+        Net::conn_t dummy_conn = nullptr;
+        msg_timeout_report_handler(std::move(msg), dummy_conn);
+    }
+}
+
 int main(int argc, char **argv)
 {
     Config config("hotstuff.gen.conf");
@@ -523,6 +558,8 @@ int main(int argc, char **argv)
     auto opt_max_async_num = Config::OptValInt::create(10);
     auto opt_cid = Config::OptValInt::create(-1);
     auto opt_default_epoch = Config::OptValStr::create("treegen.conf");
+
+    auto opt_mock_timeouts = Config::OptValStr::create("timeouts.conf");
 
     auto shutdown = [&](int)
     { ec.stop(); };
@@ -543,6 +580,7 @@ int main(int argc, char **argv)
     config.add_opt("iter", opt_max_iter_num, Config::SET_VAL);
     config.add_opt("max-async", opt_max_async_num, Config::SET_VAL);
     config.add_opt("default_epoch", opt_default_epoch, Config::SET_VAL);
+    config.add_opt("timeouts", opt_mock_timeouts, Config::SET_VAL);
 
     config.parse(argc, argv);
 

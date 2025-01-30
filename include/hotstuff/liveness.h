@@ -363,6 +363,9 @@ namespace hotstuff
 
             current_epoch += 1;
             current_tid = 0;
+
+            HOTSTUFF_LOG_PROTO("Updating system trees");
+            hsc->update_system_trees();
         }
 
         void set_proposer(bool isTimeout, bool epoch_change)

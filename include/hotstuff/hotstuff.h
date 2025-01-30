@@ -836,8 +836,6 @@ namespace hotstuff
         Net::MsgNet::conn_t reputation_server_conn;
         Net rn = Net(ec, Net::Config());
 
-        bool is_leaf;
-
         std::vector<Epoch> epochs;
         mutable TreeNetwork current_tree_network;
         mutable Tree current_tree;
@@ -912,6 +910,8 @@ namespace hotstuff
         // Updates vars related to epoch and trees
         void change_epoch();
 
+        void stage_epoch(Epoch &epoch);
+
         // Timer-related members
         mutable std::mutex timers_mutex;                                                        ///< Mutex to protect access to proposal_timers
         std::unordered_map<uint256_t, std::shared_ptr<salticidae::TimerEvent>> proposal_timers; ///< Maps block hash to TimerEvent
@@ -926,6 +926,8 @@ namespace hotstuff
         // Reports functions
         void record_latency(size_t epoch_nr, size_t tid, const PeerId &peer, const uint256_t &blk_hash);
         void on_report_timer();
+
+        void update_system_trees();
 
         //------------------------------
         void close_client(ReplicaID rid);
