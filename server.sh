@@ -73,8 +73,6 @@ sleep 20
 
 echo "Starting Application: #${id}" >log${id}
 
-cat hotstuff.gen.conf >>log${id}
-
 if ! [ -z "$myservice" ]; then
   echo "My Kollaps service is ${myservice}" >>log${id}
 fi
@@ -84,7 +82,7 @@ sleep 60
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >> log${id} 2>&1 &
 
 # Startup Kauri (no gdb)
-gdb -ex r -ex bt -ex q --args ./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >>log${id} 2>&1 &
+./examples/hotstuff-app --conf ./hotstuff.gen-sec${id}.conf >>log${id} 2>&1 &
 
 # # Add the failure simulation for Replica 0
 if [ ${id} == 0 ]; then
@@ -114,7 +112,7 @@ fi
 # Start Client on all machines
 #gdb -ex r -ex bt -ex q --args ./examples/hotstuff-client --idx ${id} --iter -10 --max-async 50 > clientlog${id} 2>&1 &
 
-sleep 600
+sleep 650
 
 killall hotstuff-client &
 killall hotstuff-app &

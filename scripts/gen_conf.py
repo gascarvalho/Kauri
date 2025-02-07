@@ -32,7 +32,6 @@ if __name__ == "__main__":
         ips = []
         for ipEl in ipSet:
             ipElSet = ipEl.split(" ")
-            print(ipElSet)
             for x in range(int(ipElSet[1])):
                 ips.append(ipElSet[0])
 

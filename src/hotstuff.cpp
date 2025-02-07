@@ -107,13 +107,17 @@ namespace hotstuff
         cmd_pending.enqueue(std::make_pair(cmd_hash, callback));
     }
 
-    void HotStuffBase::stage_epoch(Epoch &epoch)
+    void HotStuffBase::stage_epoch(EpochReputation &epoch_repuation)
     {
 
         HOTSTUFF_LOG_INFO("STORING NEW EPOCH TO BE USED IN THE FUTURE");
 
+        auto epoch = epoch_repuation.epoch;
+
         epoch.create_tree_networks(global_replicas, get_id());
         epochs.push_back(epoch);
+
+        reputation_on_hold = epoch_repuation.repScore;
 
         HOTSTUFF_LOG_INFO("STORED NEW EPOCH READY TO DEPLOY IT IN FUTURE BLOCK");
     }
@@ -273,7 +277,7 @@ namespace hotstuff
 
         auto replica_level = msg_tree.get_level(get_id());
         auto max_level = msg_tree.get_max_level();
-        auto timeout_duration = (max_level - replica_level) * 0.1;
+        auto timeout_duration = (max_level - replica_level) * 0.5;
 
         LOG_PROTO("[PROP HANDLER] I'M REPLICA: %d, and im in level: %d out of %d", get_id(), replica_level, max_level);
 
@@ -423,6 +427,7 @@ namespace hotstuff
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
         auto numberOfChildren = msg_tree.get_numberOfChildren();
+        auto childrenSet = msg_tree.get_childrenSet();
         auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
         HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received VOTE message in epoch_nr=%d, tid=%d from ReplicaId %d for block %.10s", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), blk_hash.to_hex().c_str());
@@ -508,20 +513,20 @@ namespace hotstuff
         {
             auto &cert = blk->self_qc;
 
-            if (cert->has_n(numberOfChildren + 1))
+            if (cert->has_n(effective_required_votes(childrenSet) + 1))
             {
                 return;
             }
 
             cert->add_part(config, msg.vote.voter, *msg.vote.cert);
 
-            if (!cert->has_n(numberOfChildren + 1))
+            if (!cert->has_n(effective_required_votes(childrenSet) + 1))
             {
                 HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Not enough child votes yet for blk=%.10s; returning...", blk_hash.to_hex().c_str());
                 return;
             }
 
-            HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received all children votes (%d) + my own for blk=%.10s! Total signatures now: %d", numberOfChildren, blk_hash.to_hex().c_str(), cert->get_sigs_n());
+            HOTSTUFF_LOG_PROTO("[VOTE HANDLER] Received all children votes (%d) + my own for blk=%.10s! Total signatures now: %d", effective_required_votes(childrenSet), blk_hash.to_hex().c_str(), cert->get_sigs_n());
 
             if (!msg_tree.is_leaf())
                 stop_proposal_timer(blk_hash);
@@ -653,6 +658,7 @@ namespace hotstuff
         auto parentPeer = msg_tree.get_parentPeer();
         auto childPeers = msg_tree.get_childPeers();
         auto numberOfChildren = msg_tree.get_numberOfChildren();
+        auto childrenSet = msg_tree.get_childrenSet();
         auto tree_proposer = msg_tree.get_tree().get_tree_root();
 
         HOTSTUFF_LOG_PROTO("[RELAY HANDLER] Received VOTE-RELAY message in epoch_nr=%d, tid=%d from ReplicaId %d with a cert of size %d", msg_epoch_nr, msg_tree_id, peer_id_map.at(peer), msg.vote.cert->get_sigs_n());
@@ -791,7 +797,7 @@ namespace hotstuff
                          async_deliver_blk(v->blk_hash, peer),
                          v->cert->verify(config, vpool),
                      })
-            .then([this, blk, v = std::move(v), timeStart, tree_proposer, parentPeer, numberOfChildren, msg_tree_id, msg_epoch_nr, peer](const promise::values_t &values)
+            .then([this, blk, v = std::move(v), timeStart, tree_proposer, parentPeer, numberOfChildren, childrenSet, msg_tree_id, msg_epoch_nr, peer](const promise::values_t &values)
                   {
         struct timeval timeEnd;
 
@@ -823,7 +829,7 @@ namespace hotstuff
         if (cert != nullptr && cert->get_obj_hash() == blk->get_hash() && !cert->has_n(config.nmajority)) {
 
 
-            if (id != tree_proposer && cert->has_n(numberOfChildren + 1))
+            if (id != tree_proposer && cert->has_n(effective_required_votes(childrenSet) + 1))
             {
                 return;
             }
@@ -835,9 +841,9 @@ namespace hotstuff
             if (id != tree_proposer) {
                 
                 // If not enough, just store it and wait
-                if (!cert->has_n(numberOfChildren + 1)) 
+                if (!cert->has_n(effective_required_votes(childrenSet) + 1)) 
                 {
-                    HOTSTUFF_LOG_PROTO("[HANDLER] Still not enough child votes for block=%.10s, have %d needed=%d", blk->hash.to_hex().c_str(), cert->get_sigs_n(), numberOfChildren + 1);
+                    HOTSTUFF_LOG_PROTO("[HANDLER] Still not enough child votes for block=%.10s, have %d needed=%d", blk->hash.to_hex().c_str(), cert->get_sigs_n(), effective_required_votes(childrenSet) + 1);
                     return;
                 }
                 
@@ -1616,6 +1622,8 @@ namespace hotstuff
                     pn.add_peer(peer);
                     pn.set_peer_addr(peer, addr);
                     peer_id_map.insert(std::make_pair(peer, i));
+
+                    reputation.insert((std::make_pair(i, 0)));
                 }
             }
 
@@ -1793,7 +1801,7 @@ namespace hotstuff
 
             if (reputation_server_conn != nullptr)
             {
-                pn.send_msg(MsgTimeoutReport(tr), reputation_server_conn);
+                pn.send_msg(MsgTimeoutReport(tr, false), reputation_server_conn);
                 HOTSTUFF_LOG_INFO("[TIMER EXPIRY] Sent TimeoutReport for block %.10s to reputation server.", blk_hash.to_hex().c_str());
 
                 for (const auto &timeout : timeouts)
@@ -1988,7 +1996,63 @@ namespace hotstuff
 
     void HotStuffBase::update_system_trees()
     {
+        HOTSTUFF_LOG_INFO("[UPDATE SYSTEM TREES] Updating system trees and reputation for the new epoch");
         system_trees = epochs[pmaker->get_current_epoch()].get_system_trees();
+        reputation = reputation_on_hold;
+
+        HOTSTUFF_LOG_INFO("Reputation map updated:");
+        for (const auto &pair : reputation)
+        {
+            HOTSTUFF_LOG_INFO("Replica %d -> Reputation: %d", pair.first, pair.second);
+        }
+    }
+
+    int HotStuffBase::effective_required_votes(const std::set<ReplicaID> &expected)
+    {
+        HOTSTUFF_LOG_INFO("[REQUIRED VOTES] Checking which replicas below me are correct");
+
+        HOTSTUFF_LOG_INFO("[REQUIRED VOTES] Reputation state at function start:");
+        for (const auto &rep_entry : reputation)
+        {
+            HOTSTUFF_LOG_INFO("ReplicaID: %d, Reputation Score: %d", rep_entry.first, rep_entry.second);
+        }
+
+        // Debug: Display the set of replicas being considered
+        HOTSTUFF_LOG_INFO("[REQUIRED VOTES] Set of replicas to check:");
+        for (ReplicaID rep : expected)
+        {
+            HOTSTUFF_LOG_INFO("ReplicaID: %d", rep);
+        }
+
+        int count = 0;
+        // Debug: Track replicas that pass the predicate
+        HOTSTUFF_LOG_INFO("Checking each replica's reputation threshold...");
+
+        for (ReplicaID rep : expected)
+        {
+            auto it = reputation.find(rep);
+            if (it != reputation.end() && it->second >= 0.0)
+            {
+                HOTSTUFF_LOG_INFO("ReplicaID %d passed the reputation check with score: %df", rep, it->second);
+                count++;
+            }
+            else
+            {
+                if (it == reputation.end())
+                {
+                    HOTSTUFF_LOG_INFO("ReplicaID %d not found in reputation map.", rep);
+                }
+                else
+                {
+                    HOTSTUFF_LOG_INFO("ReplicaID %d failed the reputation check with score: %.2f", rep, it->second);
+                }
+            }
+        }
+
+        // Debug: Final result
+        HOTSTUFF_LOG_INFO("Effective required votes count: %d", count);
+
+        return count;
     }
 
     void HotStuffBase::open_client(ReplicaID rid)

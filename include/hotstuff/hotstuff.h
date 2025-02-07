@@ -147,7 +147,18 @@ namespace hotstuff
               << "tree_size=" << std::to_string(tree_array.size()) << " "
               << "fanout=" << std::to_string(fanout) << " "
               << "pipe_stretch=" << std::to_string(pipe_stretch) << " "
-              << "root_node=" << std::to_string(tree_array[0]) << ">";
+              << "root_node=" << std::to_string(tree_array[0]) << " "
+              << "tree_array=[ ";
+
+            // Add each element of tree_array to the string
+            for (size_t i = 0; i < tree_array.size(); i++)
+            {
+                s << std::to_string(tree_array[i]);
+                if (i != tree_array.size() - 1)
+                    s << ", "; // Add a comma between elements, but not after the last one
+            }
+
+            s << " ]>";
             return s;
         }
     };
@@ -167,6 +178,7 @@ namespace hotstuff
         uint16_t numberOfChildren;           // How many children I have
         DataStream info;                     // Debug info
         size_t switchTarget;                 // The block height at which to switch this tree
+        std::set<ReplicaID> childrenSet;
 
     private:
         std::vector<uint32_t> tree_array;                    // Member variable to store the tree array
@@ -200,6 +212,8 @@ namespace hotstuff
         const std::set<PeerId> &get_childPeers() const { return childPeers; }
 
         const uint16_t &get_numberOfChildren() const { return numberOfChildren; }
+
+        const std::set<ReplicaID> &get_childrenSet() const { return childrenSet; }
 
         const size_t &get_target() const { return switchTarget; }
 
@@ -307,6 +321,30 @@ namespace hotstuff
             return childrenCount;
         }
 
+        std::set<ReplicaID> collectChildren(int index, int treeSize)
+        {
+            std::set<ReplicaID> childrenSet;
+            auto fanout = tree.get_fanout();
+
+            for (int i = 1; i <= fanout; i++)
+            {
+                auto child_idx = fanout * index + i;
+
+                // If within bounds of array, child exists
+                if (child_idx < treeSize)
+                {
+                    // Add the child's ReplicaID to the set
+                    childrenSet.insert(tree_array[child_idx]);
+
+                    // Recursively collect the children's subtree ReplicaIDs
+                    std::set<ReplicaID> subtreeChildren = collectChildren(child_idx, treeSize);
+                    childrenSet.insert(subtreeChildren.begin(), subtreeChildren.end());
+                }
+            }
+
+            return childrenSet;
+        }
+
         void initializeTreeNetwork(const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &replicas, const uint16_t myReplicaId)
         {
             info << "\tTree Data: " << std::string(tree) << "\n";
@@ -368,6 +406,7 @@ namespace hotstuff
 
             // Store remainder state
             numberOfChildren = countChildren(myTreeId, size);
+            childrenSet = collectChildren(myTreeId, size);
             info << "\tTotal children in my subtree: " << std::to_string(numberOfChildren) << "\n";
 
             info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
@@ -476,6 +515,64 @@ namespace hotstuff
 
             s << "}";
 
+            return s;
+        }
+    };
+
+    struct EpochReputation : public Serializable
+    {
+
+        Epoch epoch;
+        std::unordered_map<ReplicaID, int> repScore;
+
+    public:
+        EpochReputation() = default;
+
+        EpochReputation(const Epoch &epoch, const std::unordered_map<ReplicaID, int> &repScore)
+            : epoch(epoch), repScore(repScore) {}
+
+        const std::unordered_map<ReplicaID, int> &get_reputation() const { return repScore; }
+
+        void serialize(DataStream &s) const override
+        {
+            epoch.serialize(s);
+            uint32_t mapSize = repScore.size();
+            s << htole(mapSize);
+            for (const auto &p : repScore)
+            {
+                s << p.first << p.second;
+            }
+        }
+
+        void unserialize(DataStream &s) override
+        {
+            epoch.unserialize(s);
+
+            uint32_t mapSize;
+            s >> mapSize;
+            mapSize = letoh(mapSize);
+
+            repScore.clear();
+            for (uint32_t i = 0; i < mapSize; i++)
+            {
+                ReplicaID id;
+                int score;
+                s >> id >> score;
+
+                repScore[id] = score;
+            }
+        }
+
+        operator std::string() const
+        {
+            DataStream s;
+
+            s << "Epoch number: " << epoch.get_epoch_num() << "\nReputation: ";
+
+            for (const auto &p : repScore)
+            {
+                s << "(" << p.first << ": " << p.second << ") ";
+            }
             return s;
         }
     };
@@ -832,6 +929,9 @@ namespace hotstuff
         std::vector<LatMeasure> peer_latencies;
         std::vector<TimeoutMeasure> child_timeouts;
 
+        std::unordered_map<ReplicaID, int> reputation;
+        std::unordered_map<ReplicaID, int> reputation_on_hold;
+
         NetAddr reputation_addr;
         Net::MsgNet::conn_t reputation_server_conn;
         Net rn = Net(ec, Net::Config());
@@ -910,7 +1010,7 @@ namespace hotstuff
         // Updates vars related to epoch and trees
         void change_epoch();
 
-        void stage_epoch(Epoch &epoch);
+        void stage_epoch(EpochReputation &epoch_reputation);
 
         // Timer-related members
         mutable std::mutex timers_mutex;                                                        ///< Mutex to protect access to proposal_timers
@@ -928,6 +1028,8 @@ namespace hotstuff
         void on_report_timer();
 
         void update_system_trees();
+
+        int effective_required_votes(const std::set<ReplicaID> &expected);
 
         //------------------------------
         void close_client(ReplicaID rid);

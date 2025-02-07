@@ -42,9 +42,11 @@ using salticidae::Config;
 
 using hotstuff::command_t;
 using hotstuff::Epoch;
+using hotstuff::EpochReputation;
 using hotstuff::EventContext;
 using hotstuff::HotStuffError;
 using hotstuff::MsgDeployEpoch;
+using hotstuff::MsgDeployEpochReputation;
 using hotstuff::MsgLatencyReport;
 using hotstuff::MsgTimeoutReport;
 using hotstuff::NetAddr;
@@ -64,6 +66,7 @@ uint32_t cid;
 uint32_t cnt = 0;
 uint32_t f;
 Epoch current_epoch;
+bool mock_mode;
 
 struct Request
 {
@@ -325,6 +328,7 @@ Epoch generate_and_evaluate_epoch(
         {
             best_score = cand_score;
             best_epoch = candidate;
+            break;
         }
     }
 
@@ -401,19 +405,28 @@ std::pair<std::string, std::string> split_ip_port_cport(const std::string &s)
     return std::make_pair(ret[0], ret[1]);
 }
 
-void broadcast_epoch(const Epoch &epoch)
+void broadcast_epoch(Epoch &epoch)
 {
 
-    for (const auto &[replica_id, conn] : conns)
+    if (mock_mode)
     {
-        if (conn != nullptr)
+        std::cout << "New epoch generated:\n"
+                  << std::string(epoch).c_str()
+                  << std::endl;
+    }
+    else
+    {
+        for (const auto &[replica_id, conn] : conns)
         {
-            mn.send_msg(MsgDeployEpoch(epoch), conn);
-            HOTSTUFF_LOG_INFO("Broadcasted epoch to replica %u", replica_id);
-        }
-        else
-        {
-            HOTSTUFF_LOG_WARN("Failed to broadcast epoch to replica %u: not connected", replica_id);
+            if (conn != nullptr)
+            {
+                mn.send_msg(MsgDeployEpochReputation(EpochReputation(epoch, rep_score)), conn);
+                HOTSTUFF_LOG_INFO("Broadcasted epoch to replica %u", replica_id);
+            }
+            else
+            {
+                HOTSTUFF_LOG_WARN("Failed to broadcast epoch to replica %u: not connected", replica_id);
+            }
         }
     }
 }
@@ -533,15 +546,16 @@ void replay_mock_timeouts(const std::string &file_name)
             continue; // skip comments
 
         std::istringstream iss(line);
-        uint32_t reporter, target, epoch, tid;
+        ReplicaID reporter, target;
+        uint32_t epoch, tid;
         char comma;
         iss >> reporter >> comma >> target >> comma >> epoch >> comma >> tid;
 
         TimeoutMeasure tm{target, epoch, tid};
-        std::vector<hotstuff::TimeoutMeasure> vec{tm};
-        TimeoutReport r{(ReplicaID)reporter, vec};
+        std::vector<TimeoutMeasure> vec{tm};
+        TimeoutReport r{reporter, vec};
 
-        MsgTimeoutReport msg(std::move(r));
+        MsgTimeoutReport msg(std::move(r), true);
 
         Net::conn_t dummy_conn = nullptr;
         msg_timeout_report_handler(std::move(msg), dummy_conn);
@@ -556,9 +570,10 @@ int main(int argc, char **argv)
     auto opt_replicas = Config::OptValStrVec::create();
     auto opt_max_iter_num = Config::OptValInt::create(100);
     auto opt_max_async_num = Config::OptValInt::create(10);
+    auto opt_mock_mode = Config::OptValFlag::create(true);
+
     auto opt_cid = Config::OptValInt::create(-1);
     auto opt_default_epoch = Config::OptValStr::create("treegen.conf");
-
     auto opt_mock_timeouts = Config::OptValStr::create("timeouts.conf");
 
     auto shutdown = [&](int)
@@ -579,12 +594,15 @@ int main(int argc, char **argv)
     config.add_opt("replica", opt_replicas, Config::APPEND);
     config.add_opt("iter", opt_max_iter_num, Config::SET_VAL);
     config.add_opt("max-async", opt_max_async_num, Config::SET_VAL);
+    config.add_opt("mock", opt_mock_mode, Config::SET_VAL);
     config.add_opt("default_epoch", opt_default_epoch, Config::SET_VAL);
     config.add_opt("timeouts", opt_mock_timeouts, Config::SET_VAL);
 
     config.parse(argc, argv);
 
-    HOTSTUFF_LOG_INFO("Reading epoch from %s", opt_default_epoch->get());
+    mock_mode = opt_mock_mode->get();
+
+    HOTSTUFF_LOG_INFO("Reading epoch from %s", opt_default_epoch->get().c_str());
 
     current_epoch = parse_default_epoch_config(opt_default_epoch->get());
 
@@ -628,23 +646,30 @@ int main(int argc, char **argv)
     f = (replicas.size() - 1) / 3;
     HOTSTUFF_LOG_INFO("nfaulty = %zu", f);
 
-    // for (size_t i = 0; i < replicas.size(); i++)
-    //     conns.insert(std::make_pair(i, mn.connect_sync(replicas[i])));
-
-    // Initialize the connection status map
-    for (size_t i = 0; i < replicas.size(); i++)
-    {
-        replica_connected[i] = false; // Mark all replicas as not connected
-    }
-
-    // Schedule the connection retries
-    ev_connect_timer = salticidae::TimerEvent(ec, std::bind(&try_connect_to_replicas, std::placeholders::_1, 0));
-    ev_connect_timer.add(90.0); // Start retrying 2 seconds after startup
-
     // Initialize rep_score to 0 for every replica (ID in [0..replicas.size()-1])
     for (size_t i = 0; i < replicas.size(); i++)
     {
         rep_score[i] = 0; // start from zero
+    }
+
+    // for (size_t i = 0; i < replicas.size(); i++)
+    //     conns.insert(std::make_pair(i, mn.connect_sync(replicas[i])));
+
+    if (mock_mode)
+    {
+        replay_mock_timeouts(opt_mock_timeouts->get());
+    }
+    else
+    {
+        // Initialize the connection status map
+        for (size_t i = 0; i < replicas.size(); i++)
+        {
+            replica_connected[i] = false; // Mark all replicas as not connected
+        }
+
+        // Schedule the connection retries
+        ev_connect_timer = salticidae::TimerEvent(ec, std::bind(&try_connect_to_replicas, std::placeholders::_1, 0));
+        ev_connect_timer.add(90.0); // Start retrying 2 seconds after startup
     }
 
     ec.dispatch();

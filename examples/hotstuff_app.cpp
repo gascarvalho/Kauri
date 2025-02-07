@@ -55,6 +55,7 @@ using hotstuff::Finality;
 using hotstuff::get_hash;
 using hotstuff::HotStuffError;
 using hotstuff::MsgDeployEpoch;
+using hotstuff::MsgDeployEpochReputation;
 using hotstuff::MsgReqCmd;
 using hotstuff::MsgRespCmd;
 using hotstuff::NetAddr;
@@ -94,7 +95,7 @@ class HotStuffApp : public HotStuff
     salticidae::BoxObj<salticidae::ThreadCall> resp_tcall;
     salticidae::BoxObj<salticidae::ThreadCall> req_tcall;
 
-    void epoch_handler(MsgDeployEpoch &&, const conn_t &);
+    void epoch_handler(MsgDeployEpochReputation &&, const conn_t &);
 
     static command_t parse_cmd(DataStream &s)
     {
@@ -392,18 +393,17 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
     cn.listen(clisten_addr);
 }
 
-void HotStuffApp::epoch_handler(MsgDeployEpoch &&msg, const conn_t &conn)
+void HotStuffApp::epoch_handler(MsgDeployEpochReputation &&msg, const conn_t &conn)
 {
     const NetAddr addr = conn->get_addr();
 
     HOTSTUFF_LOG_INFO("RECEIVED NEW EPOCH FROM %zu", addr.ip);
 
-    auto new_epoch = msg.get_epoch();
+    auto epoch_reputation = msg.get_epoch_reputation();
 
+    HOTSTUFF_LOG_INFO("[EPOCH HANDLER] Received new epoch %s", std::string(epoch_reputation.epoch).c_str());
 
-    HOTSTUFF_LOG_INFO("[EPOCH HANDLER] Received new epoch %s", std::string(new_epoch).c_str());
-
-    stage_epoch(new_epoch);
+    stage_epoch(epoch_reputation);
 
     // auto cmd = parse_cmd(msg.serialized);
     // const auto &cmd_hash = cmd->get_hash();

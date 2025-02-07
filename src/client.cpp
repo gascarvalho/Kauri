@@ -22,6 +22,7 @@ namespace hotstuff
     const opcode_t MsgLatencyReport::opcode;
     const opcode_t MsgTimeoutReport::opcode;
     const opcode_t MsgDeployEpoch::opcode;
+    const opcode_t MsgDeployEpochReputation::opcode;
 
     // const opcode_t MsgReqCmd::opcode;
     // const opcode_t MsgRespCmd::opcode;

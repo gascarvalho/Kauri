@@ -59,38 +59,28 @@ for LINE in $FLINES; do
     for container in $(docker ps -q -f name="server"); do
       replica_index=$((replica_index + 1))
 
-      if [ ! $(docker exec -it $container bash -c "cd MSc-Kauri && test -e log*") ]; then
+      # Check if any file matching log* exists in MSc-Kauri
+      docker exec -i "$container" bash -c "cd MSc-Kauri && ls log*" >/dev/null 2>&1
+      if [ $? -eq 0 ]; then
         REPLICA_LOG_FILE="${REPLICA_LOG_FOLDER}/log_${TIMESTAMP}_${replica_index}.txt"
-        docker exec -it $container bash -c "cd MSc-Kauri && cat log*" >$REPLICA_LOG_FILE
+        docker exec -i "$container" bash -c "cd MSc-Kauri && cat log*" >"$REPLICA_LOG_FILE"
+      else
+        logger "No client log files found in client container $container"
       fi
     done
 
     for container in $(docker ps -q -f name="client"); do
-      #add iterator
-
-      if [ ! $(docker exec -it $container bash -c "cd MSc-Kauri && test -e clientlog*") ]; then
+      # Check if any file matching clientlog* exists in MSc-Kauri
+      docker exec -i "$container" bash -c "cd MSc-Kauri && ls clientlog*" >/dev/null 2>&1
+      if [ $? -eq 0 ]; then
         CLIENT_LOG_FILE="${CLIENT_LOG_FOLDER}/clientlog_${TIMESTAMP}_999.txt"
-        docker exec -it $container bash -c "cd MSc-Kauri && cat clientlog*" >$CLIENT_LOG_FILE
+        docker exec -i "$container" bash -c "cd MSc-Kauri && cat clientlog*" >"$CLIENT_LOG_FILE"
+      else
+        logger "No client log files found in client container $container"
       fi
     done
 
     docker stack rm kauriservice
-
-    # Rename replica log files to have correct replica name
-    while IFS= read -r log_file; do
-      replica_index=$(grep -o "ReplicaID [0-9]\+" "$log_file" | grep -o '[0-9]\+' | tail -n 1)
-      if [ -n "$replica_index" ]; then
-        mv "$log_file" "$REPLICA_LOG_FOLDER/log_${TIMESTAMP}_r${replica_index}.txt"
-      fi
-    done < <(find "$REPLICA_LOG_FOLDER" -regextype posix-egrep -regex '.*_[0-9]+\.txt')
-
-    #Rename client log files to have correct replica name
-    while IFS= read -r log_file; do
-      replica_index=$(grep -o "I am client with id = [0-9]\+" "$log_file" | grep -o '[0-9]\+' | tail -n 1)
-      if [ -n "$replica_index" ]; then
-        mv "$log_file" "$CLIENT_LOG_FOLDER/clientlog_${TIMESTAMP}_c${replica_index}.txt"
-      fi
-    done < <(find "$CLIENT_LOG_FOLDER" -regextype posix-egrep -regex '.*_[0-9]+\.txt')
 
     sleep 30
   done

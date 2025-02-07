@@ -53,9 +53,16 @@ namespace hotstuff
         DataStream serialized;
         TimeoutReport report;
 
-        MsgTimeoutReport(const TimeoutReport &report)
+        MsgTimeoutReport(const TimeoutReport &report, bool mock)
         {
-            serialized << report;
+            if (mock)
+            {
+                this->report = report;
+            }
+            else
+            {
+                serialized << report;
+            }
         }
 
         MsgTimeoutReport(DataStream &&s)
@@ -85,6 +92,25 @@ namespace hotstuff
             epoch.unserialize(s);
 
             return epoch;
+        }
+    };
+
+    struct MsgDeployEpochReputation
+    {
+        static const opcode_t opcode = 0x11;
+        DataStream serialized;
+
+        MsgDeployEpochReputation(const EpochReputation &er) { er.serialize(serialized); }
+
+        MsgDeployEpochReputation(DataStream &&s) : serialized(std::move(s)) {}
+
+        EpochReputation get_epoch_reputation() const
+        {
+            EpochReputation epoch_reputation;
+            DataStream s = serialized;
+            epoch_reputation.unserialize(s);
+
+            return epoch_reputation;
         }
     };
 
