@@ -139,6 +139,60 @@ namespace hotstuff
             return std::string(s);
         }
 
+        size_t get_node_position(ReplicaID node) const
+        {
+            for (size_t i = 0; i < tree_array.size(); i++)
+            {
+                if (tree_array[i] == node)
+                    return i;
+            }
+            return tree_array.size();
+        }
+
+        bool is_parent_of(ReplicaID potentialParent, ReplicaID potentialChild) const
+        {
+            size_t childPos = get_node_position(potentialChild);
+
+            if (childPos == 0 || childPos >= tree_array.size())
+                return false;
+
+            size_t parentPos = (childPos - 1) / fanout;
+
+            return (tree_array[parentPos] == potentialParent);
+        }
+
+        bool violates_votes_constraint(const std::set<std::pair<ReplicaID, ReplicaID>> &constraints) const
+        {
+
+            for (const auto &pair : constraints)
+            {
+                ReplicaID reporter = pair.first;
+                ReplicaID target = pair.second;
+
+                if (is_parent_of(reporter, target) || is_parent_of(target, reporter))
+                    return true;
+            }
+
+            return false;
+        }
+
+        size_t get_height() const
+        {
+            if (tree_array.empty())
+                return 0;
+
+            size_t height = 0;
+            size_t capacity = 1;
+
+            while (capacity < tree_array.size())
+            {
+                height++;
+                capacity *= fanout;
+            }
+
+            return height;
+        }
+
         operator std::string() const
         {
             DataStream s;
@@ -619,17 +673,25 @@ namespace hotstuff
             : child(child), epoch_nr(epoch_nr), tid(tid), latency_us(latency_us) {}
     };
 
+    enum TimeoutReportType
+    {
+        CHILD_TIMEOUT = 0, // A direct timeout (child did not respond)
+        MISSING_VOTE = 1   // A missing vote: e.g., a child did not forward the vote of one of its children (i.e. a grandchild's vote is missing)
+    };
+
     struct TimeoutMeasure
     {
         ReplicaID non_responsive_replica;
         uint32_t epoch_nr;
         uint32_t tid;
+
+        ReplicaID missing_voter;
         // Possibly store how long we waited, or a timestamp, or # of attempts, etc.
 
         TimeoutMeasure() = default;
 
-        TimeoutMeasure(ReplicaID non_responsive_replica, uint32_t epoch_nr, uint32_t tid)
-            : non_responsive_replica(non_responsive_replica), epoch_nr(epoch_nr), tid(tid) {}
+        TimeoutMeasure(ReplicaID non_responsive_replica, uint32_t epoch_nr, uint32_t tid, ReplicaID missing_voter)
+            : non_responsive_replica(non_responsive_replica), epoch_nr(epoch_nr), tid(tid), missing_voter(missing_voter) {}
     };
 
     struct LatencyReport : public Serializable
@@ -708,6 +770,7 @@ namespace hotstuff
                 s << tm.non_responsive_replica;
                 s << tm.epoch_nr;
                 s << tm.tid;
+                s << tm.missing_voter;
             }
         }
 
@@ -725,6 +788,7 @@ namespace hotstuff
                 s >> timeouts[i].non_responsive_replica;
                 s >> timeouts[i].epoch_nr;
                 s >> timeouts[i].tid;
+                s >> timeouts[i].missing_voter;
             }
         }
     };

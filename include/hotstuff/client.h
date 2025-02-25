@@ -26,6 +26,15 @@
 namespace hotstuff
 {
 
+    struct CollectedReport
+    {
+        ReplicaID reporter;
+        ReplicaID target;
+        ReplicaID missing_voter; // if equal to target: direct report; otherwise: indirect report.
+        uint32_t epoch;
+        uint32_t tid;
+    };
+
     struct MsgLatencyReport
     {
         static const opcode_t opcode = 0x7;

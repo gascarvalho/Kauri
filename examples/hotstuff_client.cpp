@@ -23,6 +23,9 @@
 #include <fstream>
 #include <sstream>
 
+#include <cstdlib> // For rand(), RAND_MAX
+#include <ctime>   // For time() - to seed the random generator
+
 #include "salticidae/type.h"
 #include "salticidae/netaddr.h"
 #include "salticidae/network.h"
@@ -40,6 +43,7 @@
 
 using salticidae::Config;
 
+using hotstuff::CollectedReport;
 using hotstuff::command_t;
 using hotstuff::Epoch;
 using hotstuff::EpochReputation;
@@ -84,15 +88,26 @@ std::unordered_map<const uint256_t, Request> waiting_finalized;
 std::unordered_map<const uint256_t, Request> waiting;
 std::vector<NetAddr> replicas;
 std::vector<std::pair<struct timeval, double>> elapsed;
+
+std::unordered_map<uint32_t, std::vector<CollectedReport>> reportsByTid;
+
 Net mn(ec, Net::Config());
 
 // Delay connectio to replicas
 std::unordered_map<ReplicaID, bool> replica_connected;
 
 // Reputation metrics
-std::unordered_map<ReplicaID, int> rep_score;
+std::unordered_map<ReplicaID, double> rep_score;
 // For each "suspected" node, store a set of reporter IDs who alleged it timed out
 std::unordered_map<ReplicaID, std::unordered_set<ReplicaID>> timeout_evidence;
+
+// Global structure to store votes received per node in the current epoch.
+std::unordered_map<ReplicaID, std::set<ReplicaID>> votesReceived;
+
+// Global structure to store votes issued by each node in the current epoch.
+std::unordered_map<ReplicaID, std::set<ReplicaID>> votesIssued;
+
+std::set<std::pair<ReplicaID, ReplicaID>> tree_contraints;
 
 std::unordered_map<ReplicaID, int> reporter_trust;
 
@@ -100,9 +115,42 @@ std::unordered_map<ReplicaID, int> reporter_trust;
 static salticidae::TimerEvent ev_epoch_timer;
 static salticidae::TimerEvent ev_connect_timer;
 
+const double delta = 1.0;
+
+// Helper function to log the entire reputation table.
+void log_reputation_table()
+{
+    std::ostringstream oss;
+
+    oss << "Current Reputation Table: \n";
+
+    for (const auto &p : rep_score)
+    {
+        oss << "[Replica " << p.first << ": " << p.second << "]\n";
+    }
+
+    HOTSTUFF_LOG_INFO("%s", oss.str().c_str());
+}
+
 void msg_reports_handler(MsgLatencyReport &&msg, const Net::conn_t &conn)
 {
     /*Later we will use this i trust*/
+}
+
+void process_report(ReplicaID reporter, ReplicaID target)
+{
+
+    if (votesReceived[target].find(reporter) != votesReceived[target].end())
+    {
+        HOTSTUFF_LOG_INFO("[REPORT] Duplicate report: Reporter %d already reported Target %d. Ignored.", reporter, target);
+    }
+
+    votesReceived[target].insert(reporter);
+
+    rep_score[reporter] -= delta;
+    rep_score[target] -= delta;
+
+    HOTSTUFF_LOG_INFO("[REPORT] Reporter %d -> Target %d. Decrease both by %.2f", reporter, target, delta);
 }
 
 void msg_timeout_report_handler(MsgTimeoutReport &&msg, const Net::conn_t &conn)
@@ -116,48 +164,25 @@ void msg_timeout_report_handler(MsgTimeoutReport &&msg, const Net::conn_t &conn)
 
     for (auto &tm : timeouts)
     {
-        ReplicaID target = tm.non_responsive_replica;
 
-        timeout_evidence[target].insert(reporter);
+        CollectedReport cr;
 
-        HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Replica %d reported timeout for %d", reporter, target);
+        cr.reporter = reporter;
+        cr.target = tm.non_responsive_replica;
+        cr.epoch = tm.epoch_nr;
+        cr.tid = tm.tid;
+        cr.missing_voter = tm.missing_voter;
 
-        if (timeout_evidence[target].size() >= f + 1)
-        {
-
-            rep_score[target] -= 5;
-
-            timeout_evidence[target].clear();
-
-            HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Confirmed multi-source timeout for replica %d, new rep_score=%d", target, rep_score[target]);
-        }
-        else
-        {
-            HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Timeout evidence for replica %d: %zu/%d reporters", target, timeout_evidence[target].size(), f + 1);
-        }
+        reportsByTid[cr.tid].push_back(cr);
     }
 }
 
-/** ------------------------------------------------------------
- * Simplified Tree Generation:
- *   place worst f nodes as leaves, random-shuffle the rest
- * ------------------------------------------------------------
- */
-
-/**
- * Build a single Tree by:
- * 1) Sort all_nodes by ascending reputation
- * 2) The first 'f' nodes in that sorted list -> "lowest rep"
- * 3) The rest -> "better"
- * 4) random shuffle "better", then append "lowest rep" at the end
- *    => The BFS array means last 'f' are leaves, the rest are internal
- */
-Tree build_single_tree_simpler(
+Tree tree_generator(
     uint32_t tid,
     uint8_t fanout,
     uint8_t pipe_stretch,
     const std::vector<uint32_t> &all_nodes,
-    const std::unordered_map<ReplicaID, int> &rep_score,
+    const std::unordered_map<ReplicaID, double> &rep_score,
     int f)
 {
     std::vector<uint32_t> sorted_nodes(all_nodes.begin(), all_nodes.end());
@@ -172,23 +197,18 @@ Tree build_single_tree_simpler(
                   auto itb = rep_score.find(b);
                   if (itb != rep_score.end())
                       rb = itb->second;
-                  return ra < rb; // ascending
+                  return ra < rb;
               });
 
     if ((int)sorted_nodes.size() < f)
     {
-        // edge case: if we have fewer than f nodes, just do a random shuffle
-        // or handle differently
         std::random_shuffle(sorted_nodes.begin(), sorted_nodes.end());
         return Tree(tid, fanout, pipe_stretch, sorted_nodes);
     }
 
-    // Extract the lowest f
     std::vector<uint32_t> lowrep(sorted_nodes.begin(), sorted_nodes.begin() + f);
-    // The rest
     std::vector<uint32_t> better(sorted_nodes.begin() + f, sorted_nodes.end());
 
-    // Shuffle the better portion
     std::random_shuffle(better.begin(), better.end());
 
     std::vector<uint32_t> tree_array;
@@ -200,62 +220,80 @@ Tree build_single_tree_simpler(
         tree_array.push_back(n);
 
     HOTSTUFF_LOG_INFO("[TREE GEN] Tree %d built with BFS array of size %zu", tid, tree_array.size());
+
     for (size_t i = 0; i < tree_array.size(); i++)
     {
-        HOTSTUFF_LOG_INFO("[TREE GEN] Node %d at BFS index %zu, rep_score = %d", tree_array[i], i, rep_score.at(tree_array[i]));
+        HOTSTUFF_LOG_INFO("[TREE GEN] Node %d at BFS index %zu, rep_score = %.2f", tree_array[i], i, rep_score.at(tree_array[i]));
     }
 
-    // Construct a Tree
     return Tree(tid, fanout, pipe_stretch, tree_array);
 }
 
-/**
- * Generate a new Epoch with `num_trees` trees,
- * each built by the simpler approach of:
- *  - taking the f worst nodes as leaves,
- *  - random shuffling the rest as root & internal
- */
-Epoch simpler_epoch_generation(
-    const std::unordered_map<ReplicaID, int> &rep_score,
+Tree constraint_tree(
+    uint32_t tid,
+    uint8_t fanout,
+    uint8_t pipe_stretch,
+    const std::vector<uint32_t> &all_nodes,
+    const std::unordered_map<ReplicaID, double> &rep_score,
+    int f,
+    int maxAttempts = 10)
+{
+
+    Tree candidateTree;
+    int attempt = 0;
+    bool valid = false;
+
+    while (attempt < maxAttempts && !valid)
+    {
+        candidateTree = tree_generator(tid, fanout, pipe_stretch, all_nodes, rep_score, f);
+
+        if (!candidateTree.violates_votes_constraint(tree_contraints))
+        {
+            valid = true;
+        }
+        else
+        {
+            HOTSTUFF_LOG_INFO("[TREE GEN] Candidate tree (attempt %d) violates votes constraint. Retrying...", attempt);
+            attempt++;
+        }
+    }
+
+    if (!valid)
+        HOTSTUFF_LOG_WARN("[TREE GEN] Failed to generate a candidate tree without reported direct relationships after %d attempts.", maxAttempts);
+
+    return candidateTree;
+}
+
+Epoch epoch_generator(
+    const std::unordered_map<ReplicaID, double> &rep_score,
     const std::vector<uint32_t> &all_nodes,
     int num_trees,
     uint8_t fanout,
     uint8_t pipe_stretch,
     int f)
 {
-    Epoch ep;
-    ep.epoch_num = 0; // set to an appropriate value if needed
+    Epoch new_epoch;
+    new_epoch.epoch_num = current_epoch.epoch_num + 1;
 
     for (int t = 0; t < num_trees; t++)
     {
-        // build one tree with the simpler approach
-        Tree new_tree = build_single_tree_simpler(
-            /*tid=*/t,
+        Tree new_tree = constraint_tree(
+            t, /*tid=*/
             fanout,
             pipe_stretch,
             all_nodes,
             rep_score,
             f);
 
-        ep.trees.push_back(new_tree);
+        new_epoch.trees.push_back(new_tree);
     }
 
     HOTSTUFF_LOG_INFO("[EPOCH GEN] Generated epoch with %d trees", num_trees);
 
-    return ep;
+    return new_epoch;
 }
 
-/** ------------------------------------------------------------
- * Evaluate (score) an epoch
- * ------------------------------------------------------------
- */
-
-/**
- * Score function:
- * For each Tree, interpret the tree_array as BFS order.
- * The root is weighted 3, next layer weighted 2, subsequent layers weighted 1.
- */
-double score_epoch(const Epoch &epoch, const std::unordered_map<ReplicaID, int> &rep_score)
+double score_epoch(const Epoch &epoch, const std::unordered_map<ReplicaID, double> &rep_score)
 {
     double total_score = 0.0;
 
@@ -265,7 +303,7 @@ double score_epoch(const Epoch &epoch, const std::unordered_map<ReplicaID, int> 
         const auto &arr = tree.get_tree_array();
 
         size_t idx = 0;
-        size_t layer_num = 0; // 0 => root
+        size_t layer_num = 0;
         size_t layer_size = 1;
         uint8_t fan = tree.get_fanout();
 
@@ -281,7 +319,7 @@ double score_epoch(const Epoch &epoch, const std::unordered_map<ReplicaID, int> 
                     node_rep = it->second;
                 }
 
-                int weight = std::max(3 - static_cast<int>(layer_num), 1);
+                int weight = std::max(static_cast<int>(tree.get_height()) - static_cast<int>(layer_num), 1);
                 tree_score += node_rep * weight;
             }
             layer_num++;
@@ -294,17 +332,8 @@ double score_epoch(const Epoch &epoch, const std::unordered_map<ReplicaID, int> 
     return total_score;
 }
 
-/** ------------------------------------------------------------
- * Example Heuristic "Generate-and-Evaluate" if needed
- * ------------------------------------------------------------
- */
-
-/**
- * Attempt up to max_tries to generate an epoch that is better
- * than old_epoch by at least improvement_needed, using simpler approach.
- */
 Epoch generate_and_evaluate_epoch(
-    const std::unordered_map<ReplicaID, int> &rep_score,
+    const std::unordered_map<ReplicaID, double> &rep_score,
     const Epoch &old_epoch,
     const std::vector<uint32_t> &all_nodes,
     int num_trees,
@@ -320,7 +349,7 @@ Epoch generate_and_evaluate_epoch(
     for (int t = 0; t < max_tries; t++)
     {
         // generate a candidate
-        Epoch candidate = simpler_epoch_generation(rep_score, all_nodes, num_trees, fanout, pipe_stretch, f);
+        Epoch candidate = epoch_generator(rep_score, all_nodes, num_trees, fanout, pipe_stretch, f);
 
         double cand_score = score_epoch(candidate, rep_score);
 
@@ -331,8 +360,6 @@ Epoch generate_and_evaluate_epoch(
             break;
         }
     }
-
-    best_epoch.epoch_num = old_epoch.get_epoch_num() + 1;
 
     return best_epoch;
 }
@@ -420,7 +447,7 @@ void broadcast_epoch(Epoch &epoch)
         {
             if (conn != nullptr)
             {
-                mn.send_msg(MsgDeployEpochReputation(EpochReputation(epoch, rep_score)), conn);
+                // mn.send_msg(MsgDeployEpochReputation(EpochReputation(epoch, rep_score)), conn);
                 HOTSTUFF_LOG_INFO("Broadcasted epoch to replica %u", replica_id);
             }
             else
@@ -431,14 +458,132 @@ void broadcast_epoch(Epoch &epoch)
     }
 }
 
+
+size_t get_level(const Tree &tree, size_t pos)
+{
+    if (pos >= tree.get_tree_array().size() || pos == 0)
+        return 0;
+    double m = static_cast<double>(tree.get_fanout());
+    return static_cast<size_t>(std::floor(std::log(pos + 1) / std::log(m)));
+}
+
+std::vector<CollectedReport> process_missing_voter_chain(const Tree &tree, ReplicaID missingVoter, const std::vector<CollectedReport> &reportsForX)
+{
+    // Sort reportsForX by reporter depth descending (deepest first)
+    std::vector<CollectedReport> sortedReports = reportsForX;
+    std::sort(sortedReports.begin(), sortedReports.end(), [&](const CollectedReport &a, const CollectedReport &b)
+              {
+                size_t posA = tree.get_node_position(a.reporter);
+                size_t posB = tree.get_node_position(b.reporter);
+                return get_level(tree, posA) > get_level(tree, posB); });
+
+    if (sortedReports.empty())
+        return sortedReports;
+
+    // Start from the deepest report.
+    std::vector<CollectedReport> useful;
+
+    CollectedReport current = sortedReports[0];
+
+    HOTSTUFF_LOG_INFO("[CHAIN] Storing processing for missing voter %d from reporter %d to target %d", missingVoter, current.reporter, current.target);
+
+    useful.push_back(current);
+
+    HOTSTUFF_LOG_INFO("[CHAIN] Starting chain processing for missing voter %d from reporter %d", missingVoter, current.reporter);
+    size_t pos = tree.get_node_position(current.reporter);
+
+    while (pos > 0 && pos < tree.get_tree_array().size())
+    {
+        size_t parentPos = (pos - 1) / tree.get_fanout();
+        ReplicaID parent = tree.get_tree_array()[parentPos];
+
+        bool found = false;
+        for (const auto &r : sortedReports)
+        {
+            if (r.reporter == parent)
+            {
+                found = true;
+
+                HOTSTUFF_LOG_INFO("[CHAIN] Found report from parent %d in chain for missing voter %d", parent, missingVoter);
+                break;
+            }
+        }
+        if (!found)
+        {
+            rep_score[parent] -= delta;
+            HOTSTUFF_LOG_INFO("[CHAIN] Missing report: Penalizing expected parent %d for missing voter %d, penalty = %.2f", parent, missingVoter, delta);
+        }
+
+        pos = parentPos;
+    }
+
+    return useful;
+}
+
+void process_reports_for_tid(uint32_t tid)
+{
+    auto &reports = reportsByTid[tid];
+
+    HOTSTUFF_LOG_INFO("[PROCESS] Processing reports for tree id %d. Total reports = %zu", tid, reports.size());
+
+    // Group reports by missing voter.
+    std::unordered_map<ReplicaID, std::vector<CollectedReport>> reportsByMissing;
+    for (const auto &r : reports)
+    {
+        reportsByMissing[r.missing_voter].push_back(r);
+    }
+
+    const Tree &tree = current_epoch.get_trees()[tid];
+
+    std::vector<CollectedReport> filtered;
+
+    // For each missing voter, process the chain.
+    for (const auto &entry : reportsByMissing)
+    {
+        ReplicaID missingVoter = entry.first;
+
+        const std::vector<CollectedReport> &reportsForX = entry.second;
+
+        HOTSTUFF_LOG_INFO("[PROCESS] Processing chain for missing voter %d in tree %d, with %zu reports.", missingVoter, tid, reportsForX.size());
+
+        auto chainReports = process_missing_voter_chain(tree, missingVoter, reportsForX);
+
+        filtered.insert(filtered.end(), chainReports.begin(), chainReports.end());
+    }
+
+    // After chain processing, process each report normally.
+    for (const auto &r : filtered)
+    {
+        tree_contraints.insert(std::pair(r.reporter, r.target));
+        process_report(r.reporter, r.target);
+        HOTSTUFF_LOG_INFO("[PROCESS] Processed report: Reporter %d -> Target %d", r.reporter, r.target);
+    }
+}
+
+void process_all_reports()
+{
+
+    for (auto &entry : reportsByTid)
+    {
+        uint32_t tid = entry.first;
+        process_reports_for_tid(tid);
+    }
+
+    reportsByTid.clear();
+
+    log_reputation_table();
+}
+
 void on_epoch_timer(salticidae::TimerEvent &te, int unused)
 {
+
+    process_all_reports();
 
     Epoch old_epoch = current_epoch;
 
     double improvement_needed = 0.0;
     int max_tries = 5;
-    int num_trees = 4;
+    int num_trees = 1;
     uint8_t fanout = 2;
     uint8_t pipe_stretch = 2;
 
@@ -546,12 +691,14 @@ void replay_mock_timeouts(const std::string &file_name)
             continue; // skip comments
 
         std::istringstream iss(line);
-        ReplicaID reporter, target;
-        uint32_t epoch, tid;
-        char comma;
-        iss >> reporter >> comma >> target >> comma >> epoch >> comma >> tid;
 
-        TimeoutMeasure tm{target, epoch, tid};
+        ReplicaID reporter, target, missing_voter;
+        uint32_t epoch, tid;
+
+        char comma;
+        iss >> reporter >> comma >> target >> comma >> epoch >> comma >> tid >> comma >> missing_voter;
+
+        TimeoutMeasure tm{target, epoch, tid, missing_voter};
         std::vector<TimeoutMeasure> vec{tm};
         TimeoutReport r{reporter, vec};
 
@@ -564,6 +711,8 @@ void replay_mock_timeouts(const std::string &file_name)
 
 int main(int argc, char **argv)
 {
+    srand(static_cast<unsigned int>(time(nullptr)));
+
     Config config("hotstuff.gen.conf");
 
     auto opt_idx = Config::OptValInt::create(0);
@@ -574,7 +723,7 @@ int main(int argc, char **argv)
 
     auto opt_cid = Config::OptValInt::create(-1);
     auto opt_default_epoch = Config::OptValStr::create("treegen.conf");
-    auto opt_mock_timeouts = Config::OptValStr::create("timeouts.conf");
+    auto opt_mock_timeouts = Config::OptValStr::create("timeouts4.conf");
 
     auto shutdown = [&](int)
     { ec.stop(); };
@@ -608,7 +757,7 @@ int main(int argc, char **argv)
 
     ev_epoch_timer = salticidae::TimerEvent(ec, std::bind(&on_epoch_timer, std::placeholders::_1, 0));
     // start it (e.g. in 30s)
-    ev_epoch_timer.add(30);
+    ev_epoch_timer.add(5);
 
     HOTSTUFF_LOG_INFO("%s\n", std::string(current_epoch).c_str());
 
@@ -649,7 +798,7 @@ int main(int argc, char **argv)
     // Initialize rep_score to 0 for every replica (ID in [0..replicas.size()-1])
     for (size_t i = 0; i < replicas.size(); i++)
     {
-        rep_score[i] = 0; // start from zero
+        rep_score[i] = 0.0; // start from zero
     }
 
     // for (size_t i = 0; i < replicas.size(); i++)

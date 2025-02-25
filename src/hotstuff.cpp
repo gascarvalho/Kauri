@@ -1792,7 +1792,7 @@ namespace hotstuff
             std::vector<TimeoutMeasure> timeouts;
             for (auto &r : missing_children)
             {
-                TimeoutMeasure tm{r, static_cast<uint32_t>(epoch_nr), static_cast<uint32_t>(tid)};
+                TimeoutMeasure tm{r, static_cast<uint32_t>(epoch_nr), static_cast<uint32_t>(tid), 0};
                 timeouts.push_back(tm);
             }
 
