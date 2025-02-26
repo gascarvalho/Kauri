@@ -25,6 +25,11 @@
 
 namespace hotstuff
 {
+    enum ReportType
+    {
+        MISSING_VOTE,
+        MISSING_PROPOSAL
+    };
 
     struct CollectedReport
     {
@@ -33,6 +38,7 @@ namespace hotstuff
         ReplicaID missing_voter; // if equal to target: direct report; otherwise: indirect report.
         uint32_t epoch;
         uint32_t tid;
+        ReportType report_type;
     };
 
     struct MsgLatencyReport

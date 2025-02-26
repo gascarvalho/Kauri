@@ -158,7 +158,7 @@ namespace hotstuff
 
             size_t parentPos = (childPos - 1) / fanout;
 
-            return (tree_array[parentPos] == potentialParent);
+            return tree_array[parentPos] == potentialParent;
         }
 
         bool violates_votes_constraint(const std::set<std::pair<ReplicaID, ReplicaID>> &constraints) const
@@ -671,12 +671,6 @@ namespace hotstuff
 
         LatMeasure(ReplicaID child, uint32_t epoch_nr, uint32_t tid, uint32_t latency_us)
             : child(child), epoch_nr(epoch_nr), tid(tid), latency_us(latency_us) {}
-    };
-
-    enum TimeoutReportType
-    {
-        CHILD_TIMEOUT = 0, // A direct timeout (child did not respond)
-        MISSING_VOTE = 1   // A missing vote: e.g., a child did not forward the vote of one of its children (i.e. a grandchild's vote is missing)
     };
 
     struct TimeoutMeasure
