@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <error.h>
+#include <cstdio>
 #include "salticidae/util.h"
 #include "hotstuff/crypto.h"
 
@@ -37,11 +37,15 @@ int main(int argc, char **argv) {
         priv_key = new hotstuff::PrivKeySecp256k1();
     else if (algo == "bls")
         priv_key = new hotstuff::PrivKeyBLS();
-    else
-        error(1, 0, "algo not supported");
+    else {
+        std::fprintf(stderr, "algo not supported\n");
+        return 1;
+    }
     int n = opt_n->get();
-    if (n < 1)
-        error(1, 0, "n must be >0");
+    if (n < 1) {
+        std::fprintf(stderr, "n must be >0\n");
+        return 1;
+    }
     while (n--)
     {
         priv_key->from_rand();

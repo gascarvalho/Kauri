@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cassert>
 #include <algorithm>
+#include <csignal>
 #include <random>
 #include <unistd.h>
 #include <signal.h>
@@ -51,6 +52,7 @@ using hotstuff::command_t;
 using hotstuff::CommandDummy;
 using hotstuff::DataStream;
 using hotstuff::EventContext;
+using hotstuff::EpochProtocolMode;
 using hotstuff::Finality;
 using hotstuff::get_hash;
 using hotstuff::HotStuffError;
@@ -70,7 +72,6 @@ using HotStuff = hotstuff::HotStuffAgg;
 class HotStuffApp : public HotStuff
 {
     double stat_period;
-    double impeach_timeout;
     EventContext ec;
     EventContext req_ec;
     EventContext resp_ec;
@@ -78,10 +79,10 @@ class HotStuffApp : public HotStuff
     ClientNetwork<opcode_t> cn;
     /** Timer object to schedule a periodic printing of system statistics */
     TimerEvent ev_stat_timer;
-    /** Timer object to monitor the progress for simple impeachment */
-    TimerEvent impeach_timer;
     /** The listen address for client RPC */
     NetAddr clisten_addr;
+    std::string adaptive_epoch_file;
+    std::uint64_t adaptive_activation_height{0};
 
     std::unordered_map<const uint256_t, promise_t> unconfirmed;
 
@@ -104,16 +105,9 @@ class HotStuffApp : public HotStuff
         return cmd;
     }
 
-    void reset_imp_timer()
-    {
-        impeach_timer.del();
-        impeach_timer.add(impeach_timeout);
-    }
-
     void state_machine_execute(const Finality &fin) override
     {
         HOTSTUFF_LOG_DEBUG("executing command: %s", std::string(fin));
-        reset_imp_timer();
     }
 
 #ifdef HOTSTUFF_MSG_STAT
@@ -124,7 +118,6 @@ class HotStuffApp : public HotStuff
 public:
     HotStuffApp(uint32_t blk_size,
                 double stat_period,
-                double impeach_timeout,
                 ReplicaID idx,
                 const bytearray_t &raw_privkey,
                 NetAddr plisten_addr,
@@ -134,7 +127,8 @@ public:
                 size_t nworker,
                 const Net::Config &repnet_config,
                 const ClientNetwork<opcode_t>::Config &clinet_config,
-                NetAddr reputation_addr);
+                NetAddr reputation_addr,
+                EpochProtocolMode protocol_mode);
 
     void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps);
     void set_fanout(int32_t fanout);
@@ -142,6 +136,9 @@ public:
     void set_tree_period(size_t nblocks);
     void set_tree_generation(std::string genAlgo, std::string fpath);
     void set_new_epoch(std::string new_epoch);
+    void set_adaptive_bootstrap(
+        std::string epoch_file,
+        std::uint64_t activation_height);
     void set_client_ip(std::string client_ip);
     void stop();
 };
@@ -158,6 +155,7 @@ salticidae::BoxObj<HotStuffApp> papp = nullptr;
 
 int main(int argc, char **argv)
 {
+    std::signal(SIGPIPE, SIG_IGN);
     Config config("hotstuff.gen.conf");
 
     ElapsedTime elapsed;
@@ -179,6 +177,9 @@ int main(int argc, char **argv)
     auto opt_base_timeout = Config::OptValDouble::create(10);
     auto opt_prop_delay = Config::OptValDouble::create(1);
     auto opt_imp_timeout = Config::OptValDouble::create(10);
+    auto opt_aggregation_timeout = Config::OptValDouble::create(0.5);
+    auto opt_leader_progress_timeout = Config::OptValDouble::create(20);
+    auto opt_leader_activation_grace = Config::OptValDouble::create(5);
     auto opt_nworker = Config::OptValInt::create(2);
     auto opt_repnworker = Config::OptValInt::create(2);
     auto opt_repburst = Config::OptValInt::create(10000);
@@ -197,6 +198,10 @@ int main(int argc, char **argv)
     auto opt_tree_generation_fpath = Config::OptValStr::create("treegen.conf");
 
     auto opt_new_epoch = Config::OptValStr::create("newepoch.conf");
+    auto opt_epoch_protocol_mode =
+        Config::OptValStr::create("legacy_static");
+    auto opt_adaptive_epoch_file = Config::OptValStr::create("");
+    auto opt_adaptive_activation_height = Config::OptValInt::create(20);
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
     config.add_opt("client-ip", opt_client_ip, Config::SET_VAL);
@@ -213,6 +218,9 @@ int main(int argc, char **argv)
     config.add_opt("base-timeout", opt_base_timeout, Config::SET_VAL, 't', "set the initial timeout for the Round-Robin Pacemaker");
     config.add_opt("prop-delay", opt_prop_delay, Config::SET_VAL, 't', "set the delay that follows the timeout for the Round-Robin Pacemaker");
     config.add_opt("imp-timeout", opt_imp_timeout, Config::SET_VAL, 'u', "set impeachment timeout (for sticky)");
+    config.add_opt("aggregation-timeout", opt_aggregation_timeout, Config::SET_VAL, -1, "per-level aggregation timeout in seconds");
+    config.add_opt("leader-progress-timeout", opt_leader_progress_timeout, Config::SET_VAL, -1, "leader progress timeout in seconds");
+    config.add_opt("leader-activation-grace", opt_leader_activation_grace, Config::SET_VAL, -1, "new leader activation grace in seconds");
     config.add_opt("nworker", opt_nworker, Config::SET_VAL, 'n', "the number of threads for verification");
     config.add_opt("repnworker", opt_repnworker, Config::SET_VAL, 'm', "the number of threads for replica network");
     config.add_opt("repburst", opt_repburst, Config::SET_VAL, 'b', "");
@@ -231,6 +239,24 @@ int main(int argc, char **argv)
     config.add_opt("tree-generation-fpath", opt_tree_generation_fpath, Config::SET_VAL, 'g', "File path for the tree generation when file is selected");
 
     config.add_opt("new-epoch", opt_new_epoch, Config::SET_VAL, 'e', "File with new epoch configuration");
+    config.add_opt(
+        "epoch-protocol-mode",
+        opt_epoch_protocol_mode,
+        Config::SET_VAL,
+        -1,
+        "epoch protocol mode (legacy_static, adaptive_v1)");
+    config.add_opt(
+        "adaptive-epoch-file",
+        opt_adaptive_epoch_file,
+        Config::SET_VAL,
+        -1,
+        "trusted-local successor epoch tree file");
+    config.add_opt(
+        "adaptive-activation-height",
+        opt_adaptive_activation_height,
+        Config::SET_VAL,
+        -1,
+        "committed height for trusted-local epoch activation");
 
     EventContext ec;
     config.parse(argc, argv);
@@ -252,6 +278,16 @@ int main(int argc, char **argv)
 
     if (!(0 <= idx && (size_t)idx < replicas.size()))
         throw HotStuffError("replica idx out of range");
+
+    EpochProtocolMode epoch_protocol_mode;
+    if (opt_epoch_protocol_mode->get() == "legacy_static")
+        epoch_protocol_mode = EpochProtocolMode::legacy_static;
+    else if (opt_epoch_protocol_mode->get() == "adaptive_v1")
+        epoch_protocol_mode = EpochProtocolMode::adaptive_v1;
+    else
+        throw HotStuffError("invalid epoch protocol mode");
+    if (opt_adaptive_activation_height->get() < 0)
+        throw HotStuffError("adaptive activation height must be non-negative");
     std::string binding_addr = std::get<0>(replicas[idx]);
     if (client_port == -1)
     {
@@ -274,7 +310,13 @@ int main(int argc, char **argv)
     if (opt_pace_maker->get() == "dummy")
     {
         HOTSTUFF_LOG_PROTO("Starting Pacemaker as a dummy!");
-        pmaker = new hotstuff::PaceMakerMultitree(ec, parent_limit, opt_base_timeout->get(), opt_prop_delay->get());
+        pmaker = new hotstuff::PaceMakerMultitree(
+            ec,
+            parent_limit,
+            opt_base_timeout->get(),
+            opt_prop_delay->get(),
+            opt_leader_progress_timeout->get(),
+            opt_leader_activation_grace->get());
     }
     else
     {
@@ -305,7 +347,6 @@ int main(int argc, char **argv)
         .nworker(opt_clinworker->get());
     papp = new HotStuffApp(opt_blk_size->get(),
                            opt_stat_period->get(),
-                           opt_imp_timeout->get(),
                            idx,
                            hotstuff::from_hex(opt_privkey->get()),
                            plisten_addr,
@@ -315,7 +356,8 @@ int main(int argc, char **argv)
                            opt_nworker->get(),
                            repnet_config,
                            clinet_config,
-                           NetAddr(opt_client_ip->get(), 50500));
+                           NetAddr(opt_client_ip->get(), 50500),
+                           epoch_protocol_mode);
 
     std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> reps;
     for (auto &r : replicas)
@@ -332,6 +374,11 @@ int main(int argc, char **argv)
     papp->set_tree_generation(opt_tree_generation->get(), opt_tree_generation_fpath->get());
     papp->set_tree_period(opt_tree_switch_period->get());
     papp->set_new_epoch(opt_new_epoch->get());
+    papp->set_adaptive_bootstrap(
+        opt_adaptive_epoch_file->get(),
+        static_cast<std::uint64_t>(
+            opt_adaptive_activation_height->get()));
+    papp->set_aggregation_timeout(opt_aggregation_timeout->get());
 
     HOTSTUFF_LOG_INFO("*** thread info ***");
     HOTSTUFF_LOG_INFO("Verification workers = %lu", opt_nworker->get());
@@ -354,7 +401,6 @@ int main(int argc, char **argv)
 
 HotStuffApp::HotStuffApp(uint32_t blk_size,
                          double stat_period,
-                         double impeach_timeout,
                          ReplicaID idx,
                          const bytearray_t &raw_privkey,
                          NetAddr plisten_addr,
@@ -364,9 +410,9 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
                          size_t nworker,
                          const Net::Config &repnet_config,
                          const ClientNetwork<opcode_t>::Config &clinet_config,
-                         NetAddr reputation_addr) : HotStuff(blk_size, idx, raw_privkey, plisten_addr, std::move(pmaker), ec, nworker, repnet_config, reputation_addr),
+                         NetAddr reputation_addr,
+                         EpochProtocolMode protocol_mode) : HotStuff(blk_size, idx, raw_privkey, plisten_addr, std::move(pmaker), ec, nworker, repnet_config, reputation_addr, protocol_mode),
                                                     stat_period(stat_period),
-                                                    impeach_timeout(impeach_timeout),
                                                     ec(ec),
                                                     cn(req_ec, clinet_config),
                                                     clisten_addr(clisten_addr)
@@ -421,17 +467,21 @@ void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytea
         //HotStuffCore::prune(100);
         ev_stat_timer.add(stat_period); });
     ev_stat_timer.add(stat_period);
-    impeach_timer = TimerEvent(ec, [this](TimerEvent &)
-                               {
-            if (get_decision_waiting().size())
-                get_pace_maker()->impeach();
-            reset_imp_timer(); });
-    impeach_timer.add(impeach_timeout);
     HOTSTUFF_LOG_INFO("** starting the system with parameters **");
     HOTSTUFF_LOG_INFO("blk_size = %lu", blk_size);
     HOTSTUFF_LOG_INFO("conns = %lu", HotStuff::size());
     HOTSTUFF_LOG_INFO("** starting the event loop...");
     HotStuff::start(reps);
+    if (!adaptive_epoch_file.empty() &&
+        !bootstrap_adaptive_epoch_from_file(
+            adaptive_epoch_file, adaptive_activation_height))
+    {
+        HOTSTUFF_LOG_WARN(
+            "KAURI_DEMO fatal replica=%u reason=bootstrap_failed",
+            get_id());
+        throw HotStuffError(
+            "failed to stage and arm trusted-local adaptive epoch");
+    }
     cn.reg_conn_handler([this](const salticidae::ConnPool::conn_t &_conn, bool connected)
                         {
         auto conn = salticidae::static_pointer_cast<conn_t::type>(_conn);
@@ -507,4 +557,12 @@ void HotStuffApp::set_tree_generation(std::string genAlgo, std::string fpath)
 void HotStuffApp::set_new_epoch(std::string new_epoch)
 {
     HotStuff::set_new_epoch(new_epoch);
+}
+
+void HotStuffApp::set_adaptive_bootstrap(
+    std::string epoch_file,
+    std::uint64_t activation_height)
+{
+    adaptive_epoch_file = std::move(epoch_file);
+    adaptive_activation_height = activation_height;
 }

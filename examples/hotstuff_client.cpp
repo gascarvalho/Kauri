@@ -22,6 +22,7 @@
 #include <sys/time.h>
 #include <fstream>
 #include <sstream>
+#include <csignal>
 
 #include <cstdlib> // For rand(), RAND_MAX
 #include <ctime>   // For time() - to seed the random generator
@@ -772,6 +773,7 @@ void replay_mock_timeouts(const std::string &file_name)
 
 int main(int argc, char **argv)
 {
+    std::signal(SIGPIPE, SIG_IGN);
     srand(static_cast<unsigned int>(time(nullptr)));
 
     Config config("hotstuff.gen.conf");

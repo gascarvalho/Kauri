@@ -44,3 +44,10 @@ scripts/re
 scripts/subprocess
 
 scripts/graphing
+
+# Local adaptive runtime artifacts
+/.DS_Store
+/build-adaptive/
+/results/
+/.venv-adaptive/
+/.pytest_cache/

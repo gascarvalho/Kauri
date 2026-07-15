@@ -22,12 +22,20 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <future>
+#include <functional>
 
 #include "salticidae/util.h"
 #include "salticidae/network.h"
 #include "salticidae/msg.h"
 #include "hotstuff/util.h"
+#include "hotstuff/aggregation.h"
+#include "hotstuff/block_delivery_orchestration.h"
 #include "hotstuff/consensus.h"
+#include "hotstuff/exact_vote_handler.h"
+#include "hotstuff/epoch_live_binding.h"
+#include "hotstuff/epoch_runtime_wiring.h"
+#include "hotstuff/pending_exact_contribution_buffer.h"
+#include "hotstuff/proposal_admission.h"
 
 namespace hotstuff
 {
@@ -247,6 +255,17 @@ namespace hotstuff
             initializeTreeNetwork(replicas, myReplicaId);
         }
 
+        TreeNetwork(const Tree &t,
+                    const ReplicaConfig &replicas,
+                    const ReplicaID myReplicaId) : tree(t)
+        {
+            initializeTreeNetwork(
+                [&replicas](ReplicaID replica) {
+                    return replicas.get_peer_id(replica);
+                },
+                myReplicaId);
+        }
+
         TreeNetwork(const Tree t,
                     const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                     const uint16_t myReplicaId) : tree(t)
@@ -399,7 +418,10 @@ namespace hotstuff
             return childrenSet;
         }
 
-        void initializeTreeNetwork(const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &replicas, const uint16_t myReplicaId)
+        template<typename PeerResolver>
+        void initializeTreeNetwork(
+            PeerResolver peer_for,
+            const ReplicaID myReplicaId)
         {
             info << "\tTree Data: " << std::string(tree) << "\n";
 
@@ -424,9 +446,7 @@ namespace hotstuff
             if (myTreeId != 0)
             {
                 auto parent_idx = std::floor((myTreeId - 1) / fanout);
-                auto parent_cert_hash = std::get<2>(replicas[tree_array[parent_idx]]);
-                salticidae::PeerId parent_peer{parent_cert_hash};
-                parentPeer = parent_peer;
+                parentPeer = peer_for(tree_array[parent_idx]);
                 info << "\tMy parent: " << std::to_string(tree_array[parent_idx]) << "\n";
             }
             else
@@ -441,9 +461,7 @@ namespace hotstuff
                 // If within bounds of array, child exists
                 if (child_idx < size)
                 {
-                    auto child_cert_hash = std::get<2>(replicas[tree_array[child_idx]]);
-                    salticidae::PeerId child_peer{child_cert_hash};
-                    childPeers.insert(child_peer);
+                    childPeers.insert(peer_for(tree_array[child_idx]));
                     tmp.append(std::to_string(tree_array[child_idx])).append(", ");
                 }
             }
@@ -465,6 +483,17 @@ namespace hotstuff
 
             info << "\tMy ReplicaID: " << std::to_string(myReplicaId) << "\n";
             info << "\tMy ID in the tree: " << std::to_string(myTreeId) << "\n";
+        }
+
+        void initializeTreeNetwork(
+            const std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &replicas,
+            const ReplicaID myReplicaId)
+        {
+            initializeTreeNetwork(
+                [&replicas](ReplicaID replica) {
+                    return PeerId{std::get<2>(replicas.at(replica))};
+                },
+                myReplicaId);
         }
     };
 
@@ -572,6 +601,53 @@ namespace hotstuff
             return s;
         }
     };
+
+    /**
+     * Find a message tree without indexing untrusted identifiers or
+     * populating Epoch::system_trees. The returned pointer refers to the
+     * immutable tree_networks entry owned by epochs.
+     */
+    const TreeNetwork *find_message_tree(const std::vector<Epoch> &epochs,
+                                         uint32_t epoch_nr,
+                                         uint32_t tree_id) noexcept;
+
+    /**
+     * Event-loop admission checks shared by the real handlers and socket-free
+     * tests. cryptographically_verified is the immutable result returned by
+     * the verification worker; these functions never perform cryptography or
+     * mutate consensus state.
+     */
+    bool admit_verified_vote(const ReplicaConfig &config,
+                             uint32_t expected_epoch,
+                             const TreeNetwork &tree,
+                             const PeerId &authenticated_peer,
+                             const Vote &vote,
+                             bool cryptographically_verified) noexcept;
+
+    bool admit_verified_relay(const ReplicaConfig &config,
+                              uint32_t expected_epoch,
+                              const TreeNetwork &tree,
+                              const PeerId &authenticated_peer,
+                              const VoteRelay &relay,
+                              bool cryptographically_verified) noexcept;
+
+    /**
+     * Start vote/certificate verification and referenced-block delivery once,
+     * then enter the event-loop continuation only after both succeed. The
+     * overloads are intentionally narrow so tests can exercise the same
+     * asynchronous boundary used by the production handlers without sockets.
+     */
+    promise_t coordinate_verified_delivery(
+        const Vote &message,
+        std::function<promise_t()> start_worker_verification,
+        std::function<promise_t()> start_block_delivery,
+        std::function<void(const block_t &)> continuation);
+
+    promise_t coordinate_verified_delivery(
+        const VoteRelay &message,
+        std::function<promise_t()> start_worker_verification,
+        std::function<promise_t()> start_block_delivery,
+        std::function<void(const block_t &)> continuation);
 
     struct EpochReputation : public Serializable
     {
@@ -811,7 +887,7 @@ namespace hotstuff
         Vote vote;
         MsgVote(const Vote &);
         MsgVote(DataStream &&s) : serialized(std::move(s)) {}
-        void postponed_parse(HotStuffCore *hsc);
+        bool postponed_parse(HotStuffCore *hsc) noexcept;
     };
 
     struct MsgReqBlock
@@ -841,7 +917,7 @@ namespace hotstuff
         VoteRelay vote;
         MsgRelay(const VoteRelay &);
         MsgRelay(DataStream &&s) : serialized(std::move(s)) {}
-        void postponed_parse(HotStuffCore *hsc);
+        bool postponed_parse(HotStuffCore *hsc) noexcept;
     };
 
     using promise::promise_t;
@@ -872,24 +948,9 @@ namespace hotstuff
         inline void add_replica(const PeerId &replica, bool fetch_now = true);
     };
 
-    class BlockDeliveryContext : public promise_t
-    {
-    public:
-        ElapsedTime elapsed;
-        BlockDeliveryContext &operator=(const BlockDeliveryContext &) = delete;
-        BlockDeliveryContext(const BlockDeliveryContext &other) : promise_t(static_cast<const promise_t &>(other)),
-                                                                  elapsed(other.elapsed) {}
-        BlockDeliveryContext(BlockDeliveryContext &&other) : promise_t(static_cast<const promise_t &>(other)),
-                                                             elapsed(std::move(other.elapsed)) {}
-        template <typename Func>
-        BlockDeliveryContext(Func callback) : promise_t(callback)
-        {
-            elapsed.start();
-        }
-    };
-
     /** HotStuff protocol (with network implementation). */
-    class HotStuffBase : public HotStuffCore
+    class HotStuffBase : public HotStuffCore,
+                         private ProposalAdmissionEffects
     {
         using BlockFetchContext = FetchContext<ENT_TYPE_BLK>;
         using CmdFetchContext = FetchContext<ENT_TYPE_CMD>;
@@ -923,13 +984,17 @@ namespace hotstuff
         bool ec_loop;
         /** network stack */
         Net pn;
+        const EpochProtocolMode epoch_protocol_mode;
+        std::optional<PeerId> epoch_manager_peer;
+        EpochWireLimits epoch_wire_limits{4 << 20, 128, 4096, 4096};
+        std::uint64_t epoch_activation_grace_blocks{1};
+        bool adaptive_demo_markers{false};
         std::unordered_set<uint256_t> valid_tls_certs;
 #ifdef HOTSTUFF_BLK_PROFILE
         BlockProfiler blk_profiler;
 #endif
         pacemaker_bt pmaker;
         TimerEvent ev_beat_timer;
-        TimerEvent ev_check_pending;
         TimerEvent ev_end_warmup;
 
         TimerEvent ev_report_timer;
@@ -940,7 +1005,7 @@ namespace hotstuff
         /* queues for async tasks */
 
         std::unordered_map<const uint256_t, BlockFetchContext> blk_fetch_waiting;
-        std::unordered_map<const uint256_t, BlockDeliveryContext> blk_delivery_waiting;
+        BlockDeliveryOrchestrator blk_delivery_orchestrator;
         std::unordered_map<const uint256_t, commit_cb_t> decision_waiting;
         std::unordered_map<const uint256_t, uint32_t> decision_made;
         using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
@@ -974,16 +1039,14 @@ namespace hotstuff
         // mutable std::set<PeerId> childPeers;
 
         vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> global_replicas;
+        std::vector<ReplicaID> fixed_membership;
 
         // std::unordered_map<size_t, Tree> system_trees;
         // TODO: deprecated
         std::unordered_map<size_t, TreeNetwork> system_trees;
-        std::unordered_set<uint256_t> pass_trought_blks;
-        std::unordered_map<uint256_t, std::set<ReplicaID>> pending_votes;
 
         // Reports stuff
         std::mutex metrics_lock;
-        std::unordered_map<BlockPeerKey, struct timeval, BlockPeerKey::Hash> lat_start; // track proposal time
         std::vector<LatMeasure> peer_latencies;
         std::vector<TimeoutMeasure> child_timeouts;
 
@@ -995,10 +1058,25 @@ namespace hotstuff
         Net rn = Net(ec, Net::Config());
 
         std::vector<Epoch> epochs;
+        std::unique_ptr<EpochStore> exact_epochs;
+        FutureProposalBuffer future_proposals;
+        std::unique_ptr<ProposalAdmissionCoordinator> proposal_admission;
+        std::unique_ptr<AggregationScheduler> aggregation_scheduler;
+        std::shared_ptr<ProposalContextLifecycle> proposal_contexts;
+        PendingExactContributionBuffer pending_exact_contributions{
+            PendingExactContributionBufferLimits{4096, 64}};
+        struct ExactRuntimeAccess;
+        class ExactContributionEffects;
+        std::shared_ptr<ExactRuntimeAccess> exact_runtime_access;
+        AggregationTimeoutPolicy aggregation_timeout_policy;
+        std::unique_ptr<AggregationTimeoutCoordinator>
+            aggregation_timeout_coordinator;
+        struct AdaptiveEpochRuntime;
+        std::unique_ptr<AdaptiveEpochRuntime> adaptive_epoch_runtime;
+        HotStuffEpochLiveBinding *epoch_live_binding{nullptr};
         mutable TreeNetwork current_tree_network;
         mutable Tree current_tree;
         uint32_t lastCheckedHeight;
-        std::vector<std::pair<MsgPropose, Net::conn_t>> pending_proposals;
 
         /* Epoch */
 
@@ -1013,7 +1091,91 @@ namespace hotstuff
 
         void on_fetch_cmd(const command_t &cmd);
         void on_fetch_blk(const block_t &blk);
+        bool deliver_blk_without_finalization(const block_t &blk);
         bool on_deliver_blk(const block_t &blk);
+
+        const EpochDefinition &register_legacy_epoch(const Epoch &epoch);
+        ConfigurationId exact_configuration(
+            uint32_t epoch_number, uint32_t tree_id) const;
+        const TreeNetwork *find_exact_runtime_tree(
+            const ConfigurationId &configuration) const noexcept;
+        std::optional<std::uint64_t> find_exact_runtime_generation(
+            const ConfigurationId &configuration) const noexcept;
+        std::optional<ProposalContextMetadata> exact_context_metadata(
+            const ProposalKey &key) const;
+        std::optional<ProposalContextLease> admit_exact_context(
+            const ProposalContextMetadata &metadata,
+            ProposalContextOrigin origin);
+        void activate_proposal_configuration(
+            const ConfigurationId &configuration);
+        void activate_initial_leader_view();
+        void initialize_adaptive_epoch_runtime();
+        void install_legacy_consensus_handlers();
+        void install_adaptive_epoch_handlers();
+        bool authorize_manager_peer(const PeerId &peer) const noexcept;
+        void rebuild_aggregation_timeout_coordinator();
+        std::optional<ProposalKey> committed_proposal_key(
+            const block_t &blk,
+            const std::vector<ProposalKey> &committed_keys) const;
+        void record_adaptive_commit_marker(
+            const block_t &blk,
+            const std::vector<ProposalKey> &committed_keys) const;
+        void finish_adaptive_epoch_commit(
+            const block_t &blk,
+            const EpochCommitIngressResult &activation);
+        void advance_committed_retirement_floor(
+            const block_t &blk,
+            const std::vector<ProposalKey> &committed_keys);
+
+        promise_t verify_exact_contribution(
+            ExactContributionKind kind,
+            const ExactContributionEnvelope &contribution);
+        void buffer_or_dispatch_exact_contribution(
+            ExactContributionKind kind,
+            ExactContributionEnvelope envelope,
+            PeerId authenticated_source);
+        void dispatch_exact_contribution(
+            PendingExactContribution contribution);
+        void drain_pending_exact_contributions(const ProposalKey &key);
+        void purge_pending_exact_contributions(const ProposalKey &key);
+        promise_t deliver_exact_contribution(
+            const ProposalKey &key,
+            const PeerId &source_peer);
+        void continue_exact_contribution(
+            const ProposalContextLease &lease,
+            ExactContributionKind kind,
+            const ExactContributionEnvelope &contribution);
+        void record_exact_latency(
+            const ProposalContextLease &lease,
+            ReplicaID child);
+        bool send_exact_relay(
+            const ProposalContextLease &lease,
+            quorum_cert_bt certificate);
+        bool forward_exact_direct(
+            const ProposalContextLease &lease,
+            const Vote &vote);
+        bool forward_exact_relay(
+            const ProposalContextLease &lease,
+            const VoteRelay &relay);
+        quorum_cert_bt verified_aggregation_candidate(
+            const ProposalContextLease &lease);
+        void record_aggregation_timeout(
+            const ProposalContextLease &lease,
+            const std::set<ReplicaID> &missing);
+        void try_finish_exact_context(
+            const ProposalContextLease &lease);
+        bool publish_exact_root_qc(
+            const ProposalContextLease &lease,
+            quorum_cert_bt final_qc);
+        void drain_ready_piped_qcs();
+
+        void relay_once(const BufferedProposal &proposal) override;
+        void process_active(const BufferedProposal &proposal) override;
+        void local_vote_authorized(const ProposalKey &key) override;
+        void create_expected_vote_state(const ProposalKey &key) override;
+        void start_latency_deadline(const ProposalKey &key) override;
+        void start_aggregation_timer(const ProposalKey &key) override;
+        void emit_timeout_report(const ProposalKey &key) override;
 
         /** deliver consensus message: <propose> */
         inline void propose_handler(MsgPropose &&, const Net::conn_t &);
@@ -1021,6 +1183,16 @@ namespace hotstuff
         inline void vote_handler(MsgVote &&, const Net::conn_t &);
         /** deliver consensus relay message: <vote_relay> */
         inline void vote_relay_handler(MsgRelay &&, const Net::conn_t &);
+        inline void adaptive_stage_epoch_handler(
+            MsgStageEpochDefinition &&, const Net::conn_t &);
+        inline void adaptive_arm_epoch_handler(
+            MsgArmActivation &&, const Net::conn_t &);
+        inline void adaptive_propose_handler(
+            MsgPropose &&, const Net::conn_t &);
+        inline void adaptive_vote_handler(
+            MsgVote &&, const Net::conn_t &);
+        inline void adaptive_relay_handler(
+            MsgRelay &&, const Net::conn_t &);
         /** fetches full block data */
         inline void req_blk_handler(MsgReqBlock &&, const Net::conn_t &);
         /** receives a block */
@@ -1030,6 +1202,12 @@ namespace hotstuff
 
         void do_broadcast_proposal(const Proposal &) override;
         void do_vote(Proposal, const Vote &) override;
+        bool admit_local(const Proposal &) override;
+        void apply_local_vote(const Vote &) override;
+        void on_verified_local_proposal_progress(
+            const ProposalKey &key) override;
+        void on_verified_commit_progress(
+            const ProposalKey &key) override;
         void inc_time(ReconfigurationType reconfig_type) override;
         bool is_proposer(int id) override;
         void proposer_base_deliver(const block_t &blk) override;
@@ -1037,6 +1215,15 @@ namespace hotstuff
         void do_consensus(const block_t &blk) override;
         uint32_t get_tree_id() override;
         uint32_t get_cur_epoch_nr() override;
+        uint256_t get_epoch_digest(uint32_t epoch_number) override;
+        ConfigurationId get_exact_tree_configuration(
+            std::uint32_t epoch_number,
+            std::uint32_t tree_id) const override;
+        ReplicaID get_exact_tree_root(
+            std::uint32_t epoch_number,
+            std::uint32_t tree_id) const override;
+        LeaderTimeoutRotationDisposition rotate_tree_on_leader_timeout(
+            const LeaderViewId &expired_view) noexcept override;
 
     protected:
         /** Called to replicate the execution of a command, the application should
@@ -1052,7 +1239,9 @@ namespace hotstuff
                      EventContext ec,
                      size_t nworker,
                      const Net::Config &netconfi,
-                     NetAddr reputation_addr);
+                     NetAddr reputation_addr,
+                     EpochProtocolMode protocol_mode =
+                         EpochProtocolMode::legacy_static);
 
         ~HotStuffBase();
 
@@ -1062,6 +1251,18 @@ namespace hotstuff
         void exec_command(uint256_t cmd_hash, commit_cb_t callback);
         void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                    bool ec_loop = false);
+        void set_aggregation_timeout(double timeout_seconds);
+        void configure_epoch_manager(
+            const PeerId &manager_peer,
+            const NetAddr &manager_address);
+        ReplicaStageIngressResult trusted_local_stage_epoch(
+            StageEpochDefinition definition,
+            const EpochValidationContext &validation_context);
+        ReplicaArmIngressResult trusted_local_arm_epoch(
+            ArmActivation activation);
+        bool bootstrap_adaptive_epoch_from_file(
+            const std::string &configuration_path,
+            std::uint64_t activation_height);
         void tree_config(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
         void read_epoch_from_file(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas);
         void tree_scheduler(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool startup);
@@ -1070,24 +1271,10 @@ namespace hotstuff
 
         void stage_epoch(EpochReputation &epoch_reputation);
 
-        // Timer-related members
-        mutable std::mutex timers_mutex;                                                        ///< Mutex to protect access to proposal_timers
-        std::unordered_map<uint256_t, std::shared_ptr<salticidae::TimerEvent>> proposal_timers; ///< Maps block hash to TimerEvent
-
-        // Helper functions
-        void start_proposal_timer(size_t tid, size_t epoch_nr, uint256_t blk_hash, double timeout_duration, size_t tree_level);
-        void stop_proposal_timer(const uint256_t &blk_hash);
-        void on_timer_expired(size_t tid, size_t epoch_nr, uint256_t blk_hash, uint32_t tree_level);
-        std::set<ReplicaID> find_children_who_did_not_respond(const uint256_t &blk_hash);
-        RcObj<VoteRelay> create_partial_vote_relay(size_t tid, size_t epoch_nr, const uint256_t &blk_hash);
-
         // Reports functions
-        void record_latency(size_t epoch_nr, size_t tid, const PeerId &peer, const uint256_t &blk_hash);
         void on_report_timer();
 
         void update_system_trees();
-
-        int effective_required_votes(const std::set<ReplicaID> &expected);
 
         //------------------------------
         void close_client(ReplicaID rid);
@@ -1103,10 +1290,10 @@ namespace hotstuff
         const auto &get_decision_waiting() const { return decision_waiting; };
         ThreadCall &get_tcall() { return tcall; };
         PaceMaker *get_pace_maker() { return pmaker.get(); };
-        size_t get_total_system_trees() { return system_trees.size(); };
-        ReplicaID get_system_tree_root(int tid) { return system_trees[tid].get_tree().get_tree_root(); };
-        ReplicaID get_current_system_tree_root() { return current_tree.get_tree_root(); };
-        TreeNetwork get_current_tree_network() { return current_tree_network; };
+        size_t get_total_system_trees() override;
+        ReplicaID get_system_tree_root(int tid) override;
+        ReplicaID get_current_system_tree_root() override;
+        TreeNetwork get_current_tree_network();
         void print_stat() const;
         virtual void do_elected() {}
         // #ifdef HOTSTUFF_AUTOCLI
@@ -1132,30 +1319,32 @@ namespace hotstuff
         using HotStuffBase::HotStuffBase;
 
     protected:
-        part_cert_bt create_part_cert(const PrivKey &priv_key, const uint256_t &blk_hash) override
+        part_cert_bt create_part_cert(const PrivKey &priv_key,
+                                      const ProposalKey &key) override
         {
             HOTSTUFF_LOG_DEBUG("create part cert with priv=%s, blk_hash=%s",
-                               get_hex10(priv_key).c_str(), get_hex10(blk_hash).c_str());
+                               get_hex10(priv_key).c_str(),
+                               get_hex10(key.block_hash).c_str());
             return new PartCertType(
                 static_cast<const PrivKeyType &>(priv_key),
-                blk_hash);
+                key);
         }
 
         part_cert_bt parse_part_cert(DataStream &s) override
         {
-            PartCert *pc = new PartCertType();
+            part_cert_bt pc(new PartCertType());
             s >> *pc;
             return pc;
         }
 
-        quorum_cert_bt create_quorum_cert(const uint256_t &blk_hash) override
+        quorum_cert_bt create_quorum_cert(const ProposalKey &key) override
         {
-            return new QuorumCertType(get_config(), blk_hash);
+            return new QuorumCertType(get_config(), key);
         }
 
         quorum_cert_bt parse_quorum_cert(DataStream &s) override
         {
-            QuorumCert *qc = new QuorumCertType();
+            quorum_cert_bt qc(new QuorumCertType());
             s >> *qc;
             return qc;
         }
@@ -1169,7 +1358,9 @@ namespace hotstuff
                  EventContext ec = EventContext(),
                  size_t nworker = 4,
                  const Net::Config &netconfig = Net::Config(),
-                 NetAddr reputation_addr = NetAddr()) : HotStuffBase(blk_size,
+                 NetAddr reputation_addr = NetAddr(),
+                 EpochProtocolMode protocol_mode =
+                     EpochProtocolMode::legacy_static) : HotStuffBase(blk_size,
                                                                      rid,
                                                                      new PrivKeyType(raw_privkey),
                                                                      listen_addr,
@@ -1177,7 +1368,8 @@ namespace hotstuff
                                                                      ec,
                                                                      nworker,
                                                                      netconfig,
-                                                                     reputation_addr) {}
+                                                                     reputation_addr,
+                                                                     protocol_mode) {}
 
         void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &replicas, bool ec_loop = false)
         {
@@ -1214,6 +1406,11 @@ namespace hotstuff
         void set_new_epoch(std::string new_epoch)
         {
             HotStuffBase::set_new_epoch(new_epoch);
+        }
+
+        void set_aggregation_timeout(double timeout_seconds)
+        {
+            HotStuffBase::set_aggregation_timeout(timeout_seconds);
         }
 
         void set_client_ip(std::string client_ip)

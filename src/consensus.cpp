@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <stack>
+#include <unordered_set>
 #include <include/hotstuff/liveness.h>
 #include <salticidae/type.h>
 
@@ -139,18 +140,40 @@ namespace hotstuff
         return true;
     }
 
-    bool HotStuffCore::is_ancestor(const block_t &maybe_ancestor, const block_t &descendant)
+    bool HotStuffCore::is_ancestor(const block_t &maybe_ancestor,
+                                   const block_t &descendant) const
     {
-        // quick approach, walk up parents of descendant until we match or reach genesis
-        for (block_t b = descendant; b->height >= maybe_ancestor->height;)
+        if (!maybe_ancestor || !descendant)
+            return false;
+
+        std::unordered_set<const Block *> visited;
+        for (block_t block = descendant; block;)
         {
-            if (b == maybe_ancestor)
+            if (!visited.insert(block.get()).second)
+                return false;
+            if (block == maybe_ancestor)
                 return true;
-            if (b->parents.empty())
-                break;         // reached genesis
-            b = b->parents[0]; // e.g., single-parent chain
+            if (block->parents.empty())
+                return false;
+
+            const block_t &parent = block->parents[0];
+            if (!parent || parent->height >= block->height)
+                return false;
+            block = parent;
         }
         return false;
+    }
+
+    bool HotStuffCore::has_valid_qc_ancestry(
+        const block_t &certifier,
+        const block_t &certified) const
+    {
+        return certifier && certifier->delivered && certifier->qc &&
+               certified && certified->delivered &&
+               certifier->qc_ref == certified &&
+               certifier->qc->get_obj_hash() == certified->hash &&
+               certified->height < certifier->height &&
+               is_ancestor(certified, certifier);
     }
 
     void HotStuffCore::update_hqc(const block_t &_hqc, const quorum_cert_bt &qc)
@@ -164,6 +187,9 @@ namespace hotstuff
 
     void HotStuffCore::update(const block_t &nblk)
     {
+        if (!nblk || !nblk->delivered)
+            return;
+
         std::cout << "Begin update fuction at Head -> nblk: " << std::string(*nblk).c_str() << std::endl;
 
         /* nblk = b*, blk2 = b'', blk1 = b', blk = b */
@@ -171,66 +197,70 @@ namespace hotstuff
         /* three-step HotStuff */
         const block_t &blk2 = nblk->qc_ref;
 
-        if (blk2 == nullptr)
+        if (!has_valid_qc_ancestry(nblk, blk2))
         {
-            std::cout << "nblk has no qc_ref: blk2 is null." << std::endl;
+            std::cout << "nblk has no valid delivered qc_ref." << std::endl;
             return;
         }
 
-        // if(blk2->qc_ref != nullptr) { // Avoids b0 sigsegv on qc_ref
         std::cout << "blk2: " << std::string(*blk2).c_str() << std::endl;
-        //}
-
-        /* decided blk could possible be incomplete due to pruning */
-        if (blk2->decision)
-        {
-            std::cout << "blk2->decision == 1, returning" << std::endl;
-            return;
-        }
 
         update_hqc(blk2, nblk->qc);
         std::cout << "update: step 1 done (pre-commit/hqc update)" << std::endl;
 
         const block_t &blk1 = blk2->qc_ref;
-        if (blk1 == nullptr)
+        if (!has_valid_qc_ancestry(blk2, blk1))
         {
-            std::cout << "blk2 has no qc_ref: blk1 is null." << std::endl;
+            std::cout << "blk2 has no valid delivered qc_ref." << std::endl;
             return;
         }
 
         std::cout << "blk1: " << std::string(*blk1).c_str() << std::endl;
 
-        if (blk1->decision)
-        {
-            std::cout << "blk1->decision == 1, returning" << std::endl;
-            return;
-        }
         if (blk1->height > b_lock->height)
             b_lock = blk1;
 
         std::cout << "update: step 2 done (commit/b_lock update)" << std::endl;
 
         const block_t &blk = blk1->qc_ref;
-        if (blk == nullptr)
+        if (!has_valid_qc_ancestry(blk1, blk))
         {
-            std::cout << "blk1 has no qc_ref: blk is null." << std::endl;
+            std::cout << "blk1 has no valid delivered qc_ref." << std::endl;
             return;
         }
 
         std::cout << "blk: " << std::string(*blk).c_str() << std::endl;
 
-        if (blk->decision)
+        if (!(blk->height < blk1->height && blk1->height < blk2->height) ||
+            !is_ancestor(blk, blk1) ||
+            !is_ancestor(blk1, blk2) ||
+            !is_ancestor(b_exec, blk))
         {
-            std::cout << "blk->decision == 1, returning" << std::endl;
+            std::cout << "update: invalid certified ancestry" << std::endl;
             return;
         }
 
-        /** TODO: due to inplace Kauri pipeline system, this system needs to be reworked to keep in mind the pipeline gaps*/
-        /* commit requires direct parent */
-        // if (blk2->parents[0] != blk1 || blk1->parents[0] != blk) {
-        //     std::cout <<  "update: no direct parent for step 3 " <<  std::endl;
-        //     return;
-        // }
+        std::vector<block_t> commit_queue;
+        std::unordered_set<const Block *> visited;
+        for (block_t block = blk; block != b_exec;)
+        {
+            if (!block || block->height <= b_exec->height ||
+                !visited.insert(block.get()).second || block->parents.empty())
+                return;
+
+            const block_t &parent = block->parents[0];
+            if (!parent || parent->height >= block->height)
+                return;
+
+            commit_queue.push_back(block);
+            block = parent;
+        }
+
+        if (blk2->decision || blk1->decision || blk->decision)
+        {
+            std::cout << "certified block already decided, returning" << std::endl;
+            return;
+        }
 
 #else
         /* two-step HotStuff */
@@ -260,6 +290,7 @@ namespace hotstuff
         std::cout << "update: step 3 able to decide (decide/b_exec update)" << std::endl;
 
         /* otherwise commit */
+#ifdef HOTSTUFF_TWO_STEP
         std::vector<block_t> commit_queue;
         block_t b;
         for (b = blk; b->height > b_exec->height; b = b->parents[0])
@@ -270,6 +301,7 @@ namespace hotstuff
             throw std::runtime_error("safety breached :( " +
                                      std::string(*blk) + " " +
                                      std::string(*b_exec));
+#endif
 
         for (auto it = commit_queue.rbegin(); it != commit_queue.rend(); it++)
         {
@@ -297,6 +329,10 @@ namespace hotstuff
                 do_decide(Finality(id, get_cur_epoch_nr(), get_tree_id(), 1, i, blk->height,
                                    blk->cmds[i], blk->get_hash()));
         }
+
+        if (!commit_queue.empty() && blk1->qc != nullptr)
+            on_verified_commit_progress(
+                blk1->qc->get_proposal_key());
 
         b_exec = blk;
     }
@@ -349,7 +385,16 @@ namespace hotstuff
 
         LOG_PROTO("propose %s", std::string(*bnew).c_str());
         on_deliver_blk(bnew);
-        Proposal prop = process_block(bnew, true, get_tree_id(), get_cur_epoch_nr());
+        const auto epoch_number = get_cur_epoch_nr();
+        Proposal prop = process_block(
+            bnew,
+            true,
+            ConfigurationId{
+                epoch_number,
+                get_tree_id(),
+                get_epoch_digest(epoch_number)});
+
+        on_verified_local_proposal_progress(prop.key());
 
         /* broadcast to other replicas */
         do_broadcast_proposal(prop);
@@ -375,25 +420,36 @@ namespace hotstuff
             LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current epoch! (block height is now %llu)", b_normal_height);
             inc_time(switch_type);
         }
-        else if (b_normal_height > get_total_system_trees()) // TODO: WARMUP PARAMETER
-            inc_time(switch_type);
-
         return bnew;
     }
 
-    Proposal HotStuffCore::process_block(const block_t &bnew, bool adjustHeight, int tid, uint32_t epoch_nr)
+    Proposal HotStuffCore::process_block(
+        const block_t &bnew,
+        bool adjustHeight,
+        const ConfigurationId &configuration)
     {
         const uint256_t bnew_hash = bnew->get_hash();
-        if (bnew->self_qc == nullptr)
+        Proposal prop(
+            id,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            bnew,
+            nullptr);
+        if (bnew->self_qc != nullptr &&
+            bnew->self_qc->get_proposal_key() != prop.key())
         {
-            bnew->self_qc = create_quorum_cert(bnew_hash);
+            throw std::invalid_argument(
+                "published block certificate does not match the proposal key");
         }
+        if (!admit_local(prop))
+            throw std::runtime_error(
+                "failed to admit the exact leader-local proposal");
 
         // proposer_base_deliver(bnew);
         // on_deliver_blk(bnew);
         LOG_PROTO("before update");
         update(bnew);
-        Proposal prop(id, epoch_nr, tid, bnew, nullptr);
         // std::cout << "prop" << std::endl;
         /* self-vote */
         if (adjustHeight)
@@ -409,14 +465,15 @@ namespace hotstuff
         }
 
         // Vote for own proposed block
-        on_receive_vote(Vote(id, epoch_nr, tid, bnew_hash, create_part_cert(*priv_key, bnew_hash), this));
+        on_receive_vote(Vote(
+            id, prop.key(), create_part_cert(*priv_key, prop.key()), this));
 
         on_propose_(prop);
 
         return prop;
     }
 
-    void HotStuffCore::on_receive_proposal(const Proposal &prop)
+    bool HotStuffCore::on_receive_proposal(const Proposal &prop)
     {
         LOG_PROTO("[CONSENSUS] Got PROPOSAL in epoch_nr=%d, tid=%d: %s %s", prop.epoch_nr, prop.tid, std::string(prop).c_str(), std::string(*prop.blk).c_str());
 
@@ -458,7 +515,11 @@ namespace hotstuff
 
         if (opinion && !vote_disabled)
         {
-            do_vote(prop, Vote(id, prop.epoch_nr, prop.tid, bnew->get_hash(), create_part_cert(*priv_key, bnew->get_hash()), this));
+            do_vote(prop, Vote(
+                id,
+                prop.key(),
+                create_part_cert(*priv_key, prop.key()),
+                this));
         }
 
         // UNCOMMENT TO TEST TIMEOUT
@@ -479,9 +540,6 @@ namespace hotstuff
             LOG_PROTO("[PROPOSER] Forcing a reconfiguration for changing current epoch! (block height is now %llu)", bnew->height);
             inc_time(switch_type);
         }
-        else if (bnew->height > get_total_system_trees()) // TODO: WARMUP PARAMETER
-            inc_time(switch_type);
-
         /**
         if (isTreeSwitch(bnew->height))
         {
@@ -496,6 +554,7 @@ namespace hotstuff
         */
 
         // update(bnew);
+        return opinion;
     }
 
     void HotStuffCore::on_receive_vote(const Vote &vote)
@@ -508,32 +567,15 @@ namespace hotstuff
         // In current implementation, only the proposer's vote uses this function
         LOG_PROTO("[CONSENSUS] Applying own vote in epoch_nr=%d, tid=%d: %s %s", vote.epoch_nr, vote.tid, std::string(vote).c_str(), std::string(*blk).c_str());
 
-        if (!blk->voted.insert(vote.voter).second)
-        {
-            LOG_WARN("duplicate vote for %s from %d", get_hex10(vote.blk_hash).c_str(), vote.voter);
-            return;
-        }
-
         if (vote.voter != get_id())
             return;
-        if (blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority))
+        if (vote.key().block_hash != blk->get_hash() ||
+            vote.cert->get_proposal_key() != vote.key())
+        {
+            LOG_WARN("local vote does not match its exact proposal");
             return;
-
-        // std::cout << "self vote" << std::endl;
-        auto &qc = blk->self_qc;
-        if (qc == nullptr)
-        {
-            LOG_WARN("vote for block not proposed by itself");
-            qc = create_quorum_cert(blk->get_hash());
         }
-
-        qc->add_part(config, vote.voter, *vote.cert);
-        if (qc->has_n(config.nmajority))
-        {
-            qc->compute();
-            update_hqc(blk, qc);
-            on_qc_finish(blk);
-        }
+        apply_local_vote(vote);
     }
 
     /*** end HotStuff protocol logic ***/
@@ -545,7 +587,8 @@ namespace hotstuff
         HOTSTUFF_LOG_PROTO("Maximum Faults: %d", nfaulty);
         HOTSTUFF_LOG_PROTO("Majority Necessary for Quorums: %d", config.nmajority);
 
-        b0->qc = create_quorum_cert(b0->get_hash());
+        b0->qc = create_quorum_cert(
+            genesis_certification_key(b0->get_hash()));
         // b0->qc->compute();
         b0->self_qc = b0->qc->clone();
         b0->qc_ref = b0;
@@ -619,7 +662,9 @@ namespace hotstuff
                              { pm.resolve(); });
         }
 
-        if ((blk->self_qc != nullptr && blk->self_qc->has_n(config.nmajority) && !blk->voted.empty() && blk->self_qc->verify(config)) || blk->voted.size() >= config.nmajority)
+        if (blk->self_qc != nullptr &&
+            blk->self_qc->has_n(config.nmajority) &&
+            blk->self_qc->verify(config))
         {
             HOTSTUFF_LOG_PROTO("async_qc_finish %.10s", blk->get_hash().to_hex().c_str());
 

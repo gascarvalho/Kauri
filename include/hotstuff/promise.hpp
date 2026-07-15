@@ -28,6 +28,7 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <exception>
 #include <type_traits>
 
 #if __cplusplus >= 201703L
@@ -379,11 +380,23 @@ namespace promise {
                 std::vector<Promise *>::const_iterator,
                 std::vector<Promise *> *,
                 Promise *>> s;
-            auto push_frame = [&s](Promise *pm) {
+            std::exception_ptr first_error;
+            auto push_frame = [&s, &first_error](Promise *pm) {
                 if (pm->state == State::PreFulfilled)
                 {
                     pm->state = State::Fulfilled;
-                    for (auto &cb: pm->fulfilled_callbacks) cb();
+                    for (auto &cb: pm->fulfilled_callbacks)
+                    {
+                        try
+                        {
+                            cb();
+                        }
+                        catch (...)
+                        {
+                            if (!first_error)
+                                first_error = std::current_exception();
+                        }
+                    }
                     s.push(std::make_tuple(pm->fulfilled_pms.begin(),
                                           &pm->fulfilled_pms,
                                           pm));
@@ -391,7 +404,18 @@ namespace promise {
                 else if (pm->state == State::PreRejected)
                 {
                     pm->state = State::Rejected;
-                    for (auto &cb: pm->rejected_callbacks) cb();
+                    for (auto &cb: pm->rejected_callbacks)
+                    {
+                        try
+                        {
+                            cb();
+                        }
+                        catch (...)
+                        {
+                            if (!first_error)
+                                first_error = std::current_exception();
+                        }
+                    }
                     s.push(std::make_tuple(pm->rejected_pms.begin(),
                                           &pm->rejected_pms,
                                           pm));
@@ -414,6 +438,8 @@ namespace promise {
                 }
                 push_frame(*it++);
             }
+            if (first_error)
+                std::rethrow_exception(first_error);
         }
 
         void trigger_fulfill() {
@@ -471,14 +497,48 @@ namespace promise {
 
         void trigger_fulfill() {
             state = State::Fulfilled;
-            for (const auto &cb: fulfilled_callbacks) cb();
+            auto callbacks = std::move(fulfilled_callbacks);
             fulfilled_callbacks.clear();
+            rejected_callbacks.clear();
+
+            std::exception_ptr first_error;
+            for (const auto &cb: callbacks)
+            {
+                try
+                {
+                    cb();
+                }
+                catch (...)
+                {
+                    if (!first_error)
+                        first_error = std::current_exception();
+                }
+            }
+            if (first_error)
+                std::rethrow_exception(first_error);
         }
 
         void trigger_reject() {
             state = State::Rejected;
-            for (const auto &cb: rejected_callbacks) cb();
+            auto callbacks = std::move(rejected_callbacks);
+            fulfilled_callbacks.clear();
             rejected_callbacks.clear();
+
+            std::exception_ptr first_error;
+            for (const auto &cb: callbacks)
+            {
+                try
+                {
+                    cb();
+                }
+                catch (...)
+                {
+                    if (!first_error)
+                        first_error = std::current_exception();
+                }
+            }
+            if (first_error)
+                std::rethrow_exception(first_error);
         }
 #endif
         public:
@@ -657,13 +717,42 @@ namespace promise {
     }
 
     template<typename T>
-    inline void promise_t::resolve(T result) const { (*this)->resolve(result); }
+    inline void promise_t::resolve(T result) const {
+#ifdef CPPROMISE_USE_STACK_FREE
+        promise_t dispatch_owner(*this);
+        dispatch_owner->resolve(result);
+#else
+        (*this)->resolve(result);
+#endif
+    }
 
     template<typename T>
-    inline void promise_t::reject(T reason) const { (*this)->reject(reason); }
+    inline void promise_t::reject(T reason) const {
+#ifdef CPPROMISE_USE_STACK_FREE
+        promise_t dispatch_owner(*this);
+        dispatch_owner->reject(reason);
+#else
+        (*this)->reject(reason);
+#endif
+    }
 
-    inline void promise_t::resolve() const { (*this)->resolve(); }
-    inline void promise_t::reject() const { (*this)->reject(); }
+    inline void promise_t::resolve() const {
+#ifdef CPPROMISE_USE_STACK_FREE
+        promise_t dispatch_owner(*this);
+        dispatch_owner->resolve();
+#else
+        (*this)->resolve();
+#endif
+    }
+
+    inline void promise_t::reject() const {
+#ifdef CPPROMISE_USE_STACK_FREE
+        promise_t dispatch_owner(*this);
+        dispatch_owner->reject();
+#else
+        (*this)->reject();
+#endif
+    }
 
     template<typename T>
     struct callback_types {

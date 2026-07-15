@@ -26,9 +26,17 @@
 #include "hotstuff/type.h"
 #include "hotstuff/entity.h"
 #include "hotstuff/crypto.h"
+#include "hotstuff/future_proposal_buffer.h"
 
 namespace hotstuff
 {
+
+    enum class LeaderTimeoutRotationDisposition : std::uint8_t
+    {
+        legacy_fallback = 0,
+        rejected,
+        rotated,
+    };
 
     struct Proposal;
     struct Vote;
@@ -85,7 +93,11 @@ namespace hotstuff
 
         void update_hqc(const block_t &_hqc, const quorum_cert_bt &qc);
 
-        bool is_ancestor(const block_t &maybe_ancestor, const block_t &descendant);
+        bool is_ancestor(const block_t &maybe_ancestor,
+                         const block_t &descendant) const;
+
+        bool has_valid_qc_ancestry(const block_t &certifier,
+                                   const block_t &certified) const;
 
         void on_qc_finish(const block_t &blk);
 
@@ -133,6 +145,21 @@ namespace hotstuff
         virtual size_t get_total_system_trees() {}
         virtual ReplicaID get_system_tree_root(int tid) {}
         virtual ReplicaID get_current_system_tree_root() {}
+        virtual LeaderTimeoutRotationDisposition
+        rotate_tree_on_leader_timeout(const LeaderViewId &) noexcept
+        {
+            return LeaderTimeoutRotationDisposition::legacy_fallback;
+        }
+        virtual ConfigurationId get_exact_tree_configuration(
+            std::uint32_t, std::uint32_t) const
+        {
+            return {};
+        }
+        virtual ReplicaID get_exact_tree_root(
+            std::uint32_t, std::uint32_t) const
+        {
+            return 0;
+        }
 
         virtual void update_system_trees() {}
 
@@ -160,7 +187,7 @@ namespace hotstuff
 
         /** Call upon the delivery of a proposal message.
          * The block mentioned in the message should be already delivered. */
-        void on_receive_proposal(const Proposal &prop);
+        bool on_receive_proposal(const Proposal &prop);
 
         /** Call upon the delivery of a vote message.
          * The block mentioned in the message should be already delivered. */
@@ -220,6 +247,18 @@ namespace hotstuff
          * while safety is always guaranteed by HotStuffCore. */
         virtual void do_vote(Proposal last_proposer, const Vote &vote) = 0;
 
+        /** Open exact leader-local state before any protocol mutation. */
+        virtual bool admit_local(const Proposal &) { return true; }
+
+        /** Record an already-created local vote in derived runtime state. */
+        virtual void apply_local_vote(const Vote &) {}
+
+        /** Report protocol-accepted progress with an exact proposal key. */
+        virtual void on_verified_local_proposal_progress(
+            const ProposalKey &) {}
+        virtual void on_verified_commit_progress(
+            const ProposalKey &) {}
+
         /**
          * Increment timer to mark receival.
          */
@@ -239,17 +278,26 @@ namespace hotstuff
          */
         virtual uint32_t get_cur_epoch_nr() {};
 
-        virtual void start_proposal_timer(size_t tid, size_t epoch_nr, uint256_t blk_hash, double timeout_duration, size_t tree_level) = 0;
+        /** Return the exact staged digest for a locally-created proposal. */
+        virtual uint256_t get_epoch_digest(uint32_t) { return {}; };
+
+        // Compatibility seam for legacy test cores. Runtime aggregation
+        // deadlines are owned by ProposalContextLifecycle.
+        virtual void start_proposal_timer(
+            size_t, size_t, uint256_t, double, size_t)
+        {}
 
         /* The user plugs in the detailed instances for those
          * polymorphic data types. */
     public:
-        /** Create a partial certificate that proves the vote for a block. */
-        virtual part_cert_bt create_part_cert(const PrivKey &priv_key, const uint256_t &blk_hash) = 0;
+        /** Create a partial certificate for one exact proposal identity. */
+        virtual part_cert_bt create_part_cert(
+            const PrivKey &priv_key, const ProposalKey &key) = 0;
         /** Create a partial certificate from its seralized form. */
         virtual part_cert_bt parse_part_cert(DataStream &s) = 0;
-        /** Create a quorum certificate that proves 2f+1 votes for a block. */
-        virtual quorum_cert_bt create_quorum_cert(const uint256_t &blk_hash) = 0;
+        /** Create a quorum certificate for one exact proposal identity. */
+        virtual quorum_cert_bt create_quorum_cert(
+            const ProposalKey &key) = 0;
         /** Create a quorum certificate from its serialized form. */
         virtual quorum_cert_bt parse_quorum_cert(DataStream &s) = 0;
         /** Create a command object from its serialized form. */
@@ -282,7 +330,9 @@ namespace hotstuff
         operator std::string() const;
         void set_vote_disabled(bool f) { vote_disabled = f; }
 
-        Proposal process_block(const block_t &bnew, bool adjustHeight, int tid, uint32_t epoch_nr);
+        Proposal process_block(const block_t &bnew,
+                               bool adjustHeight,
+                               const ConfigurationId &configuration);
 
         void tree_config(bool b);
         void tree_scheduler(bool b);
@@ -295,11 +345,13 @@ namespace hotstuff
     /** Abstraction for proposal messages. */
     struct Proposal : public Serializable
     {
-        ReplicaID proposer;
+        ReplicaID proposer{0};
         /* epoch that the given proposal refers to */
-        uint32_t epoch_nr;
+        uint32_t epoch_nr{0};
         /** tree used for the message*/
-        uint32_t tid;
+        uint32_t tid{0};
+        /** digest of the exact epoch definition used by this proposal */
+        uint256_t epoch_digest{};
         /** block being proposed */
         block_t blk;
         /** handle of the core object to allow polymorphism. The user should use
@@ -310,29 +362,51 @@ namespace hotstuff
         Proposal(ReplicaID proposer,
                  uint32_t epoch_nr,
                  uint32_t tid,
+                 const uint256_t &epoch_digest,
                  const block_t &blk,
                  HotStuffCore *hsc) : proposer(proposer),
                                       epoch_nr(epoch_nr),
                                       tid(tid),
+                                      epoch_digest(epoch_digest),
                                       blk(blk),
                                       hsc(hsc) {}
 
+        ConfigurationId configuration() const
+        {
+            return ConfigurationId{epoch_nr, tid, epoch_digest};
+        }
+
+        ProposalMetadata metadata() const
+        {
+            return ProposalMetadata{
+                configuration(), blk ? blk->get_hash() : uint256_t{}, proposer};
+        }
+
+        ProposalKey key() const
+        {
+            return metadata().key();
+        }
+
         void serialize(DataStream &s) const override
         {
-            s << proposer
-              << epoch_nr
-              << tid
-              << *blk;
+            metadata().serialize(s);
+            s << *blk;
         }
 
         void unserialize(DataStream &s) override
         {
             assert(hsc != nullptr);
-            s >> proposer;
-            s >> epoch_nr;
-            s >> tid;
+            ProposalMetadata parsed_metadata;
+            parsed_metadata.unserialize(s);
+            proposer = parsed_metadata.proposer;
+            epoch_nr = parsed_metadata.configuration.epoch_number;
+            tid = parsed_metadata.configuration.tree_id;
+            epoch_digest = parsed_metadata.configuration.epoch_digest;
             Block _blk;
             _blk.unserialize(s, hsc);
+            if (_blk.get_hash() != parsed_metadata.block_hash)
+                throw HotStuffInvalidEntity(
+                    "proposal block hash does not match wire metadata");
             blk = hsc->storage->add_blk(std::move(_blk), hsc->get_config());
         }
 
@@ -343,7 +417,8 @@ namespace hotstuff
               << "rid=" << std::to_string(proposer) << " "
               << "blk=" << get_hex10(blk->get_hash()) << " "
               << "tid=" << std::to_string(tid) << " "
-              << "epoch_nr=" << std::to_string(epoch_nr) << ">";
+              << "epoch_nr=" << std::to_string(epoch_nr) << " "
+              << "epoch_digest=" << get_hex10(epoch_digest) << ">";
             return s;
         }
     };
@@ -356,6 +431,8 @@ namespace hotstuff
         uint32_t epoch_nr;
         /** tree used for the message*/
         uint32_t tid;
+        /** exact epoch-definition digest used for the message */
+        uint256_t epoch_digest;
         /** block being voted */
         uint256_t blk_hash;
         /** proof of validity for the vote */
@@ -366,34 +443,46 @@ namespace hotstuff
 
         Vote() : cert(nullptr), hsc(nullptr) {}
         Vote(ReplicaID voter,
-             uint32_t epoch_nr,
-             uint32_t tid,
-             const uint256_t &blk_hash,
+             const ProposalKey &key,
              part_cert_bt &&cert,
              HotStuffCore *hsc) : voter(voter),
-                                  epoch_nr(epoch_nr),
-                                  tid(tid),
-                                  blk_hash(blk_hash),
+                                  epoch_nr(key.configuration.epoch_number),
+                                  tid(key.configuration.tree_id),
+                                  epoch_digest(key.configuration.epoch_digest),
+                                  blk_hash(key.block_hash),
                                   cert(std::move(cert)), hsc(hsc) {}
 
         Vote(const Vote &other) : voter(other.voter),
                                   epoch_nr(other.epoch_nr),
                                   tid(other.tid),
+                                  epoch_digest(other.epoch_digest),
                                   blk_hash(other.blk_hash),
                                   cert(other.cert ? other.cert->clone() : nullptr),
                                   hsc(other.hsc) {}
 
         Vote(Vote &&other) = default;
+        Vote &operator=(Vote &&other) = default;
+
+        ConfigurationId configuration() const
+        {
+            return ConfigurationId{epoch_nr, tid, epoch_digest};
+        }
+
+        ProposalKey key() const
+        {
+            return ProposalKey{configuration(), blk_hash};
+        }
 
         void serialize(DataStream &s) const override
         {
-            s << voter << epoch_nr << tid << blk_hash << *cert;
+            s << voter << epoch_nr << tid << epoch_digest
+              << blk_hash << *cert;
         }
 
         void unserialize(DataStream &s) override
         {
             assert(hsc != nullptr);
-            s >> voter >> epoch_nr >> tid >> blk_hash;
+            s >> voter >> epoch_nr >> tid >> epoch_digest >> blk_hash;
             cert = hsc->parse_part_cert(s);
         }
 
@@ -401,14 +490,14 @@ namespace hotstuff
         {
             assert(hsc != nullptr);
             return cert->verify(hsc->get_config().get_pubkey(voter)) &&
-                   cert->get_obj_hash() == blk_hash;
+                   cert->get_proposal_key() == key();
         }
 
         promise_t verify(VeriPool &vpool) const
         {
             assert(hsc != nullptr);
             return cert->verify(hsc->get_config().get_pubkey(voter), vpool).then([this](bool result)
-                                                                                 { return result && cert->get_obj_hash() == blk_hash; });
+                                                                                 { return result && cert->get_proposal_key() == key(); });
         }
 
         operator std::string() const
@@ -487,6 +576,8 @@ namespace hotstuff
         uint32_t epoch_nr;
         /** tree used for the message*/
         uint32_t tid;
+        /** exact epoch-definition digest used for the message */
+        uint256_t epoch_digest;
         /** block being voted */
         uint256_t blk_hash;
         /** proof of validity for the vote */
@@ -496,29 +587,44 @@ namespace hotstuff
         HotStuffCore *hsc;
 
         VoteRelay() : cert(nullptr), hsc(nullptr) {}
-        VoteRelay(uint32_t epoch_nr, uint32_t tid, const uint256_t &blk_hash,
+        VoteRelay(const ProposalKey &key,
                   quorum_cert_bt &&cert,
-                  HotStuffCore *hsc) : epoch_nr(epoch_nr), tid(tid),
-                                       blk_hash(blk_hash),
+                  HotStuffCore *hsc)
+            : epoch_nr(key.configuration.epoch_number),
+              tid(key.configuration.tree_id),
+              epoch_digest(key.configuration.epoch_digest),
+              blk_hash(key.block_hash),
                                        cert(std::move(cert)), hsc(hsc) {}
 
         VoteRelay(const VoteRelay &other) : epoch_nr(other.epoch_nr),
                                             tid(other.tid),
+                                            epoch_digest(other.epoch_digest),
                                             blk_hash(other.blk_hash),
                                             cert(other.cert ? other.cert->clone() : nullptr),
                                             hsc(other.hsc) {}
 
         VoteRelay(VoteRelay &&other) = default;
+        VoteRelay &operator=(VoteRelay &&other) = default;
+
+        ConfigurationId configuration() const
+        {
+            return ConfigurationId{epoch_nr, tid, epoch_digest};
+        }
+
+        ProposalKey key() const
+        {
+            return ProposalKey{configuration(), blk_hash};
+        }
 
         void serialize(DataStream &s) const override
         {
-            s << epoch_nr << tid << blk_hash << *cert;
+            s << epoch_nr << tid << epoch_digest << blk_hash << *cert;
         }
 
         void unserialize(DataStream &s) override
         {
             assert(hsc != nullptr);
-            s >> epoch_nr >> tid >> blk_hash;
+            s >> epoch_nr >> tid >> epoch_digest >> blk_hash;
             cert = hsc->parse_quorum_cert(s);
         }
 
@@ -532,6 +638,25 @@ namespace hotstuff
             return s;
         }
     };
+
+    /** Cheap socket-free envelope checks used before worker scheduling. */
+    bool validate_authenticated_vote(const ReplicaConfig &config,
+                                     const PeerId &authenticated_peer,
+                                     const Vote &vote) noexcept;
+
+    bool validate_relay_envelope(const ReplicaConfig &config,
+                                 const VoteRelay &relay) noexcept;
+
+    /**
+     * Synchronous compatibility helpers. Network handlers deliberately use
+     * the validate_* functions above and schedule cryptography in VeriPool.
+     */
+    bool verify_authenticated_vote(const ReplicaConfig &config,
+                                   const PeerId &authenticated_peer,
+                                   const Vote &vote) noexcept;
+
+    bool verify_relay_certificate(const ReplicaConfig &config,
+                                  const VoteRelay &relay) noexcept;
 
 }
 

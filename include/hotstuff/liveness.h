@@ -18,8 +18,16 @@
 #ifndef _HOTSTUFF_LIVENESS_H
 #define _HOTSTUFF_LIVENESS_H
 
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+
 #include "salticidae/util.h"
 #include "hotstuff/hotstuff.h"
+#include "hotstuff/leader_progress.h"
 
 namespace hotstuff
 {
@@ -61,6 +69,34 @@ namespace hotstuff
         virtual size_t get_current_epoch() {}
         virtual void update_tree_proposer() {}
         virtual void setup() {}
+        virtual bool configure_leader_progress(
+            LeaderProgressConfig::Duration)
+        {
+            return true;
+        }
+        virtual bool activate_leader_view(
+            const ConfigurationId &, ReplicaID)
+        {
+            return true;
+        }
+        virtual bool activate_leader_view(const LeaderViewId &)
+        {
+            return true;
+        }
+        virtual bool activate_runtime_view(const LeaderViewId &view)
+        {
+            return activate_leader_view(view);
+        }
+        virtual bool record_verified_progress(
+            const ConfigurationId &, LeaderProgressEvent)
+        {
+            return false;
+        }
+        virtual std::optional<LeaderViewId> active_leader_view() const
+        {
+            return std::nullopt;
+        }
+        virtual void shutdown() {}
 
         virtual block_t get_current_proposal() {}
     };
@@ -307,38 +343,372 @@ namespace hotstuff
         }
     };
 
+    class SalticidaeLeaderProgressScheduler final
+        : public LeaderProgressScheduler
+    {
+        struct State
+        {
+            std::mutex mutex;
+            std::condition_variable idle;
+            std::uint64_t next_id{0};
+            std::unordered_map<
+                std::uint64_t,
+                std::shared_ptr<TimerEvent>> timers;
+            bool closed{false};
+            std::size_t active_callbacks{0};
+        };
+
+        EventContext ec;
+        std::shared_ptr<State> state;
+
+    public:
+        explicit SalticidaeLeaderProgressScheduler(
+            const EventContext &ec)
+            : ec(ec), state(std::make_shared<State>())
+        {}
+
+        ~SalticidaeLeaderProgressScheduler() override
+        {
+            shutdown();
+        }
+
+        Cancellation schedule_after(
+            Duration delay, Callback callback) override
+        {
+            if (delay <= Duration::zero() || !callback)
+                return {};
+
+            std::uint64_t timer_id;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->closed)
+                    return {};
+                timer_id = ++state->next_id;
+            }
+
+            const std::weak_ptr<State> weak_state(state);
+            auto timer = std::make_shared<TimerEvent>(
+                ec,
+                [weak_state,
+                 timer_id,
+                 callback = std::move(callback)](TimerEvent &) mutable
+                {
+                    const auto active_state = weak_state.lock();
+                    if (active_state == nullptr)
+                        return;
+                    std::shared_ptr<TimerEvent> keep_alive;
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            active_state->mutex);
+                        const auto found =
+                            active_state->timers.find(timer_id);
+                        if (found == active_state->timers.end())
+                            return;
+                        keep_alive = std::move(found->second);
+                        active_state->timers.erase(found);
+                        ++active_state->active_callbacks;
+                    }
+                    try
+                    {
+                        callback();
+                    }
+                    catch (...)
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            active_state->mutex);
+                        if (--active_state->active_callbacks == 0)
+                            active_state->idle.notify_all();
+                        throw;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            active_state->mutex);
+                        if (--active_state->active_callbacks == 0)
+                            active_state->idle.notify_all();
+                    }
+                });
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->closed)
+                    return {};
+                state->timers.emplace(timer_id, timer);
+                timer->add(
+                    std::chrono::duration<double>(delay).count());
+            }
+
+            return [weak_state, timer_id]()
+            {
+                const auto active_state = weak_state.lock();
+                if (active_state == nullptr)
+                    return;
+                std::shared_ptr<TimerEvent> timer;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        active_state->mutex);
+                    const auto found =
+                        active_state->timers.find(timer_id);
+                    if (found == active_state->timers.end())
+                        return;
+                    timer = std::move(found->second);
+                    active_state->timers.erase(found);
+                }
+                timer->del();
+            };
+        }
+
+        void shutdown()
+        {
+            std::vector<std::shared_ptr<TimerEvent>> timers;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->closed)
+                    return;
+                state->closed = true;
+                timers.reserve(state->timers.size());
+                for (auto &entry : state->timers)
+                    timers.push_back(std::move(entry.second));
+                state->timers.clear();
+            }
+            for (const auto &timer : timers)
+                timer->del();
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->idle.wait(lock, [this]()
+                             { return state->active_callbacks == 0; });
+        }
+    };
+
     /** PaceMaker that switches alongside the scheduled trees. */
     class PaceMakerMultitree : public PaceMakerDummy
     {
-        /** timer event.*/
         TimerEvent timer;
-        TimerEvent timeout_timer;
         double base_timeout;
         double prop_delay;
-        double timeout;
-
-        bool delaying_proposal = false;
-
+        double leader_progress_timeout_seconds;
+        double leader_activation_grace_seconds;
+        bool delaying_proposal{false};
         EventContext ec;
-
-        ReplicaID proposer;
-        size_t current_tid;
-
-        /* Keeps track of the current epoch*/
-        size_t current_epoch;
-
+        ReplicaID proposer{0};
+        size_t current_tid{0};
+        size_t current_epoch{0};
+        std::uint64_t view_generation{0};
+        SalticidaeLeaderProgressScheduler leader_progress_scheduler;
+        std::unique_ptr<LeaderProgressMonitor> leader_progress;
         promise_t pm_qc_manual;
 
+        static LeaderProgressConfig::Duration seconds(double value)
+        {
+            if (!(value > 0.0))
+                throw std::invalid_argument(
+                    "leader progress durations must be positive");
+            return std::chrono::duration_cast<
+                LeaderProgressConfig::Duration>(
+                std::chrono::duration<double>(value));
+        }
+
+        void arm_proposal_delay()
+        {
+            timer.del();
+            if (get_proposer() == hsc->get_id())
+            {
+                delaying_proposal = true;
+                timer = TimerEvent(
+                    ec,
+                    salticidae::generic_bind(
+                        &PaceMakerMultitree::unlock, this, _1));
+                timer.add(prop_delay);
+            }
+            else
+            {
+                delaying_proposal = false;
+            }
+        }
+
     public:
-        PaceMakerMultitree(EventContext ec, int32_t parent_limit,
-                           double base_timeout, double prop_delay) : PaceMakerDummy(parent_limit),
-                                                                     base_timeout(10),
-                                                                     timeout(20),
-                                                                     prop_delay(0),
-                                                                     ec(std::move(ec)),
-                                                                     proposer(0),
-                                                                     current_tid(0),
-                                                                     current_epoch(0) {}
+        PaceMakerMultitree(EventContext ec,
+                           int32_t parent_limit,
+                           double base_timeout,
+                           double prop_delay,
+                           double leader_progress_timeout,
+                           double leader_activation_grace)
+            : PaceMakerDummy(parent_limit),
+              base_timeout(base_timeout),
+              prop_delay(prop_delay),
+              leader_progress_timeout_seconds(leader_progress_timeout),
+              leader_activation_grace_seconds(leader_activation_grace),
+              ec(std::move(ec)),
+              leader_progress_scheduler(this->ec)
+        {
+            if (!(this->base_timeout > 0.0) ||
+                !(this->prop_delay >= 0.0))
+                throw std::invalid_argument(
+                    "pacemaker timing values are invalid");
+        }
+
+        bool configure_leader_progress(
+            LeaderProgressConfig::Duration maximum_aggregation_timeout)
+            override
+        {
+            if (leader_progress != nullptr)
+                return false;
+            LeaderProgressEffects effects;
+            effects.rotate_active_view =
+                [this](const LeaderViewId &expired_view)
+                {
+                    rotate_active_tree_on_timeout(expired_view);
+                };
+            leader_progress = std::make_unique<LeaderProgressMonitor>(
+                LeaderProgressConfig{
+                    seconds(leader_activation_grace_seconds),
+                    seconds(leader_progress_timeout_seconds),
+                    maximum_aggregation_timeout,
+                    {LeaderProgressEvent::verified_proposal,
+                     LeaderProgressEvent::quorum_certificate,
+                     LeaderProgressEvent::commit}},
+                std::move(effects));
+            return true;
+        }
+
+        bool activate_leader_view(const LeaderViewId &view) override
+        {
+            if (leader_progress == nullptr)
+                return false;
+            const auto active = leader_progress->active_view();
+            if (active.has_value() && *active == view)
+                return true;
+            if (!leader_progress->activate(
+                    view, leader_progress_scheduler))
+                return false;
+            view_generation = view.view_generation;
+            return true;
+        }
+
+        bool activate_leader_view(
+            const ConfigurationId &configuration,
+            ReplicaID leader) override
+        {
+            if (leader_progress == nullptr)
+                return false;
+            const auto active = leader_progress->active_view();
+            if (active.has_value() &&
+                active->configuration == configuration &&
+                active->leader_id == leader)
+                return true;
+            return activate_leader_view(LeaderViewId{
+                configuration, view_generation + 1, leader});
+        }
+
+        bool activate_runtime_view(const LeaderViewId &view) override
+        {
+            if (!activate_leader_view(view))
+                return false;
+            current_epoch = view.configuration.epoch_number;
+            current_tid = view.configuration.tree_id;
+            proposer = view.leader_id;
+            view_generation = view.view_generation;
+            return true;
+        }
+
+        bool record_verified_progress(
+            const ConfigurationId &configuration,
+            LeaderProgressEvent event) override
+        {
+            if (leader_progress == nullptr)
+                return false;
+            const auto active = leader_progress->active_view();
+            if (!active.has_value() ||
+                active->configuration != configuration)
+                return false;
+            return leader_progress->record_verified_progress(
+                *active, event, leader_progress_scheduler);
+        }
+
+        std::optional<LeaderViewId> active_leader_view() const override
+        {
+            if (leader_progress == nullptr)
+                return std::nullopt;
+            return leader_progress->active_view();
+        }
+
+        void rotate_active_tree_on_timeout(
+            const LeaderViewId &expired_view)
+        {
+            if (hsc == nullptr || leader_progress == nullptr ||
+                hsc->get_total_system_trees() == 0)
+                return;
+            const auto active = leader_progress->active_view();
+            if (!active.has_value() || *active != expired_view)
+                return;
+
+            const auto delegated =
+                hsc->rotate_tree_on_leader_timeout(expired_view);
+            if (delegated !=
+                LeaderTimeoutRotationDisposition::legacy_fallback)
+                return;
+
+            const auto next_tid =
+                (current_tid + 1) % hsc->get_total_system_trees();
+            const auto configuration =
+                hsc->get_exact_tree_configuration(
+                    static_cast<std::uint32_t>(current_epoch),
+                    static_cast<std::uint32_t>(next_tid));
+            LeaderViewId next_view{
+                configuration,
+                expired_view.view_generation + 1,
+                hsc->get_exact_tree_root(
+                    static_cast<std::uint32_t>(current_epoch),
+                    static_cast<std::uint32_t>(next_tid))};
+            if (!activate_leader_view(next_view))
+                return;
+
+            current_tid = next_tid;
+            update_tree_proposer();
+            vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> replicas;
+            hsc->tree_scheduler(std::move(replicas), false);
+            arm_proposal_delay();
+        }
+
+        bool set_proposer(bool is_timeout, bool epoch_change)
+        {
+            if (is_timeout)
+            {
+                const auto active = active_leader_view();
+                if (!active.has_value())
+                    return false;
+                rotate_active_tree_on_timeout(*active);
+                return active_leader_view() != active;
+            }
+            if (hsc == nullptr || hsc->get_total_system_trees() == 0)
+                return false;
+
+            const auto target_epoch =
+                current_epoch + (epoch_change ? 1 : 0);
+            const auto target_tid = epoch_change
+                                        ? size_t{0}
+                                        : (current_tid + 1) %
+                                              hsc->get_total_system_trees();
+            const auto configuration =
+                hsc->get_exact_tree_configuration(
+                    static_cast<std::uint32_t>(target_epoch),
+                    static_cast<std::uint32_t>(target_tid));
+            LeaderViewId next_view{
+                configuration,
+                view_generation + 1,
+                hsc->get_exact_tree_root(
+                    static_cast<std::uint32_t>(target_epoch),
+                    static_cast<std::uint32_t>(target_tid))};
+            if (!activate_leader_view(next_view))
+                return false;
+
+            current_epoch = target_epoch;
+            current_tid = target_tid;
+            if (epoch_change)
+                hsc->update_system_trees();
+            update_tree_proposer();
+            vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> replicas;
+            hsc->tree_scheduler(std::move(replicas), false);
+            arm_proposal_delay();
+            return true;
+        }
 
         ReplicaID get_proposer() override
         {
@@ -351,154 +721,43 @@ namespace hotstuff
                              { pm.resolve(proposer); });
         }
 
-        void proposer_timeout(TimerEvent &)
-        {
-            set_proposer(true, false);
-        }
-
-        void set_new_epoch()
-        {
-
-            HOTSTUFF_LOG_PROTO("\n=========================== Changing Epoch =================================\n");
-
-            current_epoch += 1;
-            current_tid = 0;
-
-            HOTSTUFF_LOG_PROTO("Updating system trees");
-            hsc->update_system_trees();
-        }
-
-        void set_proposer(bool isTimeout, bool epoch_change)
-        {
-
-            delaying_proposal = true;
-            // std::queue<promise_t> empty;
-            // std::swap( pending_beats, empty );
-
-            HOTSTUFF_LOG_PROTO("-------------------------------");
-            HOTSTUFF_LOG_PROTO("[PMAKER] %s reached!!!", isTimeout ? "Timeout" : "Reconfiguration");
-
-            HOTSTUFF_LOG_PROTO("Previous: proposer=%d and tid=%d", proposer, current_tid);
-
-            // hsc->close_client(proposer);
-
-            /** Rotation happens according to the total trees in the system */
-            if (!epoch_change)
-                current_tid = (current_tid + 1) % hsc->get_total_system_trees();
-
-            update_tree_proposer();
-
-            HOTSTUFF_LOG_PROTO("NOW: proposer=%d and tid=%d", proposer, current_tid);
-
-            if (isTimeout)
-            {
-                // timeout *= 2;
-                // if (timeout > (base_timeout * pow(2, 4)))
-                // {
-                //     timeout = (base_timeout * pow(2, 4));
-                // }
-                timeout = 20;
-            }
-
-            vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> reps;
-            hsc->tree_scheduler(std::move(reps), false);
-
-            if (get_proposer() == hsc->get_id())
-            {
-                HOTSTUFF_LOG_PROTO("Elected itself as a new leader!");
-                timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::unlock, this, _1));
-                timer.add(prop_delay);
-            }
-            else
-            {
-                HOTSTUFF_LOG_PROTO("Not the leader!");
-                delaying_proposal = false;
-                timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
-                timer.add(timeout);
-            }
-
-            HOTSTUFF_LOG_PROTO("[PMAKER] Finished recalculating tree!");
-            HOTSTUFF_LOG_PROTO("-------------------------------");
-        }
-
         void unlock(TimerEvent &)
         {
-            HOTSTUFF_LOG_PROTO("TIMER DELETE: UNLOCK");
             timer.del();
-            // do_new_consensus(0, std::vector<uint256_t>{});
             delaying_proposal = false;
             locked = false;
-            HOTSTUFF_LOG_PROTO("Unlocking Proposer!!!");
         }
 
         void inc_time(ReconfigurationType reconfig_type) override
         {
-
             auto *hsb = dynamic_cast<HotStuffBase *>(hsc);
-
+            if (hsb == nullptr)
+                return;
             switch (reconfig_type)
             {
             case TREE_SWITCH:
-
-                hsb->increment_reconfig_count();
-                set_proposer(false, false);
+                if (set_proposer(false, false))
+                    hsb->increment_reconfig_count();
                 break;
-
             case EPOCH_SWITCH:
-                set_new_epoch();
-
-                hsb->increment_reconfig_count();
-
-                set_proposer(false, true);
+                if (set_proposer(false, true))
+                    hsb->increment_reconfig_count();
                 break;
-
             case NO_SWITCH:
-
-                if (!delaying_proposal)
-                {
-                    HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
-                    timer.del();
-                    timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
-                    timer.add(timeout);
-                }
                 break;
-
             default:
                 HOTSTUFF_LOG_PROTO("Unknown Reconfiguration Type");
                 break;
             }
-
-            /**
-            if (force)
-            {
-                set_proposer(false);
-            }
-            else
-            {
-                if (!delaying_proposal)
-                {
-                    HOTSTUFF_LOG_PROTO("Inc time %f", timeout);
-                    timer.del();
-                    timer = TimerEvent(ec, salticidae::generic_bind(&PaceMakerMultitree::proposer_timeout, this, _1));
-                    timer.add(timeout);
-                }
-            }
-            **/
         }
 
         void schedule_next() override
         {
             if (!delaying_proposal)
-            {
                 PMWaitQC::schedule_next();
-            }
         }
 
-        void on_consensus(const block_t &blk) override
-        {
-            // timer.del();
-            // already_reconfigured = false;
-        }
+        void on_consensus(const block_t &) override {}
 
         size_t get_current_tid() override
         {
@@ -513,14 +772,23 @@ namespace hotstuff
         void update_tree_proposer() override
         {
             proposer = hsc->get_system_tree_root(current_tid);
-            HOTSTUFF_LOG_PROTO("[PMAKER] Updated tree proposer to %d", proposer);
+            HOTSTUFF_LOG_PROTO(
+                "[PMAKER] Updated tree proposer to %d", proposer);
         }
 
-        void do_new_consensus(int x, const std::vector<uint256_t> &cmds)
+        void shutdown() override
         {
-            // auto hs = static_cast<hotstuff::HotStuffBase *>(hsc);
-            // auto blk = hs->repropose_beat(cmds);
-            auto blk = hsc->on_propose(cmds, get_parents(), bytearray_t());
+            if (leader_progress != nullptr)
+                leader_progress->shutdown();
+            leader_progress_scheduler.shutdown();
+            timer.del();
+        }
+
+        void do_new_consensus(
+            int x, const std::vector<uint256_t> &cmds)
+        {
+            auto blk = hsc->on_propose(
+                cmds, get_parents(), bytearray_t());
             pm_qc_manual.reject();
             (pm_qc_manual = hsc->async_qc_finish(blk))
                 .then([this, x]()
@@ -529,7 +797,6 @@ namespace hotstuff
 #ifdef HOTSTUFF_TWO_STEP
                 if (x >= 2) return;
 #else
-
                 if (x >= 3) return;
 #endif
                 do_new_consensus(x + 1, std::vector<uint256_t>{}); });

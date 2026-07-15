@@ -17,14 +17,21 @@
 #ifndef _HOTSTUFF_CRYPTO_H
 #define _HOTSTUFF_CRYPTO_H
 
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <set>
+#include <vector>
+
 #include <openssl/rand.h>
 
 #include "secp256k1.h"
 #include "salticidae/crypto.h"
 #include "hotstuff/type.h"
 #include "hotstuff/task.h"
+#include "hotstuff/vote_identity.h"
 #include "bls/src/bls.hpp"
-#include <libnet.h>
 
 namespace hotstuff
 {
@@ -56,25 +63,59 @@ namespace hotstuff
         virtual ~PartCert() = default;
         virtual promise_t verify(const PubKey &pubkey, VeriPool &vpool) = 0;
         virtual bool verify(const PubKey &pubkey) = 0;
+        virtual const ProposalKey &get_proposal_key() const = 0;
         virtual const uint256_t &get_obj_hash() const = 0;
         virtual PartCert *clone() override = 0;
     };
 
     class ReplicaConfig;
+    class HotStuffBase;
+    class ProposalContextLifecycle;
 
     class QuorumCert : public Serializable, public Cloneable
     {
+        friend class HotStuffBase;
+        friend class ProposalContextLifecycle;
+
     public:
         virtual ~QuorumCert() = default;
         virtual void add_part(const ReplicaConfig &config, ReplicaID replica, const PartCert &pc) = 0;
-        virtual void merge_quorum(const QuorumCert &qc) = 0;
+        void merge_quorum(const ReplicaConfig &config, QuorumCert &qc)
+        {
+            bool valid = false;
+            try
+            {
+                valid = qc.verify(config);
+            }
+            catch (const std::exception &)
+            {
+                valid = false;
+            }
+            if (!valid)
+                throw std::invalid_argument("cannot merge an invalid quorum certificate");
+            merge_verified_quorum(static_cast<const QuorumCert &>(qc));
+        }
         virtual bool has_n(uint32_t n) = 0;
         virtual size_t get_sigs_n() = 0;
         virtual void compute() = 0;
         virtual promise_t verify(const ReplicaConfig &config, VeriPool &vpool) = 0;
         virtual bool verify(const ReplicaConfig &config) = 0;
+        virtual std::vector<ReplicaID> get_signers() const = 0;
+        virtual const ProposalKey &get_proposal_key() const = 0;
         virtual const uint256_t &get_obj_hash() const = 0;
         virtual QuorumCert *clone() override = 0;
+
+    protected:
+        /**
+         * Event-loop-only mutation boundaries. HotStuffBase may call these
+         * only after the corresponding immutable worker verification result
+         * has been accepted. Keeping them non-public prevents untrusted BLS
+         * certificates from bypassing the checked public API above.
+         */
+        virtual void add_verified_part(const ReplicaConfig &config,
+                                       ReplicaID replica,
+                                       const PartCert &pc) = 0;
+        virtual void merge_verified_quorum(const QuorumCert &qc) = 0;
     };
 
     using part_cert_bt = BoxObj<PartCert>;
@@ -124,6 +165,8 @@ namespace hotstuff
 
     class SigSecDummy : public Serializable
     {
+        uint256_t signed_digest;
+
     public:
         SigSecDummy() : Serializable() {}
         SigSecDummy(const uint256_t &digest,
@@ -132,39 +175,67 @@ namespace hotstuff
             sign(digest, priv_key);
         }
 
-        SigSecDummy(const SigSecDummy &obj) {}
+        SigSecDummy(const SigSecDummy &obj)
+            : signed_digest(obj.signed_digest) {}
         SigSecDummy(bls::G2Element sig) : Serializable() {}
-        void serialize(DataStream &s) const override {}
-        void unserialize(DataStream &s) override {}
-        void sign(const bytearray_t &msg, const PrivKeyDummy &priv_key) {}
-        bool verify(const bytearray_t &msg, const PubKeyDummy &pub_key) const { return true; }
+        void serialize(DataStream &s) const override
+        {
+            s << signed_digest;
+        }
+        void unserialize(DataStream &s) override
+        {
+            s >> signed_digest;
+        }
+        void sign(const bytearray_t &msg, const PrivKeyDummy &)
+        {
+            signed_digest = uint256_t(msg);
+        }
+        bool verify(const bytearray_t &msg, const PubKeyDummy &) const
+        {
+            return signed_digest == uint256_t(msg);
+        }
     };
 
     PubKeyDummy::PubKeyDummy(const PrivKeyDummy &priv_key) : PubKey() {}
 
     class PartCertDummy : public SigSecDummy, public PartCert
     {
-        uint256_t obj_hash;
+        ProposalKey proposal_key;
 
     public:
         PartCertDummy() = default;
-        PartCertDummy(const PrivKeyDummy &priv_key, const uint256_t &obj_hash) : SigSecDummy(obj_hash, priv_key),
-                                                                                 PartCert(),
-                                                                                 obj_hash(obj_hash) {}
+        PartCertDummy(const PrivKeyDummy &priv_key,
+                      const ProposalKey &proposal_key)
+            : SigSecDummy(exact_vote_authentication_digest(proposal_key),
+                          priv_key),
+              PartCert(),
+              proposal_key(proposal_key) {}
 
         bool verify(const PubKey &pub_key) override
         {
-            return SigSecDummy::verify(obj_hash,
+            return SigSecDummy::verify(
+                                       exact_vote_authentication_digest(proposal_key),
                                        static_cast<const PubKeyDummy &>(pub_key));
         }
 
         promise_t verify(const PubKey &pub_key, VeriPool &vpool) override
         {
-            return promise_t([](promise_t &pm)
-                             { pm.resolve(true); });
+            const bool valid = SigSecDummy::verify(
+                exact_vote_authentication_digest(proposal_key),
+                static_cast<const PubKeyDummy &>(pub_key));
+            return promise_t([valid](promise_t &pm)
+                             { pm.resolve(valid); });
         }
 
-        const uint256_t &get_obj_hash() const override { return obj_hash; }
+        const ProposalKey &get_proposal_key() const override
+        {
+            return proposal_key;
+        }
+
+        const uint256_t &get_obj_hash() const override
+        {
+            return proposal_key.block_hash;
+        }
 
         PartCertDummy *clone() override
         {
@@ -173,36 +244,79 @@ namespace hotstuff
 
         void serialize(DataStream &s) const override
         {
-            s << obj_hash;
+            serialize_proposal_key(s, proposal_key);
             this->SigSecDummy::serialize(s);
         }
 
         void unserialize(DataStream &s) override
         {
-            s >> obj_hash;
+            unserialize_proposal_key(s, proposal_key);
             this->SigSecDummy::unserialize(s);
         }
     };
 
     class QuorumCertDummy : public QuorumCert
     {
-        uint256_t obj_hash;
+        ProposalKey proposal_key;
+        uint256_t authentication_digest;
         size_t qty = 0;
+        std::set<ReplicaID> signers;
 
     public:
-        QuorumCertDummy() { qty++; }
-        QuorumCertDummy(const QuorumCertDummy &other) : obj_hash(other.obj_hash), qty(other.qty) {}
-        QuorumCertDummy(const ReplicaConfig &, const uint256_t &obj_hash) : obj_hash(obj_hash) { qty++; }
+        QuorumCertDummy() = default;
+        QuorumCertDummy(const QuorumCertDummy &other)
+            : proposal_key(other.proposal_key),
+              authentication_digest(other.authentication_digest),
+              qty(other.qty),
+              signers(other.signers) {}
+        QuorumCertDummy(const ReplicaConfig &,
+                        const ProposalKey &proposal_key)
+            : proposal_key(proposal_key),
+              authentication_digest(
+                  exact_vote_authentication_digest(proposal_key))
+        {}
 
         void serialize(DataStream &s) const override
         {
-            s << (uint32_t)1 << obj_hash << qty;
+            s << (uint32_t)2;
+            serialize_proposal_key(s, proposal_key);
+            s << authentication_digest << qty;
+            s << htole(static_cast<std::uint32_t>(signers.size()));
+            for (const auto signer : signers)
+                s << signer;
         }
 
         void unserialize(DataStream &s) override
         {
             uint32_t tmp;
-            s >> tmp >> obj_hash >> qty;
+            s >> tmp;
+            if (tmp != 2)
+                throw std::invalid_argument(
+                    "unsupported dummy quorum certificate version");
+            unserialize_proposal_key(s, proposal_key);
+            s >> authentication_digest >> qty;
+            std::uint32_t signer_count{0};
+            s >> signer_count;
+            signer_count = letoh(signer_count);
+            constexpr auto max_replica_count =
+                static_cast<std::size_t>(
+                    std::numeric_limits<ReplicaID>::max()) + 1;
+            if (signer_count > max_replica_count ||
+                signer_count > s.size() / sizeof(ReplicaID))
+                throw std::invalid_argument(
+                    "dummy quorum signer set exceeds the remaining payload");
+            signers.clear();
+            for (std::uint32_t index = 0; index < signer_count; ++index)
+            {
+                ReplicaID signer{0};
+                s >> signer;
+                if (!signers.insert(signer).second)
+                    throw std::invalid_argument(
+                        "dummy quorum signer set contains a duplicate");
+            }
+            if (qty != signers.size())
+                throw std::invalid_argument(
+                    "dummy quorum signer count does not match its signer set");
         }
 
         QuorumCert *clone() override
@@ -210,14 +324,44 @@ namespace hotstuff
             return new QuorumCertDummy(*this);
         }
 
-        void add_part(const ReplicaConfig &config, ReplicaID, const PartCert &) override
+        void add_part(const ReplicaConfig &, ReplicaID replica,
+                      const PartCert &part) override
         {
-            qty++;
+            if (part.get_proposal_key() != proposal_key)
+                throw std::invalid_argument(
+                    "part certificate does not match the proposal key");
+            if (signers.insert(replica).second)
+                qty = signers.size();
         }
-        void merge_quorum(const QuorumCert &qc) override
+
+    protected:
+        void add_verified_part(const ReplicaConfig &config,
+                               ReplicaID replica,
+                               const PartCert &pc) override
         {
-            qty += ((QuorumCertDummy &)qc).qty;
+            add_part(config, replica, pc);
         }
+        void merge_verified_quorum(const QuorumCert &qc) override
+        {
+            if (qc.get_proposal_key() != proposal_key)
+                throw std::invalid_argument(
+                    "quorum certificate does not match the proposal key");
+            const auto *incoming =
+                dynamic_cast<const QuorumCertDummy *>(&qc);
+            if (incoming == nullptr ||
+                incoming->qty != incoming->signers.size())
+                throw std::invalid_argument(
+                    "dummy quorum certificate has inconsistent signers");
+            for (const auto signer : incoming->signers)
+                if (signers.count(signer) != 0)
+                    throw std::invalid_argument(
+                        "dummy quorum certificates have overlapping signers");
+            signers.insert(
+                incoming->signers.begin(), incoming->signers.end());
+            qty = signers.size();
+        }
+
+    public:
         bool has_n(const uint32_t n) override
         {
             return qty >= n;
@@ -227,14 +371,35 @@ namespace hotstuff
             return qty;
         }
         void compute() override {}
-        bool verify(const ReplicaConfig &) override { return true; }
+        bool verify(const ReplicaConfig &) override
+        {
+            return qty == signers.size() &&
+                   authentication_digest ==
+                   exact_vote_authentication_digest(proposal_key);
+        }
         promise_t verify(const ReplicaConfig &, VeriPool &) override
         {
-            return promise_t([](promise_t &pm)
-                             { pm.resolve(true); });
+            const bool valid = qty == signers.size() &&
+                               authentication_digest ==
+                               exact_vote_authentication_digest(proposal_key);
+            return promise_t([valid](promise_t &pm)
+                             { pm.resolve(valid); });
         }
 
-        const uint256_t &get_obj_hash() const override { return obj_hash; }
+        std::vector<ReplicaID> get_signers() const override
+        {
+            return {signers.begin(), signers.end()};
+        }
+
+        const ProposalKey &get_proposal_key() const override
+        {
+            return proposal_key;
+        }
+
+        const uint256_t &get_obj_hash() const override
+        {
+            return proposal_key.block_hash;
+        }
     };
 
     class Secp256k1Context
@@ -489,29 +654,42 @@ namespace hotstuff
 
     class PartCertSecp256k1 : public SigSecp256k1, public PartCert
     {
-        uint256_t obj_hash;
+        ProposalKey proposal_key;
 
     public:
         PartCertSecp256k1() = default;
-        PartCertSecp256k1(const PrivKeySecp256k1 &priv_key, const uint256_t &obj_hash) : SigSecp256k1(obj_hash, priv_key),
-                                                                                         PartCert(),
-                                                                                         obj_hash(obj_hash) {}
+        PartCertSecp256k1(const PrivKeySecp256k1 &priv_key,
+                         const ProposalKey &proposal_key)
+            : SigSecp256k1(exact_vote_authentication_digest(proposal_key),
+                           priv_key),
+              PartCert(),
+              proposal_key(proposal_key) {}
 
         bool verify(const PubKey &pub_key) override
         {
-            return SigSecp256k1::verify(obj_hash,
+            return SigSecp256k1::verify(
+                                        exact_vote_authentication_digest(proposal_key),
                                         static_cast<const PubKeySecp256k1 &>(pub_key),
                                         secp256k1_default_verify_ctx);
         }
 
         promise_t verify(const PubKey &pub_key, VeriPool &vpool) override
         {
-            return vpool.verify(new Secp256k1VeriTask(obj_hash,
+            return vpool.verify(new Secp256k1VeriTask(
+                                                      exact_vote_authentication_digest(proposal_key),
                                                       static_cast<const PubKeySecp256k1 &>(pub_key),
                                                       static_cast<const SigSecp256k1 &>(*this)));
         }
 
-        const uint256_t &get_obj_hash() const override { return obj_hash; }
+        const ProposalKey &get_proposal_key() const override
+        {
+            return proposal_key;
+        }
+
+        const uint256_t &get_obj_hash() const override
+        {
+            return proposal_key.block_hash;
+        }
 
         PartCertSecp256k1 *clone() override
         {
@@ -520,48 +698,65 @@ namespace hotstuff
 
         void serialize(DataStream &s) const override
         {
-            s << obj_hash;
+            serialize_proposal_key(s, proposal_key);
             this->SigSecp256k1::serialize(s);
         }
 
         void unserialize(DataStream &s) override
         {
-            s >> obj_hash;
+            unserialize_proposal_key(s, proposal_key);
             this->SigSecp256k1::unserialize(s);
         }
     };
 
     class QuorumCertSecp256k1 : public QuorumCert
     {
-        uint256_t obj_hash;
-        salticidae::Bits rids = salticidae::Bits(512);
+        ProposalKey proposal_key;
+        std::unique_ptr<salticidae::Bits> rids;
         std::unordered_map<ReplicaID, SigSecp256k1> sigs;
 
     public:
-        QuorumCertSecp256k1() = default;
-        QuorumCertSecp256k1(const ReplicaConfig &config, const uint256_t &obj_hash);
+        QuorumCertSecp256k1();
+        QuorumCertSecp256k1(const ReplicaConfig &config,
+                            const ProposalKey &proposal_key);
+        QuorumCertSecp256k1(const QuorumCertSecp256k1 &other);
 
-        void add_part(const ReplicaConfig &config, ReplicaID rid, const PartCert &pc) override
+        void add_part(const ReplicaConfig &config,
+                      ReplicaID rid,
+                      const PartCert &pc) override;
+
+    protected:
+        void add_verified_part(const ReplicaConfig &config,
+                               ReplicaID rid,
+                               const PartCert &pc) override
         {
-            if (pc.get_obj_hash() != obj_hash)
-                throw std::invalid_argument("PartCert does match the block hash");
-            sigs.insert(std::make_pair(
-                rid, dynamic_cast<const PartCertSecp256k1 &>(pc)));
-            rids.set(rid);
+            add_part(config, rid, pc);
         }
 
-        void merge_quorum(const QuorumCert &qc) override
+        void merge_verified_quorum(const QuorumCert &qc) override
         {
-            if (qc.get_obj_hash() != obj_hash)
-                throw std::invalid_argument("QuorumCert does match the block hash");
-            for (const std::pair<const unsigned short, SigSecp256k1> &sig : dynamic_cast<const QuorumCertSecp256k1 &>(qc).sigs)
+            if (qc.get_proposal_key() != proposal_key)
+                throw std::invalid_argument(
+                    "quorum certificate does not match the proposal key");
+            const auto &incoming =
+                dynamic_cast<const QuorumCertSecp256k1 &>(qc);
+            if (rids == nullptr || incoming.rids == nullptr ||
+                rids->size() != incoming.rids->size())
+                throw std::invalid_argument(
+                    "quorum certificates use different replica sets");
+            for (const auto &sig : incoming.sigs)
+                if (sigs.count(sig.first) != 0)
+                    throw std::invalid_argument(
+                        "quorum certificates have overlapping signers");
+            for (const auto &sig : incoming.sigs)
             {
                 sigs.insert(std::make_pair(
                     sig.first, sig.second));
-                rids.set(sig.first);
+                rids->set(sig.first);
             }
         }
 
+    public:
         bool has_n(const uint32_t n) override
         {
             // std::cout << std::to_string(sigs.size()) << " " << std::to_string(n) << std::endl;
@@ -572,12 +767,30 @@ namespace hotstuff
             return sigs.size();
         }
 
+        std::vector<ReplicaID> get_signers() const override
+        {
+            std::vector<ReplicaID> signers;
+            signers.reserve(sigs.size());
+            for (const auto &signature : sigs)
+                signers.push_back(signature.first);
+            std::sort(signers.begin(), signers.end());
+            return signers;
+        }
+
         void compute() override {}
 
         bool verify(const ReplicaConfig &config) override;
         promise_t verify(const ReplicaConfig &config, VeriPool &vpool) override;
 
-        const uint256_t &get_obj_hash() const override { return obj_hash; }
+        const ProposalKey &get_proposal_key() const override
+        {
+            return proposal_key;
+        }
+
+        const uint256_t &get_obj_hash() const override
+        {
+            return proposal_key.block_hash;
+        }
 
         QuorumCertSecp256k1 *clone() override
         {
@@ -586,19 +799,17 @@ namespace hotstuff
 
         void serialize(DataStream &s) const override
         {
-            s << obj_hash << rids;
-            for (size_t i = 0; i < rids.size(); i++)
-                if (rids.get(i))
+            if (rids == nullptr)
+                throw std::logic_error(
+                    "quorum certificate has no signer bitmap");
+            serialize_proposal_key(s, proposal_key);
+            s << *rids;
+            for (size_t i = 0; i < rids->size(); i++)
+                if (rids->get(i))
                     s << sigs.at(i);
         }
 
-        void unserialize(DataStream &s) override
-        {
-            s >> obj_hash >> rids;
-            for (size_t i = 0; i < rids.size(); i++)
-                if (rids.get(i))
-                    s >> sigs[i];
-        }
+        void unserialize(DataStream &s) override;
     };
 
     class PrivKeyBLS;
@@ -854,28 +1065,41 @@ namespace hotstuff
 
     class PartCertBLS : public SigSecBLS, public PartCert
     {
-        uint256_t obj_hash;
+        ProposalKey proposal_key;
 
     public:
         PartCertBLS() = default;
-        PartCertBLS(const PrivKeyBLS &priv_key, const uint256_t &obj_hash) : SigSecBLS(obj_hash, priv_key),
-                                                                             PartCert(),
-                                                                             obj_hash(obj_hash) {}
+        PartCertBLS(const PrivKeyBLS &priv_key,
+                    const ProposalKey &proposal_key)
+            : SigSecBLS(exact_vote_authentication_digest(proposal_key),
+                        priv_key),
+              PartCert(),
+              proposal_key(proposal_key) {}
 
         bool verify(const PubKey &pub_key) override
         {
-            return SigSecBLS::verify(obj_hash,
+            return SigSecBLS::verify(
+                                     exact_vote_authentication_digest(proposal_key),
                                      static_cast<const PubKeyBLS &>(pub_key));
         }
 
         promise_t verify(const PubKey &pub_key, VeriPool &vpool) override
         {
-            return vpool.verify(new SigVeriTaskBLS(obj_hash,
+            return vpool.verify(new SigVeriTaskBLS(
+                                                   exact_vote_authentication_digest(proposal_key),
                                                    static_cast<const PubKeyBLS &>(pub_key),
                                                    static_cast<const SigSecBLS &>(*this)));
         }
 
-        const uint256_t &get_obj_hash() const override { return obj_hash; }
+        const ProposalKey &get_proposal_key() const override
+        {
+            return proposal_key;
+        }
+
+        const uint256_t &get_obj_hash() const override
+        {
+            return proposal_key.block_hash;
+        }
 
         PartCertBLS *clone() override
         {
@@ -884,13 +1108,13 @@ namespace hotstuff
 
         void serialize(DataStream &s) const override
         {
-            s << obj_hash;
+            serialize_proposal_key(s, proposal_key);
             this->SigSecBLS::serialize(s);
         }
 
         void unserialize(DataStream &s) override
         {
-            s >> obj_hash;
+            unserialize_proposal_key(s, proposal_key);
             this->SigSecBLS::unserialize(s);
         }
     };
@@ -973,22 +1197,9 @@ namespace hotstuff
 
         bool verify(const bytearray_t &msg, const PubKeyBLS &pub_key) const
         {
-
             check_msg_length(msg);
-
-            struct timeval timeStart, timeEnd;
-            gettimeofday(&timeStart, nullptr);
-
-            bool td = bls::PopSchemeMPL::Verify(*(pub_key.data), arrToVec(msg), *data);
-
-            gettimeofday(&timeEnd, nullptr);
-
-            std::cout << "The verifying took: "
-                      << ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec)
-                      << " us to execute."
-                      << std::endl;
-
-            return td;
+            return bls::PopSchemeMPL::Verify(
+                    *pub_key.data, arrToVec(msg), *data);
         }
     };
 
@@ -1024,28 +1235,41 @@ namespace hotstuff
 
     class PartCertBLSAgg : public SigSecBLSAgg, public PartCert
     {
-        uint256_t obj_hash;
+        ProposalKey proposal_key;
 
     public:
         PartCertBLSAgg() = default;
-        PartCertBLSAgg(const PrivKeyBLS &priv_key, const uint256_t &obj_hash) : SigSecBLSAgg(obj_hash, priv_key),
-                                                                                PartCert(),
-                                                                                obj_hash(obj_hash) {}
+        PartCertBLSAgg(const PrivKeyBLS &priv_key,
+                       const ProposalKey &proposal_key)
+            : SigSecBLSAgg(exact_vote_authentication_digest(proposal_key),
+                           priv_key),
+              PartCert(),
+              proposal_key(proposal_key) {}
 
         bool verify(const PubKey &pub_key) override
         {
-            return SigSecBLSAgg::verify(obj_hash,
+            return SigSecBLSAgg::verify(
+                                        exact_vote_authentication_digest(proposal_key),
                                         dynamic_cast<const PubKeyBLS &>(pub_key));
         }
 
         promise_t verify(const PubKey &pub_key, VeriPool &vpool) override
         {
-            return vpool.verify(new SigVeriTaskBLS(obj_hash,
+            return vpool.verify(new SigVeriTaskBLS(
+                                                   exact_vote_authentication_digest(proposal_key),
                                                    dynamic_cast<const PubKeyBLS &>(pub_key),
                                                    SigSecBLS(*this->data)));
         }
 
-        const uint256_t &get_obj_hash() const override { return obj_hash; }
+        const ProposalKey &get_proposal_key() const override
+        {
+            return proposal_key;
+        }
+
+        const uint256_t &get_obj_hash() const override
+        {
+            return proposal_key.block_hash;
+        }
 
         PartCertBLSAgg *clone() override
         {
@@ -1054,35 +1278,32 @@ namespace hotstuff
 
         void serialize(DataStream &s) const override
         {
-            s << obj_hash;
+            serialize_proposal_key(s, proposal_key);
             this->SigSecBLSAgg::serialize(s);
         }
 
         void unserialize(DataStream &s) override
         {
-            s >> obj_hash;
+            unserialize_proposal_key(s, proposal_key);
             this->SigSecBLSAgg::unserialize(s);
         }
     };
 
     class QuorumCertAggBLS : public QuorumCert
     {
-        uint256_t obj_hash;
+        ProposalKey proposal_key;
         salticidae::Bits rids;
         SigSecBLSAgg *theSig = nullptr;
         vector<bls::G2Element> sigs;
         uint32_t n = 0;
 
     public:
+        using QuorumCert::merge_quorum;
+
         QuorumCertAggBLS() = default;
-        QuorumCertAggBLS(const ReplicaConfig &config, const uint256_t &obj_hash);
-        QuorumCertAggBLS(const QuorumCertAggBLS &other) : obj_hash(other.obj_hash), rids(other.rids)
-        {
-            if (other.theSig != nullptr)
-            {
-                theSig = new SigSecBLSAgg(*other.theSig);
-            }
-        }
+        QuorumCertAggBLS(const ReplicaConfig &config,
+                         const ProposalKey &proposal_key);
+        QuorumCertAggBLS(const QuorumCertAggBLS &other);
 
         ~QuorumCertAggBLS() override
         {
@@ -1102,92 +1323,40 @@ namespace hotstuff
             }
         }
 
-        void add_part(const ReplicaConfig &config, ReplicaID rid, const PartCert &pc) override
+        void add_part(const ReplicaConfig &config, ReplicaID rid, const PartCert &pc) override;
+
+        bool has_signer(ReplicaID rid) const
         {
-            if (pc.get_obj_hash() != obj_hash)
-                throw std::invalid_argument("PartCert does match the block hash");
-            rids.set(rid);
-            calculateN();
-
-            // if (theSig == nullptr) {
-            //     theSig = new SigSecBLSAgg(*dynamic_cast<const PartCertBLSAgg &>(pc).data);
-            //     sigs.push_back(*theSig->data);
-            //     return;
-            // }
-            if (sigs.empty() && theSig != nullptr)
-            {
-                sigs.push_back(*theSig->data);
-                delete theSig;
-                theSig = nullptr;
-            }
-            sigs.push_back(*dynamic_cast<const SigSecBLSAgg &>(pc).data);
-            // bls::G2Element sig1 = *theSig->data;
-            // bls::G2Element sig2 = *dynamic_cast<const SigSecBLSAgg &>(pc).data;
-
-            // struct timeval timeStart, timeEnd;
-            // gettimeofday(&timeStart, nullptr);
-
-            // bls::G2Element sig = bls::PopSchemeMPL::Aggregate({sig1, sig2});
-
-            // gettimeofday(&timeEnd, nullptr);
-
-            // std::cout << "Aggregating Sigs: "
-            //           << ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec)
-            //           << " us to execute."
-            //           << std::endl;
-
-            //*theSig->data = sig;
+            return rid < rids.size() && rids.get(rid);
         }
 
-        void merge_quorum(const QuorumCert &qc) override
+        bool has_disjoint_signers(const QuorumCertAggBLS &other) const
         {
-            if (qc.get_obj_hash() != obj_hash)
-                throw std::invalid_argument("QuorumCert does match the block hash");
-
-            salticidae::Bits newRids = dynamic_cast<const QuorumCertAggBLS &>(qc).rids;
-            for (size_t i = 0; i < rids.size(); i++)
-            {
-                if (newRids.get(i))
-                {
-                    rids.set(i);
-                }
-            }
-            calculateN();
-
-            if (sigs.empty() && theSig != nullptr)
-            {
-                sigs.push_back(*theSig->data);
-                delete theSig;
-                theSig = nullptr;
-            }
-
-            for (bls::G2Element el : dynamic_cast<const QuorumCertAggBLS &>(qc).sigs)
-            {
-                sigs.push_back(el);
-            }
-
-            if (dynamic_cast<const QuorumCertAggBLS &>(qc).theSig != nullptr)
-            {
-                sigs.push_back(*dynamic_cast<const QuorumCertAggBLS &>(qc).theSig->data);
-            }
-
-            // bls::G2Element sig1 = *theSig->data;
-            // bls::G2Element sig2 = *dynamic_cast<const QuorumCertAggBLS &>(qc).theSig->data;
-
-            // struct timeval timeStart,timeEnd;
-            // gettimeofday(&timeStart, nullptr);
-
-            // bls::G2Element sig = bls::PopSchemeMPL::Aggregate({sig1, sig2});
-
-            // gettimeofday(&timeEnd, nullptr);
-
-            // std::cout << "Aggregating Sigs: "
-            //           << ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec)
-            //           << " us to execute."
-            //           << std::endl;
-
-            //*theSig->data = sig;
+            if (rids.size() != other.rids.size())
+                return false;
+            for (size_t rid = 0; rid < rids.size(); ++rid)
+                if (rids.get(rid) && other.rids.get(rid))
+                    return false;
+            return true;
         }
+
+        std::vector<ReplicaID> get_signers() const override
+        {
+            std::vector<ReplicaID> signers;
+            signers.reserve(n);
+            for (size_t rid = 0; rid < rids.size(); ++rid)
+                if (rids.get(rid))
+                    signers.push_back(static_cast<ReplicaID>(rid));
+            return signers;
+        }
+
+    protected:
+        void add_verified_part(const ReplicaConfig &config,
+                               ReplicaID rid,
+                               const PartCert &pc) override;
+        void merge_verified_quorum(const QuorumCert &qc) override;
+
+    public:
 
         bool has_n(const uint32_t t) override
         {
@@ -1202,7 +1371,7 @@ namespace hotstuff
 
         void compute() override
         {
-            if (theSig == nullptr)
+            if (theSig == nullptr && !sigs.empty())
             {
                 struct timeval timeStart, timeEnd;
                 gettimeofday(&timeStart, nullptr);
@@ -1222,7 +1391,15 @@ namespace hotstuff
         bool verify(const ReplicaConfig &config) override;
         promise_t verify(const ReplicaConfig &config, VeriPool &vpool) override;
 
-        const uint256_t &get_obj_hash() const override { return obj_hash; }
+        const ProposalKey &get_proposal_key() const override
+        {
+            return proposal_key;
+        }
+
+        const uint256_t &get_obj_hash() const override
+        {
+            return proposal_key.block_hash;
+        }
 
         QuorumCertAggBLS *clone() override
         {
@@ -1232,7 +1409,8 @@ namespace hotstuff
         void serialize(DataStream &s) const override
         {
             bool combined = (theSig != nullptr);
-            s << obj_hash << rids << combined;
+            serialize_proposal_key(s, proposal_key);
+            s << rids << combined;
             if (combined)
             {
                 if (theSig == nullptr || !sigs.empty())
@@ -1246,7 +1424,11 @@ namespace hotstuff
         void unserialize(DataStream &s) override
         {
             bool combined;
-            s >> obj_hash >> rids >> combined;
+            delete theSig;
+            theSig = nullptr;
+            sigs.clear();
+            unserialize_proposal_key(s, proposal_key);
+            s >> rids >> combined;
             calculateN();
             if (combined)
             {
