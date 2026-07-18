@@ -198,6 +198,7 @@ add_library(hotstuff
     src/proposal_admission.cpp
     src/proposal_body.cpp
     src/response_attempt.cpp
+    src/simple_reputation.cpp
     src/structured_event.cpp
     src/tree_policy.cpp
     src/consensus.cpp

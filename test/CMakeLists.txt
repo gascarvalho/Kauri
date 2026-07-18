@@ -190,6 +190,13 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;adaptation-manager;m12"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_simple_reputation
+    test_simple_reputation.cpp)
+set_tests_properties(
+    test_simple_reputation PROPERTIES
+    LABELS "unit;adaptive;intentional-red;reputation;prototype"
+    TIMEOUT 5)
+add_kauri_catch_test(
     test_proposal_admission
     test_proposal_admission.cpp)
 add_kauri_catch_test(

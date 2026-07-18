@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <csignal>
 
@@ -37,6 +38,7 @@
 #include "hotstuff/type.h"
 #include "hotstuff/client.h"
 #include "hotstuff/hotstuff.h"
+#include "hotstuff/simple_reputation.h"
 
 #include <cstdlib>   // for rand()
 #include <algorithm> // for find()
@@ -44,7 +46,6 @@
 
 using salticidae::Config;
 
-using hotstuff::CollectedReport;
 using hotstuff::command_t;
 using hotstuff::Epoch;
 using hotstuff::EpochProtocolMode;
@@ -61,6 +62,10 @@ using hotstuff::NetAddr;
 using hotstuff::opcode_t;
 using hotstuff::ReplicaID;
 using hotstuff::ReportType;
+using hotstuff::SimpleReputation;
+using hotstuff::SimpleReputationDisposition;
+using hotstuff::SimpleReputationOutcome;
+using hotstuff::SimpleReputationUpdate;
 using hotstuff::TimeoutMeasure;
 using hotstuff::TimeoutReport;
 using hotstuff::Tree;
@@ -94,8 +99,6 @@ std::unordered_map<const uint256_t, Request> waiting;
 std::vector<NetAddr> replicas;
 std::vector<std::pair<struct timeval, double>> elapsed;
 
-std::unordered_map<uint32_t, std::vector<CollectedReport>> reportsByTid;
-
 Net mn(ec, Net::Config());
 
 // Delay connectio to replicas
@@ -103,18 +106,13 @@ std::unordered_map<ReplicaID, bool> replica_connected;
 
 // Reputation metrics
 std::unordered_map<ReplicaID, double> rep_score;
-
-// Global structure to store votes received per node in the current epoch.
-std::unordered_map<ReplicaID, std::set<ReplicaID>> votesReceived;
-std::unordered_map<ReplicaID, std::set<ReplicaID>> votesIssued;
+std::unique_ptr<SimpleReputation> simple_reputation;
 
 std::set<std::pair<ReplicaID, ReplicaID>> tree_contraints;
 
 // Timers
-static salticidae::TimerEvent ev_epoch_timer;
+static salticidae::TimerEvent ev_reputation_timer;
 static salticidae::TimerEvent ev_connect_timer;
-
-const double delta = 1.0;
 
 // Helper function to log the entire reputation table.
 void log_reputation_table()
@@ -131,78 +129,101 @@ void log_reputation_table()
     HOTSTUFF_LOG_INFO("%s", oss.str().c_str());
 }
 
-void msg_reports_handler(MsgLatencyReport &&msg, const Net::conn_t &conn)
+bool valid_direct_child_observation(
+    ReplicaID reporter,
+    ReplicaID target,
+    std::uint32_t epoch,
+    std::uint32_t tree_id)
 {
-    /*Later we will use this i trust*/
+    const auto &trees = current_epoch.get_trees();
+    return epoch == current_epoch.get_epoch_num() &&
+           tree_id < trees.size() &&
+           trees[tree_id].is_parent_of(reporter, target);
 }
 
-void process_report(ReplicaID reporter, ReplicaID target)
+const char *reputation_outcome_name(SimpleReputationOutcome outcome)
 {
+    return outcome == SimpleReputationOutcome::response
+               ? "response"
+               : "timeout";
+}
 
-    if (votesReceived[target].find(reporter) != votesReceived[target].end())
+void publish_reputation_update(const SimpleReputationUpdate &update)
+{
+    if (update.disposition != SimpleReputationDisposition::applied)
     {
-        HOTSTUFF_LOG_INFO("[REPORT] Duplicate report: Reporter %d already reported Target %d. Ignored.", reporter, target);
+        HOTSTUFF_LOG_WARN(
+            "[REPUTATION] Rejected reporter=%u target=%u disposition=%u",
+            update.reporter_id,
+            update.target_id,
+            static_cast<unsigned int>(update.disposition));
         return;
     }
 
-    votesReceived[target].insert(reporter);
-    votesIssued[reporter].insert(target);
+    rep_score[update.target_id] = update.score;
+    HOTSTUFF_LOG_INFO(
+        "KAURI_REPUTATION update reporter=%u target=%u outcome=%s delta=%d score=%d",
+        update.reporter_id,
+        update.target_id,
+        reputation_outcome_name(update.outcome),
+        update.delta,
+        update.score);
+}
 
-    rep_score[reporter] -= delta;
-    rep_score[target] -= delta;
+void msg_reports_handler(MsgLatencyReport &&msg, const Net::conn_t &conn)
+{
+    if (simple_reputation == nullptr || conn == nullptr)
+        return;
 
-    HOTSTUFF_LOG_INFO("[REPORT] Reporter %d -> Target %d. Decrease both by %.2f", reporter, target, delta);
+    const auto reporter = msg.report.reporter;
+    for (const auto &latency : msg.report.lats)
+    {
+        if (!valid_direct_child_observation(
+                reporter,
+                latency.child,
+                latency.epoch_nr,
+                latency.tid))
+        {
+            HOTSTUFF_LOG_WARN(
+                "[REPUTATION] Rejected response reporter=%u target=%u epoch=%u tree=%u",
+                reporter,
+                latency.child,
+                latency.epoch_nr,
+                latency.tid);
+            continue;
+        }
+        publish_reputation_update(
+            simple_reputation->observe_response(
+                reporter, latency.child));
+    }
 }
 
 void msg_timeout_report_handler(MsgTimeoutReport &&msg, const Net::conn_t &conn)
 {
+    if (simple_reputation == nullptr || (conn == nullptr && !mock_mode))
+        return;
+
     auto &report = msg.report;
-
-    ReplicaID reporter = report.reporter;
-    std::vector<hotstuff::TimeoutMeasure> timeouts = report.timeouts;
-
-    HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Received timeout report from %d with %zu reports", reporter, timeouts.size());
-
-    for (auto &tm : timeouts)
+    const auto reporter = report.reporter;
+    for (const auto &timeout : report.timeouts)
     {
-
-        CollectedReport cr;
-
-        cr.reporter = reporter;
-        cr.target = tm.non_responsive_replica;
-        cr.epoch = tm.epoch_nr;
-        cr.tid = tm.tid;
-        cr.missing_voter = tm.missing_voter;
-
-        if (cr.tid >= current_epoch.get_trees().size())
+        if (!valid_direct_child_observation(
+                reporter,
+                timeout.non_responsive_replica,
+                timeout.epoch_nr,
+                timeout.tid))
         {
-            HOTSTUFF_LOG_WARN("[TIMEOUT HANDLER] Invalid tree id %d in report from Replica %d. Skipping report.", cr.tid, reporter);
+            HOTSTUFF_LOG_WARN(
+                "[REPUTATION] Rejected timeout reporter=%u target=%u epoch=%u tree=%u",
+                reporter,
+                timeout.non_responsive_replica,
+                timeout.epoch_nr,
+                timeout.tid);
             continue;
         }
-
-        const Tree &tree = current_epoch.get_trees()[cr.tid];
-
-        HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Processing report: Reporter %d, Target %d, Missing voter %d, Epoch %d, Tid %d", cr.reporter, cr.target, cr.missing_voter, cr.epoch, cr.tid);
-
-        if (tree.is_parent_of(cr.target, reporter))
-        {
-            cr.report_type = MISSING_PROPOSAL;
-            cr.missing_voter = reporter; // Just to ensure there's no proposal missings of another replica in the tree that not just the parent
-            HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Determined as MISSING_PROPOSAL: Reporter %d is child of Target %d", cr.reporter, cr.target);
-        }
-        else if (tree.is_parent_of(reporter, cr.target))
-        {
-            cr.report_type = MISSING_VOTE;
-            HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Determined as MISSING_VOTE: Reporter %d is parent of Target %d", cr.reporter, cr.target);
-        }
-        else
-        {
-            HOTSTUFF_LOG_WARN("[TIMEOUT HANDLER] Ambiguous report from Replica %d: Neither direct parent-child relation found between Reporter %d and Target %d. Skipping report.", reporter, cr.reporter, cr.target);
-            continue;
-        }
-
-        reportsByTid[cr.tid].push_back(cr);
-        HOTSTUFF_LOG_INFO("[TIMEOUT HANDLER] Added report from Replica %d for tree %d", reporter, cr.tid);
+        publish_reputation_update(
+            simple_reputation->observe_timeout(
+                reporter, timeout.non_responsive_replica));
     }
 }
 
@@ -487,211 +508,15 @@ void broadcast_epoch(Epoch &epoch)
     }
 }
 
-size_t get_level(const Tree &tree, size_t pos)
+void on_reputation_timer(salticidae::TimerEvent &te, int unused)
 {
-    if (pos >= tree.get_tree_array().size() || pos == 0)
-        return 0;
-    double m = static_cast<double>(tree.get_fanout());
-    return static_cast<size_t>(std::floor(std::log(pos + 1) / std::log(m)));
-}
-
-std::vector<CollectedReport> process_missing_voter_chain(const Tree &tree, ReplicaID missingVoter, const std::vector<CollectedReport> &reportsForX)
-{
-    // Sort reportsForX by reporter depth descending (deepest first)
-    std::vector<CollectedReport> sortedReports = reportsForX;
-    std::sort(sortedReports.begin(), sortedReports.end(), [&](const CollectedReport &a, const CollectedReport &b)
-              {
-                size_t posA = tree.get_node_position(a.reporter);
-                size_t posB = tree.get_node_position(b.reporter);
-                return get_level(tree, posA) > get_level(tree, posB); });
-
-    if (sortedReports.empty())
-        return sortedReports;
-
-    // Start from the deepest report.
-    std::vector<CollectedReport> useful;
-
-    CollectedReport current = sortedReports[0];
-
-    HOTSTUFF_LOG_INFO("[CHAIN] Storing processing for missing voter %d from reporter %d to target %d", missingVoter, current.reporter, current.target);
-
-    useful.push_back(current);
-
-    HOTSTUFF_LOG_INFO("[CHAIN] Starting chain processing for missing voter %d from reporter %d", missingVoter, current.reporter);
-    size_t pos = tree.get_node_position(current.reporter);
-
-    while (pos > 0 && pos < tree.get_tree_array().size())
-    {
-        size_t parentPos = (pos - 1) / tree.get_fanout();
-        ReplicaID parent = tree.get_tree_array()[parentPos];
-
-        bool found = false;
-        for (const auto &r : sortedReports)
-        {
-            if (r.reporter == parent)
-            {
-                found = true;
-
-                HOTSTUFF_LOG_INFO("[CHAIN] Found report from parent %d in chain for missing voter %d", parent, missingVoter);
-                break;
-            }
-        }
-        if (!found)
-        {
-            rep_score[parent] -= delta;
-            HOTSTUFF_LOG_INFO("[CHAIN] Missing report: Penalizing expected parent %d for missing voter %d, penalty = %.2f", parent, missingVoter, delta);
-        }
-
-        pos = parentPos;
-    }
-
-    // Log the final chain reports being returned.
-    HOTSTUFF_LOG_INFO("[CHAIN] Final chain reports for missing voter %d:", missingVoter);
-    for (const auto &r : useful)
-    {
-        size_t level = get_level(tree, tree.get_node_position(r.reporter));
-        HOTSTUFF_LOG_INFO("[CHAIN]   Reporter %d -> Target %d (level %zu)", r.reporter, r.target, level);
-    }
-
-    return useful;
-}
-
-void process_reports_for_tid(uint32_t tid)
-{
-    auto &reports = reportsByTid[tid];
-
-    HOTSTUFF_LOG_INFO("[PROCESS] Processing reports for tree id %d. Total reports = %zu", tid, reports.size());
-
-    // Group reports by missing voter and type.
-    std::unordered_map<ReplicaID, std::vector<CollectedReport>> missing_vote_reports;
-
-    std::vector<CollectedReport> filtered; // final reports to be processed
-
-    for (const auto &r : reports)
-    {
-        if (r.report_type == MISSING_VOTE)
-            missing_vote_reports[r.missing_voter].push_back(r);
-        else if (r.report_type == MISSING_PROPOSAL)
-            filtered.push_back(r);
-    }
-
-    const Tree &tree = current_epoch.get_trees()[tid];
-
-    // For each missing voter, process the chain.
-    for (const auto &entry : missing_vote_reports)
-    {
-        ReplicaID missingVoter = entry.first;
-
-        const std::vector<CollectedReport> &reportsForX = entry.second;
-
-        HOTSTUFF_LOG_INFO("[PROCESS] Processing chain for missing voter %d in tree %d, with %zu reports.", missingVoter, tid, reportsForX.size());
-
-        auto chainReports = process_missing_voter_chain(tree, missingVoter, reportsForX);
-
-        filtered.insert(filtered.end(), chainReports.begin(), chainReports.end());
-    }
-
-    // After chain processing, process each report normally.
-    for (const auto &r : filtered)
-    {
-        HOTSTUFF_LOG_INFO("[PROCESS] Processing report: Reporter %d -> Target %d", r.reporter, r.target);
-        tree_contraints.insert(std::pair(r.reporter, r.target));
-        process_report(r.reporter, r.target);
-    }
-}
-
-void reward_unvoted_replicas()
-{
-
-    for (const auto &entry : rep_score)
-    {
-        ReplicaID replica = entry.first;
-
-        bool noIssued = (votesIssued.find(replica) == votesIssued.end()) || votesIssued[replica].empty();
-        bool noReceived = (votesReceived.find(replica) == votesReceived.end()) || votesReceived[replica].empty();
-
-        if (noIssued && noReceived)
-        {
-            rep_score[replica] += delta;
-            HOTSTUFF_LOG_INFO("[REWARD] Rewarding Replica %d with delta %.2f (did not vote or receive any vote).", replica, delta);
-        }
-    }
-}
-
-void process_all_reports()
-{
+    static_cast<void>(unused);
     log_reputation_table();
 
-    for (auto &entry : reportsByTid)
-    {
-        uint32_t tid = entry.first;
-        process_reports_for_tid(tid);
-    }
-
-    reportsByTid.clear();
-
-    reward_unvoted_replicas();
-
-    // Clear the epoch votes since the contrainsts are already captured
-    votesIssued.clear();
-    votesReceived.clear();
-
-    log_reputation_table();
-}
-
-void on_epoch_timer(salticidae::TimerEvent &te, int unused)
-{
-
-    process_all_reports();
-
-    Epoch old_epoch = current_epoch;
-
-    double improvement_needed = 0.0;
-    int max_tries = 5;
-    uint8_t fanout = 2;
-    uint8_t pipe_stretch = 2;
-
-    // gather node IDs
-    std::vector<uint32_t> all_nodes;
-    for (auto &p : rep_score)
-    {
-        all_nodes.push_back(p.first);
-    }
-
-    Epoch candidate = generate_and_evaluate_epoch(
-        rep_score,
-        old_epoch,
-        all_nodes,
-        fanout,
-        pipe_stretch,
-        f,
-        improvement_needed,
-        max_tries);
-
-    double old_score = score_epoch(old_epoch, rep_score);
-    double new_score = score_epoch(candidate, rep_score);
-
-    HOTSTUFF_LOG_INFO("[EPOCH TIMER] Old epoch score = %.2f, New epoch score = %.2f", old_score, new_score);
-
-    if (new_score > old_score)
-    {
-        // We found something better
-        HOTSTUFF_LOG_INFO("Found a better epoch with score=%.2f, old=%.2f, adopting new epoch_num=%d",
-                          score_epoch(candidate, rep_score),
-                          score_epoch(old_epoch, rep_score),
-                          candidate.get_epoch_num());
-
-        current_epoch = candidate;
-
-        broadcast_epoch(current_epoch);
-    }
-    else
-    {
-        HOTSTUFF_LOG_INFO("No improvement over old epoch, keep old one");
-    }
-
-    // re-schedule the timer if you want repeated triggers
-
+    // This first prototype is scoring-only. A manager-local epoch change would
+    // diverge from replicas because the committed staging/deployment path is
+    // not wired yet, and would make later evidence validate against the wrong
+    // topology.
     te.add(30.0);
 }
 
@@ -801,9 +626,6 @@ int main(int argc, char **argv)
     mn.reg_handler(msg_reports_handler);
     mn.reg_handler(msg_timeout_report_handler);
 
-    mn.start();
-    mn.listen(NetAddr("0.0.0.0", 50500));
-
     config.add_opt("idx", opt_idx, Config::SET_VAL);
     config.add_opt("cid", opt_cid, Config::SET_VAL);
     config.add_opt("replica", opt_replicas, Config::APPEND);
@@ -837,9 +659,10 @@ int main(int argc, char **argv)
 
     current_epoch = parse_default_epoch_config(opt_default_epoch->get());
 
-    ev_epoch_timer = salticidae::TimerEvent(ec, std::bind(&on_epoch_timer, std::placeholders::_1, 0));
-    // start it (e.g. in 30s)
-    ev_epoch_timer.add(5);
+    ev_reputation_timer = salticidae::TimerEvent(
+        ec,
+        std::bind(&on_reputation_timer, std::placeholders::_1, 0));
+    ev_reputation_timer.add(5);
 
     HOTSTUFF_LOG_INFO("%s\n", std::string(current_epoch).c_str());
 
@@ -893,12 +716,23 @@ int main(int argc, char **argv)
         HOTSTUFF_LOG_INFO("nfaulty = %u", f);
     }
 
+    std::vector<ReplicaID> reputation_membership;
+    reputation_membership.reserve(replicas.size());
 
     // Initialize rep_score to 0 for every replica (ID in [0..replicas.size()-1])
     for (size_t i = 0; i < replicas.size(); i++)
     {
         rep_score[i] = 0.0; // start from zero
+        reputation_membership.push_back(static_cast<ReplicaID>(i));
     }
+    simple_reputation =
+        std::make_unique<SimpleReputation>(
+            std::move(reputation_membership));
+
+    // Listen only after membership and scoring state are ready. The demo
+    // launcher uses this listener as the manager readiness boundary.
+    mn.start();
+    mn.listen(NetAddr("0.0.0.0", 50500));
 
     // for (size_t i = 0; i < replicas.size(); i++)
     //     conns.insert(std::make_pair(i, mn.connect_sync(replicas[i])));
