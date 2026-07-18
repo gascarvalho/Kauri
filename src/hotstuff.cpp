@@ -20,11 +20,13 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <future>
 #include <iostream>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include "hotstuff/client.h"
 #include "hotstuff/liveness.h"
@@ -44,6 +46,27 @@ namespace hotstuff
 
     namespace
     {
+        constexpr std::uint32_t exact_forwarding_max_attempts = 3;
+        constexpr auto exact_forwarding_retry_base_delay =
+            std::chrono::milliseconds(5);
+
+        bool signer_sets_overlap(
+            const std::set<ReplicaID> &left,
+            const std::set<ReplicaID> &right)
+        {
+            const auto &smaller = left.size() <= right.size()
+                                      ? left
+                                      : right;
+            const auto &larger = left.size() <= right.size()
+                                     ? right
+                                     : left;
+            return std::any_of(
+                smaller.begin(), smaller.end(),
+                [&larger](ReplicaID signer) {
+                    return larger.count(signer) != 0;
+                });
+        }
+
         AggregationScheduler::Duration adaptive_timeout_from_seconds(
             double seconds)
         {
@@ -547,6 +570,38 @@ namespace hotstuff
         HotStuffBase *owner;
         std::size_t active_callbacks{0};
         bool closing{false};
+    };
+
+    struct HotStuffBase::ExactForwardingRetryJob final
+    {
+        ExactForwardingRetryJob(
+            std::uint64_t id,
+            const ProposalContextLease &lease,
+            quorum_cert_bt exact_certificate,
+            std::set<ReplicaID> exact_signers,
+            std::optional<std::uint64_t> pending_id,
+            ExactForwardingRole forwarding_role,
+            std::uint32_t completed_attempts)
+            : id(id),
+              key(lease.key()),
+              generation(lease.generation()),
+              certificate(std::move(exact_certificate)),
+              signers(std::move(exact_signers)),
+              pending_candidate_id(pending_id),
+              role(forwarding_role),
+              attempts(completed_attempts)
+        {}
+
+        const std::uint64_t id;
+        const ProposalKey key;
+        const std::uint64_t generation;
+        const quorum_cert_bt certificate;
+        const std::set<ReplicaID> signers;
+        const std::optional<std::uint64_t> pending_candidate_id;
+        const ExactForwardingRole role;
+        std::uint32_t attempts;
+        bool scheduled{false};
+        AggregationScheduler::Cancellation cancellation;
     };
 
     class HotStuffBase::ExactContributionEffects final
@@ -1395,9 +1450,7 @@ namespace hotstuff
         return make_exact_proposal_context_metadata(
             key,
             get_id(),
-            definition->members_breadth_first,
-            definition->fanout,
-            definition->pipeline_stretch,
+            *definition,
             config.nmajority);
     }
 
@@ -1443,6 +1496,7 @@ namespace hotstuff
         }
 
         proposal_contexts->activate_configuration(configuration);
+        emit_active_configuration_event(configuration);
 
         if (proposal_admission == nullptr)
         {
@@ -1748,6 +1802,7 @@ namespace hotstuff
     void HotStuffBase::purge_pending_exact_contributions(
         const ProposalKey &key)
     {
+        discard_exact_forwarding_retries(key);
         static_cast<void>(pending_exact_contributions.purge(key));
     }
 
@@ -1803,18 +1858,18 @@ namespace hotstuff
         if (parent.is_null())
             return false;
 
-        VoteRelay relay(
-            lease.key(), std::move(certificate), this);
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
+        try
         {
-            if (adaptive_epoch_runtime == nullptr)
-                return false;
-            const auto generation = find_exact_runtime_generation(
-                lease.key().configuration);
-            if (!generation.has_value())
-                return false;
-            try
+            VoteRelay relay(
+                lease.key(), std::move(certificate), this);
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
             {
+                if (adaptive_epoch_runtime == nullptr)
+                    return false;
+                const auto generation = find_exact_runtime_generation(
+                    lease.key().configuration);
+                if (!generation.has_value())
+                    return false;
                 const MsgRelay native(relay);
                 const auto encoded = adaptive_epoch_consensus_message(
                     lease.key().configuration,
@@ -1827,17 +1882,131 @@ namespace hotstuff
                     epoch_wire_limits);
                 if (encoded.empty())
                     return false;
-                pn.send_msg(MsgRelay(DataStream(encoded)), parent);
+                return pn.send_msg(
+                    MsgRelay(DataStream(encoded)), parent);
             }
-            catch (...)
-            {
-                return false;
-            }
-            return true;
-        }
 
-        pn.send_msg(MsgRelay(relay), parent);
+            return pn.send_msg(MsgRelay(relay), parent);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool HotStuffBase::send_exact_relay_reserved(
+        const ProposalContextLease &lease,
+        ProposalForwardingClaim claim,
+        ExactForwardingRole role,
+        std::shared_ptr<ExactForwardingRetryJob> retry)
+    {
+        const auto reservation_id = claim.reservation_id;
+        if (reservation_id == 0 || claim.certificate == nullptr)
+            return false;
+        auto retained = claim.certificate->clone();
+        const auto signers = claim.signers;
+        const auto pending_candidate_id = claim.pending_candidate_id;
+        const auto attempts = retry == nullptr ? 1U : ++retry->attempts;
+        const auto reserved_event =
+            role == ExactForwardingRole::initial_aggregate
+                ? AdaptiveAggregationTransition::initial_reserved
+                : AdaptiveAggregationTransition::delta_reserved;
+        const auto enqueued_event =
+            role == ExactForwardingRole::initial_aggregate
+                ? AdaptiveAggregationTransition::initial_enqueued
+                : AdaptiveAggregationTransition::delta_enqueued;
+        const auto committed_event =
+            role == ExactForwardingRole::initial_aggregate
+                ? AdaptiveAggregationTransition::initial_committed
+                : AdaptiveAggregationTransition::delta_committed;
+        const auto released_event =
+            role == ExactForwardingRole::initial_aggregate
+                ? AdaptiveAggregationTransition::initial_released
+                : AdaptiveAggregationTransition::delta_released;
+        emit_adaptive_aggregation_event(
+            reserved_event, lease, &signers);
+        const bool enqueued = send_exact_relay(
+            lease, std::move(claim.certificate));
+        if (!enqueued)
+        {
+            if (proposal_contexts->release_forwarding_claim(
+                    lease, reservation_id))
+                emit_adaptive_aggregation_event(
+                    released_event,
+                    lease,
+                    &signers,
+                    nullptr,
+                    nullptr,
+                    0,
+                    0,
+                    "transport_enqueue_rejected");
+            schedule_exact_forwarding_retry(
+                lease,
+                std::move(retained),
+                signers,
+                pending_candidate_id,
+                role,
+                attempts);
+            return false;
+        }
+        emit_adaptive_aggregation_event(
+            enqueued_event, lease, &signers);
+        if (!proposal_contexts->commit_forwarding_claim(
+                lease, reservation_id))
+        {
+            if (proposal_contexts->release_forwarding_claim(
+                    lease, reservation_id))
+                emit_adaptive_aggregation_event(
+                    released_event,
+                    lease,
+                    &signers,
+                    nullptr,
+                    nullptr,
+                    0,
+                    0,
+                    "forwarding_commit_failed");
+            auto failure = retry;
+            if (failure == nullptr)
+                failure = std::make_shared<ExactForwardingRetryJob>(
+                    0,
+                    lease,
+                    std::move(retained),
+                    signers,
+                    pending_candidate_id,
+                    role,
+                    attempts);
+            abort_exact_forwarding(
+                lease, failure, "forwarding_commit_failed");
+            return false;
+        }
+        emit_adaptive_aggregation_event(
+            committed_event, lease, &signers);
+        if (retry != nullptr)
+            exact_forwarding_retry_jobs.erase(retry->id);
+        complete_exact_forwarding(lease, role);
         return true;
+    }
+
+    quorum_cert_bt HotStuffBase::make_exact_direct_forwarding_candidate(
+        const ProposalContextLease &lease,
+        const Vote &vote)
+    {
+        if (vote.cert == nullptr || vote.key() != lease.key())
+            return nullptr;
+        try
+        {
+            auto certificate = create_quorum_cert(lease.key());
+            certificate->add_verified_part(
+                config, vote.voter, *vote.cert);
+            certificate->compute();
+            if (!certificate->verify(config))
+                return nullptr;
+            return certificate;
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
     }
 
     bool HotStuffBase::forward_exact_direct(
@@ -1848,18 +2017,37 @@ namespace hotstuff
             !lease.tree().parent.has_value() ||
             config.get_peer_id(*lease.tree().parent).is_null())
             return false;
-        auto certificate = create_quorum_cert(lease.key());
-        certificate->add_verified_part(
-            config, vote.voter, *vote.cert);
-        certificate->compute();
-        if (!certificate->verify(config))
+        auto certificate = make_exact_direct_forwarding_candidate(
+            lease, vote);
+        if (certificate == nullptr)
             return false;
-        auto claim = proposal_contexts->claim_unforwarded_certificate(
+        auto claim = proposal_contexts
+                         ->claim_unforwarded_certificate_reservation(
             lease, std::move(certificate));
         if (!claim.has_value())
+        {
+            try
+            {
+                const std::set<ReplicaID> rejected{vote.voter};
+                emit_adaptive_aggregation_event(
+                    AdaptiveAggregationTransition::delta_rejected,
+                    lease,
+                    &rejected,
+                    nullptr,
+                    nullptr,
+                    0,
+                    0,
+                    "reservation_rejected");
+            }
+            catch (...)
+            {
+            }
             return false;
-        return send_exact_relay(
-            lease, std::move(claim->certificate));
+        }
+        return send_exact_relay_reserved(
+            lease,
+            std::move(*claim),
+            ExactForwardingRole::delta);
     }
 
     bool HotStuffBase::forward_exact_relay(
@@ -1870,12 +2058,391 @@ namespace hotstuff
             !lease.tree().parent.has_value() ||
             config.get_peer_id(*lease.tree().parent).is_null())
             return false;
-        auto claim = proposal_contexts->claim_unforwarded_certificate(
+        auto claim = proposal_contexts
+                         ->claim_unforwarded_certificate_reservation(
             lease, relay.cert->clone());
         if (!claim.has_value())
+        {
+            try
+            {
+                const auto enumerated = relay.cert->get_signers();
+                const std::set<ReplicaID> rejected(
+                    enumerated.begin(), enumerated.end());
+                emit_adaptive_aggregation_event(
+                    AdaptiveAggregationTransition::delta_rejected,
+                    lease,
+                    &rejected,
+                    nullptr,
+                    nullptr,
+                    0,
+                    0,
+                    "reservation_rejected");
+            }
+            catch (...)
+            {
+            }
             return false;
-        return send_exact_relay(
-            lease, std::move(claim->certificate));
+        }
+        return send_exact_relay_reserved(
+            lease,
+            std::move(*claim),
+            ExactForwardingRole::delta);
+    }
+
+    void HotStuffBase::complete_exact_forwarding(
+        const ProposalContextLease &lease,
+        ExactForwardingRole role)
+    {
+        const auto event =
+            role == ExactForwardingRole::initial_aggregate &&
+                    !proposal_contexts->delta_open_enabled(lease)
+                ? ProposalContextEvent::non_root_aggregate_enqueued
+                : ProposalContextEvent::late_contribution_forwarded;
+        const auto transition = proposal_contexts->transition(lease, event);
+        if (transition != ProposalTransitionResult::retained_open)
+        {
+            discard_exact_forwarding_retries(
+                lease.key(), lease.generation());
+            return;
+        }
+        if (proposal_contexts->delta_open_enabled(lease))
+            drain_pending_exact_forwarding_candidates(lease);
+    }
+
+    void HotStuffBase::drain_pending_exact_forwarding_candidates(
+        const ProposalContextLease &lease)
+    {
+        if (!proposal_contexts->revalidate(lease) ||
+            !proposal_contexts->delta_open_enabled(lease))
+            return;
+        const auto sweep_key = std::make_pair(
+            lease.key(), lease.generation());
+        if (!exact_forwarding_sweeps.insert(sweep_key).second)
+            return;
+
+        const auto pending =
+            proposal_contexts->pending_forwarding_candidate_ids(lease);
+        for (const auto pending_id : pending)
+        {
+            const bool retry_scheduled = std::any_of(
+                exact_forwarding_retry_jobs.begin(),
+                exact_forwarding_retry_jobs.end(),
+                [&lease, pending_id](const auto &entry) {
+                    const auto &retry = entry.second;
+                    return retry->key == lease.key() &&
+                           retry->generation == lease.generation() &&
+                           retry->pending_candidate_id == pending_id;
+                });
+            if (retry_scheduled)
+                continue;
+            auto claim =
+                proposal_contexts->claim_pending_certificate_reservation(
+                    lease, pending_id);
+            if (!claim.has_value())
+                continue;
+            static_cast<void>(send_exact_relay_reserved(
+                lease,
+                std::move(*claim),
+                ExactForwardingRole::delta));
+            if (!proposal_contexts->revalidate(lease))
+                break;
+        }
+        exact_forwarding_sweeps.erase(sweep_key);
+    }
+
+    void HotStuffBase::schedule_exact_forwarding_retry(
+        const ProposalContextLease &lease,
+        quorum_cert_bt certificate,
+        const std::set<ReplicaID> &signers,
+        std::optional<std::uint64_t> pending_candidate_id,
+        ExactForwardingRole role,
+        std::uint32_t attempts)
+    {
+        if (certificate == nullptr || signers.empty() ||
+            certificate->get_proposal_key() != lease.key())
+            return;
+        if (role == ExactForwardingRole::delta &&
+            proposal_contexts->initial_forwarding_owned(lease))
+        {
+            HOTSTUFF_LOG_PROTO(
+                "[FORWARD] Deferring delta retry behind initial owner for %.10s",
+                lease.key().block_hash.to_hex().c_str());
+            return;
+        }
+
+        std::shared_ptr<ExactForwardingRetryJob> retry;
+        for (const auto &entry : exact_forwarding_retry_jobs)
+        {
+            const auto &candidate = entry.second;
+            if (candidate->key != lease.key() ||
+                candidate->generation != lease.generation() ||
+                !signer_sets_overlap(candidate->signers, signers))
+                continue;
+            if (candidate->signers == signers &&
+                candidate->role == role)
+            {
+                retry = candidate;
+                break;
+            }
+            if (candidate->role == ExactForwardingRole::initial_aggregate ||
+                role == ExactForwardingRole::initial_aggregate)
+            {
+                HOTSTUFF_LOG_PROTO(
+                    "[FORWARD] Deferring overlapping retry behind initial owner for %.10s",
+                    lease.key().block_hash.to_hex().c_str());
+                return;
+            }
+
+            auto overlap = std::make_shared<ExactForwardingRetryJob>(
+                0,
+                lease,
+                std::move(certificate),
+                signers,
+                pending_candidate_id,
+                role,
+                attempts);
+            abort_exact_forwarding(
+                lease, overlap, "forwarding_retry_overlap");
+            return;
+        }
+        if (retry == nullptr)
+        {
+            std::size_t proposal_jobs = 0;
+            for (const auto &entry : exact_forwarding_retry_jobs)
+                if (entry.second->key == lease.key() &&
+                    entry.second->generation == lease.generation())
+                    ++proposal_jobs;
+            if (proposal_jobs >= lease.tree().assigned_subtree.size() + 1)
+            {
+                auto overflow =
+                    std::make_shared<ExactForwardingRetryJob>(
+                        0,
+                        lease,
+                        std::move(certificate),
+                        signers,
+                        pending_candidate_id,
+                        role,
+                        attempts);
+                abort_exact_forwarding(
+                    lease, overflow, "forwarding_retry_bound_exceeded");
+                return;
+            }
+            auto retry_id = next_exact_forwarding_retry_id++;
+            if (retry_id == 0)
+                retry_id = next_exact_forwarding_retry_id++;
+            retry = std::make_shared<ExactForwardingRetryJob>(
+                retry_id,
+                lease,
+                std::move(certificate),
+                signers,
+                pending_candidate_id,
+                role,
+                attempts);
+            exact_forwarding_retry_jobs.emplace(retry_id, retry);
+        }
+        else
+            retry->attempts = std::max(retry->attempts, attempts);
+
+        if (retry->attempts >= exact_forwarding_max_attempts)
+        {
+            abort_exact_forwarding(
+                lease, retry, "forwarding_retry_exhausted");
+            return;
+        }
+        if (retry->scheduled)
+            return;
+        if (aggregation_scheduler == nullptr)
+        {
+            abort_exact_forwarding(
+                lease, retry, "forwarding_retry_scheduler_unavailable");
+            return;
+        }
+
+        retry->scheduled = true;
+        const auto delay = std::chrono::duration_cast<
+            AggregationScheduler::Duration>(
+            exact_forwarding_retry_base_delay * retry->attempts);
+        auto cancellation = aggregation_scheduler->schedule_after(
+            delay,
+            [access = exact_runtime_access, retry]() {
+                auto runtime = access->acquire();
+                if (!runtime.has_value())
+                    return;
+                runtime->owner().dispatch_exact_forwarding_retry(retry);
+            });
+        if (!cancellation)
+        {
+            retry->scheduled = false;
+            abort_exact_forwarding(
+                lease, retry, "forwarding_retry_schedule_failed");
+            return;
+        }
+        retry->cancellation = std::move(cancellation);
+    }
+
+    void HotStuffBase::dispatch_exact_forwarding_retry(
+        const std::shared_ptr<ExactForwardingRetryJob> &retry)
+    {
+        const auto registered =
+            exact_forwarding_retry_jobs.find(retry->id);
+        if (registered == exact_forwarding_retry_jobs.end() ||
+            registered->second != retry)
+            return;
+        retry->scheduled = false;
+        retry->cancellation = {};
+
+        const auto lease =
+            proposal_contexts->acquire_open_context(retry->key);
+        if (!lease.has_value() ||
+            lease->generation() != retry->generation)
+        {
+            exact_forwarding_retry_jobs.erase(retry->id);
+            return;
+        }
+
+        std::optional<ProposalForwardingClaim> claim;
+        if (retry->role == ExactForwardingRole::initial_aggregate)
+            claim = proposal_contexts
+                        ->claim_initial_forwarding_reservation(*lease);
+        else if (retry->pending_candidate_id.has_value())
+            claim = proposal_contexts
+                        ->claim_pending_certificate_reservation(
+                            *lease, *retry->pending_candidate_id);
+        else
+            claim = proposal_contexts
+                        ->claim_unforwarded_certificate_reservation(
+                            *lease, retry->certificate->clone());
+        if (!claim.has_value())
+        {
+            const auto snapshot = proposal_contexts->snapshot(retry->key);
+            const bool covered = snapshot.has_value() &&
+                                 std::includes(
+                                     snapshot->forwarded_signers.begin(),
+                                     snapshot->forwarded_signers.end(),
+                                     retry->signers.begin(),
+                                     retry->signers.end());
+            exact_forwarding_retry_jobs.erase(retry->id);
+            if (covered)
+            {
+                if (proposal_contexts->delta_open_enabled(*lease))
+                    drain_pending_exact_forwarding_candidates(*lease);
+                return;
+            }
+            if (retry->role == ExactForwardingRole::initial_aggregate &&
+                proposal_contexts->retire_overlapped_initial_forwarding(
+                    *lease, retry->signers))
+            {
+                drain_pending_exact_forwarding_candidates(*lease);
+                return;
+            }
+            abort_exact_forwarding(
+                *lease, retry, "forwarding_retry_reclaim_failed");
+            return;
+        }
+        if (claim->signers != retry->signers)
+        {
+            static_cast<void>(proposal_contexts->release_forwarding_claim(
+                *lease, claim->reservation_id));
+            abort_exact_forwarding(
+                *lease, retry, "forwarding_retry_identity_changed");
+            return;
+        }
+        static_cast<void>(send_exact_relay_reserved(
+            *lease, std::move(*claim), retry->role, retry));
+    }
+
+    void HotStuffBase::abort_exact_forwarding(
+        const ProposalContextLease &lease,
+        const std::shared_ptr<ExactForwardingRetryJob> &retry,
+        const char *reason)
+    {
+        const auto *signers = retry == nullptr
+                                  ? nullptr
+                                  : &retry->signers;
+        if (reason != nullptr &&
+            std::strcmp(reason, "forwarding_retry_exhausted") == 0)
+            emit_adaptive_aggregation_event(
+                AdaptiveAggregationTransition::retry_exhausted,
+                lease,
+                signers,
+                nullptr,
+                nullptr,
+                0,
+                0,
+                reason);
+        emit_adaptive_aggregation_event(
+            AdaptiveAggregationTransition::proposal_aborted,
+            lease,
+            signers,
+            nullptr,
+            nullptr,
+            0,
+            0,
+            reason == nullptr ? "unspecified_forwarding_abort" : reason);
+        HOTSTUFF_LOG_WARN(
+            "[FORWARD] Exact forwarding aborted for %.10s generation=%llu "
+            "signers=%zu attempts=%u reason=%s",
+            lease.key().block_hash.to_hex().c_str(),
+            static_cast<unsigned long long>(lease.generation()),
+            retry == nullptr ? 0 : retry->signers.size(),
+            retry == nullptr ? 0 : retry->attempts,
+            reason);
+        discard_exact_forwarding_retries(
+            lease.key(), lease.generation());
+        static_cast<void>(proposal_contexts->transition(
+            lease, ProposalContextEvent::proposal_aborted));
+        pending_exact_contributions.purge(lease.key());
+        if (proposal_admission != nullptr)
+            proposal_admission->retire_proposal(lease.key());
+    }
+
+    void HotStuffBase::discard_exact_forwarding_retries(
+        const ProposalKey &key,
+        std::optional<std::uint64_t> generation)
+    {
+        std::vector<AggregationScheduler::Cancellation> cancellations;
+        for (auto retry = exact_forwarding_retry_jobs.begin();
+             retry != exact_forwarding_retry_jobs.end();)
+        {
+            if (retry->second->key != key ||
+                (generation.has_value() &&
+                 retry->second->generation != *generation))
+            {
+                ++retry;
+                continue;
+            }
+            if (retry->second->cancellation)
+                cancellations.push_back(
+                    std::move(retry->second->cancellation));
+            retry = exact_forwarding_retry_jobs.erase(retry);
+        }
+        for (auto sweep = exact_forwarding_sweeps.begin();
+             sweep != exact_forwarding_sweeps.end();)
+            if (sweep->first == key &&
+                (!generation.has_value() ||
+                 sweep->second == *generation))
+                sweep = exact_forwarding_sweeps.erase(sweep);
+            else
+                ++sweep;
+        for (auto &cancel : cancellations)
+            cancel();
+    }
+
+    void HotStuffBase::cancel_all_exact_forwarding_retries() noexcept
+    {
+        std::vector<AggregationScheduler::Cancellation> cancellations;
+        for (auto &retry : exact_forwarding_retry_jobs)
+            if (retry.second->cancellation)
+                cancellations.push_back(
+                    std::move(retry.second->cancellation));
+        exact_forwarding_retry_jobs.clear();
+        for (auto &cancel : cancellations)
+            try
+            {
+                cancel();
+            }
+            catch (...)
+            {}
     }
 
     quorum_cert_bt HotStuffBase::verified_aggregation_candidate(
@@ -1901,6 +2468,22 @@ namespace hotstuff
             "[TIMER] Exact aggregation timeout for %.10s with %zu missing children",
             lease.key().block_hash.to_hex().c_str(),
             missing.size());
+
+        try
+        {
+            const auto required_gaps =
+                proposal_contexts->missing_required_signers_by_child(lease);
+            emit_adaptive_aggregation_event(
+                AdaptiveAggregationTransition::required_branch_incomplete,
+                lease,
+                nullptr,
+                nullptr,
+                required_gaps.has_value() ? &*required_gaps : nullptr);
+        }
+        catch (...)
+        {
+        }
+
         if (missing.empty())
             return;
 
@@ -1919,6 +2502,125 @@ namespace hotstuff
                 reputation_server_conn);
     }
 
+    void HotStuffBase::record_optional_aggregation_absence(
+        const ProposalContextLease &lease,
+        const std::set<ReplicaID> &missing)
+    {
+        if (missing.empty())
+            return;
+        emit_adaptive_aggregation_event(
+            AdaptiveAggregationTransition::
+                wait_exempt_absent_at_observation_deadline,
+            lease,
+            nullptr,
+            &missing);
+    }
+
+    void HotStuffBase::emit_adaptive_aggregation_event(
+        AdaptiveAggregationTransition transition,
+        const ProposalContextLease &lease,
+        const std::set<ReplicaID> *accepted_signers,
+        const std::set<ReplicaID> *missing_optional,
+        const std::map<ReplicaID, std::set<ReplicaID>> *required_gaps,
+        std::size_t root_signer_count,
+        std::size_t global_quorum,
+        const char *reason) noexcept
+    {
+        if (adaptive_event_emitter == nullptr)
+            return;
+        try
+        {
+            AdaptiveAggregationStructuredEvent event;
+            event.transition = transition;
+            event.configuration = lease.key().configuration;
+            event.block_hash = lease.key().block_hash;
+            event.context_generation = lease.generation();
+            event.observer_replica = get_id();
+            event.wait_exempt_signers.assign(
+                lease.tree().optional_subtree.begin(),
+                lease.tree().optional_subtree.end());
+            if (accepted_signers != nullptr)
+                event.accepted_signers.assign(
+                    accepted_signers->begin(), accepted_signers->end());
+            if (missing_optional != nullptr)
+                event.missing_optional_signers.assign(
+                    missing_optional->begin(), missing_optional->end());
+            if (transition == AdaptiveAggregationTransition::
+                                  wait_exempt_absent_at_observation_deadline)
+            {
+                const auto pending = proposal_contexts->
+                    pending_optional_direct_children(lease);
+                if (pending.has_value())
+                    event.absent_direct_children.assign(
+                        pending->begin(), pending->end());
+            }
+            if (required_gaps != nullptr)
+                for (const auto &gap : *required_gaps)
+                    event.required_branch_gaps.push_back(
+                        RequiredBranchSignerGap{
+                            gap.first,
+                            std::vector<ReplicaID>(
+                                gap.second.begin(), gap.second.end())});
+            event.root_signer_count = root_signer_count;
+            event.global_quorum = global_quorum;
+            if (reason != nullptr)
+                event.rejection_reason = reason;
+            adaptive_event_emitter->emit_adaptive(event);
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
+        }
+    }
+
+    void HotStuffBase::emit_active_configuration_event(
+        const ConfigurationId &configuration) noexcept
+    {
+        if (adaptive_event_emitter == nullptr || exact_epochs == nullptr)
+            return;
+        try
+        {
+            const auto *definition = exact_epochs->find_tree(
+                configuration.epoch_number, configuration.tree_id);
+            if (definition == nullptr)
+                return;
+            const auto byzantine = derive_byzantine_quorum(
+                definition->members_breadth_first.size());
+            if (!byzantine.has_value())
+                return;
+            AdaptiveAggregationStructuredEvent event;
+            event.transition =
+                AdaptiveAggregationTransition::configuration_active;
+            event.configuration = configuration;
+            event.observer_replica = get_id();
+            event.wait_exempt_signers =
+                definition->wait_exempt_leaves;
+            event.global_quorum = byzantine->quorum;
+            adaptive_event_emitter->emit_adaptive(event);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void HotStuffBase::emit_epoch_lifecycle_event(
+        EpochLifecycleTransition transition,
+        const ConfigurationId &configuration,
+        std::uint64_t activation_height) noexcept
+    {
+        if (structured_event_emitter == nullptr)
+            return;
+        try
+        {
+            structured_event_emitter->emit(
+                StructuredEventPayload{EpochLifecycleEvent{
+                    transition, configuration, activation_height}});
+        }
+        catch (...)
+        {
+        }
+    }
+
     void HotStuffBase::continue_exact_contribution(
         const ProposalContextLease &lease,
         ExactContributionKind kind,
@@ -1934,12 +2636,17 @@ namespace hotstuff
             if (vote == nullptr || vote->cert == nullptr ||
                 !contribution.claimed_voter.has_value())
                 return;
+            auto forwarding_candidate =
+                make_exact_direct_forwarding_candidate(lease, *vote);
+            if (forwarding_candidate == nullptr)
+                return;
             accepted = proposal_contexts->record_verified_direct_part(
                 lease,
                 config,
                 contribution.authenticated_sender,
                 *contribution.claimed_voter,
-                *vote->cert);
+                *vote->cert,
+                std::move(forwarding_candidate));
         }
         else
         {
@@ -1952,7 +2659,94 @@ namespace hotstuff
                 *relay->cert);
         }
         if (!accepted)
+        {
+            if (proposal_contexts->delta_open_enabled(lease))
+                try
+                {
+                    std::set<ReplicaID> rejected_signers;
+                    if (kind == ExactContributionKind::direct_vote &&
+                        contribution.claimed_voter.has_value())
+                        rejected_signers.insert(
+                            *contribution.claimed_voter);
+                    else if (kind == ExactContributionKind::aggregate_relay &&
+                             contribution.aggregate_relay != nullptr &&
+                             contribution.aggregate_relay->cert != nullptr)
+                    {
+                        const auto signers =
+                            contribution.aggregate_relay->cert->get_signers();
+                        rejected_signers.insert(
+                            signers.begin(), signers.end());
+                    }
+                    emit_adaptive_aggregation_event(
+                        AdaptiveAggregationTransition::delta_rejected,
+                        lease,
+                        rejected_signers.empty()
+                            ? nullptr
+                            : &rejected_signers,
+                        nullptr,
+                        nullptr,
+                        0,
+                        0,
+                        "verification_or_overlap_rejected");
+                }
+                catch (...)
+                {
+                }
             return;
+        }
+
+        try
+        {
+            std::set<ReplicaID> contribution_signers;
+            if (kind == ExactContributionKind::direct_vote)
+                contribution_signers.insert(
+                    *contribution.claimed_voter);
+            else
+            {
+                const auto signers =
+                    contribution.aggregate_relay->cert->get_signers();
+                contribution_signers.insert(
+                    signers.begin(), signers.end());
+            }
+            if (proposal_contexts->delta_open_enabled(lease))
+            {
+                std::set<ReplicaID> accepted_optional;
+                std::set_intersection(
+                    contribution_signers.begin(),
+                    contribution_signers.end(),
+                    lease.tree().optional_subtree.begin(),
+                    lease.tree().optional_subtree.end(),
+                    std::inserter(
+                        accepted_optional, accepted_optional.end()));
+                if (!accepted_optional.empty())
+                    emit_adaptive_aggregation_event(
+                        AdaptiveAggregationTransition::
+                            wait_exempt_late_accepted,
+                        lease,
+                        &accepted_optional);
+            }
+
+            if (!lease.tree().parent.has_value())
+            {
+                const auto snapshot =
+                    proposal_contexts->snapshot(lease.key());
+                const auto quorum =
+                    proposal_contexts->frozen_global_quorum(lease);
+                if (snapshot.has_value() && quorum.has_value())
+                    emit_adaptive_aggregation_event(
+                        AdaptiveAggregationTransition::
+                            root_quorum_progress,
+                        lease,
+                        &snapshot->verified_signers,
+                        nullptr,
+                        nullptr,
+                        snapshot->verified_signers.size(),
+                        *quorum);
+            }
+        }
+        catch (...)
+        {
+        }
 
         record_exact_latency(
             lease, contribution.authenticated_sender);
@@ -1963,16 +2757,14 @@ namespace hotstuff
                 try_finish_exact_context(lease);
                 return;
             }
-            const bool forwarded =
+            if (!proposal_contexts->delta_open_enabled(lease))
+                return;
+            static_cast<void>(
                 kind == ExactContributionKind::direct_vote
                     ? forward_exact_direct(
                           lease, *contribution.direct_vote)
                     : forward_exact_relay(
-                          lease, *contribution.aggregate_relay);
-            if (forwarded)
-                proposal_contexts->transition(
-                    lease,
-                    ProposalContextEvent::late_contribution_forwarded);
+                          lease, *contribution.aggregate_relay));
             return;
         }
         try_finish_exact_context(lease);
@@ -2041,9 +2833,31 @@ namespace hotstuff
             const auto lease =
                 proposal_contexts->acquire_open_context(key);
             if (lease.has_value())
+            {
+                try
+                {
+                    const auto snapshot =
+                        proposal_contexts->snapshot(key);
+                    const auto quorum =
+                        proposal_contexts->frozen_global_quorum(*lease);
+                    if (snapshot.has_value() && quorum.has_value())
+                        emit_adaptive_aggregation_event(
+                            AdaptiveAggregationTransition::
+                                root_qc_published,
+                            *lease,
+                            &snapshot->verified_signers,
+                            nullptr,
+                            nullptr,
+                            snapshot->verified_signers.size(),
+                            *quorum);
+                }
+                catch (...)
+                {
+                }
                 proposal_contexts->transition(
                     *lease,
                     ProposalContextEvent::root_qc_published);
+            }
         }
     }
 
@@ -2069,13 +2883,38 @@ namespace hotstuff
             if (!publish_exact_root_qc(
                     lease, std::move(final_qc)))
                 return;
+            try
+            {
+                const auto snapshot =
+                    proposal_contexts->snapshot(lease.key());
+                const auto quorum =
+                    proposal_contexts->frozen_global_quorum(lease);
+                if (snapshot.has_value() && quorum.has_value())
+                    emit_adaptive_aggregation_event(
+                        AdaptiveAggregationTransition::root_qc_published,
+                        lease,
+                        &snapshot->verified_signers,
+                        nullptr,
+                        nullptr,
+                        snapshot->verified_signers.size(),
+                        *quorum);
+            }
+            catch (...)
+            {
+            }
             proposal_contexts->transition(
                 lease, ProposalContextEvent::root_qc_published);
             drain_ready_piped_qcs();
             return;
         }
 
-        if (!proposal_contexts->assigned_subtree_complete(lease))
+        const bool initial_ready = tree.optional_subtree.empty()
+                                       ? proposal_contexts
+                                             ->assigned_subtree_complete(lease)
+                                       : proposal_contexts
+                                             ->required_subtree_complete(lease);
+        if (proposal_contexts->delta_open_enabled(lease) ||
+            !initial_ready)
             return;
         if (config.get_peer_id(*tree.parent).is_null())
             return;
@@ -2085,15 +2924,29 @@ namespace hotstuff
         aggregate->compute();
         if (!aggregate->verify(config))
             return;
-        auto claim = proposal_contexts->claim_unforwarded_certificate(
+        auto claim = proposal_contexts
+                         ->claim_initial_certificate_reservation(
             lease, std::move(aggregate));
-        if (!claim.has_value() ||
-            !send_exact_relay(
-                lease, std::move(claim->certificate)))
+        if (!claim.has_value())
             return;
-        proposal_contexts->transition(
-            lease,
-            ProposalContextEvent::non_root_aggregate_enqueued);
+        try
+        {
+            const auto missing_optional =
+                proposal_contexts->missing_optional_signers(lease);
+            emit_adaptive_aggregation_event(
+                AdaptiveAggregationTransition::required_set_ready,
+                lease,
+                &claim->signers,
+                missing_optional.has_value() ? &*missing_optional : nullptr);
+        }
+        catch (...)
+        {
+        }
+        if (!send_exact_relay_reserved(
+                lease,
+                std::move(*claim),
+                ExactForwardingRole::initial_aggregate))
+            return;
     }
 
     void HotStuffBase::local_vote_authorized(const ProposalKey &key)
@@ -3478,10 +4331,23 @@ namespace hotstuff
             epoch_live_binding == nullptr)
             throw std::logic_error(
                 "trusted local staging requires an initialized adaptive runtime");
-        return epoch_live_binding->handle_stage(
+        const ConfigurationId configuration{
+            definition.activation.successor_epoch_number,
+            0,
+            definition.activation.successor_epoch_digest};
+        const auto activation_height =
+            definition.activation.activation_height;
+        auto result = epoch_live_binding->handle_stage(
             MsgStageEpochDefinition(definition, epoch_wire_limits),
             AuthenticatedEpochPeer::manager(),
             validation_context);
+        if (result.error == EpochIngressError::none &&
+            result.disposition == ReplicaStageDisposition::staged)
+            emit_epoch_lifecycle_event(
+                EpochLifecycleTransition::staged,
+                configuration,
+                activation_height);
+        return result;
     }
 
     ReplicaArmIngressResult HotStuffBase::trusted_local_arm_epoch(
@@ -3491,9 +4357,22 @@ namespace hotstuff
             epoch_live_binding == nullptr)
             throw std::logic_error(
                 "trusted local arming requires an initialized adaptive runtime");
-        return epoch_live_binding->handle_arm(
+        const ConfigurationId configuration{
+            activation.activation.successor_epoch_number,
+            0,
+            activation.activation.successor_epoch_digest};
+        const auto activation_height =
+            activation.activation.activation_height;
+        auto result = epoch_live_binding->handle_arm(
             MsgArmActivation(activation, epoch_wire_limits),
             AuthenticatedEpochPeer::manager());
+        if (result.error == EpochIngressError::none &&
+            result.disposition == ReplicaArmDisposition::armed)
+            emit_epoch_lifecycle_event(
+                EpochLifecycleTransition::activation_armed,
+                configuration,
+                activation_height);
+        return result;
     }
 
     bool HotStuffBase::bootstrap_adaptive_epoch_from_file(
@@ -3611,21 +4490,68 @@ namespace hotstuff
     void HotStuffBase::rebuild_aggregation_timeout_coordinator()
     {
         AggregationTimeoutEffects aggregation_effects;
-        aggregation_effects.send_upward =
+        aggregation_effects.try_send_upward =
             [this](const ProposalContextLease &lease,
                    ProposalForwardingClaim claim)
             {
-                if (!send_exact_relay(
-                        lease, std::move(claim.certificate)))
-                    HOTSTUFF_LOG_WARN(
-                        "[TIMER] Failed to enqueue exact aggregate for %.10s",
-                        lease.key().block_hash.to_hex().c_str());
+                auto retained = claim.certificate == nullptr
+                                    ? quorum_cert_bt()
+                                    : claim.certificate->clone();
+                const auto signers = claim.signers;
+                const auto pending_candidate_id =
+                    claim.pending_candidate_id;
+                const bool enqueued = send_exact_relay(
+                    lease, std::move(claim.certificate));
+                if (!enqueued && retained != nullptr)
+                    schedule_exact_forwarding_retry(
+                        lease,
+                        std::move(retained),
+                        signers,
+                        pending_candidate_id,
+                        ExactForwardingRole::initial_aggregate,
+                        1);
+                return enqueued;
             };
         aggregation_effects.record_timeout =
             [this](const ProposalContextLease &lease,
                    const std::set<ReplicaID> &missing)
             {
                 record_aggregation_timeout(lease, missing);
+            };
+        aggregation_effects.record_optional_absence =
+            [this](const ProposalContextLease &lease,
+                   const std::set<ReplicaID> &missing)
+            {
+                record_optional_aggregation_absence(lease, missing);
+            };
+        aggregation_effects.record_initial_forwarding =
+            [this](const ProposalContextLease &lease,
+                   const std::set<ReplicaID> &signers,
+                   AggregationForwardingObservation observation)
+            {
+                auto transition =
+                    AdaptiveAggregationTransition::initial_reserved;
+                switch (observation)
+                {
+                    case AggregationForwardingObservation::reserved:
+                        transition = AdaptiveAggregationTransition::
+                            initial_reserved;
+                        break;
+                    case AggregationForwardingObservation::enqueued:
+                        transition = AdaptiveAggregationTransition::
+                            initial_enqueued;
+                        break;
+                    case AggregationForwardingObservation::committed:
+                        transition = AdaptiveAggregationTransition::
+                            initial_committed;
+                        break;
+                    case AggregationForwardingObservation::released:
+                        transition = AdaptiveAggregationTransition::
+                            initial_released;
+                        break;
+                }
+                emit_adaptive_aggregation_event(
+                    transition, lease, &signers);
             };
         aggregation_timeout_coordinator =
             std::make_unique<AggregationTimeoutCoordinator>(
@@ -3648,6 +4574,14 @@ namespace hotstuff
         rebuild_aggregation_timeout_coordinator();
     }
 
+    void HotStuffBase::bind_structured_event_emitters(
+        StructuredEventEmitter *lifecycle_emitter,
+        AdaptiveStructuredEventEmitter *aggregation_emitter) noexcept
+    {
+        structured_event_emitter = lifecycle_emitter;
+        adaptive_event_emitter = aggregation_emitter;
+    }
+
     bool HotStuffBase::admit_local(const Proposal &prop)
     {
         const auto metadata = exact_context_metadata(prop.key());
@@ -3666,21 +4600,26 @@ namespace hotstuff
     {
         const auto lease =
             proposal_contexts->acquire_open_context(vote.key());
-        if (!lease.has_value() || vote.cert == nullptr ||
-            !proposal_contexts->record_local_part(
-                *lease, config, get_id(), *vote.cert))
+        if (!lease.has_value() || vote.cert == nullptr)
             return;
-        if (proposal_contexts->pass_through_enabled(*lease))
+        auto forwarding_candidate =
+            make_exact_direct_forwarding_candidate(*lease, vote);
+        if (forwarding_candidate == nullptr ||
+            !proposal_contexts->record_local_part(
+                *lease,
+                config,
+                get_id(),
+                *vote.cert,
+                std::move(forwarding_candidate)))
+            return;
+        if (proposal_contexts->delta_open_enabled(*lease))
         {
             if (!lease->tree().parent.has_value())
             {
                 try_finish_exact_context(*lease);
                 return;
             }
-            if (forward_exact_direct(*lease, vote))
-                proposal_contexts->transition(
-                    *lease,
-                    ProposalContextEvent::late_contribution_forwarded);
+            static_cast<void>(forward_exact_direct(*lease, vote));
             return;
         }
         try_finish_exact_context(*lease);
@@ -3829,15 +4768,21 @@ namespace hotstuff
                 auto &owner = runtime->owner();
                 const auto lease = owner.proposal_contexts
                                        ->acquire_open_context(prop.key());
-                if (!lease.has_value() || vote.cert == nullptr ||
+                if (!lease.has_value() || vote.cert == nullptr)
+                    return;
+                auto forwarding_candidate =
+                    owner.make_exact_direct_forwarding_candidate(
+                        *lease, vote);
+                if (forwarding_candidate == nullptr ||
                     !owner.proposal_contexts->record_local_part(
                         *lease,
                         owner.config,
                         owner.get_id(),
-                        *vote.cert))
+                        *vote.cert,
+                        std::move(forwarding_candidate)))
                     return;
 
-                if (owner.proposal_contexts->pass_through_enabled(
+                if (owner.proposal_contexts->delta_open_enabled(
                         *lease))
                 {
                     if (!lease->tree().parent.has_value())
@@ -3845,10 +4790,8 @@ namespace hotstuff
                         owner.try_finish_exact_context(*lease);
                         return;
                     }
-                    if (owner.forward_exact_direct(*lease, vote))
-                        owner.proposal_contexts->transition(
-                            *lease,
-                            ProposalContextEvent::late_contribution_forwarded);
+                    static_cast<void>(
+                        owner.forward_exact_direct(*lease, vote));
                     return;
                 }
 
@@ -3976,6 +4919,14 @@ namespace hotstuff
                                .drain_activated_futures();
         const auto &configuration =
             activation.update->activation.configuration;
+        const auto *definition =
+            activation.update->activation.definition;
+        emit_epoch_lifecycle_event(
+            EpochLifecycleTransition::activated,
+            configuration,
+            definition == nullptr
+                ? blk->get_height()
+                : definition->activation_height());
         if (adaptive_demo_markers)
             HOTSTUFF_LOG_INFO(
                 "KAURI_DEMO epoch_activated replica=%u epoch=%u "
@@ -4207,6 +5158,7 @@ namespace hotstuff
         pmaker->shutdown();
         epoch_live_binding = nullptr;
         adaptive_epoch_runtime.reset();
+        cancel_all_exact_forwarding_retries();
         exact_runtime_access->close_and_wait();
         proposal_contexts->shutdown();
         pending_exact_contributions.clear();

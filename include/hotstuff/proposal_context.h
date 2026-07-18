@@ -36,6 +36,12 @@ enum class ProposalContextOrigin
     leader_local
 };
 
+enum class ProposalContextPhase
+{
+    collecting,
+    delta_open
+};
+
 enum class ProposalContextEvent
 {
     leaf_vote_enqueued,
@@ -63,6 +69,11 @@ struct ProposalTreeSnapshot
     std::vector<ReplicaID> direct_children;
     std::vector<ReplicaID> assigned_subtree;
     std::map<ReplicaID, std::set<ReplicaID>> child_subtrees;
+    // Frozen at proposal admission from the exact activated tree definition.
+    // Optional signers are exempt only from waiting; they remain valid votes.
+    std::set<ReplicaID> required_subtree;
+    std::set<ReplicaID> optional_subtree;
+    std::map<ReplicaID, std::set<ReplicaID>> required_child_subtrees;
     std::uint32_t fanout{0};
     std::uint32_t pipeline_stretch{0};
 };
@@ -83,12 +94,30 @@ make_exact_proposal_context_metadata(
     std::uint32_t pipeline_stretch,
     std::size_t global_quorum);
 
+std::optional<ProposalContextMetadata>
+make_exact_proposal_context_metadata(
+    const ProposalKey &key,
+    ReplicaID local_replica,
+    const EpochTreeDefinition &tree,
+    std::size_t global_quorum);
+
 struct ProposalContextSnapshot
 {
+    // Canonical all-child observation state. Optional branches remain here
+    // even though their absence cannot block required-set readiness.
+    std::set<ReplicaID> pending_observation_children;
+    std::set<ReplicaID> pending_required_child_branches;
+    // Compatibility mirror for the pre-WE03 observation API.
     std::set<ReplicaID> pending_children;
     std::set<ReplicaID> latency_started;
     std::set<ReplicaID> verified_signers;
+    std::set<ReplicaID> reserved_signers;
     std::set<ReplicaID> forwarded_signers;
+    // Non-empty only while the first hierarchical aggregate owns forwarding
+    // for this exact proposal generation. Later verified contributions remain
+    // canonical pending candidates until this ownership is resolved.
+    std::set<ReplicaID> initial_forwarding_signers;
+    ProposalContextPhase phase{ProposalContextPhase::collecting};
     bool pass_through{false};
     bool root_qc_progress_claimed{false};
     std::uint64_t timer_generation{0};
@@ -98,6 +127,8 @@ struct ProposalForwardingClaim
 {
     quorum_cert_bt certificate;
     std::set<ReplicaID> signers;
+    std::uint64_t reservation_id{0};
+    std::optional<std::uint64_t> pending_candidate_id;
 };
 
 struct ProposalContextStorageStats
@@ -188,13 +219,15 @@ public:
         const ProposalContextLease &lease,
         const ReplicaConfig &config,
         ReplicaID signer,
-        const PartCert &part);
+        const PartCert &part,
+        quorum_cert_bt forwarding_candidate = nullptr);
     bool record_verified_direct_part(
         const ProposalContextLease &lease,
         const ReplicaConfig &config,
         ReplicaID authenticated_child,
         ReplicaID claimed_voter,
-        const PartCert &part);
+        const PartCert &part,
+        quorum_cert_bt forwarding_candidate = nullptr);
     bool record_verified_aggregate_certificate(
         const ProposalContextLease &lease,
         ReplicaID authenticated_child,
@@ -207,9 +240,26 @@ public:
         const ProposalContextLease &lease);
     bool assigned_subtree_complete(
         const ProposalContextLease &lease) const;
+    bool required_subtree_complete(
+        const ProposalContextLease &lease) const;
     bool pass_through_enabled(
         const ProposalContextLease &lease) const;
+    bool delta_open_enabled(
+        const ProposalContextLease &lease) const;
     std::optional<std::set<ReplicaID>> pending_children(
+        const ProposalContextLease &lease) const;
+    std::optional<std::set<ReplicaID>>
+    pending_required_child_branches(
+        const ProposalContextLease &lease) const;
+    std::optional<std::map<ReplicaID, std::set<ReplicaID>>>
+    missing_required_signers_by_child(
+        const ProposalContextLease &lease) const;
+    std::optional<std::set<ReplicaID>> missing_optional_signers(
+        const ProposalContextLease &lease) const;
+    std::optional<std::set<ReplicaID>>
+    pending_optional_direct_children(
+        const ProposalContextLease &lease) const;
+    std::optional<std::size_t> frozen_global_quorum(
         const ProposalContextLease &lease) const;
     bool record_local_signer(const ProposalContextLease &lease);
     bool record_verified_direct(const ProposalContextLease &lease,
@@ -222,6 +272,36 @@ public:
     bool mark_forwarded_signers(
         const ProposalContextLease &lease,
         const std::set<ReplicaID> &certified_signers);
+    std::optional<ProposalForwardingClaim>
+    claim_initial_certificate_reservation(
+        const ProposalContextLease &lease,
+        quorum_cert_bt candidate);
+    std::optional<ProposalForwardingClaim>
+    claim_initial_forwarding_reservation(
+        const ProposalContextLease &lease);
+    bool initial_forwarding_owned(
+        const ProposalContextLease &lease) const;
+    bool retire_overlapped_initial_forwarding(
+        const ProposalContextLease &lease,
+        const std::set<ReplicaID> &expected_signers);
+    std::optional<ProposalForwardingClaim>
+    claim_unforwarded_certificate_reservation(
+        const ProposalContextLease &lease,
+        quorum_cert_bt candidate);
+    std::vector<std::uint64_t> pending_forwarding_candidate_ids(
+        const ProposalContextLease &lease) const;
+    std::optional<ProposalForwardingClaim>
+    claim_pending_certificate_reservation(
+        const ProposalContextLease &lease,
+        std::uint64_t pending_candidate_id);
+    bool commit_forwarding_claim(
+        const ProposalContextLease &lease,
+        std::uint64_t reservation_id);
+    bool release_forwarding_claim(
+        const ProposalContextLease &lease,
+        std::uint64_t reservation_id);
+    // Compatibility helper for callers that do not expose enqueue failure.
+    // Production forwarding uses reserve/commit/release explicitly.
     std::optional<ProposalForwardingClaim>
     claim_unforwarded_certificate(
         const ProposalContextLease &lease,
@@ -268,6 +348,8 @@ private:
     std::uint32_t first_live_epoch_{0};
     std::uint64_t next_generation_{1};
     std::uint64_t next_timer_generation_{1};
+    std::uint64_t next_pending_forwarding_candidate_{1};
+    std::uint64_t next_forwarding_reservation_{1};
 };
 
 } // namespace hotstuff

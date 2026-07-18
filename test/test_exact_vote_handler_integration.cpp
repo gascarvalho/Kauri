@@ -683,7 +683,8 @@ TEST_CASE("late direct and aggregate forwarding claim signers before enqueue",
 
     for (const auto &path : {direct, relay})
     {
-        const auto claim = path.find("claim_unforwarded_certificate");
+        const auto claim = path.find(
+            "claim_unforwarded_certificate_reservation");
         const auto send = path.find("send_exact_relay");
         CHECK(claim != std::string::npos);
         REQUIRE(send != std::string::npos);
@@ -699,6 +700,93 @@ TEST_CASE("late direct and aggregate forwarding claim signers before enqueue",
             "marking after send permits duplicate enqueue before ownership is "
             "recorded");
     }
+}
+
+TEST_CASE("WE06-C05 production forwarding retries are transactional and bounded",
+          "[we06][c05][production-wiring][reservation][retry]")
+{
+    const auto source = read_source("src/hotstuff.cpp");
+    const auto normalized_source = without_whitespace(source);
+    const auto send = without_whitespace(source_slice(
+        source,
+        "bool HotStuffBase::send_exact_relay_reserved",
+        "quorum_cert_bt HotStuffBase::make_exact_direct_forwarding_candidate"));
+    const auto retry = without_whitespace(source_slice(
+        source,
+        "void HotStuffBase::schedule_exact_forwarding_retry",
+        "void HotStuffBase::dispatch_exact_forwarding_retry"));
+    const auto abort = without_whitespace(source_slice(
+        source,
+        "void HotStuffBase::abort_exact_forwarding",
+        "void HotStuffBase::discard_exact_forwarding_retries"));
+    const auto emitter = source_slice(
+        source,
+        "void HotStuffBase::emit_adaptive_aggregation_event",
+        "void HotStuffBase::emit_active_configuration_event");
+    const auto finish = without_whitespace(source_slice(
+        source,
+        "void HotStuffBase::try_finish_exact_context",
+        "void HotStuffBase::local_vote_authorized"));
+    const auto required_timeout = source_slice(
+        source,
+        "void HotStuffBase::record_aggregation_timeout",
+        "void HotStuffBase::record_optional_aggregation_absence");
+    const auto optional_absence = source_slice(
+        source,
+        "void HotStuffBase::record_optional_aggregation_absence",
+        "void HotStuffBase::emit_adaptive_aggregation_event");
+    const auto continuation = source_slice(
+        source,
+        "void HotStuffBase::continue_exact_contribution",
+        "bool HotStuffBase::publish_exact_root_qc");
+
+    const auto release = send.find("release_forwarding_claim(");
+    const auto schedule = send.find("schedule_exact_forwarding_retry(");
+    const auto enqueue = send.find("send_exact_relay(");
+    const auto commit = send.find("commit_forwarding_claim(");
+    REQUIRE(release != std::string::npos);
+    REQUIRE(schedule != std::string::npos);
+    REQUIRE(enqueue != std::string::npos);
+    REQUIRE(commit != std::string::npos);
+    CHECK(release < schedule);
+    CHECK(enqueue < commit);
+    CHECK(normalized_source.find(
+              "exact_forwarding_max_attempts=3") !=
+          std::string::npos);
+    CHECK(retry.find(
+              "retry->attempts>=exact_forwarding_max_attempts") !=
+          std::string::npos);
+    CHECK(retry.find(
+              "proposal_jobs>=lease.tree().assigned_subtree.size()+1") !=
+          std::string::npos);
+    CHECK(retry.find(
+              "abort_exact_forwarding(lease,retry,"
+              "\"forwarding_retry_exhausted\")") !=
+          std::string::npos);
+    CHECK(abort.find("ProposalContextEvent::proposal_aborted") !=
+          std::string::npos);
+    CHECK(abort.find("pending_exact_contributions.purge(lease.key())") !=
+          std::string::npos);
+    CHECK(emitter.find("if (adaptive_event_emitter == nullptr)") !=
+          std::string::npos);
+
+    const auto required_ready = finish.find(
+        "required_subtree_complete(lease)");
+    const auto initial_claim = finish.find(
+        "claim_initial_certificate_reservation(");
+    const auto initial_send = finish.find("send_exact_relay_reserved(");
+    REQUIRE(required_ready != std::string::npos);
+    REQUIRE(initial_claim != std::string::npos);
+    REQUIRE(initial_send != std::string::npos);
+    CHECK(required_ready < initial_claim);
+    CHECK(initial_claim < initial_send);
+    CHECK(required_timeout.find("required_branch_incomplete") !=
+          std::string::npos);
+    CHECK(optional_absence.find(
+              "wait_exempt_absent_at_observation_deadline") !=
+          std::string::npos);
+    CHECK(continuation.find("rejected_signers") != std::string::npos);
+    CHECK(continuation.find("delta_rejected") != std::string::npos);
 }
 
 TEST_CASE("normal exact completion keeps frozen subtree and global quorum rules",

@@ -1,6 +1,7 @@
 #include "hotstuff/aggregation.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -146,18 +147,135 @@ bool AggregationTimeoutCoordinator::dispatch_timeout(
 void AggregationTimeoutCoordinator::apply_timeout(
     const ProposalContextLease &lease)
 {
-    const auto missing_children = contexts_.pending_children(lease);
-    if (!missing_children.has_value())
+    const auto missing_required =
+        contexts_.pending_required_child_branches(lease);
+    const auto pending_observation =
+        contexts_.pending_children(lease);
+    const auto missing_optional =
+        contexts_.missing_optional_signers(lease);
+    if (!missing_required.has_value() ||
+        !pending_observation.has_value() ||
+        !missing_optional.has_value())
         return;
 
+    std::set<ReplicaID> unobserved_required_children;
+    std::set_intersection(
+        missing_required->begin(),
+        missing_required->end(),
+        pending_observation->begin(),
+        pending_observation->end(),
+        std::inserter(
+            unobserved_required_children,
+            unobserved_required_children.end()));
+
+    const auto record_optional_absence = [&]() {
+        if (!missing_optional->empty() &&
+            effects_.record_optional_absence)
+            effects_.record_optional_absence(lease, *missing_optional);
+    };
+
+    // The first aggregate owns this exact generation across enqueue retries.
+    // Do not create an overlapping aggregate, but retain neutral optional
+    // observation at the fired deadline.
+    if (contexts_.initial_forwarding_owned(lease))
+    {
+        record_optional_absence();
+        return;
+    }
+
+    // An optional-only observation deadline is not an aggregation timeout.
+    // It neither flushes nor changes the exact proposal lifecycle phase.
+    if (contexts_.required_subtree_complete(lease))
+    {
+        record_optional_absence();
+        return;
+    }
+
     if (lease.tree().parent.has_value() &&
-        verified_candidate_provider_ && effects_.send_upward)
+        verified_candidate_provider_ &&
+        (effects_.try_send_upward || effects_.send_upward))
     {
         auto candidate = verified_candidate_provider_(lease);
-        auto claim = contexts_.claim_unforwarded_certificate(
+        auto claim = contexts_.claim_initial_certificate_reservation(
             lease, std::move(candidate));
         if (claim.has_value())
-            effects_.send_upward(lease, std::move(*claim));
+        {
+            const auto reservation_id = claim->reservation_id;
+            std::set<ReplicaID> observed_signers;
+            bool observation_ready = false;
+            if (effects_.record_initial_forwarding)
+                try
+                {
+                    observed_signers = claim->signers;
+                    observation_ready = true;
+                    effects_.record_initial_forwarding(
+                        lease,
+                        observed_signers,
+                        AggregationForwardingObservation::reserved);
+                }
+                catch (...)
+                {
+                    observation_ready = false;
+                }
+            const auto observe = [&](AggregationForwardingObservation state) {
+                if (!observation_ready ||
+                    !effects_.record_initial_forwarding)
+                    return;
+                try
+                {
+                    effects_.record_initial_forwarding(
+                        lease, observed_signers, state);
+                }
+                catch (...)
+                {
+                }
+            };
+            bool enqueued = false;
+            try
+            {
+                if (effects_.try_send_upward)
+                    enqueued = effects_.try_send_upward(
+                        lease, std::move(*claim));
+                else
+                {
+                    effects_.send_upward(lease, std::move(*claim));
+                    enqueued = true;
+                }
+            }
+            catch (...)
+            {
+                enqueued = false;
+            }
+
+            if (enqueued)
+            {
+                observe(AggregationForwardingObservation::enqueued);
+                if (contexts_.commit_forwarding_claim(
+                        lease, reservation_id))
+                    observe(AggregationForwardingObservation::committed);
+                else if (contexts_.release_forwarding_claim(
+                             lease, reservation_id))
+                    observe(AggregationForwardingObservation::released);
+            }
+            else
+            {
+                if (contexts_.release_forwarding_claim(
+                        lease, reservation_id))
+                    observe(AggregationForwardingObservation::released);
+            }
+        }
+    }
+
+    if (contexts_.initial_forwarding_owned(lease))
+    {
+        // This timeout created the first owner and its enqueue is retrying.
+        // Preserve the required-missing observation, but do not open delta
+        // forwarding until that exact aggregate is accepted.
+        if (effects_.record_timeout)
+            effects_.record_timeout(
+                lease, unobserved_required_children);
+        record_optional_absence();
+        return;
     }
 
     if (contexts_.transition(
@@ -166,7 +284,8 @@ void AggregationTimeoutCoordinator::apply_timeout(
         return;
 
     if (effects_.record_timeout)
-        effects_.record_timeout(lease, *missing_children);
+        effects_.record_timeout(lease, unobserved_required_children);
+    record_optional_absence();
 }
 
 } // namespace hotstuff

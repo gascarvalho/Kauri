@@ -209,6 +209,15 @@ ProposalTreeSnapshot internal_tree()
         1, 0, 0, {3, 4}, {1, 3, 4}, {{3, {3}}, {4, {4}}});
 }
 
+ProposalTreeSnapshot wait_exempt_internal_tree()
+{
+    auto tree = internal_tree();
+    tree.required_subtree = {1, 3};
+    tree.optional_subtree = {4};
+    tree.required_child_subtrees = {{3, {3}}, {4, {}}};
+    return tree;
+}
+
 ProposalTreeSnapshot wide_internal_tree()
 {
     return make_tree(
@@ -392,6 +401,11 @@ struct Harness
                                    const std::set<ReplicaID> &missing) {
             timeouts.record(lease, missing);
         };
+        value.record_optional_absence = [this](
+                                            const ProposalContextLease &,
+                                            const std::set<ReplicaID> &missing) {
+            optional_absence.push_back(missing);
+        };
         return value;
     }
 
@@ -424,6 +438,7 @@ struct Harness
     AggregationTimeoutEffects effects;
     AggregationTimeoutCoordinator coordinator;
     std::size_t candidate_requests{0};
+    std::vector<std::set<ReplicaID>> optional_absence;
 };
 
 constexpr auto test_delay = std::chrono::milliseconds(25);
@@ -696,6 +711,155 @@ TEST_CASE("pre-timeout completion waits for immutable assigned subtree",
           hotstuff::ProposalTransitionResult::terminal_closed);
     CHECK(harness.contexts.context_status(key) ==
           ProposalContextStatus::terminal_closed);
+}
+
+TEST_CASE("WE06-C05 wait-exempt readiness preserves optional contributions",
+          "[we06][c05][aggregation][wait-exempt][delta-open]")
+{
+    SECTION("missing local signer still flushes verified descendants")
+    {
+        Harness harness(1);
+        const auto key = make_test_proposal_key(
+            make_digest(0xce), 0xcf, 39, 1);
+        const auto lease = harness.admit(
+            key, wait_exempt_internal_tree());
+        REQUIRE(harness.coordinator.arm_timeout(
+                    lease,
+                    harness.scheduler,
+                    internal_level,
+                    maximum_level) != 0);
+
+        auto required_child = harness.core.make_part(3, key);
+        REQUIRE(harness.contexts.record_verified_direct_part(
+            lease,
+            harness.core.get_config(),
+            3,
+            3,
+            *required_child));
+        REQUIRE_FALSE(
+            harness.contexts.required_subtree_complete(lease));
+        const auto pending_required =
+            harness.contexts.pending_required_child_branches(lease);
+        REQUIRE(pending_required.has_value());
+        REQUIRE(pending_required->empty());
+
+        harness.scheduler.advance_by(
+            harness.policy.timeout_for(
+                internal_level, maximum_level));
+
+        CHECK(harness.transport.signer_sets ==
+              std::vector<std::set<ReplicaID>>{{3}});
+        CHECK(harness.contexts.delta_open_enabled(lease));
+    }
+
+    SECTION("optional absence forwards once before its observation deadline")
+    {
+        Harness harness(1);
+        const auto key = make_test_proposal_key(
+            make_digest(0xd0), 0xd1, 40, 1);
+        const auto lease = harness.admit(
+            key, wait_exempt_internal_tree());
+        REQUIRE(harness.coordinator.arm_timeout(
+                    lease,
+                    harness.scheduler,
+                    internal_level,
+                    maximum_level) != 0);
+
+        auto local = harness.signing.sign(key, 1);
+        REQUIRE(harness.contexts.record_local_part(
+            lease, harness.core.get_config(), 1, *local));
+        auto required_child = harness.core.make_part(3, key);
+        REQUIRE(harness.contexts.record_verified_direct_part(
+            lease,
+            harness.core.get_config(),
+            3,
+            3,
+            *required_child));
+        REQUIRE(harness.contexts.required_subtree_complete(lease));
+        CHECK_FALSE(harness.contexts.assigned_subtree_complete(lease));
+        CHECK(harness.contexts.missing_optional_signers(lease) ==
+              std::optional<std::set<ReplicaID>>({4}));
+
+        auto candidate = harness.contexts.clone_accumulator(lease);
+        REQUIRE(candidate != nullptr);
+        candidate->compute();
+        REQUIRE(candidate->verify(harness.core.get_config()));
+        auto claim = harness.contexts
+                         .claim_initial_certificate_reservation(
+                             lease, std::move(candidate));
+        REQUIRE(claim.has_value());
+        CHECK(claim->signers == std::set<ReplicaID>{1, 3});
+        const auto reservation_id = claim->reservation_id;
+        harness.transport.send(lease, std::move(*claim));
+        REQUIRE(harness.contexts.commit_forwarding_claim(
+            lease, reservation_id));
+        REQUIRE(harness.contexts.transition(
+                    lease,
+                    ProposalContextEvent::non_root_aggregate_enqueued) ==
+                hotstuff::ProposalTransitionResult::retained_open);
+        REQUIRE(harness.contexts.delta_open_enabled(lease));
+        const auto signing_calls = harness.signing.calls;
+
+        harness.scheduler.advance_by(
+            harness.policy.timeout_for(
+                internal_level, maximum_level));
+
+        CHECK(harness.signing.calls == signing_calls);
+        CHECK(harness.pacemaker.rotations.empty());
+        CHECK(harness.candidate_requests == 0);
+        CHECK(harness.timeouts.keys.empty());
+        REQUIRE(harness.transport.signer_sets.size() == 1);
+        CHECK(harness.transport.signer_sets.front() ==
+              std::set<ReplicaID>{1, 3});
+        CHECK(harness.optional_absence ==
+              std::vector<std::set<ReplicaID>>{{4}});
+        CHECK(harness.contexts.delta_open_enabled(lease));
+    }
+
+    SECTION("an on-time optional vote remains in the initial aggregate")
+    {
+        Harness harness(1);
+        const auto key = make_test_proposal_key(
+            make_digest(0xd2), 0xd3, 41, 1);
+        const auto lease = harness.admit(
+            key, wait_exempt_internal_tree());
+        auto local = harness.signing.sign(key, 1);
+        REQUIRE(harness.contexts.record_local_part(
+            lease, harness.core.get_config(), 1, *local));
+        for (const ReplicaID child : {3, 4})
+        {
+            auto part = harness.core.make_part(child, key);
+            REQUIRE(harness.contexts.record_verified_direct_part(
+                lease,
+                harness.core.get_config(),
+                child,
+                child,
+                *part));
+        }
+        REQUIRE(harness.contexts.required_subtree_complete(lease));
+        REQUIRE(harness.contexts.assigned_subtree_complete(lease));
+
+        auto candidate = harness.contexts.clone_accumulator(lease);
+        REQUIRE(candidate != nullptr);
+        candidate->compute();
+        REQUIRE(candidate->verify(harness.core.get_config()));
+        auto claim = harness.contexts
+                         .claim_initial_certificate_reservation(
+                             lease, std::move(candidate));
+        REQUIRE(claim.has_value());
+        CHECK(claim->signers == std::set<ReplicaID>{1, 3, 4});
+        const auto reservation_id = claim->reservation_id;
+        harness.transport.send(lease, std::move(*claim));
+        REQUIRE(harness.contexts.commit_forwarding_claim(
+            lease, reservation_id));
+        CHECK(harness.contexts.transition(
+                  lease,
+                  ProposalContextEvent::non_root_aggregate_enqueued) ==
+              hotstuff::ProposalTransitionResult::terminal_closed);
+        REQUIRE(harness.transport.signer_sets.size() == 1);
+        CHECK(harness.transport.signer_sets.front() ==
+              std::set<ReplicaID>{1, 3, 4});
+    }
 }
 
 TEST_CASE("late direct and aggregate certificates each claim once",

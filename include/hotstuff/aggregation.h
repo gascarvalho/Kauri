@@ -15,6 +15,14 @@
 namespace hotstuff
 {
 
+enum class AggregationForwardingObservation
+{
+    reserved,
+    enqueued,
+    committed,
+    released,
+};
+
 class AggregationScheduler
 {
 public:
@@ -30,12 +38,26 @@ public:
 class AggregationTimeoutEffects
 {
 public:
+    // Returns whether transport accepted the enqueue. Production uses this
+    // transactional callback; send_upward remains for legacy test adapters.
+    std::function<bool(const ProposalContextLease &,
+                       ProposalForwardingClaim)>
+        try_send_upward;
     std::function<void(const ProposalContextLease &,
                        ProposalForwardingClaim)>
         send_upward;
     std::function<void(const ProposalContextLease &,
                        const std::set<ReplicaID> &)>
         record_timeout;
+    // Neutral observation only. Wait-exempt absence cannot produce timeout,
+    // reputation, conviction, or leader-suspicion effects.
+    std::function<void(const ProposalContextLease &,
+                       const std::set<ReplicaID> &)>
+        record_optional_absence;
+    std::function<void(const ProposalContextLease &,
+                       const std::set<ReplicaID> &,
+                       AggregationForwardingObservation)>
+        record_initial_forwarding;
 };
 
 class AggregationTimeoutPolicy

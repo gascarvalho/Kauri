@@ -52,6 +52,7 @@ struct ProposalForwardingClaim;
 
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
+using hotstuff::EpochTreeDefinition;
 using hotstuff::ProposalContextEvent;
 using hotstuff::ProposalContextLease;
 using hotstuff::ProposalContextLifecycle;
@@ -2817,6 +2818,113 @@ TEST_CASE("an exact verified forwarding candidate is claimed once",
           "[atomic]")
 {
     check_owned_one_shot_forwarding_claim<ProposalContextLifecycle>();
+}
+
+TEST_CASE("WE06-C05 forwarding reservations preserve disjoint late ownership",
+          "[we06][c05][proposal-context][reservation][delta-open]")
+{
+    ProposalContextLifecycle contexts;
+    BlsTestCore core(7, 1);
+    const auto proposal = key(
+        configuration(64, 1, "wait-exempt-forwarding"),
+        "wait-exempt-forwarding-block");
+    EpochTreeDefinition definition{
+        1, 2, 2, {0, 1, 2, 3, 4, 5, 6}, {4}};
+    const auto frozen = hotstuff::make_exact_proposal_context_metadata(
+        proposal, 1, definition, 5);
+    REQUIRE(frozen.has_value());
+    CHECK(frozen->tree.required_subtree ==
+          std::set<ReplicaID>{1, 3});
+    CHECK(frozen->tree.optional_subtree ==
+          std::set<ReplicaID>{4});
+    auto lease = contexts.admit_remote(*frozen);
+    REQUIRE(lease.has_value());
+    definition.wait_exempt_leaves.clear();
+    CHECK(lease->tree().required_subtree ==
+          std::set<ReplicaID>{1, 3});
+    CHECK(lease->tree().optional_subtree ==
+          std::set<ReplicaID>{4});
+    REQUIRE(contexts.initialize_accumulator(
+        *lease, empty_bls_accumulator(core, proposal)));
+
+    auto local = core.make_part(1, proposal);
+    REQUIRE(contexts.record_local_part(
+        *lease, core.get_config(), 1, *local));
+    auto required = core.make_part(3, proposal);
+    REQUIRE(contexts.record_verified_direct_part(
+        *lease, core.get_config(), 3, 3, *required));
+    REQUIRE(contexts.required_subtree_complete(*lease));
+    CHECK_FALSE(contexts.assigned_subtree_complete(*lease));
+
+    auto initial = contexts.clone_accumulator(*lease);
+    REQUIRE(initial != nullptr);
+    initial->compute();
+    REQUIRE(initial->verify(core.get_config()));
+    auto first = contexts.claim_initial_certificate_reservation(
+        *lease, std::move(initial));
+    REQUIRE(first.has_value());
+    CHECK(first->signers == std::set<ReplicaID>{1, 3});
+    REQUIRE(contexts.release_forwarding_claim(
+        *lease, first->reservation_id));
+    auto after_release = contexts.snapshot(proposal);
+    REQUIRE(after_release.has_value());
+    CHECK(after_release->reserved_signers.empty());
+    CHECK(after_release->forwarded_signers.empty());
+
+    auto retried = contexts.claim_initial_forwarding_reservation(*lease);
+    REQUIRE(retried.has_value());
+    CHECK(retried->signers == std::set<ReplicaID>{1, 3});
+    REQUIRE(contexts.commit_forwarding_claim(
+        *lease, retried->reservation_id));
+    REQUIRE(contexts.transition(
+                *lease,
+                ProposalContextEvent::non_root_aggregate_enqueued) ==
+            ProposalTransitionResult::retained_open);
+    REQUIRE(contexts.delta_open_enabled(*lease));
+
+    auto optional = core.make_part(4, proposal);
+    auto optional_candidate = verified_bls_aggregate(
+        core, proposal, {4});
+    REQUIRE(contexts.record_verified_direct_part(
+        *lease,
+        core.get_config(),
+        4,
+        4,
+        *optional,
+        std::move(optional_candidate)));
+    const auto pending = contexts.pending_forwarding_candidate_ids(*lease);
+    REQUIRE(pending.size() == 1);
+
+    auto overlapping = verified_bls_aggregate(
+        core, proposal, {3, 4});
+    const auto before_overlap = contexts.snapshot(proposal);
+    REQUIRE(before_overlap.has_value());
+    CHECK_FALSE(contexts.claim_unforwarded_certificate_reservation(
+        *lease, std::move(overlapping)).has_value());
+    const auto after_overlap = contexts.snapshot(proposal);
+    REQUIRE(after_overlap.has_value());
+    CHECK(after_overlap->reserved_signers ==
+          before_overlap->reserved_signers);
+    CHECK(after_overlap->forwarded_signers ==
+          before_overlap->forwarded_signers);
+
+    auto late = contexts.claim_pending_certificate_reservation(
+        *lease, pending.front());
+    REQUIRE(late.has_value());
+    CHECK(late->signers == std::set<ReplicaID>{4});
+    REQUIRE(contexts.release_forwarding_claim(
+        *lease, late->reservation_id));
+    late = contexts.claim_pending_certificate_reservation(
+        *lease, pending.front());
+    REQUIRE(late.has_value());
+    REQUIRE(contexts.commit_forwarding_claim(
+        *lease, late->reservation_id));
+    CHECK_FALSE(contexts.claim_pending_certificate_reservation(
+        *lease, pending.front()).has_value());
+    CHECK(contexts.transition(
+              *lease,
+              ProposalContextEvent::late_contribution_forwarded) ==
+          ProposalTransitionResult::terminal_closed);
 }
 
 TEST_CASE("invalid forwarding candidates never mark signer state",

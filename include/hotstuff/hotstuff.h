@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <future>
 #include <functional>
+#include <map>
 
 #include "salticidae/util.h"
 #include "salticidae/network.h"
@@ -36,6 +37,7 @@
 #include "hotstuff/epoch_runtime_wiring.h"
 #include "hotstuff/pending_exact_contribution_buffer.h"
 #include "hotstuff/proposal_admission.h"
+#include "hotstuff/structured_event.h"
 
 namespace hotstuff
 {
@@ -989,6 +991,10 @@ namespace hotstuff
         EpochWireLimits epoch_wire_limits{4 << 20, 128, 4096, 4096};
         std::uint64_t epoch_activation_grace_blocks{1};
         bool adaptive_demo_markers{false};
+        // Borrowed observational capabilities. The caller must unbind them
+        // before either emitter is destroyed.
+        StructuredEventEmitter *structured_event_emitter{nullptr};
+        AdaptiveStructuredEventEmitter *adaptive_event_emitter{nullptr};
         std::unordered_set<uint256_t> valid_tls_certs;
 #ifdef HOTSTUFF_BLK_PROFILE
         BlockProfiler blk_profiler;
@@ -1071,6 +1077,18 @@ namespace hotstuff
         AggregationTimeoutPolicy aggregation_timeout_policy;
         std::unique_ptr<AggregationTimeoutCoordinator>
             aggregation_timeout_coordinator;
+        enum class ExactForwardingRole
+        {
+            initial_aggregate,
+            delta
+        };
+        struct ExactForwardingRetryJob;
+        std::uint64_t next_exact_forwarding_retry_id{1};
+        std::map<std::uint64_t,
+                 std::shared_ptr<ExactForwardingRetryJob>>
+            exact_forwarding_retry_jobs;
+        std::set<std::pair<ProposalKey, std::uint64_t>>
+            exact_forwarding_sweeps;
         struct AdaptiveEpochRuntime;
         std::unique_ptr<AdaptiveEpochRuntime> adaptive_epoch_runtime;
         HotStuffEpochLiveBinding *epoch_live_binding{nullptr};
@@ -1151,6 +1169,36 @@ namespace hotstuff
         bool send_exact_relay(
             const ProposalContextLease &lease,
             quorum_cert_bt certificate);
+        bool send_exact_relay_reserved(
+            const ProposalContextLease &lease,
+            ProposalForwardingClaim claim,
+            ExactForwardingRole role,
+            std::shared_ptr<ExactForwardingRetryJob> retry = nullptr);
+        quorum_cert_bt make_exact_direct_forwarding_candidate(
+            const ProposalContextLease &lease,
+            const Vote &vote);
+        void complete_exact_forwarding(
+            const ProposalContextLease &lease,
+            ExactForwardingRole role);
+        void drain_pending_exact_forwarding_candidates(
+            const ProposalContextLease &lease);
+        void schedule_exact_forwarding_retry(
+            const ProposalContextLease &lease,
+            quorum_cert_bt certificate,
+            const std::set<ReplicaID> &signers,
+            std::optional<std::uint64_t> pending_candidate_id,
+            ExactForwardingRole role,
+            std::uint32_t attempts);
+        void dispatch_exact_forwarding_retry(
+            const std::shared_ptr<ExactForwardingRetryJob> &retry);
+        void abort_exact_forwarding(
+            const ProposalContextLease &lease,
+            const std::shared_ptr<ExactForwardingRetryJob> &retry,
+            const char *reason);
+        void discard_exact_forwarding_retries(
+            const ProposalKey &key,
+            std::optional<std::uint64_t> generation = std::nullopt);
+        void cancel_all_exact_forwarding_retries() noexcept;
         bool forward_exact_direct(
             const ProposalContextLease &lease,
             const Vote &vote);
@@ -1162,6 +1210,25 @@ namespace hotstuff
         void record_aggregation_timeout(
             const ProposalContextLease &lease,
             const std::set<ReplicaID> &missing);
+        void record_optional_aggregation_absence(
+            const ProposalContextLease &lease,
+            const std::set<ReplicaID> &missing);
+        void emit_adaptive_aggregation_event(
+            AdaptiveAggregationTransition transition,
+            const ProposalContextLease &lease,
+            const std::set<ReplicaID> *accepted_signers = nullptr,
+            const std::set<ReplicaID> *missing_optional = nullptr,
+            const std::map<ReplicaID, std::set<ReplicaID>> *
+                required_gaps = nullptr,
+            std::size_t root_signer_count = 0,
+            std::size_t global_quorum = 0,
+            const char *reason = nullptr) noexcept;
+        void emit_active_configuration_event(
+            const ConfigurationId &configuration) noexcept;
+        void emit_epoch_lifecycle_event(
+            EpochLifecycleTransition transition,
+            const ConfigurationId &configuration,
+            std::uint64_t activation_height) noexcept;
         void try_finish_exact_context(
             const ProposalContextLease &lease);
         bool publish_exact_root_qc(
@@ -1252,6 +1319,13 @@ namespace hotstuff
         void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                    bool ec_loop = false);
         void set_aggregation_timeout(double timeout_seconds);
+        /**
+         * Borrow event emitters without taking ownership. Passing null
+         * unbinds a capability; bound emitters must outlive HotStuffBase.
+         */
+        void bind_structured_event_emitters(
+            StructuredEventEmitter *lifecycle_emitter,
+            AdaptiveStructuredEventEmitter *aggregation_emitter) noexcept;
         void configure_epoch_manager(
             const PeerId &manager_peer,
             const NetAddr &manager_address);

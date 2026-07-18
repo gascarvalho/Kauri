@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <utility>
 
 namespace hotstuff
@@ -17,6 +18,30 @@ bool is_zero(const uint256_t &value)
 std::set<ReplicaID> as_set(const std::vector<ReplicaID> &values)
 {
     return std::set<ReplicaID>(values.begin(), values.end());
+}
+
+std::set<ReplicaID> set_intersection(
+    const std::set<ReplicaID> &left,
+    const std::set<ReplicaID> &right)
+{
+    std::set<ReplicaID> result;
+    std::set_intersection(
+        left.begin(), left.end(),
+        right.begin(), right.end(),
+        std::inserter(result, result.end()));
+    return result;
+}
+
+std::set<ReplicaID> set_difference(
+    const std::set<ReplicaID> &left,
+    const std::set<ReplicaID> &right)
+{
+    std::set<ReplicaID> result;
+    std::set_difference(
+        left.begin(), left.end(),
+        right.begin(), right.end(),
+        std::inserter(result, result.end()));
+    return result;
 }
 
 void collect_subtree(
@@ -53,8 +78,78 @@ bool tree_equal(const ProposalTreeSnapshot &left,
            left.direct_children == right.direct_children &&
            left.assigned_subtree == right.assigned_subtree &&
            left.child_subtrees == right.child_subtrees &&
+           left.required_subtree == right.required_subtree &&
+           left.optional_subtree == right.optional_subtree &&
+           left.required_child_subtrees ==
+               right.required_child_subtrees &&
            left.fanout == right.fanout &&
            left.pipeline_stretch == right.pipeline_stretch;
+}
+
+void derive_frozen_wait_policy(
+    ProposalTreeSnapshot &tree,
+    const std::set<ReplicaID> &wait_exempt_leaves)
+{
+    const auto assigned = as_set(tree.assigned_subtree);
+    tree.optional_subtree =
+        set_intersection(assigned, wait_exempt_leaves);
+    tree.required_subtree =
+        set_difference(assigned, tree.optional_subtree);
+    tree.required_child_subtrees.clear();
+    for (const auto &branch : tree.child_subtrees)
+        tree.required_child_subtrees.emplace(
+            branch.first,
+            set_intersection(branch.second, tree.required_subtree));
+}
+
+ProposalContextMetadata normalized_metadata(
+    const ProposalContextMetadata &metadata)
+{
+    auto normalized = metadata;
+    if (normalized.tree.required_subtree.empty() &&
+        normalized.tree.optional_subtree.empty() &&
+        normalized.tree.required_child_subtrees.empty())
+    {
+        // Pre-WE03 callers expressed the empty wait-exempt policy by omitting
+        // these derived fields. Freeze that legacy meaning before admission.
+        derive_frozen_wait_policy(normalized.tree, {});
+    }
+    return normalized;
+}
+
+void initialize_runtime(
+    ProposalContextSnapshot &runtime,
+    const ProposalTreeSnapshot &tree)
+{
+    const auto children = as_set(tree.direct_children);
+    runtime.pending_observation_children = children;
+    runtime.pending_children = children;
+    for (const auto &branch : tree.required_child_subtrees)
+        if (!branch.second.empty())
+            runtime.pending_required_child_branches.insert(branch.first);
+}
+
+void mark_observed(
+    ProposalContextSnapshot &runtime,
+    ReplicaID child)
+{
+    runtime.pending_observation_children.erase(child);
+    runtime.pending_children.erase(child);
+}
+
+void update_required_branch_completion(
+    const ProposalTreeSnapshot &tree,
+    ProposalContextSnapshot &runtime,
+    ReplicaID child)
+{
+    const auto branch = tree.required_child_subtrees.find(child);
+    if (branch == tree.required_child_subtrees.end())
+        return;
+    if (std::includes(
+            runtime.verified_signers.begin(),
+            runtime.verified_signers.end(),
+            branch->second.begin(), branch->second.end()))
+        runtime.pending_required_child_branches.erase(child);
 }
 
 bool is_deterministic_terminal(ProposalContextEvent event)
@@ -75,22 +170,37 @@ bool exact_signer_set(
                const_cast<QuorumCert &>(certificate).get_sigs_n();
 }
 
-} // namespace
-
 std::optional<ProposalContextMetadata>
-make_exact_proposal_context_metadata(
+make_exact_proposal_context_metadata_impl(
     const ProposalKey &key,
     ReplicaID local_replica,
     const std::vector<ReplicaID> &members_breadth_first,
     std::uint32_t fanout,
     std::uint32_t pipeline_stretch,
+    const std::vector<ReplicaID> &wait_exempt_leaves,
     std::size_t global_quorum)
 {
     if (members_breadth_first.empty() || fanout == 0 ||
         global_quorum == 0 ||
         as_set(members_breadth_first).size() !=
-            members_breadth_first.size())
+            members_breadth_first.size() ||
+        as_set(wait_exempt_leaves).size() !=
+            wait_exempt_leaves.size())
         return std::nullopt;
+
+    for (const auto wait_exempt : wait_exempt_leaves)
+    {
+        const auto member = std::find(
+            members_breadth_first.begin(),
+            members_breadth_first.end(),
+            wait_exempt);
+        if (member == members_breadth_first.end())
+            return std::nullopt;
+        const auto index = static_cast<std::size_t>(std::distance(
+            members_breadth_first.begin(), member));
+        if (fanout * index + 1 < members_breadth_first.size())
+            return std::nullopt;
+    }
 
     const auto local = std::find(
         members_breadth_first.begin(),
@@ -131,14 +241,72 @@ make_exact_proposal_context_metadata(
             &child_subtree);
         tree.child_subtrees.emplace(child, std::move(child_subtree));
     }
+    derive_frozen_wait_policy(tree, as_set(wait_exempt_leaves));
 
     ProposalContextMetadata metadata{
         key, std::move(tree), global_quorum};
     return metadata;
 }
 
+} // namespace
+
+std::optional<ProposalContextMetadata>
+make_exact_proposal_context_metadata(
+    const ProposalKey &key,
+    ReplicaID local_replica,
+    const std::vector<ReplicaID> &members_breadth_first,
+    std::uint32_t fanout,
+    std::uint32_t pipeline_stretch,
+    std::size_t global_quorum)
+{
+    return make_exact_proposal_context_metadata_impl(
+        key,
+        local_replica,
+        members_breadth_first,
+        fanout,
+        pipeline_stretch,
+        {},
+        global_quorum);
+}
+
+std::optional<ProposalContextMetadata>
+make_exact_proposal_context_metadata(
+    const ProposalKey &key,
+    ReplicaID local_replica,
+    const EpochTreeDefinition &tree,
+    std::size_t global_quorum)
+{
+    return make_exact_proposal_context_metadata_impl(
+        key,
+        local_replica,
+        tree.members_breadth_first,
+        tree.fanout,
+        tree.pipeline_stretch,
+        tree.wait_exempt_leaves,
+        global_quorum);
+}
+
 struct ProposalContextLifecycle::Entry
 {
+    struct PendingForwardingCandidate
+    {
+        quorum_cert_bt certificate;
+        std::set<ReplicaID> signers;
+    };
+
+    struct ForwardingReservation
+    {
+        std::set<ReplicaID> signers;
+        std::optional<std::uint64_t> pending_candidate_id;
+        bool initial_forwarding{false};
+    };
+
+    struct InitialForwardingOwner
+    {
+        quorum_cert_bt certificate;
+        std::set<ReplicaID> signers;
+    };
+
     std::shared_ptr<const ProposalTreeSnapshot> tree;
     std::size_t global_quorum{0};
     ProposalContextStatus status{ProposalContextStatus::buffered_future};
@@ -146,10 +314,57 @@ struct ProposalContextLifecycle::Entry
     std::uint64_t generation{0};
     std::optional<ProposalContextSnapshot> runtime;
     quorum_cert_bt accumulator;
+    std::map<std::uint64_t, PendingForwardingCandidate>
+        pending_forwarding_candidates;
+    std::map<std::uint64_t, ForwardingReservation>
+        forwarding_reservations;
+    std::optional<InitialForwardingOwner> initial_forwarding_owner;
     std::map<ReplicaID, std::chrono::steady_clock::time_point>
         latency_starts;
     TimerCancellation timer_cancellation;
 };
+
+namespace
+{
+
+template<typename EntryType>
+bool retain_pending_forwarding_candidate(
+    EntryType &entry,
+    std::uint64_t &next_candidate_id,
+    quorum_cert_bt certificate,
+    const std::set<ReplicaID> &signers)
+{
+    if (!entry.tree->parent.has_value() || certificate == nullptr)
+        return true;
+
+    const auto assigned = as_set(entry.tree->assigned_subtree);
+    if (signers.empty() ||
+        !std::includes(
+            assigned.begin(), assigned.end(),
+            signers.begin(), signers.end()))
+        return false;
+
+    std::size_t retained_signers = 0;
+    for (const auto &pending : entry.pending_forwarding_candidates)
+    {
+        retained_signers += pending.second.signers.size();
+        if (!set_intersection(pending.second.signers, signers).empty())
+            return false;
+    }
+    if (retained_signers + signers.size() > assigned.size())
+        return false;
+
+    auto candidate_id = next_candidate_id++;
+    if (candidate_id == 0)
+        candidate_id = next_candidate_id++;
+    entry.pending_forwarding_candidates.emplace(
+        candidate_id,
+        typename EntryType::PendingForwardingCandidate{
+            std::move(certificate), signers});
+    return true;
+}
+
+} // namespace
 
 ProposalContextLease::ProposalContextLease(
     ProposalKey key,
@@ -244,20 +459,21 @@ bool ProposalContextLifecycle::revalidate(
 bool ProposalContextLifecycle::buffer_future(
     const ProposalContextMetadata &metadata)
 {
-    if (!valid_metadata(metadata))
+    const auto frozen = normalized_metadata(metadata);
+    if (!valid_metadata(frozen))
         return false;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (configuration_is_retired_unlocked(metadata.key.configuration) ||
-        entries_.count(metadata.key) != 0)
+    if (configuration_is_retired_unlocked(frozen.key.configuration) ||
+        entries_.count(frozen.key) != 0)
         return false;
 
     auto entry = std::make_unique<Entry>();
-    entry->tree = std::make_shared<const ProposalTreeSnapshot>(metadata.tree);
-    entry->global_quorum = metadata.global_quorum;
+    entry->tree = std::make_shared<const ProposalTreeSnapshot>(frozen.tree);
+    entry->global_quorum = frozen.global_quorum;
     entry->status = ProposalContextStatus::buffered_future;
-    entries_.emplace(metadata.key, std::move(entry));
-    index_key_unlocked(metadata.key);
+    entries_.emplace(frozen.key, std::move(entry));
+    index_key_unlocked(frozen.key);
     return true;
 }
 
@@ -277,50 +493,50 @@ std::optional<ProposalContextLease> ProposalContextLifecycle::admit(
     const ProposalContextMetadata &metadata,
     ProposalContextOrigin origin)
 {
-    if (!valid_metadata(metadata))
+    const auto frozen = normalized_metadata(metadata);
+    if (!valid_metadata(frozen))
         return std::nullopt;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (configuration_is_retired_unlocked(metadata.key.configuration))
+    if (configuration_is_retired_unlocked(frozen.key.configuration))
         return std::nullopt;
 
-    auto found = entries_.find(metadata.key);
+    auto found = entries_.find(frozen.key);
     if (found != entries_.end())
     {
         auto &entry = *found->second;
         if (entry.status == ProposalContextStatus::terminal_closed ||
-            !same_metadata(entry, metadata))
+            !same_metadata(entry, frozen))
             return std::nullopt;
         if (entry.status == ProposalContextStatus::admitted_open)
         {
-            index_key_unlocked(metadata.key);
+            index_key_unlocked(frozen.key);
             return ProposalContextLease(
-                metadata.key, entry.origin, entry.generation, entry.tree);
+                frozen.key, entry.origin, entry.generation, entry.tree);
         }
 
         entry.status = ProposalContextStatus::admitted_open;
         entry.origin = origin;
         entry.generation = next_generation_++;
         entry.runtime.emplace();
-        entry.runtime->pending_children =
-            as_set(entry.tree->direct_children);
-        index_key_unlocked(metadata.key);
+        initialize_runtime(*entry.runtime, *entry.tree);
+        index_key_unlocked(frozen.key);
         return ProposalContextLease(
-            metadata.key, entry.origin, entry.generation, entry.tree);
+            frozen.key, entry.origin, entry.generation, entry.tree);
     }
 
     auto entry = std::make_unique<Entry>();
-    entry->tree = std::make_shared<const ProposalTreeSnapshot>(metadata.tree);
-    entry->global_quorum = metadata.global_quorum;
+    entry->tree = std::make_shared<const ProposalTreeSnapshot>(frozen.tree);
+    entry->global_quorum = frozen.global_quorum;
     entry->status = ProposalContextStatus::admitted_open;
     entry->origin = origin;
     entry->generation = next_generation_++;
     entry->runtime.emplace();
-    entry->runtime->pending_children = as_set(metadata.tree.direct_children);
+    initialize_runtime(*entry->runtime, frozen.tree);
     auto lease = ProposalContextLease(
-        metadata.key, origin, entry->generation, entry->tree);
-    entries_.emplace(metadata.key, std::move(entry));
-    index_key_unlocked(metadata.key);
+        frozen.key, origin, entry->generation, entry->tree);
+    entries_.emplace(frozen.key, std::move(entry));
+    index_key_unlocked(frozen.key);
     return lease;
 }
 
@@ -522,7 +738,10 @@ bool ProposalContextLifecycle::mark_child_responded(
         !found->second->runtime.has_value() ||
         as_set(found->second->tree->direct_children).count(child) == 0)
         return false;
-    return found->second->runtime->pending_children.erase(child) != 0;
+    const bool first_observation =
+        found->second->runtime->pending_observation_children.erase(child) != 0;
+    found->second->runtime->pending_children.erase(child);
+    return first_observation;
 }
 
 bool ProposalContextLifecycle::record_latency_start(
@@ -597,9 +816,17 @@ bool ProposalContextLifecycle::record_local_part(
     const ProposalContextLease &lease,
     const ReplicaConfig &config,
     ReplicaID signer,
-    const PartCert &part)
+    const PartCert &part,
+    quorum_cert_bt forwarding_candidate)
 {
     if (part.get_proposal_key() != lease.key())
+        return false;
+    std::set<ReplicaID> candidate_signers;
+    if (forwarding_candidate != nullptr &&
+        (forwarding_candidate->get_proposal_key() != lease.key() ||
+         !exact_signer_set(*forwarding_candidate, candidate_signers) ||
+         candidate_signers != std::set<ReplicaID>{signer} ||
+         !forwarding_candidate->verify(config)))
         return false;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -628,6 +855,12 @@ bool ProposalContextLifecycle::record_local_part(
     if (!exact_signer_set(*next, next_signers) ||
         next_signers != expected)
         return false;
+    if (!retain_pending_forwarding_candidate(
+            *found->second,
+            next_pending_forwarding_candidate_,
+            std::move(forwarding_candidate),
+            candidate_signers))
+        return false;
 
     found->second->accumulator = std::move(next);
     found->second->runtime->verified_signers = std::move(expected);
@@ -639,10 +872,18 @@ bool ProposalContextLifecycle::record_verified_direct_part(
     const ReplicaConfig &config,
     ReplicaID authenticated_child,
     ReplicaID claimed_voter,
-    const PartCert &part)
+    const PartCert &part,
+    quorum_cert_bt forwarding_candidate)
 {
     if (part.get_proposal_key() != lease.key() ||
         authenticated_child != claimed_voter)
+        return false;
+    std::set<ReplicaID> candidate_signers;
+    if (forwarding_candidate != nullptr &&
+        (forwarding_candidate->get_proposal_key() != lease.key() ||
+         !exact_signer_set(*forwarding_candidate, candidate_signers) ||
+         candidate_signers != std::set<ReplicaID>{claimed_voter} ||
+         !forwarding_candidate->verify(config)))
         return false;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -676,10 +917,20 @@ bool ProposalContextLifecycle::record_verified_direct_part(
     if (!exact_signer_set(*next, next_signers) ||
         next_signers != expected)
         return false;
+    if (!retain_pending_forwarding_candidate(
+            *found->second,
+            next_pending_forwarding_candidate_,
+            std::move(forwarding_candidate),
+            candidate_signers))
+        return false;
 
     found->second->accumulator = std::move(next);
     found->second->runtime->verified_signers = std::move(expected);
-    found->second->runtime->pending_children.erase(authenticated_child);
+    mark_observed(*found->second->runtime, authenticated_child);
+    update_required_branch_completion(
+        *found->second->tree,
+        *found->second->runtime,
+        authenticated_child);
     return true;
 }
 
@@ -694,6 +945,18 @@ bool ProposalContextLifecycle::record_verified_aggregate_certificate(
     if (!exact_signer_set(certificate, certified_signers) ||
         certified_signers.empty())
         return false;
+    quorum_cert_bt forwarding_candidate;
+    try
+    {
+        // QuorumCert::clone is logically const but predates const-correctness
+        // in the crypto interface.
+        forwarding_candidate =
+            const_cast<QuorumCert &>(certificate).clone();
+    }
+    catch (...)
+    {
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = entries_.find(lease.key());
@@ -729,10 +992,20 @@ bool ProposalContextLifecycle::record_verified_aggregate_certificate(
     if (!exact_signer_set(*next, next_signers) ||
         next_signers != expected)
         return false;
+    if (!retain_pending_forwarding_candidate(
+            *found->second,
+            next_pending_forwarding_candidate_,
+            std::move(forwarding_candidate),
+            certified_signers))
+        return false;
 
     found->second->accumulator = std::move(next);
     found->second->runtime->verified_signers = std::move(expected);
-    found->second->runtime->pending_children.erase(authenticated_child);
+    mark_observed(*found->second->runtime, authenticated_child);
+    update_required_branch_completion(
+        *found->second->tree,
+        *found->second->runtime,
+        authenticated_child);
     return true;
 }
 
@@ -814,6 +1087,23 @@ bool ProposalContextLifecycle::assigned_subtree_complete(
         assigned.begin(), assigned.end());
 }
 
+bool ProposalContextLifecycle::required_subtree_complete(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return false;
+    const auto &required = found->second->tree->required_subtree;
+    return std::includes(
+        found->second->runtime->verified_signers.begin(),
+        found->second->runtime->verified_signers.end(),
+        required.begin(), required.end());
+}
+
 bool ProposalContextLifecycle::pass_through_enabled(
     const ProposalContextLease &lease) const
 {
@@ -824,6 +1114,19 @@ bool ProposalContextLifecycle::pass_through_enabled(
            found->second->generation == lease.generation() &&
            found->second->runtime.has_value() &&
            found->second->runtime->pass_through;
+}
+
+bool ProposalContextLifecycle::delta_open_enabled(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    return found != entries_.end() &&
+           found->second->status == ProposalContextStatus::admitted_open &&
+           found->second->generation == lease.generation() &&
+           found->second->runtime.has_value() &&
+           found->second->runtime->phase ==
+               ProposalContextPhase::delta_open;
 }
 
 std::optional<std::set<ReplicaID>>
@@ -837,7 +1140,92 @@ ProposalContextLifecycle::pending_children(
         found->second->generation != lease.generation() ||
         !found->second->runtime.has_value())
         return std::nullopt;
-    return found->second->runtime->pending_children;
+    return found->second->runtime->pending_observation_children;
+}
+
+std::optional<std::set<ReplicaID>>
+ProposalContextLifecycle::pending_required_child_branches(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return std::nullopt;
+    return found->second->runtime->pending_required_child_branches;
+}
+
+std::optional<std::map<ReplicaID, std::set<ReplicaID>>>
+ProposalContextLifecycle::missing_required_signers_by_child(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return std::nullopt;
+
+    std::map<ReplicaID, std::set<ReplicaID>> missing;
+    for (const auto &branch :
+         found->second->tree->required_child_subtrees)
+    {
+        auto gap = set_difference(
+            branch.second,
+            found->second->runtime->verified_signers);
+        if (!gap.empty())
+            missing.emplace(branch.first, std::move(gap));
+    }
+    return missing;
+}
+
+std::optional<std::set<ReplicaID>>
+ProposalContextLifecycle::missing_optional_signers(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return std::nullopt;
+    return set_difference(
+        found->second->tree->optional_subtree,
+        found->second->runtime->verified_signers);
+}
+
+std::optional<std::set<ReplicaID>>
+ProposalContextLifecycle::pending_optional_direct_children(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return std::nullopt;
+    return set_intersection(
+        found->second->runtime->pending_observation_children,
+        found->second->tree->optional_subtree);
+}
+
+std::optional<std::size_t>
+ProposalContextLifecycle::frozen_global_quorum(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return std::nullopt;
+    return found->second->global_quorum;
 }
 
 bool ProposalContextLifecycle::record_local_signer(
@@ -876,7 +1264,11 @@ bool ProposalContextLifecycle::record_verified_direct(
         return false;
 
     found->second->runtime->verified_signers.insert(claimed_voter);
-    found->second->runtime->pending_children.erase(authenticated_child);
+    mark_observed(*found->second->runtime, authenticated_child);
+    update_required_branch_completion(
+        *found->second->tree,
+        *found->second->runtime,
+        authenticated_child);
     return true;
 }
 
@@ -907,7 +1299,11 @@ bool ProposalContextLifecycle::record_verified_aggregate(
 
     found->second->runtime->verified_signers.insert(
         certified_signers.begin(), certified_signers.end());
-    found->second->runtime->pending_children.erase(authenticated_child);
+    mark_observed(*found->second->runtime, authenticated_child);
+    update_required_branch_completion(
+        *found->second->tree,
+        *found->second->runtime,
+        authenticated_child);
     return true;
 }
 
@@ -923,10 +1319,12 @@ bool ProposalContextLifecycle::mark_forwarded_signers(
     if (found == entries_.end() ||
         found->second->status != ProposalContextStatus::admitted_open ||
         found->second->generation != lease.generation() ||
-        !found->second->runtime.has_value())
+        !found->second->runtime.has_value() ||
+        found->second->initial_forwarding_owner.has_value())
         return false;
     for (const auto signer : certified_signers)
         if (found->second->runtime->verified_signers.count(signer) == 0 ||
+            found->second->runtime->reserved_signers.count(signer) != 0 ||
             found->second->runtime->forwarded_signers.count(signer) != 0)
             return false;
 
@@ -936,7 +1334,189 @@ bool ProposalContextLifecycle::mark_forwarded_signers(
 }
 
 std::optional<ProposalForwardingClaim>
-ProposalContextLifecycle::claim_unforwarded_certificate(
+ProposalContextLifecycle::claim_initial_certificate_reservation(
+    const ProposalContextLease &lease,
+    quorum_cert_bt candidate)
+{
+    if (candidate == nullptr ||
+        candidate->get_proposal_key() != lease.key())
+        return std::nullopt;
+
+    std::set<ReplicaID> signers;
+    if (!exact_signer_set(*candidate, signers) || signers.empty())
+        return std::nullopt;
+    quorum_cert_bt owned_certificate;
+    try
+    {
+        owned_certificate = candidate->clone();
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value() ||
+        !found->second->tree->parent.has_value() ||
+        found->second->runtime->phase != ProposalContextPhase::collecting ||
+        found->second->initial_forwarding_owner.has_value() ||
+        !found->second->forwarding_reservations.empty() ||
+        !found->second->runtime->reserved_signers.empty() ||
+        !found->second->runtime->forwarded_signers.empty() ||
+        signers != found->second->runtime->verified_signers)
+        return std::nullopt;
+
+    auto reservation_id = next_forwarding_reservation_++;
+    if (reservation_id == 0)
+        reservation_id = next_forwarding_reservation_++;
+    std::optional<std::uint64_t> pending_candidate_id;
+    for (const auto &pending :
+         found->second->pending_forwarding_candidates)
+        if (pending.second.signers == signers)
+        {
+            pending_candidate_id = pending.first;
+            break;
+        }
+    found->second->initial_forwarding_owner =
+        Entry::InitialForwardingOwner{
+            std::move(owned_certificate), signers};
+    found->second->runtime->initial_forwarding_signers = signers;
+    found->second->runtime->reserved_signers.insert(
+        signers.begin(), signers.end());
+    found->second->forwarding_reservations.emplace(
+        reservation_id,
+        Entry::ForwardingReservation{
+            signers, pending_candidate_id, true});
+    return ProposalForwardingClaim{
+        std::move(candidate), std::move(signers), reservation_id,
+        pending_candidate_id};
+}
+
+std::optional<ProposalForwardingClaim>
+ProposalContextLifecycle::claim_initial_forwarding_reservation(
+    const ProposalContextLease &lease)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value() ||
+        !found->second->initial_forwarding_owner.has_value())
+        return std::nullopt;
+
+    const auto &owner = *found->second->initial_forwarding_owner;
+    for (const auto signer : owner.signers)
+        if (found->second->runtime->verified_signers.count(signer) == 0 ||
+            found->second->runtime->reserved_signers.count(signer) != 0 ||
+            found->second->runtime->forwarded_signers.count(signer) != 0)
+            return std::nullopt;
+
+    quorum_cert_bt certificate;
+    try
+    {
+        certificate = owner.certificate->clone();
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+    auto reservation_id = next_forwarding_reservation_++;
+    if (reservation_id == 0)
+        reservation_id = next_forwarding_reservation_++;
+    std::optional<std::uint64_t> pending_candidate_id;
+    for (const auto &pending :
+         found->second->pending_forwarding_candidates)
+        if (pending.second.signers == owner.signers)
+        {
+            pending_candidate_id = pending.first;
+            break;
+        }
+    const auto signers = owner.signers;
+    found->second->runtime->reserved_signers.insert(
+        signers.begin(), signers.end());
+    found->second->forwarding_reservations.emplace(
+        reservation_id,
+        Entry::ForwardingReservation{
+            signers, pending_candidate_id, true});
+    return ProposalForwardingClaim{
+        std::move(certificate), signers, reservation_id,
+        pending_candidate_id};
+}
+
+bool ProposalContextLifecycle::initial_forwarding_owned(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    return found != entries_.end() &&
+           found->second->status ==
+               ProposalContextStatus::admitted_open &&
+           found->second->generation == lease.generation() &&
+           found->second->runtime.has_value() &&
+           found->second->initial_forwarding_owner.has_value();
+}
+
+bool ProposalContextLifecycle::retire_overlapped_initial_forwarding(
+    const ProposalContextLease &lease,
+    const std::set<ReplicaID> &expected_signers)
+{
+    if (expected_signers.empty())
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value() ||
+        found->second->runtime->phase != ProposalContextPhase::delta_open)
+        return false;
+
+    if (found->second->initial_forwarding_owner.has_value() &&
+        found->second->initial_forwarding_owner->signers !=
+            expected_signers)
+        return false;
+    for (const auto &reservation : found->second->forwarding_reservations)
+        if (reservation.second.initial_forwarding)
+            return false;
+    const auto already_forwarded = set_intersection(
+        expected_signers,
+        found->second->runtime->forwarded_signers);
+    const auto uncovered = set_difference(
+        expected_signers,
+        found->second->runtime->forwarded_signers);
+    if (already_forwarded.empty() || uncovered.empty())
+        return false;
+
+    std::set<ReplicaID> canonically_owned;
+    for (const auto &pending :
+         found->second->pending_forwarding_candidates)
+        canonically_owned.insert(
+            pending.second.signers.begin(), pending.second.signers.end());
+    for (const auto &reservation : found->second->forwarding_reservations)
+        canonically_owned.insert(
+            reservation.second.signers.begin(),
+            reservation.second.signers.end());
+    if (!std::includes(
+            canonically_owned.begin(), canonically_owned.end(),
+            uncovered.begin(), uncovered.end()))
+        return false;
+
+    if (found->second->initial_forwarding_owner.has_value())
+    {
+        found->second->initial_forwarding_owner.reset();
+        found->second->runtime->initial_forwarding_signers.clear();
+    }
+    return true;
+}
+
+std::optional<ProposalForwardingClaim>
+ProposalContextLifecycle::claim_unforwarded_certificate_reservation(
     const ProposalContextLease &lease,
     quorum_cert_bt candidate)
 {
@@ -953,18 +1533,194 @@ ProposalContextLifecycle::claim_unforwarded_certificate(
     if (found == entries_.end() ||
         found->second->status != ProposalContextStatus::admitted_open ||
         found->second->generation != lease.generation() ||
-        !found->second->runtime.has_value())
+        !found->second->runtime.has_value() ||
+        found->second->initial_forwarding_owner.has_value())
         return std::nullopt;
 
     for (const auto signer : signers)
         if (found->second->runtime->verified_signers.count(signer) == 0 ||
+            found->second->runtime->reserved_signers.count(signer) != 0 ||
             found->second->runtime->forwarded_signers.count(signer) != 0)
             return std::nullopt;
 
-    found->second->runtime->forwarded_signers.insert(
+    auto reservation_id = next_forwarding_reservation_++;
+    if (reservation_id == 0)
+        reservation_id = next_forwarding_reservation_++;
+    std::optional<std::uint64_t> pending_candidate_id;
+    for (const auto &pending :
+         found->second->pending_forwarding_candidates)
+        if (pending.second.signers == signers)
+        {
+            pending_candidate_id = pending.first;
+            break;
+        }
+    found->second->runtime->reserved_signers.insert(
         signers.begin(), signers.end());
+    found->second->forwarding_reservations.emplace(
+        reservation_id,
+        Entry::ForwardingReservation{
+            signers, pending_candidate_id, false});
     return ProposalForwardingClaim{
-        std::move(candidate), std::move(signers)};
+        std::move(candidate), std::move(signers), reservation_id,
+        pending_candidate_id};
+}
+
+std::vector<std::uint64_t>
+ProposalContextLifecycle::pending_forwarding_candidate_ids(
+    const ProposalContextLease &lease) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return {};
+
+    std::vector<std::uint64_t> ids;
+    ids.reserve(found->second->pending_forwarding_candidates.size());
+    for (const auto &pending :
+         found->second->pending_forwarding_candidates)
+        ids.push_back(pending.first);
+    return ids;
+}
+
+std::optional<ProposalForwardingClaim>
+ProposalContextLifecycle::claim_pending_certificate_reservation(
+    const ProposalContextLease &lease,
+    std::uint64_t pending_candidate_id)
+{
+    if (pending_candidate_id == 0)
+        return std::nullopt;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value() ||
+        found->second->initial_forwarding_owner.has_value())
+        return std::nullopt;
+    const auto pending =
+        found->second->pending_forwarding_candidates.find(
+            pending_candidate_id);
+    if (pending ==
+        found->second->pending_forwarding_candidates.end())
+        return std::nullopt;
+    for (const auto signer : pending->second.signers)
+        if (found->second->runtime->verified_signers.count(signer) == 0 ||
+            found->second->runtime->reserved_signers.count(signer) != 0 ||
+            found->second->runtime->forwarded_signers.count(signer) != 0)
+            return std::nullopt;
+
+    auto reservation_id = next_forwarding_reservation_++;
+    if (reservation_id == 0)
+        reservation_id = next_forwarding_reservation_++;
+    auto certificate = pending->second.certificate->clone();
+    auto signers = pending->second.signers;
+    found->second->runtime->reserved_signers.insert(
+        signers.begin(), signers.end());
+    found->second->forwarding_reservations.emplace(
+        reservation_id,
+        Entry::ForwardingReservation{
+            signers, pending_candidate_id, false});
+    return ProposalForwardingClaim{
+        std::move(certificate), std::move(signers), reservation_id,
+        pending_candidate_id};
+}
+
+bool ProposalContextLifecycle::commit_forwarding_claim(
+    const ProposalContextLease &lease,
+    std::uint64_t reservation_id)
+{
+    if (reservation_id == 0)
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return false;
+    const auto reservation =
+        found->second->forwarding_reservations.find(reservation_id);
+    if (reservation == found->second->forwarding_reservations.end())
+        return false;
+    const auto reserved = reservation->second;
+    if (reserved.initial_forwarding &&
+        (!found->second->initial_forwarding_owner.has_value() ||
+         found->second->initial_forwarding_owner->signers !=
+             reserved.signers))
+        return false;
+    for (const auto signer : reserved.signers)
+        if (found->second->runtime->reserved_signers.count(signer) == 0 ||
+            found->second->runtime->forwarded_signers.count(signer) != 0)
+            return false;
+
+    for (const auto signer : reserved.signers)
+        found->second->runtime->reserved_signers.erase(signer);
+    found->second->runtime->forwarded_signers.insert(
+        reserved.signers.begin(), reserved.signers.end());
+    found->second->forwarding_reservations.erase(reservation);
+    if (reserved.initial_forwarding)
+    {
+        found->second->initial_forwarding_owner.reset();
+        found->second->runtime->initial_forwarding_signers.clear();
+    }
+    for (auto pending =
+             found->second->pending_forwarding_candidates.begin();
+         pending != found->second->pending_forwarding_candidates.end();)
+    {
+        if (std::includes(
+                found->second->runtime->forwarded_signers.begin(),
+                found->second->runtime->forwarded_signers.end(),
+                pending->second.signers.begin(),
+                pending->second.signers.end()))
+            pending = found->second->pending_forwarding_candidates.erase(
+                pending);
+        else
+            ++pending;
+    }
+    return true;
+}
+
+bool ProposalContextLifecycle::release_forwarding_claim(
+    const ProposalContextLease &lease,
+    std::uint64_t reservation_id)
+{
+    if (reservation_id == 0)
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value())
+        return false;
+    const auto reservation =
+        found->second->forwarding_reservations.find(reservation_id);
+    if (reservation == found->second->forwarding_reservations.end())
+        return false;
+
+    for (const auto signer : reservation->second.signers)
+        found->second->runtime->reserved_signers.erase(signer);
+    found->second->forwarding_reservations.erase(reservation);
+    return true;
+}
+
+std::optional<ProposalForwardingClaim>
+ProposalContextLifecycle::claim_unforwarded_certificate(
+    const ProposalContextLease &lease,
+    quorum_cert_bt candidate)
+{
+    auto claim = claim_unforwarded_certificate_reservation(
+        lease, std::move(candidate));
+    if (!claim.has_value() ||
+        !commit_forwarding_claim(lease, claim->reservation_id))
+        return std::nullopt;
+    return claim;
 }
 
 std::uint64_t ProposalContextLifecycle::arm_timer(
@@ -1070,13 +1826,37 @@ ProposalTransitionResult ProposalContextLifecycle::transition(
 
         auto &entry = *found->second;
         bool terminal = false;
+        const auto enter_delta_open = [&entry, &cancellation]() {
+            entry.runtime->phase = ProposalContextPhase::delta_open;
+            entry.runtime->pass_through = true;
+            // Preserve the original deadline when optional signers exist so
+            // their absence can be recorded as neutral observation telemetry.
+            if (entry.tree->optional_subtree.empty())
+            {
+                entry.runtime->timer_generation = 0;
+                if (entry.timer_cancellation)
+                    cancellation = std::move(entry.timer_cancellation);
+            }
+        };
         switch (event)
         {
         case ProposalContextEvent::aggregation_timeout:
             entry.runtime->pass_through = true;
+            if (entry.tree->parent.has_value())
+                entry.runtime->phase = ProposalContextPhase::delta_open;
             break;
         case ProposalContextEvent::late_contribution_forwarded:
+        {
+            const auto assigned = as_set(entry.tree->assigned_subtree);
+            terminal = entry.tree->parent.has_value() &&
+                       std::includes(
+                           entry.runtime->forwarded_signers.begin(),
+                           entry.runtime->forwarded_signers.end(),
+                           assigned.begin(), assigned.end());
+            if (entry.tree->parent.has_value() && !terminal)
+                enter_delta_open();
             break;
+        }
         case ProposalContextEvent::leaf_vote_enqueued:
             terminal = entry.tree->direct_children.empty() &&
                        entry.tree->parent.has_value() &&
@@ -1085,13 +1865,25 @@ ProposalTransitionResult ProposalContextLifecycle::transition(
             break;
         case ProposalContextEvent::non_root_aggregate_enqueued:
         {
+            if (entry.accumulator == nullptr &&
+                entry.forwarding_reservations.empty())
+            {
+                // The non-cryptographic lifecycle compatibility API models
+                // this event as the enqueue boundary itself. Production exact
+                // contexts always own an accumulator and commit forwarded
+                // signer ownership before emitting the event.
+                entry.runtime->forwarded_signers =
+                    entry.runtime->verified_signers;
+            }
             const auto assigned = as_set(entry.tree->assigned_subtree);
             terminal = entry.tree->parent.has_value() &&
                        !entry.tree->direct_children.empty() &&
                        std::includes(
-                           entry.runtime->verified_signers.begin(),
-                           entry.runtime->verified_signers.end(),
+                           entry.runtime->forwarded_signers.begin(),
+                           entry.runtime->forwarded_signers.end(),
                            assigned.begin(), assigned.end());
+            if (entry.tree->parent.has_value() && !terminal)
+                enter_delta_open();
             break;
         }
         case ProposalContextEvent::root_qc_published:
@@ -1139,6 +1931,8 @@ bool ProposalContextLifecycle::valid_metadata(
 
     const auto assigned = as_set(metadata.tree.assigned_subtree);
     const auto children = as_set(metadata.tree.direct_children);
+    const auto &required = metadata.tree.required_subtree;
+    const auto &optional = metadata.tree.optional_subtree;
     const bool local_is_root =
         metadata.tree.local_replica == metadata.tree.root;
     if (assigned.size() != metadata.tree.assigned_subtree.size() ||
@@ -1146,11 +1940,26 @@ bool ProposalContextLifecycle::valid_metadata(
         assigned.count(metadata.tree.local_replica) == 0 ||
         local_is_root !=
             !metadata.tree.parent.has_value() ||
-        metadata.tree.child_subtrees.size() != children.size())
+        metadata.tree.child_subtrees.size() != children.size() ||
+        metadata.tree.required_child_subtrees.size() != children.size())
+        return false;
+
+    const auto required_optional_overlap =
+        set_intersection(required, optional);
+    auto reconstructed_policy = required;
+    reconstructed_policy.insert(optional.begin(), optional.end());
+    if (!required_optional_overlap.empty() ||
+        reconstructed_policy != assigned ||
+        (!metadata.tree.direct_children.empty() &&
+         optional.count(metadata.tree.local_replica) != 0))
         return false;
 
     if (local_is_root)
     {
+        // This lifecycle is shared by legacy/adaptive-v1 contexts, whose
+        // historical membership is not required to be exactly 3f+1.
+        // Adaptive-v2 enforces exact membership when validating its epoch
+        // definition before this frozen proposal metadata is constructed.
         const auto authoritative_quorum =
             2 * ((assigned.size() - 1) / 3) + 1;
         if (metadata.global_quorum != authoritative_quorum)
@@ -1170,8 +1979,15 @@ bool ProposalContextLifecycle::valid_metadata(
     for (const auto child : children)
     {
         const auto subtree = metadata.tree.child_subtrees.find(child);
+        const auto required_branch =
+            metadata.tree.required_child_subtrees.find(child);
         if (subtree == metadata.tree.child_subtrees.end() ||
-            subtree->second.empty() || subtree->second.count(child) == 0)
+            required_branch ==
+                metadata.tree.required_child_subtrees.end() ||
+            subtree->second.empty() || subtree->second.count(child) == 0 ||
+            required_branch->second !=
+                set_intersection(subtree->second, required) ||
+            (optional.count(child) != 0 && subtree->second.size() != 1))
             return false;
         for (const auto member : subtree->second)
         {
@@ -1204,6 +2020,9 @@ ProposalContextLifecycle::compact_terminal_unlocked(
     entry.global_quorum = 0;
     entry.runtime.reset();
     entry.accumulator = nullptr;
+    entry.pending_forwarding_candidates.clear();
+    entry.forwarding_reservations.clear();
+    entry.initial_forwarding_owner.reset();
     entry.latency_starts.clear();
     return cancellation;
 }
