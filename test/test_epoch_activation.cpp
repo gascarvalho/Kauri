@@ -14,6 +14,7 @@
 
 #include "catch.hpp"
 #include "hotstuff/client.h"
+#include "hotstuff/epoch_change.h"
 #include "hotstuff/epoch_store.h"
 #include "hotstuff/evidence.h"
 
@@ -377,10 +378,13 @@ namespace
 {
 
 using hotstuff::ActivationBlockReason;
+using hotstuff::ActivationRecord;
+using hotstuff::ActivationRecordDisposition;
 using hotstuff::ActivationRecoveryNeed;
 using hotstuff::ActivationStatus;
 using hotstuff::ActivationTransition;
 using hotstuff::ArmActivation;
+using hotstuff::AuthorizedEpochChange;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::ConfigurationId;
 using hotstuff::EpochAckTracker;
@@ -389,6 +393,7 @@ using hotstuff::EpochActivationIdentity;
 using hotstuff::EpochActivationResult;
 using hotstuff::EpochDefinition;
 using hotstuff::EpochDefinitionInput;
+using hotstuff::EpochChangePayload;
 using hotstuff::EpochProtocolMode;
 using hotstuff::EpochStore;
 using hotstuff::EpochTreeDefinition;
@@ -482,6 +487,52 @@ EpochDefinitionInput successor_input(const EpochDefinition &predecessor)
     return input;
 }
 
+EpochDefinitionInput successor_v2_input(const EpochDefinition &predecessor)
+{
+    auto input = successor_input(predecessor);
+    input.schema_version = hotstuff::kEpochDefinitionSchemaVersionV2;
+    input.activation_height = 0;
+    input.policy_version = "c08a-adaptive-v2";
+    input.evidence_snapshot_id = "c08a-containment";
+    input.trees[0].wait_exempt_leaves = {4, 5};
+    input.trees[1].wait_exempt_leaves = {4, 5};
+    std::sort(
+        input.trees.begin(), input.trees.end(),
+        [](const auto &left, const auto &right) {
+            return left.tree_id < right.tree_id;
+        });
+    input.epoch_digest.reset();
+    return input;
+}
+
+EpochDefinitionInput epoch_zero_v2_input()
+{
+    auto input = epoch_zero_input();
+    input.schema_version = hotstuff::kEpochDefinitionSchemaVersionV2;
+    input.policy_version = "c08a-baseline-v2";
+    input.evidence_snapshot_id = "c08a-baseline";
+    input.epoch_digest.reset();
+    return input;
+}
+
+AuthorizedEpochChange prevalidated_v2_command(
+    const EpochDefinition &predecessor,
+    const uint256_t &successor_digest,
+    std::uint64_t delay)
+{
+    hotstuff::PrivKeySecp256k1 key;
+    key.from_hex(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    return hotstuff::authorize_epoch_change(
+        EpochChangePayload{
+            predecessor.epoch_number() + 1,
+            predecessor.epoch_digest(),
+            successor_digest,
+            delay},
+        17,
+        key);
+}
+
 EpochValidationContext successor_context()
 {
     return {10, 5, {}};
@@ -558,6 +609,28 @@ struct EpochFixture
     }
 };
 
+struct EpochV2Fixture
+{
+    EpochStore store{membership7()};
+    const EpochDefinition *epoch0{nullptr};
+
+    EpochV2Fixture()
+    {
+        epoch0 = &store.stage(epoch_zero_v2_input(), epoch_zero_context());
+    }
+};
+
+template <typename Fixture>
+const EpochDefinition &stage_v2_successor(Fixture &fixture)
+{
+    const auto staged = fixture.store.stage_available_v2(
+        successor_v2_input(*fixture.epoch0), *fixture.epoch0);
+    REQUIRE(staged.disposition ==
+            hotstuff::DefinitionAvailabilityDisposition::staged);
+    REQUIRE(staged.definition != nullptr);
+    return *staged.definition;
+}
+
 void overwrite_u32(
     bytearray_t &payload,
     std::size_t offset,
@@ -605,6 +678,26 @@ void check_effect(
     REQUIRE(expected_generation.has_value());
     CHECK(*expected_generation == packed + 1);
     CHECK(effect.generation == *expected_generation);
+}
+
+void check_record(
+    const ActivationRecord &record,
+    const EpochDefinition &predecessor,
+    const EpochDefinition &successor,
+    const AuthorizedEpochChange &command,
+    std::uint64_t commit_height,
+    std::uint64_t activation_height)
+{
+    CHECK(record.predecessor_epoch_number == predecessor.epoch_number());
+    CHECK(record.predecessor_epoch_digest == predecessor.epoch_digest());
+    CHECK(record.successor_epoch_number == successor.epoch_number());
+    CHECK(record.successor_epoch_digest == successor.epoch_digest());
+    CHECK(record.payload_digest ==
+          hotstuff::epoch_change_payload_digest(command.payload));
+    CHECK(record.command_commit_height == commit_height);
+    CHECK(record.activation_delay_blocks ==
+          command.payload.activation_delay_blocks);
+    CHECK(record.activation_height == activation_height);
 }
 
 std::string read_source(const std::string &relative_path)
@@ -893,6 +986,433 @@ TEST_CASE("wire encoder rejects structurally invalid canonical definitions",
         duplicate_member.activation.successor_epoch_digest = digest;
 
         CHECK_THROWS(hotstuff::encode_epoch_wire(duplicate_member, limits));
+    }
+}
+
+TEST_CASE("C08a freezes one committed adaptive-v2 activation record",
+          "[c08a][epoch-activation][adaptive-v2][record][idempotent]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    constexpr std::uint64_t delay = 5;
+    EpochV2Fixture fixture;
+    const auto &successor = stage_v2_successor(fixture);
+    ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+    const auto command = prevalidated_v2_command(
+        *fixture.epoch0, successor.epoch_digest(), delay);
+
+    const auto recorded = replica.record_committed_v2(
+        command, commit_height);
+    CHECK(recorded.disposition == ActivationRecordDisposition::recorded);
+    REQUIRE(recorded.record.has_value());
+    check_record(
+        *recorded.record,
+        *fixture.epoch0,
+        successor,
+        command,
+        commit_height,
+        commit_height + delay);
+    REQUIRE(replica.committed_v2_record().has_value());
+    check_record(
+        *replica.committed_v2_record(),
+        *fixture.epoch0,
+        successor,
+        command,
+        commit_height,
+        commit_height + delay);
+    CHECK(successor.schema_version() ==
+          hotstuff::kEpochDefinitionSchemaVersionV2);
+    CHECK(successor.activation_height() == 0);
+    check_effect(replica.active_effect(), *fixture.epoch0, 0, 0);
+
+    const auto duplicate = replica.record_committed_v2(
+        command, commit_height);
+    CHECK(duplicate.disposition == ActivationRecordDisposition::duplicate);
+    const auto later_duplicate = replica.record_committed_v2(
+        command, commit_height + 3);
+    CHECK(later_duplicate.disposition ==
+          ActivationRecordDisposition::duplicate);
+    REQUIRE(replica.committed_v2_record().has_value());
+    CHECK(replica.committed_v2_record()->command_commit_height ==
+          commit_height);
+    CHECK(replica.committed_v2_record()->activation_height ==
+          commit_height + delay);
+    CHECK(replica.admits_new_proposals());
+}
+
+TEST_CASE("C08a rejects invalid committed adaptive-v2 records fail closed",
+          "[c08a][epoch-activation][adaptive-v2][record][negative]")
+{
+    constexpr std::uint64_t commit_height = 40;
+
+    SECTION("unsupported command schema")
+    {
+        EpochV2Fixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        ++command.schema_version;
+        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+              ActivationRecordDisposition::unsupported_schema);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+
+    SECTION("non-v2 command")
+    {
+        EpochV2Fixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        command.protocol_mode = EpochProtocolMode::adaptive_v1;
+        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+              ActivationRecordDisposition::wrong_mode);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+
+    SECTION("non-v2 active predecessor")
+    {
+        EpochFixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        const auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+              ActivationRecordDisposition::wrong_mode);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+
+    SECTION("wrong predecessor")
+    {
+        EpochV2Fixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        command.payload.predecessor_epoch_digest =
+            fixture_digest("wrong-v2-predecessor");
+        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+              ActivationRecordDisposition::wrong_predecessor);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+
+    SECTION("wrong successor")
+    {
+        EpochV2Fixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        ++command.payload.successor_epoch_number;
+        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+              ActivationRecordDisposition::wrong_successor);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+
+    SECTION("missing definition")
+    {
+        EpochV2Fixture fixture;
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        const auto input = successor_v2_input(*fixture.epoch0);
+        const auto command = prevalidated_v2_command(
+            *fixture.epoch0, hotstuff::compute_epoch_digest(input), 5);
+        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+              ActivationRecordDisposition::missing_definition);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+
+    SECTION("mismatched scheduled definition")
+    {
+        EpochV2Fixture fixture;
+        const auto &scheduled = fixture.store.stage(
+            successor_input(*fixture.epoch0), successor_context());
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        const auto command = prevalidated_v2_command(
+            *fixture.epoch0, scheduled.epoch_digest(), 5);
+        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+              ActivationRecordDisposition::mismatched_definition);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+
+    SECTION("activation height overflow")
+    {
+        EpochV2Fixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        const auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        CHECK(replica.record_committed_v2(
+                  command,
+                  std::numeric_limits<std::uint64_t>::max() - 4)
+                  .disposition ==
+              ActivationRecordDisposition::activation_height_overflow);
+        CHECK_FALSE(replica.committed_v2_record().has_value());
+        CHECK_FALSE(replica.admits_new_proposals());
+    }
+}
+
+TEST_CASE("C08a preserves the first record and blocks a conflicting schedule",
+          "[c08a][epoch-activation][adaptive-v2][record][conflict]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    EpochV2Fixture fixture;
+    const auto &successor = stage_v2_successor(fixture);
+    ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+    const auto command = prevalidated_v2_command(
+        *fixture.epoch0, successor.epoch_digest(), 5);
+    REQUIRE(replica.record_committed_v2(command, commit_height).disposition ==
+            ActivationRecordDisposition::recorded);
+
+    const auto conflicting = prevalidated_v2_command(
+        *fixture.epoch0, successor.epoch_digest(), 6);
+    const auto result = replica.record_committed_v2(
+        conflicting, commit_height + 1);
+    CHECK(result.disposition ==
+          ActivationRecordDisposition::conflicting_record);
+    REQUIRE(replica.committed_v2_record().has_value());
+    check_record(
+        *replica.committed_v2_record(),
+        *fixture.epoch0,
+        successor,
+        command,
+        commit_height,
+        commit_height + 5);
+    CHECK_FALSE(replica.admits_new_proposals());
+}
+
+TEST_CASE("C08a activates v2 only after the exact post-block boundary",
+          "[c08a][epoch-activation][adaptive-v2][post-block]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    constexpr std::uint64_t delay = 5;
+    constexpr std::uint64_t activation_height = commit_height + delay;
+    EpochV2Fixture fixture;
+    const auto &successor = stage_v2_successor(fixture);
+    ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+    const auto command = prevalidated_v2_command(
+        *fixture.epoch0, successor.epoch_digest(), delay);
+    REQUIRE(replica.record_committed_v2(command, commit_height).disposition ==
+            ActivationRecordDisposition::recorded);
+
+    const auto preview = replica.preview_v2_post_block_commit(
+        activation_height, fixture.epoch0->epoch_digest());
+    CHECK(preview.transition == ActivationTransition::activated);
+    REQUIRE(preview.effect.has_value());
+    check_effect(*preview.effect, successor, 0, 0);
+    check_effect(replica.active_effect(), *fixture.epoch0, 0, 0);
+
+    const auto early = replica.on_v2_post_block_commit(
+        activation_height - 1, fixture.epoch0->epoch_digest());
+    CHECK(early.transition == ActivationTransition::waiting);
+    CHECK_FALSE(early.effect.has_value());
+    check_effect(replica.active_effect(), *fixture.epoch0, 0, 0);
+
+    const auto activated = replica.on_v2_post_block_commit(
+        activation_height, fixture.epoch0->epoch_digest());
+    CHECK(activated.transition == ActivationTransition::activated);
+    CHECK(activated.blocked_reason == ActivationBlockReason::none);
+    REQUIRE(activated.effect.has_value());
+    check_effect(*activated.effect, successor, 0, 0);
+    check_effect(replica.active_effect(), successor, 0, 0);
+    CHECK(successor.activation_height() == 0);
+    CHECK_FALSE(replica.active_status().has_value());
+    CHECK(replica.admits_new_proposals());
+
+    const auto replay = replica.on_v2_post_block_commit(
+        activation_height, fixture.epoch0->epoch_digest());
+    CHECK(replay.transition == ActivationTransition::already_active);
+    REQUIRE(replay.effect.has_value());
+    check_effect(*replay.effect, successor, 0, 0);
+}
+
+TEST_CASE("C08a schedules a later v2 epoch after completing the prior record",
+          "[c08a][epoch-activation][adaptive-v2][record][multi-epoch]")
+{
+    constexpr std::uint64_t first_commit_height = 40;
+    constexpr std::uint64_t first_delay = 5;
+    constexpr std::uint64_t second_commit_height = 60;
+    constexpr std::uint64_t second_delay = 4;
+    EpochV2Fixture fixture;
+    const auto &epoch1 = stage_v2_successor(fixture);
+    ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+    const auto epoch1_command = prevalidated_v2_command(
+        *fixture.epoch0, epoch1.epoch_digest(), first_delay);
+
+    REQUIRE(replica.record_committed_v2(
+                epoch1_command, first_commit_height)
+                .disposition == ActivationRecordDisposition::recorded);
+    REQUIRE(replica.on_v2_post_block_commit(
+                first_commit_height + first_delay,
+                fixture.epoch0->epoch_digest())
+                .transition == ActivationTransition::activated);
+    check_effect(replica.active_effect(), epoch1, 0, 0);
+
+    const auto old_duplicate = replica.record_committed_v2(
+        epoch1_command, second_commit_height);
+    CHECK(old_duplicate.disposition ==
+          ActivationRecordDisposition::duplicate);
+    REQUIRE(old_duplicate.record.has_value());
+    CHECK(old_duplicate.record->command_commit_height == first_commit_height);
+
+    const auto epoch2_staged = fixture.store.stage_available_v2(
+        successor_v2_input(epoch1), epoch1);
+    REQUIRE(epoch2_staged.disposition ==
+            hotstuff::DefinitionAvailabilityDisposition::staged);
+    REQUIRE(epoch2_staged.definition != nullptr);
+    const auto &epoch2 = *epoch2_staged.definition;
+    const auto epoch2_command = prevalidated_v2_command(
+        epoch1, epoch2.epoch_digest(), second_delay);
+
+    const auto recorded = replica.record_committed_v2(
+        epoch2_command, second_commit_height);
+    CHECK(recorded.disposition == ActivationRecordDisposition::recorded);
+    REQUIRE(recorded.record.has_value());
+    check_record(
+        *recorded.record,
+        epoch1,
+        epoch2,
+        epoch2_command,
+        second_commit_height,
+        second_commit_height + second_delay);
+    check_effect(replica.active_effect(), epoch1, 0, 0);
+
+    const auto completed_replay = replica.record_committed_v2(
+        epoch1_command, second_commit_height + 1);
+    CHECK(completed_replay.disposition ==
+          ActivationRecordDisposition::duplicate);
+    REQUIRE(completed_replay.record.has_value());
+    CHECK(completed_replay.record->command_commit_height ==
+          first_commit_height);
+    REQUIRE(replica.committed_v2_record().has_value());
+    CHECK(replica.committed_v2_record()->payload_digest ==
+          hotstuff::epoch_change_payload_digest(epoch2_command.payload));
+    CHECK(replica.committed_v2_record()->command_commit_height ==
+          second_commit_height);
+    CHECK(replica.admits_new_proposals());
+
+    const auto early = replica.on_v2_post_block_commit(
+        second_commit_height + second_delay - 1,
+        epoch1.epoch_digest());
+    CHECK(early.transition == ActivationTransition::waiting);
+    check_effect(replica.active_effect(), epoch1, 0, 0);
+
+    const auto activated = replica.on_v2_post_block_commit(
+        second_commit_height + second_delay,
+        epoch1.epoch_digest());
+    CHECK(activated.transition == ActivationTransition::activated);
+    REQUIRE(activated.effect.has_value());
+    check_effect(*activated.effect, epoch2, 0, 0);
+    check_effect(replica.active_effect(), epoch2, 0, 0);
+}
+
+TEST_CASE("C08a does not mask a permanent v2 block as already active",
+          "[c08a][epoch-activation][adaptive-v2][fail-closed][completed]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    constexpr std::uint64_t delay = 5;
+    EpochV2Fixture fixture;
+    const auto &epoch1 = stage_v2_successor(fixture);
+    ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+    const auto epoch1_command = prevalidated_v2_command(
+        *fixture.epoch0, epoch1.epoch_digest(), delay);
+
+    REQUIRE(replica.record_committed_v2(epoch1_command, commit_height)
+                .disposition == ActivationRecordDisposition::recorded);
+    REQUIRE(replica.on_v2_post_block_commit(
+                commit_height + delay,
+                fixture.epoch0->epoch_digest())
+                .transition == ActivationTransition::activated);
+    check_effect(replica.active_effect(), epoch1, 0, 0);
+
+    auto invalid_epoch2 = prevalidated_v2_command(
+        epoch1, fixture_digest("invalid-epoch2"), delay);
+    invalid_epoch2.payload.predecessor_epoch_digest =
+        fixture_digest("wrong-current-predecessor");
+    const auto rejected = replica.record_committed_v2(
+        invalid_epoch2, commit_height + 10);
+    CHECK(rejected.disposition ==
+          ActivationRecordDisposition::wrong_predecessor);
+    CHECK_FALSE(replica.admits_new_proposals());
+
+    const auto preview = replica.preview_v2_post_block_commit(
+        commit_height + delay, fixture.epoch0->epoch_digest());
+    CHECK(preview.transition == ActivationTransition::blocked);
+    CHECK(preview.blocked_reason ==
+          ActivationBlockReason::predecessor_digest_mismatch);
+    CHECK_FALSE(preview.effect.has_value());
+
+    const auto applied = replica.on_v2_post_block_commit(
+        commit_height + delay, fixture.epoch0->epoch_digest());
+    CHECK(applied.transition == ActivationTransition::blocked);
+    CHECK(applied.blocked_reason ==
+          ActivationBlockReason::predecessor_digest_mismatch);
+    CHECK_FALSE(applied.effect.has_value());
+    check_effect(replica.active_effect(), epoch1, 0, 0);
+}
+
+TEST_CASE("C08a misses or mismatches the v2 boundary fail closed",
+          "[c08a][epoch-activation][adaptive-v2][post-block][fail-closed]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    constexpr std::uint64_t activation_height = 45;
+
+    SECTION("first post-block observation is late")
+    {
+        EpochV2Fixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        const auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        REQUIRE(replica.record_committed_v2(command, commit_height).disposition ==
+                ActivationRecordDisposition::recorded);
+
+        const auto preview = replica.preview_v2_post_block_commit(
+            activation_height + 1, fixture.epoch0->epoch_digest());
+        CHECK(preview.transition == ActivationTransition::blocked);
+        CHECK(preview.blocked_reason ==
+              ActivationBlockReason::missed_activation_height);
+        CHECK(replica.admits_new_proposals());
+
+        const auto missed = replica.on_v2_post_block_commit(
+            activation_height + 1, fixture.epoch0->epoch_digest());
+        CHECK(missed.transition == ActivationTransition::blocked);
+        CHECK(missed.blocked_reason ==
+              ActivationBlockReason::missed_activation_height);
+        CHECK_FALSE(replica.admits_new_proposals());
+        check_effect(replica.active_effect(), *fixture.epoch0, 0, 0);
+
+        const auto backwards = replica.on_v2_post_block_commit(
+            activation_height, fixture.epoch0->epoch_digest());
+        CHECK(backwards.transition == ActivationTransition::blocked);
+        CHECK(backwards.blocked_reason ==
+              ActivationBlockReason::missed_activation_height);
+    }
+
+    SECTION("committed predecessor digest mismatches")
+    {
+        EpochV2Fixture fixture;
+        const auto &successor = stage_v2_successor(fixture);
+        ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+        const auto command = prevalidated_v2_command(
+            *fixture.epoch0, successor.epoch_digest(), 5);
+        REQUIRE(replica.record_committed_v2(command, commit_height).disposition ==
+                ActivationRecordDisposition::recorded);
+
+        const auto mismatched = replica.on_v2_post_block_commit(
+            activation_height - 1,
+            fixture_digest("wrong-post-block-predecessor"));
+        CHECK(mismatched.transition == ActivationTransition::blocked);
+        CHECK(mismatched.blocked_reason ==
+              ActivationBlockReason::predecessor_digest_mismatch);
+        CHECK_FALSE(replica.admits_new_proposals());
+        check_effect(replica.active_effect(), *fixture.epoch0, 0, 0);
     }
 }
 

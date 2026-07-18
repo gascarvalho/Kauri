@@ -16,6 +16,7 @@
 #include <optional>
 #include <vector>
 
+#include "hotstuff/epoch_change.h"
 #include "hotstuff/epoch_store.h"
 #include "hotstuff/epoch_wire.h"
 #include "hotstuff/evidence.h"
@@ -104,6 +105,9 @@ enum class ActivationBlockReason : std::uint8_t
     missing_arm,
     predecessor_digest_mismatch,
     missed_activation_height,
+    invalid_activation_record,
+    conflicting_activation_record,
+    activation_height_overflow,
 };
 
 enum class ActivationTransition : std::uint8_t
@@ -127,6 +131,46 @@ struct EpochActivationResult
     const ActivationTransition transition;
     const ActivationBlockReason blocked_reason;
     const std::optional<EpochActivationEffect> effect;
+};
+
+/**
+ * Immutable schedule derived from one prevalidated adaptive-v2 command after
+ * the command itself commits.  The successor definition remains schedule-free;
+ * activation_height is checked and derived only as h_c + Delta.
+ */
+struct ActivationRecord
+{
+    const std::uint32_t predecessor_epoch_number;
+    const uint256_t predecessor_epoch_digest;
+    const std::uint32_t successor_epoch_number;
+    const uint256_t successor_epoch_digest;
+    const uint256_t payload_digest;
+    const std::uint64_t command_commit_height;
+    const std::uint64_t activation_delay_blocks;
+    const std::uint64_t activation_height;
+
+    bool operator==(const ActivationRecord &other) const noexcept;
+    bool operator!=(const ActivationRecord &other) const noexcept;
+};
+
+enum class ActivationRecordDisposition : std::uint8_t
+{
+    recorded = 1,
+    duplicate,
+    unsupported_schema,
+    wrong_mode,
+    wrong_predecessor,
+    wrong_successor,
+    missing_definition,
+    mismatched_definition,
+    activation_height_overflow,
+    conflicting_record,
+};
+
+struct ActivationRecordResult
+{
+    const ActivationRecordDisposition disposition;
+    const std::optional<ActivationRecord> record;
 };
 
 std::optional<std::uint32_t> checked_successor_epoch(
@@ -156,6 +200,17 @@ public:
         const EpochValidationContext &validation_context);
     ReplicaArmDisposition arm(const ArmActivation &message);
     bool restore_expectation(const ActivationStatus &status);
+
+    ActivationRecordResult record_committed_v2(
+        const AuthorizedEpochChange &prevalidated_command,
+        std::uint64_t command_commit_height);
+    std::optional<ActivationRecord> committed_v2_record() const;
+    EpochActivationResult preview_v2_post_block_commit(
+        std::uint64_t height,
+        const uint256_t &predecessor_digest) const;
+    EpochActivationResult on_v2_post_block_commit(
+        std::uint64_t height,
+        const uint256_t &predecessor_digest);
 
     EpochActivationResult on_predecessor_commit(
         std::uint64_t height,

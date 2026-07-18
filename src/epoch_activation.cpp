@@ -201,6 +201,25 @@ std::optional<std::uint64_t> checked_activation_generation(
     return packed + 1;
 }
 
+bool ActivationRecord::operator==(
+    const ActivationRecord &other) const noexcept
+{
+    return predecessor_epoch_number == other.predecessor_epoch_number &&
+           predecessor_epoch_digest == other.predecessor_epoch_digest &&
+           successor_epoch_number == other.successor_epoch_number &&
+           successor_epoch_digest == other.successor_epoch_digest &&
+           payload_digest == other.payload_digest &&
+           command_commit_height == other.command_commit_height &&
+           activation_delay_blocks == other.activation_delay_blocks &&
+           activation_height == other.activation_height;
+}
+
+bool ActivationRecord::operator!=(
+    const ActivationRecord &other) const noexcept
+{
+    return !(*this == other);
+}
+
 struct ReplicaEpochActivation::State
 {
     struct CommitProof
@@ -246,7 +265,9 @@ struct ReplicaEpochActivation::State
             throw std::overflow_error(
                 "initial epoch activation generation overflows");
         }
-        if (active_epoch.epoch_number() != 0)
+        if (active_epoch.epoch_number() != 0 &&
+            active_epoch.schema_version() ==
+                kEpochDefinitionSchemaVersionV1)
         {
             completed_activation = EpochActivationIdentity{
                 active_epoch.epoch_number() - 1,
@@ -320,6 +341,36 @@ struct ReplicaEpochActivation::State
         return definition;
     }
 
+    bool active_is_completed_v2_activation() const noexcept
+    {
+        return completed_v2_activation_record &&
+               active_definition->epoch_number() ==
+                   completed_v2_activation_record->successor_epoch_number &&
+               active_definition->epoch_digest() ==
+                   completed_v2_activation_record->successor_epoch_digest;
+    }
+
+    const EpochDefinition *exact_staged_v2_definition() const noexcept
+    {
+        if (!pending_v2_activation_record)
+            return nullptr;
+        const auto &record = *pending_v2_activation_record;
+        const auto *const definition = store.find_epoch_by_digest(
+            record.successor_epoch_digest);
+        if (definition == nullptr ||
+            definition->schema_version() !=
+                kEpochDefinitionSchemaVersionV2 ||
+            definition->activation_height() != 0 ||
+            definition->epoch_number() != record.successor_epoch_number ||
+            definition->previous_epoch_digest() !=
+                record.predecessor_epoch_digest ||
+            store.find_tree(record.successor_epoch_number, 0) == nullptr)
+        {
+            return nullptr;
+        }
+        return definition;
+    }
+
     EpochActivationResult waiting_result() const
     {
         return {
@@ -366,6 +417,81 @@ struct ReplicaEpochActivation::State
                     definition.epoch_digest()},
                 0,
                 *generation}};
+    }
+
+    EpochActivationResult preview_v2_post_block(
+        std::uint64_t height,
+        const uint256_t &predecessor_digest) const
+    {
+        if (permanent_block)
+            return blocked_result();
+        if (!pending_v2_activation_record)
+        {
+            if (active_is_completed_v2_activation())
+                return active_result(ActivationTransition::already_active);
+            return waiting_result();
+        }
+
+        const auto &record = *pending_v2_activation_record;
+        if (predecessor_digest != record.predecessor_epoch_digest)
+        {
+            return {
+                ActivationTransition::blocked,
+                ActivationBlockReason::predecessor_digest_mismatch,
+                std::nullopt};
+        }
+        if (height < record.activation_height)
+            return waiting_result();
+        if (height > record.activation_height)
+        {
+            return {
+                ActivationTransition::blocked,
+                ActivationBlockReason::missed_activation_height,
+                std::nullopt};
+        }
+        const auto *const definition = exact_staged_v2_definition();
+        if (definition == nullptr)
+        {
+            return {
+                ActivationTransition::blocked,
+                ActivationBlockReason::missing_definition,
+                std::nullopt};
+        }
+        return prospective_active_result(*definition);
+    }
+
+    EpochActivationResult apply_v2_post_block(
+        std::uint64_t height,
+        const uint256_t &predecessor_digest)
+    {
+        const auto preview = preview_v2_post_block(
+            height, predecessor_digest);
+        if (preview.transition == ActivationTransition::blocked)
+        {
+            block_reason = preview.blocked_reason;
+            permanent_block = true;
+            return blocked_result();
+        }
+        if (preview.transition != ActivationTransition::activated)
+            return preview;
+
+        const auto *const definition = exact_staged_v2_definition();
+        if (definition == nullptr)
+        {
+            block_reason = ActivationBlockReason::missing_definition;
+            permanent_block = true;
+            return blocked_result();
+        }
+        draining_configuration = active_configuration();
+        active_definition = definition;
+        active_tree_id = 0;
+        rotation_ordinal = 0;
+        completed_v2_activation_record.emplace(
+            *pending_v2_activation_record);
+        pending_v2_activation_record.reset();
+        block_reason = ActivationBlockReason::none;
+        permanent_block = false;
+        return active_result(ActivationTransition::activated);
     }
 
     EpochActivationResult preview_proof(
@@ -493,6 +619,8 @@ struct ReplicaEpochActivation::State
     std::optional<EpochActivationIdentity> expected_activation;
     std::optional<EpochActivationIdentity> armed_activation;
     std::optional<CommitProof> commit_proof;
+    std::optional<ActivationRecord> pending_v2_activation_record;
+    std::optional<ActivationRecord> completed_v2_activation_record;
     std::optional<ConfigurationId> draining_configuration;
     ActivationBlockReason block_reason{ActivationBlockReason::none};
     bool permanent_block{false};
@@ -514,6 +642,169 @@ ReplicaEpochActivation::ReplicaEpochActivation(
 }
 
 ReplicaEpochActivation::~ReplicaEpochActivation() = default;
+
+ActivationRecordResult ReplicaEpochActivation::record_committed_v2(
+    const AuthorizedEpochChange &prevalidated_command,
+    std::uint64_t command_commit_height)
+{
+    const auto reject = [this](
+                            ActivationRecordDisposition disposition,
+                            ActivationBlockReason reason) {
+        state_->block_reason = reason;
+        state_->permanent_block = true;
+        return ActivationRecordResult{
+            disposition, std::nullopt};
+    };
+
+    if (prevalidated_command.schema_version !=
+        kEpochChangeSchemaVersionV1)
+    {
+        return reject(
+            ActivationRecordDisposition::unsupported_schema,
+            ActivationBlockReason::invalid_activation_record);
+    }
+    if (prevalidated_command.protocol_mode !=
+        EpochProtocolMode::adaptive_v2)
+    {
+        return reject(
+            ActivationRecordDisposition::wrong_mode,
+            ActivationBlockReason::invalid_activation_record);
+    }
+    if (state_->active_definition->schema_version() !=
+        kEpochDefinitionSchemaVersionV2)
+    {
+        return reject(
+            ActivationRecordDisposition::wrong_mode,
+            ActivationBlockReason::invalid_activation_record);
+    }
+
+    const auto &payload = prevalidated_command.payload;
+    const auto payload_digest = epoch_change_payload_digest(payload);
+    const auto is_same_command = [&payload, &payload_digest](
+                                     const ActivationRecord &record) {
+        return record.payload_digest == payload_digest &&
+               record.successor_epoch_number ==
+                   payload.successor_epoch_number &&
+               record.predecessor_epoch_digest ==
+                   payload.predecessor_epoch_digest &&
+               record.successor_epoch_digest ==
+                   payload.successor_epoch_digest &&
+               record.activation_delay_blocks ==
+                   payload.activation_delay_blocks;
+    };
+    if (state_->pending_v2_activation_record &&
+        is_same_command(*state_->pending_v2_activation_record))
+    {
+        return {
+            ActivationRecordDisposition::duplicate,
+            state_->pending_v2_activation_record};
+    }
+    if (state_->completed_v2_activation_record &&
+        is_same_command(*state_->completed_v2_activation_record))
+    {
+        return {
+            ActivationRecordDisposition::duplicate,
+            state_->completed_v2_activation_record};
+    }
+    if (state_->pending_v2_activation_record)
+    {
+        return reject(
+            ActivationRecordDisposition::conflicting_record,
+            ActivationBlockReason::conflicting_activation_record);
+    }
+    if (state_->permanent_block)
+    {
+        return {
+            ActivationRecordDisposition::conflicting_record,
+            std::nullopt};
+    }
+
+    const auto *const predecessor = state_->active_definition;
+    if (payload.predecessor_epoch_digest != predecessor->epoch_digest())
+    {
+        return reject(
+            ActivationRecordDisposition::wrong_predecessor,
+            ActivationBlockReason::predecessor_digest_mismatch);
+    }
+    const auto successor_epoch = checked_successor_epoch(
+        predecessor->epoch_number());
+    if (!successor_epoch ||
+        payload.successor_epoch_number != *successor_epoch)
+    {
+        return reject(
+            ActivationRecordDisposition::wrong_successor,
+            ActivationBlockReason::invalid_activation_record);
+    }
+    if (payload.activation_delay_blocks >
+        std::numeric_limits<std::uint64_t>::max() - command_commit_height)
+    {
+        return reject(
+            ActivationRecordDisposition::activation_height_overflow,
+            ActivationBlockReason::activation_height_overflow);
+    }
+
+    const auto *const successor = state_->store.find_epoch_by_digest(
+        payload.successor_epoch_digest);
+    if (successor == nullptr)
+    {
+        return reject(
+            ActivationRecordDisposition::missing_definition,
+            ActivationBlockReason::missing_definition);
+    }
+    if (successor->schema_version() !=
+            kEpochDefinitionSchemaVersionV2 ||
+        successor->activation_height() != 0 ||
+        successor->epoch_number() != payload.successor_epoch_number ||
+        successor->previous_epoch_digest() !=
+            payload.predecessor_epoch_digest ||
+        state_->store.find_epoch(payload.successor_epoch_number) !=
+            successor ||
+        state_->store.find_tree(payload.successor_epoch_number, 0) ==
+            nullptr)
+    {
+        return reject(
+            ActivationRecordDisposition::mismatched_definition,
+            ActivationBlockReason::invalid_activation_record);
+    }
+
+    const auto activation_height =
+        command_commit_height + payload.activation_delay_blocks;
+    state_->pending_v2_activation_record.emplace(ActivationRecord{
+        predecessor->epoch_number(),
+        predecessor->epoch_digest(),
+        payload.successor_epoch_number,
+        payload.successor_epoch_digest,
+        payload_digest,
+        command_commit_height,
+        payload.activation_delay_blocks,
+        activation_height});
+    return {
+        ActivationRecordDisposition::recorded,
+        state_->pending_v2_activation_record};
+}
+
+std::optional<ActivationRecord>
+ReplicaEpochActivation::committed_v2_record() const
+{
+    if (state_->pending_v2_activation_record)
+        return state_->pending_v2_activation_record;
+    return state_->completed_v2_activation_record;
+}
+
+EpochActivationResult
+ReplicaEpochActivation::preview_v2_post_block_commit(
+    std::uint64_t height,
+    const uint256_t &predecessor_digest) const
+{
+    return state_->preview_v2_post_block(height, predecessor_digest);
+}
+
+EpochActivationResult ReplicaEpochActivation::on_v2_post_block_commit(
+    std::uint64_t height,
+    const uint256_t &predecessor_digest)
+{
+    return state_->apply_v2_post_block(height, predecessor_digest);
+}
 
 ReplicaStageResult ReplicaEpochActivation::stage(
     const StageEpochDefinition &message,
