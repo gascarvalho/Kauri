@@ -4895,14 +4895,22 @@ namespace hotstuff
                 blk->get_height());
             return;
         }
+        const auto monotonic_ns = std::chrono::duration_cast<
+            std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
         HOTSTUFF_LOG_INFO(
             "KAURI_DEMO commit replica=%u height=%llu epoch=%u "
-            "tree=%u root=%u",
+            "tree=%u root=%u "
+            "hash=%s tx_count=%zu monotonic_ns=%lld",
             get_id(),
-            blk->get_height(),
+            static_cast<unsigned long long>(blk->get_height()),
             key.configuration.epoch_number,
             key.configuration.tree_id,
-            tree->get_tree().get_tree_root());
+            tree->get_tree().get_tree_root(),
+            blk->get_hash().to_hex().c_str(),
+            blk->get_cmds().size(),
+            static_cast<long long>(monotonic_ns));
     }
 
     void HotStuffBase::finish_adaptive_epoch_commit(

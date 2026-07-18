@@ -1,0 +1,23 @@
+{
+  "profile_id": "seven-replica-leaf-crash-v1",
+  "label": "7-replica leaf-crash development smoke",
+  "replica_ids": [0, 1, 2, 3, 4, 5, 6],
+  "f": 2,
+  "tree": "fan:2 pipe:2 0 1 2 3 4 5 6",
+  "observer": 0,
+  "crash_targets": [4, 6],
+  "bucket_width_s": 5,
+  "baseline_bucket_count": 3,
+  "grace_bucket_count": 1,
+  "post_bucket_count": 3,
+  "minimum_recovery_ratio": 0.8,
+  "max_stall_s": 10,
+  "minimum_common_baseline_commits": 3,
+  "minimum_common_post_crash_commits": 3,
+  "aggregation_timeout_s": 0.5,
+  "leader_progress_timeout_s": 5.0,
+  "leader_activation_grace_s": 1.0,
+  "adaptive_activation_height": 1000000,
+  "block_size": 1,
+  "seed": 20260718
+}
