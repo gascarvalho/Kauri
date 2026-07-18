@@ -109,6 +109,13 @@ add_kauri_catch_test(
     test_configuration
     test_configuration.cpp)
 add_kauri_catch_test(
+    test_epoch_change
+    test_epoch_change.cpp)
+set_tests_properties(
+    test_epoch_change PROPERTIES
+    LABELS "unit;adaptive;epoch-change;c07"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_evidence
     test_evidence.cpp)
 set_tests_properties(

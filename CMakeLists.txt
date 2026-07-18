@@ -181,6 +181,7 @@ add_library(hotstuff
     src/crypto.cpp
     src/entity.cpp
     src/epoch_activation.cpp
+    src/epoch_change.cpp
     src/epoch_live_binding.cpp
     src/epoch_runtime.cpp
     src/epoch_runtime_wiring.cpp

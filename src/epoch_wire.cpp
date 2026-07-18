@@ -221,13 +221,20 @@ bool mode_supports_kind(
     EpochWireKind kind) noexcept
 {
     if (mode == EpochProtocolMode::adaptive_v1)
-        return true;
+    {
+        return kind == EpochWireKind::stage_epoch_definition ||
+               kind == EpochWireKind::stage_ack ||
+               kind == EpochWireKind::arm_activation ||
+               kind == EpochWireKind::activation_status;
+    }
     if (mode == EpochProtocolMode::adaptive_v2)
     {
         // Adaptive-v2 activation is consensus ordered. The v1 Arm and its
         // recovery status are deliberately unavailable in this mode.
         return kind == EpochWireKind::stage_epoch_definition ||
-               kind == EpochWireKind::stage_ack;
+               kind == EpochWireKind::stage_ack ||
+               kind == EpochWireKind::definition_request ||
+               kind == EpochWireKind::definition_reply;
     }
     return false;
 }
@@ -411,6 +418,33 @@ EpochDefinitionInput normalized_definition(
     }
     definition.epoch_digest = value.activation.successor_epoch_digest;
     return definition;
+}
+
+EpochDefinitionInput normalized_definition_reply(
+    const EpochDefinitionReply &value,
+    const EpochWireLimits &limits)
+{
+    if (value.protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        value.definition.schema_version != kEpochDefinitionSchemaVersionV2 ||
+        value.definition.activation_height != 0)
+    {
+        throw std::invalid_argument(
+            "definition availability requires schedule-free adaptive-v2 bytes");
+    }
+
+    EpochActivationIdentity identity;
+    identity.predecessor_epoch_digest =
+        value.definition.previous_epoch_digest;
+    identity.successor_epoch_number = value.definition.epoch_number;
+    identity.successor_epoch_digest = value.successor_epoch_digest;
+    identity.activation_height = 0;
+    return normalized_definition(
+        StageEpochDefinition{
+            value.wire_schema_version,
+            value.protocol_mode,
+            std::move(identity),
+            value.definition},
+        limits);
 }
 
 void append_definition(
@@ -702,6 +736,47 @@ bytearray_t encode_epoch_wire(
     return std::move(writer).finish();
 }
 
+bytearray_t encode_epoch_wire(
+    const EpochDefinitionRequest &value,
+    const EpochWireLimits &limits)
+{
+    require_encode_limits(limits);
+    require_encode_header_contract(
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::definition_request);
+    Writer writer(limits.maximum_payload_bytes);
+    append_header(
+        writer,
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::definition_request);
+    writer.digest(value.successor_epoch_digest);
+    return std::move(writer).finish();
+}
+
+bytearray_t encode_epoch_wire(
+    const EpochDefinitionReply &value,
+    const EpochWireLimits &limits)
+{
+    require_encode_limits(limits);
+    require_encode_header_contract(
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::definition_reply);
+    auto definition = normalized_definition_reply(value, limits);
+    Writer writer(limits.maximum_payload_bytes);
+    append_header(
+        writer,
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::definition_reply);
+    writer.digest(value.successor_epoch_digest);
+    append_definition(
+        writer, definition, value.protocol_mode, limits);
+    return std::move(writer).finish();
+}
+
 EpochWireDecodeResult<StageEpochDefinition> decode_stage_epoch_definition(
     const bytearray_t &payload,
     EpochProtocolMode expected_mode,
@@ -797,6 +872,56 @@ EpochWireDecodeResult<ActivationStatus> decode_activation_status(
         });
 }
 
+EpochWireDecodeResult<EpochDefinitionRequest> decode_epoch_definition_request(
+    const bytearray_t &payload,
+    EpochProtocolMode expected_mode,
+    const EpochWireLimits &limits) noexcept
+{
+    return decode<EpochDefinitionRequest>(
+        payload, limits,
+        [&](Reader &reader) {
+            read_header(
+                reader,
+                expected_mode,
+                EpochWireKind::definition_request);
+            return EpochDefinitionRequest{
+                *wire_schema_for_mode(expected_mode),
+                expected_mode,
+                reader.digest()};
+        });
+}
+
+EpochWireDecodeResult<EpochDefinitionReply> decode_epoch_definition_reply(
+    const bytearray_t &payload,
+    EpochProtocolMode expected_mode,
+    const EpochWireLimits &limits) noexcept
+{
+    return decode<EpochDefinitionReply>(
+        payload, limits,
+        [&](Reader &reader) {
+            read_header(
+                reader,
+                expected_mode,
+                EpochWireKind::definition_reply);
+            const auto digest = reader.digest();
+            auto definition = read_definition(
+                reader, expected_mode, 0, limits);
+            definition.epoch_digest = digest;
+            auto normalized = normalized_definition_reply(
+                EpochDefinitionReply{
+                    *wire_schema_for_mode(expected_mode),
+                    expected_mode,
+                    digest,
+                    std::move(definition)},
+                limits);
+            return EpochDefinitionReply{
+                *wire_schema_for_mode(expected_mode),
+                expected_mode,
+                digest,
+                std::move(normalized)};
+        });
+}
+
 std::optional<EpochWireKind> adaptive_epoch_wire_kind(
     opcode_t opcode) noexcept
 {
@@ -810,6 +935,10 @@ std::optional<EpochWireKind> adaptive_epoch_wire_kind(
         return EpochWireKind::arm_activation;
     case MsgActivationStatus::opcode:
         return EpochWireKind::activation_status;
+    case MsgEpochDefinitionRequest::opcode:
+        return EpochWireKind::definition_request;
+    case MsgEpochDefinitionReply::opcode:
+        return EpochWireKind::definition_reply;
     default:
         // In particular, legacy 0x10/0x11 and reserved 0x12 stay outside the
         // adaptive namespace.
@@ -821,6 +950,8 @@ const opcode_t MsgStageEpochDefinition::opcode;
 const opcode_t MsgStageAck::opcode;
 const opcode_t MsgArmActivation::opcode;
 const opcode_t MsgActivationStatus::opcode;
+const opcode_t MsgEpochDefinitionRequest::opcode;
+const opcode_t MsgEpochDefinitionReply::opcode;
 
 MsgStageEpochDefinition::MsgStageEpochDefinition(
     const StageEpochDefinition &value,
@@ -867,6 +998,32 @@ MsgActivationStatus::MsgActivationStatus(
 }
 
 MsgActivationStatus::MsgActivationStatus(DataStream &&serialized_payload)
+    : serialized(std::move(serialized_payload))
+{
+}
+
+MsgEpochDefinitionRequest::MsgEpochDefinitionRequest(
+    const EpochDefinitionRequest &value,
+    const EpochWireLimits &limits)
+    : serialized(encode_epoch_wire(value, limits))
+{
+}
+
+MsgEpochDefinitionRequest::MsgEpochDefinitionRequest(
+    DataStream &&serialized_payload)
+    : serialized(std::move(serialized_payload))
+{
+}
+
+MsgEpochDefinitionReply::MsgEpochDefinitionReply(
+    const EpochDefinitionReply &value,
+    const EpochWireLimits &limits)
+    : serialized(encode_epoch_wire(value, limits))
+{
+}
+
+MsgEpochDefinitionReply::MsgEpochDefinitionReply(
+    DataStream &&serialized_payload)
     : serialized(std::move(serialized_payload))
 {
 }

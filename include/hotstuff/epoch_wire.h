@@ -38,6 +38,8 @@ enum class EpochWireKind : std::uint8_t
     stage_ack = 2,
     arm_activation = 3,
     activation_status = 4,
+    definition_request = 5,
+    definition_reply = 6,
 };
 
 enum class EpochWireError : std::uint8_t
@@ -118,6 +120,21 @@ struct ActivationStatus
     ActivationRecoveryNeed recovery_need{ActivationRecoveryNeed::none};
 };
 
+struct EpochDefinitionRequest
+{
+    std::uint32_t wire_schema_version{kEpochWireSchemaVersionV2};
+    EpochProtocolMode protocol_mode{EpochProtocolMode::adaptive_v2};
+    uint256_t successor_epoch_digest;
+};
+
+struct EpochDefinitionReply
+{
+    std::uint32_t wire_schema_version{kEpochWireSchemaVersionV2};
+    EpochProtocolMode protocol_mode{EpochProtocolMode::adaptive_v2};
+    uint256_t successor_epoch_digest;
+    EpochDefinitionInput definition;
+};
+
 template <typename Value>
 struct EpochWireDecodeResult
 {
@@ -142,6 +159,12 @@ bytearray_t encode_epoch_wire(
 bytearray_t encode_epoch_wire(
     const ActivationStatus &value,
     const EpochWireLimits &limits);
+bytearray_t encode_epoch_wire(
+    const EpochDefinitionRequest &value,
+    const EpochWireLimits &limits);
+bytearray_t encode_epoch_wire(
+    const EpochDefinitionReply &value,
+    const EpochWireLimits &limits);
 
 EpochWireDecodeResult<StageEpochDefinition> decode_stage_epoch_definition(
     const bytearray_t &payload,
@@ -156,6 +179,14 @@ EpochWireDecodeResult<ArmActivation> decode_arm_activation(
     EpochProtocolMode expected_mode,
     const EpochWireLimits &limits) noexcept;
 EpochWireDecodeResult<ActivationStatus> decode_activation_status(
+    const bytearray_t &payload,
+    EpochProtocolMode expected_mode,
+    const EpochWireLimits &limits) noexcept;
+EpochWireDecodeResult<EpochDefinitionRequest> decode_epoch_definition_request(
+    const bytearray_t &payload,
+    EpochProtocolMode expected_mode,
+    const EpochWireLimits &limits) noexcept;
+EpochWireDecodeResult<EpochDefinitionReply> decode_epoch_definition_reply(
     const bytearray_t &payload,
     EpochProtocolMode expected_mode,
     const EpochWireLimits &limits) noexcept;
@@ -203,6 +234,28 @@ struct MsgActivationStatus
         const ActivationStatus &value,
         const EpochWireLimits &limits);
     explicit MsgActivationStatus(DataStream &&serialized_payload);
+};
+
+struct MsgEpochDefinitionRequest
+{
+    static const opcode_t opcode = 0x17;
+    DataStream serialized;
+
+    MsgEpochDefinitionRequest(
+        const EpochDefinitionRequest &value,
+        const EpochWireLimits &limits);
+    explicit MsgEpochDefinitionRequest(DataStream &&serialized_payload);
+};
+
+struct MsgEpochDefinitionReply
+{
+    static const opcode_t opcode = 0x18;
+    DataStream serialized;
+
+    MsgEpochDefinitionReply(
+        const EpochDefinitionReply &value,
+        const EpochWireLimits &limits);
+    explicit MsgEpochDefinitionReply(DataStream &&serialized_payload);
 };
 
 } // namespace hotstuff

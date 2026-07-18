@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -162,6 +163,32 @@ void validate_wait_exempt_leaves(
     }
 }
 
+bool has_canonical_v2_availability_order(
+    const EpochDefinitionInput &input) noexcept
+{
+    std::optional<std::uint32_t> previous_tree_id;
+    for (const auto &tree : input.trees)
+    {
+        if (previous_tree_id && tree.tree_id <= *previous_tree_id)
+        {
+            return false;
+        }
+        previous_tree_id = tree.tree_id;
+
+        if (!std::is_sorted(
+                tree.wait_exempt_leaves.begin(),
+                tree.wait_exempt_leaves.end()) ||
+            std::adjacent_find(
+                tree.wait_exempt_leaves.begin(),
+                tree.wait_exempt_leaves.end()) !=
+                tree.wait_exempt_leaves.end())
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 EpochStore::EpochStore(std::vector<ReplicaID> membership)
@@ -182,6 +209,10 @@ const EpochDefinition &EpochStore::stage(
     {
         reject("unsupported schema version " +
                std::to_string(input.schema_version));
+    }
+    if (schema_v2 && input.activation_height != 0)
+    {
+        reject("adaptive-v2 definition cannot contain an activation height");
     }
     const auto byzantine = schema_v2
         ? derive_byzantine_quorum(membership_.size())
@@ -245,16 +276,19 @@ const EpochDefinition &EpochStore::stage(
     {
         reject("membership digest mismatch");
     }
-    if (context.minimum_activation_grace >
-        std::numeric_limits<std::uint64_t>::max() - context.current_height)
+    if (schema_v1)
     {
-        reject("activation grace overflows height range");
-    }
-    const auto minimum_activation_height =
-        context.current_height + context.minimum_activation_grace;
-    if (input.activation_height < minimum_activation_height)
-    {
-        reject("activation height does not provide minimum staging grace");
+        if (context.minimum_activation_grace >
+            std::numeric_limits<std::uint64_t>::max() - context.current_height)
+        {
+            reject("activation grace overflows height range");
+        }
+        const auto minimum_activation_height =
+            context.current_height + context.minimum_activation_grace;
+        if (input.activation_height < minimum_activation_height)
+        {
+            reject("activation height does not provide minimum staging grace");
+        }
     }
     if (input.trees.empty())
     {
@@ -326,12 +360,28 @@ const EpochDefinition &EpochStore::stage(
             std::move(canonical_serialization),
             computed_digest));
     const auto epoch_number = definition->epoch_number();
-    const auto insertion = epochs_.emplace(epoch_number, std::move(definition));
-    if (!insertion.second)
+    const auto *const definition_pointer = definition.get();
+    const auto digest_insertion = epochs_by_digest_.emplace(
+        computed_digest, definition_pointer);
+    if (!digest_insertion.second)
     {
-        reject("duplicate epoch " + std::to_string(epoch_number));
+        reject("duplicate epoch digest");
     }
-    return *insertion.first->second;
+    try
+    {
+        const auto insertion = epochs_.emplace(
+            epoch_number, std::move(definition));
+        if (!insertion.second)
+        {
+            reject("duplicate epoch " + std::to_string(epoch_number));
+        }
+        return *insertion.first->second;
+    }
+    catch (...)
+    {
+        epochs_by_digest_.erase(digest_insertion.first);
+        throw;
+    }
 }
 
 const EpochDefinition *EpochStore::find_epoch(
@@ -339,6 +389,87 @@ const EpochDefinition *EpochStore::find_epoch(
 {
     const auto epoch = epochs_.find(epoch_number);
     return epoch == epochs_.end() ? nullptr : epoch->second.get();
+}
+
+const EpochDefinition *EpochStore::find_epoch_by_digest(
+    const uint256_t &epoch_digest) const noexcept
+{
+    const auto epoch = epochs_by_digest_.find(epoch_digest);
+    return epoch == epochs_by_digest_.end() ? nullptr : epoch->second;
+}
+
+DefinitionAvailabilityResult EpochStore::stage_available_v2(
+    const EpochDefinitionInput &input,
+    const EpochDefinition &active_epoch)
+{
+    const auto *const owned_active = find_epoch(active_epoch.epoch_number());
+    if (owned_active != &active_epoch)
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
+    if (input.schema_version != kEpochDefinitionSchemaVersionV2 ||
+        input.activation_height != 0 ||
+        !has_canonical_v2_availability_order(input))
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
+
+    bytearray_t canonical_input;
+    try
+    {
+        canonical_input = canonical_serialize_epoch(input);
+    }
+    catch (const std::invalid_argument &)
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
+    catch (const std::length_error &)
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
+    const auto input_digest = DataStream(canonical_input).get_hash();
+    if (input.epoch_digest && *input.epoch_digest != input_digest)
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
+    if (const auto *const existing = find_epoch_by_digest(input_digest))
+    {
+        // A hash match alone is not an exact duplicate. Comparing the complete
+        // canonical definition prevents a collision or a noncanonical replay
+        // from bypassing the structural validation already applied to the
+        // stored object.
+        if (existing->canonical_serialization() != canonical_input)
+        {
+            return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+        }
+        return {DefinitionAvailabilityDisposition::duplicate, existing};
+    }
+    if (input.epoch_number <= active_epoch.epoch_number())
+    {
+        return {DefinitionAvailabilityDisposition::stale, nullptr};
+    }
+    if (active_epoch.epoch_number() ==
+            std::numeric_limits<std::uint32_t>::max() ||
+        input.epoch_number != active_epoch.epoch_number() + 1 ||
+        input.previous_epoch_digest != active_epoch.epoch_digest() ||
+        find_epoch(input.epoch_number) != nullptr)
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
+
+    try
+    {
+        const auto &staged = stage(input, EpochValidationContext{});
+        return {DefinitionAvailabilityDisposition::staged, &staged};
+    }
+    catch (const std::invalid_argument &)
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
+    catch (const std::length_error &)
+    {
+        return {DefinitionAvailabilityDisposition::conflicting, nullptr};
+    }
 }
 
 const EpochTreeDefinition *EpochStore::find_tree(

@@ -23,6 +23,21 @@ struct EpochValidationContext
     std::vector<ReplicaID> ineligible_members;
 };
 
+enum class DefinitionAvailabilityDisposition : std::uint8_t
+{
+    staged = 0,
+    duplicate,
+    stale,
+    conflicting,
+};
+
+struct DefinitionAvailabilityResult
+{
+    DefinitionAvailabilityDisposition disposition{
+        DefinitionAvailabilityDisposition::conflicting};
+    const EpochDefinition *definition{nullptr};
+};
+
 class EpochStore final
 {
 public:
@@ -34,6 +49,13 @@ public:
 
     const EpochDefinition *find_epoch(std::uint32_t epoch_number) const noexcept;
 
+    const EpochDefinition *find_epoch_by_digest(
+        const uint256_t &epoch_digest) const noexcept;
+
+    DefinitionAvailabilityResult stage_available_v2(
+        const EpochDefinitionInput &input,
+        const EpochDefinition &active_epoch);
+
     const EpochTreeDefinition *find_tree(
         std::uint32_t epoch_number,
         std::uint32_t tree_id) const noexcept;
@@ -44,6 +66,7 @@ private:
     const std::vector<ReplicaID> membership_;
     const uint256_t membership_digest_;
     std::map<std::uint32_t, std::unique_ptr<const EpochDefinition>> epochs_;
+    std::map<uint256_t, const EpochDefinition *> epochs_by_digest_;
 };
 
 } // namespace hotstuff
