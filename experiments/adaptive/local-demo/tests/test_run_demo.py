@@ -46,6 +46,22 @@ def passing_logs() -> dict[int, str]:
     return logs
 
 
+def reputation_marker(
+    *,
+    reporter: int = 0,
+    target: int = 1,
+    outcome: str = "response",
+    delta: int = 1,
+    score: int = 1,
+) -> str:
+    return (
+        "2026-07-17 10:00:00 [hotstuff info] "
+        "KAURI_REPUTATION update "
+        f"reporter={reporter} target={target} outcome={outcome} "
+        f"delta={delta} score={score}"
+    )
+
+
 class FakeProcess:
     def __init__(self) -> None:
         self.return_code: int | None = None
@@ -102,6 +118,137 @@ class MarkerTests(unittest.TestCase):
             with self.subTest(line=line):
                 with self.assertRaises(demo.DemoError):
                     demo.parse_marker(line)
+
+
+class ReputationMarkerTests(unittest.TestCase):
+    def test_parser_retains_complete_manager_update(self) -> None:
+        parsed = demo.parse_reputation_marker(reputation_marker(), 11)
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.event, "update")
+        self.assertEqual(parsed.line_number, 11)
+        self.assertEqual(
+            parsed.fields,
+            {
+                "reporter": "0",
+                "target": "1",
+                "outcome": "response",
+                "delta": "1",
+                "score": "1",
+            },
+        )
+
+    def test_parser_rejects_incomplete_manager_update(self) -> None:
+        incomplete = reputation_marker().replace(" score=1", "")
+
+        with self.assertRaises(demo.DemoError):
+            demo.parse_reputation_marker(incomplete)
+
+
+class ReputationVerdictTests(unittest.TestCase):
+    def test_manager_verdict_requires_complete_reputation_marker(self) -> None:
+        verdict = demo.evaluate_reputation_log(reputation_marker())
+
+        self.assertTrue(verdict.passed)
+        self.assertEqual(verdict.reasons, ())
+        self.assertEqual(
+            verdict.evidence["updates"],
+            [
+                {
+                    "reporter": 0,
+                    "target": 1,
+                    "outcome": "response",
+                    "delta": 1,
+                    "score": 1,
+                }
+            ],
+        )
+
+    def test_manager_verdict_rejects_missing_reputation_marker(self) -> None:
+        verdict = demo.evaluate_reputation_log(
+            "2026-07-17 10:00:00 manager ready"
+        )
+
+        self.assertFalse(verdict.passed)
+        self.assertIn(
+            "manager: missing KAURI_REPUTATION update",
+            verdict.reasons,
+        )
+
+    def test_manager_verdict_rejects_inconsistent_score_progression(self) -> None:
+        manager_log = "\n".join(
+            [
+                reputation_marker(score=1),
+                reputation_marker(score=3),
+            ]
+        )
+
+        verdict = demo.evaluate_reputation_log(manager_log)
+
+        self.assertFalse(verdict.passed)
+        self.assertIn(
+            "manager: target 1 score jumped from 1 to 3 on line 2",
+            verdict.reasons,
+        )
+
+    def test_manager_verdict_rejects_unknown_members(self) -> None:
+        verdict = demo.evaluate_reputation_log(
+            reputation_marker(reporter=0, target=99)
+        )
+
+        self.assertFalse(verdict.passed)
+        self.assertIn(
+            "manager: reporter-target pair is outside demo membership on line 1",
+            verdict.reasons,
+        )
+
+    def test_manager_verdict_preserves_late_correction_sequence(self) -> None:
+        manager_log = "\n".join(
+            [
+                reputation_marker(
+                    outcome="timeout", delta=-1, score=-1
+                ),
+                reputation_marker(
+                    outcome="response", delta=1, score=0
+                ),
+            ]
+        )
+
+        verdict = demo.evaluate_reputation_log(manager_log)
+
+        self.assertTrue(verdict.passed)
+        self.assertEqual(
+            [update["score"] for update in verdict.evidence["updates"]],
+            [-1, 0],
+        )
+        self.assertEqual(
+            {
+                (update["reporter"], update["target"])
+                for update in verdict.evidence["updates"]
+            },
+            {(0, 1)},
+        )
+
+    def test_combined_verdict_retains_narrow_claim_boundary(self) -> None:
+        verdict = demo.combine_live_verdicts(
+            demo.evaluate_logs(passing_logs()),
+            demo.evaluate_reputation_log(reputation_marker()),
+        )
+
+        self.assertTrue(verdict.passed)
+        self.assertEqual(
+            verdict.evidence["claim_boundary"],
+            {
+                "environment": "trusted-local",
+                "protocol_mode": "adaptive_v1",
+                "evidence_scope": "transition-only",
+                "does_not_establish": [
+                    "crash-recovery",
+                    "adaptive-v2-activation",
+                ],
+            },
+        )
 
 
 class VerdictTests(unittest.TestCase):

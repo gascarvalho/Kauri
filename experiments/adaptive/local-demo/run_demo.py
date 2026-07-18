@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and validate the isolated four-replica adaptive epoch demo."""
+"""Run the four-replica trusted-local adaptive-v1 transition-only demo."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import uuid
 
 REPLICA_IDS = tuple(range(4))
 MARKER_TOKEN = "KAURI_DEMO"
+REPUTATION_MARKER_TOKEN = "KAURI_REPUTATION"
 MANAGER_PORT = 50500
 FORBIDDEN_COMMAND_TOKENS = frozenset(
     {"killall", "pkill", "sudo", "ssh"}
@@ -188,6 +189,137 @@ def parse_log(text: str) -> list[Marker]:
         if marker is not None:
             markers.append(marker)
     return markers
+
+
+def parse_reputation_marker(
+    line: str, line_number: int = 0
+) -> Marker | None:
+    """Parse one complete manager-side reputation update."""
+    offset = line.find(REPUTATION_MARKER_TOKEN)
+    if offset < 0:
+        return None
+    payload = line[offset + len(REPUTATION_MARKER_TOKEN) :].strip()
+    try:
+        tokens = shlex.split(payload)
+    except ValueError as exc:
+        raise DemoError(
+            f"invalid reputation marker quoting on line {line_number}: {exc}"
+        ) from exc
+    if not tokens or "=" in tokens[0]:
+        raise DemoError(
+            f"reputation marker on line {line_number} has no event"
+        )
+    event = tokens.pop(0)
+    fields: dict[str, str] = {}
+    for token in tokens:
+        if "=" not in token:
+            raise DemoError(
+                f"invalid reputation marker token on line {line_number}: "
+                f"{token!r}"
+            )
+        key, value = token.split("=", 1)
+        if not key or not value or key in fields:
+            raise DemoError(
+                f"invalid reputation marker field on line {line_number}: "
+                f"{token!r}"
+            )
+        fields[key] = value
+    required = {"reporter", "target", "outcome", "delta", "score"}
+    if event != "update" or set(fields) != required:
+        raise DemoError(
+            f"incomplete reputation update on line {line_number}"
+        )
+    return Marker(event, fields, line_number, line.rstrip("\n"))
+
+
+def evaluate_reputation_log(text: str) -> Verdict:
+    """Require a complete scalar update without inferring failure detection."""
+    reasons: list[str] = []
+    updates: list[dict[str, object]] = []
+    scores: dict[int, int] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        try:
+            marker = parse_reputation_marker(line, line_number)
+        except DemoError as exc:
+            reasons.append(f"manager: {exc}")
+            continue
+        if marker is None:
+            continue
+        try:
+            reporter = int(marker.fields["reporter"])
+            target = int(marker.fields["target"])
+            delta = int(marker.fields["delta"])
+            score = int(marker.fields["score"])
+        except ValueError:
+            reasons.append(
+                f"manager: non-integer reputation field on line {line_number}"
+            )
+            continue
+        outcome = marker.fields["outcome"]
+        expected_delta = {"response": 1, "timeout": -1}.get(outcome)
+        if reporter < 0 or target < 0 or reporter == target:
+            reasons.append(
+                f"manager: invalid reporter-target pair on line {line_number}"
+            )
+            continue
+        if reporter not in REPLICA_IDS or target not in REPLICA_IDS:
+            reasons.append(
+                "manager: reporter-target pair is outside demo membership "
+                f"on line {line_number}"
+            )
+            continue
+        if expected_delta is None or delta != expected_delta:
+            reasons.append(
+                f"manager: invalid reputation outcome/delta on line {line_number}"
+            )
+            continue
+        previous_score = scores.get(target, 0)
+        if score != previous_score + delta:
+            reasons.append(
+                f"manager: target {target} score jumped from "
+                f"{previous_score} to {score} on line {line_number}"
+            )
+            continue
+        scores[target] = score
+        updates.append(
+            {
+                "reporter": reporter,
+                "target": target,
+                "outcome": outcome,
+                "delta": delta,
+                "score": score,
+            }
+        )
+    if not updates:
+        reasons.append("manager: missing KAURI_REPUTATION update")
+    return Verdict(not reasons, tuple(reasons), {"updates": updates})
+
+
+def claim_boundary_evidence() -> dict[str, object]:
+    """Describe the deliberately narrow evidence boundary of this demo."""
+    return {
+        "environment": "trusted-local",
+        "protocol_mode": "adaptive_v1",
+        "evidence_scope": "transition-only",
+        "does_not_establish": [
+            "crash-recovery",
+            "adaptive-v2-activation",
+        ],
+    }
+
+
+def combine_live_verdicts(
+    replica_verdict: Verdict, reputation_verdict: Verdict
+) -> Verdict:
+    return Verdict(
+        replica_verdict.passed and reputation_verdict.passed,
+        replica_verdict.reasons + reputation_verdict.reasons,
+        {
+            **replica_verdict.evidence,
+            "reputation": reputation_verdict.evidence,
+            "claim_boundary": claim_boundary_evidence(),
+        },
+    )
 
 
 def _int_field(marker: Marker, key: str) -> int | None:
@@ -764,11 +896,21 @@ def _read_replica_logs(run_directory: Path) -> dict[int, str]:
     }
 
 
+def _read_manager_log(run_directory: Path) -> str:
+    path = run_directory / "manager.log"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     local_directory = Path(__file__).resolve().parent
     repository = local_directory.parents[2]
     parser = argparse.ArgumentParser(
-        description="Run the isolated four-replica adaptive epoch demo"
+        description=(
+            "Run the four-replica trusted-local adaptive-v1 "
+            "transition-only demo"
+        )
     )
     parser.add_argument("--repository", type=Path, default=repository)
     parser.add_argument(
@@ -842,6 +984,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             },
         },
         "ports": list(ports),
+        "claim_boundary": claim_boundary_evidence(),
         "processes": [],
         "exit_observations": [],
     }
@@ -933,18 +1076,28 @@ def run(argv: Sequence[str] | None = None) -> int:
                 )
                 break
             logs = _read_replica_logs(run_directory)
-            verdict = evaluate_logs(logs)
+            replica_verdict = evaluate_logs(logs)
+            reputation_verdict = evaluate_reputation_log(
+                _read_manager_log(run_directory)
+            )
+            verdict = combine_live_verdicts(
+                replica_verdict, reputation_verdict
+            )
             if verdict.passed or any("fatal" in reason for reason in verdict.reasons):
                 break
             time.sleep(0.2)
         else:
-            verdict = evaluate_logs(_read_replica_logs(run_directory))
+            verdict = combine_live_verdicts(
+                evaluate_logs(_read_replica_logs(run_directory)),
+                evaluate_reputation_log(_read_manager_log(run_directory)),
+            )
             if verdict.passed:
                 pass
             else:
                 verdict = Verdict(
                     False,
-                    verdict.reasons + ("timed out waiting for adaptive proof",),
+                    verdict.reasons
+                    + ("timed out waiting for transition-only evidence",),
                     verdict.evidence,
                 )
     except (DemoError, OSError, subprocess.SubprocessError) as exc:
