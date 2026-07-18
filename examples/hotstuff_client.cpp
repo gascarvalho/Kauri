@@ -47,6 +47,7 @@ using salticidae::Config;
 using hotstuff::CollectedReport;
 using hotstuff::command_t;
 using hotstuff::Epoch;
+using hotstuff::EpochProtocolMode;
 using hotstuff::EpochReputation;
 using hotstuff::EventContext;
 using hotstuff::HotStuffError;
@@ -787,6 +788,8 @@ int main(int argc, char **argv)
     auto opt_cid = Config::OptValInt::create(-1);
     auto opt_default_epoch = Config::OptValStr::create("treegen.conf");
     auto opt_mock_timeouts = Config::OptValStr::create("timeouts4.conf");
+    auto opt_epoch_protocol_mode =
+        Config::OptValStr::create("legacy_static");
 
     auto shutdown = [&](int)
     { ec.stop(); };
@@ -809,8 +812,24 @@ int main(int argc, char **argv)
     config.add_opt("mock", opt_mock_mode, Config::SET_VAL);
     config.add_opt("default_epoch", opt_default_epoch, Config::SET_VAL);
     config.add_opt("timeouts", opt_mock_timeouts, Config::SET_VAL);
+    config.add_opt(
+        "epoch-protocol-mode",
+        opt_epoch_protocol_mode,
+        Config::SET_VAL,
+        -1,
+        "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2)");
 
     config.parse(argc, argv);
+
+    EpochProtocolMode epoch_protocol_mode;
+    if (opt_epoch_protocol_mode->get() == "legacy_static")
+        epoch_protocol_mode = EpochProtocolMode::legacy_static;
+    else if (opt_epoch_protocol_mode->get() == "adaptive_v1")
+        epoch_protocol_mode = EpochProtocolMode::adaptive_v1;
+    else if (opt_epoch_protocol_mode->get() == "adaptive_v2")
+        epoch_protocol_mode = EpochProtocolMode::adaptive_v2;
+    else
+        throw HotStuffError("invalid epoch protocol mode");
 
     mock_mode = opt_mock_mode->get();
 
@@ -855,8 +874,25 @@ int main(int argc, char **argv)
     }
 
     HOTSTUFF_LOG_INFO("client sees replica num = %zu", replicas.size());
-    f = (replicas.size() - 1) / 3;
-    HOTSTUFF_LOG_INFO("nfaulty = %zu", f);
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+    {
+        const auto byzantine =
+            hotstuff::derive_byzantine_quorum(replicas.size());
+        if (!byzantine.has_value())
+            throw HotStuffError(
+                "adaptive-v2 reputation server requires exact N = 3f + 1 membership");
+        f = byzantine->fault_threshold;
+        HOTSTUFF_LOG_INFO(
+            "nfaulty = %u, quorum = %u",
+            byzantine->fault_threshold,
+            byzantine->quorum);
+    }
+    else
+    {
+        f = (replicas.size() - 1) / 3;
+        HOTSTUFF_LOG_INFO("nfaulty = %u", f);
+    }
+
 
     // Initialize rep_score to 0 for every replica (ID in [0..replicas.size()-1])
     for (size_t i = 0; i < replicas.size(); i++)

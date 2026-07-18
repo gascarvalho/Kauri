@@ -17,7 +17,23 @@
 namespace hotstuff
 {
 
-constexpr std::uint32_t kEpochDefinitionSchemaVersion = 1;
+constexpr std::uint32_t kEpochDefinitionSchemaVersionV1 = 1;
+constexpr std::uint32_t kEpochDefinitionSchemaVersionV2 = 2;
+
+// Keep existing callers and legacy parsing on the byte-compatible v1
+// definition unless they explicitly opt into adaptive-v2.
+constexpr std::uint32_t kEpochDefinitionSchemaVersion =
+    kEpochDefinitionSchemaVersionV1;
+
+struct ByzantineQuorum final
+{
+    std::uint32_t replica_count{0};
+    std::uint32_t fault_threshold{0};
+    std::uint32_t quorum{0};
+};
+
+std::optional<ByzantineQuorum> derive_byzantine_quorum(
+    std::size_t replica_count) noexcept;
 
 struct ConfigurationId
 {
@@ -57,6 +73,9 @@ struct EpochTreeDefinition
     std::uint32_t fanout{0};
     std::uint32_t pipeline_stretch{0};
     std::vector<ReplicaID> members_breadth_first;
+    // Adaptive-v2 only. The stored representation is canonical increasing
+    // order; v1 definitions must leave this empty.
+    std::vector<ReplicaID> wait_exempt_leaves;
 };
 
 struct EpochDefinitionInput

@@ -17,7 +17,8 @@ namespace
 {
 
 constexpr char kMembershipDomain[] = "kauri-membership-v1";
-constexpr char kEpochDomain[] = "kauri-epoch-definition-v1";
+constexpr char kEpochDomainV1[] = "kauri-epoch-definition-v1";
+constexpr char kEpochDomainV2[] = "kauri-epoch-definition-v2";
 
 template <typename UInt>
 void append_big_endian(bytearray_t &output, UInt value)
@@ -135,6 +136,22 @@ void hash_combine(std::size_t &seed, std::size_t value) noexcept
 
 } // namespace
 
+std::optional<ByzantineQuorum> derive_byzantine_quorum(
+    std::size_t replica_count) noexcept
+{
+    if (replica_count == 0 ||
+        replica_count > std::numeric_limits<std::uint32_t>::max() ||
+        (replica_count - 1) % 3 != 0)
+        return std::nullopt;
+
+    const auto replicas = static_cast<std::uint32_t>(replica_count);
+    const auto faults = static_cast<std::uint32_t>((replica_count - 1) / 3);
+    return ByzantineQuorum{
+        replicas,
+        faults,
+        static_cast<std::uint32_t>(faults * 2 + 1)};
+}
+
 bool ConfigurationId::operator==(const ConfigurationId &other) const noexcept
 {
     return epoch_number == other.epoch_number &&
@@ -217,13 +234,34 @@ bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input)
         throw std::length_error("epoch tree count exceeds uint32 length");
     }
 
+    const bool schema_v1 =
+        input.schema_version == kEpochDefinitionSchemaVersionV1;
+    const bool schema_v2 =
+        input.schema_version == kEpochDefinitionSchemaVersionV2;
+    if (!schema_v1 && !schema_v2)
+    {
+        throw std::invalid_argument(
+            "unsupported epoch definition schema " +
+            std::to_string(input.schema_version));
+    }
+
     bytearray_t bytes;
-    append_domain(bytes, kEpochDomain, sizeof(kEpochDomain) - 1);
+    if (schema_v1)
+        append_domain(
+            bytes, kEpochDomainV1, sizeof(kEpochDomainV1) - 1);
+    else
+        append_domain(
+            bytes, kEpochDomainV2, sizeof(kEpochDomainV2) - 1);
     append_big_endian(bytes, input.schema_version);
     append_big_endian(bytes, input.epoch_number);
     append_digest(bytes, input.previous_epoch_digest);
     append_digest(bytes, input.membership_digest);
-    append_big_endian(bytes, input.activation_height);
+    if (schema_v1)
+    {
+        // Retain the historical v1 identity exactly. Adaptive-v2 separates
+        // immutable definition identity from its activation schedule.
+        append_big_endian(bytes, input.activation_height);
+    }
     append_big_endian(bytes, input.generation_seed);
     append_string(bytes, input.policy_version);
     append_string(bytes, input.evidence_snapshot_id);
@@ -238,6 +276,17 @@ bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input)
         {
             throw std::length_error("tree membership exceeds uint32 length");
         }
+        if (tree->wait_exempt_leaves.size() >
+            std::numeric_limits<std::uint32_t>::max())
+        {
+            throw std::length_error(
+                "tree wait-exempt set exceeds uint32 length");
+        }
+        if (schema_v1 && !tree->wait_exempt_leaves.empty())
+        {
+            throw std::invalid_argument(
+                "v1 epoch definition cannot contain wait-exempt leaves");
+        }
 
         append_big_endian(bytes, tree->tree_id);
         append_big_endian(bytes, tree->fanout);
@@ -250,6 +299,16 @@ bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input)
             // Breadth-first order is protocol state and is intentionally not
             // sorted while canonicalizing the surrounding tree collection.
             append_big_endian(bytes, member);
+        }
+        if (schema_v2)
+        {
+            auto wait_exempt = tree->wait_exempt_leaves;
+            std::sort(wait_exempt.begin(), wait_exempt.end());
+            append_big_endian(
+                bytes,
+                static_cast<std::uint32_t>(wait_exempt.size()));
+            for (const auto member : wait_exempt)
+                append_big_endian(bytes, member);
         }
     }
     return bytes;

@@ -28,7 +28,8 @@ bool valid_limits(const EpochWireLimits &limits) noexcept
     return limits.maximum_payload_bytes != 0 &&
            limits.maximum_trees != 0 &&
            limits.maximum_members_per_tree != 0 &&
-           limits.maximum_string_bytes != 0;
+           limits.maximum_string_bytes != 0 &&
+           limits.maximum_wait_exempt_leaves_per_tree != 0;
 }
 
 void require_encode_limits(const EpochWireLimits &limits)
@@ -185,29 +186,101 @@ void append_header(
     writer.integer(static_cast<std::uint8_t>(kind));
 }
 
+std::optional<std::uint32_t> wire_schema_for_mode(
+    EpochProtocolMode mode) noexcept
+{
+    switch (mode)
+    {
+    case EpochProtocolMode::adaptive_v1:
+        return kEpochWireSchemaVersionV1;
+    case EpochProtocolMode::adaptive_v2:
+        return kEpochWireSchemaVersionV2;
+    case EpochProtocolMode::legacy_static:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint32_t> definition_schema_for_mode(
+    EpochProtocolMode mode) noexcept
+{
+    switch (mode)
+    {
+    case EpochProtocolMode::adaptive_v1:
+        return kEpochDefinitionSchemaVersionV1;
+    case EpochProtocolMode::adaptive_v2:
+        return kEpochDefinitionSchemaVersionV2;
+    case EpochProtocolMode::legacy_static:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+bool mode_supports_kind(
+    EpochProtocolMode mode,
+    EpochWireKind kind) noexcept
+{
+    if (mode == EpochProtocolMode::adaptive_v1)
+        return true;
+    if (mode == EpochProtocolMode::adaptive_v2)
+    {
+        // Adaptive-v2 activation is consensus ordered. The v1 Arm and its
+        // recovery status are deliberately unavailable in this mode.
+        return kind == EpochWireKind::stage_epoch_definition ||
+               kind == EpochWireKind::stage_ack;
+    }
+    return false;
+}
+
+void require_encode_header_contract(
+    std::uint32_t schema,
+    EpochProtocolMode mode,
+    EpochWireKind kind)
+{
+    const auto expected_schema = wire_schema_for_mode(mode);
+    if (!expected_schema.has_value())
+    {
+        throw std::invalid_argument(
+            "epoch wire encoder requires an adaptive protocol mode");
+    }
+    if (schema != *expected_schema)
+    {
+        throw std::invalid_argument(
+            "epoch wire schema does not match protocol mode");
+    }
+    if (!mode_supports_kind(mode, kind))
+    {
+        throw std::invalid_argument(
+            "epoch wire kind is unsupported for protocol mode");
+    }
+}
+
 void read_header(
     Reader &reader,
     EpochProtocolMode expected_mode,
     EpochWireKind expected_kind)
 {
     const auto schema = reader.integer<std::uint32_t>();
-    if (schema != kEpochWireSchemaVersion)
-    {
-        fail(EpochWireError::unsupported_schema);
-    }
     const auto mode = static_cast<EpochProtocolMode>(
         reader.integer<std::uint8_t>());
-    if (expected_mode != EpochProtocolMode::adaptive_v1 ||
-        mode != EpochProtocolMode::adaptive_v1 ||
-        mode != expected_mode)
+    const auto expected_schema = wire_schema_for_mode(expected_mode);
+    if (!expected_schema.has_value() || mode != expected_mode)
     {
         fail(EpochWireError::mode_mismatch);
+    }
+    if (schema != *expected_schema)
+    {
+        fail(EpochWireError::unsupported_schema);
     }
     const auto kind = static_cast<EpochWireKind>(
         reader.integer<std::uint8_t>());
     if (kind != expected_kind)
     {
         fail(EpochWireError::unexpected_kind);
+    }
+    if (!mode_supports_kind(mode, kind))
+    {
+        fail(EpochWireError::unsupported_kind_for_mode);
     }
 }
 
@@ -235,9 +308,12 @@ EpochActivationIdentity read_identity(Reader &reader)
 
 bool identity_matches_definition(
     const EpochActivationIdentity &identity,
-    const EpochDefinitionInput &definition)
+    const EpochDefinitionInput &definition,
+    EpochProtocolMode mode)
 {
-    if (definition.schema_version != kEpochDefinitionSchemaVersion ||
+    const auto expected_schema = definition_schema_for_mode(mode);
+    if (!expected_schema.has_value() ||
+        definition.schema_version != *expected_schema ||
         definition.epoch_number != identity.successor_epoch_number ||
         definition.previous_epoch_digest !=
             identity.predecessor_epoch_digest ||
@@ -259,7 +335,8 @@ EpochDefinitionInput normalized_definition(
     const StageEpochDefinition &value,
     const EpochWireLimits &limits)
 {
-    if (!identity_matches_definition(value.activation, value.definition))
+    if (!identity_matches_definition(
+            value.activation, value.definition, value.protocol_mode))
     {
         throw std::invalid_argument(
             "epoch activation identity does not match definition");
@@ -292,7 +369,7 @@ EpochDefinitionInput normalized_definition(
         throw std::invalid_argument(
             "epoch wire definition contains duplicate tree IDs");
     }
-    for (const auto &tree : definition.trees)
+    for (auto &tree : definition.trees)
     {
         if (tree.members_breadth_first.size() >
             limits.maximum_members_per_tree)
@@ -308,6 +385,29 @@ EpochDefinitionInput normalized_definition(
             throw std::invalid_argument(
                 "epoch wire definition contains duplicate members");
         }
+        if (tree.wait_exempt_leaves.size() >
+            limits.maximum_wait_exempt_leaves_per_tree)
+        {
+            throw std::length_error(
+                "epoch wire wait-exempt count exceeds limit");
+        }
+        if (value.protocol_mode == EpochProtocolMode::adaptive_v1 &&
+            !tree.wait_exempt_leaves.empty())
+        {
+            throw std::invalid_argument(
+                "adaptive-v1 definition contains wait-exempt leaves");
+        }
+        std::sort(
+            tree.wait_exempt_leaves.begin(),
+            tree.wait_exempt_leaves.end());
+        if (std::adjacent_find(
+                tree.wait_exempt_leaves.begin(),
+                tree.wait_exempt_leaves.end()) !=
+            tree.wait_exempt_leaves.end())
+        {
+            throw std::invalid_argument(
+                "epoch wire definition contains duplicate wait-exempt replicas");
+        }
     }
     definition.epoch_digest = value.activation.successor_epoch_digest;
     return definition;
@@ -316,13 +416,15 @@ EpochDefinitionInput normalized_definition(
 void append_definition(
     Writer &writer,
     const EpochDefinitionInput &definition,
+    EpochProtocolMode mode,
     const EpochWireLimits &limits)
 {
     writer.integer(definition.schema_version);
     writer.integer(definition.epoch_number);
     writer.digest(definition.previous_epoch_digest);
     writer.digest(definition.membership_digest);
-    writer.integer(definition.activation_height);
+    if (mode != EpochProtocolMode::adaptive_v2)
+        writer.integer(definition.activation_height);
     writer.integer(definition.generation_seed);
     writer.string(definition.policy_version, limits.maximum_string_bytes);
     writer.string(
@@ -341,19 +443,37 @@ void append_definition(
         {
             writer.integer(member);
         }
+        if (mode == EpochProtocolMode::adaptive_v2)
+        {
+            writer.integer(static_cast<std::uint32_t>(
+                tree.wait_exempt_leaves.size()));
+            for (const auto member : tree.wait_exempt_leaves)
+                writer.integer(member);
+        }
     }
 }
 
 EpochDefinitionInput read_definition(
     Reader &reader,
+    EpochProtocolMode mode,
+    std::uint64_t activation_height,
     const EpochWireLimits &limits)
 {
     EpochDefinitionInput definition;
     definition.schema_version = reader.integer<std::uint32_t>();
+    const auto expected_schema = definition_schema_for_mode(mode);
+    if (!expected_schema.has_value() ||
+        definition.schema_version != *expected_schema)
+    {
+        fail(EpochWireError::unsupported_schema);
+    }
     definition.epoch_number = reader.integer<std::uint32_t>();
     definition.previous_epoch_digest = reader.digest();
     definition.membership_digest = reader.digest();
-    definition.activation_height = reader.integer<std::uint64_t>();
+    definition.activation_height =
+        mode == EpochProtocolMode::adaptive_v1
+            ? reader.integer<std::uint64_t>()
+            : activation_height;
     definition.generation_seed = reader.integer<std::uint64_t>();
     definition.policy_version = reader.string(limits.maximum_string_bytes);
     definition.evidence_snapshot_id =
@@ -404,6 +524,36 @@ EpochDefinitionInput read_definition(
         {
             tree.members_breadth_first.push_back(
                 reader.integer<ReplicaID>());
+        }
+        if (mode == EpochProtocolMode::adaptive_v2)
+        {
+            const auto wait_exempt_count = reader.integer<std::uint32_t>();
+            if (wait_exempt_count >
+                limits.maximum_wait_exempt_leaves_per_tree)
+            {
+                fail(EpochWireError::wait_exempt_count_exceeded);
+            }
+            if (wait_exempt_count > tree.members_breadth_first.size() ||
+                wait_exempt_count >
+                    reader.remaining() / sizeof(ReplicaID))
+            {
+                fail(EpochWireError::truncated);
+            }
+            tree.wait_exempt_leaves.reserve(wait_exempt_count);
+            std::optional<ReplicaID> previous_wait_exempt;
+            for (std::uint32_t wait_index = 0;
+                 wait_index < wait_exempt_count;
+                 ++wait_index)
+            {
+                const auto member = reader.integer<ReplicaID>();
+                if (previous_wait_exempt &&
+                    member <= *previous_wait_exempt)
+                {
+                    fail(EpochWireError::invalid_definition_digest);
+                }
+                previous_wait_exempt = member;
+                tree.wait_exempt_leaves.push_back(member);
+            }
         }
         definition.trees.push_back(std::move(tree));
     }
@@ -472,6 +622,10 @@ bytearray_t encode_epoch_wire(
     const EpochWireLimits &limits)
 {
     require_encode_limits(limits);
+    require_encode_header_contract(
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::stage_epoch_definition);
     auto definition = normalized_definition(value, limits);
     Writer writer(limits.maximum_payload_bytes);
     append_header(
@@ -480,7 +634,7 @@ bytearray_t encode_epoch_wire(
         value.protocol_mode,
         EpochWireKind::stage_epoch_definition);
     append_identity(writer, value.activation);
-    append_definition(writer, definition, limits);
+    append_definition(writer, definition, value.protocol_mode, limits);
     return std::move(writer).finish();
 }
 
@@ -489,6 +643,10 @@ bytearray_t encode_epoch_wire(
     const EpochWireLimits &limits)
 {
     require_encode_limits(limits);
+    require_encode_header_contract(
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::stage_ack);
     Writer writer(limits.maximum_payload_bytes);
     append_header(
         writer,
@@ -505,6 +663,10 @@ bytearray_t encode_epoch_wire(
     const EpochWireLimits &limits)
 {
     require_encode_limits(limits);
+    require_encode_header_contract(
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::arm_activation);
     Writer writer(limits.maximum_payload_bytes);
     append_header(
         writer,
@@ -520,6 +682,10 @@ bytearray_t encode_epoch_wire(
     const EpochWireLimits &limits)
 {
     require_encode_limits(limits);
+    require_encode_header_contract(
+        value.wire_schema_version,
+        value.protocol_mode,
+        EpochWireKind::activation_status);
     if (value.recovery_need > ActivationRecoveryNeed::exact_arm)
     {
         throw std::invalid_argument("invalid activation recovery need");
@@ -549,14 +715,19 @@ EpochWireDecodeResult<StageEpochDefinition> decode_stage_epoch_definition(
                 expected_mode,
                 EpochWireKind::stage_epoch_definition);
             auto activation = read_identity(reader);
-            auto definition = read_definition(reader, limits);
+            auto definition = read_definition(
+                reader,
+                expected_mode,
+                activation.activation_height,
+                limits);
             definition.epoch_digest = activation.successor_epoch_digest;
-            if (!identity_matches_definition(activation, definition))
+            if (!identity_matches_definition(
+                    activation, definition, expected_mode))
             {
                 fail(EpochWireError::invalid_definition_digest);
             }
             return StageEpochDefinition{
-                kEpochWireSchemaVersion,
+                *wire_schema_for_mode(expected_mode),
                 expected_mode,
                 std::move(activation),
                 std::move(definition)};
@@ -574,7 +745,7 @@ EpochWireDecodeResult<StageAck> decode_stage_ack(
             read_header(reader, expected_mode, EpochWireKind::stage_ack);
             const auto replica = reader.integer<ReplicaID>();
             return StageAck{
-                kEpochWireSchemaVersion,
+                *wire_schema_for_mode(expected_mode),
                 expected_mode,
                 replica,
                 read_identity(reader)};
@@ -591,7 +762,7 @@ EpochWireDecodeResult<ArmActivation> decode_arm_activation(
         [&](Reader &reader) {
             read_header(reader, expected_mode, EpochWireKind::arm_activation);
             return ArmActivation{
-                kEpochWireSchemaVersion,
+                *wire_schema_for_mode(expected_mode),
                 expected_mode,
                 read_identity(reader)};
         });
@@ -618,7 +789,7 @@ EpochWireDecodeResult<ActivationStatus> decode_activation_status(
                 fail(EpochWireError::invalid_definition_digest);
             }
             return ActivationStatus{
-                kEpochWireSchemaVersion,
+                *wire_schema_for_mode(expected_mode),
                 expected_mode,
                 replica,
                 std::move(activation),

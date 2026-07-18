@@ -316,6 +316,17 @@ TEST_CASE("canonical epoch serialization is deterministic and explicit",
           hotstuff::kEpochDefinitionSchemaVersion);
 }
 
+TEST_CASE("adaptive v2 derives the fixed N7 Byzantine quorum",
+          "[c01][configuration][adaptive-v2][quorum]")
+{
+    const auto quorum = hotstuff::derive_byzantine_quorum(7);
+    REQUIRE(quorum.has_value());
+    CHECK((hotstuff::kEpochDefinitionSchemaVersionV2 == 2 &&
+           quorum->replica_count == 7 &&
+           quorum->fault_threshold == 2 &&
+           quorum->quorum == 5));
+}
+
 TEST_CASE("every protocol-relevant epoch field is digest-bound",
           "[c04][configuration][digest]")
 {
@@ -418,7 +429,7 @@ TEST_CASE("store rejects invalid epoch sequencing without mutation",
     SECTION("unsupported schema version")
     {
         require_rejected_without_store_mutation(
-            store, epoch1, [](auto &input) { ++input.schema_version; });
+            store, epoch1, [](auto &input) { input.schema_version = 0; });
     }
 
     SECTION("activation height lacks staging grace")

@@ -114,6 +114,54 @@ void validate_eligibility(
     }
 }
 
+void validate_wait_exempt_leaves(
+    const EpochTreeDefinition &tree,
+    const std::set<ReplicaID> &membership,
+    std::uint32_t fault_threshold)
+{
+    if (tree.wait_exempt_leaves.size() > fault_threshold)
+    {
+        reject("tree " + std::to_string(tree.tree_id) +
+               " wait-exempt set exceeds Byzantine fault threshold");
+    }
+
+    if (std::adjacent_find(
+            tree.wait_exempt_leaves.begin(),
+            tree.wait_exempt_leaves.end()) !=
+        tree.wait_exempt_leaves.end())
+    {
+        reject("tree " + std::to_string(tree.tree_id) +
+               " contains duplicate wait-exempt replicas");
+    }
+
+    const auto internal_slots = internal_slot_count(
+        tree.members_breadth_first.size(), tree.fanout);
+    for (const auto member : tree.wait_exempt_leaves)
+    {
+        if (membership.count(member) == 0)
+        {
+            reject("tree " + std::to_string(tree.tree_id) +
+                   " contains unknown wait-exempt replica " +
+                   std::to_string(member));
+        }
+
+        const auto position = std::find(
+            tree.members_breadth_first.begin(),
+            tree.members_breadth_first.end(),
+            member);
+        if (position == tree.members_breadth_first.end() ||
+            static_cast<std::size_t>(std::distance(
+                tree.members_breadth_first.begin(), position)) <
+                internal_slots)
+        {
+            reject("tree " + std::to_string(tree.tree_id) +
+                   " places wait-exempt replica " +
+                   std::to_string(member) +
+                   " in a root or internal position");
+        }
+    }
+}
+
 } // namespace
 
 EpochStore::EpochStore(std::vector<ReplicaID> membership)
@@ -126,10 +174,36 @@ const EpochDefinition &EpochStore::stage(
     const EpochDefinitionInput &input,
     const EpochValidationContext &context)
 {
-    if (input.schema_version != kEpochDefinitionSchemaVersion)
+    const bool schema_v1 =
+        input.schema_version == kEpochDefinitionSchemaVersionV1;
+    const bool schema_v2 =
+        input.schema_version == kEpochDefinitionSchemaVersionV2;
+    if (!schema_v1 && !schema_v2)
     {
         reject("unsupported schema version " +
                std::to_string(input.schema_version));
+    }
+    const auto byzantine = schema_v2
+        ? derive_byzantine_quorum(membership_.size())
+        : std::optional<ByzantineQuorum>();
+    if (schema_v2 && !byzantine.has_value())
+    {
+        reject("adaptive-v2 fixed membership must satisfy N = 3f + 1");
+    }
+    for (const auto &tree : input.trees)
+    {
+        if (schema_v1 && !tree.wait_exempt_leaves.empty())
+        {
+            reject("v1 tree " + std::to_string(tree.tree_id) +
+                   " cannot contain wait-exempt replicas");
+        }
+        if (!std::is_sorted(
+                tree.wait_exempt_leaves.begin(),
+                tree.wait_exempt_leaves.end()))
+        {
+            reject("tree " + std::to_string(tree.tree_id) +
+                   " wait-exempt replicas are not in canonical order");
+        }
     }
     if (epochs_.find(input.epoch_number) != epochs_.end())
     {
@@ -228,6 +302,11 @@ const EpochDefinition &EpochStore::stage(
     {
         validate_tree_membership(tree, membership);
         validate_eligibility(tree, ineligible_members);
+        if (schema_v2)
+        {
+            validate_wait_exempt_leaves(
+                tree, membership, byzantine->fault_threshold);
+        }
     }
 
     auto canonical_serialization =

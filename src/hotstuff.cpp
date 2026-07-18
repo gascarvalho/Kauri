@@ -4709,7 +4709,7 @@ namespace hotstuff
     // Tree switch could be either a a normal tree switch or a epoch change (that is nothing more than also a tree switch)
     ReconfigurationType HotStuffBase::isTreeSwitch(int bheight)
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
+        if (epoch_protocol_mode != EpochProtocolMode::legacy_static)
             return NO_SWITCH;
 
         if (bheight > lastCheckedHeight)
@@ -4735,16 +4735,32 @@ namespace hotstuff
         /* Initial tree config */
 
         HotStuffBase::tree_scheduler(std::move(replicas), true);
+        /* ((n - 1) + 1 - 1) / 3 */
+        uint32_t nfaulty = peers.size() / 3;
+        const auto byzantine =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2
+                ? derive_byzantine_quorum(config.nreplicas)
+                : std::optional<ByzantineQuorum>();
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            (!byzantine.has_value() ||
+             byzantine->fault_threshold != nfaulty))
+        {
+            throw HotStuffError(
+                "adaptive-v2 startup requires exact N = 3f + 1");
+        }
         for (const PeerId &peer : peers)
         {
             pn.conn_peer(peer);
         }
-
-        /* ((n - 1) + 1 - 1) / 3 */
-        uint32_t nfaulty = peers.size() / 3;
         if (nfaulty == 0)
             LOG_WARN("too few replicas in the system to tolerate any failure");
         on_init(nfaulty);
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            config.nmajority != byzantine->quorum)
+        {
+            throw HotStuffError(
+                "adaptive-v2 startup quorum does not equal 2f + 1");
+        }
         pmaker->init(this);
 
         // TODO: Make this less ugly
@@ -4941,8 +4957,8 @@ namespace hotstuff
                     piped_submitted = false;
 
                     // TREE ROTATION FOR PROPOSER CASE 2
-                    if (epoch_protocol_mode !=
-                        EpochProtocolMode::adaptive_v1)
+                    if (epoch_protocol_mode ==
+                        EpochProtocolMode::legacy_static)
                     {
                         auto switch_type =
                             isTreeSwitch(piped_block->get_height());

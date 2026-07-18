@@ -2,7 +2,8 @@
  * Canonical, bounded wire values for adaptive epoch staging.
  *
  * These values are externally serialized. Legacy deployment remains the
- * explicitly selected legacy_static mode; adaptive_v1 uses its own opcodes.
+ * explicitly selected legacy_static mode; adaptive modes use their own
+ * versioned envelope and never reinterpret one another's definition bytes.
  * The legacy 0x10 and 0x11 opcodes, and the reserved 0x12 opcode, are never
  * interpreted as adaptive epoch messages.
  */
@@ -19,12 +20,16 @@
 namespace hotstuff
 {
 
-constexpr std::uint32_t kEpochWireSchemaVersion = 1;
+constexpr std::uint32_t kEpochWireSchemaVersionV1 = 1;
+constexpr std::uint32_t kEpochWireSchemaVersionV2 = 2;
+constexpr std::uint32_t kEpochWireSchemaVersion =
+    kEpochWireSchemaVersionV1;
 
 enum class EpochProtocolMode : std::uint8_t
 {
     legacy_static = 0,
     adaptive_v1 = 1,
+    adaptive_v2 = 2,
 };
 
 enum class EpochWireKind : std::uint8_t
@@ -49,6 +54,8 @@ enum class EpochWireError : std::uint8_t
     member_count_exceeded,
     string_length_exceeded,
     invalid_definition_digest,
+    wait_exempt_count_exceeded,
+    unsupported_kind_for_mode,
 };
 
 struct EpochWireLimits
@@ -57,6 +64,7 @@ struct EpochWireLimits
     std::uint32_t maximum_trees{64};
     std::uint32_t maximum_members_per_tree{4096};
     std::uint32_t maximum_string_bytes{4096};
+    std::uint32_t maximum_wait_exempt_leaves_per_tree{4096};
 };
 
 struct EpochActivationIdentity

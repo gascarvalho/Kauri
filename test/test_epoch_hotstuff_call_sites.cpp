@@ -91,6 +91,8 @@ TEST_CASE("HotStuffBase owns one explicitly selected epoch protocol binding",
     const auto implementation = source("src/hotstuff.cpp");
     const auto constructor = function_body(
         implementation, "HotStuffBase::HotStuffBase(");
+    const auto tree_switch = function_body(
+        implementation, "ReconfigurationType HotStuffBase::isTreeSwitch(");
 
     CHECK(header.find("HotStuffEpochLiveBinding") != std::string::npos);
     CHECK(header.find(
@@ -106,6 +108,17 @@ TEST_CASE("HotStuffBase owns one explicitly selected epoch protocol binding",
               constructor, "install_adaptive_epoch_handlers") == 1);
     CHECK(count_occurrences(
               constructor, "install_legacy_consensus_handlers") == 1);
+    REQUIRE_FALSE(tree_switch.empty());
+    CHECK((contains_in_order(
+               tree_switch,
+               {"EpochProtocolMode::adaptive_v2",
+                "return NO_SWITCH",
+                "lastCheckedHeight"}) ||
+           contains_in_order(
+               tree_switch,
+               {"epoch_protocol_mode != EpochProtocolMode::legacy_static",
+                "return NO_SWITCH",
+                "lastCheckedHeight"})));
 }
 
 TEST_CASE("adaptive pn handlers authenticate the connection before delegation",

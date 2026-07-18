@@ -2337,10 +2337,12 @@ TEST_CASE("typed transport prepares before staging and discards rejection",
           hotstuff::encode_epoch_wire(divergent, wire_limits()));
     CHECK_FALSE(harness.transaction.invariant_failed);
 
-    auto mixed = stage;
-    mixed.protocol_mode = EpochProtocolMode::legacy_static;
+    auto mixed_wire = hotstuff::encode_epoch_wire(stage, wire_limits());
+    REQUIRE(mixed_wire.size() > 4);
+    mixed_wire[4] =
+        static_cast<std::uint8_t>(EpochProtocolMode::legacy_static);
     const auto mixed_result = harness.transport.dispatch_stage(
-        MsgStageEpochDefinition(mixed, wire_limits()),
+        MsgStageEpochDefinition(hotstuff::DataStream(std::move(mixed_wire))),
         AuthenticatedEpochPeer::manager(),
         successor_context());
     CHECK(mixed_result.error == EpochIngressError::wire_rejected);
@@ -2582,6 +2584,21 @@ TEST_CASE("manager handler arms once after exact authenticated ack quorum",
     CHECK(duplicate.disposition == StageAckDisposition::duplicate);
     CHECK_FALSE(duplicate.arm.has_value());
     CHECK(tracker.acknowledgement_count() == 5);
+}
+
+TEST_CASE("v1 ack tracker accepts membership above the minimum fault bound",
+          "[c01][epoch-runtime][ack][quorum][v1][regression]")
+{
+    const EpochActivationIdentity activation{
+        0,
+        digest("c01-v1-n8-predecessor"),
+        1,
+        digest("c01-v1-n8-successor"),
+        kActivationHeight};
+    EpochAckTracker tracker(
+        activation, {0, 1, 2, 3, 4, 5, 6, 7}, 2);
+
+    CHECK(tracker.required_acknowledgements() == 5);
 }
 
 TEST_CASE("every post-prepare stage rejection consumes only its candidate",
@@ -2947,19 +2964,27 @@ TEST_CASE("oversized handlers preflight before payload-sized allocation",
     CHECK(invalid.wire_error == EpochWireError::invalid_limits);
     CHECK(invalid_limits.transaction.prepare_count == 0);
 
-    auto mixed_arm = arm_for(stage.activation);
-    mixed_arm.protocol_mode = EpochProtocolMode::legacy_static;
+    auto mixed_arm_wire = hotstuff::encode_epoch_wire(
+        arm_for(stage.activation), wire_limits());
+    REQUIRE(mixed_arm_wire.size() > 4);
+    mixed_arm_wire[4] =
+        static_cast<std::uint8_t>(EpochProtocolMode::legacy_static);
     const auto mixed_arm_result = harness.transport.dispatch_arm(
-        MsgArmActivation(mixed_arm, wire_limits()),
+        MsgArmActivation(
+            hotstuff::DataStream(std::move(mixed_arm_wire))),
         AuthenticatedEpochPeer::manager());
     CHECK(mixed_arm_result.error == EpochIngressError::wire_rejected);
     CHECK(mixed_arm_result.wire_error == EpochWireError::mode_mismatch);
     CHECK_FALSE(mixed_arm_result.disposition.has_value());
 
-    auto mixed_ack = acknowledgement(0, stage.activation);
-    mixed_ack.protocol_mode = EpochProtocolMode::legacy_static;
+    auto mixed_ack_wire = hotstuff::encode_epoch_wire(
+        acknowledgement(0, stage.activation), wire_limits());
+    REQUIRE(mixed_ack_wire.size() > 4);
+    mixed_ack_wire[4] =
+        static_cast<std::uint8_t>(EpochProtocolMode::legacy_static);
     const auto mixed_ack_result = harness.transport.dispatch_ack(
-        MsgStageAck(mixed_ack, wire_limits()),
+        MsgStageAck(
+            hotstuff::DataStream(std::move(mixed_ack_wire))),
         AuthenticatedEpochPeer::replica(0));
     CHECK(mixed_ack_result.error == EpochIngressError::wire_rejected);
     CHECK(mixed_ack_result.wire_error == EpochWireError::mode_mismatch);
