@@ -18,7 +18,7 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Iterable, Mapping, NamedTuple, Sequence
+from typing import Callable, Iterable, Mapping, NamedTuple, Sequence
 import uuid
 from xml.sax.saxutils import escape
 
@@ -85,6 +85,26 @@ class ReputationVerdict(NamedTuple):
     updates: tuple[Mapping[str, object], ...]
 
 
+def event_clock_now_ns() -> int:
+    """Read the CLOCK_MONOTONIC_RAW domain used by the C++ marker."""
+    clock_id = getattr(time, "CLOCK_MONOTONIC_RAW", None)
+    clock_gettime_ns = getattr(time, "clock_gettime_ns", None)
+    if clock_id is None or not callable(clock_gettime_ns):
+        raise SmokeError(
+            "CLOCK_MONOTONIC_RAW is unavailable; cannot align runner and "
+            "C++ event timestamps"
+        )
+    try:
+        value = int(clock_gettime_ns(clock_id))
+    except (OSError, TypeError, ValueError) as exc:
+        raise SmokeError(f"CLOCK_MONOTONIC_RAW read failed: {exc}") from exc
+    if value < 0:
+        raise SmokeError(
+            "CLOCK_MONOTONIC_RAW returned a negative timestamp"
+        )
+    return value
+
+
 def calibrate_event_clock(
     anchor_event_ns: int, observed_runner_ns: int
 ) -> int:
@@ -100,6 +120,29 @@ def runner_to_event_clock(runner_ns: int, offset_ns: int) -> int:
     if runner_ns < 0 or mapped < 0:
         raise SmokeError("mapped monotonic timestamp cannot be negative")
     return mapped
+
+
+def crash_event_clock_ns(
+    event: Mapping[str, object], offset_ns: int | None
+) -> int:
+    """Resolve a crash request into the C++ event-clock domain."""
+    direct = event.get("requested_event_monotonic_ns")
+    if direct is not None:
+        value = int(direct)
+        if value < 0:
+            raise SmokeError(
+                "crash event-clock timestamp cannot be negative"
+            )
+        return value
+    if "requested_monotonic_ns" not in event:
+        raise SmokeError("crash event is missing its requested timestamp")
+    if offset_ns is None:
+        raise SmokeError(
+            "legacy crash timestamp requires a recorded event-clock offset"
+        )
+    return runner_to_event_clock(
+        int(event["requested_monotonic_ns"]), offset_ns
+    )
 
 
 class ProcessRecord:
@@ -481,6 +524,7 @@ def inject_crashes(
     crash_targets: Sequence[int],
     *,
     killpg: object = os.killpg,
+    event_clock_now: Callable[[], int] | None = None,
 ) -> list[dict[str, object]]:
     """Send SIGKILL only to the explicitly registered crash targets."""
     if len(set(crash_targets)) != len(crash_targets):
@@ -516,8 +560,12 @@ def inject_crashes(
             raise SmokeError(f"crash target replica {replica} already exited")
         selected.append((replica, record))
     events: list[dict[str, object]] = []
+    read_event_clock = event_clock_now or event_clock_now_ns
     for replica, record in selected:
         requested_ns = time.monotonic_ns()
+        requested_event_ns = int(read_event_clock())
+        if requested_event_ns < 0:
+            raise SmokeError("crash event-clock timestamp cannot be negative")
         killpg(int(getattr(record, "pgid")), signal.SIGKILL)  # type: ignore[operator]
         events.append(
             {
@@ -530,6 +578,7 @@ def inject_crashes(
                     dt.timezone.utc
                 ).isoformat(),
                 "requested_monotonic_ns": requested_ns,
+                "requested_event_monotonic_ns": requested_event_ns,
                 "epoch": 0,
                 "tree": 0,
                 "role": "leaf",
@@ -1439,10 +1488,7 @@ def analyze_and_write_artifacts(
 
     crash_ns = (
         min(
-            runner_to_event_clock(
-                int(event["requested_monotonic_ns"]),
-                event_clock_offset_ns or 0,
-            )
+            crash_event_clock_ns(event, event_clock_offset_ns)
             for event in crash_events
         )
         if crash_events
@@ -1651,6 +1697,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         _assert_executable(path, label)
     if args.startup_timeout <= 0 or args.crash_confirm_timeout <= 0:
         raise SmokeError("runner timeouts must be positive")
+    event_clock_now_ns()
 
     replica_ids = tuple(int(value) for value in profile["replica_ids"])
     crash_targets = tuple(int(value) for value in profile["crash_targets"])
@@ -1792,32 +1839,19 @@ def run(argv: Sequence[str] | None = None) -> int:
             int(profile["minimum_common_baseline_commits"]),
             args.startup_timeout,
         )
-        observer = int(profile["observer"])
-        observer_log = _read_replica_logs(run_directory, (observer,)).get(
-            observer, ""
-        )
-        observer_events = validate_and_deduplicate_commits(
-            parse_commit_events(observer_log, observer)
-        )
-        if not observer_events:
-            raise SmokeError("observer has no commit event for clock anchor")
-        anchor_event = observer_events[-1]
         runner_measurement_start_ns = time.monotonic_ns()
+        measurement_start_event_ns = event_clock_now_ns()
         event_clock_offset_ns = calibrate_event_clock(
-            anchor_event.monotonic_ns, runner_measurement_start_ns
-        )
-        measurement_start_event_ns = runner_to_event_clock(
-            runner_measurement_start_ns, event_clock_offset_ns
+            measurement_start_event_ns, runner_measurement_start_ns
         )
         manifest["baseline_common_commits"] = [
             {"height": height, "hash": block_hash}
             for height, block_hash in baseline_common
         ]
         manifest["clock_calibration"] = {
-            "anchor_replica": observer,
-            "anchor_height": anchor_event.height,
-            "anchor_hash": anchor_event.block_hash,
-            "anchor_event_monotonic_ns": anchor_event.monotonic_ns,
+            "method": "direct_clock_monotonic_raw_sample",
+            "event_clock": "CLOCK_MONOTONIC_RAW",
+            "observed_event_monotonic_ns": measurement_start_event_ns,
             "observed_runner_monotonic_ns": runner_measurement_start_ns,
             "event_minus_runner_offset_ns": event_clock_offset_ns,
         }
@@ -1860,6 +1894,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             crash_targets,
         )
         _write_json(run_directory / "crash-events.json", crash_events)
+        manifest["crash_events"] = crash_events
+        _write_json(run_directory / "manifest.json", manifest)
 
         total_buckets = (
             int(profile["baseline_bucket_count"])
@@ -1901,6 +1937,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             ).isoformat()
             manifest["interrupted"] = interrupted
             manifest["runtime_error"] = runtime_error
+            manifest["crash_events"] = crash_events
             manifest["exit_observations"] = exit_observations
             manifest["processes"] = [
                 record.manifest_entry() for record in records

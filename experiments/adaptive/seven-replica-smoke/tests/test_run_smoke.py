@@ -241,7 +241,7 @@ class TestCommitMarkerContract:
         assert '"hash=%s' in marker_source
         assert "tx_count=%" in marker_source
         assert "monotonic_ns=%" in marker_source
-        assert "steady_clock" in marker_source
+        assert "CLOCK_MONOTONIC_RAW" in marker_source
         assert "get_cmds().size()" in marker_source
 
     def test_parser_requires_full_hash_transaction_count_and_clock(self) -> None:
@@ -282,16 +282,21 @@ class TestCrashOwnership:
         }
         calls: list[tuple[int, signal.Signals]] = []
 
-        smoke().inject_crashes(
+        event_ticks = iter((16_000_000_000, 16_000_000_100))
+        events = smoke().inject_crashes(
             records,
             crash_targets=(4, 6),
             killpg=lambda pgid, sig: calls.append((pgid, sig)),
+            event_clock_now=lambda: next(event_ticks),
         )
 
         assert calls == [
             (records[4].pgid, signal.SIGKILL),
             (records[6].pgid, signal.SIGKILL),
         ]
+        assert [
+            item["requested_event_monotonic_ns"] for item in events
+        ] == [16_000_000_000, 16_000_000_100]
 
     def test_rejects_stale_stored_pgid_without_signalling(
         self, monkeypatch: pytest.MonkeyPatch
@@ -498,6 +503,97 @@ class TestCommitIntegrity:
             for reason in result["reasons"]
         )
 
+    def test_delayed_log_observation_cannot_move_crash_boundary_early(
+        self, tmp_path: Path
+    ) -> None:
+        observer_schedule = (
+            (0.1, 50),
+            (5.1, 50),
+            (10.1, 50),
+            (14.1, 50),
+            (20.1, 40),
+            (25.1, 40),
+            (30.1, 40),
+        )
+        manager_log = (
+            "KAURI_REPUTATION update reporter=1 target=4 "
+            "outcome=timeout delta=-1 score=-1\n"
+            "KAURI_REPUTATION update reporter=2 target=6 "
+            "outcome=timeout delta=-1 score=-1"
+        )
+        passing = analyze_fixture(
+            tmp_path,
+            observer_schedule=observer_schedule,
+            manager_log=manager_log,
+        )
+        assert passing["classification"] == "PASS"
+
+        crash_target_log = tmp_path / "replica-4.log"
+        agreed_marker = marker(
+            replica=4,
+            height=103,
+            block_hash=f"{4:064x}",
+            tx_count=50,
+            monotonic_ns=15_100_000_000,
+        )
+        conflicting_marker = marker(
+            replica=4,
+            height=103,
+            block_hash=HASH_B,
+            tx_count=50,
+            monotonic_ns=15_100_000_000,
+        )
+        crash_target_text = crash_target_log.read_text(encoding="utf-8")
+        assert agreed_marker in crash_target_text
+        crash_target_log.write_text(
+            crash_target_text.replace(agreed_marker, conflicting_marker, 1),
+            encoding="utf-8",
+        )
+
+        # The event happened at runner 10.1s + the real 1s offset, but the
+        # runner did not observe its log line until 12.1s. Treating those
+        # non-contemporaneous samples as one instant shifts the inferred
+        # event-clock crash boundary two seconds early.
+        delayed_offset_ns = smoke().calibrate_event_clock(
+            11_100_000_000,
+            12_100_000_000,
+        )
+        assert delayed_offset_ns == -1_000_000_000
+        crash_events = [
+            {
+                "replica": replica,
+                "requested_monotonic_ns": 15_000_000_000,
+                "requested_event_monotonic_ns": 16_000_000_000,
+            }
+            for replica in (4, 6)
+        ]
+        exit_observations = [
+            {
+                "replica": replica,
+                "popen_return_code": -signal.SIGKILL,
+                "signal_number": signal.SIGKILL,
+                "phase": "post_crash",
+            }
+            for replica in (4, 6)
+        ]
+        result = smoke().analyze_and_write_artifacts(
+            tmp_path,
+            json.loads(PROFILE_PATH.read_text(encoding="utf-8")),
+            measurement_start_event_ns=1_000_000_000,
+            event_clock_offset_ns=delayed_offset_ns,
+            crash_events=crash_events,
+            exit_observations=exit_observations,
+            runtime_error=None,
+            postflight_listeners=(),
+        )
+
+        assert result["classification"] == "FAIL"
+        assert any(
+            "height 103" in reason
+            and ("conflict" in reason or "agree" in reason)
+            for reason in result["reasons"]
+        )
+
 
 class TestGeneratedSecretPermissions:
     @pytest.mark.parametrize(
@@ -585,6 +681,35 @@ class TestGeneratedSecretPermissions:
 
 
 class TestClockCalibration:
+    def test_legacy_crash_timestamp_requires_recorded_clock_offset(
+        self,
+    ) -> None:
+        direct = {
+            "requested_monotonic_ns": 10,
+            "requested_event_monotonic_ns": 20,
+        }
+        assert smoke().crash_event_clock_ns(direct, None) == 20
+
+        legacy = {"requested_monotonic_ns": 10}
+        with pytest.raises(
+            smoke().SmokeError,
+            match=r"legacy.*offset|offset.*missing",
+        ):
+            smoke().crash_event_clock_ns(legacy, None)
+
+        assert smoke().crash_event_clock_ns(legacy, 0) == 10
+
+    def test_event_clock_fails_closed_when_raw_monotonic_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delattr(smoke().time, "CLOCK_MONOTONIC_RAW")
+
+        with pytest.raises(
+            smoke().SmokeError,
+            match=r"CLOCK_MONOTONIC_RAW.*unavailable",
+        ):
+            smoke().event_clock_now_ns()
+
     def test_maps_runner_crash_boundary_into_the_cpp_event_clock(self) -> None:
         anchor_event_ns = 274_000_000_000_000
         observed_runner_ns = 210_000_000_000_000

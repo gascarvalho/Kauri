@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <ctime>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -4895,10 +4896,19 @@ namespace hotstuff
                 blk->get_height());
             return;
         }
-        const auto monotonic_ns = std::chrono::duration_cast<
-            std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-                                      .count();
+        struct timespec event_clock{};
+        if (::clock_gettime(CLOCK_MONOTONIC_RAW, &event_clock) != 0)
+        {
+            HOTSTUFF_LOG_WARN(
+                "KAURI_DEMO marker_skipped replica=%u height=%llu "
+                "reason=event_clock_unavailable",
+                get_id(),
+                blk->get_height());
+            return;
+        }
+        const auto monotonic_ns =
+            static_cast<long long>(event_clock.tv_sec) * 1000000000LL +
+            static_cast<long long>(event_clock.tv_nsec);
         HOTSTUFF_LOG_INFO(
             "KAURI_DEMO commit replica=%u height=%llu epoch=%u "
             "tree=%u root=%u "
