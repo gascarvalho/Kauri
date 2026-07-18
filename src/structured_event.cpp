@@ -319,6 +319,143 @@ bool payload_type(const StructuredEventPayload &payload,
     }
 }
 
+bool adaptive_payload_type(
+    const AdaptiveAggregationStructuredEvent &event,
+    StructuredEventType &type) noexcept
+{
+    switch (event.transition)
+    {
+        case AdaptiveAggregationTransition::configuration_active:
+            type = StructuredEventType::adaptive_configuration_active;
+            return true;
+        case AdaptiveAggregationTransition::required_set_ready:
+            type = StructuredEventType::aggregation_required_set_ready;
+            return true;
+        case AdaptiveAggregationTransition::initial_reserved:
+            type = StructuredEventType::aggregation_initial_reserved;
+            return true;
+        case AdaptiveAggregationTransition::initial_enqueued:
+            type = StructuredEventType::aggregation_initial_enqueued;
+            return true;
+        case AdaptiveAggregationTransition::initial_committed:
+            type = StructuredEventType::aggregation_initial_committed;
+            return true;
+        case AdaptiveAggregationTransition::initial_released:
+            type = StructuredEventType::aggregation_initial_released;
+            return true;
+        case AdaptiveAggregationTransition::delta_reserved:
+            type = StructuredEventType::aggregation_delta_reserved;
+            return true;
+        case AdaptiveAggregationTransition::delta_enqueued:
+            type = StructuredEventType::aggregation_delta_enqueued;
+            return true;
+        case AdaptiveAggregationTransition::delta_committed:
+            type = StructuredEventType::aggregation_delta_committed;
+            return true;
+        case AdaptiveAggregationTransition::delta_released:
+            type = StructuredEventType::aggregation_delta_released;
+            return true;
+        case AdaptiveAggregationTransition::delta_rejected:
+            type = StructuredEventType::aggregation_delta_rejected;
+            return true;
+        case AdaptiveAggregationTransition::required_branch_incomplete:
+            type = StructuredEventType::aggregation_required_branch_incomplete;
+            return true;
+        case AdaptiveAggregationTransition::
+                 wait_exempt_absent_at_observation_deadline:
+            type = StructuredEventType::aggregation_wait_exempt_absent;
+            return true;
+        case AdaptiveAggregationTransition::wait_exempt_late_accepted:
+            type = StructuredEventType::aggregation_wait_exempt_late_accepted;
+            return true;
+        case AdaptiveAggregationTransition::retry_exhausted:
+            type = StructuredEventType::aggregation_retry_exhausted;
+            return true;
+        case AdaptiveAggregationTransition::proposal_aborted:
+            type = StructuredEventType::aggregation_proposal_aborted;
+            return true;
+        case AdaptiveAggregationTransition::root_quorum_progress:
+            type = StructuredEventType::aggregation_root_quorum_progress;
+            return true;
+        case AdaptiveAggregationTransition::root_qc_published:
+            type = StructuredEventType::aggregation_root_qc_published;
+            return true;
+    }
+    return false;
+}
+
+bool strictly_increasing(const std::vector<ReplicaID> &values) noexcept
+{
+    return std::adjacent_find(
+               values.begin(), values.end(),
+               [](ReplicaID left, ReplicaID right) {
+                   return left >= right;
+               }) == values.end();
+}
+
+bool valid_adaptive_payload(
+    const AdaptiveAggregationStructuredEvent &event) noexcept
+{
+    StructuredEventType ignored{};
+    if (!adaptive_payload_type(event, ignored) ||
+        event.configuration.epoch_digest == uint256_t{} ||
+        !valid_utf8(event.rejection_reason) ||
+        !strictly_increasing(event.wait_exempt_signers) ||
+        !strictly_increasing(event.accepted_signers) ||
+        !strictly_increasing(event.absent_direct_children) ||
+        !strictly_increasing(event.missing_optional_signers))
+        return false;
+
+    if (event.transition !=
+            AdaptiveAggregationTransition::configuration_active &&
+        (!event.block_hash.has_value() ||
+         *event.block_hash == uint256_t{} ||
+         !event.context_generation.has_value() ||
+         *event.context_generation == 0))
+        return false;
+    if (event.transition ==
+            AdaptiveAggregationTransition::configuration_active &&
+        (event.block_hash.has_value() ||
+         event.context_generation.has_value()))
+        return false;
+    if ((event.transition ==
+             AdaptiveAggregationTransition::delta_rejected ||
+         event.transition ==
+             AdaptiveAggregationTransition::proposal_aborted) &&
+        event.rejection_reason.empty())
+        return false;
+    const bool root_observation =
+        event.transition ==
+            AdaptiveAggregationTransition::root_quorum_progress ||
+        event.transition ==
+            AdaptiveAggregationTransition::root_qc_published;
+    if ((root_observation ||
+         event.transition ==
+             AdaptiveAggregationTransition::configuration_active) &&
+        event.global_quorum == 0)
+        return false;
+    if (root_observation &&
+        event.root_signer_count != event.accepted_signers.size())
+        return false;
+    if (event.transition ==
+            AdaptiveAggregationTransition::root_qc_published &&
+        event.root_signer_count < event.global_quorum)
+        return false;
+
+    ReplicaID previous_child{0};
+    bool first_child = true;
+    for (const auto &gap : event.required_branch_gaps)
+    {
+        if (gap.missing_required_signers.empty() ||
+            !strictly_increasing(gap.missing_required_signers) ||
+            (!first_child && gap.direct_child <= previous_child))
+            return false;
+        previous_child = gap.direct_child;
+        first_child = false;
+    }
+    return true;
+}
+
 void append_configuration(JsonLineBuilder &builder,
                           const ConfigurationId &configuration)
 {
@@ -384,6 +521,73 @@ void append_commit_payload(JsonLineBuilder &builder,
     builder.append('}');
 }
 
+void append_replica_ids(JsonLineBuilder &builder,
+                        const std::vector<ReplicaID> &values)
+{
+    builder.append('[');
+    bool first = true;
+    for (const auto value : values)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append_integer(value);
+        first = false;
+    }
+    builder.append(']');
+}
+
+void append_adaptive_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveAggregationStructuredEvent &event)
+{
+    builder.append('{');
+    append_configuration(builder, event.configuration);
+    builder.append(",\"block_hash\":");
+    if (event.block_hash)
+        builder.append_escaped(event.block_hash->to_hex());
+    else
+        builder.append("null");
+    builder.append(",\"context_generation\":");
+    if (event.context_generation)
+        builder.append_integer(*event.context_generation);
+    else
+        builder.append("null");
+    builder.append(",\"observer_replica\":");
+    builder.append_integer(event.observer_replica);
+    builder.append(",\"wait_exempt_signers\":");
+    append_replica_ids(builder, event.wait_exempt_signers);
+    builder.append(",\"accepted_signers\":");
+    append_replica_ids(builder, event.accepted_signers);
+    builder.append(",\"absent_direct_children\":");
+    append_replica_ids(builder, event.absent_direct_children);
+    builder.append(",\"missing_optional_signers\":");
+    append_replica_ids(builder, event.missing_optional_signers);
+    builder.append(",\"required_branch_gaps\":[");
+    bool first = true;
+    for (const auto &gap : event.required_branch_gaps)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append("{\"direct_child\":");
+        builder.append_integer(gap.direct_child);
+        builder.append(",\"missing_required_signers\":");
+        append_replica_ids(builder, gap.missing_required_signers);
+        builder.append('}');
+        first = false;
+    }
+    builder.append("]");
+    builder.append(",\"root_signer_count\":");
+    builder.append_integer(event.root_signer_count);
+    builder.append(",\"global_quorum\":");
+    builder.append_integer(event.global_quorum);
+    builder.append(",\"rejection_reason\":");
+    if (event.rejection_reason.empty())
+        builder.append("null");
+    else
+        builder.append_escaped(event.rejection_reason);
+    builder.append('}');
+}
+
 std::string serialize_event(const StructuredEventConfig &config,
                             const StructuredEventPayload &payload,
                             StructuredEventType type,
@@ -426,6 +630,36 @@ std::string serialize_event(const StructuredEventConfig &config,
         default:
             throw std::bad_variant_access{};
     }
+    builder.append('}');
+    return builder.finish();
+}
+
+std::string serialize_adaptive_event(
+    const StructuredEventConfig &config,
+    const AdaptiveAggregationStructuredEvent &event,
+    StructuredEventType type,
+    std::uint64_t sequence,
+    std::uint64_t monotonic_ns)
+{
+    JsonLineBuilder builder(config.limits.maximum_line_bytes);
+    builder.append("{\"event_schema_version\":");
+    builder.append_integer(kStructuredEventSchemaVersion);
+    builder.append(",\"run_id\":");
+    builder.append_escaped(config.run_id);
+    builder.append(",\"source_kind\":");
+    builder.append_escaped(source_kind_name(config.source.kind));
+    builder.append(",\"source_id\":");
+    builder.append_escaped(config.source.logical_id);
+    builder.append(",\"source_instance\":");
+    builder.append_escaped(config.source.instance_id);
+    builder.append(",\"source_sequence\":");
+    builder.append_integer(sequence);
+    builder.append(",\"source_monotonic_ns\":");
+    builder.append_integer(monotonic_ns);
+    builder.append(",\"event_type\":");
+    builder.append_escaped(structured_event_type_name(type));
+    builder.append(",\"payload\":");
+    append_adaptive_payload(builder, event);
     builder.append('}');
     return builder.finish();
 }
@@ -828,6 +1062,42 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "epoch.activated";
         case StructuredEventType::block_committed:
             return "block.committed";
+        case StructuredEventType::adaptive_configuration_active:
+            return "adaptive.configuration_active";
+        case StructuredEventType::aggregation_required_set_ready:
+            return "aggregation.required_set_ready";
+        case StructuredEventType::aggregation_initial_reserved:
+            return "aggregation.initial_reserved";
+        case StructuredEventType::aggregation_initial_enqueued:
+            return "aggregation.initial_enqueued";
+        case StructuredEventType::aggregation_initial_committed:
+            return "aggregation.initial_committed";
+        case StructuredEventType::aggregation_initial_released:
+            return "aggregation.initial_released";
+        case StructuredEventType::aggregation_delta_reserved:
+            return "aggregation.delta_reserved";
+        case StructuredEventType::aggregation_delta_enqueued:
+            return "aggregation.delta_enqueued";
+        case StructuredEventType::aggregation_delta_committed:
+            return "aggregation.delta_committed";
+        case StructuredEventType::aggregation_delta_released:
+            return "aggregation.delta_released";
+        case StructuredEventType::aggregation_delta_rejected:
+            return "aggregation.delta_rejected";
+        case StructuredEventType::aggregation_required_branch_incomplete:
+            return "aggregation.required_branch_incomplete";
+        case StructuredEventType::aggregation_wait_exempt_absent:
+            return "aggregation.wait_exempt_absent_at_observation_deadline";
+        case StructuredEventType::aggregation_wait_exempt_late_accepted:
+            return "aggregation.wait_exempt_late_accepted";
+        case StructuredEventType::aggregation_retry_exhausted:
+            return "aggregation.retry_exhausted";
+        case StructuredEventType::aggregation_proposal_aborted:
+            return "aggregation.proposal_aborted";
+        case StructuredEventType::aggregation_root_quorum_progress:
+            return "aggregation.root_quorum_progress";
+        case StructuredEventType::aggregation_root_qc_published:
+            return "aggregation.root_qc_published";
     }
     return "unknown";
 }
@@ -886,6 +1156,82 @@ struct StructuredEventSink::State final
         status.queued_bytes = 0;
     }
 
+    template <typename Serializer>
+    void admit(bool valid_payload, Serializer &&serializer) noexcept
+    {
+        if (active_call)
+        {
+            fail_reentrant();
+            return;
+        }
+        if (!status.healthy || closed)
+            return;
+        ReentrancyScope scope(active_call);
+
+        if (!valid_payload)
+        {
+            fail_admission(StructuredEventFailure::invalid_payload);
+            return;
+        }
+        if (status.last_assigned_sequence ==
+            std::numeric_limits<std::uint64_t>::max())
+        {
+            fail_admission(StructuredEventFailure::sequence_exhausted);
+            return;
+        }
+
+        const auto sequence = status.last_assigned_sequence + 1;
+        const auto monotonic_ns = clock.now_ns();
+        if (!status.healthy)
+        {
+            output_failed = true;
+            discard_queue();
+            return;
+        }
+        if (status.has_last_monotonic_ns &&
+            monotonic_ns < status.last_monotonic_ns)
+        {
+            fail_admission(StructuredEventFailure::clock_regression);
+            return;
+        }
+
+        try
+        {
+            auto record = serializer(sequence, monotonic_ns);
+            if (record.size() > config.limits.maximum_line_bytes)
+            {
+                fail_admission(StructuredEventFailure::line_too_large);
+                return;
+            }
+            if (status.queued_events >=
+                    config.limits.maximum_queued_events ||
+                record.size() >
+                    config.limits.maximum_queued_bytes -
+                        std::min(config.limits.maximum_queued_bytes,
+                                 status.queued_bytes))
+            {
+                fail_admission(StructuredEventFailure::queue_full);
+                return;
+            }
+
+            const auto record_size = record.size();
+            queue.push_back(std::move(record));
+            ++status.queued_events;
+            status.queued_bytes += record_size;
+            status.last_assigned_sequence = sequence;
+            status.has_last_monotonic_ns = true;
+            status.last_monotonic_ns = monotonic_ns;
+        }
+        catch (const LineLimitExceeded &)
+        {
+            fail_admission(StructuredEventFailure::line_too_large);
+        }
+        catch (...)
+        {
+            fail_admission(StructuredEventFailure::allocation_failure);
+        }
+    }
+
     StructuredEventConfig config;
     StructuredEventClock &clock;
     StructuredEventOutput &output;
@@ -917,79 +1263,29 @@ void StructuredEventSink::emit(
     const StructuredEventPayload &payload) noexcept
 {
     auto &state = *state_;
-    if (state.active_call)
-    {
-        state.fail_reentrant();
-        return;
-    }
-    if (!state.status.healthy || state.closed)
-        return;
-    ReentrancyScope scope(state.active_call);
-
     StructuredEventType type{};
-    if (!payload_type(payload, type))
-    {
-        state.fail_admission(StructuredEventFailure::invalid_payload);
-        return;
-    }
-    if (state.status.last_assigned_sequence ==
-        std::numeric_limits<std::uint64_t>::max())
-    {
-        state.fail_admission(StructuredEventFailure::sequence_exhausted);
-        return;
-    }
-
-    const auto sequence = state.status.last_assigned_sequence + 1;
-    const auto monotonic_ns = state.clock.now_ns();
-    if (!state.status.healthy)
-    {
-        state.output_failed = true;
-        state.discard_queue();
-        return;
-    }
-    if (state.status.has_last_monotonic_ns &&
-        monotonic_ns < state.status.last_monotonic_ns)
-    {
-        state.fail_admission(StructuredEventFailure::clock_regression);
-        return;
-    }
-
-    try
-    {
-        auto record = serialize_event(
+    const auto valid = payload_type(payload, type);
+    state.admit(valid, [&state, &payload, type](
+                           std::uint64_t sequence,
+                           std::uint64_t monotonic_ns) {
+        return serialize_event(
             state.config, payload, type, sequence, monotonic_ns);
-        if (record.size() > state.config.limits.maximum_line_bytes)
-        {
-            state.fail_admission(StructuredEventFailure::line_too_large);
-            return;
-        }
-        if (state.status.queued_events >=
-                state.config.limits.maximum_queued_events ||
-            record.size() >
-                state.config.limits.maximum_queued_bytes -
-                    std::min(state.config.limits.maximum_queued_bytes,
-                             state.status.queued_bytes))
-        {
-            state.fail_admission(StructuredEventFailure::queue_full);
-            return;
-        }
+    });
+}
 
-        const auto record_size = record.size();
-        state.queue.push_back(std::move(record));
-        ++state.status.queued_events;
-        state.status.queued_bytes += record_size;
-        state.status.last_assigned_sequence = sequence;
-        state.status.has_last_monotonic_ns = true;
-        state.status.last_monotonic_ns = monotonic_ns;
-    }
-    catch (const LineLimitExceeded &)
-    {
-        state.fail_admission(StructuredEventFailure::line_too_large);
-    }
-    catch (...)
-    {
-        state.fail_admission(StructuredEventFailure::allocation_failure);
-    }
+void StructuredEventSink::emit_adaptive(
+    const AdaptiveAggregationStructuredEvent &event) noexcept
+{
+    auto &state = *state_;
+    StructuredEventType type{};
+    const auto valid = valid_adaptive_payload(event) &&
+                       adaptive_payload_type(event, type);
+    state.admit(valid, [&state, &event, type](
+                           std::uint64_t sequence,
+                           std::uint64_t monotonic_ns) {
+        return serialize_adaptive_event(
+            state.config, event, type, sequence, monotonic_ns);
+    });
 }
 
 void StructuredEventSink::drain() noexcept

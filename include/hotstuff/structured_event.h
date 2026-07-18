@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "hotstuff/configuration.h"
 
@@ -82,6 +83,58 @@ using StructuredEventPayload = std::variant<
     EpochLifecycleEvent,
     CommitStructuredEvent>;
 
+enum class AdaptiveAggregationTransition : std::uint8_t
+{
+    configuration_active = 1,
+    required_set_ready,
+    initial_reserved,
+    initial_enqueued,
+    initial_committed,
+    initial_released,
+    delta_reserved,
+    delta_enqueued,
+    delta_committed,
+    delta_released,
+    delta_rejected,
+    required_branch_incomplete,
+    wait_exempt_absent_at_observation_deadline,
+    wait_exempt_late_accepted,
+    retry_exhausted,
+    proposal_aborted,
+    root_quorum_progress,
+    root_qc_published,
+};
+
+struct RequiredBranchSignerGap
+{
+    // The reporter observed this direct child. Missing descendants remain a
+    // separate signer gap and are never promoted to a direct fault claim.
+    ReplicaID direct_child{0};
+    std::vector<ReplicaID> missing_required_signers;
+};
+
+/**
+ * Observational adaptive-v2 evidence. These records cannot authorize a vote,
+ * change readiness, mutate reputation, or alter the fixed quorum.
+ */
+struct AdaptiveAggregationStructuredEvent
+{
+    AdaptiveAggregationTransition transition{
+        AdaptiveAggregationTransition::configuration_active};
+    ConfigurationId configuration;
+    std::optional<uint256_t> block_hash;
+    std::optional<std::uint64_t> context_generation;
+    ReplicaID observer_replica{0};
+    std::vector<ReplicaID> wait_exempt_signers;
+    std::vector<ReplicaID> accepted_signers;
+    std::vector<ReplicaID> absent_direct_children;
+    std::vector<ReplicaID> missing_optional_signers;
+    std::vector<RequiredBranchSignerGap> required_branch_gaps;
+    std::size_t root_signer_count{0};
+    std::size_t global_quorum{0};
+    std::string rejection_reason;
+};
+
 enum class StructuredEventType : std::uint8_t
 {
     process_started = 1,
@@ -96,6 +149,24 @@ enum class StructuredEventType : std::uint8_t
     epoch_activation_armed,
     epoch_activated,
     block_committed,
+    adaptive_configuration_active,
+    aggregation_required_set_ready,
+    aggregation_initial_reserved,
+    aggregation_initial_enqueued,
+    aggregation_initial_committed,
+    aggregation_initial_released,
+    aggregation_delta_reserved,
+    aggregation_delta_enqueued,
+    aggregation_delta_committed,
+    aggregation_delta_released,
+    aggregation_delta_rejected,
+    aggregation_required_branch_incomplete,
+    aggregation_wait_exempt_absent,
+    aggregation_wait_exempt_late_accepted,
+    aggregation_retry_exhausted,
+    aggregation_proposal_aborted,
+    aggregation_root_quorum_progress,
+    aggregation_root_qc_published,
 };
 
 StructuredEventType structured_event_type(
@@ -210,6 +281,18 @@ public:
 };
 
 /**
+ * Separate protocol-facing capability preserves the closed legacy payload
+ * variant while sharing the same bounded sink, schema envelope, and writer.
+ */
+class AdaptiveStructuredEventEmitter
+{
+public:
+    virtual ~AdaptiveStructuredEventEmitter() = default;
+    virtual void emit_adaptive(
+        const AdaptiveAggregationStructuredEvent &event) noexcept = 0;
+};
+
+/**
  * Sole externally serialized writer-owner capability.
  *
  * The borrowed clock and output must outlive this owner and sink destruction.
@@ -226,6 +309,7 @@ public:
 };
 
 class StructuredEventSink final : public StructuredEventEmitter,
+                                  public AdaptiveStructuredEventEmitter,
                                   public StructuredEventDrainOwner
 {
 public:
@@ -242,6 +326,8 @@ public:
     StructuredEventSink &operator=(StructuredEventSink &&) = delete;
 
     void emit(const StructuredEventPayload &payload) noexcept override;
+    void emit_adaptive(
+        const AdaptiveAggregationStructuredEvent &event) noexcept override;
     void drain() noexcept override;
     void shutdown() noexcept override;
     StructuredEventHealth health() const noexcept override;

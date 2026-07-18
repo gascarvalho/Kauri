@@ -499,6 +499,9 @@ StructuredEventPrefixResult parse_structured_event_prefix(
 namespace
 {
 
+using hotstuff::AdaptiveAggregationStructuredEvent;
+using hotstuff::AdaptiveAggregationTransition;
+using hotstuff::AdaptiveStructuredEventEmitter;
 using hotstuff::CommitStructuredEvent;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
@@ -507,6 +510,7 @@ using hotstuff::EpochLifecycleTransition;
 using hotstuff::ProcessLifecycleEvent;
 using hotstuff::ProcessLifecycleState;
 using hotstuff::ProposalKey;
+using hotstuff::RequiredBranchSignerGap;
 using hotstuff::StructuredEventClock;
 using hotstuff::StructuredEventConfig;
 using hotstuff::StructuredEventCursor;
@@ -609,6 +613,39 @@ CommitStructuredEvent commit_event()
         ProposalKey{proof_configuration, digest("decision-proof-block")},
         19,
         2};
+}
+
+AdaptiveAggregationStructuredEvent adaptive_event(
+    AdaptiveAggregationTransition transition =
+        AdaptiveAggregationTransition::required_set_ready)
+{
+    AdaptiveAggregationStructuredEvent event;
+    event.transition = transition;
+    event.configuration = configuration(9, 2, "adaptive-epoch");
+    event.block_hash = digest("adaptive-block");
+    event.context_generation = 17;
+    event.observer_replica = 4;
+    event.wait_exempt_signers = {0, 1};
+    event.accepted_signers = {2, 3, 4};
+    event.absent_direct_children = {0, 1};
+    event.missing_optional_signers = {0, 1};
+    event.required_branch_gaps = {
+        RequiredBranchSignerGap{2, {5, 6}},
+        RequiredBranchSignerGap{3, {7}}};
+    event.root_signer_count = event.accepted_signers.size();
+    event.global_quorum = 5;
+
+    if (transition == AdaptiveAggregationTransition::configuration_active)
+    {
+        event.block_hash.reset();
+        event.context_generation.reset();
+    }
+    if (transition == AdaptiveAggregationTransition::delta_rejected ||
+        transition == AdaptiveAggregationTransition::proposal_aborted)
+        event.rejection_reason = "rejected";
+    if (transition == AdaptiveAggregationTransition::root_qc_published)
+        event.global_quorum = event.root_signer_count;
+    return event;
 }
 
 class FakeClock final : public StructuredEventClock
@@ -1191,6 +1228,336 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
 #else
     INFO("the structured contract remains active with human logs disabled");
 #endif
+}
+
+TEST_CASE("WE06-C04 maps every adaptive transition to one canonical event",
+          "[we06][c04][structured-event][adaptive][schema]")
+{
+    using AdaptiveEmit = void (AdaptiveStructuredEventEmitter::*)(
+        const AdaptiveAggregationStructuredEvent &) noexcept;
+    static_assert(
+        std::is_same<
+            decltype(&AdaptiveStructuredEventEmitter::emit_adaptive),
+            AdaptiveEmit>::value,
+        "adaptive emission is behavior-neutral noexcept evidence output");
+    static_assert(
+        std::is_base_of<
+            AdaptiveStructuredEventEmitter,
+            StructuredEventSink>::value,
+        "the bounded sink implements the separate adaptive capability");
+    static_assert(
+        std::variant_size<StructuredEventPayload>::value == 3,
+        "adaptive evidence does not broaden the legacy payload variant");
+
+    struct Mapping
+    {
+        AdaptiveAggregationTransition transition;
+        StructuredEventType type;
+        const char *name;
+    };
+    const std::array<Mapping, 18> mappings{{
+        {AdaptiveAggregationTransition::configuration_active,
+         StructuredEventType::adaptive_configuration_active,
+         "adaptive.configuration_active"},
+        {AdaptiveAggregationTransition::required_set_ready,
+         StructuredEventType::aggregation_required_set_ready,
+         "aggregation.required_set_ready"},
+        {AdaptiveAggregationTransition::initial_reserved,
+         StructuredEventType::aggregation_initial_reserved,
+         "aggregation.initial_reserved"},
+        {AdaptiveAggregationTransition::initial_enqueued,
+         StructuredEventType::aggregation_initial_enqueued,
+         "aggregation.initial_enqueued"},
+        {AdaptiveAggregationTransition::initial_committed,
+         StructuredEventType::aggregation_initial_committed,
+         "aggregation.initial_committed"},
+        {AdaptiveAggregationTransition::initial_released,
+         StructuredEventType::aggregation_initial_released,
+         "aggregation.initial_released"},
+        {AdaptiveAggregationTransition::delta_reserved,
+         StructuredEventType::aggregation_delta_reserved,
+         "aggregation.delta_reserved"},
+        {AdaptiveAggregationTransition::delta_enqueued,
+         StructuredEventType::aggregation_delta_enqueued,
+         "aggregation.delta_enqueued"},
+        {AdaptiveAggregationTransition::delta_committed,
+         StructuredEventType::aggregation_delta_committed,
+         "aggregation.delta_committed"},
+        {AdaptiveAggregationTransition::delta_released,
+         StructuredEventType::aggregation_delta_released,
+         "aggregation.delta_released"},
+        {AdaptiveAggregationTransition::delta_rejected,
+         StructuredEventType::aggregation_delta_rejected,
+         "aggregation.delta_rejected"},
+        {AdaptiveAggregationTransition::required_branch_incomplete,
+         StructuredEventType::aggregation_required_branch_incomplete,
+         "aggregation.required_branch_incomplete"},
+        {AdaptiveAggregationTransition::
+             wait_exempt_absent_at_observation_deadline,
+         StructuredEventType::aggregation_wait_exempt_absent,
+         "aggregation.wait_exempt_absent_at_observation_deadline"},
+        {AdaptiveAggregationTransition::wait_exempt_late_accepted,
+         StructuredEventType::aggregation_wait_exempt_late_accepted,
+         "aggregation.wait_exempt_late_accepted"},
+        {AdaptiveAggregationTransition::retry_exhausted,
+         StructuredEventType::aggregation_retry_exhausted,
+         "aggregation.retry_exhausted"},
+        {AdaptiveAggregationTransition::proposal_aborted,
+         StructuredEventType::aggregation_proposal_aborted,
+         "aggregation.proposal_aborted"},
+        {AdaptiveAggregationTransition::root_quorum_progress,
+         StructuredEventType::aggregation_root_quorum_progress,
+         "aggregation.root_quorum_progress"},
+        {AdaptiveAggregationTransition::root_qc_published,
+         StructuredEventType::aggregation_root_qc_published,
+         "aggregation.root_qc_published"},
+    }};
+
+    std::vector<StructuredEventType> observed_types;
+    std::vector<std::string> observed_names;
+    for (const auto &mapping : mappings)
+    {
+        CAPTURE(mapping.name);
+        CHECK(std::string(
+                  hotstuff::structured_event_type_name(mapping.type)) ==
+              mapping.name);
+        CHECK(std::find(
+                  observed_types.begin(), observed_types.end(),
+                  mapping.type) == observed_types.end());
+        CHECK(std::find(
+                  observed_names.begin(), observed_names.end(),
+                  mapping.name) == observed_names.end());
+
+        FakeClock clock({1000});
+        MemoryOutput output;
+        StructuredEventSink sink(event_config(), clock, output);
+        AdaptiveStructuredEventEmitter &protocol = sink;
+        protocol.emit_adaptive(adaptive_event(mapping.transition));
+        sink.shutdown();
+
+        const auto health = sink.health();
+        CHECK(health.healthy);
+        CHECK(health.complete_records == 1);
+        CHECK(complete_lines(output.bytes()).size() == 1);
+        CHECK(rendered(output).find(
+                  std::string{"\"event_type\":\""} +
+                  mapping.name + "\"") != std::string::npos);
+        observed_types.push_back(mapping.type);
+        observed_names.emplace_back(mapping.name);
+    }
+}
+
+TEST_CASE("WE06-C04 serializes exact adaptive identity in canonical order",
+          "[we06][c04][structured-event][adaptive][ndjson]")
+{
+    auto event = adaptive_event(
+        AdaptiveAggregationTransition::required_branch_incomplete);
+    event.rejection_reason = "reason-\"\\\n";
+    const auto expected =
+        "{\"event_schema_version\":1,"
+        "\"run_id\":\"run-structured-event\","
+        "\"source_kind\":\"replica\","
+        "\"source_id\":\"replica-2\","
+        "\"source_instance\":\"spawn-9\","
+        "\"source_sequence\":1,"
+        "\"source_monotonic_ns\":4321,"
+        "\"event_type\":\"aggregation.required_branch_incomplete\","
+        "\"payload\":{"
+        "\"epoch_number\":9,"
+        "\"tree_id\":2,"
+        "\"epoch_digest\":\"" +
+        event.configuration.epoch_digest.to_hex() + "\","
+        "\"block_hash\":\"" + event.block_hash->to_hex() + "\","
+        "\"context_generation\":17,"
+        "\"observer_replica\":4,"
+        "\"wait_exempt_signers\":[0,1],"
+        "\"accepted_signers\":[2,3,4],"
+        "\"absent_direct_children\":[0,1],"
+        "\"missing_optional_signers\":[0,1],"
+        "\"required_branch_gaps\":["
+        "{\"direct_child\":2,\"missing_required_signers\":[5,6]},"
+        "{\"direct_child\":3,\"missing_required_signers\":[7]}],"
+        "\"root_signer_count\":3,"
+        "\"global_quorum\":5,"
+        "\"rejection_reason\":\"reason-\\\"\\\\\\n\"}}\n";
+
+    FakeClock clock({4321});
+    MemoryOutput output;
+    StructuredEventSink sink(event_config(), clock, output);
+    sink.emit_adaptive(event);
+    const auto queued = sink.health();
+    CHECK(queued.healthy);
+    CHECK(queued.last_assigned_sequence == 1);
+    CHECK(queued.queued_events == 1);
+    CHECK(queued.queued_bytes == expected.size());
+    CHECK(output.write_calls() == 0);
+
+    sink.drain();
+    CHECK(rendered(output) == expected);
+    const auto parsed = hotstuff::parse_structured_event_prefix(
+        output.bytes());
+    CHECK(parsed.status == StructuredEventPrefixStatus::complete);
+    CHECK(parsed.complete_records == 1);
+    CHECK(parsed.complete_bytes == output.bytes().size());
+}
+
+TEST_CASE("WE06-C04 rejects noncanonical or incomplete adaptive payloads",
+          "[we06][c04][structured-event][adaptive][validation]")
+{
+    const auto rejects = [](AdaptiveAggregationStructuredEvent event) {
+        FakeClock clock({1000});
+        MemoryOutput output;
+        StructuredEventSink sink(event_config(), clock, output);
+        sink.emit_adaptive(event);
+        const auto failed = sink.health();
+        const bool rejected =
+            !failed.healthy && failed.stopped &&
+            failed.first_failure ==
+                StructuredEventFailure::invalid_payload &&
+            failed.last_assigned_sequence == 0 &&
+            failed.dropped_records == 1 && clock.calls() == 0 &&
+            output.bytes().empty() && output.write_calls() == 0;
+        sink.emit_adaptive(adaptive_event());
+        sink.drain();
+        return rejected && same_health(sink.health(), failed) &&
+               clock.calls() == 0 && output.bytes().empty();
+    };
+
+    SECTION("transition and exact identities are mandatory")
+    {
+        auto invalid = adaptive_event();
+        invalid.transition =
+            static_cast<AdaptiveAggregationTransition>(0);
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.configuration.epoch_digest = uint256_t{};
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.block_hash.reset();
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.block_hash = uint256_t{};
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.context_generation.reset();
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.context_generation = 0;
+        CHECK(rejects(invalid));
+    }
+
+    SECTION("configuration identity excludes proposal identity")
+    {
+        auto invalid = adaptive_event(
+            AdaptiveAggregationTransition::configuration_active);
+        invalid.block_hash = digest("unexpected-block");
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event(
+            AdaptiveAggregationTransition::configuration_active);
+        invalid.context_generation = 1;
+        CHECK(rejects(invalid));
+    }
+
+    SECTION("rejections and quorum observations carry their context")
+    {
+        auto invalid = adaptive_event(
+            AdaptiveAggregationTransition::delta_rejected);
+        invalid.rejection_reason.clear();
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event(
+            AdaptiveAggregationTransition::proposal_aborted);
+        invalid.rejection_reason.clear();
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event(
+            AdaptiveAggregationTransition::delta_rejected);
+        invalid.rejection_reason.assign(
+            1, static_cast<char>(0xff));
+        CHECK(rejects(invalid));
+
+        for (const auto transition : {
+                 AdaptiveAggregationTransition::configuration_active,
+                 AdaptiveAggregationTransition::root_quorum_progress,
+                 AdaptiveAggregationTransition::root_qc_published})
+        {
+            invalid = adaptive_event(transition);
+            invalid.global_quorum = 0;
+            CHECK(rejects(invalid));
+        }
+
+        invalid = adaptive_event(
+            AdaptiveAggregationTransition::root_quorum_progress);
+        ++invalid.root_signer_count;
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event(
+            AdaptiveAggregationTransition::root_qc_published);
+        ++invalid.global_quorum;
+        CHECK(rejects(invalid));
+    }
+
+    SECTION("every signer sequence uses canonical increasing order")
+    {
+        auto invalid = adaptive_event();
+        invalid.wait_exempt_signers = {1, 0};
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.accepted_signers = {2, 2};
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.absent_direct_children = {1, 0};
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.missing_optional_signers = {0, 0};
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.required_branch_gaps[0].missing_required_signers = {6, 5};
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        invalid.required_branch_gaps[0].missing_required_signers.clear();
+        CHECK(rejects(invalid));
+
+        invalid = adaptive_event();
+        std::swap(
+            invalid.required_branch_gaps[0],
+            invalid.required_branch_gaps[1]);
+        CHECK(rejects(invalid));
+    }
+
+    SECTION("adaptive records remain bounded by the shared sink")
+    {
+        auto config = event_config();
+        config.limits.maximum_line_bytes = 256;
+        auto oversized = adaptive_event(
+            AdaptiveAggregationTransition::delta_rejected);
+        oversized.rejection_reason.assign(512, 'x');
+        FakeClock clock({1000});
+        MemoryOutput output;
+        StructuredEventSink sink(config, clock, output);
+
+        sink.emit_adaptive(oversized);
+        const auto failed = sink.health();
+        CHECK_FALSE(failed.healthy);
+        CHECK(failed.first_failure ==
+              StructuredEventFailure::line_too_large);
+        CHECK(failed.last_assigned_sequence == 0);
+        CHECK(failed.dropped_records == 1);
+        CHECK(clock.calls() == 1);
+        CHECK(output.bytes().empty());
+        CHECK(output.write_calls() == 0);
+    }
 }
 
 TEST_CASE("V13 rejects every invalid closed payload discriminator",
