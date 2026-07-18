@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "catch.hpp"
+#include "hotstuff/entity.h"
 #include "hotstuff/epoch_change.h"
 
 namespace
@@ -17,6 +18,8 @@ using hotstuff::EpochChangeDisposition;
 using hotstuff::EpochChangeHistoryView;
 using hotstuff::EpochChangeIssuer;
 using hotstuff::EpochChangePayload;
+using hotstuff::EpochChangeExtraDisposition;
+using hotstuff::EpochChangeProposalDisposition;
 using hotstuff::EpochChangeVerifier;
 using hotstuff::EpochDefinitionInput;
 using hotstuff::EpochDefinitionReply;
@@ -27,10 +30,23 @@ using hotstuff::EpochTreeDefinition;
 using hotstuff::EpochValidationContext;
 using hotstuff::EpochWireLimits;
 using hotstuff::PrivKeySecp256k1;
+using hotstuff::QuorumCertDummy;
 using hotstuff::ReplicaID;
+using hotstuff::block_t;
+using hotstuff::bytearray_t;
+using hotstuff::quorum_cert_bt;
 using hotstuff::uint256_t;
 
 constexpr std::uint32_t kIssuerId = 17;
+
+static_assert(noexcept(hotstuff::evaluate_epoch_change_proposal_control(
+    std::declval<const bytearray_t &>(),
+    std::declval<std::size_t>(),
+    std::declval<const EpochChangeVerifier &>(),
+    std::declval<const hotstuff::EpochDefinition &>(),
+    std::declval<const EpochStore &>(),
+    std::declval<const EpochChangeHistoryView &>())),
+    "proposal-control evaluation must reject internal failures, not throw");
 
 uint256_t digest(const char *label)
 {
@@ -149,6 +165,53 @@ std::size_t definition_tree_wire_size(
            definition.members_breadth_first.size() * sizeof(ReplicaID) +
            sizeof(std::uint32_t) +
            definition.wait_exempt_leaves.size() * sizeof(ReplicaID);
+}
+
+block_t proposal_with_extra(
+    bytearray_t extra,
+    std::vector<uint256_t> commands = {digest("application-command")})
+{
+    const std::vector<block_t> parents;
+    quorum_cert_bt qc = new QuorumCertDummy();
+    return block_t(new hotstuff::Block(
+        parents,
+        commands,
+        qc->clone(),
+        std::move(extra),
+        1,
+        nullptr,
+        nullptr));
+}
+
+bytearray_t high_s_epoch_change_wire(bytearray_t wire)
+{
+    hotstuff::DataStream order_stream;
+    order_stream.load_hex(
+        "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+    const bytearray_t order = static_cast<bytearray_t>(order_stream);
+    REQUIRE(order.size() == 32);
+    REQUIRE(wire.size() >= order.size());
+    const auto s_offset = wire.size() - order.size();
+    unsigned borrow = 0;
+    for (std::size_t remaining = order.size(); remaining > 0; --remaining)
+    {
+        const auto index = remaining - 1;
+        int difference = static_cast<int>(order[index]) -
+                         static_cast<int>(wire[s_offset + index]) -
+                         static_cast<int>(borrow);
+        if (difference < 0)
+        {
+            difference += 256;
+            borrow = 1;
+        }
+        else
+        {
+            borrow = 0;
+        }
+        wire[s_offset + index] = static_cast<std::uint8_t>(difference);
+    }
+    REQUIRE(borrow == 0);
+    return wire;
 }
 
 } // namespace
@@ -649,4 +712,360 @@ TEST_CASE("C07 defers a valid command until its definition is available",
         EpochChangeHistoryView{accepted.payload_digest});
     CHECK(conflict.disposition ==
           EpochChangeDisposition::conflicting_successor);
+}
+
+TEST_CASE("C08b1 extracts zero or one canonical epoch command from block extra",
+          "[c08b1][epoch-change][block-extra][canonical]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    const auto command = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, digest("predecessor"), digest("successor"), 5},
+        kIssuerId,
+        key);
+    const auto wire = hotstuff::encode_epoch_change_block_extra(command);
+
+    const auto empty = hotstuff::extract_epoch_change_block_extra(
+        bytearray_t{}, limits().maximum_payload_bytes);
+    CHECK(empty.disposition == EpochChangeExtraDisposition::absent);
+    CHECK(empty.wire_error == hotstuff::EpochChangeWireError::none);
+    CHECK_FALSE(empty.command.has_value());
+    CHECK_FALSE(empty.payload_digest.has_value());
+    CHECK_FALSE(empty.envelope_digest.has_value());
+
+    const auto invalid_limit = hotstuff::extract_epoch_change_block_extra(
+        bytearray_t{}, 0);
+    CHECK(invalid_limit.disposition ==
+          EpochChangeExtraDisposition::rejected);
+    CHECK(invalid_limit.wire_error ==
+          hotstuff::EpochChangeWireError::invalid_limit);
+
+    const auto canonical = hotstuff::extract_epoch_change_block_extra(
+        wire, wire.size());
+    CHECK(canonical.disposition == EpochChangeExtraDisposition::present);
+    CHECK(canonical.wire_error == hotstuff::EpochChangeWireError::none);
+    REQUIRE(canonical.command.has_value());
+    CHECK(canonical.command->payload == command.payload);
+    REQUIRE(canonical.payload_digest.has_value());
+    CHECK(*canonical.payload_digest ==
+          hotstuff::epoch_change_payload_digest(command.payload));
+    REQUIRE(canonical.envelope_digest.has_value());
+    CHECK(*canonical.envelope_digest ==
+          hotstuff::epoch_change_envelope_digest(command));
+    CHECK(hotstuff::encode_epoch_change_block_extra(*canonical.command) ==
+          wire);
+
+    const auto oversized = hotstuff::extract_epoch_change_block_extra(
+        wire, wire.size() - 1);
+    CHECK(oversized.disposition == EpochChangeExtraDisposition::rejected);
+    CHECK(oversized.wire_error ==
+          hotstuff::EpochChangeWireError::payload_too_large);
+
+    auto malformed = wire;
+    malformed.front() ^= 0x01;
+    const auto invalid_domain = hotstuff::extract_epoch_change_block_extra(
+        malformed, limits().maximum_payload_bytes);
+    CHECK(invalid_domain.disposition ==
+          EpochChangeExtraDisposition::rejected);
+    CHECK(invalid_domain.wire_error ==
+          hotstuff::EpochChangeWireError::invalid_domain);
+
+    malformed = wire;
+    malformed.pop_back();
+    const auto truncated = hotstuff::extract_epoch_change_block_extra(
+        malformed, limits().maximum_payload_bytes);
+    CHECK(truncated.disposition == EpochChangeExtraDisposition::rejected);
+    CHECK(truncated.wire_error ==
+          hotstuff::EpochChangeWireError::truncated);
+
+    malformed = wire;
+    malformed.push_back(0);
+    const auto trailing = hotstuff::extract_epoch_change_block_extra(
+        malformed, limits().maximum_payload_bytes);
+    CHECK(trailing.disposition == EpochChangeExtraDisposition::rejected);
+    CHECK(trailing.wire_error ==
+          hotstuff::EpochChangeWireError::trailing_bytes);
+
+    const auto two_commands = [&]() {
+        auto value = wire;
+        value.insert(value.end(), wire.begin(), wire.end());
+        return value;
+    }();
+    const auto multiple = hotstuff::extract_epoch_change_block_extra(
+        two_commands, 2 * limits().maximum_payload_bytes);
+    CHECK(multiple.disposition == EpochChangeExtraDisposition::rejected);
+    CHECK(multiple.wire_error ==
+          hotstuff::EpochChangeWireError::trailing_bytes);
+
+    const auto noncanonical = hotstuff::extract_epoch_change_block_extra(
+        high_s_epoch_change_wire(wire), limits().maximum_payload_bytes);
+    CHECK(noncanonical.disposition == EpochChangeExtraDisposition::rejected);
+    CHECK(noncanonical.wire_error ==
+          hotstuff::EpochChangeWireError::noncanonical_encoding);
+}
+
+TEST_CASE("C08b1 proposal control authenticates before definition retrieval",
+          "[c08b1][epoch-change][proposal-control][auth-first]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next_digest = hotstuff::compute_epoch_digest(
+        successor(active.epoch_digest()));
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto evaluate = [&](
+        const AuthorizedEpochChange &candidate,
+        const EpochChangeHistoryView &history = {}) {
+        const auto extra = hotstuff::encode_epoch_change_block_extra(candidate);
+        return hotstuff::evaluate_epoch_change_proposal_control(
+            extra,
+            limits().maximum_payload_bytes,
+            verifier,
+            active,
+            store,
+            history);
+    };
+    const auto reject_without_request = [&](
+        const AuthorizedEpochChange &candidate,
+        EpochChangeDisposition expected) {
+        const auto result = evaluate(candidate);
+        CHECK(result.disposition == EpochChangeProposalDisposition::rejected);
+        CHECK(result.wire_error == hotstuff::EpochChangeWireError::none);
+        REQUIRE(result.command.has_value());
+        REQUIRE(result.validation.has_value());
+        CHECK(result.validation->disposition == expected);
+        CHECK_FALSE(result.validation->recovery_request.has_value());
+    };
+
+    const auto empty = hotstuff::evaluate_epoch_change_proposal_control(
+        bytearray_t{},
+        limits().maximum_payload_bytes,
+        verifier,
+        active,
+        store,
+        EpochChangeHistoryView{});
+    CHECK(empty.disposition == EpochChangeProposalDisposition::accepted);
+    CHECK_FALSE(empty.command.has_value());
+    CHECK_FALSE(empty.validation.has_value());
+
+    auto invalid_signature = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, active.epoch_digest(), next_digest, 5},
+        kIssuerId,
+        key);
+    invalid_signature.payload.successor_epoch_digest =
+        digest("attacker-selected-missing-definition");
+    reject_without_request(
+        invalid_signature, EpochChangeDisposition::invalid_signature);
+
+    const auto wrong_issuer = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, active.epoch_digest(), next_digest, 5},
+        kIssuerId + 1,
+        key);
+    reject_without_request(
+        wrong_issuer, EpochChangeDisposition::unauthorized_issuer);
+    reject_without_request(
+        hotstuff::authorize_epoch_change(
+            EpochChangePayload{1, active.epoch_digest(), next_digest, 1},
+            kIssuerId,
+            key),
+        EpochChangeDisposition::invalid_delay);
+    reject_without_request(
+        hotstuff::authorize_epoch_change(
+            EpochChangePayload{1, digest("wrong-predecessor"), next_digest, 5},
+            kIssuerId,
+            key),
+        EpochChangeDisposition::wrong_predecessor);
+    reject_without_request(
+        hotstuff::authorize_epoch_change(
+            EpochChangePayload{2, active.epoch_digest(), next_digest, 5},
+            kIssuerId,
+            key),
+        EpochChangeDisposition::invalid_successor);
+
+    const auto valid = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, active.epoch_digest(), next_digest, 5},
+        kIssuerId,
+        key);
+    const auto conflict = evaluate(
+        valid, EpochChangeHistoryView{digest("different-command")});
+    CHECK(conflict.disposition == EpochChangeProposalDisposition::rejected);
+    REQUIRE(conflict.validation.has_value());
+    CHECK(conflict.validation->disposition ==
+          EpochChangeDisposition::conflicting_successor);
+    CHECK_FALSE(conflict.validation->recovery_request.has_value());
+
+    const auto valid_wire = hotstuff::encode_epoch_change_block_extra(valid);
+    const auto expect_wire_rejected = [&](
+        const bytearray_t &wire,
+        hotstuff::EpochChangeWireError expected) {
+        const auto result = hotstuff::evaluate_epoch_change_proposal_control(
+            wire,
+            limits().maximum_payload_bytes,
+            verifier,
+            active,
+            store,
+            EpochChangeHistoryView{});
+        CHECK(result.disposition ==
+              EpochChangeProposalDisposition::rejected);
+        CHECK(result.wire_error == expected);
+        CHECK_FALSE(result.command.has_value());
+        CHECK_FALSE(result.validation.has_value());
+    };
+
+    auto malformed = valid_wire;
+    malformed.push_back(0);
+    expect_wire_rejected(
+        malformed, hotstuff::EpochChangeWireError::trailing_bytes);
+
+    const auto signing_bytes =
+        hotstuff::canonical_epoch_change_signing_bytes(valid);
+    constexpr std::size_t fixed_signing_fields =
+        sizeof(std::uint32_t) +
+        sizeof(std::uint8_t) +
+        sizeof(hotstuff::EpochChangeIssuerId) +
+        sizeof(std::uint32_t) +
+        2 * 32 +
+        sizeof(std::uint64_t);
+    REQUIRE(signing_bytes.size() > fixed_signing_fields);
+    const auto domain_bytes = signing_bytes.size() - fixed_signing_fields;
+    malformed = valid_wire;
+    malformed[domain_bytes + sizeof(std::uint32_t) - 1] = 2;
+    expect_wire_rejected(
+        malformed, hotstuff::EpochChangeWireError::unsupported_schema);
+    malformed = valid_wire;
+    malformed[domain_bytes + sizeof(std::uint32_t)] =
+        static_cast<std::uint8_t>(EpochProtocolMode::adaptive_v1);
+    expect_wire_rejected(
+        malformed, hotstuff::EpochChangeWireError::unsupported_mode);
+}
+
+TEST_CASE("C08b1 defers until the exact definition and then preserves history",
+          "[c08b1][epoch-change][proposal-control][availability][history]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next = successor(active.epoch_digest());
+    const auto next_digest = hotstuff::compute_epoch_digest(next);
+    const auto command = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, active.epoch_digest(), next_digest, 5},
+        kIssuerId,
+        key);
+    const auto extra = hotstuff::encode_epoch_change_block_extra(command);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto evaluate = [&](const EpochChangeHistoryView &history = {}) {
+        return hotstuff::evaluate_epoch_change_proposal_control(
+            extra,
+            limits().maximum_payload_bytes,
+            verifier,
+            active,
+            store,
+            history);
+    };
+    const auto payload_digest =
+        hotstuff::epoch_change_payload_digest(command.payload);
+
+    const auto missing = evaluate();
+    CHECK(missing.disposition == EpochChangeProposalDisposition::defer);
+    REQUIRE(missing.command.has_value());
+    REQUIRE(missing.validation.has_value());
+    CHECK(missing.validation->payload_digest == payload_digest);
+    CHECK(missing.validation->envelope_digest ==
+          hotstuff::epoch_change_envelope_digest(command));
+    REQUIRE(missing.validation->recovery_request.has_value());
+    CHECK(missing.validation->recovery_request->successor_epoch_digest ==
+          next_digest);
+
+    const auto duplicate_missing = evaluate(
+        EpochChangeHistoryView{payload_digest});
+    CHECK(duplicate_missing.disposition ==
+          EpochChangeProposalDisposition::defer);
+    REQUIRE(duplicate_missing.validation.has_value());
+    REQUIRE(duplicate_missing.validation->recovery_request.has_value());
+    CHECK(duplicate_missing.validation->recovery_request
+              ->successor_epoch_digest == next_digest);
+
+    const auto reply_wire = hotstuff::encode_epoch_wire(
+        EpochDefinitionReply{
+            hotstuff::kEpochWireSchemaVersionV2,
+            EpochProtocolMode::adaptive_v2,
+            next_digest,
+            next},
+        limits());
+    const auto reply = hotstuff::decode_epoch_definition_reply(
+        reply_wire, EpochProtocolMode::adaptive_v2, limits());
+    REQUIRE(reply);
+    REQUIRE(store.stage_available_v2(
+                reply.value->definition, active)
+                .disposition ==
+            hotstuff::DefinitionAvailabilityDisposition::staged);
+    const auto accepted = evaluate();
+    CHECK(accepted.disposition == EpochChangeProposalDisposition::accepted);
+    REQUIRE(accepted.validation.has_value());
+    CHECK(accepted.validation->successor_definition ==
+          store.find_epoch_by_digest(next_digest));
+    CHECK_FALSE(accepted.validation->recovery_request.has_value());
+
+    const auto ancestry_duplicate = evaluate(
+        EpochChangeHistoryView{payload_digest});
+    CHECK(ancestry_duplicate.disposition ==
+          EpochChangeProposalDisposition::duplicate);
+    REQUIRE(ancestry_duplicate.validation.has_value());
+    CHECK(ancestry_duplicate.validation->disposition ==
+          EpochChangeDisposition::duplicate);
+    CHECK(ancestry_duplicate.validation->successor_definition ==
+          store.find_epoch_by_digest(next_digest));
+    CHECK_FALSE(ancestry_duplicate.validation->recovery_request.has_value());
+
+    const auto committed_duplicate = evaluate(
+        EpochChangeHistoryView{std::nullopt, payload_digest});
+    CHECK(committed_duplicate.disposition ==
+          EpochChangeProposalDisposition::duplicate);
+
+    const auto conflict = evaluate(EpochChangeHistoryView{
+        payload_digest, digest("different-committed-command")});
+    CHECK(conflict.disposition == EpochChangeProposalDisposition::rejected);
+    REQUIRE(conflict.validation.has_value());
+    CHECK(conflict.validation->disposition ==
+          EpochChangeDisposition::conflicting_successor);
+    CHECK_FALSE(conflict.validation->recovery_request.has_value());
+}
+
+TEST_CASE("C08b1 block extra changes identity without becoming an app command",
+          "[c08b1][epoch-change][block-extra][block-hash]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    const auto command = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, digest("predecessor"), digest("successor"), 5},
+        kIssuerId,
+        key);
+    const std::vector<uint256_t> application_commands = {
+        digest("application-1"), digest("application-2")};
+    const auto without_control = proposal_with_extra(
+        bytearray_t{}, application_commands);
+    const auto with_control = proposal_with_extra(
+        hotstuff::encode_epoch_change_block_extra(command),
+        application_commands);
+
+    hotstuff::DataStream without_control_qc;
+    hotstuff::DataStream with_control_qc;
+    without_control->get_qc()->serialize(without_control_qc);
+    with_control->get_qc()->serialize(with_control_qc);
+
+    CHECK(without_control->get_parent_hashes() ==
+          with_control->get_parent_hashes());
+    CHECK(without_control->get_cmds() == with_control->get_cmds());
+    CHECK(without_control->get_cmds() == application_commands);
+    CHECK(static_cast<bytearray_t>(without_control_qc) ==
+          static_cast<bytearray_t>(with_control_qc));
+    CHECK(without_control->get_hash() != with_control->get_hash());
+    CHECK(without_control->get_extra().empty());
+    CHECK_FALSE(with_control->get_extra().empty());
 }

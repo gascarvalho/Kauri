@@ -79,6 +79,7 @@ enum class EpochChangeWireError : std::uint8_t
     unsupported_schema,
     unsupported_mode,
     malformed_signature,
+    noncanonical_encoding,
     allocation_failure,
     internal_failure,
 };
@@ -96,6 +97,30 @@ struct EpochChangeDecodeResult
 
 EpochChangeDecodeResult decode_authorized_epoch_change(
     const bytearray_t &payload,
+    std::size_t maximum_payload_bytes) noexcept;
+
+enum class EpochChangeExtraDisposition : std::uint8_t
+{
+    absent = 0,
+    present,
+    rejected,
+};
+
+struct EpochChangeBlockExtraResult
+{
+    EpochChangeExtraDisposition disposition{
+        EpochChangeExtraDisposition::rejected};
+    EpochChangeWireError wire_error{EpochChangeWireError::none};
+    std::optional<AuthorizedEpochChange> command;
+    std::optional<uint256_t> payload_digest;
+    std::optional<uint256_t> envelope_digest;
+};
+
+bytearray_t encode_epoch_change_block_extra(
+    const AuthorizedEpochChange &command);
+
+EpochChangeBlockExtraResult extract_epoch_change_block_extra(
+    const bytearray_t &extra,
     std::size_t maximum_payload_bytes) noexcept;
 
 struct EpochChangeDelayBounds
@@ -154,6 +179,31 @@ private:
     const EpochChangeIssuer issuer_;
     const EpochChangeDelayBounds delay_bounds_;
 };
+
+enum class EpochChangeProposalDisposition : std::uint8_t
+{
+    accepted = 0,
+    duplicate,
+    defer,
+    rejected,
+};
+
+struct EpochChangeProposalControlResult
+{
+    EpochChangeProposalDisposition disposition{
+        EpochChangeProposalDisposition::rejected};
+    EpochChangeWireError wire_error{EpochChangeWireError::none};
+    std::optional<AuthorizedEpochChange> command;
+    std::optional<EpochChangeValidationResult> validation;
+};
+
+EpochChangeProposalControlResult evaluate_epoch_change_proposal_control(
+    const bytearray_t &extra,
+    std::size_t maximum_payload_bytes,
+    const EpochChangeVerifier &verifier,
+    const EpochDefinition &active_epoch,
+    const EpochStore &store,
+    const EpochChangeHistoryView &history) noexcept;
 
 } // namespace hotstuff
 
