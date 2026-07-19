@@ -176,6 +176,12 @@ struct AdaptiveV2PreVoteConfig
     std::size_t maximum_ancestry_blocks{0};
 };
 
+struct AdaptiveV2ManagerPin
+{
+    NetAddr address;
+    salticidae::PeerId peer;
+};
+
 struct ReplicaStructuredEventOptions
 {
     hotstuff::StructuredEventConfig config;
@@ -277,6 +283,54 @@ parse_adaptive_v2_pre_vote_config(
             maximum_ancestry_blocks,
             "maximum ancestry blocks",
             true)};
+}
+
+std::optional<AdaptiveV2ManagerPin> parse_adaptive_v2_manager_pin(
+    const std::string &protocol_mode,
+    const std::string &manager_address,
+    const std::string &manager_tls_certificate_hex)
+{
+    if (protocol_mode != "adaptive_v2")
+        return std::nullopt;
+    if (manager_address.empty())
+        throw HotStuffError(
+            "adaptive-v2 epoch manager address is required");
+    if (manager_tls_certificate_hex.empty() ||
+        manager_tls_certificate_hex.size() % 2 != 0 ||
+        !std::all_of(
+            manager_tls_certificate_hex.begin(),
+            manager_tls_certificate_hex.end(),
+            [](unsigned char character) {
+                return std::isxdigit(character) != 0;
+            }))
+    {
+        throw HotStuffError(
+            "adaptive-v2 epoch manager TLS certificate is invalid");
+    }
+
+    try
+    {
+        NetAddr address(manager_address);
+        if (address.is_null())
+            throw HotStuffError(
+                "adaptive-v2 epoch manager address is invalid");
+        const auto manager_certificate = salticidae::X509::create_from_der(
+            hotstuff::from_hex(manager_tls_certificate_hex));
+        const salticidae::PeerId manager_peer(manager_certificate);
+        if (manager_peer.is_null())
+            throw HotStuffError(
+                "adaptive-v2 epoch manager TLS certificate is invalid");
+        return AdaptiveV2ManagerPin{address, manager_peer};
+    }
+    catch (const HotStuffError &)
+    {
+        throw;
+    }
+    catch (const std::exception &)
+    {
+        throw HotStuffError(
+            "adaptive-v2 epoch manager address or TLS certificate is invalid");
+    }
 }
 
 std::optional<ReplicaStructuredEventOptions>
@@ -388,6 +442,8 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_epoch_change_maximum_ancestry_blocks =
         Config::OptValStr::create("");
+    auto opt_epoch_manager_address = Config::OptValStr::create("");
+    auto opt_epoch_manager_tls_cert = Config::OptValStr::create("");
     auto opt_structured_event_run_id = Config::OptValStr::create("");
     auto opt_structured_event_source_instance =
         Config::OptValStr::create("");
@@ -488,6 +544,18 @@ int main(int argc, char **argv)
         -1,
         "maximum adaptive-v2 proposal ancestry blocks");
     config.add_opt(
+        "epoch-manager-address",
+        opt_epoch_manager_address,
+        Config::SET_VAL,
+        -1,
+        "pinned adaptive-v2 manager replica-network address");
+    config.add_opt(
+        "epoch-manager-tls-cert",
+        opt_epoch_manager_tls_cert,
+        Config::SET_VAL,
+        -1,
+        "pinned adaptive-v2 manager TLS certificate DER in hex");
+    config.add_opt(
         "structured-event-run-id",
         opt_structured_event_run_id,
         Config::SET_VAL,
@@ -576,6 +644,21 @@ int main(int argc, char **argv)
         epoch_protocol_mode = EpochProtocolMode::adaptive_v2;
     else
         throw HotStuffError("invalid epoch protocol mode");
+    const auto adaptive_v2_manager_pin = parse_adaptive_v2_manager_pin(
+        opt_epoch_protocol_mode->get(),
+        opt_epoch_manager_address->get(),
+        opt_epoch_manager_tls_cert->get());
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+        (opt_notls->get() || opt_tls_privkey->get().empty() ||
+         opt_tls_cert->get().empty()))
+    {
+        throw HotStuffError(
+            "adaptive-v2 replica networking requires TLS credentials");
+    }
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+        opt_max_rep_msg->get() <= 0)
+        throw HotStuffError(
+            "adaptive-v2 maximum replica message size must be positive");
     if (opt_adaptive_activation_height->get() < 0)
         throw HotStuffError("adaptive activation height must be non-negative");
     std::string binding_addr = std::get<0>(replicas[idx]);
@@ -719,7 +802,14 @@ int main(int argc, char **argv)
             pre_vote_config.issuer,
             pre_vote_config.delay_bounds,
             pre_vote_config.maximum_block_extra_bytes,
-            pre_vote_config.maximum_ancestry_blocks);
+            pre_vote_config.maximum_ancestry_blocks,
+            static_cast<std::size_t>(opt_max_rep_msg->get()));
+        if (!adaptive_v2_manager_pin.has_value())
+            throw HotStuffError(
+                "adaptive-v2 epoch manager pin is unavailable");
+        papp->configure_epoch_manager(
+            adaptive_v2_manager_pin->peer,
+            adaptive_v2_manager_pin->address);
     }
 
     HOTSTUFF_LOG_INFO("*** thread info ***");

@@ -832,7 +832,7 @@ TEST_CASE("pipelined leaders admit the exact local proposal before broadcast",
         "void HotStuffBase::print_pipe_queues");
     const auto piped_branch = without_whitespace(source_slice(
         beat,
-        "block_t piped_block = storage->add_blk",
+        "block_t piped_block;",
         "piped_submitted = false;"));
 
     const auto configuration = piped_branch.find(

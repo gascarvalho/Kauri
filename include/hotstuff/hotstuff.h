@@ -35,6 +35,7 @@
 #include "hotstuff/block_delivery_orchestration.h"
 #include "hotstuff/consensus.h"
 #include "hotstuff/exact_vote_handler.h"
+#include "hotstuff/epoch_change_inbox.h"
 #include "hotstuff/epoch_live_binding.h"
 #include "hotstuff/epoch_runtime_wiring.h"
 #include "hotstuff/pending_exact_contribution_buffer.h"
@@ -1106,6 +1107,12 @@ namespace hotstuff
         std::unique_ptr<AdaptiveEpochRuntime> adaptive_epoch_runtime;
         HotStuffEpochLiveBinding *epoch_live_binding{nullptr};
         std::unique_ptr<EpochChangeVerifier> epoch_change_verifier;
+        std::optional<EpochChangeBundleLimits>
+            adaptive_v2_epoch_change_bundle_limits;
+        std::unique_ptr<AdaptiveV2CommandInbox>
+            adaptive_v2_command_inbox;
+        std::optional<std::uint64_t>
+            adaptive_v2_pending_command_reservation;
         std::size_t epoch_change_maximum_block_extra_bytes{0};
         std::size_t epoch_change_maximum_ancestry_blocks{0};
         struct CommittedEpochChangeHistoryState
@@ -1119,6 +1126,7 @@ namespace hotstuff
         {
             uint256_t block_hash;
             AuthorizedEpochChange command;
+            uint256_t payload_digest;
         };
         std::optional<PendingCommittedEpochChange>
             pending_committed_epoch_change;
@@ -1219,6 +1227,9 @@ namespace hotstuff
         void adaptive_definition_reply_handler(
             MsgEpochDefinitionReply &&message,
             const Net::conn_t &conn);
+        void adaptive_v2_epoch_change_bundle_handler(
+            MsgAdaptiveV2EpochChangeBundle &&message,
+            const Net::conn_t &conn);
         bool authorize_manager_peer(const PeerId &peer) const noexcept;
         void bind_adaptive_v2_manager_reporting_transport();
         EvidenceTransportResult enqueue_adaptive_v2_evidence_report(
@@ -1239,6 +1250,13 @@ namespace hotstuff
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
             const std::vector<ProposalKey> &committed_keys) const;
+        std::optional<uint256_t>
+        adaptive_v2_committed_epoch_change_payload_digest(
+            const block_t &blk) const noexcept;
+        void observe_authoritative_commit(
+            const std::optional<ProposalKey> &committed_proposal,
+            const std::optional<uint256_t> &committed_payload_digest)
+            noexcept;
         bool observe_proposal_view_generation(
             const ProposalKey &key,
             std::uint64_t generation) noexcept;
@@ -1460,7 +1478,8 @@ namespace hotstuff
             EpochChangeIssuer issuer,
             EpochChangeDelayBounds delay_bounds,
             std::size_t maximum_block_extra_bytes,
-            std::size_t maximum_ancestry_blocks);
+            std::size_t maximum_ancestry_blocks,
+            std::size_t maximum_bundle_bytes = 4 << 20);
         /**
          * Borrow event emitters without taking ownership. Passing null
          * unbinds a capability; bound emitters must outlive HotStuffBase.

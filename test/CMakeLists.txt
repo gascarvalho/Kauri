@@ -457,6 +457,21 @@ set_tests_properties(
     LABELS "integration;adaptive;adaptive-v2;intentional-red;structured-event;we06-c10;ownership"
     TIMEOUT 20)
 
+add_kauri_catch_test(
+    test_adaptive_v2_live_successor_wiring
+    test_adaptive_v2_live_successor_wiring.cpp)
+target_compile_definitions(
+    test_adaptive_v2_live_successor_wiring PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+    KAURI_HOTSTUFF_APP_PATH="$<TARGET_FILE:hotstuff-app>")
+add_dependencies(
+    test_adaptive_v2_live_successor_wiring
+    hotstuff-app)
+set_tests_properties(
+    test_adaptive_v2_live_successor_wiring PROPERTIES
+    LABELS "wiring;adaptive;adaptive-v2;intentional-red;live-successor;we08"
+    TIMEOUT 20)
+
 set(KAURI_COMPONENT_TEST_TARGETS
     test_commit_rule
     test_protocol_integration)

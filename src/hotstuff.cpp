@@ -2103,7 +2103,9 @@ namespace hotstuff
             if (extracted.command)
                 pending_committed_epoch_change.emplace(
                     PendingCommittedEpochChange{
-                        block->get_hash(), *extracted.command});
+                        block->get_hash(),
+                        *extracted.command,
+                        *extracted.payload_digest});
         }
         catch (...)
         {
@@ -4111,6 +4113,55 @@ namespace hotstuff
             recovery->second.request_live = true;
     }
 
+    void HotStuffBase::adaptive_v2_epoch_change_bundle_handler(
+        MsgAdaptiveV2EpochChangeBundle &&message,
+        const Net::conn_t &conn)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            conn == nullptr || adaptive_v2_command_inbox == nullptr ||
+            !adaptive_v2_epoch_change_bundle_limits.has_value() ||
+            epoch_change_verifier == nullptr || exact_epochs == nullptr ||
+            adaptive_epoch_runtime == nullptr)
+            return;
+
+        const auto peer = conn->get_peer_id();
+        if (!authorize_manager_peer(peer))
+            return;
+        const auto pinned_connection = pn.get_peer_conn(peer);
+        const auto *certificate = conn->get_peer_cert();
+        if (pinned_connection == nullptr || pinned_connection != conn ||
+            certificate == nullptr || PeerId(*certificate) != peer)
+            return;
+
+        const auto decoded = decode_adaptive_v2_epoch_change_bundle(
+            static_cast<bytearray_t>(message.serialized),
+            *adaptive_v2_epoch_change_bundle_limits);
+        if (!decoded)
+            return;
+
+        const auto active_configuration =
+            adaptive_epoch_runtime->activation.active_effect().configuration;
+        const auto *active_epoch = exact_epochs->find_epoch(
+            active_configuration.epoch_number);
+        if (active_epoch == nullptr ||
+            active_epoch->epoch_digest() !=
+                active_configuration.epoch_digest)
+            return;
+
+        auto &command_inbox = *adaptive_v2_command_inbox;
+        const auto result = command_inbox.ingest(
+            *decoded.value,
+            *active_epoch,
+            *epoch_change_verifier,
+            *exact_epochs);
+        if (result.disposition ==
+                AdaptiveV2CommandIngestDisposition::internal_failure)
+        {
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Adaptive-v2 successor inbox failed internally");
+        }
+    }
+
     void HotStuffBase::adaptive_propose_handler(
         MsgPropose &&message,
         const Net::conn_t &conn)
@@ -5243,6 +5294,9 @@ namespace hotstuff
     void HotStuffBase::install_adaptive_v2_definition_handlers()
     {
         pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_v2_epoch_change_bundle_handler,
+            this, _1, _2));
+        pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_definition_request_handler,
             this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(
@@ -5908,7 +5962,8 @@ namespace hotstuff
         EpochChangeIssuer issuer,
         EpochChangeDelayBounds delay_bounds,
         std::size_t maximum_block_extra_bytes,
-        std::size_t maximum_ancestry_blocks)
+        std::size_t maximum_ancestry_blocks,
+        std::size_t maximum_bundle_bytes)
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             throw std::logic_error(
@@ -5920,16 +5975,28 @@ namespace hotstuff
             throw std::logic_error(
                 "epoch-change voting configuration is already pinned");
         if (maximum_block_extra_bytes == 0 ||
-            maximum_ancestry_blocks == 0)
+            maximum_ancestry_blocks == 0 || maximum_bundle_bytes == 0 ||
+            maximum_block_extra_bytes > maximum_bundle_bytes)
             throw std::invalid_argument(
-                "epoch-change voting bounds must be nonzero");
+                "epoch-change voting bounds are invalid");
 
         auto verifier = std::make_unique<EpochChangeVerifier>(
             std::move(issuer), delay_bounds);
+        const EpochChangeBundleLimits bundle_limits{
+            maximum_bundle_bytes,
+            maximum_block_extra_bytes,
+            epoch_wire_limits};
+        auto command_inbox = std::make_unique<AdaptiveV2CommandInbox>(
+            AdaptiveV2CommandInboxLimits{
+                maximum_bundle_bytes,
+                maximum_block_extra_bytes,
+                std::numeric_limits<std::uint64_t>::max()});
         epoch_change_maximum_block_extra_bytes =
             maximum_block_extra_bytes;
         epoch_change_maximum_ancestry_blocks =
             maximum_ancestry_blocks;
+        adaptive_v2_epoch_change_bundle_limits = bundle_limits;
+        adaptive_v2_command_inbox = std::move(command_inbox);
         epoch_change_verifier = std::move(verifier);
     }
 
@@ -6027,6 +6094,21 @@ namespace hotstuff
         pmaker->record_verified_progress(
             key.configuration,
             LeaderProgressEvent::verified_proposal);
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_command_inbox == nullptr ||
+            !adaptive_v2_pending_command_reservation.has_value())
+            return;
+
+        const auto reservation_token =
+            *adaptive_v2_pending_command_reservation;
+        adaptive_v2_pending_command_reservation.reset();
+        auto &command_inbox = *adaptive_v2_command_inbox;
+        if (!command_inbox.mark_proposed(reservation_token, key))
+        {
+            static_cast<void>(command_inbox.release(reservation_token));
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Failed to bind successor command to exact proposal");
+        }
     }
 
     void HotStuffBase::on_verified_commit_progress(
@@ -6463,6 +6545,13 @@ namespace hotstuff
                                .drain_activated_futures();
         const auto &configuration =
             activation.update->activation.configuration;
+        const auto generation =
+            activation.update->activation.generation;
+        if (adaptive_v2_command_inbox != nullptr)
+        {
+            static_cast<void>(adaptive_v2_command_inbox->observe_activation(
+                configuration, generation));
+        }
         const auto *definition =
             activation.update->activation.definition;
         const auto event_activation_height =
@@ -6608,12 +6697,39 @@ namespace hotstuff
         }
     }
 
+    std::optional<uint256_t>
+    HotStuffBase::adaptive_v2_committed_epoch_change_payload_digest(
+        const block_t &blk) const noexcept
+    {
+        if (!pending_committed_epoch_change.has_value() || blk == nullptr ||
+            pending_committed_epoch_change->block_hash != blk->get_hash())
+            return std::nullopt;
+        return pending_committed_epoch_change->payload_digest;
+    }
+
+    void HotStuffBase::observe_authoritative_commit(
+        const std::optional<ProposalKey> &committed_proposal,
+        const std::optional<uint256_t> &committed_payload_digest) noexcept
+    {
+        if (adaptive_v2_command_inbox == nullptr ||
+            !committed_proposal.has_value())
+            return;
+        static_cast<void>(
+            adaptive_v2_command_inbox->observe_authoritative_commit(
+                *committed_proposal, committed_payload_digest));
+    }
+
     void HotStuffBase::do_consensus(const block_t &blk)
     {
         record_committed_epoch_change_history(blk);
         retire_deferred_epoch_changes_for_block(blk->get_hash());
         const auto keys =
             proposal_contexts->close_committed_block(blk->get_hash());
+        const auto authoritative_key = committed_proposal_key(blk, keys);
+        const auto committed_payload_digest =
+            adaptive_v2_committed_epoch_change_payload_digest(blk);
+        observe_authoritative_commit(
+            authoritative_key, committed_payload_digest);
         // Preserve the authoritative committed key for protocol cadence and
         // copy optional evidence metadata before terminal cache cleanup.
         cache_adaptive_v2_commit(blk, keys);
@@ -7520,10 +7636,14 @@ namespace hotstuff
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
             (epoch_change_verifier == nullptr ||
              epoch_change_maximum_block_extra_bytes == 0 ||
-             epoch_change_maximum_ancestry_blocks == 0))
+             epoch_change_maximum_ancestry_blocks == 0 ||
+             !adaptive_v2_epoch_change_bundle_limits.has_value() ||
+             adaptive_v2_command_inbox == nullptr ||
+             !epoch_manager_peer.has_value() ||
+             !epoch_manager_address.has_value()))
         {
             throw HotStuffError(
-                "adaptive-v2 startup requires a pinned pre-vote verifier and bounds");
+                "adaptive-v2 startup requires pinned verifier, bounds, inbox, and manager TLS peer");
         }
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
             !derive_byzantine_quorum(replicas.size()).has_value())
@@ -7697,6 +7817,75 @@ namespace hotstuff
         /** Ask pmaker to know if we're a proposer or not. If we are, we propose */
         pmaker->beat().then([this](ReplicaID proposer)
                             {
+        const auto reserve_adaptive_v2_command =
+            [this](const std::vector<block_t> &proposal_parents,
+                   bool include_latest_piped_parent)
+            -> std::optional<AdaptiveV2CommandReservation>
+        {
+            if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+                adaptive_v2_command_inbox == nullptr ||
+                adaptive_epoch_runtime == nullptr ||
+                !committed_epoch_change_history.has_value() ||
+                committed_epoch_change_history->head == nullptr ||
+                proposal_parents.empty() || hqc.second == nullptr)
+                return std::nullopt;
+
+            auto &command_inbox = *adaptive_v2_command_inbox;
+            const auto inbox_snapshot = command_inbox.snapshot();
+            if ((inbox_snapshot.state !=
+                     AdaptiveV2CommandInboxState::available &&
+                 inbox_snapshot.state !=
+                     AdaptiveV2CommandInboxState::in_flight) ||
+                inbox_snapshot.material == nullptr)
+                return std::nullopt;
+
+            const auto active_effect =
+                adaptive_epoch_runtime->activation.active_effect();
+            const auto *active_tree = find_exact_runtime_tree(
+                active_effect.configuration);
+            if (active_tree == nullptr)
+                return std::nullopt;
+
+            auto exact_proposal_parents = proposal_parents;
+            if (include_latest_piped_parent && !piped_queue.empty())
+            {
+                const auto piped_block =
+                    storage->find_blk(piped_queue.back());
+                if (exact_proposal_parents.front()->height <=
+                    piped_block->height)
+                    exact_proposal_parents.insert(
+                        exact_proposal_parents.begin(), piped_block);
+            }
+            Block history_probe(
+                exact_proposal_parents,
+                {},
+                hqc.second->clone(),
+                bytearray_t{},
+                exact_proposal_parents.front()->get_height() + 1,
+                hqc.first,
+                nullptr);
+            const auto history = build_epoch_change_proposal_history(
+                history_probe,
+                *committed_epoch_change_history->head,
+                active_effect.configuration.epoch_digest,
+                committed_epoch_change_history->snapshot,
+                epoch_change_maximum_block_extra_bytes,
+                epoch_change_maximum_ancestry_blocks);
+            if (!history)
+                return std::nullopt;
+
+            const AdaptiveV2ProposalPreparation preparation{
+                active_effect.configuration,
+                active_effect.generation,
+                get_id(),
+                static_cast<ReplicaID>(
+                    active_tree->get_tree().get_tree_root()),
+                history.history};
+            const auto prepared =
+                command_inbox.prepare_for_proposal(preparation);
+            return prepared.reservation;
+        };
+
         if (piped_queue.size() > get_config().async_blocks + 1) {
             HOTSTUFF_LOG_PROTO("[PIPELINING] Piped queue is full! Current size: %d, Max Async Blocks: %d", piped_queue.size(), get_config().async_blocks);
             return;
@@ -7735,27 +7924,56 @@ namespace hotstuff
                     if (parents[0]->height < highest->height) {
                         parents.insert(parents.begin(), highest);
                     }
-                    auto cmds = std::move(final_buffer);
-                    block_t piped_block = storage->add_blk(new Block(parents, cmds,
-                                                             hqc.second->clone(), bytearray_t(),
-                                                             parents[0]->height + 1,
-                                                             current,
-                                                             nullptr));
-                    const auto configuration = exact_configuration(
-                        get_cur_epoch_nr(), get_tree_id());
-                    piped_queue.push_back(piped_block->hash);
-                    HOTSTUFF_LOG_PROTO("[PIPELINING] Pushed piped block into queue: %.10s", piped_block->hash.to_hex().c_str());
-                    print_pipe_queues(true, false);
-                    HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
+                    const auto command_reservation =
+                        reserve_adaptive_v2_command(parents, false);
+                    block_t piped_block;
+                    try
+                    {
+                        bytearray_t block_extra;
+                        if (command_reservation.has_value())
+                        {
+                            adaptive_v2_pending_command_reservation =
+                                command_reservation->token;
+                            block_extra = command_reservation->material
+                                              ->canonical_block_extra;
+                        }
+                        auto cmds = std::move(final_buffer);
+                        piped_block = storage->add_blk(new Block(
+                            parents,
+                            cmds,
+                            hqc.second->clone(),
+                            std::move(block_extra),
+                            parents[0]->height + 1,
+                            current,
+                            nullptr));
+                        const auto configuration = exact_configuration(
+                            get_cur_epoch_nr(), get_tree_id());
+                        piped_queue.push_back(piped_block->hash);
+                        HOTSTUFF_LOG_PROTO("[PIPELINING] Pushed piped block into queue: %.10s", piped_block->hash.to_hex().c_str());
+                        print_pipe_queues(true, false);
+                        HOTSTUFF_LOG_PROTO("propose piped %s", std::string(*piped_block).c_str());
 
-                    /* broadcast to other replicas */
-                    gettimeofday(&last_block_time, NULL);
-                    on_deliver_blk(piped_block);
-                    Proposal prop = process_block(
-                        piped_block, false, configuration);
-                    on_verified_local_proposal_progress(prop.key());
-                    piped_block->piped_delivered = true;
-                    do_broadcast_proposal(prop);
+                        /* broadcast to other replicas */
+                        gettimeofday(&last_block_time, NULL);
+                        on_deliver_blk(piped_block);
+                        Proposal prop = process_block(
+                            piped_block, false, configuration);
+                        on_verified_local_proposal_progress(prop.key());
+                        piped_block->piped_delivered = true;
+                        do_broadcast_proposal(prop);
+                    }
+                    catch (...)
+                    {
+                        if (command_reservation.has_value())
+                        {
+                            auto &command_inbox =
+                                *adaptive_v2_command_inbox;
+                            static_cast<void>(command_inbox.release(
+                                command_reservation->token));
+                            adaptive_v2_pending_command_reservation.reset();
+                        }
+                        throw;
+                    }
                     /*if (id == get_pace_maker()->get_proposer()) {
                         gettimeofday(&timeEnd, NULL);
                         long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);
@@ -7798,8 +8016,35 @@ namespace hotstuff
                 }
             } else {
                 gettimeofday(&last_block_time, NULL);
-                auto cmds = std::move(final_buffer);
-                on_propose(cmds, std::move(parents));
+                const auto command_reservation =
+                    reserve_adaptive_v2_command(parents, true);
+                try
+                {
+                    bytearray_t block_extra;
+                    if (command_reservation.has_value())
+                    {
+                        adaptive_v2_pending_command_reservation =
+                            command_reservation->token;
+                        block_extra = command_reservation->material
+                                          ->canonical_block_extra;
+                    }
+                    auto cmds = std::move(final_buffer);
+                    on_propose(
+                        cmds,
+                        std::move(parents),
+                        std::move(block_extra));
+                }
+                catch (...)
+                {
+                    if (command_reservation.has_value())
+                    {
+                        auto &command_inbox = *adaptive_v2_command_inbox;
+                        static_cast<void>(command_inbox.release(
+                            command_reservation->token));
+                        adaptive_v2_pending_command_reservation.reset();
+                    }
+                    throw;
+                }
             }
         } });
     }
