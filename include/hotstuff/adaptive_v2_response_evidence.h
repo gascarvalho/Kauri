@@ -1,0 +1,138 @@
+/**
+ * Adaptive-v2 live response-attempt evidence bridge.
+ */
+
+#ifndef HOTSTUFF_ADAPTIVE_V2_RESPONSE_EVIDENCE_H_INCLUDED
+#define HOTSTUFF_ADAPTIVE_V2_RESPONSE_EVIDENCE_H_INCLUDED
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <set>
+
+#include "hotstuff/evidence_reporter.h"
+#include "hotstuff/proposal_context.h"
+
+namespace hotstuff
+{
+
+struct AdaptiveV2ResponseEvidenceLimits
+{
+    ResponseAttemptLimits attempts;
+    EvidenceReporterLimits reporter;
+    EvidenceWireLimits wire;
+    std::size_t maximum_handles{4096};
+    // Ordinary spillover behind the reporter FIFO. Late compensation has a
+    // separate per-attempt reservation below.
+    std::size_t maximum_retained_facts{4096};
+    // One preallocated emergency slot per timeout-eligible active attempt.
+    // A late response can therefore be retained even while both ordinary
+    // outbox queues are saturated.
+    std::size_t maximum_late_compensations{4096};
+};
+
+struct AdaptiveV2ResponseEvidenceDiagnostics
+{
+    std::size_t active_handles{0};
+    std::size_t pending_reports{0};
+    std::size_t retained_facts{0};
+    std::size_t retention_capacity{0};
+    std::size_t pending_late_compensations{0};
+    std::size_t late_compensation_capacity{0};
+    std::uint64_t armed_attempts{0};
+    std::uint64_t response_facts{0};
+    std::uint64_t timeout_facts{0};
+    std::uint64_t retired_attempts{0};
+    std::uint64_t rejected_operations{0};
+    std::uint64_t capacity_failures{0};
+    std::uint64_t retention_capacity_failures{0};
+    std::uint64_t late_compensation_capacity_failures{0};
+    std::uint64_t enqueue_failures{0};
+    std::uint64_t retry_schedules{0};
+    std::uint64_t retry_schedule_failures{0};
+    bool transport_bound{false};
+    bool retry_scheduler_bound{false};
+    bool retry_scheduled{false};
+    bool healthy{true};
+};
+
+using EvidenceRetryCallback = std::function<void()>;
+using EvidenceRetryCancellation = std::function<void()>;
+using EvidenceRetryScheduler = std::function<EvidenceRetryCancellation(
+    EvidenceRetryCallback)>;
+
+/**
+ * Event-loop-confined adapter from exact proposal callbacks to immutable
+ * response evidence. It owns no timers, network, manager authority, quorum
+ * state, or topology decisions. Callers provide explicit monotonic times and
+ * only already authenticated, topology-verified signer sets.
+ *
+ * A transport result acknowledges only this local outbox delivery attempt.
+ * It is not evidence that an adaptation manager accepted the observation.
+ * Calls, including the injected callback, must be externally serialized and
+ * non-reentrant.
+ */
+class AdaptiveV2ResponseEvidenceBridge final
+{
+public:
+    explicit AdaptiveV2ResponseEvidenceBridge(
+        ReplicaID reporter_id,
+        AdaptiveV2ResponseEvidenceLimits limits = {});
+    ~AdaptiveV2ResponseEvidenceBridge();
+
+    AdaptiveV2ResponseEvidenceBridge(
+        const AdaptiveV2ResponseEvidenceBridge &) = delete;
+    AdaptiveV2ResponseEvidenceBridge &operator=(
+        const AdaptiveV2ResponseEvidenceBridge &) = delete;
+    AdaptiveV2ResponseEvidenceBridge(
+        AdaptiveV2ResponseEvidenceBridge &&) = delete;
+    AdaptiveV2ResponseEvidenceBridge &operator=(
+        AdaptiveV2ResponseEvidenceBridge &&) = delete;
+
+    bool arm(
+        const ProposalKey &proposal,
+        const ProposalTreeSnapshot &tree,
+        std::uint64_t start_monotonic_ns,
+        std::uint64_t deadline_duration_us) noexcept;
+
+    bool record_verified_response(
+        const ProposalKey &proposal,
+        ReplicaID authenticated_sender,
+        ExpectedMessageType message_type,
+        const std::set<ReplicaID> &canonical_verified_signers,
+        std::uint64_t response_monotonic_ns) noexcept;
+
+    std::size_t record_timeouts(
+        const ProposalKey &proposal,
+        const std::set<ReplicaID> &exact_missing_direct_children,
+        std::uint64_t timeout_monotonic_ns) noexcept;
+
+    std::size_t retire(const ProposalKey &proposal) noexcept;
+
+    /**
+     * Bind a one-shot event-loop scheduler for retrying temporary transport
+     * failures. The scheduler must defer the callback and return a callable
+     * cancellation; it grants no manager or consensus authority.
+     */
+    void bind_retry_scheduler(EvidenceRetryScheduler scheduler);
+    void unbind_retry_scheduler() noexcept;
+    void bind_transport(EvidenceTransportCallback transport);
+    void unbind_transport() noexcept;
+    std::size_t flush() noexcept;
+
+    const PendingEvidenceReport *front() const noexcept;
+    AdaptiveV2ResponseEvidenceDiagnostics diagnostics() const noexcept;
+
+private:
+    void schedule_retry() noexcept;
+    void cancel_retry() noexcept;
+    void run_scheduled_retry() noexcept;
+
+    struct State;
+    std::unique_ptr<State> state_;
+};
+
+} // namespace hotstuff
+
+#endif

@@ -171,6 +171,7 @@ add_library(hotstuff
     OBJECT
     src/adaptation.cpp
     src/adaptation_manager.cpp
+    src/adaptive_v2_response_evidence.cpp
     src/aggregation.cpp
     src/util.cpp
     src/block_delivery.cpp

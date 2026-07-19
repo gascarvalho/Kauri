@@ -50,6 +50,8 @@ namespace hotstuff
         constexpr std::uint32_t exact_forwarding_max_attempts = 3;
         constexpr auto exact_forwarding_retry_base_delay =
             std::chrono::milliseconds(5);
+        constexpr auto adaptive_v2_evidence_retry_delay =
+            std::chrono::milliseconds(5);
 
         bool signer_sets_overlap(
             const std::set<ReplicaID> &left,
@@ -83,6 +85,28 @@ namespace hotstuff
         {
             return mode == EpochProtocolMode::adaptive_v1 ||
                    mode == EpochProtocolMode::adaptive_v2;
+        }
+
+        std::uint64_t adaptive_monotonic_now_ns() noexcept
+        {
+            const auto elapsed = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+            return elapsed > 0
+                       ? static_cast<std::uint64_t>(elapsed)
+                       : 0;
+        }
+
+        std::uint64_t adaptive_deadline_duration_us(
+            AggregationTimeoutPolicy::Duration duration) noexcept
+        {
+            constexpr auto nanoseconds_per_microsecond = 1000;
+            const auto nanoseconds = duration.count();
+            if (nanoseconds < nanoseconds_per_microsecond)
+                return 0;
+            return static_cast<std::uint64_t>(
+                nanoseconds / nanoseconds_per_microsecond);
         }
 
         EpochChangeProposalChainResult bypass_epoch_change_gate() noexcept
@@ -2422,6 +2446,9 @@ namespace hotstuff
     {
         discard_exact_forwarding_retries(key);
         static_cast<void>(pending_exact_contributions.purge(key));
+        if (adaptive_v2_response_evidence != nullptr)
+            static_cast<void>(
+                adaptive_v2_response_evidence->retire(key));
     }
 
     promise_t HotStuffBase::deliver_exact_contribution(
@@ -3006,11 +3033,9 @@ namespace hotstuff
             retry == nullptr ? 0 : retry->signers.size(),
             retry == nullptr ? 0 : retry->attempts,
             reason);
-        discard_exact_forwarding_retries(
-            lease.key(), lease.generation());
         static_cast<void>(proposal_contexts->transition(
             lease, ProposalContextEvent::proposal_aborted));
-        pending_exact_contributions.purge(lease.key());
+        purge_pending_exact_contributions(lease.key());
         if (proposal_admission != nullptr)
             proposal_admission->retire_proposal(lease.key());
     }
@@ -3104,6 +3129,18 @@ namespace hotstuff
         }
 
         if (missing.empty())
+            return;
+
+        if (adaptive_v2_response_evidence != nullptr)
+            static_cast<void>(
+                adaptive_v2_response_evidence->record_timeouts(
+                    lease.key(),
+                    missing,
+                    adaptive_monotonic_now_ns()));
+
+        // Adaptive-v2 emits only exact, locally derived response facts. The
+        // legacy timeout message has no authenticated manager-ingress seam.
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
             return;
 
         std::vector<TimeoutMeasure> timeouts;
@@ -3327,6 +3364,16 @@ namespace hotstuff
                 contribution_signers.insert(
                     signers.begin(), signers.end());
             }
+            if (adaptive_v2_response_evidence != nullptr)
+                static_cast<void>(
+                    adaptive_v2_response_evidence->record_verified_response(
+                        lease.key(),
+                        contribution.authenticated_sender,
+                        kind == ExactContributionKind::direct_vote
+                            ? ExpectedMessageType::direct_vote
+                            : ExpectedMessageType::aggregate_relay,
+                        contribution_signers,
+                        adaptive_monotonic_now_ns()));
             if (proposal_contexts->delta_open_enabled(lease))
             {
                 std::set<ReplicaID> accepted_optional;
@@ -3590,6 +3637,28 @@ namespace hotstuff
             return;
         for (const auto child : lease->tree().direct_children)
             proposal_contexts->record_latency_start(*lease, child);
+
+        if (adaptive_v2_response_evidence == nullptr ||
+            lease->tree().direct_children.empty())
+            return;
+        const auto *tree = find_exact_runtime_tree(key.configuration);
+        if (tree == nullptr)
+            return;
+        try
+        {
+            const auto duration = aggregation_timeout_policy.timeout_for(
+                static_cast<std::uint32_t>(tree->get_level(get_id())),
+                static_cast<std::uint32_t>(tree->get_max_level()));
+            static_cast<void>(adaptive_v2_response_evidence->arm(
+                key,
+                lease->tree(),
+                adaptive_monotonic_now_ns(),
+                adaptive_deadline_duration_us(duration)));
+        }
+        catch (...)
+        {
+            // Evidence is observational and cannot stop proposal progress.
+        }
     }
 
     void HotStuffBase::start_aggregation_timer(const ProposalKey &key)
@@ -4984,6 +5053,24 @@ namespace hotstuff
                                                           warmup_finished(false)
     {
         initialize_committed_epoch_change_history();
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        {
+            adaptive_v2_response_evidence =
+                std::make_unique<AdaptiveV2ResponseEvidenceBridge>(
+                    get_id());
+            adaptive_v2_response_evidence->bind_retry_scheduler(
+                [this](EvidenceRetryCallback retry) {
+                    const auto access = exact_runtime_access;
+                    return aggregation_scheduler->schedule_after(
+                        adaptive_v2_evidence_retry_delay,
+                        [access, retry = std::move(retry)]() mutable {
+                            auto runtime = access->acquire();
+                            if (!runtime.has_value())
+                                return;
+                            retry();
+                        });
+                });
+        }
         rebuild_aggregation_timeout_coordinator();
 
         /* register the handlers for msg from replicas */
@@ -5380,6 +5467,31 @@ namespace hotstuff
     {
         structured_event_emitter = lifecycle_emitter;
         adaptive_event_emitter = aggregation_emitter;
+    }
+
+    void HotStuffBase::bind_adaptive_v2_evidence_transport(
+        EvidenceTransportCallback transport)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_response_evidence == nullptr)
+            throw std::logic_error(
+                "response evidence transport is available only in adaptive-v2");
+        adaptive_v2_response_evidence->bind_transport(
+            std::move(transport));
+    }
+
+    void HotStuffBase::unbind_adaptive_v2_evidence_transport() noexcept
+    {
+        if (adaptive_v2_response_evidence != nullptr)
+            adaptive_v2_response_evidence->unbind_transport();
+    }
+
+    std::size_t HotStuffBase::flush_adaptive_v2_evidence() noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_response_evidence == nullptr)
+            return 0;
+        return adaptive_v2_response_evidence->flush();
     }
 
     bool HotStuffBase::admit_local(const Proposal &prop)
@@ -6225,6 +6337,11 @@ namespace hotstuff
         deferred_epoch_change_proposal_count = 0;
         proposal_contexts->shutdown();
         pending_exact_contributions.clear();
+        if (adaptive_v2_response_evidence != nullptr)
+        {
+            adaptive_v2_response_evidence->unbind_transport();
+            adaptive_v2_response_evidence.reset();
+        }
         blk_delivery_orchestrator.cancel(nullptr);
     }
 

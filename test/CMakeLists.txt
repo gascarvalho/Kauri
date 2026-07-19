@@ -150,6 +150,16 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;evidence;evidence-reporter"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_adaptive_v2_response_evidence
+    test_adaptive_v2_response_evidence.cpp)
+target_compile_definitions(
+    test_adaptive_v2_response_evidence PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_adaptive_v2_response_evidence PROPERTIES
+    LABELS "unit;adaptive;evidence;response-attempt;adaptive-v2"
+    TIMEOUT 5)
+add_kauri_catch_test(
     test_evidence_ingress
     test_evidence_ingress.cpp)
 target_compile_definitions(

@@ -765,7 +765,9 @@ TEST_CASE("WE06-C05 production forwarding retries are transactional and bounded"
           std::string::npos);
     CHECK(abort.find("ProposalContextEvent::proposal_aborted") !=
           std::string::npos);
-    CHECK(abort.find("pending_exact_contributions.purge(lease.key())") !=
+    CHECK(abort.find("purge_pending_exact_contributions(lease.key())") !=
+          std::string::npos);
+    CHECK(abort.find("pending_exact_contributions.purge(lease.key())") ==
           std::string::npos);
     CHECK(emitter.find("if (adaptive_event_emitter == nullptr)") !=
           std::string::npos);

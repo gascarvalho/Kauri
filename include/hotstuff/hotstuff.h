@@ -29,6 +29,7 @@
 #include "salticidae/network.h"
 #include "salticidae/msg.h"
 #include "hotstuff/util.h"
+#include "hotstuff/adaptive_v2_response_evidence.h"
 #include "hotstuff/aggregation.h"
 #include "hotstuff/block_delivery_orchestration.h"
 #include "hotstuff/consensus.h"
@@ -1077,6 +1078,8 @@ namespace hotstuff
         AggregationTimeoutPolicy aggregation_timeout_policy;
         std::unique_ptr<AggregationTimeoutCoordinator>
             aggregation_timeout_coordinator;
+        std::unique_ptr<AdaptiveV2ResponseEvidenceBridge>
+            adaptive_v2_response_evidence;
         enum class ExactForwardingRole
         {
             initial_aggregate,
@@ -1411,6 +1414,15 @@ namespace hotstuff
         void bind_structured_event_emitters(
             StructuredEventEmitter *lifecycle_emitter,
             AdaptiveStructuredEventEmitter *aggregation_emitter) noexcept;
+        /**
+         * Bind a local adaptive-v2 evidence outbox transport capability.
+         * Delivery acceptance removes an outbox item only; it grants no
+         * manager, epoch, topology, quorum, or consensus authority.
+         */
+        void bind_adaptive_v2_evidence_transport(
+            EvidenceTransportCallback transport);
+        void unbind_adaptive_v2_evidence_transport() noexcept;
+        std::size_t flush_adaptive_v2_evidence() noexcept;
         void configure_epoch_manager(
             const PeerId &manager_peer,
             const NetAddr &manager_address);
