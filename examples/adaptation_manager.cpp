@@ -26,6 +26,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -43,6 +44,7 @@
 
 #include "hotstuff/adaptive_v2_manager_controller.h"
 #include "hotstuff/adaptive_v2_manager_delivery.h"
+#include "hotstuff/structured_event.h"
 #include "hotstuff/util.h"
 
 namespace
@@ -108,6 +110,9 @@ struct ManagerOptions
     PrivKeySecp256k1 issuer_private_key;
     std::uint64_t activation_delay_blocks{5};
     std::string bundle_output;
+    std::string structured_event_run_id;
+    std::string structured_event_source_instance;
+    std::string structured_event_output;
 };
 
 template <typename Value>
@@ -275,6 +280,19 @@ AdaptiveV2ManagerControllerConfig smoke_controller_config(
     return config;
 }
 
+hotstuff::StructuredEventConfig manager_structured_event_config(
+    const ManagerOptions &options)
+{
+    return hotstuff::StructuredEventConfig{
+        options.structured_event_run_id,
+        hotstuff::StructuredEventSource{
+            hotstuff::StructuredEventSourceKind::adaptation_manager,
+            "adaptive-manager",
+            options.structured_event_source_instance},
+        std::nullopt,
+        hotstuff::StructuredEventLimits{}};
+}
+
 const char *controller_status_name(
     AdaptiveV2ManagerControllerStatus status) noexcept
 {
@@ -372,6 +390,10 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_issuer_private_key = Config::OptValStr::create();
     auto opt_activation_delay = Config::OptValStr::create("5");
     auto opt_bundle_output = Config::OptValStr::create();
+    auto opt_structured_event_run_id = Config::OptValStr::create();
+    auto opt_structured_event_source_instance =
+        Config::OptValStr::create();
+    auto opt_structured_event_output = Config::OptValStr::create();
 
     config.add_opt("help", opt_help, Config::SWITCH_ON, 'h');
     config.add_opt("listen", opt_listen, Config::SET_VAL);
@@ -385,6 +407,18 @@ ManagerOptions parse_options(int argc, char **argv)
         "activation-delay-blocks", opt_activation_delay,
         Config::SET_VAL);
     config.add_opt("bundle-output", opt_bundle_output, Config::SET_VAL);
+    config.add_opt(
+        "structured-event-run-id",
+        opt_structured_event_run_id,
+        Config::SET_VAL);
+    config.add_opt(
+        "structured-event-source-instance",
+        opt_structured_event_source_instance,
+        Config::SET_VAL);
+    config.add_opt(
+        "structured-event-output",
+        opt_structured_event_output,
+        Config::SET_VAL);
     config.parse(argc, argv);
     if (opt_help->get())
     {
@@ -421,6 +455,23 @@ ManagerOptions parse_options(int argc, char **argv)
     options.bundle_output = opt_bundle_output->get();
     if (options.bundle_output.empty())
         throw std::invalid_argument("bundle output path is required");
+    options.structured_event_run_id =
+        opt_structured_event_run_id->get();
+    if (options.structured_event_run_id.empty())
+        throw std::invalid_argument(
+            "structured-event run ID is required");
+    options.structured_event_source_instance =
+        opt_structured_event_source_instance->get();
+    if (options.structured_event_source_instance.empty())
+        throw std::invalid_argument(
+            "structured-event source instance is required");
+    options.structured_event_output = opt_structured_event_output->get();
+    if (options.structured_event_output.empty())
+        throw std::invalid_argument(
+            "structured-event output path is required");
+    if (options.structured_event_output == options.bundle_output)
+        throw std::invalid_argument(
+            "structured-event and bundle outputs must be distinct");
 
     for (const auto &raw : opt_replicas->get())
         options.replicas.push_back(parse_replica_endpoint(raw));
@@ -490,7 +541,8 @@ public:
     AdaptationManager(
         EventContext &event_context,
         ManagerOptions options,
-        const ManagerNetwork::Config &net_config)
+        const ManagerNetwork::Config &net_config,
+        hotstuff::StructuredEventSink &structured_event_sink)
         : event_context_(event_context),
           options_(std::move(options)),
           network_(event_context_, net_config),
@@ -500,7 +552,8 @@ public:
               kInitialTreeId,
               kInitialActivationGeneration,
               smoke_ingress_limits()),
-          controller_(ingress_, smoke_controller_config(options_))
+          controller_(ingress_, smoke_controller_config(options_)),
+          structured_event_sink_(structured_event_sink)
     {
         for (const auto &replica : options_.replicas)
         {
@@ -519,24 +572,94 @@ public:
         interrupt.add(SIGINT);
         terminate.add(SIGTERM);
 
-        network_.start();
-        for (const auto &replica : options_.replicas)
+        salticidae::TimerEvent structured_event_drain_timer;
+        bool process_started = false;
+        try
         {
-            network_.add_peer(replica.peer_id);
-            network_.set_peer_addr(replica.peer_id, replica.address);
-        }
-        network_.listen(options_.listen_address);
-        for (const auto &replica : options_.replicas)
-            network_.conn_peer(replica.peer_id);
+            structured_event_drain_timer = salticidae::TimerEvent(
+                event_context_,
+                [this](salticidae::TimerEvent &timer) {
+                    structured_event_sink_.drain();
+                    const auto health = structured_event_sink_.health();
+                    if (!health.healthy)
+                    {
+                        fail("structured_event_unhealthy");
+                        return;
+                    }
+                    timer.add(0.05);
+                });
 
-        HOTSTUFF_LOG_INFO(
-            "KAURI_ADAPTIVE_MANAGER listening=%s n=7 f=2 quorum=5",
-            std::string(options_.listen_address).c_str());
-        event_context_.dispatch();
-        // Join network workers before shutting down callback-owned state.
-        network_.stop();
-        ingress_.shutdown();
-        return failed_ || !successor_distributed_ ? 1 : 0;
+            emit_process_lifecycle(
+                hotstuff::ProcessLifecycleState::started);
+            process_started = true;
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+            {
+                failed_ = true;
+                emit_process_lifecycle(
+                    hotstuff::ProcessLifecycleState::stopping);
+                event_context_.stop();
+                structured_event_drain_timer.del();
+                stop_runtime();
+                emit_process_lifecycle(
+                    hotstuff::ProcessLifecycleState::stopped);
+                return 1;
+            }
+
+            network_stop_required_ = true;
+            network_.start();
+            for (const auto &replica : options_.replicas)
+            {
+                network_.add_peer(replica.peer_id);
+                network_.set_peer_addr(
+                    replica.peer_id, replica.address);
+            }
+            network_.listen(options_.listen_address);
+            for (const auto &replica : options_.replicas)
+                network_.conn_peer(replica.peer_id);
+
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_MANAGER listening=%s n=7 f=2 quorum=5",
+                std::string(options_.listen_address).c_str());
+            emit_process_lifecycle(
+                hotstuff::ProcessLifecycleState::ready);
+            structured_event_drain_timer.add(0.05);
+            event_context_.dispatch();
+
+            emit_process_lifecycle(
+                hotstuff::ProcessLifecycleState::stopping);
+            event_context_.stop();
+            structured_event_drain_timer.del();
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+                failed_ = true;
+            stop_runtime();
+            emit_process_lifecycle(
+                hotstuff::ProcessLifecycleState::stopped);
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+                failed_ = true;
+            return failed_ || !successor_distributed_ ? 1 : 0;
+        }
+        catch (...)
+        {
+            if (process_started)
+            {
+                emit_process_lifecycle(
+                    hotstuff::ProcessLifecycleState::stopping);
+            }
+            event_context_.stop();
+            structured_event_drain_timer.del();
+            structured_event_sink_.drain();
+            stop_runtime();
+            if (process_started)
+            {
+                emit_process_lifecycle(
+                    hotstuff::ProcessLifecycleState::stopped);
+                structured_event_sink_.drain();
+            }
+            throw;
+        }
     }
 
 private:
@@ -570,11 +693,67 @@ private:
         event_context_.stop();
     }
 
+    void stop_runtime() noexcept
+    {
+        event_context_.stop();
+        if (network_stop_required_ && !network_stopped_)
+        {
+            network_stopped_ = true;
+            try
+            {
+                network_.stop();
+            }
+            catch (...)
+            {
+                failed_ = true;
+                HOTSTUFF_LOG_WARN(
+                    "KAURI_ADAPTIVE_MANAGER fatal reason=network_stop_failed");
+            }
+        }
+        if (!ingress_stopped_)
+        {
+            ingress_stopped_ = true;
+            ingress_.shutdown();
+        }
+    }
+
+    void emit_process_lifecycle(
+        hotstuff::ProcessLifecycleState state) noexcept
+    {
+        structured_event_sink_.emit(
+            hotstuff::StructuredEventPayload{
+                hotstuff::ProcessLifecycleEvent{
+                    state, std::nullopt}});
+    }
+
+    void emit_new_score_trajectory() noexcept
+    {
+        const auto &trajectory = controller_.score_trajectory();
+        const auto evidence_cutoff = controller_.current_cutoff();
+        while (emitted_score_trajectory_ < trajectory.size())
+        {
+            const hotstuff::AuditStructuredEventPayload event{
+                hotstuff::ReputationEvidenceAppliedStructuredEvent{
+                    evidence_cutoff,
+                    trajectory[emitted_score_trajectory_]}};
+            structured_event_sink_.emit_audit(event);
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("structured_event_reputation_emit_failed");
+                return;
+            }
+            ++emitted_score_trajectory_;
+        }
+    }
+
     void evaluate()
     {
         if (failed_ || successor_distributed_)
             return;
         const auto status = controller_.evaluate();
+        emit_new_score_trajectory();
+        if (failed_)
+            return;
         HOTSTUFF_LOG_INFO(
             "KAURI_ADAPTIVE_MANAGER state=%s cutoff=%llu",
             controller_status_name(status),
@@ -763,6 +942,11 @@ private:
     std::unordered_map<PeerId, ReplicaID> peer_to_replica_;
     AdaptiveV2ManagerIngress ingress_;
     AdaptiveV2ManagerController controller_;
+    hotstuff::StructuredEventSink &structured_event_sink_;
+    std::size_t emitted_score_trajectory_{0};
+    bool network_stop_required_{false};
+    bool network_stopped_{false};
+    bool ingress_stopped_{false};
     bool successor_distributed_{false};
     bool failed_{false};
 };
@@ -775,11 +959,44 @@ int main(int argc, char **argv)
     try
     {
         auto options = parse_options(argc, argv);
+        const auto structured_event_config =
+            manager_structured_event_config(options);
+        hotstuff::MonotonicRawStructuredEventClock
+            structured_event_clock;
+        hotstuff::ExclusiveFileStructuredEventOutput
+            structured_event_output(options.structured_event_output);
+        hotstuff::StructuredEventSink structured_event_sink(
+            structured_event_config,
+            structured_event_clock,
+            structured_event_output);
+        if (!structured_event_sink.health().healthy)
+            throw std::runtime_error(
+                "structured-event sink configuration is unhealthy");
         const auto net_config = network_config(options);
         EventContext event_context;
-        AdaptationManager manager(
-            event_context, std::move(options), net_config);
-        return manager.run();
+        auto manager = std::make_unique<AdaptationManager>(
+            event_context,
+            std::move(options),
+            net_config,
+            structured_event_sink);
+        int run_status = 1;
+        std::exception_ptr run_failure;
+        try
+        {
+            run_status = manager->run();
+        }
+        catch (...)
+        {
+            run_failure = std::current_exception();
+        }
+        manager.reset();
+        structured_event_sink.shutdown();
+        const auto health = structured_event_sink.health();
+        if (!health.healthy)
+            return 1;
+        if (run_failure != nullptr)
+            std::rethrow_exception(run_failure);
+        return run_status;
     }
     catch (const std::exception &error)
     {

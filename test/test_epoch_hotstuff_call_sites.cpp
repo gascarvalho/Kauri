@@ -1,12 +1,14 @@
 #include <cerrno>
-#include <cstddef>
 #include <cctype>
+#include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sys/types.h>
@@ -205,17 +207,67 @@ ProcessResult run_hotstuff_app(const std::vector<std::string> &arguments)
     return result;
 }
 
-std::vector<std::string> valid_adaptive_v2_arguments()
+struct AdaptiveV2Arguments
 {
-    return {
-        "--epoch-protocol-mode", "adaptive_v2",
-        "--epoch-change-issuer-id", "0",
-        "--epoch-change-issuer-public-key",
-        "022543a7f8dd080a3e44c4fac62194129ac260a3896ee9d546bfb08bbb379067c1",
-        "--epoch-change-minimum-activation-delay", "2",
-        "--epoch-change-maximum-activation-delay", "20",
-        "--epoch-change-maximum-block-extra-bytes", "4096",
-        "--epoch-change-maximum-ancestry-blocks", "128"};
+    std::vector<std::string> values;
+    std::string temporary_directory;
+    std::string structured_event_output;
+
+    AdaptiveV2Arguments()
+    {
+        char directory_template[] =
+            "/tmp/kauri-call-site-events-XXXXXX";
+        const auto *created_directory = ::mkdtemp(directory_template);
+        if (created_directory == nullptr)
+            throw std::runtime_error(
+                "failed to create structured-event fixture directory");
+        temporary_directory = created_directory;
+        structured_event_output =
+            temporary_directory + "/replica-events.jsonl";
+        const auto token = temporary_directory.substr(
+            temporary_directory.find_last_of('/') + 1);
+        values = {
+            "--epoch-protocol-mode", "adaptive_v2",
+            "--epoch-change-issuer-id", "0",
+            "--epoch-change-issuer-public-key",
+            "022543a7f8dd080a3e44c4fac62194129ac260a3896ee9d546bfb08bbb379067c1",
+            "--epoch-change-minimum-activation-delay", "2",
+            "--epoch-change-maximum-activation-delay", "20",
+            "--epoch-change-maximum-block-extra-bytes", "4096",
+            "--epoch-change-maximum-ancestry-blocks", "128",
+            "--structured-event-run-id", "call-site-" + token,
+            "--structured-event-source-instance", "replica-" + token,
+            "--structured-event-output", structured_event_output,
+            "--structured-event-commit-observer-id", "replica-0",
+            "--structured-event-commit-observer-instance",
+            "observer-" + token};
+    }
+
+    AdaptiveV2Arguments(const AdaptiveV2Arguments &) = delete;
+    AdaptiveV2Arguments &operator=(const AdaptiveV2Arguments &) = delete;
+
+    AdaptiveV2Arguments(AdaptiveV2Arguments &&other) noexcept
+        : values(std::move(other.values)),
+          temporary_directory(std::move(other.temporary_directory)),
+          structured_event_output(
+              std::move(other.structured_event_output))
+    {
+        other.temporary_directory.clear();
+        other.structured_event_output.clear();
+    }
+
+    ~AdaptiveV2Arguments()
+    {
+        if (!structured_event_output.empty())
+            ::unlink(structured_event_output.c_str());
+        if (!temporary_directory.empty())
+            ::rmdir(temporary_directory.c_str());
+    }
+};
+
+AdaptiveV2Arguments valid_adaptive_v2_arguments()
+{
+    return AdaptiveV2Arguments{};
 }
 
 void set_option_value(
@@ -1894,7 +1946,8 @@ TEST_CASE("accepted adaptive v2 CLI pins the configured verifier before start",
 TEST_CASE("adaptive v2 executable validates exact pre-vote configuration",
           "[c08][adaptive-v2][cli][subprocess][intentional-red]")
 {
-    const auto accepted = run_hotstuff_app(valid_adaptive_v2_arguments());
+    const auto accepted_arguments = valid_adaptive_v2_arguments();
+    const auto accepted = run_hotstuff_app(accepted_arguments.values);
     CHECK(accepted.status != 0);
     CHECK(accepted.output.find("replica idx out of range") !=
           std::string::npos);
@@ -1910,8 +1963,8 @@ TEST_CASE("adaptive v2 executable validates exact pre-vote configuration",
              "--epoch-change-maximum-ancestry-blocks"})
     {
         auto arguments = valid_adaptive_v2_arguments();
-        remove_option(arguments, option);
-        const auto missing = run_hotstuff_app(arguments);
+        remove_option(arguments.values, option);
+        const auto missing = run_hotstuff_app(arguments.values);
         CAPTURE(option);
         CAPTURE(missing.output);
         CHECK(missing.status != 0);
@@ -1944,8 +1997,9 @@ TEST_CASE("adaptive v2 numeric options reject noncanonical and overflowing input
               "9999999999999999999999999999999999999999"}})
     {
         auto arguments = valid_adaptive_v2_arguments();
-        set_option_value(arguments, invalid.option, invalid.value);
-        const auto rejected = run_hotstuff_app(arguments);
+        set_option_value(
+            arguments.values, invalid.option, invalid.value);
+        const auto rejected = run_hotstuff_app(arguments.values);
         CAPTURE(invalid.option);
         CAPTURE(invalid.value);
         CAPTURE(rejected.output);
@@ -1974,8 +2028,9 @@ TEST_CASE("adaptive v2 executable rejects semantic bounds and malformed keys",
               "000000000000000000000000000000000000000000000000000000000000000000"}})
     {
         auto arguments = valid_adaptive_v2_arguments();
-        set_option_value(arguments, invalid.option, invalid.value);
-        const auto rejected = run_hotstuff_app(arguments);
+        set_option_value(
+            arguments.values, invalid.option, invalid.value);
+        const auto rejected = run_hotstuff_app(arguments.values);
         CAPTURE(invalid.option);
         CAPTURE(invalid.value);
         CAPTURE(rejected.output);
@@ -1990,9 +2045,10 @@ TEST_CASE("adaptive v2 executable rejects a zero commit rotation period",
           "[c08][adaptive-v2][commit-cadence][cli][subprocess]")
 {
     auto adaptive_v2 = valid_adaptive_v2_arguments();
-    adaptive_v2.insert(
-        adaptive_v2.end(), {"--tree-switch-period", "0"});
-    const auto rejected = run_hotstuff_app(adaptive_v2);
+    adaptive_v2.values.insert(
+        adaptive_v2.values.end(),
+        {"--tree-switch-period", "0"});
+    const auto rejected = run_hotstuff_app(adaptive_v2.values);
     CHECK(rejected.status != 0);
     CHECK(rejected.output.find("adaptive-v2 tree switch period") !=
           std::string::npos);
@@ -2017,9 +2073,10 @@ TEST_CASE("adaptive v2 executable accepts only finite integral rotation periods"
              "18446744073709551616"})
     {
         auto arguments = valid_adaptive_v2_arguments();
-        arguments.insert(
-            arguments.end(), {"--tree-switch-period", invalid});
-        const auto rejected = run_hotstuff_app(arguments);
+        arguments.values.insert(
+            arguments.values.end(),
+            {"--tree-switch-period", invalid});
+        const auto rejected = run_hotstuff_app(arguments.values);
         CAPTURE(invalid);
         CAPTURE(rejected.output);
         CHECK(rejected.status != 0);

@@ -440,6 +440,23 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;structured-event;v13"
     TIMEOUT 10)
 
+add_kauri_catch_test(
+    test_structured_event_ownership_wiring
+    test_structured_event_ownership_wiring.cpp)
+target_compile_definitions(
+    test_structured_event_ownership_wiring PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+    KAURI_HOTSTUFF_APP_PATH="$<TARGET_FILE:hotstuff-app>"
+    KAURI_ADAPTATION_MANAGER_PATH="$<TARGET_FILE:adaptation-manager>")
+add_dependencies(
+    test_structured_event_ownership_wiring
+    hotstuff-app
+    adaptation-manager)
+set_tests_properties(
+    test_structured_event_ownership_wiring PROPERTIES
+    LABELS "integration;adaptive;adaptive-v2;intentional-red;structured-event;we06-c10;ownership"
+    TIMEOUT 20)
+
 set(KAURI_COMPONENT_TEST_TARGETS
     test_commit_rule
     test_protocol_integration)

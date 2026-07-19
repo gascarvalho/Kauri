@@ -23,7 +23,9 @@
 #include <charconv>
 #include <cmath>
 #include <csignal>
+#include <exception>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <random>
 #include <system_error>
@@ -42,6 +44,7 @@
 #include "hotstuff/client.h"
 #include "hotstuff/hotstuff.h"
 #include "hotstuff/liveness.h"
+#include "hotstuff/structured_event.h"
 
 using salticidae::_1;
 using salticidae::_2;
@@ -136,7 +139,11 @@ public:
                 NetAddr reputation_addr,
                 EpochProtocolMode protocol_mode);
 
-    void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps);
+    void start(
+        const std::vector<
+            std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps);
+    void bind_process_lifecycle_emitter(
+        hotstuff::StructuredEventEmitter *emitter) noexcept;
     void set_fanout(int32_t fanout);
     void set_piped_latency(int32_t piped_latency, int32_t async_blocks);
     void set_tree_period(size_t nblocks);
@@ -147,6 +154,10 @@ public:
         std::uint64_t activation_height);
     void set_client_ip(std::string client_ip);
     void stop();
+
+private:
+    hotstuff::StructuredEventEmitter *process_lifecycle_emitter_{nullptr};
+    bool process_stopping_emitted_{false};
 };
 
 std::pair<std::string, std::string> split_ip_port_cport(const std::string &s)
@@ -163,6 +174,12 @@ struct AdaptiveV2PreVoteConfig
     hotstuff::EpochChangeDelayBounds delay_bounds;
     std::size_t maximum_block_extra_bytes{0};
     std::size_t maximum_ancestry_blocks{0};
+};
+
+struct ReplicaStructuredEventOptions
+{
+    hotstuff::StructuredEventConfig config;
+    std::string output_path;
 };
 
 template<typename Value>
@@ -262,6 +279,53 @@ parse_adaptive_v2_pre_vote_config(
             true)};
 }
 
+std::optional<ReplicaStructuredEventOptions>
+parse_replica_structured_event_options(
+    const std::string &protocol_mode,
+    ReplicaID replica_id,
+    const std::string &run_id,
+    const std::string &source_instance,
+    const std::string &output_path,
+    const std::string &commit_observer_id,
+    const std::string &commit_observer_instance)
+{
+    if (protocol_mode != "adaptive_v2")
+        return std::nullopt;
+
+    const auto require_value = [](const std::string &value,
+                                  const char *name)
+    {
+        if (value.empty())
+            throw HotStuffError(
+                std::string("adaptive-v2 structured-event ") + name +
+                " is required");
+    };
+    require_value(run_id, "run ID");
+    require_value(source_instance, "source instance");
+    require_value(output_path, "output path");
+    require_value(commit_observer_id, "commit observer ID");
+    require_value(
+        commit_observer_instance, "commit observer instance");
+
+    const hotstuff::StructuredEventSource source{
+        hotstuff::StructuredEventSourceKind::replica,
+        "replica-" + std::to_string(replica_id),
+        source_instance};
+    hotstuff::StructuredEventConfig structured_event_config{
+        run_id,
+        source,
+        std::nullopt,
+        hotstuff::StructuredEventLimits{}};
+    structured_event_config.designated_commit_observer =
+        hotstuff::StructuredEventSource{
+            hotstuff::StructuredEventSourceKind::replica,
+            commit_observer_id,
+            commit_observer_instance};
+    return ReplicaStructuredEventOptions{
+        std::move(structured_event_config),
+        output_path};
+}
+
 salticidae::BoxObj<HotStuffApp> papp = nullptr;
 
 int main(int argc, char **argv)
@@ -323,6 +387,14 @@ int main(int argc, char **argv)
     auto opt_epoch_change_maximum_block_extra_bytes =
         Config::OptValStr::create("");
     auto opt_epoch_change_maximum_ancestry_blocks =
+        Config::OptValStr::create("");
+    auto opt_structured_event_run_id = Config::OptValStr::create("");
+    auto opt_structured_event_source_instance =
+        Config::OptValStr::create("");
+    auto opt_structured_event_output = Config::OptValStr::create("");
+    auto opt_structured_event_commit_observer_id =
+        Config::OptValStr::create("");
+    auto opt_structured_event_commit_observer_instance =
         Config::OptValStr::create("");
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
@@ -415,6 +487,36 @@ int main(int argc, char **argv)
         Config::SET_VAL,
         -1,
         "maximum adaptive-v2 proposal ancestry blocks");
+    config.add_opt(
+        "structured-event-run-id",
+        opt_structured_event_run_id,
+        Config::SET_VAL,
+        -1,
+        "exact run identity for adaptive-v2 structured events");
+    config.add_opt(
+        "structured-event-source-instance",
+        opt_structured_event_source_instance,
+        Config::SET_VAL,
+        -1,
+        "unique process instance identity for structured events");
+    config.add_opt(
+        "structured-event-output",
+        opt_structured_event_output,
+        Config::SET_VAL,
+        -1,
+        "exclusive structured-event JSONL output path");
+    config.add_opt(
+        "structured-event-commit-observer-id",
+        opt_structured_event_commit_observer_id,
+        Config::SET_VAL,
+        -1,
+        "exact logical ID of the designated commit observer");
+    config.add_opt(
+        "structured-event-commit-observer-instance",
+        opt_structured_event_commit_observer_instance,
+        Config::SET_VAL,
+        -1,
+        "exact instance ID of the designated commit observer");
 
     EventContext ec;
     config.parse(argc, argv);
@@ -432,6 +534,15 @@ int main(int argc, char **argv)
             opt_epoch_change_maximum_activation_delay->get(),
             opt_epoch_change_maximum_block_extra_bytes->get(),
             opt_epoch_change_maximum_ancestry_blocks->get());
+    const auto replica_structured_event_options =
+        parse_replica_structured_event_options(
+            opt_epoch_protocol_mode->get(),
+            static_cast<ReplicaID>(opt_idx->get()),
+            opt_structured_event_run_id->get(),
+            opt_structured_event_source_instance->get(),
+            opt_structured_event_output->get(),
+            opt_structured_event_commit_observer_id->get(),
+            opt_structured_event_commit_observer_instance->get());
     const auto tree_switch_period = opt_tree_switch_period->get();
     if (opt_epoch_protocol_mode->get() == "adaptive_v2" &&
         (!std::isfinite(tree_switch_period) ||
@@ -538,6 +649,42 @@ int main(int argc, char **argv)
                            NetAddr(opt_client_ip->get(), 50500),
                            epoch_protocol_mode);
 
+    std::optional<hotstuff::MonotonicRawStructuredEventClock>
+        structured_event_clock;
+    std::optional<hotstuff::ExclusiveFileStructuredEventOutput>
+        structured_event_output;
+    std::optional<hotstuff::StructuredEventSink> structured_event_sink;
+    hotstuff::StructuredEventSink *structured_event_sink_ptr = nullptr;
+    if (replica_structured_event_options.has_value())
+    {
+        structured_event_clock.emplace();
+        structured_event_output.emplace(
+            replica_structured_event_options->output_path);
+        structured_event_sink.emplace(
+            replica_structured_event_options->config,
+            structured_event_clock.value(),
+            structured_event_output.value());
+        structured_event_sink_ptr = &structured_event_sink.value();
+        if (!structured_event_sink_ptr->health().healthy)
+            throw HotStuffError(
+                "adaptive-v2 structured-event sink is unhealthy");
+        papp->bind_structured_event_emitters(
+            structured_event_sink_ptr,
+            structured_event_sink_ptr,
+            structured_event_sink_ptr);
+        papp->bind_process_lifecycle_emitter(
+            structured_event_sink_ptr);
+        structured_event_sink_ptr->emit(
+            hotstuff::StructuredEventPayload{
+                hotstuff::ProcessLifecycleEvent{
+                    hotstuff::ProcessLifecycleState::started,
+                    std::nullopt}});
+        structured_event_sink_ptr->drain();
+        if (!structured_event_sink_ptr->health().healthy)
+            throw HotStuffError(
+                "adaptive-v2 structured-event startup record failed");
+    }
+
     std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> reps;
     for (auto &r : replicas)
     {
@@ -581,6 +728,28 @@ int main(int argc, char **argv)
     HOTSTUFF_LOG_INFO("Replica burst = %lu", opt_repburst->get());
     HOTSTUFF_LOG_INFO("*******************");
 
+    bool structured_event_failed = false;
+    TimerEvent structured_event_drain_timer;
+    if (structured_event_sink_ptr != nullptr)
+    {
+        structured_event_drain_timer = TimerEvent(
+            ec,
+            [&](TimerEvent &timer)
+            {
+                structured_event_sink.value().drain();
+                const auto health =
+                    structured_event_sink.value().health();
+                if (!health.healthy)
+                {
+                    structured_event_failed = true;
+                    papp->stop();
+                    return;
+                }
+                timer.add(0.05);
+            });
+        structured_event_drain_timer.add(0.05);
+    }
+
     auto shutdown = [&](int)
     { papp->stop(); };
     salticidae::SigEvent ev_sigint(ec, shutdown);
@@ -588,9 +757,50 @@ int main(int argc, char **argv)
     ev_sigint.add(SIGINT);
     ev_sigterm.add(SIGTERM);
 
-    papp->start(reps);
+    std::exception_ptr start_failure;
+    try
+    {
+        papp->start(reps);
+    }
+    catch (...)
+    {
+        start_failure = std::current_exception();
+    }
+    structured_event_drain_timer.del();
+    papp->stop();
+
+    if (structured_event_sink_ptr != nullptr)
+    {
+        structured_event_sink_ptr->drain();
+        if (!structured_event_sink_ptr->health().healthy)
+            structured_event_failed = true;
+        papp->bind_structured_event_emitters(
+            nullptr, nullptr, nullptr);
+        papp->bind_process_lifecycle_emitter(nullptr);
+    }
+    papp = salticidae::BoxObj<HotStuffApp>();
+
+    if (structured_event_sink.has_value())
+    {
+        structured_event_sink.value().emit(
+            hotstuff::StructuredEventPayload{
+                hotstuff::ProcessLifecycleEvent{
+                    hotstuff::ProcessLifecycleState::stopped,
+                    std::nullopt}});
+        structured_event_sink.value().drain();
+        if (!structured_event_sink.value().health().healthy)
+            structured_event_failed = true;
+        structured_event_sink.value().shutdown();
+        const auto health = structured_event_sink.value().health();
+        if (!health.healthy)
+            structured_event_failed = true;
+    }
 
     elapsed.stop(true);
+    if (structured_event_failed)
+        return 1;
+    if (start_failure != nullptr)
+        std::rethrow_exception(start_failure);
     return 0;
 }
 
@@ -630,8 +840,6 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
 
     /* register the handlers for msg from clients */
     cn.reg_handler(salticidae::generic_bind(&HotStuffApp::epoch_handler, this, _1, _2));
-    cn.start();
-    cn.listen(clisten_addr);
 }
 
 void HotStuffApp::epoch_handler(MsgDeployEpochReputation &&msg, const conn_t &conn)
@@ -653,7 +861,9 @@ void HotStuffApp::epoch_handler(MsgDeployEpochReputation &&msg, const conn_t &co
     //              { resp_queue.enqueue(std::make_pair(fin, addr)); });
 }
 
-void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps)
+void HotStuffApp::start(
+    const std::vector<
+        std::tuple<NetAddr, bytearray_t, bytearray_t>> &reps)
 {
     ev_stat_timer = TimerEvent(ec, [this](TimerEvent &)
                                {
@@ -685,6 +895,16 @@ void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytea
         else
             client_conns.erase(conn);
         return true; });
+    cn.start();
+    cn.listen(clisten_addr);
+    if (process_lifecycle_emitter_ != nullptr)
+    {
+        process_lifecycle_emitter_->emit(
+            hotstuff::StructuredEventPayload{
+                hotstuff::ProcessLifecycleEvent{
+                    hotstuff::ProcessLifecycleState::ready,
+                    std::nullopt}});
+    }
     req_thread = std::thread([this]()
                              { req_ec.dispatch(); });
     resp_thread = std::thread([this]()
@@ -693,15 +913,36 @@ void HotStuffApp::start(const std::vector<std::tuple<NetAddr, bytearray_t, bytea
     ec.dispatch();
 }
 
+void HotStuffApp::bind_process_lifecycle_emitter(
+    hotstuff::StructuredEventEmitter *emitter) noexcept
+{
+    process_lifecycle_emitter_ = emitter;
+}
+
 void HotStuffApp::stop()
 {
-    papp->req_tcall->async_call([this](salticidae::ThreadCall::Handle &)
-                                { req_ec.stop(); });
-    papp->resp_tcall->async_call([this](salticidae::ThreadCall::Handle &)
-                                 { resp_ec.stop(); });
-
-    req_thread.join();
-    resp_thread.join();
+    if (!process_stopping_emitted_ &&
+        process_lifecycle_emitter_ != nullptr)
+    {
+        process_lifecycle_emitter_->emit(
+            hotstuff::StructuredEventPayload{
+                hotstuff::ProcessLifecycleEvent{
+                    hotstuff::ProcessLifecycleState::stopping,
+                    std::nullopt}});
+        process_stopping_emitted_ = true;
+    }
+    if (req_thread.joinable())
+    {
+        req_tcall->async_call([this](salticidae::ThreadCall::Handle &)
+                              { req_ec.stop(); });
+        req_thread.join();
+    }
+    if (resp_thread.joinable())
+    {
+        resp_tcall->async_call([this](salticidae::ThreadCall::Handle &)
+                               { resp_ec.stop(); });
+        resp_thread.join();
+    }
     ec.stop();
 }
 
