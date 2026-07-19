@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@ struct CommitCallbackObservation
     CommitCallbackKind kind;
     std::uint32_t height;
     uint256_t hash;
+    std::optional<std::uint64_t> commit_batch_index;
 };
 
 class CommitRuleCore final : public HotStuffCore
@@ -176,7 +178,8 @@ protected:
         callbacks_.push_back(CommitCallbackObservation{
             CommitCallbackKind::decide,
             finality.cmd_height,
-            finality.blk_hash});
+            finality.blk_hash,
+            std::nullopt});
     }
 
     void do_consensus(const block_t &block) override
@@ -184,17 +187,21 @@ protected:
         callbacks_.push_back(CommitCallbackObservation{
             CommitCallbackKind::consensus,
             block->get_height(),
-            block->get_hash()});
+            block->get_hash(),
+            std::nullopt});
         committed_.push_back(
             CommittedBlock{block->get_height(), block->get_hash()});
     }
 
-    void do_post_block_commit(const block_t &block) override
+    void do_post_block_commit(
+        const block_t &block,
+        std::uint64_t commit_batch_index) override
     {
         callbacks_.push_back(CommitCallbackObservation{
             CommitCallbackKind::post_block_commit,
             block->get_height(),
-            block->get_hash()});
+            block->get_hash(),
+            commit_batch_index});
     }
 
     void do_broadcast_proposal(const Proposal &) override {}

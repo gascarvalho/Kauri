@@ -135,6 +135,9 @@ TEST_CASE("post-block commit follows every application decision",
     CHECK(callbacks[0].kind == CommitCallbackKind::consensus);
     CHECK(callbacks[1].kind == CommitCallbackKind::decide);
     CHECK(callbacks[2].kind == CommitCallbackKind::post_block_commit);
+    CHECK_FALSE(callbacks[0].commit_batch_index.has_value());
+    CHECK_FALSE(callbacks[1].commit_batch_index.has_value());
+    CHECK(callbacks[2].commit_batch_index == 0);
     for (const auto &callback : callbacks)
     {
         CHECK(callback.height == chain[0]->get_height());
@@ -159,6 +162,8 @@ TEST_CASE("empty-command commits still run the post-block hook",
     REQUIRE(callbacks.size() == 2);
     CHECK(callbacks[0].kind == CommitCallbackKind::consensus);
     CHECK(callbacks[1].kind == CommitCallbackKind::post_block_commit);
+    CHECK_FALSE(callbacks[0].commit_batch_index.has_value());
+    CHECK(callbacks[1].commit_batch_index == 0);
     for (const auto &callback : callbacks)
     {
         CHECK(callback.height == block1->get_height());
@@ -190,6 +195,12 @@ TEST_CASE("post-block commit preserves ordering across one commit queue",
               CommitCallbackKind::decide);
         CHECK(callbacks[callback_index + 2].kind ==
               CommitCallbackKind::post_block_commit);
+        CHECK_FALSE(
+            callbacks[callback_index].commit_batch_index.has_value());
+        CHECK_FALSE(
+            callbacks[callback_index + 1].commit_batch_index.has_value());
+        CHECK(callbacks[callback_index + 2].commit_batch_index ==
+              block_index);
         for (std::size_t offset = 0; offset < 3; ++offset)
         {
             const auto &callback = callbacks[callback_index + offset];

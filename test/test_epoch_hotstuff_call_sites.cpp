@@ -953,7 +953,7 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
         "void HotStuffBase::finish_adaptive_epoch_commit(");
 
     CHECK(header.find(
-              "void do_post_block_commit(const block_t &blk) override;") !=
+              "void do_post_block_commit(") !=
           std::string::npos);
 
     REQUIRE_FALSE(consensus.empty());
@@ -1056,7 +1056,250 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
         core,
         {"do_consensus(blk);",
          "do_decide(Finality(",
-         "do_post_block_commit(blk);"}));
+         "do_post_block_commit(blk, commit_batch_index);"}));
+}
+
+TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
+          "[adaptive-v2][structured-event][commit-hook][audit]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto consensus_header = source("include/hotstuff/consensus.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto consensus = source("src/consensus.cpp");
+    const auto binding = function_body(
+        implementation, "void HotStuffBase::bind_structured_event_emitters(");
+    const auto commit_event = function_body(
+        implementation, "void HotStuffBase::emit_committed_block_event(");
+    const auto command_event = function_body(
+        implementation,
+        "void HotStuffBase::emit_epoch_command_committed_event(");
+    const auto post_commit = function_body(
+        implementation, "void HotStuffBase::do_post_block_commit(");
+    const auto cache_commit = function_body(
+        implementation, "void HotStuffBase::cache_adaptive_v2_commit(");
+    const auto observe_generation = function_body(
+        implementation,
+        "bool HotStuffBase::observe_proposal_view_generation(");
+    const auto local_proposal = function_body(
+        implementation, "void HotStuffBase::do_broadcast_proposal(");
+    const auto remote_proposal = function_body(
+        implementation, "void HotStuffBase::process_active(");
+    const auto do_consensus = function_body(
+        implementation, "void HotStuffBase::do_consensus(");
+    const auto retire_before_epoch = function_body(
+        implementation,
+        "void HotStuffBase::retire_deferred_epoch_changes_before_epoch(");
+    const auto retire_for_block = function_body(
+        implementation,
+        "void HotStuffBase::retire_deferred_epoch_changes_for_block(");
+    const auto retirement_floor = function_body(
+        implementation,
+        "void HotStuffBase::advance_committed_retirement_floor(");
+    const auto forwarding_abort = function_body(
+        implementation, "void HotStuffBase::abort_exact_forwarding(");
+
+    CHECK(contains_all(
+        header,
+        {"AuditStructuredEventEmitter *audit_event_emitter{nullptr}",
+         "AuditStructuredEventEmitter *audit_emitter",
+         "maximum_proposal_view_generation_observations",
+         "proposal_view_generations",
+         "std::optional<std::uint64_t> view_generation"}));
+    CHECK(contains_in_order(
+        consensus_header,
+        {"do_post_block_commit(",
+         "const block_t &",
+         "std::uint64_t commit_batch_index)"}));
+    CHECK(contains_in_order(
+        consensus,
+        {"std::uint64_t commit_batch_index = 0",
+         "commit_queue.rbegin()",
+         "do_post_block_commit(blk, commit_batch_index)",
+         "++commit_batch_index"}));
+    REQUIRE_FALSE(binding.empty());
+    CHECK(contains_all(
+        binding,
+        {"structured_event_emitter = lifecycle_emitter",
+         "adaptive_event_emitter = aggregation_emitter",
+         "audit_event_emitter = audit_emitter"}));
+
+    REQUIRE_FALSE(commit_event.empty());
+    CHECK(contains_all(
+        commit_event,
+        {"structured_event_emitter == nullptr",
+         "committed_key.has_value()",
+         "view_generation.has_value()",
+         "key.block_hash != blk->get_hash()",
+         "blk->get_parent_hashes()",
+         "blk->get_cmds().size()",
+         "key,",
+         "commit_batch_index",
+         "CommitStructuredEvent",
+         "StructuredEventPayload"}));
+    CHECK(commit_event.find("activation.active_effect()") ==
+          std::string::npos);
+    CHECK(commit_event.find("find_exact_runtime_generation(") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(observe_generation.empty());
+    CHECK(contains_all(
+        observe_generation,
+        {"generation == 0",
+         "proposal_view_generations.find(key)",
+         "found->second.reset()",
+         "maximum_proposal_view_generation_observations",
+         "proposal_view_generations.emplace(key, generation)",
+         "catch (...)"}));
+    REQUIRE_FALSE(local_proposal.empty());
+    CHECK(contains_in_order(
+        local_proposal,
+        {"adaptive_epoch_consensus_message(",
+         "if (adaptive_payload.empty())",
+         "observe_proposal_view_generation(",
+         "prop.key()",
+         "*generation"}));
+    REQUIRE_FALSE(remote_proposal.empty());
+    CHECK(contains_in_order(
+        remote_proposal,
+        {"proposal.metadata.key()",
+         "observe_proposal_view_generation(",
+         "proposal.view_generation"}));
+
+    REQUIRE_FALSE(cache_commit.empty());
+    CHECK(contains_all(
+        cache_commit,
+        {"committed_proposal_key(blk, committed_keys)",
+         "proposal_view_generation(*committed_key)",
+         "PendingAdaptiveV2Commit"}));
+    REQUIRE_FALSE(do_consensus.empty());
+    CHECK(contains_in_order(
+        do_consensus,
+        {"record_committed_epoch_change_history(blk)",
+         "retire_deferred_epoch_changes_for_block(blk->get_hash())",
+         "close_committed_block(blk->get_hash())",
+         "cache_adaptive_v2_commit(blk, keys)",
+         "forget_proposal_view_generation(key)",
+         "forget_proposal_view_generations_for_block(blk->get_hash())"}));
+    REQUIRE_FALSE(retire_before_epoch.empty());
+    CHECK(retire_before_epoch.find(
+              "forget_proposal_view_generation(key)") !=
+          std::string::npos);
+    REQUIRE_FALSE(retire_for_block.empty());
+    CHECK(retire_for_block.find(
+              "forget_proposal_view_generation(key)") ==
+          std::string::npos);
+    REQUIRE_FALSE(retirement_floor.empty());
+    CHECK(retirement_floor.find(
+              "forget_proposal_view_generations_before_epoch(") !=
+          std::string::npos);
+    REQUIRE_FALSE(forwarding_abort.empty());
+    CHECK(forwarding_abort.find(
+              "forget_proposal_view_generation(lease.key())") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(command_event.empty());
+    CHECK(contains_all(
+        command_event,
+        {"audit_event_emitter == nullptr",
+         "record.command_commit_height",
+         "blk->get_height()",
+         "epoch_change_payload_digest(command.payload)",
+         "record.payload_digest",
+         "record.predecessor_epoch_number",
+         "record.predecessor_epoch_digest",
+         "record.successor_epoch_number",
+         "record.successor_epoch_digest",
+         "record.activation_delay_blocks",
+         "record.activation_height",
+         "EpochCommandCommittedStructuredEvent",
+         "AuditStructuredEventPayload"}));
+    CHECK(command_event.find("activation.active_effect()") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(post_commit.empty());
+    CHECK(count_occurrences(
+              post_commit, "emit_committed_block_event(") == 1);
+    CHECK(count_occurrences(
+              post_commit, "emit_epoch_command_committed_event(") == 1);
+    CHECK(contains_in_order(
+        post_commit,
+        {"committed_key = pending_adaptive_v2_commit->committed_key",
+         "view_generation =",
+         "pending_adaptive_v2_commit->view_generation",
+         "pending_adaptive_v2_commit.reset()",
+         "emit_committed_block_event(",
+         "commit_batch_index",
+         "record_committed_v2(command, blk->get_height())",
+         "ActivationRecordDisposition::recorded",
+         "recorded.record.has_value()",
+         "emit_epoch_command_committed_event(",
+         "pending_committed_epoch_change.reset()",
+         "on_v2_post_block_commit("}));
+}
+
+TEST_CASE("every adaptive v2 topology publication emits active configuration",
+          "[adaptive-v2][structured-event][topology][runtime]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto runtime = source("src/epoch_runtime.cpp");
+    const auto live_binding = source("src/epoch_live_binding.cpp");
+    const auto apply = function_body(
+        implementation,
+        "void apply(const EpochRuntimeUpdate &update) noexcept");
+    const auto successor = function_body(
+        live_binding, "HotStuffEpochLiveBinding::finish_commit(");
+    const auto rotate = function_body(
+        live_binding, "HotStuffEpochLiveBinding::rotate_to_tree(");
+    const auto compare_and_rotate = function_body(
+        runtime, "AdaptiveV2RotationCoordinator::compare_and_rotate(");
+    const auto periodic = function_body(
+        implementation,
+        "void HotStuffBase::rotate_adaptive_v2_after_commit(");
+    const auto timeout = function_body(
+        implementation,
+        "HotStuffBase::rotate_tree_on_leader_timeout(");
+
+    REQUIRE_FALSE(apply.empty());
+    CHECK(count_occurrences(
+              apply, "emit_active_configuration_event(") == 1);
+    CHECK(contains_in_order(
+        apply,
+        {"activate_runtime_view(",
+         "active_index = armed_index",
+         "owner.config.async_blocks",
+         "owner.config.fanout",
+         "armed_topology = nullptr",
+         "EpochProtocolMode::adaptive_v2",
+         "owner.emit_active_configuration_event(",
+         "update.activation.configuration"}));
+    CHECK(count_occurrences(
+              implementation, "topology.apply(update)") == 1);
+
+    REQUIRE_FALSE(successor.empty());
+    CHECK(contains_in_order(
+        successor,
+        {"ActivationTransition::activated",
+         "live_effects_.apply_update(*result.update)"}));
+
+    REQUIRE_FALSE(compare_and_rotate.empty());
+    CHECK(contains_in_order(
+        compare_and_rotate,
+        {"effects_.rotate_to_tree(*next_tree)",
+         "rotation.update.has_value()"}));
+    REQUIRE_FALSE(rotate.empty());
+    CHECK(contains_in_order(
+        rotate,
+        {"adapter_.rotate_to_tree(tree_id)",
+         "live_effects_.apply_update(*result.update)"}));
+
+    REQUIRE_FALSE(periodic.empty());
+    CHECK(periodic.find(
+              "adaptive_v2_rotation_coordinator->on_commit(") !=
+          std::string::npos);
+    REQUIRE_FALSE(timeout.empty());
+    CHECK(timeout.find(
+              "adaptive_v2_rotation_coordinator->on_timeout(") !=
+          std::string::npos);
 }
 
 TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
@@ -1099,8 +1342,17 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
     CHECK(contains_in_order(
         cache,
         {"EpochProtocolMode::adaptive_v2",
+         "committed_proposal_key(blk, committed_keys)",
+         "proposal_view_generation(*committed_key)",
          "pending_adaptive_v2_commit.emplace(",
-         "committed_proposal_key(blk, committed_keys)"}));
+         "PendingAdaptiveV2Commit"}));
+    CHECK(cache.find("observed_committed_proposal_key(") ==
+          std::string::npos);
+    CHECK(contains_in_order(
+        cache,
+        {"committed_key",
+         "generation",
+         "blk->get_hash(), committed_key, generation"}));
 
     REQUIRE_FALSE(post_commit.empty());
     CHECK(contains_in_order(
@@ -1108,10 +1360,14 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
         {"pending_adaptive_v2_commit",
          "block_hash == blk->get_hash()",
          "committed_key =",
+         "view_generation =",
          "pending_adaptive_v2_commit.reset()",
          "epoch_live_binding->on_v2_post_block_commit(",
          "finish_adaptive_epoch_commit(blk, activation)",
          "rotate_adaptive_v2_after_commit(committed_key)"}));
+    CHECK(post_commit.find(
+              "rotate_adaptive_v2_after_commit(view_generation)") ==
+          std::string::npos);
 
     REQUIRE_FALSE(finish_commit.empty());
     CHECK(contains_in_order(
@@ -1127,6 +1383,8 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
          "committed_key",
          "active.configuration",
          "active.generation"}));
+    CHECK(periodic_rotation.find("view_generation") ==
+          std::string::npos);
     CHECK(periodic_rotation.find("nmajority") == std::string::npos);
 
     REQUIRE_FALSE(timeout_rotation.empty());

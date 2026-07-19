@@ -988,6 +988,10 @@ namespace hotstuff
                     active->trees[active_index].get_tree().get_fanout();
                 armed_topology = nullptr;
                 armed_replacement = false;
+                if (owner.epoch_protocol_mode ==
+                    EpochProtocolMode::adaptive_v2)
+                    owner.emit_active_configuration_event(
+                        update.activation.configuration);
             }
 
             const TreeNetwork *find_tree(
@@ -1580,6 +1584,7 @@ namespace hotstuff
             proposal_contexts->close(
                 metadata.key,
                 ProposalContextEvent::proposal_aborted);
+            forget_proposal_view_generation(metadata.key);
             return std::nullopt;
         }
         return lease;
@@ -2159,6 +2164,7 @@ namespace hotstuff
                 }
                 catch (...)
                 {}
+                forget_proposal_view_generation(key);
                 proposal = proposals.erase(proposal);
                 if (deferred_epoch_change_proposal_count != 0)
                     --deferred_epoch_change_proposal_count;
@@ -2174,12 +2180,15 @@ namespace hotstuff
     void HotStuffBase::process_active(const BufferedProposal &proposal)
     {
         const auto proposal_key = proposal.metadata.key();
+        static_cast<void>(observe_proposal_view_generation(
+            proposal_key, proposal.view_generation));
         if (proposal.source_peer.is_null())
         {
             erase_deferred_epoch_change(proposal_key);
             proposal_contexts->close(
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
+            forget_proposal_view_generation(proposal_key);
             if (proposal_admission != nullptr)
                 proposal_admission->retire_proposal(proposal_key);
             purge_pending_exact_contributions(proposal_key);
@@ -2228,6 +2237,7 @@ namespace hotstuff
                         owner.proposal_contexts->close(
                             metadata.key,
                             ProposalContextEvent::proposal_aborted);
+                        owner.forget_proposal_view_generation(metadata.key);
                         if (owner.proposal_admission != nullptr)
                             owner.proposal_admission->retire_proposal(
                                 metadata.key);
@@ -2316,6 +2326,7 @@ namespace hotstuff
                     owner.proposal_contexts->close(
                         delivery_key,
                         ProposalContextEvent::proposal_aborted);
+                    owner.forget_proposal_view_generation(delivery_key);
                     if (owner.proposal_admission != nullptr)
                         owner.proposal_admission->retire_proposal(
                             delivery_key);
@@ -2328,6 +2339,7 @@ namespace hotstuff
             proposal_contexts->close(
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
+            forget_proposal_view_generation(proposal_key);
             if (proposal_admission != nullptr)
                 proposal_admission->retire_proposal(proposal_key);
             purge_pending_exact_contributions(proposal_key);
@@ -2341,6 +2353,7 @@ namespace hotstuff
             proposal_contexts->close(
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
+            forget_proposal_view_generation(proposal_key);
             if (proposal_admission != nullptr)
                 proposal_admission->retire_proposal(proposal_key);
             purge_pending_exact_contributions(proposal_key);
@@ -3027,6 +3040,7 @@ namespace hotstuff
             reason);
         static_cast<void>(proposal_contexts->transition(
             lease, ProposalContextEvent::proposal_aborted));
+        forget_proposal_view_generation(lease.key());
         purge_pending_exact_contributions(lease.key());
         if (proposal_admission != nullptr)
             proposal_admission->retire_proposal(lease.key());
@@ -3248,6 +3262,83 @@ namespace hotstuff
         }
         catch (...)
         {
+        }
+    }
+
+    void HotStuffBase::emit_committed_block_event(
+        const block_t &blk,
+        const std::optional<ProposalKey> &committed_key,
+        const std::optional<std::uint64_t> &view_generation,
+        std::uint64_t commit_batch_index) noexcept
+    {
+        if (structured_event_emitter == nullptr || blk == nullptr ||
+            !committed_key.has_value() || !view_generation.has_value())
+            return;
+        try
+        {
+            const auto &key = *committed_key;
+            if (key.block_hash != blk->get_hash())
+                return;
+
+            std::optional<uint256_t> parent_hash;
+            const auto &parent_hashes = blk->get_parent_hashes();
+            if (!parent_hashes.empty())
+                parent_hash = parent_hashes.front();
+            structured_event_emitter->emit(
+                StructuredEventPayload{CommitStructuredEvent{
+                    blk->get_height(),
+                    blk->get_hash(),
+                    parent_hash,
+                    static_cast<std::uint64_t>(blk->get_cmds().size()),
+                    key,
+                    view_generation,
+                    commit_batch_index}});
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
+        }
+    }
+
+    void HotStuffBase::emit_epoch_command_committed_event(
+        const block_t &blk,
+        const AuthorizedEpochChange &command,
+        const ActivationRecord &record) noexcept
+    {
+        if (audit_event_emitter == nullptr || blk == nullptr)
+            return;
+        try
+        {
+            const auto payload_digest =
+                epoch_change_payload_digest(command.payload);
+            if (record.command_commit_height != blk->get_height() ||
+                record.payload_digest != payload_digest ||
+                record.predecessor_epoch_digest !=
+                    command.payload.predecessor_epoch_digest ||
+                record.successor_epoch_number !=
+                    command.payload.successor_epoch_number ||
+                record.successor_epoch_digest !=
+                    command.payload.successor_epoch_digest ||
+                record.activation_delay_blocks !=
+                    command.payload.activation_delay_blocks)
+                return;
+
+            audit_event_emitter->emit_audit(
+                AuditStructuredEventPayload{
+                    EpochCommandCommittedStructuredEvent{
+                        blk->get_height(),
+                        blk->get_hash(),
+                        record.predecessor_epoch_number,
+                        record.predecessor_epoch_digest,
+                        record.successor_epoch_number,
+                        record.successor_epoch_digest,
+                        record.payload_digest,
+                        record.activation_delay_blocks,
+                        record.activation_height}});
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
         }
     }
 
@@ -5455,10 +5546,12 @@ namespace hotstuff
 
     void HotStuffBase::bind_structured_event_emitters(
         StructuredEventEmitter *lifecycle_emitter,
-        AdaptiveStructuredEventEmitter *aggregation_emitter) noexcept
+        AdaptiveStructuredEventEmitter *aggregation_emitter,
+        AuditStructuredEventEmitter *audit_emitter) noexcept
     {
         structured_event_emitter = lifecycle_emitter;
         adaptive_event_emitter = aggregation_emitter;
+        audit_event_emitter = audit_emitter;
     }
 
     void HotStuffBase::bind_adaptive_v2_evidence_transport(
@@ -5619,6 +5712,9 @@ namespace hotstuff
             }
             if (adaptive_payload.empty())
                 return;
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+                static_cast<void>(observe_proposal_view_generation(
+                    prop.key(), *generation));
         }
 
         for (const auto child : metadata->tree.direct_children)
@@ -5781,6 +5877,106 @@ namespace hotstuff
         return std::nullopt;
     }
 
+    bool HotStuffBase::observe_proposal_view_generation(
+        const ProposalKey &key,
+        std::uint64_t generation) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            generation == 0)
+            return false;
+        try
+        {
+            const auto found = proposal_view_generations.find(key);
+            if (found != proposal_view_generations.end())
+            {
+                if (!found->second || *found->second != generation)
+                {
+                    // A conflict is permanent for this exact key. Keeping the
+                    // tombstone prevents a replay from restoring false
+                    // precision to the evidence identity.
+                    found->second.reset();
+                    return false;
+                }
+                return true;
+            }
+            if (proposal_view_generations.size() >=
+                maximum_proposal_view_generation_observations)
+                return false;
+            proposal_view_generations.emplace(key, generation);
+            return true;
+        }
+        catch (...)
+        {
+            // Observation failure affects evidence completeness only.
+            return false;
+        }
+    }
+
+    std::optional<std::uint64_t>
+    HotStuffBase::proposal_view_generation(
+        const ProposalKey &key) const noexcept
+    {
+        try
+        {
+            const auto found = proposal_view_generations.find(key);
+            if (found == proposal_view_generations.end())
+                return std::nullopt;
+            return found->second;
+        }
+        catch (...)
+        {
+            return std::nullopt;
+        }
+    }
+
+    void HotStuffBase::forget_proposal_view_generation(
+        const ProposalKey &key) noexcept
+    {
+        try
+        {
+            proposal_view_generations.erase(key);
+        }
+        catch (...)
+        {}
+    }
+
+    void HotStuffBase::forget_proposal_view_generations_for_block(
+        const uint256_t &block_hash) noexcept
+    {
+        try
+        {
+            for (auto observation = proposal_view_generations.begin();
+                 observation != proposal_view_generations.end();)
+            {
+                if (observation->first.block_hash == block_hash)
+                    observation = proposal_view_generations.erase(observation);
+                else
+                    ++observation;
+            }
+        }
+        catch (...)
+        {}
+    }
+
+    void HotStuffBase::forget_proposal_view_generations_before_epoch(
+        std::uint32_t first_live_epoch) noexcept
+    {
+        try
+        {
+            for (auto observation = proposal_view_generations.begin();
+                 observation != proposal_view_generations.end();)
+            {
+                if (observation->first.configuration.epoch_number <
+                    first_live_epoch)
+                    observation = proposal_view_generations.erase(observation);
+                else
+                    ++observation;
+            }
+        }
+        catch (...)
+        {}
+    }
+
     void HotStuffBase::record_adaptive_commit_marker(
         const block_t &blk,
         const std::vector<ProposalKey> &committed_keys) const
@@ -5924,6 +6120,8 @@ namespace hotstuff
                 first_live_epoch);
             proposal_contexts->advance_retirement_floor(
                 first_live_epoch);
+            forget_proposal_view_generations_before_epoch(
+                first_live_epoch);
         }
     }
 
@@ -5973,14 +6171,29 @@ namespace hotstuff
 
     void HotStuffBase::cache_adaptive_v2_commit(
         const block_t &blk,
-        const std::vector<ProposalKey> &committed_keys)
+        const std::vector<ProposalKey> &committed_keys) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
-        pending_adaptive_v2_commit.emplace(
-            PendingAdaptiveV2Commit{
-                blk->get_hash(),
-                committed_proposal_key(blk, committed_keys)});
+        pending_adaptive_v2_commit.reset();
+        if (blk == nullptr)
+            return;
+        try
+        {
+            const auto committed_key =
+                committed_proposal_key(blk, committed_keys);
+            const auto generation = committed_key.has_value()
+                ? proposal_view_generation(*committed_key)
+                : std::nullopt;
+            pending_adaptive_v2_commit.emplace(
+                PendingAdaptiveV2Commit{
+                    blk->get_hash(), committed_key, generation});
+        }
+        catch (...)
+        {
+            // Observation failure affects evidence completeness only.
+            pending_adaptive_v2_commit.reset();
+        }
     }
 
     void HotStuffBase::do_consensus(const block_t &blk)
@@ -5989,6 +6202,8 @@ namespace hotstuff
         retire_deferred_epoch_changes_for_block(blk->get_hash());
         const auto keys =
             proposal_contexts->close_committed_block(blk->get_hash());
+        // Preserve the authoritative committed key for protocol cadence and
+        // copy optional evidence metadata before terminal cache cleanup.
         cache_adaptive_v2_commit(blk, keys);
         record_adaptive_commit_marker(blk, keys);
         pending_exact_contributions.purge_block(blk->get_hash());
@@ -5997,7 +6212,9 @@ namespace hotstuff
             purge_pending_exact_contributions(key);
             erase_deferred_epoch_change(key);
             proposal_admission->retire_proposal(key);
+            forget_proposal_view_generation(key);
         }
+        forget_proposal_view_generations_for_block(blk->get_hash());
         const auto activation =
             epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
                 epoch_live_binding != nullptr
@@ -6026,18 +6243,27 @@ namespace hotstuff
         }
     }
 
-    void HotStuffBase::do_post_block_commit(const block_t &blk)
+    void HotStuffBase::do_post_block_commit(
+        const block_t &blk,
+        std::uint64_t commit_batch_index)
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
 
         std::optional<ProposalKey> committed_key;
+        std::optional<std::uint64_t> view_generation;
         if (blk != nullptr && pending_adaptive_v2_commit &&
             pending_adaptive_v2_commit->block_hash == blk->get_hash())
+        {
             committed_key = pending_adaptive_v2_commit->committed_key;
+            view_generation =
+                pending_adaptive_v2_commit->view_generation;
+        }
         pending_adaptive_v2_commit.reset();
         if (blk == nullptr)
             return;
+        emit_committed_block_event(
+            blk, committed_key, view_generation, commit_batch_index);
 
         const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
             pending_committed_epoch_change.reset();
@@ -6117,6 +6343,13 @@ namespace hotstuff
                         }
                         else
                         {
+                            if (recorded.disposition ==
+                                    ActivationRecordDisposition::recorded &&
+                                recorded.record.has_value())
+                            {
+                                emit_epoch_command_committed_event(
+                                    blk, command, *recorded.record);
+                            }
                             pending_committed_epoch_change.reset();
                         }
                     }

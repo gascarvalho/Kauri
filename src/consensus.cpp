@@ -303,6 +303,7 @@ namespace hotstuff
                                      std::string(*b_exec));
 #endif
 
+        std::uint64_t commit_batch_index = 0;
         for (auto it = commit_queue.rbegin(); it != commit_queue.rend(); it++)
         {
             const block_t &blk = *it;
@@ -330,7 +331,8 @@ namespace hotstuff
                 do_decide(Finality(id, get_cur_epoch_nr(), get_tree_id(), 1, i, blk->height,
                                    blk->cmds[i], blk->get_hash()));
             }
-            do_post_block_commit(blk);
+            do_post_block_commit(blk, commit_batch_index);
+            ++commit_batch_index;
         }
 
         if (!commit_queue.empty() && blk1->qc != nullptr)

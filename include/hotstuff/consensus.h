@@ -19,6 +19,7 @@
 #define _HOTSTUFF_CONSENSUS_H
 
 #include <cassert>
+#include <cstdint>
 #include <set>
 #include <unordered_map>
 
@@ -240,8 +241,12 @@ namespace hotstuff
         /** Called by HotStuffCore upon the decision being made for cmd. */
         virtual void do_decide(Finality &&fin) = 0;
         virtual void do_consensus(const block_t &blk) = 0;
-        /** Called once per committed block after all application decisions. */
-        virtual void do_post_block_commit(const block_t &) {}
+        /** Called once per committed block after all application decisions.
+         * The index is zero-based within the current commit queue, ordered
+         * from the oldest committed block to the newest. */
+        virtual void do_post_block_commit(
+            const block_t &,
+            std::uint64_t commit_batch_index) {}
         /** Called by HotStuffCore upon broadcasting a new proposal.
          * The user should send the proposal message to all replicas except for
          * itself. */

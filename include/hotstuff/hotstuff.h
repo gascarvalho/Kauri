@@ -993,9 +993,10 @@ namespace hotstuff
         std::uint64_t epoch_activation_grace_blocks{1};
         bool adaptive_demo_markers{false};
         // Borrowed observational capabilities. The caller must unbind them
-        // before either emitter is destroyed.
+        // before any emitter is destroyed.
         StructuredEventEmitter *structured_event_emitter{nullptr};
         AdaptiveStructuredEventEmitter *adaptive_event_emitter{nullptr};
+        AuditStructuredEventEmitter *audit_event_emitter{nullptr};
         std::unordered_set<uint256_t> valid_tls_certs;
 #ifdef HOTSTUFF_BLK_PROFILE
         BlockProfiler blk_profiler;
@@ -1116,9 +1117,16 @@ namespace hotstuff
         {
             uint256_t block_hash;
             std::optional<ProposalKey> committed_key;
+            std::optional<std::uint64_t> view_generation;
         };
         std::optional<PendingAdaptiveV2Commit>
             pending_adaptive_v2_commit;
+        static constexpr std::size_t
+            maximum_proposal_view_generation_observations{4096};
+        // Evidence-only identity captured at proposal production/processing.
+        // A disengaged mapped value permanently marks an exact-key conflict.
+        std::map<ProposalKey, std::optional<std::uint64_t>>
+            proposal_view_generations;
         std::optional<std::size_t> adaptive_v2_tree_switch_period;
         std::unique_ptr<AdaptiveV2RotationCoordinator>
             adaptive_v2_rotation_coordinator;
@@ -1207,9 +1215,20 @@ namespace hotstuff
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
             const std::vector<ProposalKey> &committed_keys) const;
+        bool observe_proposal_view_generation(
+            const ProposalKey &key,
+            std::uint64_t generation) noexcept;
+        std::optional<std::uint64_t> proposal_view_generation(
+            const ProposalKey &key) const noexcept;
+        void forget_proposal_view_generation(
+            const ProposalKey &key) noexcept;
+        void forget_proposal_view_generations_for_block(
+            const uint256_t &block_hash) noexcept;
+        void forget_proposal_view_generations_before_epoch(
+            std::uint32_t first_live_epoch) noexcept;
         void cache_adaptive_v2_commit(
             const block_t &blk,
-            const std::vector<ProposalKey> &committed_keys);
+            const std::vector<ProposalKey> &committed_keys) noexcept;
         void rotate_adaptive_v2_after_commit(
             const std::optional<ProposalKey> &committed_key) noexcept;
         void record_adaptive_commit_marker(
@@ -1302,6 +1321,15 @@ namespace hotstuff
             const char *reason = nullptr) noexcept;
         void emit_active_configuration_event(
             const ConfigurationId &configuration) noexcept;
+        void emit_committed_block_event(
+            const block_t &blk,
+            const std::optional<ProposalKey> &committed_key,
+            const std::optional<std::uint64_t> &view_generation,
+            std::uint64_t commit_batch_index) noexcept;
+        void emit_epoch_command_committed_event(
+            const block_t &blk,
+            const AuthorizedEpochChange &command,
+            const ActivationRecord &record) noexcept;
         void emit_epoch_lifecycle_event(
             EpochLifecycleTransition transition,
             const ConfigurationId &configuration,
@@ -1357,7 +1385,9 @@ namespace hotstuff
         void proposer_base_deliver(const block_t &blk) override;
         void do_decide(Finality &&) override;
         void do_consensus(const block_t &blk) override;
-        void do_post_block_commit(const block_t &blk) override;
+        void do_post_block_commit(
+            const block_t &blk,
+            std::uint64_t commit_batch_index) override;
         uint32_t get_tree_id() override;
         uint32_t get_cur_epoch_nr() override;
         uint256_t get_epoch_digest(uint32_t epoch_number) override;
@@ -1413,7 +1443,8 @@ namespace hotstuff
          */
         void bind_structured_event_emitters(
             StructuredEventEmitter *lifecycle_emitter,
-            AdaptiveStructuredEventEmitter *aggregation_emitter) noexcept;
+            AdaptiveStructuredEventEmitter *aggregation_emitter,
+            AuditStructuredEventEmitter *audit_emitter = nullptr) noexcept;
         /**
          * Bind a local adaptive-v2 evidence outbox transport capability.
          * Delivery acceptance removes an outbox item only; it grants no
