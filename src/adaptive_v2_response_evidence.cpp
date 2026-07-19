@@ -191,6 +191,10 @@ struct AdaptiveV2ResponseEvidenceBridge::State
     std::uint64_t armed_attempts{0};
     std::uint64_t response_facts{0};
     std::uint64_t timeout_facts{0};
+    std::uint64_t timeout_missing_handles{0};
+    std::uint64_t timeout_ineligible_attempts{0};
+    std::uint64_t timeout_tracker_rejections{0};
+    std::uint64_t timeout_exceptions{0};
     std::uint64_t retired_attempts{0};
     std::uint64_t rejected_operations{0};
     std::uint64_t capacity_failures{0};
@@ -470,9 +474,16 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
     {
         const auto found = state_->handles.find(
             ChildAttemptKey{proposal, child});
-        if (found == state_->handles.end() ||
-            !found->second.timeout_eligible)
+        if (found == state_->handles.end())
+        {
+            increment(state_->timeout_missing_handles);
             continue;
+        }
+        if (!found->second.timeout_eligible)
+        {
+            increment(state_->timeout_ineligible_attempts);
+            continue;
+        }
         try
         {
             static_cast<void>(flush());
@@ -495,7 +506,10 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
             auto fact = state_->tracker.record_timeout(
                 found->second.handle, timeout_monotonic_ns);
             if (!fact.has_value())
+            {
+                increment(state_->timeout_tracker_rejections);
                 continue;
+            }
             if (!state_->retained_facts.push(std::move(*fact)))
             {
                 increment(state_->retention_capacity_failures);
@@ -509,6 +523,7 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
         }
         catch (...)
         {
+            increment(state_->timeout_exceptions);
             increment(state_->rejected_operations);
             state_->healthy = false;
         }
@@ -700,6 +715,13 @@ AdaptiveV2ResponseEvidenceBridge::diagnostics() const noexcept
     result.armed_attempts = state_->armed_attempts;
     result.response_facts = state_->response_facts;
     result.timeout_facts = state_->timeout_facts;
+    result.timeout_missing_handles =
+        state_->timeout_missing_handles;
+    result.timeout_ineligible_attempts =
+        state_->timeout_ineligible_attempts;
+    result.timeout_tracker_rejections =
+        state_->timeout_tracker_rejections;
+    result.timeout_exceptions = state_->timeout_exceptions;
     result.retired_attempts = state_->retired_attempts;
     result.rejected_operations = state_->rejected_operations;
     result.capacity_failures = state_->capacity_failures;

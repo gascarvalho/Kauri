@@ -166,6 +166,8 @@ TEST_CASE(
     REQUIRE(bridge.arm(key, response_tree(), kStartNs, kDeadlineUs));
 
     CHECK(bridge.record_timeouts(key, {1}, after_us(100)) == 1);
+    CHECK(bridge.record_timeouts(key, {1}, after_us(101)) == 0);
+    CHECK(bridge.diagnostics().timeout_tracker_rejections == 1);
     REQUIRE(bridge.record_verified_response(
         key,
         1,
@@ -202,6 +204,7 @@ TEST_CASE(
     REQUIRE(bridge.arm(key, response_tree(), kStartNs, kDeadlineUs));
 
     CHECK(bridge.record_timeouts(key, {5}, after_us(100)) == 0);
+    CHECK(bridge.diagnostics().timeout_ineligible_attempts == 1);
     CHECK_FALSE(bridge.record_verified_response(
         key,
         1,
@@ -230,6 +233,7 @@ TEST_CASE(
     CHECK(bridge.diagnostics().active_handles == 0);
     CHECK(bridge.diagnostics().retired_attempts == 3);
     CHECK(bridge.record_timeouts(key, {1, 2}, after_us(100)) == 0);
+    CHECK(bridge.diagnostics().timeout_missing_handles == 2);
     CHECK_FALSE(bridge.record_verified_response(
         key,
         2,
@@ -504,6 +508,10 @@ TEST_CASE(
     REQUIRE(legacy_send != std::string::npos);
     CHECK(exact_fact < v2_guard);
     CHECK(v2_guard < legacy_send);
+    CHECK(timeout.find("const auto recorded") != std::string::npos);
+    CHECK(timeout.find("diagnostics()") != std::string::npos);
+    CHECK(timeout.find("[EVIDENCE] Timeout bridge") !=
+          std::string::npos);
 
     const auto optional_absence = function_slice(
         implementation,

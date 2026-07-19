@@ -43,6 +43,10 @@ struct AdaptiveV2ResponseEvidenceDiagnostics
     std::uint64_t armed_attempts{0};
     std::uint64_t response_facts{0};
     std::uint64_t timeout_facts{0};
+    std::uint64_t timeout_missing_handles{0};
+    std::uint64_t timeout_ineligible_attempts{0};
+    std::uint64_t timeout_tracker_rejections{0};
+    std::uint64_t timeout_exceptions{0};
     std::uint64_t retired_attempts{0};
     std::uint64_t rejected_operations{0};
     std::uint64_t capacity_failures{0};

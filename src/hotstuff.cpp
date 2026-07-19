@@ -3498,11 +3498,39 @@ namespace hotstuff
             return;
 
         if (adaptive_v2_response_evidence != nullptr)
-            static_cast<void>(
+        {
+            const auto recorded =
                 adaptive_v2_response_evidence->record_timeouts(
                     lease.key(),
                     missing,
-                    adaptive_monotonic_now_ns()));
+                    adaptive_monotonic_now_ns());
+            const auto diagnostics =
+                adaptive_v2_response_evidence->diagnostics();
+            HOTSTUFF_LOG_INFO(
+                "[EVIDENCE] Timeout bridge epoch=%u tree=%u block=%.10s "
+                "requested=%zu recorded=%zu missing_handles=%llu "
+                "ineligible=%llu tracker_rejections=%llu "
+                "retention_failures=%llu late_reservation_failures=%llu "
+                "exceptions=%llu healthy=%u",
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                missing.size(),
+                recorded,
+                static_cast<unsigned long long>(
+                    diagnostics.timeout_missing_handles),
+                static_cast<unsigned long long>(
+                    diagnostics.timeout_ineligible_attempts),
+                static_cast<unsigned long long>(
+                    diagnostics.timeout_tracker_rejections),
+                static_cast<unsigned long long>(
+                    diagnostics.retention_capacity_failures),
+                static_cast<unsigned long long>(
+                    diagnostics.late_compensation_capacity_failures),
+                static_cast<unsigned long long>(
+                    diagnostics.timeout_exceptions),
+                diagnostics.healthy ? 1U : 0U);
+        }
 
         // Adaptive-v2 emits only exact, locally derived response facts. The
         // legacy timeout message has no authenticated manager-ingress seam.
