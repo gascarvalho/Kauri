@@ -246,6 +246,16 @@ set_tests_properties(
     LABELS "adaptive-v2;manager-controller;n7;evidence;selection;epoch-factory;unit"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_adaptive_v2_manager_delivery
+    test_adaptive_v2_manager_delivery.cpp)
+target_compile_definitions(
+    test_adaptive_v2_manager_delivery PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_adaptive_v2_manager_delivery PROPERTIES
+    LABELS "adaptive-v2;manager-delivery;one-shot;quorum;unit"
+    TIMEOUT 5)
+add_kauri_catch_test(
     test_adaptive_v2_reporting_outbox
     test_adaptive_v2_reporting_outbox.cpp)
 set_tests_properties(

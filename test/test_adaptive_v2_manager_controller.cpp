@@ -50,6 +50,7 @@ constexpr std::uint64_t kActivationGeneration = 3;
 constexpr std::uint32_t kIssuerId = 17;
 constexpr std::uint64_t kSnapshotSeed = 0xA2F7;
 constexpr std::uint32_t kTimeoutsPerReporter = 2;
+constexpr std::uint32_t kMinimumScoreDrop = 6;
 
 static_assert(!std::is_copy_constructible<
               AdaptiveV2ManagerController>::value);
@@ -124,7 +125,7 @@ AdaptiveV2ManagerControllerConfig controller_config(
 {
     AdaptiveV2ManagerControllerConfig config;
     config.selection.required_nonresponsive = 2;
-    config.selection.minimum_score_drop = 2;
+    config.selection.minimum_score_drop = kMinimumScoreDrop;
     config.selection.minimum_timeouts_per_reporter =
         kTimeoutsPerReporter;
     config.selection.maximum_post_baseline_timeout_attempts = 128;

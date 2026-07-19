@@ -173,6 +173,7 @@ add_library(hotstuff
     src/adaptation_manager.cpp
     src/adaptive_v2_epoch_factory.cpp
     src/adaptive_v2_manager_controller.cpp
+    src/adaptive_v2_manager_delivery.cpp
     src/adaptive_v2_manager_ingress.cpp
     src/adaptive_v2_reporting_outbox.cpp
     src/adaptive_v2_response_evidence.cpp
