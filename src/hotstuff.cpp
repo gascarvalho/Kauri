@@ -711,6 +711,47 @@ namespace hotstuff
         AggregationScheduler::Cancellation cancellation;
     };
 
+    struct HotStuffBase::ExactVoteFallbackJob final
+    {
+        ExactVoteFallbackJob(
+            const ProposalContextLease &lease,
+            std::uint64_t exact_epoch_generation,
+            ReplicaID exact_root,
+            const Vote &exact_vote)
+            : key(lease.key()),
+              context_generation(lease.generation()),
+              epoch_generation(exact_epoch_generation),
+              root(exact_root),
+              vote(std::make_shared<const Vote>(exact_vote))
+        {}
+
+        const ProposalKey key;
+        const std::uint64_t context_generation;
+        const std::uint64_t epoch_generation;
+        const ReplicaID root;
+        const std::shared_ptr<const Vote> vote;
+        AggregationScheduler::Cancellation cancellation;
+    };
+
+    struct HotStuffBase::ExactProposalFallbackJob final
+    {
+        ExactProposalFallbackJob(
+            const ProposalContextLease &lease,
+            std::uint64_t exact_epoch_generation,
+            const Proposal &exact_proposal)
+            : key(lease.key()),
+              context_generation(lease.generation()),
+              epoch_generation(exact_epoch_generation),
+              proposal(std::make_shared<const Proposal>(exact_proposal))
+        {}
+
+        const ProposalKey key;
+        const std::uint64_t context_generation;
+        const std::uint64_t epoch_generation;
+        const std::shared_ptr<const Proposal> proposal;
+        AggregationScheduler::Cancellation cancellation;
+    };
+
     class HotStuffBase::ExactContributionEffects final
         : public ExactVoteHandlerEffects
     {
@@ -2458,6 +2499,7 @@ namespace hotstuff
         const ProposalKey &key)
     {
         discard_exact_forwarding_retries(key);
+        discard_exact_fallbacks(key);
         static_cast<void>(pending_exact_contributions.purge(key));
         if (adaptive_v2_response_evidence != nullptr)
             static_cast<void>(
@@ -3103,6 +3145,305 @@ namespace hotstuff
             {}
     }
 
+    void HotStuffBase::schedule_exact_vote_fallback(
+        const ProposalContextLease &lease,
+        const Vote &vote)
+    {
+        if (!lease.tree().parent.has_value() ||
+            lease.tree().local_replica != get_id() ||
+            vote.voter != get_id() || vote.key() != lease.key() ||
+            vote.cert == nullptr || aggregation_scheduler == nullptr ||
+            proposal_admission == nullptr ||
+            exact_vote_fallback_jobs.count(lease.key()) != 0)
+            return;
+        const auto *tree = find_exact_runtime_tree(
+            lease.key().configuration);
+        const auto generation = find_exact_runtime_generation(
+            lease.key().configuration);
+        if (tree == nullptr || !generation.has_value() ||
+            tree->get_tree().get_tree_root() != lease.tree().root)
+            return;
+
+        try
+        {
+            const auto delay = aggregation_timeout_policy.timeout_for(
+                0,
+                static_cast<std::uint32_t>(tree->get_max_level()));
+            auto job = std::make_shared<ExactVoteFallbackJob>(
+                lease, *generation, lease.tree().root, vote);
+            exact_vote_fallback_jobs.emplace(lease.key(), job);
+            auto cancellation = aggregation_scheduler->schedule_after(
+                delay,
+                [access = exact_runtime_access,
+                 key = lease.key(),
+                 context_generation = lease.generation()]() {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    runtime->owner().dispatch_exact_vote_fallback(
+                        key, context_generation);
+                });
+            if (!cancellation)
+            {
+                exact_vote_fallback_jobs.erase(lease.key());
+                return;
+            }
+            job->cancellation = std::move(cancellation);
+        }
+        catch (...)
+        {
+            exact_vote_fallback_jobs.erase(lease.key());
+        }
+    }
+
+    void HotStuffBase::dispatch_exact_vote_fallback(
+        const ProposalKey &key,
+        std::uint64_t context_generation)
+    {
+        const auto found = exact_vote_fallback_jobs.find(key);
+        if (found == exact_vote_fallback_jobs.end() ||
+            found->second->context_generation != context_generation)
+            return;
+        auto job = found->second;
+        job->cancellation = {};
+        exact_vote_fallback_jobs.erase(found);
+
+        const auto active = proposal_contexts->active_configuration();
+        const auto generation = find_exact_runtime_generation(
+            key.configuration);
+        const auto metadata = exact_context_metadata(key);
+        if (!active.has_value() || *active != key.configuration ||
+            !generation.has_value() || *generation != job->epoch_generation ||
+            metadata == std::nullopt || metadata->tree.root != job->root ||
+            metadata->tree.local_replica != get_id() ||
+            std::find(
+                metadata->tree.assigned_subtree.begin(),
+                metadata->tree.assigned_subtree.end(),
+                get_id()) == metadata->tree.assigned_subtree.end() ||
+            proposal_admission == nullptr ||
+            !proposal_admission->contains_admitted(key) ||
+            job->vote == nullptr || job->vote->cert == nullptr)
+            return;
+
+        static_cast<void>(send_exact_vote_to_root(
+            key, job->epoch_generation, job->root, *job->vote));
+    }
+
+    bool HotStuffBase::send_exact_vote_to_root(
+        const ProposalKey &key,
+        std::uint64_t epoch_generation,
+        ReplicaID root,
+        const Vote &vote)
+    {
+        if (vote.key() != key || vote.voter != get_id() ||
+            vote.cert == nullptr || root == get_id())
+            return false;
+        const auto peer = config.get_peer_id(root);
+        if (peer.is_null())
+            return false;
+        try
+        {
+            if (is_adaptive_epoch_mode(epoch_protocol_mode))
+            {
+                if (adaptive_epoch_runtime == nullptr)
+                    return false;
+                const MsgVote native(vote);
+                const auto encoded = adaptive_epoch_consensus_message(
+                    key.configuration,
+                    epoch_generation,
+                    EpochConsensusWireKind::vote,
+                    key,
+                    get_id(),
+                    root,
+                    static_cast<bytearray_t>(native.serialized),
+                    epoch_wire_limits,
+                    epoch_protocol_mode);
+                if (encoded.empty())
+                    return false;
+                return pn.send_msg(MsgVote(DataStream(encoded)), peer);
+            }
+            return pn.send_msg(MsgVote(vote), peer);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void HotStuffBase::schedule_exact_proposal_fallback(
+        const ProposalContextLease &lease,
+        const Proposal &proposal)
+    {
+        if (lease.tree().parent.has_value() ||
+            lease.tree().local_replica != get_id() ||
+            lease.tree().root != get_id() || proposal.key() != lease.key() ||
+            aggregation_scheduler == nullptr ||
+            exact_proposal_fallback_jobs.count(lease.key()) != 0)
+            return;
+        const auto *tree = find_exact_runtime_tree(
+            lease.key().configuration);
+        const auto generation = find_exact_runtime_generation(
+            lease.key().configuration);
+        if (tree == nullptr || !generation.has_value())
+            return;
+
+        try
+        {
+            const auto delay = aggregation_timeout_policy.timeout_for(
+                0,
+                static_cast<std::uint32_t>(tree->get_max_level()));
+            auto job = std::make_shared<ExactProposalFallbackJob>(
+                lease, *generation, proposal);
+            exact_proposal_fallback_jobs.emplace(lease.key(), job);
+            auto cancellation = aggregation_scheduler->schedule_after(
+                delay,
+                [access = exact_runtime_access,
+                 key = lease.key(),
+                 context_generation = lease.generation()]() {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    runtime->owner().dispatch_exact_proposal_fallback(
+                        key, context_generation);
+                });
+            if (!cancellation)
+            {
+                exact_proposal_fallback_jobs.erase(lease.key());
+                return;
+            }
+            job->cancellation = std::move(cancellation);
+        }
+        catch (...)
+        {
+            exact_proposal_fallback_jobs.erase(lease.key());
+        }
+    }
+
+    void HotStuffBase::dispatch_exact_proposal_fallback(
+        const ProposalKey &key,
+        std::uint64_t context_generation)
+    {
+        const auto found = exact_proposal_fallback_jobs.find(key);
+        if (found == exact_proposal_fallback_jobs.end() ||
+            found->second->context_generation != context_generation)
+            return;
+        auto job = found->second;
+        job->cancellation = {};
+        exact_proposal_fallback_jobs.erase(found);
+
+        const auto lease = proposal_contexts->acquire_open_context(key);
+        const auto active = proposal_contexts->active_configuration();
+        const auto generation = find_exact_runtime_generation(
+            key.configuration);
+        if (!lease.has_value() ||
+            lease->generation() != context_generation ||
+            lease->tree().root != get_id() ||
+            lease->tree().parent.has_value() ||
+            !active.has_value() || *active != key.configuration ||
+            !generation.has_value() || *generation != job->epoch_generation ||
+            adaptive_epoch_runtime == nullptr ||
+            !adaptive_epoch_runtime->activation.admits_new_proposals() ||
+            job->proposal == nullptr)
+            return;
+        static_cast<void>(broadcast_exact_proposal_fallback(
+            *lease, job->epoch_generation, *job->proposal));
+    }
+
+    bool HotStuffBase::broadcast_exact_proposal_fallback(
+        const ProposalContextLease &lease,
+        std::uint64_t epoch_generation,
+        const Proposal &proposal)
+    {
+        if (proposal.key() != lease.key() ||
+            lease.tree().root != get_id() ||
+            lease.tree().parent.has_value())
+            return false;
+        try
+        {
+            bytearray_t encoded;
+            if (is_adaptive_epoch_mode(epoch_protocol_mode))
+            {
+                const MsgPropose native(proposal);
+                encoded = adaptive_epoch_consensus_message(
+                    lease.key().configuration,
+                    epoch_generation,
+                    EpochConsensusWireKind::proposal,
+                    lease.key(),
+                    get_id(),
+                    get_id(),
+                    static_cast<bytearray_t>(native.serialized),
+                    epoch_wire_limits,
+                    epoch_protocol_mode);
+                if (encoded.empty())
+                    return false;
+            }
+
+            bool enqueued = false;
+            for (const auto member : lease.tree().assigned_subtree)
+            {
+                if (member == get_id())
+                    continue;
+                const auto peer = config.get_peer_id(member);
+                if (peer.is_null())
+                    continue;
+                enqueued = is_adaptive_epoch_mode(epoch_protocol_mode)
+                    ? pn.send_msg(
+                          MsgPropose(DataStream(encoded)), peer) || enqueued
+                    : pn.send_msg(MsgPropose(proposal), peer) || enqueued;
+            }
+            return enqueued;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void HotStuffBase::discard_exact_fallbacks(const ProposalKey &key)
+    {
+        std::vector<AggregationScheduler::Cancellation> cancellations;
+        const auto vote = exact_vote_fallback_jobs.find(key);
+        if (vote != exact_vote_fallback_jobs.end())
+        {
+            if (vote->second->cancellation)
+                cancellations.push_back(
+                    std::move(vote->second->cancellation));
+            exact_vote_fallback_jobs.erase(vote);
+        }
+        const auto proposal = exact_proposal_fallback_jobs.find(key);
+        if (proposal != exact_proposal_fallback_jobs.end())
+        {
+            if (proposal->second->cancellation)
+                cancellations.push_back(
+                    std::move(proposal->second->cancellation));
+            exact_proposal_fallback_jobs.erase(proposal);
+        }
+        for (auto &cancel : cancellations)
+            cancel();
+    }
+
+    void HotStuffBase::cancel_all_exact_fallbacks() noexcept
+    {
+        std::vector<AggregationScheduler::Cancellation> cancellations;
+        for (auto &entry : exact_vote_fallback_jobs)
+            if (entry.second->cancellation)
+                cancellations.push_back(
+                    std::move(entry.second->cancellation));
+        for (auto &entry : exact_proposal_fallback_jobs)
+            if (entry.second->cancellation)
+                cancellations.push_back(
+                    std::move(entry.second->cancellation));
+        exact_vote_fallback_jobs.clear();
+        exact_proposal_fallback_jobs.clear();
+        for (auto &cancel : cancellations)
+            try
+            {
+                cancel();
+            }
+            catch (...)
+            {}
+    }
+
     quorum_cert_bt HotStuffBase::verified_aggregation_candidate(
         const ProposalContextLease &lease)
     {
@@ -3387,13 +3728,26 @@ namespace hotstuff
                 make_exact_direct_forwarding_candidate(lease, *vote);
             if (forwarding_candidate == nullptr)
                 return;
-            accepted = proposal_contexts->record_verified_direct_part(
-                lease,
-                config,
-                contribution.authenticated_sender,
-                *contribution.claimed_voter,
-                *vote->cert,
-                std::move(forwarding_candidate));
+            const bool descendant_root_fallback =
+                lease.tree().local_replica == lease.tree().root &&
+                !lease.tree().parent.has_value() &&
+                lease.tree().child_subtrees.count(
+                    contribution.authenticated_sender) == 0;
+            accepted = descendant_root_fallback
+                ? proposal_contexts->record_verified_root_fallback_part(
+                      lease,
+                      config,
+                      contribution.authenticated_sender,
+                      *contribution.claimed_voter,
+                      *vote->cert,
+                      std::move(forwarding_candidate))
+                : proposal_contexts->record_verified_direct_part(
+                      lease,
+                      config,
+                      contribution.authenticated_sender,
+                      *contribution.claimed_voter,
+                      *vote->cert,
+                      std::move(forwarding_candidate));
         }
         else
         {
@@ -6075,6 +6429,7 @@ namespace hotstuff
                 *vote.cert,
                 std::move(forwarding_candidate)))
             return;
+        schedule_exact_vote_fallback(*lease, vote);
         if (proposal_contexts->delta_open_enabled(*lease))
         {
             if (!lease->tree().parent.has_value())
@@ -6198,6 +6553,8 @@ namespace hotstuff
                 pn.send_msg(
                     MsgPropose(prop), config.get_peer_id(child));
         }
+        if (lease.has_value())
+            schedule_exact_proposal_fallback(*lease, prop);
     }
 
     void HotStuffBase::inc_time(ReconfigurationType reconfig_type)
@@ -6263,6 +6620,7 @@ namespace hotstuff
                         *vote.cert,
                         std::move(forwarding_candidate)))
                     return;
+                owner.schedule_exact_vote_fallback(*lease, vote);
 
                 if (owner.proposal_contexts->delta_open_enabled(
                         *lease))
@@ -7090,6 +7448,7 @@ namespace hotstuff
         epoch_live_binding = nullptr;
         adaptive_epoch_runtime.reset();
         cancel_all_exact_forwarding_retries();
+        cancel_all_exact_fallbacks();
         exact_runtime_access->close_and_wait();
         deferred_epoch_definition_recoveries.clear();
         deferred_epoch_change_proposal_count = 0;
@@ -7375,7 +7734,9 @@ namespace hotstuff
             }
             if (maximum_timeout <=
                     AggregationTimeoutPolicy::Duration::zero() ||
-                !pmaker->configure_leader_progress(maximum_timeout))
+                !pmaker->configure_leader_progress(
+                    exact_fallback_recovery_horizon(
+                        maximum_timeout)))
                 throw std::logic_error(
                     "failed to configure leader progress safely");
         }

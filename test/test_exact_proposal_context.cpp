@@ -2264,6 +2264,89 @@ TEST_CASE("root QC publication requires its frozen global quorum",
     check_frozen_root_quorum_contract<ProposalContextMetadata>();
 }
 
+TEST_CASE("root fallback atomically admits a frozen descendant without child response",
+          "[fallback][proposal-context][root][descendant][atomic]")
+{
+    ProposalContextLifecycle contexts;
+    BlsTestCore core(7);
+    const auto proposal = key(
+        configuration(65, 5, "root-descendant-fallback"),
+        "root-descendant-fallback-block");
+    auto lease = contexts.admit_local(
+        metadata(proposal, root_tree(), 5));
+    REQUIRE(lease.has_value());
+    REQUIRE(contexts.initialize_accumulator(
+        *lease, empty_bls_accumulator(core, proposal)));
+
+    auto local = core.make_part(0, proposal);
+    REQUIRE(contexts.record_local_part(
+        *lease, core.get_config(), 0, *local));
+    const auto before = contexts.snapshot(proposal);
+    REQUIRE(before.has_value());
+    CHECK(before->pending_children == std::set<ReplicaID>{1, 2});
+
+    auto descendant = core.make_part(3, proposal);
+    auto descendant_candidate = verified_bls_aggregate(
+        core, proposal, {3});
+    REQUIRE(contexts.record_verified_root_fallback_part(
+        *lease,
+        core.get_config(),
+        3,
+        3,
+        *descendant,
+        std::move(descendant_candidate)));
+    const auto accepted = capture_accumulator_state(
+        contexts, *lease, core.get_config());
+    CHECK(accepted.signers == std::set<ReplicaID>{0, 3});
+    CHECK(accepted.runtime.pending_children ==
+          std::set<ReplicaID>{1, 2});
+    CHECK(contexts.clone_publishable_root_qc(*lease) == nullptr);
+
+    auto duplicate = core.make_part(3, proposal);
+    auto duplicate_candidate = verified_bls_aggregate(
+        core, proposal, {3});
+    CHECK_FALSE(contexts.record_verified_root_fallback_part(
+        *lease,
+        core.get_config(),
+        3,
+        3,
+        *duplicate,
+        std::move(duplicate_candidate)));
+    check_same_state(
+        capture_accumulator_state(contexts, *lease, core.get_config()),
+        accepted);
+
+    auto mismatched = core.make_part(4, proposal);
+    auto mismatched_candidate = verified_bls_aggregate(
+        core, proposal, {4});
+    CHECK_FALSE(contexts.record_verified_root_fallback_part(
+        *lease,
+        core.get_config(),
+        3,
+        4,
+        *mismatched,
+        std::move(mismatched_candidate)));
+    check_same_state(
+        capture_accumulator_state(contexts, *lease, core.get_config()),
+        accepted);
+
+    ProposalContextLifecycle non_root_contexts;
+    auto non_root_lease = non_root_contexts.admit_remote(
+        metadata(proposal, non_root_tree(), 5));
+    REQUIRE(non_root_lease.has_value());
+    REQUIRE(non_root_contexts.initialize_accumulator(
+        *non_root_lease, empty_bls_accumulator(core, proposal)));
+    auto non_root_candidate = verified_bls_aggregate(
+        core, proposal, {3});
+    CHECK_FALSE(non_root_contexts.record_verified_root_fallback_part(
+        *non_root_lease,
+        core.get_config(),
+        3,
+        3,
+        *descendant,
+        std::move(non_root_candidate)));
+}
+
 TEST_CASE("root QC eligibility atomically uses the frozen global quorum",
           "[rem-a06-02][proposal-context][root][quorum][candidate]"
           "[intentional-red]")

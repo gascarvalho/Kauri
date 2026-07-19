@@ -4251,6 +4251,35 @@ TEST_CASE("multi-hop proposal authenticates its parent without rewriting root",
     CHECK(effects.relayed_source[0] == parent_peer);
     CHECK(effects.processed_source[0] == parent_peer);
 
+    const auto root_peer =
+        structural_core.get_config().get_peer_id(root_proposer);
+    const auto authenticated_root =
+        hotstuff::authenticated_epoch_replica(
+            root_proposer, root_peer);
+    const auto fallback_block = actual_proposal_block(
+        structural_core, 0x44);
+    const auto fallback_body = actual_proposal_body(
+        active_configuration, root_proposer, fallback_block);
+    auto root_fallback = consensus_envelope(
+        active_configuration,
+        active.generation,
+        "real-body-root-fallback",
+        root_proposer,
+        EpochConsensusWireKind::proposal,
+        fallback_body);
+    root_fallback.block_hash = fallback_block->get_hash();
+    const auto fallback_accepted = adapter.handle_proposal(
+        proposal_message(root_fallback), authenticated_root);
+    REQUIRE(fallback_accepted.error == EpochIngressError::none);
+    CHECK(fallback_accepted.admission_disposition ==
+          ProposalDisposition::admitted_active);
+    REQUIRE(effects.relay_count == 2);
+    REQUIRE(effects.process_count == 2);
+    CHECK(effects.relayed[1] == root_fallback.key());
+    CHECK(effects.processed[1] == root_fallback.key());
+    CHECK(effects.relayed_source[1] == root_peer);
+    CHECK(effects.processed_source[1] == root_peer);
+
     const auto reject_without_protocol_effects = [
         &](const EpochConsensusEnvelope &candidate,
             const AuthenticatedEpochPeer &peer) {

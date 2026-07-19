@@ -228,6 +228,13 @@ public:
         ReplicaID claimed_voter,
         const PartCert &part,
         quorum_cert_bt forwarding_candidate = nullptr);
+    bool record_verified_root_fallback_part(
+        const ProposalContextLease &lease,
+        const ReplicaConfig &config,
+        ReplicaID authenticated_sender,
+        ReplicaID claimed_voter,
+        const PartCert &part,
+        quorum_cert_bt verified_candidate = nullptr);
     bool record_verified_aggregate_certificate(
         const ProposalContextLease &lease,
         ReplicaID authenticated_child,

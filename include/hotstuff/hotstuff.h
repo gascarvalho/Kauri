@@ -1103,6 +1103,14 @@ namespace hotstuff
             exact_forwarding_retry_jobs;
         std::set<std::pair<ProposalKey, std::uint64_t>>
             exact_forwarding_sweeps;
+        struct ExactVoteFallbackJob;
+        struct ExactProposalFallbackJob;
+        std::map<ProposalKey,
+                 std::shared_ptr<ExactVoteFallbackJob>>
+            exact_vote_fallback_jobs;
+        std::map<ProposalKey,
+                 std::shared_ptr<ExactProposalFallbackJob>>
+            exact_proposal_fallback_jobs;
         struct AdaptiveEpochRuntime;
         std::unique_ptr<AdaptiveEpochRuntime> adaptive_epoch_runtime;
         HotStuffEpochLiveBinding *epoch_live_binding{nullptr};
@@ -1337,6 +1345,29 @@ namespace hotstuff
             const ProposalKey &key,
             std::optional<std::uint64_t> generation = std::nullopt);
         void cancel_all_exact_forwarding_retries() noexcept;
+        void schedule_exact_vote_fallback(
+            const ProposalContextLease &lease,
+            const Vote &vote);
+        void dispatch_exact_vote_fallback(
+            const ProposalKey &key,
+            std::uint64_t context_generation);
+        bool send_exact_vote_to_root(
+            const ProposalKey &key,
+            std::uint64_t epoch_generation,
+            ReplicaID root,
+            const Vote &vote);
+        void schedule_exact_proposal_fallback(
+            const ProposalContextLease &lease,
+            const Proposal &proposal);
+        void dispatch_exact_proposal_fallback(
+            const ProposalKey &key,
+            std::uint64_t context_generation);
+        bool broadcast_exact_proposal_fallback(
+            const ProposalContextLease &lease,
+            std::uint64_t epoch_generation,
+            const Proposal &proposal);
+        void discard_exact_fallbacks(const ProposalKey &key);
+        void cancel_all_exact_fallbacks() noexcept;
         bool forward_exact_direct(
             const ProposalContextLease &lease,
             const Vote &vote);

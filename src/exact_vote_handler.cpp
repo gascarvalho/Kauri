@@ -148,21 +148,37 @@ bool passes_exact_contribution_cheap_gate(
         contribution.message_key != key)
         return false;
 
+    if (kind == ExactContributionKind::direct_vote)
+    {
+        if (!contribution.claimed_voter.has_value() ||
+            *contribution.claimed_voter !=
+                contribution.authenticated_sender ||
+            contribution.certified_signers.size() != 1 ||
+            contribution.certified_signers.count(
+                *contribution.claimed_voter) != 1)
+            return false;
+
+        const auto direct_child = tree.child_subtrees.find(
+            contribution.authenticated_sender);
+        if (direct_child != tree.child_subtrees.end())
+            return true;
+
+        // Only the exact root may accept the delayed direct-vote fallback.
+        // The authenticated voter must still belong to the immutable
+        // proposal membership. Non-roots retain the direct-child-only gate.
+        return tree.local_replica == tree.root &&
+               !tree.parent.has_value() &&
+               std::find(
+                   tree.assigned_subtree.begin(),
+                   tree.assigned_subtree.end(),
+                   contribution.authenticated_sender) !=
+                   tree.assigned_subtree.end();
+    }
+
     const auto child = tree.child_subtrees.find(
         contribution.authenticated_sender);
     if (child == tree.child_subtrees.end())
         return false;
-
-    if (kind == ExactContributionKind::direct_vote)
-    {
-        return contribution.claimed_voter.has_value() &&
-               *contribution.claimed_voter ==
-                   contribution.authenticated_sender &&
-               contribution.certified_signers.size() == 1 &&
-               contribution.certified_signers.count(
-                   *contribution.claimed_voter) == 1;
-    }
-
     if (contribution.claimed_voter.has_value() ||
         contribution.certified_signers.empty())
         return false;

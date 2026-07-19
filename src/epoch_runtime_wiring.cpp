@@ -406,7 +406,12 @@ struct HotStuffEpochConsensusBodyValidator::State
             ? tree->members_breadth_first.front()
             : tree->members_breadth_first[
                   (local_position - 1) / tree->fanout];
-        return *peer.replica_id == expected_source;
+        // Hierarchical dissemination remains primary. The exact proposer/root
+        // is additionally permitted to retransmit the already-admitted
+        // proposal directly after the bounded recovery deadline.
+        return *peer.replica_id == expected_source ||
+               *peer.replica_id ==
+                   tree->members_breadth_first.front();
     }
 
     HotStuffCore &decoder;

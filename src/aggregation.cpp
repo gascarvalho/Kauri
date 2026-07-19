@@ -84,6 +84,20 @@ AggregationTimeoutPolicy::timeout_for(
         per_level * static_cast<Duration::rep>(remaining_levels));
 }
 
+AggregationTimeoutPolicy::Duration exact_fallback_recovery_horizon(
+    AggregationTimeoutPolicy::Duration maximum_level_aware_deadline)
+{
+    if (maximum_level_aware_deadline <=
+        AggregationTimeoutPolicy::Duration::zero())
+        throw std::invalid_argument(
+            "fallback recovery deadline must be positive");
+    if (maximum_level_aware_deadline >
+        AggregationTimeoutPolicy::Duration::max() / 2)
+        throw std::overflow_error(
+            "fallback recovery deadline overflow");
+    return maximum_level_aware_deadline * 2;
+}
+
 AggregationTimeoutCoordinator::AggregationTimeoutCoordinator(
     ProposalContextLifecycle &contexts,
     AggregationTimeoutPolicy policy,

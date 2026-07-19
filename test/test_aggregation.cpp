@@ -76,6 +76,12 @@ public:
     }
 };
 
+AggregationTimeoutPolicy::Duration exact_fallback_recovery_horizon(
+    AggregationTimeoutPolicy::Duration)
+{
+    return AggregationTimeoutPolicy::Duration::zero();
+}
+
 class AggregationTimeoutCoordinator
 {
 public:
@@ -109,6 +115,7 @@ using hotstuff::AggregationScheduler;
 using hotstuff::AggregationTimeoutCoordinator;
 using hotstuff::AggregationTimeoutEffects;
 using hotstuff::AggregationTimeoutPolicy;
+using hotstuff::exact_fallback_recovery_horizon;
 using hotstuff::ConfigurationId;
 using hotstuff::ProposalForwardingClaim;
 using hotstuff::ProposalContextEvent;
@@ -521,6 +528,28 @@ TEST_CASE("aggregation timeout policy is positive and level aware",
     CHECK(deepest == std::chrono::milliseconds(10));
     CHECK(middle == std::chrono::milliseconds(20));
     CHECK(root == std::chrono::milliseconds(40));
+}
+
+TEST_CASE("two-stage fallback horizon must precede independent suspicion",
+          "[fallback][aggregation][leader-progress][boundary]")
+{
+    const auto maximum_deadline = std::chrono::milliseconds(1500);
+    CHECK(exact_fallback_recovery_horizon(maximum_deadline) ==
+          std::chrono::seconds(3));
+    REQUIRE_THROWS_AS(
+        exact_fallback_recovery_horizon(Duration::zero()),
+        std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        exact_fallback_recovery_horizon(Duration::max()),
+        std::overflow_error);
+
+    const auto grace = std::chrono::seconds(1);
+    const auto leader_progress_timeout = std::chrono::seconds(5);
+    CHECK(exact_fallback_recovery_horizon(maximum_deadline) <
+          grace + leader_progress_timeout);
+    CHECK_FALSE(exact_fallback_recovery_horizon(
+                    std::chrono::seconds(3)) <
+                grace + leader_progress_timeout);
 }
 
 TEST_CASE("leaf contexts never arm aggregation timeouts",

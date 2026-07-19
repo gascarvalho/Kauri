@@ -620,6 +620,79 @@ TEST_CASE("leader-local broadcast initializes child timing exactly once",
     }
 }
 
+TEST_CASE("exact fallback waits for the full tree deadline and targets the root",
+          "[fallback][production-wiring][proposal][vote][bounded]")
+{
+    const auto source = read_source("src/hotstuff.cpp");
+    const auto broadcast = source_slice(
+        source,
+        "void HotStuffBase::do_broadcast_proposal",
+        "void HotStuffBase::inc_time");
+    const auto proposal_schedule = source_slice(
+        source,
+        "void HotStuffBase::schedule_exact_proposal_fallback",
+        "void HotStuffBase::dispatch_exact_proposal_fallback");
+    const auto proposal_dispatch = source_slice(
+        source,
+        "void HotStuffBase::dispatch_exact_proposal_fallback",
+        "bool HotStuffBase::broadcast_exact_proposal_fallback");
+    const auto proposal_send = source_slice(
+        source,
+        "bool HotStuffBase::broadcast_exact_proposal_fallback",
+        "void HotStuffBase::discard_exact_fallbacks");
+    const auto vote_schedule = source_slice(
+        source,
+        "void HotStuffBase::schedule_exact_vote_fallback",
+        "void HotStuffBase::dispatch_exact_vote_fallback");
+    const auto vote_dispatch = source_slice(
+        source,
+        "void HotStuffBase::dispatch_exact_vote_fallback",
+        "bool HotStuffBase::send_exact_vote_to_root");
+    const auto vote_send = source_slice(
+        source,
+        "bool HotStuffBase::send_exact_vote_to_root",
+        "void HotStuffBase::schedule_exact_proposal_fallback");
+    const auto purge = source_slice(
+        source,
+        "void HotStuffBase::purge_pending_exact_contributions",
+        "promise_t HotStuffBase::deliver_exact_contribution");
+
+    const auto primary = broadcast.find(
+        "for (const auto child : metadata->tree.direct_children)");
+    const auto fallback = broadcast.find(
+        "schedule_exact_proposal_fallback");
+    REQUIRE(primary != std::string::npos);
+    REQUIRE(fallback != std::string::npos);
+    CHECK(primary < fallback);
+
+    for (const auto &schedule : {proposal_schedule, vote_schedule})
+    {
+        CHECK(schedule.find("timeout_for(") != std::string::npos);
+        CHECK(schedule.find("tree->get_max_level()") !=
+              std::string::npos);
+        CHECK(schedule.find("schedule_after(") != std::string::npos);
+    }
+    CHECK(proposal_dispatch.find("acquire_open_context(key)") !=
+          std::string::npos);
+    CHECK(proposal_dispatch.find("*active != key.configuration") !=
+          std::string::npos);
+    CHECK(proposal_dispatch.find("admits_new_proposals()") !=
+          std::string::npos);
+    CHECK(proposal_send.find(
+              "for (const auto member : lease.tree().assigned_subtree)") !=
+          std::string::npos);
+    CHECK(vote_dispatch.find("contains_admitted(key)") !=
+          std::string::npos);
+    CHECK(vote_dispatch.find("*active != key.configuration") !=
+          std::string::npos);
+    CHECK(vote_send.find("ReplicaID root") != std::string::npos);
+    CHECK(vote_send.find("config.get_peer_id(root)") !=
+          std::string::npos);
+    CHECK(vote_send.find("MsgVote") != std::string::npos);
+    CHECK(purge.find("discard_exact_fallbacks(key)") !=
+          std::string::npos);
+}
+
 TEST_CASE("timed-out root consumes late votes toward its frozen quorum",
           "[a06][a06-wiring-audit][production-wiring][root][late-vote]"
           "[intentional-red]")
@@ -1022,6 +1095,18 @@ ProposalContextMetadata gate_metadata(const ProposalKey &key,
     return ProposalContextMetadata{key, std::move(tree), 5};
 }
 
+ProposalContextMetadata non_root_gate_metadata(const ProposalKey &key)
+{
+    ProposalTreeSnapshot tree;
+    tree.local_replica = 3;
+    tree.root = 0;
+    tree.parent = 1;
+    tree.assigned_subtree = {3};
+    tree.fanout = 2;
+    tree.pipeline_stretch = 2;
+    return ProposalContextMetadata{key, std::move(tree), 5};
+}
+
 ExactContributionEnvelope direct_envelope(
     const ProposalKey &key,
     ReplicaID authenticated_sender = 1,
@@ -1359,10 +1444,24 @@ TEST_CASE("unopened exact contexts reject before every asynchronous or protocol 
         check_no_handler_work(effects);
     }
 
-    SECTION("authenticated sender must be a direct child in the frozen tree")
+    SECTION("the exact root admits an authenticated frozen descendant")
     {
         ProposalContextLifecycle contexts;
         REQUIRE(contexts.admit_remote(gate_metadata(active_key)).has_value());
+        GateEffects effects;
+        ExactVoteHandlerCoordinator handler(contexts, effects);
+        CHECK(immediate_value(
+            handler.handle_direct(direct_envelope(active_key, 6, 6))));
+        CHECK(effects.worker_starts == 1);
+        CHECK(effects.delivery_starts == 1);
+        CHECK(effects.continuations == 1);
+    }
+
+    SECTION("a non-root still rejects a non-child direct vote")
+    {
+        ProposalContextLifecycle contexts;
+        REQUIRE(contexts.admit_remote(
+            non_root_gate_metadata(active_key)).has_value());
         GateEffects effects;
         ExactVoteHandlerCoordinator handler(contexts, effects);
         CHECK_FALSE(immediate_value(

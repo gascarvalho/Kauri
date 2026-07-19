@@ -934,6 +934,66 @@ bool ProposalContextLifecycle::record_verified_direct_part(
     return true;
 }
 
+bool ProposalContextLifecycle::record_verified_root_fallback_part(
+    const ProposalContextLease &lease,
+    const ReplicaConfig &config,
+    ReplicaID authenticated_sender,
+    ReplicaID claimed_voter,
+    const PartCert &part,
+    quorum_cert_bt verified_candidate)
+{
+    if (part.get_proposal_key() != lease.key() ||
+        authenticated_sender != claimed_voter)
+        return false;
+    std::set<ReplicaID> candidate_signers;
+    if (verified_candidate == nullptr ||
+        verified_candidate->get_proposal_key() != lease.key() ||
+        !exact_signer_set(*verified_candidate, candidate_signers) ||
+        candidate_signers != std::set<ReplicaID>{claimed_voter} ||
+        !verified_candidate->verify(config))
+        return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = entries_.find(lease.key());
+    if (found == entries_.end() ||
+        found->second->status != ProposalContextStatus::admitted_open ||
+        found->second->generation != lease.generation() ||
+        !found->second->runtime.has_value() ||
+        found->second->accumulator == nullptr ||
+        found->second->tree == nullptr ||
+        found->second->tree->local_replica !=
+            found->second->tree->root ||
+        found->second->tree->parent.has_value() ||
+        as_set(found->second->tree->assigned_subtree).count(
+            claimed_voter) == 0 ||
+        claimed_voter == found->second->tree->local_replica ||
+        found->second->runtime->verified_signers.count(
+            claimed_voter) != 0)
+        return false;
+
+    auto expected = found->second->runtime->verified_signers;
+    expected.insert(claimed_voter);
+    quorum_cert_bt next(found->second->accumulator->clone());
+    try
+    {
+        next->add_verified_part(config, claimed_voter, part);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    std::set<ReplicaID> next_signers;
+    if (!exact_signer_set(*next, next_signers) ||
+        next_signers != expected)
+        return false;
+
+    found->second->accumulator = std::move(next);
+    found->second->runtime->verified_signers = std::move(expected);
+    // A descendant fallback proves only that signer. It must not clear the
+    // missing direct-child observation or response-evidence state.
+    return true;
+}
+
 bool ProposalContextLifecycle::record_verified_aggregate_certificate(
     const ProposalContextLease &lease,
     ReplicaID authenticated_child,

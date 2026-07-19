@@ -74,6 +74,12 @@ private:
     Duration per_remaining_level_;
 };
 
+// A stranded descendant first waits for the root's all-member proposal
+// retransmission and then waits the same full-tree deadline before sending its
+// already-signed individual vote to that root.
+AggregationTimeoutPolicy::Duration exact_fallback_recovery_horizon(
+    AggregationTimeoutPolicy::Duration maximum_level_aware_deadline);
+
 class AggregationTimeoutCoordinator
 {
 public:
