@@ -121,7 +121,7 @@ void operator delete(void *allocation, std::size_t) noexcept
 namespace hotstuff
 {
 
-constexpr std::uint32_t kProposalLifecycleNoticeSchemaVersion = 1;
+constexpr std::uint32_t kProposalLifecycleNoticeSchemaVersion = 2;
 
 struct NormalProposalRuntimeInitialized
 {
@@ -136,6 +136,7 @@ struct ProposalRuntimeAborted
 struct ProposalCommitted
 {
     ProposalKey proposal;
+    std::uint64_t evidence_sequence_fence{0};
 };
 
 struct ProposalConfigurationRetired
@@ -172,6 +173,7 @@ struct EvidenceLifecycleLimits
     std::size_t maximum_signer_entries{65536};
     std::size_t maximum_deduplication_entries{4096};
     std::size_t maximum_lifecycle_sources{1024};
+    std::size_t maximum_quarantined_records_per_reporter{128};
 };
 
 struct EvidenceLifecycleAccountingLimits
@@ -232,6 +234,7 @@ enum class EvidenceObservationDisposition : std::uint8_t
     quarantined_unknown,
     quarantined_behind_unknown,
     duplicate_quarantined,
+    rejected_quarantine_capacity,
     evidence_unhealthy,
     stopped,
 };
@@ -266,6 +269,7 @@ struct EvidenceLifecycleStats
     std::size_t lifecycle_sources{0};
     std::uint64_t duplicate_observations{0};
     std::uint64_t applied_lifecycle_notices{0};
+    std::uint64_t quarantine_quota_rejections{0};
     std::uint64_t capacity_failures{0};
     bool healthy{true};
     bool stopped{false};
@@ -304,6 +308,9 @@ public:
     ProposalLifecycleApplyResult apply_notice(
         const AuthenticatedReporter &authenticated_source,
         const ProposalLifecycleNotice &notice) noexcept;
+
+    ProposalLifecycleApplyResult retry_reporter(
+        const AuthenticatedReporter &authenticated_reporter) noexcept;
 
     EvidenceObservationResult ingest_observation(
         const AuthenticatedReporter &authenticated_reporter,
@@ -408,7 +415,7 @@ EpochValidationContext validation_context()
 
 EvidenceLifecycleLimits lifecycle_limits()
 {
-    return {32, 64 * 1024, 8, 64, 32, 8};
+    return {32, 64 * 1024, 8, 64, 32, 8, 8};
 }
 
 EvidenceLifecycleAccountingLimits accounting_limits(
@@ -546,6 +553,8 @@ bool same_retained_state(
                right.duplicate_observations &&
            left.applied_lifecycle_notices ==
                right.applied_lifecycle_notices &&
+           left.quarantine_quota_rejections ==
+               right.quarantine_quota_rejections &&
            left.stopped == right.stopped;
 }
 
@@ -767,7 +776,7 @@ TEST_CASE("E08 lifecycle coordinator exposes one borrowed bounded seam",
           "[e08][evidence-lifecycle][contract][intentional-red]")
 {
     CHECK(KAURI_HAS_EVIDENCE_LIFECYCLE_API == 1);
-    CHECK(hotstuff::kProposalLifecycleNoticeSchemaVersion == 1);
+    CHECK(hotstuff::kProposalLifecycleNoticeSchemaVersion == 2);
 
     const EvidenceLifecycleLimits defaults;
     CHECK(defaults.maximum_quarantined_records == 4096);
@@ -776,6 +785,7 @@ TEST_CASE("E08 lifecycle coordinator exposes one borrowed bounded seam",
     CHECK(defaults.maximum_signer_entries == 65536);
     CHECK(defaults.maximum_deduplication_entries == 4096);
     CHECK(defaults.maximum_lifecycle_sources == 1024);
+    CHECK(defaults.maximum_quarantined_records_per_reporter == 128);
     const EvidenceLifecycleAccounting default_accounting;
     CHECK(same_accounting_limits(
         default_accounting.limits(),
@@ -1559,6 +1569,86 @@ TEST_CASE("monotonic retirement floor drains below-floor queues as stale",
           EvidenceRejectionReason::stale_block);
 }
 
+TEST_CASE(
+    "per reporter quarantine quota rejects overflow without global poisoning",
+    "[e08][evidence-lifecycle][quarantine][quota][nonfatal]")
+{
+    auto limits = lifecycle_limits();
+    limits.maximum_quarantined_records_per_reporter = 1;
+    Fixture fixture(limits);
+    const auto first = observation(
+        fixture.key("reporter-quota-first"), 1, 3, 1);
+    const auto overflow = observation(
+        fixture.key("reporter-quota-overflow"), 1, 3, 2);
+    const auto independent = observation(
+        fixture.key("reporter-quota-independent"), 2, 5, 1);
+
+    const auto retained = fixture.coordinator->ingest_observation(
+        AuthenticatedReporter{1}, first);
+    REQUIRE(retained.disposition ==
+            EvidenceObservationDisposition::quarantined_unknown);
+    const auto before_overflow = fixture.coordinator->stats();
+    const auto accounting_before = fixture.coordinator->accounting().stats();
+
+    const auto rejected = fixture.coordinator->ingest_observation(
+        AuthenticatedReporter{1}, overflow);
+    CHECK(rejected.disposition == EvidenceObservationDisposition::
+              rejected_quarantine_capacity);
+    CHECK(rejected.accepted_observations == 0);
+    CHECK(rejected.rejected_observations == 1);
+    CHECK(rejected.quarantined_observations == 1);
+    const auto after_overflow = fixture.coordinator->stats();
+    CHECK(after_overflow.quarantined_records ==
+          before_overflow.quarantined_records);
+    CHECK(after_overflow.quarantined_bytes ==
+          before_overflow.quarantined_bytes);
+    CHECK(after_overflow.deduplication_entries ==
+          before_overflow.deduplication_entries);
+    CHECK(after_overflow.quarantine_quota_rejections == 1);
+    CHECK(after_overflow.capacity_failures == 0);
+    CHECK(same_accounting_state(
+        fixture.coordinator->accounting().stats(), accounting_before));
+    CHECK(fixture.ledger->accepted().empty());
+    CHECK(fixture.ledger->rejected().empty());
+    CHECK(fixture.coordinator->healthy());
+
+    const auto other = fixture.coordinator->ingest_observation(
+        AuthenticatedReporter{2}, independent);
+    CHECK(other.disposition ==
+          EvidenceObservationDisposition::quarantined_unknown);
+    CHECK(other.quarantined_observations == 2);
+    CHECK(fixture.coordinator->healthy());
+
+    const auto opened = fixture.coordinator->apply_notice(
+        AuthenticatedReporter{0},
+        notice(
+            0,
+            1,
+            NormalProposalRuntimeInitialized{first.proposal_key()}));
+    CHECK(opened.status == ProposalLifecycleApplyStatus::applied);
+    CHECK(opened.retried_observations == 1);
+    CHECK(opened.accepted_observations == 1);
+    CHECK(opened.remaining_quarantined == 1);
+
+    const auto blocked = fixture.coordinator->retry_reporter(
+        AuthenticatedReporter{2});
+    CHECK(blocked.status == ProposalLifecycleApplyStatus::applied);
+    CHECK(blocked.retried_observations == 0);
+    CHECK(blocked.remaining_quarantined == 1);
+
+    REQUIRE(fixture.index.admit(independent.proposal_key()));
+    const auto drained = fixture.coordinator->retry_reporter(
+        AuthenticatedReporter{2});
+    CHECK(drained.status == ProposalLifecycleApplyStatus::applied);
+    CHECK(drained.retried_observations == 1);
+    CHECK(drained.accepted_observations == 1);
+    CHECK(drained.remaining_quarantined == 0);
+    CHECK(fixture.coordinator->stats().quarantine_quota_rejections == 1);
+    CHECK(fixture.coordinator->stats().capacity_failures == 0);
+    CHECK(fixture.ledger->accepted().size() == 2);
+    CHECK(fixture.coordinator->healthy());
+}
+
 TEST_CASE("every retained quarantine dimension is bounded fail closed",
           "[e08][evidence-lifecycle][bounds][intentional-red]")
 {
@@ -1573,6 +1663,13 @@ TEST_CASE("every retained quarantine dimension is bounded fail closed",
     {
         auto limits = lifecycle_limits();
         limits.maximum_quarantined_bytes = 0;
+        check_zero_lifecycle_limit(limits);
+    }
+
+    SECTION("zero per reporter record limit")
+    {
+        auto limits = lifecycle_limits();
+        limits.maximum_quarantined_records_per_reporter = 0;
         check_zero_lifecycle_limit(limits);
     }
 

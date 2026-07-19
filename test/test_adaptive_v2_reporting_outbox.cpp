@@ -454,6 +454,107 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "commit lifecycle freezes the queued evidence prefix in immutable FIFO bytes",
+    "[adaptive-v2][reporting-outbox][lifecycle][commit][fence][fifo]")
+{
+    AdaptiveV2ReportingOutbox outbox(config());
+    const auto exact_proposal = proposal(
+        configuration(8, 2, "commit-fence"), "commit-fence");
+
+    REQUIRE(outbox.enqueue_lifecycle(
+                ProposalLifecycleFact{
+                    ProposalCommitted{exact_proposal, 99}}) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    auto decoded = hotstuff::decode_proposal_lifecycle_notice(
+        outbox.front()->canonical_payload, limits().lifecycle_wire);
+    REQUIRE(decoded);
+    REQUIRE(std::holds_alternative<ProposalCommitted>(
+        decoded.notice->fact));
+    CHECK(std::get<ProposalCommitted>(decoded.notice->fact)
+              .evidence_sequence_fence == 0);
+    deliver_and_release(outbox, 1);
+
+    REQUIRE(outbox.enqueue_evidence(evidence_payload({
+                observation(1, exact_proposal),
+                observation(2, exact_proposal),
+                observation(3, exact_proposal)})) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    deliver_and_release(outbox, 2);
+    REQUIRE(outbox.diagnostics().last_evidence_sequence == 3);
+
+    REQUIRE(outbox.enqueue_lifecycle(
+                ProposalLifecycleFact{ProposalCommitted{
+                    exact_proposal,
+                    std::numeric_limits<std::uint64_t>::max()}}) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    const auto committed_bytes = outbox.front()->canonical_payload;
+    decoded = hotstuff::decode_proposal_lifecycle_notice(
+        committed_bytes, limits().lifecycle_wire);
+    REQUIRE(decoded);
+    REQUIRE(std::holds_alternative<ProposalCommitted>(
+        decoded.notice->fact));
+    CHECK(std::get<ProposalCommitted>(decoded.notice->fact)
+              .evidence_sequence_fence == 3);
+
+    REQUIRE(outbox.enqueue_evidence(evidence_payload({
+                observation(4, exact_proposal)})) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->canonical_payload == committed_bytes);
+
+    const auto first_attempt = outbox.begin_delivery(100);
+    REQUIRE(first_attempt.token.has_value());
+    CHECK(outbox.acknowledge_delivery(
+              *first_attempt.token,
+              AdaptiveV2ReportingDeliveryResult::temporary_failure,
+              100) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    const auto retry = outbox.begin_delivery(110);
+    REQUIRE(retry.report != nullptr);
+    CHECK(retry.report->canonical_payload == committed_bytes);
+}
+
+TEST_CASE(
+    "reporting outbox reserves the maximum evidence sequence from commit fences",
+    "[adaptive-v2][reporting-outbox][evidence][sequence][fence][maximum]")
+{
+    const auto exact_proposal = proposal(
+        configuration(9, 2, "maximum-fence"), "maximum-fence");
+
+    SECTION("a restored maximum cannot emit a commit fence")
+    {
+        AdaptiveV2ReportingOutbox outbox(config(
+            limits(),
+            0,
+            0,
+            std::numeric_limits<std::uint64_t>::max()));
+        CHECK(outbox.enqueue_lifecycle(
+                  ProposalLifecycleFact{
+                      ProposalCommitted{exact_proposal}}) ==
+              AdaptiveV2ReportingEnqueueStatus::sequence_exhausted);
+        CHECK(outbox.diagnostics().pending_reports == 0);
+    }
+
+    SECTION("a caller-created maximum evidence sequence is rejected")
+    {
+        AdaptiveV2ReportingOutbox outbox(config(
+            limits(),
+            0,
+            0,
+            std::numeric_limits<std::uint64_t>::max() - 1));
+        CHECK(outbox.enqueue_evidence(evidence_payload({observation(
+                  std::numeric_limits<std::uint64_t>::max(),
+                  exact_proposal)})) ==
+              AdaptiveV2ReportingEnqueueStatus::sequence_exhausted);
+        CHECK(outbox.diagnostics().last_evidence_sequence ==
+              std::numeric_limits<std::uint64_t>::max() - 1);
+        CHECK(outbox.diagnostics().pending_reports == 0);
+    }
+}
+
+TEST_CASE(
     "retry exhaustion and permanent failure are explicit bounded terminal states",
     "[adaptive-v2][reporting-outbox][exhaustion][failed][bounded]")
 {

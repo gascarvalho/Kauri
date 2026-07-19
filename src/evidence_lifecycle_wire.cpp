@@ -13,7 +13,7 @@ namespace
 {
 
 const std::string kLifecycleNoticeDomain =
-    "kauri-proposal-lifecycle-notice-v1";
+    "kauri-proposal-lifecycle-notice-v2";
 constexpr std::size_t kDigestSize = 32;
 constexpr std::uint8_t kCanonicalFlags = 0;
 
@@ -369,7 +369,9 @@ ProposalLifecycleDecodeResult decode_impl(
         notice.fact = ProposalRuntimeAborted{decode_proposal(reader)};
         break;
     case ProposalLifecycleFactTag::committed:
-        notice.fact = ProposalCommitted{decode_proposal(reader)};
+        notice.fact = ProposalCommitted{
+            decode_proposal(reader),
+            reader.integer<std::uint64_t>()};
         break;
     case ProposalLifecycleFactTag::configuration_retired:
         notice.fact = ProposalConfigurationRetired{
@@ -425,10 +427,15 @@ bytearray_t encode_proposal_lifecycle_notice(
                 std::is_same<
                     Fact,
                     NormalProposalRuntimeInitialized>::value ||
-                std::is_same<Fact, ProposalRuntimeAborted>::value ||
+                std::is_same<Fact, ProposalRuntimeAborted>::value)
+            {
+                encode_proposal(writer, fact.proposal);
+            }
+            else if constexpr (
                 std::is_same<Fact, ProposalCommitted>::value)
             {
                 encode_proposal(writer, fact.proposal);
+                writer.integer(fact.evidence_sequence_fence);
             }
             else if constexpr (
                 std::is_same<

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <limits>
 #include <map>
-#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -39,10 +38,101 @@ struct CorroboratedLifecycleFact
     }
 };
 
+struct ReporterCommitBoundary
+{
+    std::uint64_t evidence_sequence_fence{0};
+    bool terminal_seen{false};
+};
+
+struct ReporterCommitFrontier
+{
+    std::vector<ReporterCommitBoundary> reporters;
+};
+
+using CorroboratingSources = std::map<ReplicaID, std::uint64_t>;
+using ReporterCommitFrontiers =
+    std::map<ProposalKey, ReporterCommitFrontier>;
+
+/**
+ * Preserve the causal prefix of each authenticated reporter while keeping the
+ * proposal's global lifecycle status stale.
+ *
+ * This relies on the adaptive-v2 transport's pinned single manager peer and
+ * one cross-stream AdaptiveV2ReportingOutbox per replica. That outbox sends
+ * readiness, lifecycle, and evidence reports through one FIFO connection. If
+ * the transport ever permits concurrent connections for one authenticated
+ * replica, the wire must first carry and validate one cross-stream sequence.
+ * Completed per-reporter fences remain retained for this fixed configuration:
+ * a pre-commit observation may still be blocked behind an older unknown FIFO
+ * head after every commit marker arrives. The proposal-index exact bound also
+ * bounds these frontiers; fixed-configuration shutdown releases them.
+ */
+class ReporterCausalProposalEvidenceWindow final
+    : public ProposalEvidenceWindow
+{
+public:
+    ReporterCausalProposalEvidenceWindow(
+        const ProposalEvidenceIndex &global_window,
+        const std::vector<ReplicaID> &membership,
+        const ReporterCommitFrontiers &frontiers) noexcept
+        : global_window_(global_window),
+          membership_(membership),
+          frontiers_(frontiers)
+    {}
+
+    ProposalEvidenceStatus classify(
+        const ProposalKey &proposal) const noexcept override
+    {
+        return global_window_.classify(proposal);
+    }
+
+    ProposalEvidenceStatus classify_for_reporter(
+        const AuthenticatedReporter &authenticated_reporter,
+        const ResponseObservation &observation) const noexcept override
+    {
+        const auto proposal = observation.proposal_key();
+        const auto global = global_window_.classify(proposal);
+        if (global != ProposalEvidenceStatus::stale)
+            return global;
+
+        const auto frontier = frontiers_.find(proposal);
+        if (frontier == frontiers_.end())
+            return global;
+
+        const auto member = std::lower_bound(
+            membership_.begin(),
+            membership_.end(),
+            authenticated_reporter.replica_id);
+        if (member == membership_.end() ||
+            *member != authenticated_reporter.replica_id ||
+            frontier->second.reporters.size() != membership_.size())
+        {
+            return global;
+        }
+        const auto index = static_cast<std::size_t>(
+            member - membership_.begin());
+        const auto &boundary = frontier->second.reporters[index];
+        if (!boundary.terminal_seen)
+            return ProposalEvidenceStatus::unknown;
+        return observation.reporter_sequence <=
+                       boundary.evidence_sequence_fence
+            ? ProposalEvidenceStatus::admissible
+            : global;
+    }
+
+private:
+    const ProposalEvidenceIndex &global_window_;
+    const std::vector<ReplicaID> &membership_;
+    const ReporterCommitFrontiers &frontiers_;
+};
+
 bool valid_limits(
     const AdaptiveV2ManagerIngressLimits &limits,
     std::size_t member_count) noexcept
 {
+    // validate_bootstrap establishes a nonempty membership first. Division
+    // avoids multiplication overflow and reserves one equal record share for
+    // every reporter; a global record limit smaller than N therefore fails.
     return limits.maximum_members != 0 &&
            limits.maximum_members <= kMaximumAdaptiveV2ManagerMembers &&
            member_count <= limits.maximum_members &&
@@ -61,6 +151,9 @@ bool valid_limits(
            limits.lifecycle.maximum_signer_entries != 0 &&
            limits.lifecycle.maximum_deduplication_entries != 0 &&
            limits.lifecycle.maximum_lifecycle_sources >= member_count &&
+           limits.lifecycle.maximum_quarantined_records_per_reporter != 0 &&
+           limits.lifecycle.maximum_quarantined_records_per_reporter <=
+               limits.lifecycle.maximum_quarantined_records / member_count &&
            limits.maximum_pending_lifecycle_facts_per_source != 0 &&
            limits.maximum_pending_lifecycle_facts_per_source <=
                kMaximumAdaptiveV2PendingLifecycleFactsPerSource &&
@@ -130,6 +223,7 @@ struct AdaptiveV2ManagerIngress::State
     struct LifecycleSourceEntry
     {
         std::uint64_t source_sequence{0};
+        std::uint64_t highest_received_evidence_sequence{0};
         std::size_t pending_associations{0};
     };
 
@@ -142,9 +236,12 @@ struct AdaptiveV2ManagerIngress::State
           limits(std::move(bootstrap.limits)),
           epochs(membership),
           proposal_index(limits.proposal_index),
-          ledger(epochs, proposal_index, limits.evidence_store),
+          reporter_causal_window(
+              proposal_index, membership, reporter_commit_frontiers),
+          ledger(epochs, reporter_causal_window, limits.evidence_store),
           coordinator(
               proposal_index,
+              reporter_causal_window,
               ledger,
               EvidenceLifecycleAccounting{
                   limits.lifecycle_accounting},
@@ -193,6 +290,180 @@ struct AdaptiveV2ManagerIngress::State
         proposal_index.shutdown();
     }
 
+    std::optional<std::size_t> member_index(
+        ReplicaID replica_id) const noexcept
+    {
+        const auto member = std::lower_bound(
+            membership.begin(), membership.end(), replica_id);
+        if (member == membership.end() || *member != replica_id)
+            return std::nullopt;
+        return static_cast<std::size_t>(member - membership.begin());
+    }
+
+    bool begin_reporter_commit_frontier(
+        const ProposalKey &proposal,
+        const CorroboratingSources &corroborating_sources) noexcept
+    {
+        if (reporter_commit_frontiers.count(proposal) != 0 ||
+            reporter_commit_frontiers.size() >=
+                limits.proposal_index.maximum_exact_proposals)
+        {
+            record(audit.capacity_failures);
+            fail_closed();
+            return false;
+        }
+        try
+        {
+            ReporterCommitFrontier frontier;
+            frontier.reporters.resize(membership.size());
+            for (const auto &source : corroborating_sources)
+            {
+                const auto index = member_index(source.first);
+                if (!index.has_value())
+                {
+                    fail_closed();
+                    return false;
+                }
+                auto &boundary = frontier.reporters[*index];
+                boundary.evidence_sequence_fence = source.second;
+                boundary.terminal_seen = true;
+            }
+            const auto inserted = reporter_commit_frontiers.emplace(
+                proposal, std::move(frontier));
+            if (!inserted.second)
+            {
+                fail_closed();
+                return false;
+            }
+        }
+        catch (...)
+        {
+            fail_closed();
+            return false;
+        }
+        return true;
+    }
+
+    void cancel_reporter_commit_frontier(
+        const ProposalKey &proposal) noexcept
+    {
+        reporter_commit_frontiers.erase(proposal);
+    }
+
+    bool close_reporter_commit_frontier(
+        const ProposalKey &proposal,
+        ReplicaID source,
+        std::uint64_t evidence_sequence_fence) noexcept
+    {
+        const auto frontier = reporter_commit_frontiers.find(proposal);
+        if (frontier == reporter_commit_frontiers.end())
+        {
+            fail_closed();
+            return false;
+        }
+        const auto index = member_index(source);
+        if (!index.has_value() ||
+            frontier->second.reporters.size() != membership.size())
+        {
+            fail_closed();
+            return false;
+        }
+        auto &boundary = frontier->second.reporters[*index];
+        if (boundary.terminal_seen)
+            return true;
+        boundary.evidence_sequence_fence =
+            evidence_sequence_fence;
+        boundary.terminal_seen = true;
+        return true;
+    }
+
+    enum class ReporterCommitBoundaryState : std::uint8_t
+    {
+        no_frontier = 1,
+        open,
+        terminal,
+        invalid,
+    };
+
+    ReporterCommitBoundaryState reporter_commit_boundary_state(
+        const ProposalKey &proposal,
+        ReplicaID source) noexcept
+    {
+        const auto frontier = reporter_commit_frontiers.find(proposal);
+        if (frontier == reporter_commit_frontiers.end())
+            return ReporterCommitBoundaryState::no_frontier;
+        const auto index = member_index(source);
+        if (!index.has_value() ||
+            frontier->second.reporters.size() != membership.size())
+        {
+            fail_closed();
+            return ReporterCommitBoundaryState::invalid;
+        }
+        return frontier->second.reporters[*index].terminal_seen
+            ? ReporterCommitBoundaryState::terminal
+            : ReporterCommitBoundaryState::open;
+    }
+
+    std::optional<std::uint64_t> reporter_commit_fence(
+        const ProposalKey &proposal,
+        ReplicaID source) const noexcept
+    {
+        const auto frontier = reporter_commit_frontiers.find(proposal);
+        const auto index = member_index(source);
+        if (frontier == reporter_commit_frontiers.end() ||
+            !index.has_value() ||
+            frontier->second.reporters.size() != membership.size())
+        {
+            return std::nullopt;
+        }
+        return frontier->second.reporters[*index].evidence_sequence_fence;
+    }
+
+    enum class ReceivedEvidenceSequenceStatus : std::uint8_t
+    {
+        accepted = 1,
+        rejected,
+        failed,
+    };
+
+    ReceivedEvidenceSequenceStatus consume_received_evidence_sequence(
+        ReplicaID source,
+        std::uint64_t reporter_sequence) noexcept
+    {
+        const auto entry = lifecycle_sources.find(source);
+        if (entry == lifecycle_sources.end())
+        {
+            fail_closed();
+            return ReceivedEvidenceSequenceStatus::failed;
+        }
+        if (reporter_sequence == 0 ||
+            reporter_sequence <=
+                entry->second.highest_received_evidence_sequence)
+        {
+            return record(audit.evidence_sequence_rejections)
+                ? ReceivedEvidenceSequenceStatus::rejected
+                : ReceivedEvidenceSequenceStatus::failed;
+        }
+        entry->second.highest_received_evidence_sequence =
+            reporter_sequence;
+        return ReceivedEvidenceSequenceStatus::accepted;
+    }
+
+    std::size_t open_reporter_commit_reporters() const noexcept
+    {
+        std::size_t open = 0;
+        for (const auto &proposal : reporter_commit_frontiers)
+        {
+            open += static_cast<std::size_t>(std::count_if(
+                proposal.second.reporters.begin(),
+                proposal.second.reporters.end(),
+                [](const ReporterCommitBoundary &boundary) {
+                    return !boundary.terminal_seen;
+                }));
+        }
+        return open;
+    }
+
     bool record(std::uint64_t &counter) noexcept
     {
         if (increment(counter))
@@ -238,6 +509,10 @@ struct AdaptiveV2ManagerIngress::State
         snapshot.pending_lifecycle_facts = pending_lifecycle_votes.size();
         snapshot.pending_lifecycle_associations =
             pending_lifecycle_associations;
+        snapshot.reporter_causal_retained_proposals =
+            reporter_commit_frontiers.size();
+        snapshot.reporter_causal_open_reporters =
+            open_reporter_commit_reporters();
         return snapshot;
     }
 
@@ -248,9 +523,9 @@ struct AdaptiveV2ManagerIngress::State
         if (pending == pending_lifecycle_votes.end())
             return true;
 
-        for (const auto source : pending->second)
+        for (const auto &source : pending->second)
         {
-            const auto entry = lifecycle_sources.find(source);
+            const auto entry = lifecycle_sources.find(source.first);
             if (entry == lifecycle_sources.end() ||
                 entry->second.pending_associations == 0 ||
                 pending_lifecycle_associations == 0)
@@ -270,6 +545,8 @@ struct AdaptiveV2ManagerIngress::State
     AdaptiveV2ManagerIngressLimits limits;
     EpochStore epochs;
     ProposalEvidenceIndex proposal_index;
+    ReporterCommitFrontiers reporter_commit_frontiers;
+    ReporterCausalProposalEvidenceWindow reporter_causal_window;
     EvidenceLedger ledger;
     ProposalLifecycleEvidenceCoordinator coordinator;
     const EpochDefinition *current_epoch{nullptr};
@@ -277,7 +554,7 @@ struct AdaptiveV2ManagerIngress::State
     std::uint64_t activation_generation{0};
     std::map<ReplicaID, ReadinessEntry> readiness;
     std::map<ReplicaID, LifecycleSourceEntry> lifecycle_sources;
-    std::map<CorroboratedLifecycleFact, std::set<ReplicaID>>
+    std::map<CorroboratedLifecycleFact, CorroboratingSources>
         pending_lifecycle_votes;
     std::size_t pending_lifecycle_associations{0};
     std::size_t ready_members{0};
@@ -660,6 +937,7 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
     }
 
     CorroboratedLifecycleFact fact;
+    std::uint64_t claimed_evidence_sequence_fence = 0;
     if (std::holds_alternative<NormalProposalRuntimeInitialized>(notice.fact))
     {
         fact = CorroboratedLifecycleFact{
@@ -668,9 +946,13 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
     }
     else if (std::holds_alternative<ProposalCommitted>(notice.fact))
     {
+        const auto &committed =
+            std::get<ProposalCommitted>(notice.fact);
         fact = CorroboratedLifecycleFact{
             CorroboratedLifecycleFactKind::committed,
-            std::get<ProposalCommitted>(notice.fact).proposal};
+            committed.proposal};
+        claimed_evidence_sequence_fence =
+            committed.evidence_sequence_fence;
     }
     else
     {
@@ -712,27 +994,151 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
                     {}};
         }
     }
-    else if (classification == ProposalEvidenceStatus::stale)
+    else if (fact.kind == CorroboratedLifecycleFactKind::committed &&
+             classification == ProposalEvidenceStatus::stale)
     {
-        if (!state.erase_pending_lifecycle_fact(fact))
+        const auto boundary = state.reporter_commit_boundary_state(
+            fact.proposal, authenticated_source.replica_id);
+        if (boundary == State::ReporterCommitBoundaryState::invalid ||
+            boundary == State::ReporterCommitBoundaryState::no_frontier)
+        {
+            state.fail_closed();
+            return {AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                    {},
+                    {}};
+        }
+        if (boundary == State::ReporterCommitBoundaryState::terminal)
+        {
+            const auto frozen_fence = state.reporter_commit_fence(
+                fact.proposal, authenticated_source.replica_id);
+            if (!frozen_fence.has_value())
+            {
+                state.fail_closed();
+                return {
+                    AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                    {},
+                    {}};
+            }
+            if (claimed_evidence_sequence_fence != *frozen_fence)
+            {
+                if (!state.record(
+                        state.audit.lifecycle_fence_mismatch_rejections))
+                {
+                    return {
+                        AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                        {},
+                        {}};
+                }
+                return {
+                    AdaptiveV2ManagerIngressStatus::rejected_lifecycle,
+                    {},
+                    {}};
+            }
+            if (!state.erase_pending_lifecycle_fact(fact))
+            {
+                return {
+                    AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                    {},
+                    {}};
+            }
+            return {AdaptiveV2ManagerIngressStatus::already_applied,
+                    {},
+                    {}};
+        }
+        if (claimed_evidence_sequence_fence ==
+                std::numeric_limits<std::uint64_t>::max() ||
+            claimed_evidence_sequence_fence !=
+            source_entry->second.highest_received_evidence_sequence)
+        {
+            if (!state.record(
+                    state.audit.lifecycle_fence_mismatch_rejections))
+            {
+                return {
+                    AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                    {},
+                    {}};
+            }
+            return {AdaptiveV2ManagerIngressStatus::rejected_lifecycle,
+                    {},
+                    {}};
+        }
+        if (!state.close_reporter_commit_frontier(
+                fact.proposal,
+                authenticated_source.replica_id,
+                claimed_evidence_sequence_fence) ||
+            !state.erase_pending_lifecycle_fact(fact))
         {
             return {AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
                     {},
                     {}};
         }
+        const auto retried = state.coordinator.retry_reporter(
+            authenticated_source);
+        if (retried.status == ProposalLifecycleApplyStatus::stopped)
+        {
+            return {AdaptiveV2ManagerIngressStatus::stopped,
+                    {},
+                    retried};
+        }
+        if (retried.status != ProposalLifecycleApplyStatus::applied)
+        {
+            state.fail_closed();
+            return {AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                    {},
+                    retried};
+        }
         return {AdaptiveV2ManagerIngressStatus::already_applied,
                 {},
-                {}};
+                retried};
     }
 
     auto pending = state.pending_lifecycle_votes.find(fact);
-    if (pending != state.pending_lifecycle_votes.end() &&
-        pending->second.count(authenticated_source.replica_id) != 0)
+    if (pending != state.pending_lifecycle_votes.end())
     {
-        return {
-            AdaptiveV2ManagerIngressStatus::awaiting_corroboration,
-            {},
-            {}};
+        const auto frozen = pending->second.find(
+            authenticated_source.replica_id);
+        if (frozen != pending->second.end())
+        {
+            if (fact.kind == CorroboratedLifecycleFactKind::committed &&
+                claimed_evidence_sequence_fence != frozen->second)
+            {
+                if (!state.record(
+                        state.audit.lifecycle_fence_mismatch_rejections))
+                {
+                    return {
+                        AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                        {},
+                        {}};
+                }
+                return {
+                    AdaptiveV2ManagerIngressStatus::rejected_lifecycle,
+                    {},
+                    {}};
+            }
+            return {
+                AdaptiveV2ManagerIngressStatus::awaiting_corroboration,
+                {},
+                {}};
+        }
+    }
+
+    if (fact.kind == CorroboratedLifecycleFactKind::committed &&
+        (claimed_evidence_sequence_fence ==
+             std::numeric_limits<std::uint64_t>::max() ||
+         claimed_evidence_sequence_fence !=
+            source_entry->second.highest_received_evidence_sequence))
+    {
+        if (!state.record(
+                state.audit.lifecycle_fence_mismatch_rejections))
+        {
+            return {
+                AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                {},
+                {}};
+        }
+        return {AdaptiveV2ManagerIngressStatus::rejected_lifecycle,
+                {},
+                {}};
     }
 
     if (source_entry->second.pending_associations >=
@@ -756,12 +1162,17 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
         if (pending == state.pending_lifecycle_votes.end())
         {
             const auto inserted = state.pending_lifecycle_votes.emplace(
-                fact, std::set<ReplicaID>{});
+                fact, CorroboratingSources{});
             pending = inserted.first;
             inserted_fact = inserted.second;
         }
-        const auto inserted_source = pending->second.insert(
-            authenticated_source.replica_id);
+        const auto frozen_evidence_sequence =
+            fact.kind == CorroboratedLifecycleFactKind::committed
+            ? claimed_evidence_sequence_fence
+            : 0;
+        const auto inserted_source = pending->second.emplace(
+            authenticated_source.replica_id,
+            frozen_evidence_sequence);
         if (!inserted_source.second)
         {
             return {
@@ -795,6 +1206,17 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
             {}};
     }
 
+    const bool globally_committing =
+        fact.kind == CorroboratedLifecycleFactKind::committed;
+    if (globally_committing &&
+        !state.begin_reporter_commit_frontier(
+            fact.proposal, pending->second))
+    {
+        return {AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                {},
+                {}};
+    }
+
     const auto applied = state.coordinator.apply_notice(
         authenticated_source, notice);
     if (applied.status == ProposalLifecycleApplyStatus::applied)
@@ -819,6 +1241,10 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
                     applied};
             }
         }
+    }
+    else if (globally_committing)
+    {
+        state.cancel_reporter_commit_frontier(fact.proposal);
     }
     switch (applied.status)
     {
@@ -1011,6 +1437,25 @@ AdaptiveV2ManagerIngress::ingest_evidence(
     result.decoded_observations = decoded.batch->observations.size();
     for (const auto &observation : decoded.batch->observations)
     {
+        // The authenticated transport sequence is consumed immediately after
+        // canonical decoding. A later reporter-id, topology, timing, signer,
+        // or proposal rejection cannot make a lower sequence reusable.
+        const auto sequence = state.consume_received_evidence_sequence(
+            authenticated_reporter.replica_id,
+            observation.reporter_sequence);
+        if (sequence == State::ReceivedEvidenceSequenceStatus::failed)
+        {
+            result.status =
+                AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
+            return result;
+        }
+        if (sequence == State::ReceivedEvidenceSequenceStatus::rejected)
+        {
+            ++result.processed_observations;
+            ++result.rejected_observations;
+            continue;
+        }
+
         if (observation.reporter_id !=
             authenticated_reporter.replica_id)
         {
@@ -1038,7 +1483,6 @@ AdaptiveV2ManagerIngress::ingest_evidence(
                     AdaptiveV2ManagerIngressStatus::rejected_nonmember;
             }
         }
-
         const auto observed = state.coordinator.ingest_observation(
             authenticated_reporter, observation);
         ++result.processed_observations;
@@ -1058,6 +1502,9 @@ AdaptiveV2ManagerIngress::ingest_evidence(
             break;
         case EvidenceObservationDisposition::duplicate_quarantined:
             ++result.duplicate_quarantined_observations;
+            break;
+        case EvidenceObservationDisposition::rejected_quarantine_capacity:
+            ++result.quarantine_capacity_rejections;
             break;
         case EvidenceObservationDisposition::stopped:
             result.status = AdaptiveV2ManagerIngressStatus::stopped;
@@ -1144,6 +1591,7 @@ void AdaptiveV2ManagerIngress::shutdown() noexcept
     state_->stopped = true;
     state_->coordinator.shutdown();
     state_->proposal_index.shutdown();
+    state_->reporter_commit_frontiers.clear();
 }
 
 } // namespace hotstuff

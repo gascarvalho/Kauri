@@ -122,8 +122,8 @@ bool EvidenceReporter::enqueue(const ResponseAttemptFact &fact)
         return false;
     }
 
-    if (state_->diagnostics.last_reporter_sequence ==
-        std::numeric_limits<std::uint64_t>::max())
+    if (state_->diagnostics.last_reporter_sequence >=
+        std::numeric_limits<std::uint64_t>::max() - 1)
     {
         increment(state_->diagnostics.sequence_overflows);
         state_->diagnostics.healthy = false;

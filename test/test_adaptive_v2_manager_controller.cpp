@@ -97,7 +97,7 @@ AdaptiveV2ManagerIngressLimits ingress_limits()
     limits.evidence_wire = {4096, 8, 7};
     limits.proposal_index = {256, 16};
     limits.evidence_store = {512, 128};
-    limits.lifecycle = {64, 32 * 1024, 7, 512, 256, 7};
+    limits.lifecycle = {64, 32 * 1024, 7, 512, 256, 7, 8};
     limits.lifecycle_accounting = {64, 32 * 1024, 512};
     limits.maximum_pending_lifecycle_facts_per_source = 64;
     return limits;

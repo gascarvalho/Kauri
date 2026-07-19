@@ -233,7 +233,7 @@ AdaptiveV2ManagerIngressLimits smoke_ingress_limits()
     limits.evidence_store = {512, 128};
     limits.lifecycle = {
         64, 32 * 1024, kSmokeReplicaCount, 512, 256,
-        kSmokeReplicaCount};
+        kSmokeReplicaCount, 8};
     limits.lifecycle_accounting = {64, 32 * 1024, 512};
     limits.maximum_pending_lifecycle_facts_per_source = 64;
     return limits;
@@ -905,11 +905,15 @@ private:
             "audit_nonmember_rejections=%llu "
             "audit_spoofed_source_rejections=%llu "
             "audit_state_rejections=%llu "
+            "audit_evidence_sequence_rejections=%llu "
+            "audit_lifecycle_fence_mismatch_rejections=%llu "
             "audit_lifecycle_quota_rejections=%llu "
             "audit_capacity_failures=%llu "
             "audit_corroboration_threshold=%zu "
             "audit_pending_facts=%zu "
             "audit_pending_associations=%zu "
+            "audit_reporter_causal_retained_proposals=%zu "
+            "audit_reporter_causal_open_reporters=%zu "
             "lifecycle_quarantined_records=%zu "
             "lifecycle_quarantined_bytes=%zu "
             "lifecycle_reporter_queues=%zu "
@@ -918,6 +922,7 @@ private:
             "lifecycle_sources=%zu "
             "lifecycle_duplicate_observations=%llu "
             "lifecycle_applied_notices=%llu "
+            "lifecycle_quarantine_quota_rejections=%llu "
             "lifecycle_capacity_failures=%llu "
             "lifecycle_healthy=%d lifecycle_stopped=%d "
             "ledger_accepted=%zu ledger_rejected=%zu "
@@ -938,11 +943,17 @@ private:
                 audit.spoofed_source_rejections),
             static_cast<unsigned long long>(audit.state_rejections),
             static_cast<unsigned long long>(
+                audit.evidence_sequence_rejections),
+            static_cast<unsigned long long>(
+                audit.lifecycle_fence_mismatch_rejections),
+            static_cast<unsigned long long>(
                 audit.lifecycle_quota_rejections),
             static_cast<unsigned long long>(audit.capacity_failures),
             audit.lifecycle_corroboration_threshold,
             audit.pending_lifecycle_facts,
             audit.pending_lifecycle_associations,
+            audit.reporter_causal_retained_proposals,
+            audit.reporter_causal_open_reporters,
             lifecycle.quarantined_records,
             lifecycle.quarantined_bytes,
             lifecycle.reporter_queues,
@@ -953,6 +964,8 @@ private:
                 lifecycle.duplicate_observations),
             static_cast<unsigned long long>(
                 lifecycle.applied_lifecycle_notices),
+            static_cast<unsigned long long>(
+                lifecycle.quarantine_quota_rejections),
             static_cast<unsigned long long>(
                 lifecycle.capacity_failures),
             lifecycle.healthy ? 1 : 0,

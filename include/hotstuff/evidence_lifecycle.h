@@ -18,7 +18,7 @@
 namespace hotstuff
 {
 
-constexpr std::uint32_t kProposalLifecycleNoticeSchemaVersion = 1;
+constexpr std::uint32_t kProposalLifecycleNoticeSchemaVersion = 2;
 
 struct NormalProposalRuntimeInitialized
 {
@@ -33,6 +33,7 @@ struct ProposalRuntimeAborted
 struct ProposalCommitted
 {
     ProposalKey proposal;
+    std::uint64_t evidence_sequence_fence{0};
 };
 
 struct ProposalConfigurationRetired
@@ -69,6 +70,7 @@ struct EvidenceLifecycleLimits
     std::size_t maximum_signer_entries{65536};
     std::size_t maximum_deduplication_entries{4096};
     std::size_t maximum_lifecycle_sources{1024};
+    std::size_t maximum_quarantined_records_per_reporter{128};
 };
 
 struct EvidenceLifecycleAccountingLimits
@@ -142,6 +144,7 @@ enum class EvidenceObservationDisposition : std::uint8_t
     quarantined_unknown,
     quarantined_behind_unknown,
     duplicate_quarantined,
+    rejected_quarantine_capacity,
     evidence_unhealthy,
     stopped,
 };
@@ -176,6 +179,7 @@ struct EvidenceLifecycleStats
     std::size_t lifecycle_sources{0};
     std::uint64_t duplicate_observations{0};
     std::uint64_t applied_lifecycle_notices{0};
+    std::uint64_t quarantine_quota_rejections{0};
     std::uint64_t capacity_failures{0};
     bool healthy{true};
     bool stopped{false};
@@ -194,18 +198,25 @@ struct QuarantinedEvidenceObservation
 /**
  * Externally serialized owner of lifecycle sequence and quarantine state.
  *
- * The proposal index and evidence ledger are borrowed and must outlive this
- * coordinator. This class does not own transport, authentication, clocks, or
- * epoch activation. Authenticated replica identities are supplied by the
- * caller. Construction transfers an empty accounting owner; retained input
- * throws std::invalid_argument before transfer and leaves the input, index,
- * and ledger unchanged.
+ * The proposal index, optional reporter-aware proposal window, and evidence
+ * ledger are borrowed and must outlive this coordinator. This class does not
+ * own transport, authentication, clocks, or epoch activation. Authenticated
+ * replica identities are supplied by the caller. Construction transfers an
+ * empty accounting owner; retained input throws std::invalid_argument before
+ * transfer and leaves the input, index, window, and ledger unchanged.
  */
 class ProposalLifecycleEvidenceCoordinator final
 {
 public:
     ProposalLifecycleEvidenceCoordinator(
         ProposalEvidenceIndex &proposal_index,
+        EvidenceLedger &ledger,
+        EvidenceLifecycleAccounting &&accounting,
+        EvidenceLifecycleLimits limits = {});
+
+    ProposalLifecycleEvidenceCoordinator(
+        ProposalEvidenceIndex &proposal_index,
+        const ProposalEvidenceWindow &proposal_window,
         EvidenceLedger &ledger,
         EvidenceLifecycleAccounting &&accounting,
         EvidenceLifecycleLimits limits = {});
@@ -223,6 +234,13 @@ public:
     ProposalLifecycleApplyResult apply_notice(
         const AuthenticatedReporter &authenticated_source,
         const ProposalLifecycleNotice &notice) noexcept;
+
+    /**
+     * Retry only one authenticated reporter FIFO after an external causal
+     * boundary changes its reporter-aware proposal classification.
+     */
+    ProposalLifecycleApplyResult retry_reporter(
+        const AuthenticatedReporter &authenticated_reporter) noexcept;
 
     EvidenceObservationResult ingest_observation(
         const AuthenticatedReporter &authenticated_reporter,

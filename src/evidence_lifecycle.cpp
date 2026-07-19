@@ -159,10 +159,12 @@ struct ProposalLifecycleEvidenceCoordinator::State
     using LifecycleSources = std::map<ReplicaID, std::uint64_t>;
 
     State(ProposalEvidenceIndex &proposal_index_,
+          const ProposalEvidenceWindow &proposal_window_,
           EvidenceLedger &ledger_,
           EvidenceLifecycleAccounting accounting_,
           EvidenceLifecycleLimits limits_) noexcept
         : proposal_index(proposal_index_),
+          proposal_window(proposal_window_),
           ledger(ledger_),
           accounting(std::move(accounting_)),
           limits(limits_),
@@ -180,7 +182,8 @@ struct ProposalLifecycleEvidenceCoordinator::State
                candidate.maximum_reporter_queues != 0 &&
                candidate.maximum_signer_entries != 0 &&
                candidate.maximum_deduplication_entries != 0 &&
-               candidate.maximum_lifecycle_sources != 0;
+               candidate.maximum_lifecycle_sources != 0 &&
+               candidate.maximum_quarantined_records_per_reporter != 0;
     }
 
     std::size_t retained_records() const noexcept
@@ -225,9 +228,13 @@ struct ProposalLifecycleEvidenceCoordinator::State
         return true;
     }
 
-    bool drain(ProposalLifecycleApplyResult &result) noexcept
+    bool drain(
+        ProposalLifecycleApplyResult &result,
+        std::optional<ReplicaID> only_reporter = std::nullopt) noexcept
     {
-        auto reporter = reporter_queues.begin();
+        auto reporter = only_reporter.has_value()
+            ? reporter_queues.find(*only_reporter)
+            : reporter_queues.begin();
         while (reporter != reporter_queues.end())
         {
             if (reporter->second.empty())
@@ -236,10 +243,13 @@ struct ProposalLifecycleEvidenceCoordinator::State
                 continue;
             }
 
-            const auto status = proposal_index.classify(
-                reporter->second.front().observation.proposal_key());
+            const auto status = proposal_window.classify_for_reporter(
+                reporter->second.front().authenticated_reporter,
+                reporter->second.front().observation);
             if (status == ProposalEvidenceStatus::unknown)
             {
+                if (only_reporter.has_value())
+                    return true;
                 ++reporter;
                 continue;
             }
@@ -284,12 +294,15 @@ struct ProposalLifecycleEvidenceCoordinator::State
                 return false;
             }
 
-            reporter = reporter_queues.begin();
+            reporter = only_reporter.has_value()
+                ? reporter_queues.find(*only_reporter)
+                : reporter_queues.begin();
         }
         return true;
     }
 
     ProposalEvidenceIndex &proposal_index;
+    const ProposalEvidenceWindow &proposal_window;
     EvidenceLedger &ledger;
     EvidenceLifecycleAccounting accounting;
     EvidenceLifecycleLimits limits;
@@ -298,6 +311,7 @@ struct ProposalLifecycleEvidenceCoordinator::State
     LifecycleSources lifecycle_sources;
     std::uint64_t duplicate_observations{0};
     std::uint64_t applied_lifecycle_notices{0};
+    std::uint64_t quarantine_quota_rejections{0};
     std::uint64_t capacity_failures{0};
     bool healthy{true};
     bool stopped{false};
@@ -306,6 +320,21 @@ struct ProposalLifecycleEvidenceCoordinator::State
 ProposalLifecycleEvidenceCoordinator::
     ProposalLifecycleEvidenceCoordinator(
         ProposalEvidenceIndex &proposal_index,
+        EvidenceLedger &ledger,
+        EvidenceLifecycleAccounting &&accounting,
+        EvidenceLifecycleLimits limits)
+    : ProposalLifecycleEvidenceCoordinator(
+          proposal_index,
+          proposal_index,
+          ledger,
+          std::move(accounting),
+          limits)
+{}
+
+ProposalLifecycleEvidenceCoordinator::
+    ProposalLifecycleEvidenceCoordinator(
+        ProposalEvidenceIndex &proposal_index,
+        const ProposalEvidenceWindow &proposal_window,
         EvidenceLedger &ledger,
         EvidenceLifecycleAccounting &&accounting,
         EvidenceLifecycleLimits limits)
@@ -321,6 +350,7 @@ ProposalLifecycleEvidenceCoordinator::
 
     state_ = std::make_unique<State>(
         proposal_index,
+        proposal_window,
         ledger,
         std::move(accounting),
         limits);
@@ -507,6 +537,37 @@ ProposalLifecycleEvidenceCoordinator::apply_notice(
     return result;
 }
 
+ProposalLifecycleApplyResult
+ProposalLifecycleEvidenceCoordinator::retry_reporter(
+    const AuthenticatedReporter &authenticated_reporter) noexcept
+{
+    auto &state = *state_;
+    ProposalLifecycleApplyResult result;
+    result.remaining_quarantined = state.retained_records();
+
+    if (state.stopped)
+    {
+        result.status = ProposalLifecycleApplyStatus::stopped;
+        return result;
+    }
+    if (!state.healthy || !state.borrowed_state_healthy())
+    {
+        state.fail_closed();
+        result.status = ProposalLifecycleApplyStatus::evidence_unhealthy;
+        return result;
+    }
+    if (!state.drain(result, authenticated_reporter.replica_id))
+    {
+        result.status = ProposalLifecycleApplyStatus::evidence_unhealthy;
+        result.remaining_quarantined = state.retained_records();
+        return result;
+    }
+
+    result.status = ProposalLifecycleApplyStatus::applied;
+    result.remaining_quarantined = state.retained_records();
+    return result;
+}
+
 EvidenceObservationResult
 ProposalLifecycleEvidenceCoordinator::ingest_observation(
     const AuthenticatedReporter &authenticated_reporter,
@@ -532,7 +593,8 @@ ProposalLifecycleEvidenceCoordinator::ingest_observation(
     const auto reporter =
         state.reporter_queues.find(authenticated_reporter.replica_id);
     const auto proposal_status =
-        state.proposal_index.classify(observation.proposal_key());
+        state.proposal_window.classify_for_reporter(
+            authenticated_reporter, observation);
     const bool may_need_quarantine =
         reporter != state.reporter_queues.end() ||
         proposal_status == ProposalEvidenceStatus::unknown;
@@ -624,6 +686,28 @@ ProposalLifecycleEvidenceCoordinator::ingest_observation(
         return result;
     }
 
+    const auto reporter_records =
+        reporter == state.reporter_queues.end()
+        ? std::size_t{0}
+        : reporter->second.size();
+    if (reporter_records >=
+        state.limits.maximum_quarantined_records_per_reporter)
+    {
+        if (state.quarantine_quota_rejections ==
+            std::numeric_limits<std::uint64_t>::max())
+        {
+            state.fail_closed();
+            result.disposition =
+                EvidenceObservationDisposition::evidence_unhealthy;
+            return result;
+        }
+        ++state.quarantine_quota_rejections;
+        result.disposition = EvidenceObservationDisposition::
+            rejected_quarantine_capacity;
+        result.rejected_observations = 1;
+        return result;
+    }
+
     const auto cost = retention_cost(observation);
     const auto accounting = state.accounting.stats();
     const bool new_reporter =
@@ -710,6 +794,7 @@ ProposalLifecycleEvidenceCoordinator::stats() const noexcept
         state.lifecycle_sources.size(),
         state.duplicate_observations,
         state.applied_lifecycle_notices,
+        state.quarantine_quota_rejections,
         state.capacity_failures,
         state.healthy && state.proposal_index.healthy() &&
             !index.stopped && state.ledger.healthy(),

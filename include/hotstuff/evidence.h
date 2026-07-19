@@ -145,6 +145,11 @@ enum class ProposalEvidenceStatus : std::uint8_t
     unknown = 3,
 };
 
+struct AuthenticatedReporter
+{
+    ReplicaID replica_id{0};
+};
+
 class ProposalEvidenceWindow
 {
 public:
@@ -152,11 +157,23 @@ public:
 
     virtual ProposalEvidenceStatus classify(
         const ProposalKey &proposal) const noexcept = 0;
-};
 
-struct AuthenticatedReporter
-{
-    ReplicaID replica_id{0};
+    /**
+     * Reporter-aware admission defaults to the global proposal window.
+     *
+     * A transport owner with a stronger authenticated FIFO contract may
+     * override this view without weakening the global lifecycle state seen by
+     * other reporters. Overrides must key reporter state only from the
+     * authenticated argument, never from the observation's claimed id. The
+     * evidence ledger independently verifies that claim before acceptance.
+     */
+    virtual ProposalEvidenceStatus classify_for_reporter(
+        const AuthenticatedReporter &authenticated_reporter,
+        const ResponseObservation &observation) const noexcept
+    {
+        static_cast<void>(authenticated_reporter);
+        return classify(observation.proposal_key());
+    }
 };
 
 enum class EvidenceRejectionReason : std::uint8_t

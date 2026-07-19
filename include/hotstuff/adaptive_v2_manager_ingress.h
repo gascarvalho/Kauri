@@ -70,11 +70,15 @@ struct AdaptiveV2ManagerIngressAuditStats
     std::uint64_t nonmember_rejections{0};
     std::uint64_t spoofed_source_rejections{0};
     std::uint64_t state_rejections{0};
+    std::uint64_t evidence_sequence_rejections{0};
+    std::uint64_t lifecycle_fence_mismatch_rejections{0};
     std::uint64_t lifecycle_quota_rejections{0};
     std::uint64_t capacity_failures{0};
     std::size_t lifecycle_corroboration_threshold{0};
     std::size_t pending_lifecycle_facts{0};
     std::size_t pending_lifecycle_associations{0};
+    std::size_t reporter_causal_retained_proposals{0};
+    std::size_t reporter_causal_open_reporters{0};
 };
 
 struct AdaptiveV2ManagerReadinessResult
@@ -104,6 +108,7 @@ struct AdaptiveV2ManagerEvidenceResult
     std::size_t rejected_observations{0};
     std::size_t newly_quarantined_observations{0};
     std::size_t duplicate_quarantined_observations{0};
+    std::size_t quarantine_capacity_rejections{0};
     std::size_t remaining_quarantined_observations{0};
     std::uint64_t ledger_high_watermark{0};
 };

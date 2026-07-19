@@ -99,7 +99,11 @@ bool same_notice(
                std::get<ProposalRuntimeAborted>(right.fact).proposal;
     case 2:
         return std::get<ProposalCommitted>(left.fact).proposal ==
-               std::get<ProposalCommitted>(right.fact).proposal;
+                   std::get<ProposalCommitted>(right.fact).proposal &&
+               std::get<ProposalCommitted>(left.fact)
+                       .evidence_sequence_fence ==
+                   std::get<ProposalCommitted>(right.fact)
+                       .evidence_sequence_fence;
     case 3:
         return std::get<ProposalConfigurationRetired>(left.fact)
                    .configuration ==
@@ -208,7 +212,12 @@ TEST_CASE(
             0,
             1),
         notice(ProposalRuntimeAborted{exact_proposal}, 1, 2),
-        notice(ProposalCommitted{exact_proposal}, 2, 3),
+        notice(
+            ProposalCommitted{
+                exact_proposal,
+                std::numeric_limits<std::uint64_t>::max()},
+            2,
+            3),
         notice(
             ProposalConfigurationRetired{
                 exact_proposal.configuration},
@@ -246,20 +255,21 @@ TEST_CASE(
     const auto exact_configuration = configuration(
         0x11223344U, 0x55667788U, "big-endian-epoch");
     const auto value = notice(
-        ProposalCommitted{proposal(
-            "big-endian", exact_configuration)},
+        ProposalCommitted{
+            proposal("big-endian", exact_configuration),
+            0x1112131415161718ULL},
         0x0102U,
         0x0102030405060708ULL);
     const auto encoded = hotstuff::encode_proposal_lifecycle_notice(
         value, limits());
     const auto &domain = hotstuff::proposal_lifecycle_notice_domain();
 
-    REQUIRE(encoded.size() == domain.size() + 16 + 72);
+    REQUIRE(encoded.size() == domain.size() + 16 + 80);
     CHECK(std::equal(domain.begin(), domain.end(), encoded.begin()));
     CHECK((std::vector<std::uint8_t>(
                encoded.begin() + schema_offset(),
                encoded.begin() + source_offset()) ==
-           std::vector<std::uint8_t>{0, 0, 0, 1}));
+           std::vector<std::uint8_t>{0, 0, 0, 2}));
     CHECK((std::vector<std::uint8_t>(
                encoded.begin() + source_offset(),
                encoded.begin() + sequence_offset()) ==
@@ -278,6 +288,12 @@ TEST_CASE(
            std::vector<std::uint8_t>{
                0x11, 0x22, 0x33, 0x44,
                0x55, 0x66, 0x77, 0x88}));
+    CHECK((std::vector<std::uint8_t>(
+               encoded.end() - sizeof(std::uint64_t),
+               encoded.end()) ==
+           std::vector<std::uint8_t>{
+               0x11, 0x12, 0x13, 0x14,
+               0x15, 0x16, 0x17, 0x18}));
 }
 
 TEST_CASE(
@@ -386,7 +402,7 @@ TEST_CASE(
         malformed, ProposalLifecycleWireError::invalid_domain);
 
     malformed = canonical;
-    write_big_endian<std::uint32_t>(malformed, schema_offset(), 2);
+    write_big_endian<std::uint32_t>(malformed, schema_offset(), 1);
     check_decode_error(
         malformed, ProposalLifecycleWireError::unsupported_schema);
 

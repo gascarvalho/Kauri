@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -82,7 +83,7 @@ AdaptiveV2ManagerIngressLimits limits()
     configured.evidence_wire = {4096, 8, 7};
     configured.proposal_index = {32, 8};
     configured.evidence_store = {32, 32};
-    configured.lifecycle = {16, 4096, 7, 64, 16, 7};
+    configured.lifecycle = {16, 4096, 7, 64, 16, 7, 2};
     configured.lifecycle_accounting = {16, 4096, 64};
     configured.maximum_pending_lifecycle_facts_per_source = 4;
     return configured;
@@ -105,20 +106,23 @@ AdaptiveV2ReadinessNotice readiness(
 
 ResponseObservation observation(
     const AdaptiveV2ManagerIngress &manager,
-    const std::string &label = "quarantined")
+    const std::string &label = "quarantined",
+    ReplicaID reporter = 1,
+    ReplicaID observed = 3,
+    std::uint64_t reporter_sequence = 1)
 {
     ResponseObservation value;
-    value.reporter_id = 1;
-    value.observed_replica_id = 3;
+    value.reporter_id = reporter;
+    value.observed_replica_id = observed;
     value.configuration = manager.current_configuration();
     value.block_hash = digest(label + "-block");
     value.expected_message_type = ExpectedMessageType::direct_vote;
     value.outcome = ResponseOutcome::on_time;
     value.response_duration_us = 20;
     value.deadline_duration_us = 100;
-    value.reporter_monotonic_ns = 1'000;
-    value.reporter_sequence = 1;
-    value.signer_set = {3};
+    value.reporter_monotonic_ns = reporter_sequence * 1'000;
+    value.reporter_sequence = reporter_sequence;
+    value.signer_set = {observed};
     value.observation_id = hotstuff::compute_response_observation_id(
         value.attempt_identity());
     return value;
@@ -230,6 +234,36 @@ TEST_CASE(
     CHECK_THROWS_AS(
         AdaptiveV2ManagerIngress(
             membership(), epoch_zero(), 0, 3, excessive_pending_quota),
+        std::invalid_argument);
+
+    auto zero_reporter_quota = limits();
+    zero_reporter_quota.lifecycle.maximum_quarantined_records_per_reporter =
+        0;
+    CHECK_THROWS_AS(
+        AdaptiveV2ManagerIngress(
+            membership(), epoch_zero(), 0, 3, zero_reporter_quota),
+        std::invalid_argument);
+
+    auto excessive_reporter_share = limits();
+    excessive_reporter_share.lifecycle.
+        maximum_quarantined_records_per_reporter = 3;
+    CHECK_THROWS_AS(
+        AdaptiveV2ManagerIngress(
+            membership(), epoch_zero(), 0, 3, excessive_reporter_share),
+        std::invalid_argument);
+
+    auto undersized_global_quarantine = limits();
+    undersized_global_quarantine.lifecycle.maximum_quarantined_records = 6;
+    undersized_global_quarantine.lifecycle.
+        maximum_quarantined_records_per_reporter = 1;
+    undersized_global_quarantine.lifecycle_accounting.maximum_records = 6;
+    CHECK_THROWS_AS(
+        AdaptiveV2ManagerIngress(
+            membership(),
+            epoch_zero(),
+            0,
+            3,
+            undersized_global_quarantine),
         std::invalid_argument);
 }
 
@@ -589,6 +623,8 @@ TEST_CASE(
     CHECK(committed.lifecycle.index_changed);
     CHECK(manager.audit_stats().pending_lifecycle_facts == 0);
     CHECK(manager.audit_stats().pending_lifecycle_associations == 0);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 4);
 
     const auto late = ingest_lifecycle(
         manager,
@@ -596,6 +632,7 @@ TEST_CASE(
         lifecycle(ProposalCommitted{committed_key}, 5, 1));
     CHECK(late.status == AdaptiveV2ManagerIngressStatus::already_applied);
     CHECK_FALSE(late.lifecycle.index_changed);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 3);
 
     const auto late_initialization = ingest_lifecycle(
         manager,
@@ -604,26 +641,693 @@ TEST_CASE(
     CHECK(late_initialization.status ==
           AdaptiveV2ManagerIngressStatus::rejected_lifecycle);
     CHECK_FALSE(late_initialization.lifecycle.index_changed);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 3);
     CHECK(manager.lifecycle_stats().applied_lifecycle_notices == 1);
     CHECK(manager.audit_stats().pending_lifecycle_facts == 0);
     CHECK(manager.audit_stats().pending_lifecycle_associations == 0);
 
-    const auto stale_evidence = manager.ingest_evidence(
+    const auto precommit_evidence = manager.ingest_evidence(
         AuthenticatedReporter{1},
         hotstuff::encode_evidence_batch(
             ResponseObservationBatch{
                 hotstuff::kEvidenceBatchSchemaVersion,
                 {observation(manager, "committed-directly")}},
             configured.evidence_wire));
-    CHECK(stale_evidence.accepted_observations == 0);
-    CHECK(stale_evidence.rejected_observations == 1);
+    CHECK(precommit_evidence.accepted_observations == 0);
+    CHECK(precommit_evidence.rejected_observations == 0);
+    CHECK(precommit_evidence.newly_quarantined_observations == 1);
+
+    const auto reporter_commit = ingest_lifecycle(
+        manager,
+        configured,
+        lifecycle(ProposalCommitted{committed_key, 1}, 1, 2));
+    CHECK(reporter_commit.status ==
+          AdaptiveV2ManagerIngressStatus::already_applied);
+    CHECK(reporter_commit.lifecycle.retried_observations == 1);
+    CHECK(reporter_commit.lifecycle.accepted_observations == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 2);
+
+    const auto postcommit_evidence = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {observation(
+                    manager, "committed-directly", 1, 4, 2)}},
+            configured.evidence_wire));
+    CHECK(postcommit_evidence.accepted_observations == 0);
+    CHECK(postcommit_evidence.rejected_observations == 1);
+
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key}, 0, 2))
+              .status == AdaptiveV2ManagerIngressStatus::already_applied);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key}, 6, 2))
+              .status == AdaptiveV2ManagerIngressStatus::already_applied);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 0);
 
     const auto stats = manager.lifecycle_stats();
     CHECK(stats.lifecycle_sources == 1);
     CHECK(stats.applied_lifecycle_notices == 1);
+    CHECK(manager.ledger().accepted().size() == 1);
+    CHECK(manager.ledger().rejected().size() == 1);
     CHECK(manager.audit_stats().state_rejections == 1);
     CHECK(manager.audit_stats().pending_lifecycle_facts == 0);
     CHECK(manager.audit_stats().pending_lifecycle_associations == 0);
+    CHECK(manager.healthy());
+
+    manager.shutdown();
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 0);
+}
+
+TEST_CASE(
+    "N7 direct commit drains the authenticated precommit evidence prefix",
+    "[adaptive-v2][manager-ingress][evidence][commit][causal][n7]")
+{
+    const auto configured = limits();
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+    const auto expected = observation(
+        manager, "direct-commit-drain", 2, 5, 1);
+
+    const auto quarantined = manager.ingest_evidence(
+        AuthenticatedReporter{2},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {expected}},
+            configured.evidence_wire));
+    CHECK(quarantined.newly_quarantined_observations == 1);
+    CHECK(quarantined.remaining_quarantined_observations == 1);
+
+    for (ReplicaID source = 2; source < 4; ++source)
+    {
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  lifecycle(
+                      ProposalCommitted{
+                          expected.proposal_key(), source == 2 ? 1ULL : 0ULL},
+                      source,
+                      1))
+                  .status == AdaptiveV2ManagerIngressStatus::
+                                 awaiting_corroboration);
+    }
+    const auto committed = ingest_lifecycle(
+        manager,
+        configured,
+        lifecycle(ProposalCommitted{expected.proposal_key(), 0}, 4, 1));
+    REQUIRE(committed.status ==
+            AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(committed.lifecycle.retried_observations == 1);
+    CHECK(committed.lifecycle.accepted_observations == 1);
+    CHECK(committed.lifecycle.rejected_observations == 0);
+    CHECK(committed.lifecycle.remaining_quarantined == 0);
+
+    const auto after_boundary = manager.ingest_evidence(
+        AuthenticatedReporter{2},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {observation(
+                    manager, "direct-commit-drain", 2, 6, 2)}},
+            configured.evidence_wire));
+    CHECK(after_boundary.accepted_observations == 0);
+    CHECK(after_boundary.rejected_observations == 1);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 4);
+    CHECK(manager.ledger().accepted().size() == 1);
+    CHECK(manager.ledger().rejected().size() == 1);
+    CHECK(manager.healthy());
+}
+
+TEST_CASE(
+    "N7 retained commit fence admits a blocked precommit FIFO suffix",
+    "[adaptive-v2][manager-ingress][evidence][commit][causal][fifo][n7]")
+{
+    const auto configured = limits();
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+    const auto older = observation(
+        manager, "blocked-older", 1, 3, 1);
+    const auto committed_suffix = observation(
+        manager, "blocked-committed", 1, 4, 2);
+
+    const auto quarantined = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {older, committed_suffix}},
+            configured.evidence_wire));
+    CHECK(quarantined.newly_quarantined_observations == 2);
+    CHECK(quarantined.remaining_quarantined_observations == 2);
+
+    for (ReplicaID source = 1; source < 3; ++source)
+    {
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  lifecycle(
+                      ProposalCommitted{
+                          committed_suffix.proposal_key(),
+                          source == 1 ? 2ULL : 0ULL},
+                      source,
+                      1))
+                  .status == AdaptiveV2ManagerIngressStatus::
+                                 awaiting_corroboration);
+    }
+    const auto committed = ingest_lifecycle(
+        manager,
+        configured,
+        lifecycle(
+            ProposalCommitted{committed_suffix.proposal_key(), 0},
+            3,
+            1));
+    REQUIRE(committed.status ==
+            AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(committed.lifecycle.retried_observations == 0);
+    CHECK(committed.lifecycle.remaining_quarantined == 2);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 4);
+
+    for (ReplicaID source = 4; source < 6; ++source)
+    {
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  admission(older.proposal_key(), source, 1))
+                  .status == AdaptiveV2ManagerIngressStatus::
+                                 awaiting_corroboration);
+    }
+    const auto admitted = ingest_lifecycle(
+        manager,
+        configured,
+        admission(older.proposal_key(), 6, 1));
+    REQUIRE(admitted.status ==
+            AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(admitted.lifecycle.retried_observations == 2);
+    CHECK(admitted.lifecycle.accepted_observations == 2);
+    CHECK(admitted.lifecycle.rejected_observations == 0);
+    CHECK(admitted.lifecycle.remaining_quarantined == 0);
+
+    const auto after_fence = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {observation(
+                    manager, "blocked-committed", 1, 3, 3)}},
+            configured.evidence_wire));
+    CHECK(after_fence.accepted_observations == 0);
+    CHECK(after_fence.rejected_observations == 1);
+    CHECK(manager.ledger().accepted().size() == 2);
+    CHECK(manager.ledger().rejected().size() == 1);
+    CHECK(manager.lifecycle_stats().quarantined_records == 0);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 4);
+    CHECK(manager.healthy());
+}
+
+TEST_CASE(
+    "N7 terminal commit fence rejects late compensation beyond its prefix",
+    "[adaptive-v2][manager-ingress][evidence][commit][causal][late][n7]")
+{
+    const auto configured = limits();
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+
+    auto timeout = observation(
+        manager, "terminal-timeout-late", 1, 3, 1);
+    timeout.outcome = ResponseOutcome::timeout;
+    timeout.response_duration_us = 0;
+    timeout.signer_set.clear();
+    timeout.observation_id = hotstuff::compute_response_observation_id(
+        timeout.attempt_identity());
+
+    auto late = timeout;
+    late.outcome = ResponseOutcome::late;
+    late.response_duration_us = 150;
+    late.reporter_monotonic_ns = 2'000;
+    late.reporter_sequence = 2;
+    late.signer_set = {3};
+    late.observation_id = hotstuff::compute_response_observation_id(
+        late.attempt_identity());
+    REQUIRE(timeout.observation_id == late.observation_id);
+
+    for (ReplicaID source = 4; source < 6; ++source)
+    {
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  admission(timeout.proposal_key(), source, 1))
+                  .status == AdaptiveV2ManagerIngressStatus::
+                                 awaiting_corroboration);
+    }
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              admission(timeout.proposal_key(), 6, 1))
+              .status == AdaptiveV2ManagerIngressStatus::processed);
+
+    const auto accepted_timeout = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {timeout}},
+            configured.evidence_wire));
+    CHECK(accepted_timeout.accepted_observations == 1);
+    CHECK(accepted_timeout.rejected_observations == 0);
+
+    for (ReplicaID source = 1; source < 3; ++source)
+    {
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  lifecycle(
+                      ProposalCommitted{
+                          timeout.proposal_key(),
+                          source == 1 ? 1ULL : 0ULL},
+                      source,
+                      1))
+                  .status == AdaptiveV2ManagerIngressStatus::
+                                 awaiting_corroboration);
+    }
+    const auto committed = ingest_lifecycle(
+        manager,
+        configured,
+        lifecycle(
+            ProposalCommitted{timeout.proposal_key(), 0}, 3, 1));
+    REQUIRE(committed.status ==
+            AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 4);
+
+    const auto rejected_late = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {late}},
+            configured.evidence_wire));
+    CHECK(rejected_late.accepted_observations == 0);
+    CHECK(rejected_late.rejected_observations == 1);
+    CHECK(rejected_late.newly_quarantined_observations == 0);
+    CHECK(rejected_late.remaining_quarantined_observations == 0);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 4);
+    CHECK(manager.lifecycle_stats().quarantined_records == 0);
+    CHECK(manager.ledger().accepted().size() == 1);
+    CHECK(manager.ledger().rejected().size() == 1);
+    CHECK(manager.healthy());
+}
+
+TEST_CASE(
+    "N7 first reporter commit freezes an immutable evidence fence",
+    "[adaptive-v2][manager-ingress][evidence][commit][causal][ratchet][n7]")
+{
+    const auto configured = limits();
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+    const auto after_first_commit = observation(
+        manager, "immutable-commit-fence", 1, 3, 1);
+    const auto committed_key = after_first_commit.proposal_key();
+
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key}, 1, 1))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration);
+
+    const auto quarantined = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {after_first_commit}},
+            configured.evidence_wire));
+    CHECK(quarantined.newly_quarantined_observations == 1);
+    CHECK(quarantined.remaining_quarantined_observations == 1);
+
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key}, 1, 2))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key, 1}, 1, 3))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             rejected_lifecycle);
+    CHECK(manager.audit_stats().pending_lifecycle_associations == 1);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key}, 2, 1))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration);
+
+    const auto globally_committed = ingest_lifecycle(
+        manager,
+        configured,
+        lifecycle(ProposalCommitted{committed_key}, 3, 1));
+    REQUIRE(globally_committed.status ==
+            AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(globally_committed.lifecycle.retried_observations == 1);
+    CHECK(globally_committed.lifecycle.accepted_observations == 0);
+    CHECK(globally_committed.lifecycle.rejected_observations == 1);
+    CHECK(globally_committed.lifecycle.remaining_quarantined == 0);
+
+    const auto zero_sequence_after_commit = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {observation(
+                    manager, "immutable-commit-fence", 1, 4, 0)}},
+            configured.evidence_wire));
+    CHECK(zero_sequence_after_commit.accepted_observations == 0);
+    CHECK(zero_sequence_after_commit.rejected_observations == 1);
+
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key}, 1, 4))
+              .status == AdaptiveV2ManagerIngressStatus::already_applied);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key, 1}, 1, 5))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             rejected_lifecycle);
+    const auto replay_after_duplicate_commit = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {after_first_commit}},
+            configured.evidence_wire));
+    CHECK(replay_after_duplicate_commit.accepted_observations == 0);
+    CHECK(replay_after_duplicate_commit.rejected_observations == 1);
+    CHECK(manager.ledger().accepted().empty());
+    CHECK(manager.ledger().rejected().size() == 1);
+    CHECK(manager.audit_stats().evidence_sequence_rejections == 2);
+    CHECK(manager.audit_stats().lifecycle_fence_mismatch_rejections == 2);
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 1);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 4);
+    CHECK(manager.healthy());
+}
+
+TEST_CASE(
+    "N7 counts only finite commit fences equal to authenticated FIFO highwater",
+    "[adaptive-v2][manager-ingress][commit][fence][byzantine][n7]")
+{
+    const auto configured = limits();
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+    const auto expected = observation(
+        manager, "validated-fence", 1, 3, 2);
+    const auto committed_key = expected.proposal_key();
+
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key, 0}, 0, 1))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration);
+
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key, 1}, 1, 1))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             rejected_lifecycle);
+    const auto evidence = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {expected}},
+            configured.evidence_wire));
+    CHECK(evidence.newly_quarantined_observations == 1);
+    CHECK(evidence.remaining_quarantined_observations == 1);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key, 1}, 1, 2))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             rejected_lifecycle);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(ProposalCommitted{committed_key, 2}, 1, 3))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration);
+
+    const auto maximum = observation(
+        manager,
+        "validated-fence",
+        2,
+        5,
+        std::numeric_limits<std::uint64_t>::max());
+    const auto maximum_evidence = manager.ingest_evidence(
+        AuthenticatedReporter{2},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {maximum}},
+            configured.evidence_wire));
+    CHECK(maximum_evidence.newly_quarantined_observations == 1);
+    CHECK(maximum_evidence.remaining_quarantined_observations == 2);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(
+                  ProposalCommitted{
+                      committed_key,
+                      std::numeric_limits<std::uint64_t>::max()},
+                  2,
+                  1))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             rejected_lifecycle);
+
+    const auto lower_after_maximum = manager.ingest_evidence(
+        AuthenticatedReporter{2},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {observation(manager, "validated-fence", 2, 5, 1)}},
+            configured.evidence_wire));
+    CHECK(lower_after_maximum.rejected_observations == 1);
+    CHECK(lower_after_maximum.newly_quarantined_observations == 0);
+    CHECK(lower_after_maximum.remaining_quarantined_observations == 2);
+
+    CHECK(manager.audit_stats().pending_lifecycle_associations == 2);
+    const auto committed = ingest_lifecycle(
+        manager,
+        configured,
+        lifecycle(ProposalCommitted{committed_key, 0}, 3, 1));
+    REQUIRE(committed.status == AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(committed.lifecycle.retried_observations == 1);
+    CHECK(committed.lifecycle.accepted_observations == 1);
+    CHECK(committed.lifecycle.rejected_observations == 0);
+    CHECK(committed.lifecycle.remaining_quarantined == 1);
+    CHECK(manager.audit_stats().pending_lifecycle_associations == 0);
+    CHECK(manager.audit_stats().lifecycle_fence_mismatch_rejections == 3);
+    CHECK(manager.audit_stats().evidence_sequence_rejections == 1);
+    CHECK(manager.ledger().accepted().size() == 1);
+    CHECK(manager.ledger().rejected().empty());
+    CHECK(manager.lifecycle_stats().quarantined_records == 1);
+    CHECK(manager.healthy());
+}
+
+TEST_CASE(
+    "N7 consumes an authenticated evidence sequence before reporter validation",
+    "[adaptive-v2][manager-ingress][evidence][sequence][byzantine][n7]")
+{
+    const auto configured = limits();
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+    const auto spoofed = observation(
+        manager, "spoofed-sequence", 2, 5, 5);
+
+    const auto rejected_spoof = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {spoofed}},
+            configured.evidence_wire));
+    CHECK(rejected_spoof.status ==
+          AdaptiveV2ManagerIngressStatus::rejected_spoofed_source);
+    CHECK(rejected_spoof.processed_observations == 1);
+    CHECK(rejected_spoof.rejected_observations == 1);
+    REQUIRE(manager.ledger().rejected().size() == 1);
+    CHECK(manager.ledger().rejected().front().reason ==
+          hotstuff::EvidenceRejectionReason::reporter_mismatch);
+
+    const auto lower_valid = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {observation(manager, "lower-valid", 1, 3, 4)}},
+            configured.evidence_wire));
+    CHECK(lower_valid.status == AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(lower_valid.processed_observations == 1);
+    CHECK(lower_valid.rejected_observations == 1);
+    CHECK(manager.ledger().rejected().size() == 1);
+
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(
+                  ProposalCommitted{spoofed.proposal_key(), 4},
+                  1,
+                  1))
+              .status == AdaptiveV2ManagerIngressStatus::rejected_lifecycle);
+    CHECK(ingest_lifecycle(
+              manager,
+              configured,
+              lifecycle(
+                  ProposalCommitted{spoofed.proposal_key(), 5},
+                  1,
+                  2))
+              .status == AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration);
+    CHECK(manager.audit_stats().evidence_sequence_rejections == 1);
+    CHECK(manager.audit_stats().lifecycle_fence_mismatch_rejections == 1);
+    CHECK(manager.healthy());
+}
+
+TEST_CASE(
+    "N7 open reporter prefixes do not consume stale rejection capacity",
+    "[adaptive-v2][manager-ingress][evidence][commit][causal][capacity][n7]")
+{
+    auto configured = limits();
+    configured.evidence_store.maximum_rejected_records = 1;
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+
+    for (std::uint64_t index = 1; index <= 2; ++index)
+    {
+        const auto expected = observation(
+            manager,
+            "rejection-capacity-" + std::to_string(index),
+            1,
+            3,
+            index);
+        for (ReplicaID source = 2; source < 4; ++source)
+        {
+            CHECK(ingest_lifecycle(
+                      manager,
+                      configured,
+                      lifecycle(
+                          ProposalCommitted{expected.proposal_key()},
+                          source,
+                          index))
+                      .status == AdaptiveV2ManagerIngressStatus::
+                                     awaiting_corroboration);
+        }
+        REQUIRE(ingest_lifecycle(
+                    manager,
+                    configured,
+                    lifecycle(
+                        ProposalCommitted{expected.proposal_key()},
+                        4,
+                        index))
+                    .status == AdaptiveV2ManagerIngressStatus::processed);
+
+        const auto evidence = manager.ingest_evidence(
+            AuthenticatedReporter{1},
+            hotstuff::encode_evidence_batch(
+                ResponseObservationBatch{
+                    hotstuff::kEvidenceBatchSchemaVersion, {expected}},
+                configured.evidence_wire));
+        CHECK(evidence.status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+        CHECK(evidence.accepted_observations == 0);
+        CHECK(evidence.rejected_observations == 0);
+        CHECK(evidence.newly_quarantined_observations == 1);
+
+        const auto reporter_commit = ingest_lifecycle(
+            manager,
+            configured,
+            lifecycle(
+                ProposalCommitted{expected.proposal_key(), index},
+                1,
+                index));
+        CHECK(reporter_commit.status ==
+              AdaptiveV2ManagerIngressStatus::already_applied);
+        CHECK(reporter_commit.lifecycle.retried_observations == 1);
+        CHECK(reporter_commit.lifecycle.accepted_observations == 1);
+        CHECK(reporter_commit.lifecycle.rejected_observations == 0);
+    }
+
+    CHECK(manager.ledger().accepted().size() == 2);
+    CHECK(manager.ledger().rejected().empty());
+    CHECK(manager.audit_stats().reporter_causal_retained_proposals == 2);
+    CHECK(manager.audit_stats().reporter_causal_open_reporters == 6);
+    CHECK(manager.healthy());
+}
+
+TEST_CASE(
+    "N7 reporter quarantine quota rejects overflow without poisoning ingress",
+    "[adaptive-v2][manager-ingress][quarantine][capacity][byzantine][n7]")
+{
+    auto configured = limits();
+    configured.lifecycle.maximum_quarantined_records_per_reporter = 2;
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+
+    const auto first = observation(manager, "quota-first", 1, 3, 1);
+    const auto second = observation(manager, "quota-second", 1, 3, 2);
+    const auto overflow = observation(manager, "quota-overflow", 1, 3, 3);
+    const auto saturated = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {first, second, overflow}},
+            configured.evidence_wire));
+    CHECK(saturated.status == AdaptiveV2ManagerIngressStatus::processed);
+    CHECK(saturated.processed_observations == 3);
+    CHECK(saturated.newly_quarantined_observations == 2);
+    CHECK(saturated.quarantine_capacity_rejections == 1);
+    CHECK(saturated.rejected_observations == 1);
+    CHECK(saturated.remaining_quarantined_observations == 2);
+    CHECK(manager.lifecycle_stats().quarantine_quota_rejections == 1);
+    CHECK(manager.lifecycle_stats().capacity_failures == 0);
+    CHECK(manager.ledger().accepted().empty());
+    CHECK(manager.ledger().rejected().empty());
+    CHECK(manager.healthy());
+
+    const auto independent = manager.ingest_evidence(
+        AuthenticatedReporter{2},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion,
+                {observation(manager, "quota-independent", 2, 5, 1)}},
+            configured.evidence_wire));
+    CHECK(independent.newly_quarantined_observations == 1);
+    CHECK(independent.quarantine_capacity_rejections == 0);
+    CHECK(independent.remaining_quarantined_observations == 3);
+
+    const auto replayed_overflow = manager.ingest_evidence(
+        AuthenticatedReporter{1},
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {overflow}},
+            configured.evidence_wire));
+    CHECK(replayed_overflow.rejected_observations == 1);
+    CHECK(replayed_overflow.quarantine_capacity_rejections == 0);
+    CHECK(replayed_overflow.remaining_quarantined_observations == 3);
+    CHECK(manager.audit_stats().evidence_sequence_rejections == 1);
+    CHECK(manager.lifecycle_stats().quarantine_quota_rejections == 1);
+    CHECK(manager.lifecycle_stats().capacity_failures == 0);
     CHECK(manager.healthy());
 }
 

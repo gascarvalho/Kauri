@@ -317,6 +317,13 @@ public:
 
     void ingest(const AuthenticatedReporter &, const ResponseObservation &) {}
 
+    bool ingest_if_proposal_independent_rejected(
+        const AuthenticatedReporter &,
+        const ResponseObservation &)
+    {
+        return false;
+    }
+
     void reject_wire(const AuthenticatedReporter &, EvidenceWireError) {}
 
     std::uint64_t high_watermark() const noexcept
@@ -1085,6 +1092,40 @@ TEST_CASE("ledger accepts authenticated exact admissible evidence",
     CHECK(ledger.healthy());
 }
 
+TEST_CASE("ledger rejects zero reporter sequence before proposal state",
+          "[e08][evidence][ledger][ordering][sequence]")
+{
+    EvidenceFixture fixture;
+
+    SECTION("normal ingest rejects the first zero sequence")
+    {
+        EvidenceLedger ledger(
+            fixture.epochs, fixture.window, generous_store_limits());
+        ledger.ingest(
+            AuthenticatedReporter{0},
+            aggregate_on_time(fixture, fixture.block_a, 0, 1'000));
+        CHECK(only_rejection(ledger) ==
+              EvidenceRejectionReason::reporter_sequence_regression);
+        CHECK(ledger.high_watermark() == 1);
+        CHECK(ledger.healthy());
+    }
+
+    SECTION("proposal independent validation rejects zero")
+    {
+        EvidenceLedger ledger(
+            fixture.epochs, fixture.window, generous_store_limits());
+        const auto unknown_block = fixture_digest("zero-sequence-unknown");
+        const auto value = aggregate_on_time(
+            fixture, unknown_block, 0, 1'000);
+        CHECK(ledger.ingest_if_proposal_independent_rejected(
+            AuthenticatedReporter{0}, value));
+        CHECK(only_rejection(ledger) ==
+              EvidenceRejectionReason::reporter_sequence_regression);
+        CHECK(ledger.high_watermark() == 1);
+        CHECK(ledger.healthy());
+    }
+}
+
 TEST_CASE("ledger applies deterministic trust and correlation rejection order",
           "[e08][evidence][ledger][rejection-order][intentional-red]")
 {
@@ -1239,7 +1280,7 @@ TEST_CASE("ledger applies deterministic trust and correlation rejection order",
             ExpectedMessageType::aggregate_relay,
             ResponseOutcome::late,
             {2},
-            0,
+            1,
             0);
         ledger.ingest(AuthenticatedReporter{0}, value);
         CHECK(only_rejection(ledger) ==

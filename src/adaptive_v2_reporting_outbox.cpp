@@ -301,6 +301,12 @@ AdaptiveV2ReportingOutbox::enqueue_lifecycle(
         increment(state_->diagnostics.sequence_failures);
         return AdaptiveV2ReportingEnqueueStatus::sequence_exhausted;
     }
+    if (std::holds_alternative<ProposalCommitted>(fact) &&
+        state_->diagnostics.last_evidence_sequence == maximum)
+    {
+        increment(state_->diagnostics.sequence_failures);
+        return AdaptiveV2ReportingEnqueueStatus::sequence_exhausted;
+    }
 
     const auto next_sequence =
         state_->diagnostics.last_lifecycle_sequence + 1;
@@ -310,6 +316,15 @@ AdaptiveV2ReportingOutbox::enqueue_lifecycle(
         notice.source_replica_id = state_->config.source_replica_id;
         notice.source_sequence = next_sequence;
         notice.fact = fact;
+        if (auto *const committed =
+                std::get_if<ProposalCommitted>(&notice.fact))
+        {
+            // One outbox owns all three streams and preserves report FIFO.
+            // Freeze the evidence prefix queued before this commit marker;
+            // callers cannot inject or ratchet a different fence.
+            committed->evidence_sequence_fence =
+                state_->diagnostics.last_evidence_sequence;
+        }
         auto payload = encode_proposal_lifecycle_notice(
             notice, state_->config.limits.lifecycle_wire);
         const auto status = state_->enqueue_owned(
@@ -403,6 +418,12 @@ AdaptiveV2ReportingOutbox::enqueue_evidence(
         {
             increment(state_->diagnostics.payload_failures);
             return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
+        }
+        if (observation.reporter_sequence ==
+            std::numeric_limits<std::uint64_t>::max())
+        {
+            increment(state_->diagnostics.sequence_failures);
+            return AdaptiveV2ReportingEnqueueStatus::sequence_exhausted;
         }
         if (observation.reporter_sequence == 0 ||
             observation.reporter_sequence <= previous_sequence)

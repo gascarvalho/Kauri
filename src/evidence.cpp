@@ -491,6 +491,10 @@ struct EvidenceLedger::State
         }
         if (authenticated_reporter.replica_id != observation.reporter_id)
             return EvidenceRejectionReason::reporter_mismatch;
+        if (observation.reporter_sequence == 0)
+        {
+            return EvidenceRejectionReason::reporter_sequence_regression;
+        }
 
         const auto *epoch = epochs.find_epoch(
             observation.configuration.epoch_number);
@@ -837,6 +841,11 @@ void EvidenceLedger::ingest(
             reject(EvidenceRejectionReason::reporter_mismatch);
             return;
         }
+        if (observation.reporter_sequence == 0)
+        {
+            reject(EvidenceRejectionReason::reporter_sequence_regression);
+            return;
+        }
 
         const auto *epoch = state_->epochs.find_epoch(
             observation.configuration.epoch_number);
@@ -850,7 +859,8 @@ void EvidenceLedger::ingest(
             return;
         }
 
-        switch (state_->window.classify(observation.proposal_key()))
+        switch (state_->window.classify_for_reporter(
+            authenticated_reporter, observation))
         {
         case ProposalEvidenceStatus::admissible:
             break;

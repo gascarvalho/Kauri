@@ -654,7 +654,7 @@ TEST_CASE("reporter ordering rejects sequence overflow and clock regression",
     {
         EvidenceReporter reporter(config(
             7,
-            std::numeric_limits<std::uint64_t>::max(),
+            std::numeric_limits<std::uint64_t>::max() - 1,
             1'000));
         const auto input = fact(
             "sequence-overflow",
@@ -669,7 +669,7 @@ TEST_CASE("reporter ordering rejects sequence overflow and clock regression",
         CHECK(reporter.pending_size() == 0);
         const auto diagnostics = reporter.diagnostics();
         CHECK(diagnostics.last_reporter_sequence ==
-              std::numeric_limits<std::uint64_t>::max());
+              std::numeric_limits<std::uint64_t>::max() - 1);
         CHECK(diagnostics.last_reporter_monotonic_ns == 1'000);
         CHECK(diagnostics.sequence_overflows == 1);
     }
