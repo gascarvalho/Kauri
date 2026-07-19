@@ -204,6 +204,7 @@ public:
     ActivationRecordResult record_committed_v2(
         const AuthorizedEpochChange &prevalidated_command,
         std::uint64_t command_commit_height);
+    void fail_committed_v2(ActivationBlockReason reason) noexcept;
     std::optional<ActivationRecord> committed_v2_record() const;
     EpochActivationResult preview_v2_post_block_commit(
         std::uint64_t height,

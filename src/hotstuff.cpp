@@ -1174,7 +1174,7 @@ namespace hotstuff
                   *owner.proposal_admission,
                   retryable,
                   validator,
-                  EpochProtocolMode::adaptive_v1,
+                  owner.epoch_protocol_mode,
                   owner.epoch_wire_limits,
                   transaction),
               manager_egress(owner),
@@ -1867,6 +1867,7 @@ namespace hotstuff
     void HotStuffBase::initialize_committed_epoch_change_history() noexcept
     {
         committed_epoch_change_history.reset();
+        pending_committed_epoch_change.reset();
         const auto &genesis = committed_head();
         if (genesis == nullptr || genesis->get_decision() != 1)
             return;
@@ -1883,15 +1884,27 @@ namespace hotstuff
         catch (...)
         {
             committed_epoch_change_history.reset();
+            pending_committed_epoch_change.reset();
         }
     }
 
     void HotStuffBase::record_committed_epoch_change_history(
         const block_t &block) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            !committed_epoch_change_history)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
+        if (!committed_epoch_change_history ||
+            pending_committed_epoch_change)
+        {
+            pending_committed_epoch_change.reset();
+            committed_epoch_change_history.reset();
+            return;
+        }
+
+        const auto fail_closed = [this]() noexcept {
+            pending_committed_epoch_change.reset();
+            committed_epoch_change_history.reset();
+        };
         try
         {
             const auto &previous = *committed_epoch_change_history;
@@ -1903,7 +1916,7 @@ namespace hotstuff
                 previous.snapshot.committed_head_height !=
                     previous.head->get_height())
             {
-                committed_epoch_change_history.reset();
+                fail_closed();
                 return;
             }
 
@@ -1913,7 +1926,7 @@ namespace hotstuff
                 parents.front() != previous.head ||
                 parent_hashes.front() != previous.head->get_hash())
             {
-                committed_epoch_change_history.reset();
+                fail_closed();
                 return;
             }
 
@@ -1925,6 +1938,59 @@ namespace hotstuff
                     EpochChangeExtraDisposition::present &&
                 extracted.command && extracted.payload_digest)
             {
+                if (epoch_change_verifier == nullptr ||
+                    exact_epochs == nullptr || proposal_contexts == nullptr)
+                {
+                    fail_closed();
+                    return;
+                }
+                const auto active_configuration =
+                    proposal_contexts->active_configuration();
+                if (!active_configuration.has_value())
+                {
+                    fail_closed();
+                    return;
+                }
+                const auto *const active_epoch = exact_epochs->find_epoch(
+                    active_configuration->epoch_number);
+                if (active_epoch == nullptr ||
+                    active_epoch->epoch_digest() !=
+                        active_configuration->epoch_digest)
+                {
+                    fail_closed();
+                    return;
+                }
+
+                const auto history = EpochChangeHistoryView{
+                    std::nullopt,
+                    previous.snapshot.command &&
+                            previous.snapshot.command->predecessor_epoch_digest ==
+                                active_epoch->epoch_digest()
+                        ? std::optional<uint256_t>(
+                              previous.snapshot.command->payload_digest)
+                        : std::nullopt};
+                const auto validation = epoch_change_verifier->validate(
+                    *extracted.command,
+                    *active_epoch,
+                    *exact_epochs,
+                    history);
+                const auto *const successor =
+                    exact_epochs->find_epoch_by_digest(
+                        extracted.command->payload.successor_epoch_digest);
+                if ((validation.disposition !=
+                         EpochChangeDisposition::accepted &&
+                     validation.disposition !=
+                         EpochChangeDisposition::duplicate) ||
+                    validation.payload_digest != *extracted.payload_digest ||
+                    validation.successor_definition == nullptr ||
+                    successor == nullptr ||
+                    validation.successor_definition != successor ||
+                    validation.successor_definition->epoch_digest() !=
+                        extracted.command->payload.successor_epoch_digest)
+                {
+                    fail_closed();
+                    return;
+                }
                 command = EpochChangeCommittedHistoryEntry{
                     extracted.command->payload.predecessor_epoch_digest,
                     *extracted.payload_digest};
@@ -1932,7 +1998,7 @@ namespace hotstuff
             else if (extracted.disposition !=
                          EpochChangeExtraDisposition::absent)
             {
-                committed_epoch_change_history.reset();
+                fail_closed();
                 return;
             }
 
@@ -1943,10 +2009,14 @@ namespace hotstuff
                         block->get_hash(),
                         block->get_height(),
                         std::move(command)}};
+            if (extracted.command)
+                pending_committed_epoch_change.emplace(
+                    PendingCommittedEpochChange{
+                        block->get_hash(), *extracted.command});
         }
         catch (...)
         {
-            committed_epoch_change_history.reset();
+            fail_closed();
         }
     }
 
@@ -5223,6 +5293,10 @@ namespace hotstuff
 
     bool HotStuffBase::admit_local(const Proposal &prop)
     {
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            (adaptive_epoch_runtime == nullptr ||
+             !adaptive_epoch_runtime->activation.admits_new_proposals()))
+            return false;
         const auto metadata = exact_context_metadata(prop.key());
         if (!metadata.has_value() || metadata->tree.root != get_id())
             return false;
@@ -5583,12 +5657,15 @@ namespace hotstuff
             activation.update->activation.configuration;
         const auto *definition =
             activation.update->activation.definition;
+        const auto event_activation_height =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+                definition == nullptr
+                ? blk->get_height()
+                : definition->activation_height();
         emit_epoch_lifecycle_event(
             EpochLifecycleTransition::activated,
             configuration,
-            definition == nullptr
-                ? blk->get_height()
-                : definition->activation_height());
+            event_activation_height);
         if (adaptive_demo_markers)
             HOTSTUFF_LOG_INFO(
                 "KAURI_DEMO epoch_activated replica=%u epoch=%u "
@@ -5708,11 +5785,13 @@ namespace hotstuff
             erase_deferred_epoch_change(key);
             proposal_admission->retire_proposal(key);
         }
-        const auto activation = epoch_live_binding == nullptr
-            ? EpochCommitIngressResult{}
-            : epoch_live_binding->on_predecessor_commit(
-                  blk->get_height(),
-                  get_epoch_digest(get_cur_epoch_nr()));
+        const auto activation =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+                epoch_live_binding != nullptr
+                ? epoch_live_binding->on_predecessor_commit(
+                      blk->get_height(),
+                      get_epoch_digest(get_cur_epoch_nr()))
+                : EpochCommitIngressResult{};
         finish_adaptive_epoch_commit(blk, activation);
         advance_committed_retirement_floor(blk, keys);
         pmaker->on_consensus(blk);
@@ -5731,6 +5810,113 @@ namespace hotstuff
         else
         {
             decision_made[fin.cmd_hash] = fin.cmd_height;
+        }
+    }
+
+    void HotStuffBase::do_post_block_commit(const block_t &blk)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            blk == nullptr)
+            return;
+
+        const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
+            pending_committed_epoch_change.reset();
+            committed_epoch_change_history.reset();
+            if (adaptive_epoch_runtime != nullptr)
+                adaptive_epoch_runtime->adapter.fail_committed_v2(reason);
+        };
+        try
+        {
+            if (pending_committed_epoch_change &&
+                pending_committed_epoch_change->block_hash != blk->get_hash())
+            {
+                fail_closed(
+                    ActivationBlockReason::invalid_activation_record);
+            }
+
+            if (adaptive_epoch_runtime == nullptr ||
+                epoch_live_binding == nullptr || exact_epochs == nullptr)
+            {
+                fail_closed(
+                    ActivationBlockReason::invalid_activation_record);
+                return;
+            }
+
+            if (pending_committed_epoch_change &&
+                pending_committed_epoch_change->block_hash == blk->get_hash())
+            {
+                const auto &command =
+                    pending_committed_epoch_change->command;
+                const auto *const successor =
+                    exact_epochs->find_epoch_by_digest(
+                        command.payload.successor_epoch_digest);
+                if (successor == nullptr ||
+                    successor->schema_version() !=
+                        kEpochDefinitionSchemaVersionV2 ||
+                    successor->activation_height() != 0 ||
+                    successor->epoch_number() !=
+                        command.payload.successor_epoch_number ||
+                    successor->previous_epoch_digest() !=
+                        command.payload.predecessor_epoch_digest ||
+                    successor->epoch_digest() !=
+                        command.payload.successor_epoch_digest)
+                {
+                    HOTSTUFF_LOG_WARN(
+                        "[EPOCH] Committed v2 successor is unavailable");
+                    fail_closed(
+                        successor == nullptr
+                            ? ActivationBlockReason::missing_definition
+                            : ActivationBlockReason::invalid_activation_record);
+                }
+                else
+                {
+                    const auto prepared = adaptive_epoch_runtime->adapter
+                                              .prepare_committed_v2(*successor);
+                    if (prepared != EpochIngressError::none)
+                    {
+                        HOTSTUFF_LOG_WARN(
+                            "[EPOCH] Failed to prepare committed v2 runtime");
+                        fail_closed(
+                            ActivationBlockReason::invalid_activation_record);
+                    }
+                    else
+                    {
+                        const auto recorded =
+                            adaptive_epoch_runtime->activation
+                                .record_committed_v2(command, blk->get_height());
+                        if (recorded.disposition !=
+                                ActivationRecordDisposition::recorded &&
+                            recorded.disposition !=
+                                ActivationRecordDisposition::duplicate)
+                        {
+                            HOTSTUFF_LOG_WARN(
+                                "[EPOCH] Failed to record committed v2 command");
+                            fail_closed(
+                                adaptive_epoch_runtime->activation
+                                    .blocked_reason());
+                        }
+                        else
+                        {
+                            pending_committed_epoch_change.reset();
+                        }
+                    }
+                }
+            }
+
+            const auto active =
+                adaptive_epoch_runtime->activation.active_effect();
+            const auto &configuration = active.configuration;
+            const auto activation =
+                epoch_live_binding->on_v2_post_block_commit(
+                    blk->get_height(), configuration.epoch_digest);
+            finish_adaptive_epoch_commit(blk, activation);
+        }
+        catch (...)
+        {
+            fail_closed(
+                ActivationBlockReason::invalid_activation_record);
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Failed adaptive-v2 post-block commit processing");
         }
     }
 

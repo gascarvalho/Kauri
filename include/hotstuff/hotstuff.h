@@ -1102,6 +1102,13 @@ namespace hotstuff
         };
         std::optional<CommittedEpochChangeHistoryState>
             committed_epoch_change_history;
+        struct PendingCommittedEpochChange
+        {
+            uint256_t block_hash;
+            AuthorizedEpochChange command;
+        };
+        std::optional<PendingCommittedEpochChange>
+            pending_committed_epoch_change;
         static constexpr std::size_t
             maximum_pending_epoch_definition_digests{8};
         static constexpr std::size_t
@@ -1330,6 +1337,7 @@ namespace hotstuff
         void proposer_base_deliver(const block_t &blk) override;
         void do_decide(Finality &&) override;
         void do_consensus(const block_t &blk) override;
+        void do_post_block_commit(const block_t &blk) override;
         uint32_t get_tree_id() override;
         uint32_t get_cur_epoch_nr() override;
         uint256_t get_epoch_digest(uint32_t epoch_number) override;

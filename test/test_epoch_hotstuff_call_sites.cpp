@@ -649,6 +649,241 @@ TEST_CASE("committed epoch history owns one coherent exact head snapshot",
         {"do_consensus(blk);", "b_exec = blk;"}));
 }
 
+TEST_CASE("committed adaptive v2 commands are cached after history advances",
+          "[c08][epoch-change][commit-hook][cache][intentional-red]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto pending = function_body(
+        header, "struct PendingCommittedEpochChange");
+    const auto initialize = function_body(
+        implementation,
+        "HotStuffBase::initialize_committed_epoch_change_history(");
+    const auto record = function_body(
+        implementation,
+        "HotStuffBase::record_committed_epoch_change_history(");
+
+    REQUIRE_FALSE(pending.empty());
+    CHECK(contains_all(
+        pending,
+        {"uint256_t block_hash;", "AuthorizedEpochChange command;"}));
+    CHECK(header.find(
+              "std::optional<PendingCommittedEpochChange>") !=
+          std::string::npos);
+    CHECK(header.find("pending_committed_epoch_change") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(initialize.empty());
+    CHECK(initialize.find(
+              "pending_committed_epoch_change.reset()") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(record.empty());
+    CHECK(contains_in_order(
+        record,
+        {"EpochProtocolMode::adaptive_v2",
+         "pending_committed_epoch_change.reset()",
+         "const auto &previous = *committed_epoch_change_history",
+         "previous.snapshot.committed_head_hash",
+         "parents.front() != previous.head",
+         "extract_epoch_change_block_extra(",
+         "EpochChangeHistoryView{",
+         "previous.snapshot.command",
+         "previous.snapshot.command->payload_digest",
+         "epoch_change_verifier->validate(",
+         "*extracted.command",
+         "*active_epoch",
+         "*exact_epochs",
+         "validation.disposition",
+         "committed_epoch_change_history =",
+         "CommittedEpochChangeHistoryState{",
+         "if (extracted.command)",
+         "pending_committed_epoch_change.emplace(",
+         "block->get_hash()",
+         "*extracted.command"}));
+    CHECK(contains_all(
+        record,
+        {"EpochChangeDisposition::accepted",
+         "EpochChangeDisposition::duplicate",
+         "validation.successor_definition == nullptr",
+         "exact_epochs->find_epoch_by_digest(",
+         "extracted.command->payload.successor_epoch_digest",
+         "validation.successor_definition != successor",
+         "validation.successor_definition->epoch_digest() !=",
+         "extracted.command->payload.successor_epoch_digest"}));
+    CHECK((contains_all(
+               record,
+               {"proposal_contexts->active_configuration()",
+                "exact_epochs->find_epoch(",
+                "active_configuration->epoch_number",
+                "active_epoch->epoch_digest() !=",
+                "active_configuration->epoch_digest"}) ||
+           contains_all(
+               record,
+               {"adaptive_epoch_runtime->activation.active_effect()",
+                "active.definition",
+                "active.configuration.epoch_digest"})));
+    CHECK(contains_in_order(
+        record,
+        {"previous.snapshot.command",
+         "previous.snapshot.command->predecessor_epoch_digest ==",
+         "active_epoch->epoch_digest()",
+         "previous.snapshot.command->payload_digest",
+         ": std::nullopt"}));
+
+    const auto validation = record.find(
+        "epoch_change_verifier->validate(");
+    const auto history_assignment = record.find(
+        "committed_epoch_change_history =", validation);
+    const auto cache_assignment = record.find(
+        "pending_committed_epoch_change.emplace(", history_assignment);
+    REQUIRE(validation != std::string::npos);
+    REQUIRE(history_assignment != std::string::npos);
+    REQUIRE(cache_assignment != std::string::npos);
+    CHECK(validation < history_assignment);
+    CHECK(history_assignment < cache_assignment);
+
+    const auto extracted_present = record.find(
+        "if (extracted.disposition ==");
+    const auto extracted_failure = record.find(
+        "else if (extracted.disposition !=", extracted_present);
+    REQUIRE(extracted_present != std::string::npos);
+    REQUIRE(extracted_failure != std::string::npos);
+    const auto present_path = record.substr(
+        extracted_present, extracted_failure - extracted_present);
+    CHECK(contains_all(
+        present_path,
+        {"EpochChangeExtraDisposition::present",
+         "extracted.command",
+         "extracted.payload_digest"}));
+    CHECK(present_path.find(
+              "pending_committed_epoch_change.emplace(") ==
+          std::string::npos);
+}
+
+TEST_CASE("adaptive v2 activates only from the matching post-block command",
+          "[c08][epoch-change][commit-hook][post-block][intentional-red]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto core = source("src/consensus.cpp");
+    const auto consensus = function_body(
+        implementation, "void HotStuffBase::do_consensus(");
+    const auto admit_local = function_body(
+        implementation, "bool HotStuffBase::admit_local(");
+    const auto post_commit = function_body(
+        implementation, "void HotStuffBase::do_post_block_commit(");
+    const auto finish_commit = function_body(
+        implementation,
+        "void HotStuffBase::finish_adaptive_epoch_commit(");
+
+    CHECK(header.find(
+              "void do_post_block_commit(const block_t &blk) override;") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(consensus.empty());
+    CHECK(contains_in_order(
+        consensus,
+        {"EpochProtocolMode::adaptive_v1",
+         "epoch_live_binding->on_predecessor_commit("}));
+    CHECK(consensus.find("on_v2_post_block_commit(") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(post_commit.empty());
+    CHECK(contains_in_order(
+        post_commit,
+        {"EpochProtocolMode::adaptive_v2",
+         "pending_committed_epoch_change",
+         "block_hash != blk->get_hash()",
+         "fail_closed(",
+         "pending_committed_epoch_change",
+         "block_hash == blk->get_hash()",
+         "find_epoch_by_digest(",
+         "command.payload.successor_epoch_digest",
+         "prepare_committed_v2(*successor)",
+         "record_committed_v2(command, blk->get_height())",
+         "ActivationRecordDisposition::recorded",
+         "ActivationRecordDisposition::duplicate",
+         "pending_committed_epoch_change.reset()",
+         "activation.active_effect()",
+         "epoch_live_binding->on_v2_post_block_commit(",
+         "blk->get_height()",
+         "configuration.epoch_digest",
+         "finish_adaptive_epoch_commit(blk, activation)"}));
+    CHECK(contains_all(
+        post_commit,
+        {"successor == nullptr",
+         "successor->schema_version()",
+         "kEpochDefinitionSchemaVersionV2",
+         "successor->epoch_number()",
+         "command.payload.successor_epoch_number",
+         "successor->epoch_digest()",
+         "command.payload.successor_epoch_digest",
+         "EpochIngressError::none"}));
+    CHECK(count_occurrences(
+              post_commit, "prepare_committed_v2(*successor)") == 1);
+    CHECK(count_occurrences(
+              post_commit, "record_committed_v2(command, blk->get_height())") ==
+          1);
+    CHECK(count_occurrences(
+              post_commit, "on_v2_post_block_commit(") == 1);
+    CHECK(contains_all(
+        post_commit,
+        {"adaptive_epoch_runtime->adapter.fail_committed_v2(",
+         "ActivationBlockReason::missing_definition",
+         "ActivationBlockReason::invalid_activation_record"}));
+    const auto fail_close = function_body(
+        post_commit, "const auto fail_closed =");
+    REQUIRE_FALSE(fail_close.empty());
+    CHECK(contains_in_order(
+        fail_close,
+        {"pending_committed_epoch_change.reset()",
+         "committed_epoch_change_history.reset()",
+         "adaptive_epoch_runtime->adapter.fail_committed_v2(reason)"}));
+    REQUIRE_FALSE(admit_local.empty());
+    CHECK(contains_in_order(
+        admit_local,
+        {"EpochProtocolMode::adaptive_v2",
+         "adaptive_epoch_runtime",
+         "activation.admits_new_proposals()",
+         "return false"}));
+    REQUIRE_FALSE(finish_commit.empty());
+    CHECK(contains_in_order(
+        finish_commit,
+        {"epoch_protocol_mode == EpochProtocolMode::adaptive_v2",
+         "blk->get_height()",
+         "definition->activation_height()",
+         "emit_epoch_lifecycle_event(",
+         "EpochLifecycleTransition::activated"}));
+    const auto prepare_failure = function_body(
+        post_commit, "if (prepared != EpochIngressError::none)");
+    REQUIRE_FALSE(prepare_failure.empty());
+    CHECK(contains_all(
+        prepare_failure,
+        {"fail_closed(",
+         "ActivationBlockReason::invalid_activation_record"}));
+    const auto record_call = post_commit.find(
+        "record_committed_v2(command, blk->get_height())");
+    const auto duplicate = post_commit.find(
+        "ActivationRecordDisposition::duplicate", record_call);
+    const auto successful_consume = post_commit.find(
+        "pending_committed_epoch_change.reset()", duplicate);
+    REQUIRE(record_call != std::string::npos);
+    REQUIRE(duplicate != std::string::npos);
+    REQUIRE(successful_consume != std::string::npos);
+    CHECK(record_call < successful_consume);
+    CHECK(post_commit.find("on_predecessor_commit(") ==
+          std::string::npos);
+    CHECK(post_commit.find("handle_arm(") == std::string::npos);
+    CHECK(post_commit.find("ArmActivation") == std::string::npos);
+
+    CHECK(contains_in_order(
+        core,
+        {"do_consensus(blk);",
+         "do_decide(Finality(",
+         "do_post_block_commit(blk);"}));
+}
+
 TEST_CASE("adaptive v2 pre-vote authorization is pinned once",
           "[c08][epoch-change][pre-vote][configuration]")
 {

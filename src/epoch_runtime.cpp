@@ -713,6 +713,17 @@ EpochIngressError HotStuffEpochRuntimeAdapter::prepare_committed_v2(
     }
 }
 
+void HotStuffEpochRuntimeAdapter::fail_committed_v2(
+    ActivationBlockReason reason) noexcept
+{
+    if (state_->mode != EpochProtocolMode::adaptive_v2 ||
+        reason == ActivationBlockReason::none)
+        return;
+    state_->discard_retained();
+    state_->staged_configurations.clear();
+    state_->activation.fail_committed_v2(reason);
+}
+
 ReplicaArmIngressResult HotStuffEpochRuntimeAdapter::handle_arm(
     MsgArmActivation &&message,
     const AuthenticatedEpochPeer &authenticated_peer)

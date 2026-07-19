@@ -600,6 +600,29 @@ TEST_CASE("failed v2 preparation has no activation side effects",
     CHECK_FALSE(harness.activation.committed_v2_record().has_value());
 }
 
+TEST_CASE("committed v2 failure discards preparation and pauses admission",
+          "[c08][epoch-live-binding][adaptive-v2][prepare][fail-closed]")
+{
+    V2Harness harness;
+    REQUIRE(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+            EpochIngressError::none);
+    REQUIRE(harness.live_effects.prepared.has_value());
+
+    harness.adapter.fail_committed_v2(
+        ActivationBlockReason::invalid_activation_record);
+
+    CHECK(harness.live_effects.discard_count == 1);
+    CHECK_FALSE(harness.live_effects.prepared.has_value());
+    CHECK(harness.activation.blocked_reason() ==
+          ActivationBlockReason::invalid_activation_record);
+    CHECK_FALSE(harness.activation.admits_new_proposals());
+
+    harness.adapter.fail_committed_v2(
+        ActivationBlockReason::invalid_activation_record);
+    CHECK(harness.live_effects.discard_count == 1);
+    CHECK_FALSE(harness.activation.admits_new_proposals());
+}
+
 TEST_CASE("v2 activation requires the exact prepared successor runtime",
           "[c08][epoch-live-binding][adaptive-v2][prepare][identity]")
 {

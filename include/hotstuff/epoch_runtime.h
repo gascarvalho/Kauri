@@ -309,6 +309,7 @@ public:
         const EpochValidationContext &validation_context);
     EpochIngressError prepare_committed_v2(
         const EpochDefinition &successor_definition) noexcept;
+    void fail_committed_v2(ActivationBlockReason reason) noexcept;
     ReplicaArmIngressResult handle_arm(
         MsgArmActivation &&message,
         const AuthenticatedEpochPeer &authenticated_peer);

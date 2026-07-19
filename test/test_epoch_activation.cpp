@@ -1158,6 +1158,31 @@ TEST_CASE("C08a rejects invalid committed adaptive-v2 records fail closed",
     }
 }
 
+TEST_CASE("C08a explicit committed adaptive-v2 failure pauses proposals",
+          "[c08a][epoch-activation][adaptive-v2][record][fail-closed]")
+{
+    EpochV2Fixture fixture;
+    ReplicaEpochActivation replica(fixture.store, *fixture.epoch0, 0);
+
+    replica.fail_committed_v2(
+        ActivationBlockReason::invalid_activation_record);
+
+    CHECK(replica.blocked_reason() ==
+          ActivationBlockReason::invalid_activation_record);
+    CHECK_FALSE(replica.admits_new_proposals());
+    const auto blocked = replica.on_v2_post_block_commit(
+        40, fixture.epoch0->epoch_digest());
+    CHECK(blocked.transition == ActivationTransition::blocked);
+    CHECK(blocked.blocked_reason ==
+          ActivationBlockReason::invalid_activation_record);
+    CHECK_FALSE(blocked.effect.has_value());
+
+    replica.fail_committed_v2(ActivationBlockReason::none);
+    CHECK(replica.blocked_reason() ==
+          ActivationBlockReason::invalid_activation_record);
+    CHECK_FALSE(replica.admits_new_proposals());
+}
+
 TEST_CASE("C08a preserves the first record and blocks a conflicting schedule",
           "[c08a][epoch-activation][adaptive-v2][record][conflict]")
 {

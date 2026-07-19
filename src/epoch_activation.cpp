@@ -783,6 +783,17 @@ ActivationRecordResult ReplicaEpochActivation::record_committed_v2(
         state_->pending_v2_activation_record};
 }
 
+void ReplicaEpochActivation::fail_committed_v2(
+    ActivationBlockReason reason) noexcept
+{
+    if (reason == ActivationBlockReason::none || state_->permanent_block ||
+        state_->active_definition->schema_version() !=
+            kEpochDefinitionSchemaVersionV2)
+        return;
+    state_->block_reason = reason;
+    state_->permanent_block = true;
+}
+
 std::optional<ActivationRecord>
 ReplicaEpochActivation::committed_v2_record() const
 {
