@@ -148,6 +148,22 @@ EpochDefinitionInput epoch_input(
     return input;
 }
 
+EpochDefinitionInput epoch_v2_input(
+    std::uint32_t epoch_number,
+    const uint256_t &previous = {})
+{
+    auto input = epoch_input(epoch_number, previous);
+    input.schema_version = kEpochDefinitionSchemaVersionV2;
+    input.activation_height = 0;
+    input.generation_seed = 0;
+    input.policy_version = "c08-runtime-v2";
+    input.evidence_snapshot_id =
+        "c08-runtime-v2-" + std::to_string(epoch_number);
+    input.evidence_cutoff = epoch_number;
+    input.epoch_digest.reset();
+    return input;
+}
+
 EpochValidationContext validation_context(std::uint32_t epoch_number)
 {
     return epoch_number == 0 ? EpochValidationContext{0, 0, {}}
@@ -269,6 +285,7 @@ public:
 class LiveEffectsSpy final : public EpochLiveEffects
 {
 public:
+    bool prepare_allowed{true};
     std::size_t prepare_count{0};
     std::size_t discard_count{0};
     std::size_t arm_count{0};
@@ -278,6 +295,7 @@ public:
     bool active_plan_armed{false};
     bool rotation_armed{false};
     std::optional<PreparedEpochLiveRuntime> prepared;
+    std::optional<EpochRuntimePlan> prepared_plan;
     std::optional<PreparedEpochLiveRuntime> armed;
     std::optional<EpochRuntimeUpdate> update;
 
@@ -285,6 +303,9 @@ public:
         const EpochRuntimePlan &plan) override
     {
         ++prepare_count;
+        if (!prepare_allowed)
+            return std::nullopt;
+        prepared_plan.emplace(plan);
         prepared.emplace(PreparedEpochLiveRuntime{
             prepare_count, plan.canonical_digest});
         return prepared;
@@ -423,6 +444,80 @@ struct Harness
     }
 };
 
+struct V2Harness
+{
+    static const EpochDefinition &stage_successor(
+        EpochStore &store,
+        const EpochDefinition &active)
+    {
+        const auto staged = store.stage_available_v2(
+            epoch_v2_input(
+                active.epoch_number() + 1,
+                active.epoch_digest()),
+            active);
+        if (staged.definition == nullptr)
+            throw std::logic_error("failed to stage v2 successor fixture");
+        return *staged.definition;
+    }
+
+    EpochStore store{membership()};
+    const EpochDefinition &epoch0;
+    const EpochDefinition &epoch1;
+    ReplicaEpochActivation activation;
+    FutureProposalBuffer future;
+    ProposalContextLifecycle contexts;
+    ProposalEffectsSpy proposal_effects;
+    ProposalAdmissionCoordinator admission;
+    EmptyFutureStore retryable_future;
+    BodyValidatorSpy validator;
+    LiveEffectsSpy live_effects;
+    HotStuffEpochRuntimeTransaction transaction;
+    HotStuffEpochRuntimeAdapter adapter;
+    ManagerEgressSpy manager_egress;
+    ContinuationsSpy continuations;
+    HotStuffEpochLiveBinding binding;
+
+    V2Harness()
+        : epoch0(store.stage(epoch_v2_input(0), validation_context(0))),
+          epoch1(stage_successor(store, epoch0)),
+          activation(store, epoch0, 0, 0),
+          admission(
+              store,
+              activation.active_effect().configuration,
+              future,
+              proposal_effects),
+          transaction(admission, contexts, live_effects),
+          adapter(
+              activation,
+              contexts,
+              admission,
+              retryable_future,
+              validator,
+              EpochProtocolMode::adaptive_v2,
+              limits(),
+              transaction),
+          binding(
+              adapter,
+              activation,
+              live_effects,
+              manager_egress,
+              continuations)
+    {
+        contexts.activate_configuration(
+            activation.active_effect().configuration);
+    }
+
+    AuthorizedEpochChange command(std::uint64_t delay) const
+    {
+        AuthorizedEpochChange value;
+        value.payload.successor_epoch_number = epoch1.epoch_number();
+        value.payload.predecessor_epoch_digest = epoch0.epoch_digest();
+        value.payload.successor_epoch_digest = epoch1.epoch_digest();
+        value.payload.activation_delay_blocks = delay;
+        return value;
+    }
+};
+
 } // namespace
 
 TEST_CASE("live binding emits only a successful stage acknowledgement",
@@ -446,6 +541,148 @@ TEST_CASE("live binding emits only a successful stage acknowledgement",
     CHECK(rejected.error == EpochIngressError::unauthorized_peer);
     CHECK(harness.manager_egress.acknowledgements.size() == 1);
     CHECK(harness.live_effects.prepare_count == 1);
+}
+
+TEST_CASE("v2 runtime preparation is schedule-free and never arms",
+          "[c08][epoch-live-binding][adaptive-v2][prepare]")
+{
+    V2Harness harness;
+
+    REQUIRE(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+            EpochIngressError::none);
+    CHECK(harness.live_effects.prepare_count == 1);
+    CHECK(harness.live_effects.arm_count == 0);
+    CHECK(harness.live_effects.apply_count == 0);
+    CHECK(harness.manager_egress.acknowledgements.empty());
+    CHECK(harness.manager_egress.statuses.empty());
+    CHECK_FALSE(harness.activation.committed_v2_record().has_value());
+
+    REQUIRE(harness.live_effects.prepared_plan.has_value());
+    const auto &plan = *harness.live_effects.prepared_plan;
+    CHECK(plan.protocol_mode == EpochProtocolMode::adaptive_v2);
+    CHECK(plan.epoch_number == harness.epoch1.epoch_number());
+    CHECK(plan.epoch_digest == harness.epoch1.epoch_digest());
+    CHECK(plan.canonical_stage ==
+          harness.epoch1.canonical_serialization());
+    CHECK(plan.canonical_digest == harness.epoch1.epoch_digest());
+    REQUIRE(plan.trees.size() == harness.epoch1.trees().size());
+    for (const auto &tree : plan.trees)
+    {
+        CHECK(tree.configuration.epoch_number ==
+              harness.epoch1.epoch_number());
+        CHECK(tree.configuration.epoch_digest ==
+              harness.epoch1.epoch_digest());
+    }
+
+    CHECK(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+          EpochIngressError::none);
+    CHECK(harness.live_effects.prepare_count == 1);
+}
+
+TEST_CASE("failed v2 preparation has no activation side effects",
+          "[c08][epoch-live-binding][adaptive-v2][prepare][failure]")
+{
+    V2Harness harness;
+    harness.live_effects.prepare_allowed = false;
+
+    CHECK(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+          EpochIngressError::runtime_preparation_failed);
+    CHECK(harness.live_effects.prepare_count == 1);
+    CHECK(harness.live_effects.arm_count == 0);
+    CHECK(harness.live_effects.apply_count == 0);
+    CHECK_FALSE(harness.activation.committed_v2_record().has_value());
+    CHECK(harness.activation.active_effect().definition == &harness.epoch0);
+
+    harness.live_effects.prepare_allowed = true;
+    CHECK(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+          EpochIngressError::none);
+    CHECK(harness.live_effects.prepare_count == 2);
+    CHECK_FALSE(harness.activation.committed_v2_record().has_value());
+}
+
+TEST_CASE("v2 activation requires the exact prepared successor runtime",
+          "[c08][epoch-live-binding][adaptive-v2][prepare][identity]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    constexpr std::uint64_t delay = 5;
+    V2Harness harness;
+    EpochStore other_store{membership()};
+    const auto &other_epoch0 = other_store.stage(
+        epoch_v2_input(0), validation_context(0));
+    auto other_input = epoch_v2_input(1, other_epoch0.epoch_digest());
+    other_input.policy_version = "c08-runtime-v2-other";
+    other_input.evidence_snapshot_id = "c08-runtime-v2-other-1";
+    const auto other_staged = other_store.stage_available_v2(
+        other_input, other_epoch0);
+    REQUIRE(other_staged.definition != nullptr);
+    REQUIRE(other_staged.definition->epoch_digest() !=
+            harness.epoch1.epoch_digest());
+    REQUIRE(harness.adapter.prepare_committed_v2(
+                *other_staged.definition) == EpochIngressError::none);
+    REQUIRE(harness.activation.record_committed_v2(
+                harness.command(delay), commit_height)
+                .disposition == ActivationRecordDisposition::recorded);
+
+    const auto result = harness.binding.on_v2_post_block_commit(
+        commit_height + delay, harness.epoch0.epoch_digest());
+    CHECK(result.error == EpochIngressError::missing_prepared_runtime);
+    CHECK(result.transition == ActivationTransition::waiting);
+    CHECK(harness.activation.active_effect().definition == &harness.epoch0);
+    CHECK(harness.live_effects.arm_count == 0);
+    CHECK(harness.live_effects.apply_count == 0);
+    CHECK(harness.live_effects.discard_count == 1);
+
+    REQUIRE(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+            EpochIngressError::none);
+    const auto retried = harness.binding.on_v2_post_block_commit(
+        commit_height + delay, harness.epoch0.epoch_digest());
+    CHECK(retried.error == EpochIngressError::none);
+    CHECK(retried.transition == ActivationTransition::activated);
+    CHECK(harness.activation.active_effect().definition == &harness.epoch1);
+    CHECK(harness.live_effects.arm_count == 1);
+    CHECK(harness.live_effects.apply_count == 1);
+}
+
+TEST_CASE("missing v2 runtime leaves the exact boundary retryable",
+          "[c08][epoch-live-binding][adaptive-v2][post-block]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    constexpr std::uint64_t delay = 5;
+    constexpr std::uint64_t activation_height = commit_height + delay;
+    V2Harness harness;
+    const auto command = harness.command(delay);
+    REQUIRE(harness.activation.record_committed_v2(
+                command, commit_height)
+                .disposition == ActivationRecordDisposition::recorded);
+
+    const auto missing = harness.binding.on_v2_post_block_commit(
+        activation_height, harness.epoch0.epoch_digest());
+    CHECK(missing.error == EpochIngressError::missing_prepared_runtime);
+    CHECK(missing.transition == ActivationTransition::waiting);
+    CHECK(harness.activation.active_effect().definition == &harness.epoch0);
+    CHECK(harness.live_effects.arm_count == 0);
+    CHECK(harness.live_effects.apply_count == 0);
+
+    REQUIRE(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+            EpochIngressError::none);
+    const auto activated = harness.binding.on_v2_post_block_commit(
+        activation_height, harness.epoch0.epoch_digest());
+    REQUIRE(activated.error == EpochIngressError::none);
+    REQUIRE(activated.transition == ActivationTransition::activated);
+    REQUIRE(activated.update.has_value());
+    CHECK(activated.update->activation.definition == &harness.epoch1);
+    CHECK(harness.activation.active_effect().definition == &harness.epoch1);
+    CHECK(harness.live_effects.arm_count == 1);
+    CHECK(harness.live_effects.apply_count == 1);
+    CHECK(harness.live_effects.armed_before_apply);
+    CHECK(harness.manager_egress.statuses.empty());
+
+    const auto repeated = harness.binding.on_v2_post_block_commit(
+        activation_height, harness.epoch0.epoch_digest());
+    CHECK(repeated.error == EpochIngressError::none);
+    CHECK(repeated.transition == ActivationTransition::already_active);
+    CHECK(harness.live_effects.arm_count == 1);
+    CHECK(harness.live_effects.apply_count == 1);
 }
 
 TEST_CASE("exact commit applies the prepared update and reports activation once",

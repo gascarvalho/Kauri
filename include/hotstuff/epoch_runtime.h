@@ -158,6 +158,9 @@ struct EpochTreeRuntimeInput
 
 struct EpochRuntimePlan
 {
+    EpochProtocolMode protocol_mode{EpochProtocolMode::adaptive_v1};
+    std::uint32_t epoch_number{0};
+    uint256_t epoch_digest;
     StageEpochDefinition stage;
     bytearray_t canonical_stage;
     std::vector<EpochTreeRuntimeInput> trees;
@@ -304,10 +307,15 @@ public:
         MsgStageEpochDefinition &&message,
         const AuthenticatedEpochPeer &authenticated_peer,
         const EpochValidationContext &validation_context);
+    EpochIngressError prepare_committed_v2(
+        const EpochDefinition &successor_definition) noexcept;
     ReplicaArmIngressResult handle_arm(
         MsgArmActivation &&message,
         const AuthenticatedEpochPeer &authenticated_peer);
     EpochCommitIngressResult on_predecessor_commit(
+        std::uint64_t height,
+        const uint256_t &predecessor_digest) noexcept;
+    EpochCommitIngressResult on_v2_post_block_commit(
         std::uint64_t height,
         const uint256_t &predecessor_digest) noexcept;
     EpochCommitIngressResult replay_blocked_commit() noexcept;

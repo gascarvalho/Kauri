@@ -98,8 +98,19 @@ std::optional<PreparedEpochRuntime>
 HotStuffEpochRuntimeTransaction::prepare(const EpochRuntimePlan &plan)
 {
     if (plan.trees.empty() || plan.canonical_stage.empty() ||
+        (plan.protocol_mode != EpochProtocolMode::adaptive_v1 &&
+         plan.protocol_mode != EpochProtocolMode::adaptive_v2) ||
+        plan.epoch_digest == uint256_t{} ||
         plan.canonical_digest == uint256_t{} ||
         DataStream(plan.canonical_stage).get_hash() != plan.canonical_digest)
+        return std::nullopt;
+    if (plan.protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        (plan.stage.protocol_mode != EpochProtocolMode::adaptive_v1 ||
+         plan.stage.activation.successor_epoch_number != plan.epoch_number ||
+         plan.stage.activation.successor_epoch_digest != plan.epoch_digest))
+        return std::nullopt;
+    if (plan.protocol_mode == EpochProtocolMode::adaptive_v2 &&
+        plan.canonical_digest != plan.epoch_digest)
         return std::nullopt;
 
     PreparedPlan candidate;
@@ -111,9 +122,10 @@ HotStuffEpochRuntimeTransaction::prepare(const EpochRuntimePlan &plan)
     for (const auto &tree : plan.trees)
     {
         if (tree.configuration.epoch_number !=
-                plan.stage.activation.successor_epoch_number ||
+                plan.epoch_number ||
             tree.configuration.epoch_digest !=
-                plan.stage.activation.successor_epoch_digest ||
+                plan.epoch_digest ||
+            tree.configuration.tree_id != tree.tree.tree_id ||
             tree.activation_generation == 0 ||
             tree.tree.members_breadth_first.empty() ||
             tree.leader != tree.tree.members_breadth_first.front())

@@ -790,7 +790,9 @@ namespace hotstuff
             std::optional<PreparedEpochLiveRuntime> prepare(
                 const EpochRuntimePlan &plan)
             {
-                if (next_token == 0 || plan.trees.empty())
+                if (next_token == 0 || plan.trees.empty() ||
+                    plan.protocol_mode != owner.epoch_protocol_mode ||
+                    plan.epoch_digest == uint256_t{})
                     return std::nullopt;
 
                 auto topology = std::make_unique<Topology>();
@@ -804,9 +806,11 @@ namespace hotstuff
                 {
                     const auto index = topology->trees.size();
                     if (input.configuration.epoch_number !=
-                            plan.stage.activation.successor_epoch_number ||
+                            plan.epoch_number ||
                         input.configuration.epoch_digest !=
-                            plan.stage.activation.successor_epoch_digest ||
+                            plan.epoch_digest ||
+                        input.configuration.tree_id !=
+                            input.tree.tree_id ||
                         !topology->tree_indexes.emplace(
                              input.tree.tree_id, index).second)
                         return std::nullopt;

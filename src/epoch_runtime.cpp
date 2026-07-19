@@ -178,31 +178,78 @@ private:
 };
 
 EpochRuntimePlan make_runtime_plan(
-    StageEpochDefinition stage,
+    EpochProtocolMode protocol_mode,
+    std::uint32_t epoch_number,
+    const uint256_t &epoch_digest,
+    const std::vector<EpochTreeDefinition> &trees,
     bytearray_t canonical_stage)
 {
+    if (protocol_mode != EpochProtocolMode::adaptive_v1 &&
+        protocol_mode != EpochProtocolMode::adaptive_v2)
+        throw std::invalid_argument(
+            "runtime plan requires an adaptive protocol mode");
+    if (epoch_digest == uint256_t{} || canonical_stage.empty())
+        throw std::invalid_argument(
+            "runtime plan requires an exact epoch identity");
+
     EpochRuntimePlan plan;
-    plan.stage = std::move(stage);
+    plan.protocol_mode = protocol_mode;
+    plan.epoch_number = epoch_number;
+    plan.epoch_digest = epoch_digest;
     plan.canonical_stage = std::move(canonical_stage);
     plan.canonical_digest = DataStream(plan.canonical_stage).get_hash();
     const auto generation = checked_activation_generation(
-        plan.stage.activation.successor_epoch_number, 0);
+        epoch_number, 0);
     if (!generation)
         throw std::overflow_error("epoch activation generation overflows");
-    plan.trees.reserve(plan.stage.definition.trees.size());
-    for (const auto &tree : plan.stage.definition.trees)
+    plan.trees.reserve(trees.size());
+    for (const auto &tree : trees)
     {
         if (tree.members_breadth_first.empty())
             throw std::invalid_argument("epoch runtime tree is empty");
         plan.trees.push_back(EpochTreeRuntimeInput{
             ConfigurationId{
-                plan.stage.activation.successor_epoch_number,
+                epoch_number,
                 tree.tree_id,
-                plan.stage.activation.successor_epoch_digest},
+                epoch_digest},
             tree,
             tree.members_breadth_first.front(),
             *generation});
     }
+    return plan;
+}
+
+EpochRuntimePlan make_runtime_plan(
+    StageEpochDefinition stage,
+    bytearray_t canonical_stage)
+{
+    auto plan = make_runtime_plan(
+        stage.protocol_mode,
+        stage.activation.successor_epoch_number,
+        stage.activation.successor_epoch_digest,
+        stage.definition.trees,
+        std::move(canonical_stage));
+    plan.stage = std::move(stage);
+    return plan;
+}
+
+EpochRuntimePlan make_runtime_plan(const EpochDefinition &definition)
+{
+    if (definition.schema_version() !=
+            kEpochDefinitionSchemaVersionV2 ||
+        definition.activation_height() != 0)
+        throw std::invalid_argument(
+            "committed v2 runtime requires a schedule-free definition");
+
+    auto plan = make_runtime_plan(
+        EpochProtocolMode::adaptive_v2,
+        definition.epoch_number(),
+        definition.epoch_digest(),
+        definition.trees(),
+        definition.canonical_serialization());
+    if (plan.canonical_digest != definition.epoch_digest())
+        throw std::logic_error(
+            "stored v2 definition digest is not canonical");
     return plan;
 }
 
@@ -604,6 +651,68 @@ ReplicaStageIngressResult HotStuffEpochRuntimeAdapter::handle_stage(
     }
 }
 
+EpochIngressError HotStuffEpochRuntimeAdapter::prepare_committed_v2(
+    const EpochDefinition &successor_definition) noexcept
+{
+    if (state_->mode != EpochProtocolMode::adaptive_v2 || state_->stopped)
+        return EpochIngressError::state_rejected;
+
+    try
+    {
+        const auto active = state_->activation.active_effect();
+        if (active.definition == nullptr ||
+            active.definition->schema_version() !=
+                kEpochDefinitionSchemaVersionV2 ||
+            successor_definition.schema_version() !=
+                kEpochDefinitionSchemaVersionV2 ||
+            successor_definition.activation_height() != 0 ||
+            active.configuration.epoch_number ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            successor_definition.epoch_number() !=
+                active.configuration.epoch_number + 1 ||
+            successor_definition.previous_epoch_digest() !=
+                active.configuration.epoch_digest ||
+            successor_definition.membership_digest() !=
+                active.definition->membership_digest())
+            return EpochIngressError::validation_failed;
+
+        const auto retained_matches = [this, &successor_definition]() {
+            return state_->retained.has_value() &&
+                   !state_->staged_configurations.empty() &&
+                   state_->staged_configurations.size() ==
+                       successor_definition.trees().size() &&
+                   std::all_of(
+                       state_->staged_configurations.begin(),
+                       state_->staged_configurations.end(),
+                       [&successor_definition](const auto &tree) {
+                           return tree.configuration.epoch_number ==
+                                      successor_definition.epoch_number() &&
+                                  tree.configuration.epoch_digest ==
+                                      successor_definition.epoch_digest();
+                       });
+        };
+        if (state_->retained)
+            return retained_matches() ? EpochIngressError::none
+                                      : EpochIngressError::state_rejected;
+
+        auto plan = make_runtime_plan(successor_definition);
+        auto staged_configurations = plan.trees;
+        auto prepared = state_->transaction.prepare(plan);
+        if (!prepared)
+            return EpochIngressError::runtime_preparation_failed;
+        CandidatePreparation candidate(
+            state_->transaction, std::move(*prepared));
+
+        state_->staged_configurations.swap(staged_configurations);
+        state_->retained.emplace(candidate.release());
+        return EpochIngressError::none;
+    }
+    catch (...)
+    {
+        return EpochIngressError::runtime_preparation_failed;
+    }
+}
+
 ReplicaArmIngressResult HotStuffEpochRuntimeAdapter::handle_arm(
     MsgArmActivation &&message,
     const AuthenticatedEpochPeer &authenticated_peer)
@@ -695,6 +804,59 @@ EpochCommitIngressResult HotStuffEpochRuntimeAdapter::on_predecessor_commit(
                 std::nullopt};
         const auto previous = state_->activation.active_effect();
         const auto actual = state_->activation.on_predecessor_commit(
+            height, predecessor_digest);
+        return finish_commit(*state_, previous, preview, actual);
+    }
+    catch (...)
+    {
+        return {
+            EpochIngressError::state_rejected,
+            ActivationTransition::waiting,
+            ActivationBlockReason::none,
+            std::nullopt};
+    }
+}
+
+EpochCommitIngressResult
+HotStuffEpochRuntimeAdapter::on_v2_post_block_commit(
+    std::uint64_t height,
+    const uint256_t &predecessor_digest) noexcept
+{
+    if (state_->mode != EpochProtocolMode::adaptive_v2)
+        return {
+            EpochIngressError::state_rejected,
+            ActivationTransition::waiting,
+            ActivationBlockReason::none,
+            std::nullopt};
+
+    try
+    {
+        const auto preview =
+            state_->activation.preview_v2_post_block_commit(
+                height, predecessor_digest);
+        const auto has_exact_runtime = [&]() {
+            return state_->retained && preview.effect &&
+                   std::any_of(
+                       state_->staged_configurations.begin(),
+                       state_->staged_configurations.end(),
+                       [&preview](const auto &tree) {
+                           return tree.configuration ==
+                                  preview.effect->configuration;
+                       });
+        };
+        if (preview.transition == ActivationTransition::activated &&
+            !has_exact_runtime())
+        {
+            state_->discard_retained();
+            state_->staged_configurations.clear();
+            return {
+                EpochIngressError::missing_prepared_runtime,
+                ActivationTransition::waiting,
+                ActivationBlockReason::none,
+                std::nullopt};
+        }
+        const auto previous = state_->activation.active_effect();
+        const auto actual = state_->activation.on_v2_post_block_commit(
             height, predecessor_digest);
         return finish_commit(*state_, previous, preview, actual);
     }

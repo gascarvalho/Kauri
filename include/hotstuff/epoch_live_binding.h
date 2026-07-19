@@ -122,6 +122,9 @@ public:
     EpochCommitIngressResult on_predecessor_commit(
         std::uint64_t height,
         const uint256_t &predecessor_digest) noexcept;
+    EpochCommitIngressResult on_v2_post_block_commit(
+        std::uint64_t height,
+        const uint256_t &predecessor_digest) noexcept;
     EpochCommitIngressResult replay_blocked_commit() noexcept;
     EpochRotationResult rotate_to_tree(std::uint32_t tree_id) noexcept;
     EpochConsensusIngressResult handle_proposal(

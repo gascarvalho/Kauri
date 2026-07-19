@@ -147,6 +147,15 @@ EpochCommitIngressResult HotStuffEpochLiveBinding::on_predecessor_commit(
         adapter_.on_predecessor_commit(height, predecessor_digest));
 }
 
+EpochCommitIngressResult
+HotStuffEpochLiveBinding::on_v2_post_block_commit(
+    std::uint64_t height,
+    const uint256_t &predecessor_digest) noexcept
+{
+    return finish_commit(
+        adapter_.on_v2_post_block_commit(height, predecessor_digest));
+}
+
 EpochCommitIngressResult HotStuffEpochLiveBinding::replay_blocked_commit()
     noexcept
 {
