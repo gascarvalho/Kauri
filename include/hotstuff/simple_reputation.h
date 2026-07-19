@@ -61,6 +61,7 @@ public:
         ReplicaID reporter_id,
         ReplicaID target_id);
 
+    bool contains(ReplicaID replica_id) const noexcept;
     int score(ReplicaID target_id) const;
 
 private:

@@ -204,6 +204,13 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;reputation;prototype"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_evidence_reputation
+    test_evidence_reputation.cpp)
+set_tests_properties(
+    test_evidence_reputation PROPERTIES
+    LABELS "unit;adaptive;intentional-red;evidence;reputation;projection"
+    TIMEOUT 5)
+add_kauri_catch_test(
     test_proposal_admission
     test_proposal_admission.cpp)
 add_kauri_catch_test(

@@ -40,6 +40,11 @@ SimpleReputationUpdate SimpleReputation::observe_timeout(
         -1);
 }
 
+bool SimpleReputation::contains(ReplicaID replica_id) const noexcept
+{
+    return scores_.count(replica_id) != 0;
+}
+
 int SimpleReputation::score(ReplicaID target_id) const
 {
     const auto found = scores_.find(target_id);
