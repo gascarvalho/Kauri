@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict commit parsing and raw throughput analysis for the N=7 smoke.
+"""Strict structured-event parsing and throughput analysis for the N=7 run.
 
 This module deliberately does not validate a complete experiment run and does
 not plot figures.  It turns the designated observer's canonical structured
@@ -16,9 +16,10 @@ import statistics
 from typing import Any, Iterable, Mapping, Sequence
 
 
-EVENT_PREFIX = "KAURI_EVENT "
+LEGACY_EVENT_PREFIX = "KAURI_EVENT "
 EVENT_SCHEMA_VERSION = 1
 AUTHORITATIVE_OBSERVER = 2
+AUTHORITATIVE_SOURCE_ID = f"replica-{AUTHORITATIVE_OBSERVER}"
 REPLICA_COUNT = 7
 BUCKET_WIDTH_NS = 5_000_000_000
 UINT32_MAX = (1 << 32) - 1
@@ -60,6 +61,20 @@ ConfigurationKey = tuple[int, str, int]
 
 class AnalysisError(ValueError):
     """A deterministic canonical-input or throughput-analysis failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredEvent:
+    """One validated structured-event envelope from a bound source file."""
+
+    run_id: str
+    source_kind: str
+    source_id: str
+    source_instance: str
+    source_sequence: int
+    timestamp_ns: int
+    event_type: str
+    payload: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,15 +257,13 @@ def _require_hash(value: Any, name: str) -> str:
 
 
 def _parse_commit(
-    envelope: Mapping[str, Any],
+    envelope: StructuredEvent,
     *,
     expected_run_id: str,
     source_instance: str,
     leader_by_configuration: Mapping[ConfigurationKey, int],
 ) -> CommitEvent:
-    payload = envelope["payload"]
-    if not isinstance(payload, dict):
-        raise AnalysisError("commit payload must be an object")
+    payload = envelope.payload
     _require_exact_fields(payload, _COMMIT_FIELDS, "commit payload")
 
     if payload["designated_observer"] is not True:
@@ -322,16 +335,16 @@ def _parse_commit(
     return CommitEvent(
         run_id=expected_run_id,
         source_kind="replica",
-        source_id=str(AUTHORITATIVE_OBSERVER),
+        source_id=AUTHORITATIVE_SOURCE_ID,
         source_instance=source_instance,
         source_sequence=_require_integer(
-            envelope["source_sequence"],
+            envelope.source_sequence,
             "source_sequence",
             minimum=1,
             maximum=UINT64_MAX,
         ),
         timestamp_ns=_require_integer(
-            envelope["source_monotonic_ns"],
+            envelope.timestamp_ns,
             "source_monotonic_ns",
             maximum=UINT64_MAX,
         ),
@@ -349,24 +362,28 @@ def _parse_commit(
     )
 
 
-def parse_commit_events(
+def parse_structured_events(
     text: str,
     *,
     expected_run_id: str,
-    leader_by_configuration: Mapping[ConfigurationKey, int],
+    expected_source_kind: str,
+    expected_source_id: str,
     expected_source_instance: str,
-) -> tuple[CommitEvent, ...]:
-    """Parse canonical commits from the designated observer's mixed log.
+    allow_legacy_prefix: bool = False,
+) -> tuple[StructuredEvent, ...]:
+    """Parse one source-bound canonical raw JSONL stream.
 
-    Every ``KAURI_EVENT`` envelope belongs to the same expected run and exact
-    replica-2 process instance.  Source sequence must strictly increase and
-    source time must not regress across all structured events, including
-    non-commit events.  Non-commit events are identity-checked but do not
-    contribute throughput. Exact same-hash commit replays retain the first
-    envelope after their substantive metadata agrees.
+    Production mode accepts one JSON object per non-empty line and rejects
+    diagnostic text. ``allow_legacy_prefix`` is intentionally explicit and is
+    provided only to inspect historical mixed logs whose event records begin
+    with ``KAURI_EVENT ``. A full evidence validator must never enable it.
     """
     if not isinstance(expected_run_id, str) or not expected_run_id:
         raise AnalysisError("expected_run_id must be a non-empty string")
+    if not isinstance(expected_source_kind, str) or not expected_source_kind:
+        raise AnalysisError("expected_source_kind must be a non-empty string")
+    if not isinstance(expected_source_id, str) or not expected_source_id:
+        raise AnalysisError("expected_source_id must be a non-empty string")
     if (
         not isinstance(expected_source_instance, str)
         or not expected_source_instance
@@ -375,23 +392,34 @@ def parse_commit_events(
             "expected_source_instance must be a non-empty string"
         )
 
-    events: list[CommitEvent] = []
+    events: list[StructuredEvent] = []
     previous_sequence: int | None = None
     previous_timestamp_ns: int | None = None
-    commits_by_hash: dict[str, CommitEvent] = {}
-    heights: dict[int, str] = {}
 
     for line_number, line in enumerate(text.splitlines(), start=1):
-        if not line.startswith(EVENT_PREFIX):
-            if "KAURI_EVENT" in line:
-                raise AnalysisError(
-                    f"line {line_number}: KAURI_EVENT must start the log line"
-                )
+        if not line.strip():
             continue
+        payload_text = line
+        if allow_legacy_prefix:
+            if not line.startswith(LEGACY_EVENT_PREFIX):
+                if "KAURI_EVENT" in line:
+                    raise AnalysisError(
+                        f"line {line_number}: KAURI_EVENT must start the log line"
+                    )
+                continue
+            payload_text = line[len(LEGACY_EVENT_PREFIX) :]
+        elif line.startswith(LEGACY_EVENT_PREFIX):
+            raise AnalysisError(
+                f"line {line_number}: legacy KAURI_EVENT prefix is not "
+                "canonical raw JSONL"
+            )
+        elif "KAURI_EVENT" in line:
+            raise AnalysisError(
+                f"line {line_number}: diagnostic KAURI_EVENT text is not "
+                "canonical raw JSONL"
+            )
 
-        envelope = _load_canonical_json(
-            line[len(EVENT_PREFIX) :], line_number
-        )
+        envelope = _load_canonical_json(payload_text, line_number)
         try:
             _require_exact_fields(envelope, _ENVELOPE_FIELDS, "event envelope")
             schema = _require_integer(
@@ -405,11 +433,15 @@ def parse_commit_events(
                 )
             if envelope["run_id"] != expected_run_id:
                 raise AnalysisError("structured event run_id mismatch")
-            if envelope["source_kind"] != "replica":
-                raise AnalysisError("structured event source_kind is not replica")
-            if envelope["source_id"] != str(AUTHORITATIVE_OBSERVER):
+            if envelope["source_kind"] != expected_source_kind:
                 raise AnalysisError(
-                    "structured event source_id is not authoritative replica 2"
+                    "structured event source_kind mismatch: expected "
+                    f"{expected_source_kind}"
+                )
+            if envelope["source_id"] != expected_source_id:
+                raise AnalysisError(
+                    "structured event source_id mismatch: expected "
+                    f"{expected_source_id}"
                 )
             source_instance = envelope["source_instance"]
             if not isinstance(source_instance, str) or not source_instance:
@@ -442,13 +474,58 @@ def parse_commit_events(
                 raise AnalysisError("event_type must be a string")
             if not isinstance(envelope["payload"], dict):
                 raise AnalysisError("event payload must be an object")
-            if envelope["event_type"] != "block.committed":
-                continue
+            events.append(
+                StructuredEvent(
+                    run_id=expected_run_id,
+                    source_kind=expected_source_kind,
+                    source_id=expected_source_id,
+                    source_instance=source_instance,
+                    source_sequence=sequence,
+                    timestamp_ns=timestamp_ns,
+                    event_type=envelope["event_type"],
+                    payload=envelope["payload"],
+                )
+            )
+        except AnalysisError as exc:
+            raise AnalysisError(f"line {line_number}: {exc}") from exc
 
+    return tuple(events)
+
+
+def parse_commit_events(
+    text: str,
+    *,
+    expected_run_id: str,
+    leader_by_configuration: Mapping[ConfigurationKey, int],
+    expected_source_instance: str,
+    allow_legacy_prefix: bool = False,
+) -> tuple[CommitEvent, ...]:
+    """Parse authoritative commits from replica-2 raw structured JSONL.
+
+    All events are source-bound and ordered before non-commit records are
+    ignored. Exact same-hash commit replays retain the first envelope after
+    substantive metadata agrees.
+    """
+    envelopes = parse_structured_events(
+        text,
+        expected_run_id=expected_run_id,
+        expected_source_kind="replica",
+        expected_source_id=AUTHORITATIVE_SOURCE_ID,
+        expected_source_instance=expected_source_instance,
+        allow_legacy_prefix=allow_legacy_prefix,
+    )
+
+    events: list[CommitEvent] = []
+    commits_by_hash: dict[str, CommitEvent] = {}
+    heights: dict[int, str] = {}
+    for envelope in envelopes:
+        if envelope.event_type != "block.committed":
+            continue
+        try:
             event = _parse_commit(
                 envelope,
                 expected_run_id=expected_run_id,
-                source_instance=source_instance,
+                source_instance=envelope.source_instance,
                 leader_by_configuration=leader_by_configuration,
             )
             existing_commit = commits_by_hash.get(event.block_hash)
@@ -472,7 +549,9 @@ def parse_commit_events(
             heights[event.height] = event.block_hash
             events.append(event)
         except AnalysisError as exc:
-            raise AnalysisError(f"line {line_number}: {exc}") from exc
+            raise AnalysisError(
+                f"source_sequence {envelope.source_sequence}: {exc}"
+            ) from exc
 
     return tuple(events)
 
@@ -537,7 +616,7 @@ def build_throughput_buckets(
     for event in events:
         if (
             event.source_kind != "replica"
-            or event.source_id != str(AUTHORITATIVE_OBSERVER)
+            or event.source_id != AUTHORITATIVE_SOURCE_ID
             or event.observer_replica != AUTHORITATIVE_OBSERVER
         ):
             raise AnalysisError("throughput input contains a non-authoritative event")

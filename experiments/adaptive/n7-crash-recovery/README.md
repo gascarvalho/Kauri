@@ -1,54 +1,148 @@
-# N=7 crash-recovery analysis
+# N=7 crash-recovery validation and figure
 
-This directory contains the canonical commit parser and raw throughput
-attribution seam for the bounded seven-replica adaptive-v2 smoke scenario.
+This directory contains the strict analysis gate for the frozen
+`N=7, f=2, Q=5` adaptive-v2 crash experiment. It does not contain a fabricated
+run or a thesis figure. Test fixtures are generated only under pytest temporary
+directories and are explicitly non-evidence.
 
-> **Evidence warning:** the unit-test fixtures are synthetic and are not
-> experiment evidence. No figure produced from synthetic fixtures may be used
-> in the thesis.
+## Evidence inputs
 
-`analysis.py` accepts log lines of the form `KAURI_EVENT <canonical JSON>` and
-uses the existing structured-event envelope. It accepts throughput commits
-only when all of the following hold:
+The validator accepts three kinds of input:
 
-- `event_schema_version` is 1 and `run_id` matches the requested run;
-- `source_kind` is `replica`, `source_id` is `2`, and `source_instance`
-  matches the exact process instance supplied by the run manifest;
-- source sequence strictly increases and monotonic time never regresses;
-- `event_type` is `block.committed` and
-  `payload.designated_observer` is true;
-- the non-genesis height, full lowercase hash, transaction count, and exact
-  decision-proof configuration are well formed;
-- producer integer fields fit their declared unsigned 32- or 64-bit widths;
-- `payload.decision_proof.block_hash` equals the committed block hash; and
-- the leader is resolved through an explicit validated mapping keyed by
-  `(epoch_number, epoch_digest, tree_id)`.
+1. A canonical run manifest. It binds the full Kauri Git revision, clean
+   worktree state, frozen profile identity and SHA-256, completed and
+   non-interrupted run state, exact structured-event source instances,
+   measurement boundaries, and the two crash records.
+2. Canonical epoch definitions. Epoch 0 contains the seven cyclic trees rooted
+   `0..6`. Epoch 1 has unchanged membership, roots `2..6`, and replicas `0` and
+   `1` as wait-exempt physical leaves in every binary tree.
+3. One raw `StructuredEventSink` JSONL file per declared source. These are bare
+   JSON objects, one per line. A `KAURI_EVENT ` prefix is accepted only by
+   `analysis.py` when its explicit diagnostic compatibility option is enabled;
+   the evidence validator always rejects it.
 
-The commit event does not self-report its leader. Leader attribution must come
-from validated epoch definitions (later serialized as `epochs.json`), which
-prevents a log payload from choosing its own leader label.
+Each crash record is manifest-owned because the current process-lifecycle event
+does not identify its subject and a `SIGKILL`ed process cannot emit its own
+exit. The record binds replica, PID, PGID, `SIGKILL` number, request time in the
+shared monotonic-raw clock, and a confirmed exit with the same PID/PGID/signal.
+The manager declaration must state that it receives no crash ground truth.
 
-An exact same-hash observer replay is counted once after its substantive
-height, parent, transaction count, decision proof, resolved leader, view, and
-batch metadata agree. The first event supplies the retained sequence and
-timestamp. A same-hash metadata contradiction or two hashes at one height
-fails analysis instead of being silently deduplicated.
+The runner-owned frozen settings are checked in as `profile.json`, with profile
+identity `n7-f2-q5-crash-recovery-v1`. The validator pins its exact schema,
+values, bytes, and SHA-256; changing arbitrary profile bytes and merely updating
+the manifest hash cannot pass. `tests/synthetic_run.py` copies this profile as
+an executable schema example, but its output is never acceptable experiment
+evidence.
 
-Throughput is emitted as raw, half-open, phase-local buckets no wider than five
-seconds. Crash and activation boundaries begin new buckets, incomplete phase
-tails use their actual elapsed time, and missing intervals remain explicit
-zero rows. Seven per-leader transaction/TPS columns conserve the aggregate
-exactly. Baseline, degraded, and post-activation medians are calculated from
-those raw buckets, including zeroes.
+## Real campaign
 
-Run the synthetic unit suite with:
+Run the real local campaign from the Kauri repository root with:
 
 ```sh
-pytest -q \
-  experiments/adaptive/n7-crash-recovery/tests/test_analysis.py
+python3 experiments/adaptive/n7-crash-recovery/run.py
 ```
 
-This module is not the full run validator or plotter. A final graph may be
-generated only from a real run whose complete artifacts have passed the later
-canonical validator. A parsed log or passing unit fixture is not, by itself,
-accepted thesis evidence.
+The runner refuses to start evidence collection unless Kauri is on the fixed
+`feature/adaptive-epoch-throughput` branch, the worktree is clean, local `HEAD`
+equals `origin/feature/adaptive-epoch-throughput`, the required adaptive-v2
+binaries exist, and the default loopback ports are free. It generates fresh
+run-local identities, launches seven replicas plus the authenticated adaptation
+manager in separate process groups, waits for seven complete baseline buckets
+and a terminal `0..6` leader cycle, sends `SIGKILL` only to replicas 0 and 1,
+then waits for the committed successor and seven complete post-grace buckets.
+Alternative binary, results-root, port, and timeout paths are available through
+`python3 experiments/adaptive/n7-crash-recovery/run.py --help`.
+
+Each attempt is preserved below `results/n7-crash-recovery/`. The manifest
+hash-binds the exact executables, effective replica configs, initial epoch
+input, redacted launch arguments, timeouts, pipeline/block settings, one-block
+tree-switch period, five-block activation delay, and snapshot seed. The
+validator also reopens and hashes the actual `--conf` files and checks their
+relevant option values; normalized settings are not accepted as self-attested
+proof.
+
+The runner itself never declares scientific success. It invokes `validator.py`
+after cleanup, and invokes `plot.py` only if the immutable validator verdict is
+`PASS`. An incomplete, interrupted, inconsistent, or rejected attempt remains
+on disk without a thesis graph.
+
+## PASS gate
+
+`validator.py` uses only the Python standard library and `analysis.py`. A PASS
+requires all of the following:
+
+- exact `N=7`, `f=2`, fixed quorum `Q=5`, and unchanged membership `0..6`;
+- complete, contiguous, source-bound raw JSONL with replica 2 as the sole
+  designated authoritative commit observer;
+- a complete final epoch-0 root cycle `0..6`, ending at root 6 before either
+  crash request;
+- confirmed crashes of replicas 0 and 1 only, with no crash event or ground
+  truth supplied to the manager;
+- an identical committed epoch command and one matching successor activation
+  at every surviving replica;
+- successor roots exactly `2..6`, with failed replicas `0` and `1` both
+  wait-exempt physical leaves;
+- agreement by replicas `2..6` on every authoritative measurement height and
+  hash;
+- raw, phase-local, zero-filled throughput buckets no wider than five seconds,
+  with at least seven complete raw buckets in both baseline and post phases and
+  seven leader columns that conserve aggregate throughput exactly;
+- no authoritative commit stall above ten seconds in baseline or post, and no
+  degraded-phase stall above the protocol-derived 25-second bound (which
+  accommodates the possible `T5,T6,T0,T1` timeout sequence after replicas 0 and
+  1 crash while still rejecting an unbounded degraded interval);
+- a responsive baseline containing `on_time` evidence for every replica inside
+  `[baseline_start, first_crash)`; pre-baseline observations do not count;
+- for each failed replica, at least `f+1=3` distinct reporters with at least
+  `K=2` uncompensated timeout observation IDs each after that replica's own
+  confirmed crash and before the command, and a net crash-to-command score drop
+  of at least 6; the one legal same-ID timeout-to-late transition cancels that
+  timeout attempt, while standalone or repeated late events fail validation;
+- complete score trajectories for all seven replicas, with replicas 0 and 1
+  the lowest-ranked pair before the command and at run end; and
+- post-activation median throughput strictly above degraded median throughput,
+  with the post/baseline recovery ratio reported rather than assumed.
+
+Missing required evidence produces an immutable `INCOMPLETE` verdict.
+Contradictory evidence or a failed invariant produces an immutable `FAIL`
+verdict. Neither can be plotted. Validation also refuses to overwrite any
+existing canonical artifact, and exclusive claim files prevent concurrent
+validators or plotters from replacing one another's outputs.
+
+Run validation with:
+
+```sh
+python3 experiments/adaptive/n7-crash-recovery/validator.py \
+  --manifest /path/to/run/manifest.json \
+  --epochs /path/to/run/epochs.json \
+  --output-dir /path/to/validated-run
+```
+
+A PASS directory contains canonical copies of the manifest, profile, and epoch
+definitions plus `throughput.csv`, `reputation.csv`, and `validation.json`.
+The verdict SHA-256-binds every copied input and CSV.
+
+## PASS-only figure
+
+`plot.py` imports Matplotlib only after it has read a PASS verdict and verified
+the hashes of all five bound artifacts. It writes both `figure.png` and
+`figure.pdf` and refuses to overwrite either.
+
+```sh
+python3 experiments/adaptive/n7-crash-recovery/plot.py \
+  /path/to/validated-run
+```
+
+The upper panel contains the raw aggregate throughput line and seven raw lines
+attributed to the scheduled replica leader. It shades baseline, degraded, and
+post-activation phases; shows both crash requests, the command, activation,
+and activation-grace interval; labels the three regions as normal Epoch 0,
+crashed Epoch 0, and Epoch 1 with crashed replicas at leaves; and draws the
+three raw phase medians. The lower panel contains seven stepwise manager
+reputation trajectories, emphasizing the two crashed replicas.
+
+Run the synthetic non-evidence suite with:
+
+```sh
+pytest -q experiments/adaptive/n7-crash-recovery/tests
+```

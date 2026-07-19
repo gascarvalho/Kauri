@@ -55,7 +55,7 @@ def event_line(
     epoch_digest: str = DIGEST_0,
     run_id: str = SYNTHETIC_RUN_ID,
     source_kind: str = "replica",
-    source_id: str = "2",
+    source_id: str = "replica-2",
     source_instance: str = SOURCE_INSTANCE,
     designated_observer: bool = True,
     event_type: str = "block.committed",
@@ -98,7 +98,7 @@ def event_line(
     }
     if extra_envelope:
         envelope.update(extra_envelope)
-    return "KAURI_EVENT " + json.dumps(envelope, separators=(",", ":"))
+    return json.dumps(envelope, separators=(",", ":"))
 
 
 def non_commit_line(*, sequence: int, timestamp_ns: int) -> str:
@@ -106,14 +106,14 @@ def non_commit_line(*, sequence: int, timestamp_ns: int) -> str:
         "event_schema_version": 1,
         "run_id": SYNTHETIC_RUN_ID,
         "source_kind": "replica",
-        "source_id": "2",
+        "source_id": "replica-2",
         "source_instance": SOURCE_INSTANCE,
         "source_sequence": sequence,
         "source_monotonic_ns": timestamp_ns,
         "event_type": "process.ready",
         "payload": {"exit_status": None},
     }
-    return "KAURI_EVENT " + json.dumps(envelope, separators=(",", ":"))
+    return json.dumps(envelope, separators=(",", ":"))
 
 
 def parse(text: str, **kwargs: object) -> tuple[object, ...]:
@@ -136,7 +136,6 @@ class TestCanonicalCommitParsing:
     def test_parses_only_authoritative_commits_and_resolves_leader(self) -> None:
         text = "\n".join(
             [
-                "ordinary diagnostic log line",
                 non_commit_line(sequence=1, timestamp_ns=1_000_000_000),
                 event_line(
                     sequence=2,
@@ -153,7 +152,10 @@ class TestCanonicalCommitParsing:
         assert len(events) == 1
         commit = events[0]
         assert commit.observer_replica == 2
-        assert (commit.source_kind, commit.source_id) == ("replica", "2")
+        assert (commit.source_kind, commit.source_id) == (
+            "replica",
+            "replica-2",
+        )
         assert commit.timestamp_ns == 1_000_000_000
         assert commit.height == 1
         assert commit.block_hash == HASH_1
@@ -167,7 +169,7 @@ class TestCanonicalCommitParsing:
             ({"event_schema_version": 2}, "unsupported event_schema_version"),
             ({"run_id": "another-run"}, "run_id mismatch"),
             ({"source_kind": "adaptation_manager"}, "source_kind"),
-            ({"source_id": "3"}, "authoritative replica 2"),
+            ({"source_id": "replica-3"}, "expected replica-2"),
             ({"unknown": 1}, "unknown unknown"),
         ],
     )
@@ -395,7 +397,7 @@ class TestCanonicalCommitParsing:
         with pytest.raises(analysis().AnalysisError, match="must be"):
             parse(line)
 
-    def test_rejects_duplicate_json_keys_and_prefixed_marker(self) -> None:
+    def test_rejects_duplicate_json_keys_and_legacy_prefix_by_default(self) -> None:
         valid = event_line(sequence=1, timestamp_ns=1)
         duplicate_key = valid.replace(
             '"event_schema_version":1',
@@ -404,8 +406,18 @@ class TestCanonicalCommitParsing:
         )
         with pytest.raises(analysis().AnalysisError, match="duplicate JSON field"):
             parse(duplicate_key)
-        with pytest.raises(analysis().AnalysisError, match="must start"):
-            parse("log-prefix " + valid)
+        with pytest.raises(analysis().AnalysisError, match="legacy KAURI_EVENT"):
+            parse("KAURI_EVENT " + valid)
+
+    def test_legacy_mixed_log_requires_explicit_diagnostic_mode(self) -> None:
+        valid = event_line(sequence=1, timestamp_ns=1)
+        mixed = "ordinary diagnostic line\nKAURI_EVENT " + valid
+
+        with pytest.raises(analysis().AnalysisError, match="malformed"):
+            parse(mixed)
+        events = parse(mixed, allow_legacy_prefix=True)
+
+        assert len(events) == 1
 
 
 class TestRawThroughput:
@@ -537,7 +549,7 @@ class TestRawThroughput:
         outside = analysis().CommitEvent(
             run_id=SYNTHETIC_RUN_ID,
             source_kind="replica",
-            source_id="2",
+            source_id="replica-2",
             source_instance=SOURCE_INSTANCE,
             source_sequence=1,
             timestamp_ns=28_000_000_000,
