@@ -327,6 +327,37 @@ TEST_CASE("adaptive v2 derives the fixed N7 Byzantine quorum",
            quorum->quorum == 5));
 }
 
+TEST_CASE("adaptive v2 epoch zero helper pins replica bootstrap metadata",
+          "[c04][configuration][adaptive-v2][bootstrap]")
+{
+    const std::vector<EpochTreeDefinition> trees{
+        tree(42, {0, 1, 2, 3, 4, 5, 6}),
+        tree(7, {1, 2, 3, 4, 5, 6, 0})};
+    const auto input = hotstuff::adaptive_v2_epoch_zero_input(
+        membership7(), trees);
+
+    CHECK(input.schema_version ==
+          hotstuff::kEpochDefinitionSchemaVersionV2);
+    CHECK(input.epoch_number == 0);
+    CHECK(input.previous_epoch_digest == uint256_t{});
+    CHECK(input.membership_digest ==
+          hotstuff::canonical_membership_digest(membership7()));
+    REQUIRE(input.trees.size() == trees.size());
+    CHECK(input.trees[0].tree_id == trees[0].tree_id);
+    CHECK(input.trees[0].members_breadth_first ==
+          trees[0].members_breadth_first);
+    CHECK(input.trees[1].tree_id == trees[1].tree_id);
+    CHECK(input.trees[1].members_breadth_first ==
+          trees[1].members_breadth_first);
+    CHECK(input.activation_height == 0);
+    CHECK(input.generation_seed == 0);
+    CHECK(input.policy_version == "adaptive-v2-bootstrap");
+    CHECK(input.evidence_snapshot_id ==
+          "adaptive-v2-bootstrap-epoch-zero");
+    CHECK(input.evidence_cutoff == 0);
+    CHECK_FALSE(input.epoch_digest.has_value());
+}
+
 TEST_CASE("every protocol-relevant epoch field is digest-bound",
           "[c04][configuration][digest]")
 {

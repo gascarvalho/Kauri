@@ -96,6 +96,14 @@ struct EpochDefinitionInput
 uint256_t canonical_membership_digest(
     const std::vector<ReplicaID> &membership);
 
+/**
+ * Build the schedule-free adaptive-v2 epoch-zero identity shared by replicas
+ * and the adaptation manager.
+ */
+EpochDefinitionInput adaptive_v2_epoch_zero_input(
+    const std::vector<ReplicaID> &membership,
+    std::vector<EpochTreeDefinition> trees);
+
 bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input);
 
 uint256_t compute_epoch_digest(const EpochDefinitionInput &input);

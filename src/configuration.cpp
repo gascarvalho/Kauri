@@ -227,6 +227,25 @@ uint256_t canonical_membership_digest(
     return DataStream(bytes).get_hash();
 }
 
+EpochDefinitionInput adaptive_v2_epoch_zero_input(
+    const std::vector<ReplicaID> &membership,
+    std::vector<EpochTreeDefinition> trees)
+{
+    EpochDefinitionInput input;
+    input.schema_version = kEpochDefinitionSchemaVersionV2;
+    input.epoch_number = 0;
+    input.previous_epoch_digest = uint256_t{};
+    input.membership_digest = canonical_membership_digest(membership);
+    input.trees = std::move(trees);
+    input.activation_height = 0;
+    input.generation_seed = 0;
+    input.policy_version = "adaptive-v2-bootstrap";
+    input.evidence_snapshot_id = "adaptive-v2-bootstrap-epoch-zero";
+    input.evidence_cutoff = 0;
+    input.epoch_digest.reset();
+    return input;
+}
+
 bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input)
 {
     if (input.trees.size() > std::numeric_limits<std::uint32_t>::max())

@@ -1407,18 +1407,10 @@ namespace hotstuff
             throw std::invalid_argument(
                 "adaptive-v2 bootstrap must be epoch 0");
 
-        EpochDefinitionInput input;
-        input.schema_version = kEpochDefinitionSchemaVersionV2;
-        input.epoch_number = 0;
-        input.previous_epoch_digest = uint256_t{};
-        input.membership_digest =
-            canonical_membership_digest(fixed_membership);
-        input.activation_height = 0;
-        input.generation_seed = 0;
-        input.policy_version = "adaptive-v2-bootstrap";
-        input.evidence_snapshot_id = "adaptive-v2-bootstrap-epoch-zero";
-        input.evidence_cutoff = 0;
-        append_epoch_trees(input, epoch);
+        EpochDefinitionInput topology;
+        append_epoch_trees(topology, epoch);
+        auto input = adaptive_v2_epoch_zero_input(
+            fixed_membership, std::move(topology.trees));
 
         if (const auto *existing = exact_epochs->find_epoch(0))
         {

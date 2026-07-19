@@ -1180,9 +1180,8 @@ TEST_CASE("adaptive v2 startup is pinned and bootstraps a schedule-free epoch",
     CHECK(contains_in_order(
         bootstrap,
         {"EpochProtocolMode::adaptive_v2",
-         "kEpochDefinitionSchemaVersionV2",
-         "activation_height = 0",
-         "generation_seed = 0",
+         "append_epoch_trees(",
+         "adaptive_v2_epoch_zero_input(",
          "exact_epochs->stage("}));
 
     REQUIRE_FALSE(legacy.empty());
