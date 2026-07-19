@@ -771,7 +771,8 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
          "return;",
          "EpochChangeProposalDisposition::rejected",
          "abort();",
-         "proposal_contexts->admit_remote(",
+         "admit_exact_context(",
+         "ProposalContextOrigin::remote",
          "on_receive_proposal(parsed)",
          "create_expected_vote_state(metadata.key)",
          "start_latency_deadline(metadata.key)",
@@ -779,7 +780,7 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
 
     const auto gate = remote.find("pre_vote_epoch_change_gate(");
     const auto context = remote.find(
-        "proposal_contexts->admit_remote(", gate);
+        "admit_exact_context(", gate);
     REQUIRE(gate != std::string::npos);
     REQUIRE(context != std::string::npos);
     const auto fail_closed_path = remote.substr(gate, context - gate);
@@ -790,7 +791,7 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
          "abort();",
          "return;"}));
     for (const auto *forbidden : {
-             "proposal_contexts->admit_remote(",
+             "admit_exact_context(",
              "on_receive_proposal(parsed)",
              "create_expected_vote_state(",
              "start_latency_deadline(",

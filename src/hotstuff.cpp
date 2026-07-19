@@ -2329,12 +2329,10 @@ namespace hotstuff
                             return;
                         }
 
-                        auto lease = owner.proposal_contexts->admit_remote(
-                            metadata);
-                        if (!lease.has_value() ||
-                            !owner.proposal_contexts->initialize_accumulator(
-                                *lease,
-                                owner.create_quorum_cert(metadata.key)))
+                        auto lease = owner.admit_exact_context(
+                            metadata,
+                            ProposalContextOrigin::remote);
+                        if (!lease.has_value())
                         {
                             abort();
                             return;

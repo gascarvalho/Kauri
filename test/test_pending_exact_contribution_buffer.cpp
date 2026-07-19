@@ -249,9 +249,9 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
         "promise_t HotStuffBase::verify_exact_contribution"));
 
     const auto delivery = active.find("async_deliver_blk(");
-    const auto admit = active.find("proposal_contexts->admit_remote(");
-    const auto initialize =
-        active.find("proposal_contexts->initialize_accumulator(");
+    const auto admit = active.find("admit_exact_context(");
+    const auto remote_origin =
+        active.find("ProposalContextOrigin::remote", admit);
     const auto normal = active.find("on_receive_proposal(parsed)");
     const auto acceptance_if = active.rfind("if(", normal);
     const auto acceptance_body = active.find('{', acceptance_if);
@@ -271,7 +271,7 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
          "arm timing and drain retained contributions");
     REQUIRE(delivery != std::string::npos);
     REQUIRE(admit != std::string::npos);
-    REQUIRE(initialize != std::string::npos);
+    REQUIRE(remote_origin != std::string::npos);
     REQUIRE(normal != std::string::npos);
     REQUIRE(acceptance_if != std::string::npos);
     REQUIRE(acceptance_body != std::string::npos);
@@ -285,8 +285,8 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     REQUIRE(timer != std::string::npos);
     REQUIRE(drain != std::string::npos);
     CHECK(delivery < admit);
-    CHECK(admit < initialize);
-    CHECK(initialize < normal);
+    CHECK(admit < remote_origin);
+    CHECK(remote_origin < normal);
     CHECK(normal < still_open);
     CHECK(still_open < expected);
     CHECK(expected < latency);
