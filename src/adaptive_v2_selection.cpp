@@ -250,6 +250,122 @@ TimeoutReplayStatus replay_post_baseline_timeouts(
     return TimeoutReplayStatus::replayed;
 }
 
+enum class DrawdownReplayStatus : std::uint8_t
+{
+    replayed = 1,
+    invalid_cursor,
+    invalid_update,
+    capacity_exceeded,
+};
+
+DrawdownReplayStatus replay_drawdown_suffix(
+    const std::vector<EvidenceReputationAuditUpdate> &updates,
+    std::size_t cursor,
+    const std::vector<ReplicaID> &membership,
+    std::size_t maximum_timeout_attempts,
+    std::vector<std::int64_t> &drawdowns,
+    std::map<uint256_t, OutstandingTimeout> &outstanding_timeouts,
+    std::size_t &next_cursor) noexcept
+{
+    if (cursor > updates.size() ||
+        drawdowns.size() != membership.size() ||
+        outstanding_timeouts.size() > maximum_timeout_attempts ||
+        maximum_timeout_attempts == 0 ||
+        maximum_timeout_attempts >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::int64_t>::max()))
+    {
+        return DrawdownReplayStatus::invalid_cursor;
+    }
+
+    std::uint64_t previous_sequence =
+        cursor == 0 ? 0 : updates[cursor - 1].ingestion_sequence;
+    for (std::size_t index = cursor; index < updates.size(); ++index)
+    {
+        const auto &update = updates[index];
+        if (update.ingestion_sequence == 0 ||
+            update.ingestion_sequence <= previous_sequence)
+        {
+            return DrawdownReplayStatus::invalid_update;
+        }
+        previous_sequence = update.ingestion_sequence;
+
+        const auto member = std::lower_bound(
+            membership.begin(), membership.end(), update.target_id);
+        if (member == membership.end() || *member != update.target_id)
+            return DrawdownReplayStatus::invalid_update;
+        const auto member_index = static_cast<std::size_t>(
+            std::distance(membership.begin(), member));
+        auto &drawdown = drawdowns[member_index];
+
+        if (update.evidence_outcome == ResponseOutcome::timeout)
+        {
+            if (update.delta != -1 || drawdown > 0)
+                return DrawdownReplayStatus::invalid_update;
+            if (drawdown <= -static_cast<std::int64_t>(
+                                maximum_timeout_attempts))
+            {
+                return DrawdownReplayStatus::capacity_exceeded;
+            }
+            if (outstanding_timeouts.size() >=
+                maximum_timeout_attempts)
+            {
+                return DrawdownReplayStatus::capacity_exceeded;
+            }
+            bool inserted = false;
+            try
+            {
+                inserted = outstanding_timeouts.emplace(
+                    update.observation_id,
+                    OutstandingTimeout{
+                        update.reporter_id, update.target_id})
+                               .second;
+            }
+            catch (...)
+            {
+                return DrawdownReplayStatus::capacity_exceeded;
+            }
+            if (!inserted)
+                return DrawdownReplayStatus::invalid_update;
+            --drawdown;
+            continue;
+        }
+        if (update.evidence_outcome != ResponseOutcome::on_time &&
+            update.evidence_outcome != ResponseOutcome::late)
+        {
+            return DrawdownReplayStatus::invalid_update;
+        }
+        if (update.delta != 1 || drawdown > 0)
+            return DrawdownReplayStatus::invalid_update;
+        if (update.evidence_outcome == ResponseOutcome::on_time)
+        {
+            if (drawdown < 0)
+                ++drawdown;
+            continue;
+        }
+
+        const auto timed_out = outstanding_timeouts.find(
+            update.observation_id);
+        if (timed_out == outstanding_timeouts.end())
+        {
+            // The accepted ledger guarantees a prior correlated timeout.
+            // If it is outside this bounded set, it preceded the baseline.
+            continue;
+        }
+        if (timed_out->second.reporter_id != update.reporter_id ||
+            timed_out->second.target_id != update.target_id)
+        {
+            return DrawdownReplayStatus::invalid_update;
+        }
+        outstanding_timeouts.erase(timed_out);
+        if (drawdown < 0)
+            ++drawdown;
+    }
+
+    next_cursor = updates.size();
+    return DrawdownReplayStatus::replayed;
+}
+
 bool projection_applied(
     EvidenceReputationApplyStatus status) noexcept
 {
@@ -273,13 +389,10 @@ bool candidate_ranks_before(
         return left.total_uncompensated_timeouts >
                right.total_uncompensated_timeouts;
     }
-    if (left.baseline_score_delta != right.baseline_score_delta)
+    if (left.guard_drawdown != right.guard_drawdown)
     {
-        return left.baseline_score_delta <
-               right.baseline_score_delta;
+        return left.guard_drawdown < right.guard_drawdown;
     }
-    if (left.current_score != right.current_score)
-        return left.current_score < right.current_score;
     return left.replica_id < right.replica_id;
 }
 
@@ -298,7 +411,8 @@ struct AdaptiveV2ByzantineSelection::State
           current_epoch(std::move(current_epoch_)),
           config(std::move(config_)),
           reputation(membership),
-          projection(ledger, reputation, reputation_limits)
+          projection(ledger, reputation, reputation_limits),
+          guard_drawdowns(membership.size(), 0)
     {
         baseline_scores.reserve(membership.size());
         for (const auto replica_id : membership)
@@ -340,6 +454,10 @@ struct AdaptiveV2ByzantineSelection::State
     SimpleReputation reputation;
     EvidenceReputationProjection projection;
     std::vector<AdaptiveV2ReplicaScore> baseline_scores;
+    std::vector<std::int64_t> guard_drawdowns;
+    std::map<uint256_t, OutstandingTimeout>
+        guard_outstanding_timeouts;
+    std::size_t guard_audit_cursor{0};
     std::uint64_t baseline_cutoff{0};
     std::uint64_t current_cutoff{0};
     bool baseline_frozen{false};
@@ -417,6 +535,8 @@ AdaptiveV2ByzantineSelection::freeze_baseline(
 
     state.baseline_cutoff = evidence_cutoff;
     state.current_cutoff = evidence_cutoff;
+    state.guard_audit_cursor =
+        state.projection.audit_updates().size();
     state.baseline_frozen = true;
     return AdaptiveV2SelectionStatus::baseline_frozen;
 }
@@ -511,6 +631,46 @@ AdaptiveV2ByzantineSelection::select_through(
                    : AdaptiveV2SelectionStatus::projection_failed,
             evidence_cutoff);
     }
+    std::vector<std::int64_t> planned_drawdowns;
+    std::map<uint256_t, OutstandingTimeout>
+        planned_outstanding_timeouts;
+    try
+    {
+        planned_drawdowns = state.guard_drawdowns;
+        planned_outstanding_timeouts =
+            state.guard_outstanding_timeouts;
+    }
+    catch (...)
+    {
+        state.healthy = false;
+        return state.result(
+            AdaptiveV2SelectionStatus::internal_failure,
+            evidence_cutoff);
+    }
+    std::size_t planned_audit_cursor = state.guard_audit_cursor;
+    const auto drawdown_replay = replay_drawdown_suffix(
+        state.projection.audit_updates(),
+        state.guard_audit_cursor,
+        state.membership,
+        state.config.maximum_post_baseline_timeout_attempts,
+        planned_drawdowns,
+        planned_outstanding_timeouts,
+        planned_audit_cursor);
+    if (drawdown_replay != DrawdownReplayStatus::replayed)
+    {
+        state.healthy = false;
+        return state.result(
+            drawdown_replay ==
+                    DrawdownReplayStatus::capacity_exceeded
+                ? AdaptiveV2SelectionStatus::capacity_exceeded
+                : AdaptiveV2SelectionStatus::projection_failed,
+            evidence_cutoff);
+    }
+
+    state.guard_drawdowns.swap(planned_drawdowns);
+    state.guard_outstanding_timeouts.swap(
+        planned_outstanding_timeouts);
+    state.guard_audit_cursor = planned_audit_cursor;
     state.current_cutoff = evidence_cutoff;
 
     auto output = state.result(
@@ -552,6 +712,7 @@ AdaptiveV2ByzantineSelection::select_through(
             audit.baseline_score_delta =
                 static_cast<std::int64_t>(audit.current_score) -
                 static_cast<std::int64_t>(audit.baseline_score);
+            audit.guard_drawdown = state.guard_drawdowns[index];
 
             const auto target_found = timeout_counts.find(replica_id);
             if (target_found != timeout_counts.end())
@@ -583,7 +744,7 @@ AdaptiveV2ByzantineSelection::select_through(
                 audit.snapshot_classification ==
                 ResponsivenessClass::nonresponsive;
             audit.score_drop_satisfied =
-                audit.baseline_score_delta <=
+                audit.guard_drawdown <=
                 -static_cast<std::int64_t>(
                     state.config.minimum_score_drop);
             audit.reporter_guard_satisfied =

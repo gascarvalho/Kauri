@@ -474,9 +474,144 @@ TEST_CASE(
         CHECK(audit->qualifying_reporters ==
               std::vector<ReplicaID>{2, 3, 4});
         CHECK(audit->total_uncompensated_timeouts == 6);
+        CHECK(audit->guard_drawdown == -6);
         CHECK(audit->baseline_score_delta == -6);
         CHECK(audit->guarded_eligible);
         CHECK(result.selected_replicas.empty());
+    }
+}
+
+TEST_CASE(
+    "healthy post-baseline evidence cannot bank adaptive guard credit",
+    "[adaptive-v2][selection][drawdown][high-water]")
+{
+    Fixture fixture(512);
+    fixture.baseline_all();
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config());
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    for (std::size_t attempt = 0; attempt < 40; ++attempt)
+        fixture.on_time(1, 0);
+    fixture.persistent_timeouts(0, {2, 3, 4}, 2);
+
+    const auto result =
+        selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(result.status ==
+            AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    const auto *audit = candidate(result.eligible_candidates, 0);
+    REQUIRE(audit != nullptr);
+    CHECK(audit->baseline_score == 1);
+    CHECK(audit->current_score == 35);
+    CHECK(audit->baseline_score_delta == 34);
+    CHECK(audit->guard_drawdown == -6);
+    CHECK(audit->score_drop_satisfied);
+    CHECK(audit->guarded_eligible);
+}
+
+TEST_CASE(
+    "raw credit cannot change deterministic guarded candidate order",
+    "[adaptive-v2][selection][drawdown][ranking]")
+{
+    Fixture fixture(512);
+    fixture.baseline_all();
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config());
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    for (std::size_t attempt = 0; attempt < 40; ++attempt)
+        fixture.on_time(1, 0);
+    for (const auto target : {ReplicaID{0}, ReplicaID{1}, ReplicaID{2}})
+        fixture.persistent_timeouts(target, {3, 4, 5}, 2);
+
+    const auto result =
+        selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(result.status ==
+            AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    REQUIRE(result.eligible_candidates.size() == 3);
+    CHECK(result.eligible_candidates[0].replica_id == 0);
+    CHECK(result.eligible_candidates[1].replica_id == 1);
+    CHECK(result.eligible_candidates[2].replica_id == 2);
+    CHECK(result.eligible_candidates[0].baseline_score_delta == 34);
+    CHECK(result.eligible_candidates[1].baseline_score_delta == -6);
+    CHECK(result.eligible_candidates[2].baseline_score_delta == -6);
+    for (const auto &audit : result.eligible_candidates)
+        CHECK(audit.guard_drawdown == -6);
+}
+
+TEST_CASE(
+    "late evidence before and after the baseline preserves drawdown causality",
+    "[adaptive-v2][selection][drawdown][late][incremental]")
+{
+    SECTION("a pre-baseline timeout cannot bank late-response credit")
+    {
+        Fixture fixture;
+        const auto pre_baseline_timeout = fixture.timeout(2, 0);
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config());
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+
+        fixture.timeout(3, 0);
+        fixture.late(pre_baseline_timeout);
+        fixture.timeout(3, 0);
+        fixture.persistent_timeouts(0, {2, 4}, 2);
+        const auto result = selector.select_through(
+            fixture.ledger->high_watermark());
+
+        const auto *audit = candidate(result.eligible_candidates, 0);
+        REQUIRE(audit != nullptr);
+        CHECK(audit->baseline_score_delta == -5);
+        CHECK(audit->guard_drawdown == -6);
+        CHECK(audit->total_uncompensated_timeouts == 6);
+    }
+
+    SECTION("a later response compensates one prior drawdown exactly once")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config(5, 1));
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+
+        const auto compensated = fixture.timeout(2, 0);
+        fixture.timeout(2, 0);
+        fixture.persistent_timeouts(0, {3, 4}, 2);
+        const auto first = selector.select_through(
+            fixture.ledger->high_watermark());
+        const auto *first_audit = candidate(
+            first.eligible_candidates, 0);
+        REQUIRE(first_audit != nullptr);
+        CHECK(first_audit->guard_drawdown == -6);
+
+        fixture.late(compensated);
+        const auto second = selector.select_through(
+            fixture.ledger->high_watermark());
+        const auto *second_audit = candidate(
+            second.eligible_candidates, 0);
+        REQUIRE(second_audit != nullptr);
+        CHECK(second_audit->guard_drawdown == -5);
+        CHECK(second_audit->total_uncompensated_timeouts == 5);
+        CHECK(selector.current_cutoff() ==
+              fixture.ledger->high_watermark());
     }
 }
 

@@ -110,9 +110,15 @@ bool valid_guarded_candidates(
             !candidate.guarded_eligible ||
             candidate.qualifying_reporters.size() <
                 selection.metadata.required_qualifying_reporters ||
-            candidate.baseline_score_delta >
+            candidate.guard_drawdown >
                 -static_cast<std::int64_t>(
                     selection.metadata.minimum_score_drop) ||
+            candidate.guard_drawdown > 0 ||
+            (candidate.guard_drawdown < 0 &&
+             static_cast<std::uint64_t>(
+                 -(candidate.guard_drawdown + 1)) +
+                     1U >
+                 candidate.total_uncompensated_timeouts) ||
             static_cast<std::int64_t>(candidate.current_score) -
                     static_cast<std::int64_t>(candidate.baseline_score) !=
                 candidate.baseline_score_delta)

@@ -208,8 +208,9 @@ AdaptiveV2SelectionResult successful_selection(
         audit.snapshot_classification =
             ResponsivenessClass::nonresponsive;
         audit.baseline_score = 1;
-        audit.current_score = -5;
-        audit.baseline_score_delta = -6;
+        audit.current_score = 25;
+        audit.baseline_score_delta = 24;
+        audit.guard_drawdown = -6;
         audit.total_uncompensated_timeouts = 6;
         audit.qualifying_reporters = {2, 3, 4};
         audit.snapshot_nonresponsive = true;
@@ -366,6 +367,24 @@ TEST_CASE(
     SECTION("selection must contain exactly f targets")
     {
         fixture.selection.selected_replicas.pop_back();
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("selection drawdown must satisfy the configured guard")
+    {
+        fixture.selection.eligible_candidates.front().guard_drawdown = -1;
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("selection drawdown cannot exceed uncompensated timeouts")
+    {
+        fixture.selection.eligible_candidates.front().guard_drawdown = -7;
         const auto result = fixture.build();
         CHECK(result.status ==
               AdaptiveV2EpochFactoryStatus::invalid_selection);

@@ -74,6 +74,15 @@ struct AdaptiveV2CandidateAudit
     int baseline_score{0};
     int current_score{0};
     std::int64_t baseline_score_delta{0};
+    /**
+     * Post-baseline score relative to its running high-water mark.
+     *
+     * The value starts at zero, timeouts decrease it, and on-time responses
+     * move it toward (but never above) zero. A late response compensates only
+     * its correlated post-baseline timeout. Unlike the raw score delta,
+     * healthy history cannot bank credit against a later failure.
+     */
+    std::int64_t guard_drawdown{0};
     std::uint64_t total_uncompensated_timeouts{0};
     std::vector<ReplicaID> qualifying_reporters;
     bool snapshot_nonresponsive{false};
@@ -104,8 +113,11 @@ struct AdaptiveV2SelectionResult
  * A reporter qualifies for a target only after at least the configured K
  * timeout-only attempts after baseline. At least f+1 independently
  * authenticated qualifying reporters are required. A legal timeout-to-late
- * transition compensates the score and removes that attempt from the guard;
- * on-time observations never contribute to timeout persistence.
+ * transition compensates the score and removes that attempt from the guard.
+ * The score-drop guard uses a high-water-normalized post-baseline drawdown:
+ * on-time responses heal an existing drawdown but cannot create positive
+ * credit; a late response heals only its correlated post-baseline timeout.
+ * On-time observations never contribute to timeout persistence.
  *
  * The result is observational input only. This class cannot modify topology,
  * membership, quorum, epoch state, readiness, votes, certificates, signatures,
