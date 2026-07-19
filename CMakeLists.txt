@@ -172,6 +172,7 @@ add_library(hotstuff
     src/adaptation.cpp
     src/adaptation_manager.cpp
     src/adaptive_v2_response_evidence.cpp
+    src/adaptive_v2_readiness_wire.cpp
     src/adaptive_v2_selection.cpp
     src/aggregation.cpp
     src/util.cpp
