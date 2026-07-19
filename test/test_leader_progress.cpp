@@ -1639,6 +1639,62 @@ TEST_CASE("leader expiry owns only same-epoch active-tree rotation",
     CHECK(compact.find("timer.add(timeout)") == std::string::npos);
 }
 
+TEST_CASE("adaptive runtime activation releases the new leader's first beat",
+          "[l07][leader-progress][source-audit][runtime-handoff]")
+{
+    const auto liveness = read_source("include/hotstuff/liveness.h");
+    const auto multitree = source_slice(
+        liveness,
+        "class PaceMakerMultitree",
+        "class PMRoundRobinProposer");
+    const auto activation = function_body(
+        multitree, "bool activate_runtime_view(const LeaderViewId &view)");
+    const auto handoff = function_body(
+        multitree, "void arm_runtime_leader_handoff()");
+    const auto scheduling = function_body(
+        multitree, "void schedule_next() override");
+
+    REQUIRE_FALSE(activation.empty());
+    const auto proposer = activation.find("proposer = view.leader_id");
+    const auto arm = activation.find("arm_runtime_leader_handoff()");
+    REQUIRE(proposer != std::string::npos);
+    REQUIRE(arm != std::string::npos);
+    CHECK(proposer < arm);
+
+    REQUIRE_FALSE(handoff.empty());
+    const auto retire = handoff.find("retire_beat_lane(hsc->get_hqc())");
+    const auto ready_assignment =
+        handoff.find("runtime_leader_handoff_ready =");
+    const auto delay = handoff.find("arm_proposal_delay()");
+    REQUIRE(retire != std::string::npos);
+    REQUIRE(ready_assignment != std::string::npos);
+    REQUIRE(delay != std::string::npos);
+    CHECK(retire < ready_assignment);
+    CHECK(ready_assignment < delay);
+
+    REQUIRE_FALSE(scheduling.empty());
+    const auto ready = scheduling.find("runtime_leader_handoff_ready");
+    const auto pending = scheduling.find("pending_beats.empty()");
+    const auto resolve = scheduling.find("pm.resolve(get_proposer())");
+    REQUIRE(ready != std::string::npos);
+    REQUIRE(pending != std::string::npos);
+    REQUIRE(resolve != std::string::npos);
+    CHECK(ready < pending);
+    CHECK(pending < resolve);
+
+    const auto wait_qc = source_slice(
+        liveness, "class PMWaitQC", "class PaceMakerDummy");
+    CHECK(wait_qc.find("++beat_lane_generation") != std::string::npos);
+    CHECK(wait_qc.find("pending_beats.front().reject()") !=
+          std::string::npos);
+    CHECK(wait_qc.find("generation != beat_lane_generation") !=
+          std::string::npos);
+    CHECK(wait_qc.find("piped.erase(") != std::string::npos);
+    CHECK(wait_qc.find("rebase->get_height()") != std::string::npos);
+    CHECK(wait_qc.find("hsc->piped_submitted = false") !=
+          std::string::npos);
+}
+
 TEST_CASE("pacemaker shuts leader monitor down before runtime teardown",
           "[l07][leader-progress][source-audit][shutdown-order]"
           "[intentional-red]")

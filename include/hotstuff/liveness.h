@@ -18,6 +18,7 @@
 #ifndef _HOTSTUFF_LIVENESS_H
 #define _HOTSTUFF_LIVENESS_H
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -196,6 +197,47 @@ namespace hotstuff
         promise_t pm_wait_propose;
 
     protected:
+        std::uint64_t beat_lane_generation{0};
+
+        void retire_beat_lane(const block_t &rebase)
+        {
+            ++beat_lane_generation;
+            while (!pending_beats.empty())
+            {
+                pending_beats.front().reject();
+                pending_beats.pop();
+            }
+            if (rebase != nullptr)
+            {
+                auto &piped = hsc->piped_queue;
+                piped.erase(
+                    std::remove_if(
+                        piped.begin(), piped.end(),
+                        [this, &rebase](const uint256_t &hash)
+                        {
+                            const auto block = hsc->storage->find_blk(hash);
+                            return block == nullptr ||
+                                   block->get_height() <=
+                                       rebase->get_height();
+                        }),
+                    piped.end());
+                auto &ready = hsc->rdy_queue;
+                ready.erase(
+                    std::remove_if(
+                        ready.begin(), ready.end(),
+                        [&piped](const uint256_t &hash)
+                        {
+                            return std::find(
+                                       piped.begin(), piped.end(), hash) ==
+                                   piped.end();
+                        }),
+                    ready.end());
+            }
+            hsc->piped_submitted = false;
+            last_proposed = rebase;
+            locked = false;
+        }
+
         /** ORIGINAL IMPLEMENTATION */
 
         // void schedule_next() {
@@ -252,8 +294,17 @@ namespace hotstuff
                     HOTSTUFF_LOG_PROTO("schedule_next: popping beat as normal block");
                     auto pm = pending_beats.front();
                     pending_beats.pop();
-                    hsc->async_qc_finish(last_proposed).then([this, pm]()
-                                                             { pm.resolve(get_proposer()); });
+                    const auto generation = beat_lane_generation;
+                    hsc->async_qc_finish(last_proposed).then(
+                        [this, pm, generation]()
+                        {
+                            if (generation != beat_lane_generation)
+                            {
+                                pm.reject();
+                                return;
+                            }
+                            pm.resolve(get_proposer());
+                        });
                     locked = true;
                 }
             }
@@ -491,6 +542,7 @@ namespace hotstuff
         size_t current_tid{0};
         size_t current_epoch{0};
         std::uint64_t view_generation{0};
+        bool runtime_leader_handoff_ready{false};
         SalticidaeLeaderProgressScheduler leader_progress_scheduler;
         std::unique_ptr<LeaderProgressMonitor> leader_progress;
         promise_t pm_qc_manual;
@@ -521,6 +573,14 @@ namespace hotstuff
             {
                 delaying_proposal = false;
             }
+        }
+
+        void arm_runtime_leader_handoff()
+        {
+            retire_beat_lane(hsc->get_hqc());
+            runtime_leader_handoff_ready =
+                proposer == hsc->get_id();
+            arm_proposal_delay();
         }
 
     public:
@@ -599,12 +659,19 @@ namespace hotstuff
 
         bool activate_runtime_view(const LeaderViewId &view) override
         {
+            const bool already_active =
+                current_epoch == view.configuration.epoch_number &&
+                current_tid == view.configuration.tree_id &&
+                proposer == view.leader_id &&
+                view_generation == view.view_generation;
             if (!activate_leader_view(view))
                 return false;
             current_epoch = view.configuration.epoch_number;
             current_tid = view.configuration.tree_id;
             proposer = view.leader_id;
             view_generation = view.view_generation;
+            if (!already_active)
+                arm_runtime_leader_handoff();
             return true;
         }
 
@@ -726,6 +793,7 @@ namespace hotstuff
             timer.del();
             delaying_proposal = false;
             locked = false;
+            schedule_next();
         }
 
         void inc_time(ReconfigurationType reconfig_type) override
@@ -753,8 +821,19 @@ namespace hotstuff
 
         void schedule_next() override
         {
-            if (!delaying_proposal)
-                PMWaitQC::schedule_next();
+            if (delaying_proposal)
+                return;
+            if (runtime_leader_handoff_ready &&
+                !pending_beats.empty())
+            {
+                auto pm = pending_beats.front();
+                pending_beats.pop();
+                runtime_leader_handoff_ready = false;
+                locked = true;
+                pm.resolve(get_proposer());
+                return;
+            }
+            PMWaitQC::schedule_next();
         }
 
         void on_consensus(const block_t &) override {}
