@@ -239,17 +239,70 @@ EpochChangeProposalHistoryResult rejected_proposal_history(
         EpochChangeProposalHistoryDisposition::rejected,
         error,
         wire_error,
+        {},
         {}};
 }
 
 EpochChangeProposalHistoryResult complete_proposal_history(
-    EpochChangeHistoryView history) noexcept
+    EpochChangeHistoryView history,
+    std::vector<EpochChangeProposalHistoryObservation> observations) noexcept
 {
     return {
         EpochChangeProposalHistoryDisposition::complete,
         EpochChangeProposalHistoryError::none,
         EpochChangeWireError::none,
-        std::move(history)};
+        std::move(history),
+        std::move(observations)};
+}
+
+EpochChangeProposalChainResult rejected_proposal_chain(
+    EpochChangeProposalHistoryError history_error,
+    EpochChangeWireError wire_error,
+    std::optional<EpochChangeProposalChainFailure> failure =
+        std::nullopt) noexcept
+{
+    return {
+        EpochChangeProposalDisposition::rejected,
+        history_error,
+        wire_error,
+        {},
+        {},
+        std::nullopt,
+        std::move(failure)};
+}
+
+EpochChangeProposalChainResult complete_proposal_chain(
+    EpochChangeProposalDisposition disposition,
+    EpochChangeProposalHistoryResult history,
+    std::optional<EpochDefinitionRequest> recovery_request) noexcept
+{
+    return {
+        disposition,
+        EpochChangeProposalHistoryError::none,
+        EpochChangeWireError::none,
+        std::move(history.history),
+        std::move(history.observations),
+        std::move(recovery_request),
+        std::nullopt};
+}
+
+bool is_exact_v2_recovery_request(
+    const EpochDefinitionRequest &request,
+    const AuthorizedEpochChange &command) noexcept
+{
+    return request.wire_schema_version == kEpochWireSchemaVersionV2 &&
+           request.protocol_mode == EpochProtocolMode::adaptive_v2 &&
+           request.successor_epoch_digest ==
+               command.payload.successor_epoch_digest;
+}
+
+bool same_recovery_request(
+    const EpochDefinitionRequest &left,
+    const EpochDefinitionRequest &right) noexcept
+{
+    return left.wire_schema_version == right.wire_schema_version &&
+           left.protocol_mode == right.protocol_mode &&
+           left.successor_epoch_digest == right.successor_epoch_digest;
 }
 
 } // namespace
@@ -564,6 +617,7 @@ EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
     try
     {
         EpochChangeHistoryView history;
+        std::vector<EpochChangeProposalHistoryObservation> observations;
         if (committed_snapshot.command &&
             committed_snapshot.command->predecessor_epoch_digest ==
                 candidate_predecessor_digest)
@@ -619,8 +673,19 @@ EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
                     EpochChangeProposalHistoryError::internal_failure;
                 return false;
             }
-            if (extracted.command->payload.predecessor_epoch_digest !=
-                candidate_predecessor_digest)
+
+            const bool matching_predecessor =
+                extracted.command->payload.predecessor_epoch_digest ==
+                candidate_predecessor_digest;
+            observations.push_back(
+                EpochChangeProposalHistoryObservation{
+                    block.get_hash(),
+                    block.get_height(),
+                    committed,
+                    std::move(*extracted.command),
+                    *extracted.payload_digest,
+                    *extracted.envelope_digest});
+            if (!matching_predecessor)
             {
                 return true;
             }
@@ -688,7 +753,8 @@ EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
                     return rejected_proposal_history(
                         merge_error, merge_wire_error);
                 }
-                return complete_proposal_history(std::move(history));
+                return complete_proposal_history(
+                    std::move(history), std::move(observations));
             }
             if (parent->get_height() <= committed_head.get_height())
             {
@@ -930,6 +996,321 @@ EpochChangeProposalControlResult evaluate_epoch_change_proposal_control(
             EpochChangeWireError::internal_failure,
             std::nullopt,
             std::nullopt};
+    }
+}
+
+EpochChangeProposalChainResult evaluate_epoch_change_proposal_chain(
+    const Block &proposal,
+    const Block &committed_head,
+    const EpochChangeCommittedHistorySnapshot &committed_snapshot,
+    std::size_t maximum_block_extra_bytes,
+    std::size_t maximum_ancestry_blocks,
+    const EpochChangeVerifier &verifier,
+    const EpochDefinition &active_epoch,
+    const EpochStore &store) noexcept
+{
+    if (maximum_block_extra_bytes == 0)
+    {
+        return rejected_proposal_chain(
+            EpochChangeProposalHistoryError::invalid_limit,
+            EpochChangeWireError::none);
+    }
+    if (store.find_epoch(active_epoch.epoch_number()) != &active_epoch)
+    {
+        return rejected_proposal_chain(
+            EpochChangeProposalHistoryError::none,
+            EpochChangeWireError::internal_failure);
+    }
+
+    try
+    {
+        auto candidate_extra = extract_epoch_change_block_extra(
+            proposal.get_extra(), maximum_block_extra_bytes);
+        if (candidate_extra.disposition ==
+            EpochChangeExtraDisposition::rejected)
+        {
+            const auto wire_error =
+                candidate_extra.wire_error == EpochChangeWireError::none
+                    ? EpochChangeWireError::internal_failure
+                    : candidate_extra.wire_error;
+            return rejected_proposal_chain(
+                EpochChangeProposalHistoryError::none,
+                wire_error,
+                EpochChangeProposalChainFailure{
+                    EpochChangeProposalChainFailureSource::candidate,
+                    proposal.get_hash(),
+                    proposal.get_height(),
+                    std::nullopt});
+        }
+        const bool candidate_present =
+            candidate_extra.disposition == EpochChangeExtraDisposition::present;
+        if ((candidate_present &&
+             (!candidate_extra.command ||
+              !candidate_extra.payload_digest ||
+              !candidate_extra.envelope_digest)) ||
+            (!candidate_present &&
+             (candidate_extra.disposition !=
+                  EpochChangeExtraDisposition::absent ||
+              candidate_extra.command ||
+              candidate_extra.payload_digest ||
+              candidate_extra.envelope_digest)))
+        {
+            return rejected_proposal_chain(
+                EpochChangeProposalHistoryError::none,
+                EpochChangeWireError::internal_failure);
+        }
+
+        auto history = build_epoch_change_proposal_history(
+            proposal,
+            committed_head,
+            active_epoch.epoch_digest(),
+            committed_snapshot,
+            maximum_block_extra_bytes,
+            maximum_ancestry_blocks);
+        if (!history)
+        {
+            if (history.error == EpochChangeProposalHistoryError::none &&
+                history.wire_error == EpochChangeWireError::none)
+            {
+                return rejected_proposal_chain(
+                    EpochChangeProposalHistoryError::none,
+                    EpochChangeWireError::internal_failure);
+            }
+            return rejected_proposal_chain(
+                history.error, history.wire_error);
+        }
+
+        std::optional<EpochDefinitionRequest> recovery_request;
+        std::optional<EpochChangeProposalChainFailure> first_failure;
+        bool internal_inconsistency = false;
+        const auto record_recovery = [&](const AuthorizedEpochChange &command,
+                                         const EpochChangeValidationResult &validation) {
+            if (!validation.recovery_request ||
+                !is_exact_v2_recovery_request(
+                    *validation.recovery_request, command))
+            {
+                internal_inconsistency = true;
+                return;
+            }
+            if (!recovery_request)
+            {
+                recovery_request = *validation.recovery_request;
+            }
+            else if (!same_recovery_request(
+                         *recovery_request,
+                         *validation.recovery_request))
+            {
+                internal_inconsistency = true;
+            }
+        };
+
+        for (const auto &observation : history.observations)
+        {
+            if (observation.committed_boundary)
+                continue;
+
+            auto validation = verifier.validate(
+                observation.command, active_epoch, store, history.history);
+            if (validation.payload_digest != observation.payload_digest ||
+                validation.envelope_digest != observation.envelope_digest)
+            {
+                internal_inconsistency = true;
+            }
+
+            switch (validation.disposition)
+            {
+            case EpochChangeDisposition::accepted:
+            case EpochChangeDisposition::duplicate:
+                if (validation.recovery_request ||
+                    validation.successor_definition == nullptr)
+                {
+                    internal_inconsistency = true;
+                }
+                break;
+            case EpochChangeDisposition::defer_missing_definition:
+                if (validation.successor_definition != nullptr)
+                {
+                    internal_inconsistency = true;
+                }
+                record_recovery(observation.command, validation);
+                break;
+            default:
+                if (validation.recovery_request ||
+                    validation.successor_definition != nullptr)
+                {
+                    internal_inconsistency = true;
+                }
+                if (!first_failure)
+                {
+                    first_failure = EpochChangeProposalChainFailure{
+                        EpochChangeProposalChainFailureSource::ancestor,
+                        observation.block_hash,
+                        observation.block_height,
+                        validation.disposition};
+                }
+                break;
+            }
+        }
+
+        auto candidate = evaluate_epoch_change_proposal_control(
+            proposal.get_extra(),
+            maximum_block_extra_bytes,
+            verifier,
+            active_epoch,
+            store,
+            history.history);
+        if (candidate.wire_error != EpochChangeWireError::none)
+        {
+            const auto wire_error =
+                candidate.wire_error ==
+                        EpochChangeWireError::allocation_failure ||
+                    candidate.wire_error ==
+                        EpochChangeWireError::internal_failure
+                    ? candidate.wire_error
+                    : EpochChangeWireError::internal_failure;
+            if (!first_failure)
+            {
+                first_failure = EpochChangeProposalChainFailure{
+                    EpochChangeProposalChainFailureSource::candidate,
+                    proposal.get_hash(),
+                    proposal.get_height(),
+                    std::nullopt};
+            }
+            return rejected_proposal_chain(
+                EpochChangeProposalHistoryError::none,
+                wire_error,
+                std::move(first_failure));
+        }
+
+        if (!candidate_present)
+        {
+            if (candidate.disposition !=
+                    EpochChangeProposalDisposition::accepted ||
+                candidate.command || candidate.validation)
+            {
+                internal_inconsistency = true;
+            }
+        }
+        else if (!candidate.command || !candidate.validation)
+        {
+            internal_inconsistency = true;
+        }
+        else
+        {
+            const auto &validation = *candidate.validation;
+            if (validation.payload_digest != *candidate_extra.payload_digest ||
+                validation.envelope_digest !=
+                    *candidate_extra.envelope_digest)
+            {
+                internal_inconsistency = true;
+            }
+
+            switch (candidate.disposition)
+            {
+            case EpochChangeProposalDisposition::accepted:
+                if (validation.disposition !=
+                    EpochChangeDisposition::accepted)
+                {
+                    internal_inconsistency = true;
+                }
+                if (validation.recovery_request ||
+                    validation.successor_definition == nullptr)
+                {
+                    internal_inconsistency = true;
+                }
+                break;
+            case EpochChangeProposalDisposition::duplicate:
+                if (validation.disposition !=
+                    EpochChangeDisposition::duplicate)
+                {
+                    internal_inconsistency = true;
+                }
+                if (validation.recovery_request ||
+                    validation.successor_definition == nullptr)
+                {
+                    internal_inconsistency = true;
+                }
+                break;
+            case EpochChangeProposalDisposition::defer:
+                if (validation.disposition !=
+                        EpochChangeDisposition::defer_missing_definition ||
+                    validation.successor_definition != nullptr)
+                {
+                    internal_inconsistency = true;
+                }
+                record_recovery(*candidate.command, validation);
+                break;
+            case EpochChangeProposalDisposition::rejected:
+                if (validation.disposition ==
+                        EpochChangeDisposition::accepted ||
+                    validation.disposition ==
+                        EpochChangeDisposition::duplicate ||
+                    validation.disposition ==
+                        EpochChangeDisposition::defer_missing_definition)
+                {
+                    internal_inconsistency = true;
+                }
+                if (validation.recovery_request ||
+                    validation.successor_definition != nullptr)
+                {
+                    internal_inconsistency = true;
+                }
+                if (!first_failure)
+                {
+                    first_failure = EpochChangeProposalChainFailure{
+                        EpochChangeProposalChainFailureSource::candidate,
+                        proposal.get_hash(),
+                        proposal.get_height(),
+                        validation.disposition};
+                }
+                break;
+            }
+        }
+
+        if (internal_inconsistency)
+        {
+            return rejected_proposal_chain(
+                EpochChangeProposalHistoryError::none,
+                EpochChangeWireError::internal_failure,
+                std::move(first_failure));
+        }
+        if (first_failure)
+        {
+            return rejected_proposal_chain(
+                EpochChangeProposalHistoryError::none,
+                EpochChangeWireError::none,
+                std::move(first_failure));
+        }
+        if (recovery_request)
+        {
+            return complete_proposal_chain(
+                EpochChangeProposalDisposition::defer,
+                std::move(history),
+                std::move(recovery_request));
+        }
+        if (candidate.disposition !=
+                EpochChangeProposalDisposition::accepted &&
+            candidate.disposition !=
+                EpochChangeProposalDisposition::duplicate)
+        {
+            return rejected_proposal_chain(
+                EpochChangeProposalHistoryError::none,
+                EpochChangeWireError::internal_failure);
+        }
+        return complete_proposal_chain(
+            candidate.disposition, std::move(history), std::nullopt);
+    }
+    catch (const std::bad_alloc &)
+    {
+        return rejected_proposal_chain(
+            EpochChangeProposalHistoryError::none,
+            EpochChangeWireError::allocation_failure);
+    }
+    catch (...)
+    {
+        return rejected_proposal_chain(
+            EpochChangeProposalHistoryError::none,
+            EpochChangeWireError::internal_failure);
     }
 }
 

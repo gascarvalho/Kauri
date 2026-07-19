@@ -20,6 +20,8 @@ using hotstuff::EpochChangeIssuer;
 using hotstuff::EpochChangePayload;
 using hotstuff::EpochChangeExtraDisposition;
 using hotstuff::EpochChangeProposalDisposition;
+using hotstuff::EpochChangeProposalChainFailureSource;
+using hotstuff::EpochChangeProposalChainResult;
 using hotstuff::EpochChangeProposalHistoryDisposition;
 using hotstuff::EpochChangeProposalHistoryError;
 using hotstuff::EpochChangeCommittedHistoryEntry;
@@ -61,6 +63,17 @@ static_assert(noexcept(hotstuff::build_epoch_change_proposal_history(
     std::declval<std::size_t>(),
     std::declval<std::size_t>())),
     "proposal-history construction must reject internal failures, not throw");
+
+static_assert(noexcept(hotstuff::evaluate_epoch_change_proposal_chain(
+    std::declval<const hotstuff::Block &>(),
+    std::declval<const hotstuff::Block &>(),
+    std::declval<const EpochChangeCommittedHistorySnapshot &>(),
+    std::declval<std::size_t>(),
+    std::declval<std::size_t>(),
+    std::declval<const EpochChangeVerifier &>(),
+    std::declval<const hotstuff::EpochDefinition &>(),
+    std::declval<const EpochStore &>())),
+    "proposal-chain evaluation must reject internal failures, not throw");
 
 static_assert(
     EpochChangeProposalHistoryError::allocation_failure !=
@@ -251,6 +264,25 @@ void check_history_rejected(
     CHECK(result.wire_error == wire_error);
     CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
     CHECK_FALSE(result.history.committed_payload_digest.has_value());
+    CHECK(result.observations.empty());
+}
+
+void check_chain_rejected(
+    const EpochChangeProposalChainResult &result,
+    EpochChangeProposalChainFailureSource source,
+    EpochChangeDisposition disposition)
+{
+    CHECK(result.disposition == EpochChangeProposalDisposition::rejected);
+    CHECK(result.history_error == EpochChangeProposalHistoryError::none);
+    CHECK(result.wire_error == hotstuff::EpochChangeWireError::none);
+    CHECK_FALSE(result.recovery_request.has_value());
+    CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+    CHECK_FALSE(result.history.committed_payload_digest.has_value());
+    CHECK(result.observations.empty());
+    REQUIRE(result.failure.has_value());
+    CHECK(result.failure->source == source);
+    REQUIRE(result.failure->validation_disposition.has_value());
+    CHECK(*result.failure->validation_disposition == disposition);
 }
 
 AuthorizedEpochChange history_command(
@@ -1179,6 +1211,7 @@ TEST_CASE("C08b2b proposal history accepts a clean immediate boundary",
     CHECK(result.wire_error == hotstuff::EpochChangeWireError::none);
     CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
     CHECK_FALSE(result.history.committed_payload_digest.has_value());
+    CHECK(result.observations.empty());
 }
 
 TEST_CASE("C08b2b proposal history treats repeated ancestor commands idempotently",
@@ -1207,6 +1240,15 @@ TEST_CASE("C08b2b proposal history treats repeated ancestor commands idempotentl
     REQUIRE(result.history.ancestry_payload_digest.has_value());
     CHECK(*result.history.ancestry_payload_digest == payload_digest);
     CHECK_FALSE(result.history.committed_payload_digest.has_value());
+    REQUIRE(result.observations.size() == 2);
+    CHECK(result.observations[0].block_hash == newer->get_hash());
+    CHECK(result.observations[0].block_height == newer->get_height());
+    CHECK_FALSE(result.observations[0].committed_boundary);
+    CHECK(result.observations[0].payload_digest == payload_digest);
+    CHECK(result.observations[1].block_hash == older->get_hash());
+    CHECK(result.observations[1].block_height == older->get_height());
+    CHECK_FALSE(result.observations[1].committed_boundary);
+    CHECK(result.observations[1].payload_digest == payload_digest);
 }
 
 TEST_CASE("C08b2b proposal history rejects conflicting ancestor commands",
@@ -1505,10 +1547,12 @@ TEST_CASE("C08b2b proposal history enforces the ancestry walk bound",
           "[c08b2b][epoch-change][proposal-history][bound]")
 {
     const auto predecessor = digest("history-predecessor");
-    const auto committed = committed_history_block("committed", 10);
-    const auto older = history_block("older", 11, {committed});
-    const auto newer = history_block("newer", 12, {older});
-    const auto candidate = history_block("candidate", 13, {newer});
+    const auto command = history_command(predecessor, "same-successor");
+    const auto wire = hotstuff::encode_epoch_change_block_extra(command);
+    const auto committed = committed_history_block("committed", 10, wire);
+    const auto older = history_block("older", 11, {committed}, wire);
+    const auto newer = history_block("newer", 12, {older}, wire);
+    const auto candidate = history_block("candidate", 13, {newer}, wire);
 
     const auto exact = hotstuff::build_epoch_change_proposal_history(
         *candidate,
@@ -1519,6 +1563,19 @@ TEST_CASE("C08b2b proposal history enforces the ancestry walk bound",
         2);
     CHECK(exact.disposition ==
           EpochChangeProposalHistoryDisposition::complete);
+    REQUIRE(exact.observations.size() == 3);
+    CHECK(exact.observations[0].block_hash == newer->get_hash());
+    CHECK(exact.observations[1].block_hash == older->get_hash());
+    CHECK(exact.observations[2].block_hash == committed->get_hash());
+    CHECK_FALSE(exact.observations[0].committed_boundary);
+    CHECK_FALSE(exact.observations[1].committed_boundary);
+    CHECK(exact.observations[2].committed_boundary);
+    CHECK(std::none_of(
+        exact.observations.begin(),
+        exact.observations.end(),
+        [&](const hotstuff::EpochChangeProposalHistoryObservation &value) {
+            return value.block_hash == candidate->get_hash();
+        }));
 
     const auto one_over = hotstuff::build_epoch_change_proposal_history(
         *candidate,
@@ -1560,6 +1617,13 @@ TEST_CASE("C08b2b proposal history reconciles the committed boundary command",
         CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
         REQUIRE(result.history.committed_payload_digest.has_value());
         CHECK(*result.history.committed_payload_digest == payload_digest);
+        REQUIRE(result.observations.size() == 1);
+        CHECK(result.observations[0].block_hash == committed->get_hash());
+        CHECK(result.observations[0].block_height == committed->get_height());
+        CHECK(result.observations[0].committed_boundary);
+        CHECK(result.observations[0].payload_digest == payload_digest);
+        CHECK(result.observations[0].envelope_digest ==
+              hotstuff::epoch_change_envelope_digest(command));
     }
 
     SECTION("boundary repeats the matching snapshot idempotently")
@@ -1718,4 +1782,682 @@ TEST_CASE("C08b2b proposal history merges only a matching committed snapshot",
         check_history_rejected(
             result, EpochChangeProposalHistoryError::conflicting_history);
     }
+}
+
+TEST_CASE("C08b2c proposal chain accepts a valid empty chain",
+          "[c08b2c][epoch-change][proposal-chain][empty]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block("committed", 10);
+    const auto candidate = history_block("candidate", 11, {committed});
+
+    const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+        *candidate,
+        *committed,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        0,
+        verifier,
+        active,
+        store);
+
+    CHECK(result.disposition == EpochChangeProposalDisposition::accepted);
+    CHECK(result.history_error == EpochChangeProposalHistoryError::none);
+    CHECK(result.wire_error == hotstuff::EpochChangeWireError::none);
+    CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+    CHECK_FALSE(result.history.committed_payload_digest.has_value());
+    CHECK(result.observations.empty());
+    CHECK_FALSE(result.recovery_request.has_value());
+    CHECK_FALSE(result.failure.has_value());
+}
+
+TEST_CASE("C08b2c proposal chain preserves accepted and duplicate candidates",
+          "[c08b2c][epoch-change][proposal-chain][candidate]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next = successor(active.epoch_digest());
+    const auto next_digest = hotstuff::compute_epoch_digest(next);
+    REQUIRE(store.stage_available_v2(next, active).disposition ==
+            hotstuff::DefinitionAvailabilityDisposition::staged);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const EpochChangePayload payload{
+        1, active.epoch_digest(), next_digest, 5};
+    const auto command = hotstuff::authorize_epoch_change(
+        payload, kIssuerId, key);
+    const auto wire = hotstuff::encode_epoch_change_block_extra(command);
+    const auto committed = committed_history_block("committed", 10);
+
+    SECTION("new candidate command is accepted and excluded from observations")
+    {
+        const auto candidate = history_block(
+            "candidate", 11, {committed}, wire);
+        const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+            *candidate,
+            *committed,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            0,
+            verifier,
+            active,
+            store);
+        CHECK(result.disposition == EpochChangeProposalDisposition::accepted);
+        CHECK(result.observations.empty());
+        CHECK_FALSE(result.recovery_request.has_value());
+        CHECK_FALSE(result.failure.has_value());
+    }
+
+    SECTION("candidate repeats a valid ancestor command as a duplicate")
+    {
+        const auto ancestor = history_block(
+            "ancestor", 11, {committed}, wire);
+        const auto candidate = history_block(
+            "candidate", 12, {ancestor}, wire);
+        const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+            *candidate,
+            *committed,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1,
+            verifier,
+            active,
+            store);
+        CHECK(result.disposition == EpochChangeProposalDisposition::duplicate);
+        REQUIRE(result.observations.size() == 1);
+        CHECK(result.observations[0].block_hash == ancestor->get_hash());
+        CHECK_FALSE(result.observations[0].committed_boundary);
+        CHECK_FALSE(result.recovery_request.has_value());
+        CHECK_FALSE(result.failure.has_value());
+    }
+
+    SECTION("invalid candidate records its exact semantic disposition")
+    {
+        const auto invalid = hotstuff::authorize_epoch_change(
+            EpochChangePayload{
+                1, active.epoch_digest(), next_digest, 1},
+            kIssuerId,
+            key);
+        const auto candidate = history_block(
+            "invalid-candidate",
+            11,
+            {committed},
+            hotstuff::encode_epoch_change_block_extra(invalid));
+        const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+            *candidate,
+            *committed,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            0,
+            verifier,
+            active,
+            store);
+        check_chain_rejected(
+            result,
+            EpochChangeProposalChainFailureSource::candidate,
+            EpochChangeDisposition::invalid_delay);
+        CHECK(result.failure->block_hash == candidate->get_hash());
+        CHECK(result.failure->block_height == candidate->get_height());
+    }
+}
+
+TEST_CASE("C08b2c rejects every invalid uncommitted ancestor without recovery",
+          "[c08b2c][epoch-change][proposal-chain][ancestor][negative]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    auto other_key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc58");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next_digest = hotstuff::compute_epoch_digest(
+        successor(active.epoch_digest()));
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block("committed", 10);
+    const auto evaluate = [&](const AuthorizedEpochChange &command) {
+        const auto ancestor = history_block(
+            "ancestor",
+            11,
+            {committed},
+            hotstuff::encode_epoch_change_block_extra(command));
+        const auto candidate = history_block("candidate", 12, {ancestor});
+        return hotstuff::evaluate_epoch_change_proposal_chain(
+            *candidate,
+            *committed,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1,
+            verifier,
+            active,
+            store);
+    };
+
+    SECTION("wrong key")
+    {
+        const auto command = hotstuff::authorize_epoch_change(
+            EpochChangePayload{
+                1, active.epoch_digest(), next_digest, 5},
+            kIssuerId,
+            other_key);
+        const auto result = evaluate(command);
+        check_chain_rejected(
+            result,
+            EpochChangeProposalChainFailureSource::ancestor,
+            EpochChangeDisposition::invalid_signature);
+    }
+
+    SECTION("wrong issuer")
+    {
+        const auto command = hotstuff::authorize_epoch_change(
+            EpochChangePayload{
+                1, active.epoch_digest(), next_digest, 5},
+            kIssuerId + 1,
+            key);
+        const auto result = evaluate(command);
+        check_chain_rejected(
+            result,
+            EpochChangeProposalChainFailureSource::ancestor,
+            EpochChangeDisposition::unauthorized_issuer);
+    }
+
+    SECTION("invalid delay")
+    {
+        const auto command = hotstuff::authorize_epoch_change(
+            EpochChangePayload{
+                1, active.epoch_digest(), next_digest, 1},
+            kIssuerId,
+            key);
+        const auto result = evaluate(command);
+        check_chain_rejected(
+            result,
+            EpochChangeProposalChainFailureSource::ancestor,
+            EpochChangeDisposition::invalid_delay);
+    }
+
+    SECTION("wrong predecessor")
+    {
+        const auto command = hotstuff::authorize_epoch_change(
+            EpochChangePayload{
+                1, digest("wrong-predecessor"), next_digest, 5},
+            kIssuerId,
+            key);
+        const auto result = evaluate(command);
+        check_chain_rejected(
+            result,
+            EpochChangeProposalChainFailureSource::ancestor,
+            EpochChangeDisposition::wrong_predecessor);
+    }
+
+    SECTION("wrong successor number")
+    {
+        const auto command = hotstuff::authorize_epoch_change(
+            EpochChangePayload{
+                2, active.epoch_digest(), next_digest, 5},
+            kIssuerId,
+            key);
+        const auto result = evaluate(command);
+        check_chain_rejected(
+            result,
+            EpochChangeProposalChainFailureSource::ancestor,
+            EpochChangeDisposition::invalid_successor);
+    }
+}
+
+TEST_CASE("C08b2c validates every same-payload ancestor envelope",
+          "[c08b2c][epoch-change][proposal-chain][duplicate][signature]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    auto other_key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc58");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next = successor(active.epoch_digest());
+    const auto next_digest = hotstuff::compute_epoch_digest(next);
+    REQUIRE(store.stage_available_v2(next, active).disposition ==
+            hotstuff::DefinitionAvailabilityDisposition::staged);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const EpochChangePayload payload{
+        1, active.epoch_digest(), next_digest, 5};
+    const auto valid = hotstuff::authorize_epoch_change(
+        payload, kIssuerId, key);
+    const auto invalid = hotstuff::authorize_epoch_change(
+        payload, kIssuerId, other_key);
+    REQUIRE(hotstuff::epoch_change_payload_digest(valid.payload) ==
+            hotstuff::epoch_change_payload_digest(invalid.payload));
+    REQUIRE(hotstuff::epoch_change_envelope_digest(valid) !=
+            hotstuff::epoch_change_envelope_digest(invalid));
+    const auto committed = committed_history_block("committed", 10);
+    const auto older = history_block(
+        "valid-older",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(valid));
+    const auto newer = history_block(
+        "invalid-newer",
+        12,
+        {older},
+        hotstuff::encode_epoch_change_block_extra(invalid));
+    const auto candidate = history_block("candidate", 13, {newer});
+
+    const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+        *candidate,
+        *committed,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        2,
+        verifier,
+        active,
+        store);
+
+    check_chain_rejected(
+        result,
+        EpochChangeProposalChainFailureSource::ancestor,
+        EpochChangeDisposition::invalid_signature);
+    CHECK(result.failure->block_hash == newer->get_hash());
+    CHECK(result.failure->block_height == newer->get_height());
+}
+
+TEST_CASE("C08b2c malformed block extras never request recovery",
+          "[c08b2c][epoch-change][proposal-chain][wire][negative]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next_digest = hotstuff::compute_epoch_digest(
+        successor(active.epoch_digest()));
+    const auto command = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, active.epoch_digest(), next_digest, 5},
+        kIssuerId,
+        key);
+    const auto canonical =
+        hotstuff::encode_epoch_change_block_extra(command);
+    const auto signing_bytes =
+        hotstuff::canonical_epoch_change_signing_bytes(command);
+    constexpr std::size_t fixed_signing_fields =
+        sizeof(std::uint32_t) +
+        sizeof(std::uint8_t) +
+        sizeof(hotstuff::EpochChangeIssuerId) +
+        sizeof(std::uint32_t) +
+        2 * 32 +
+        sizeof(std::uint64_t);
+    REQUIRE(signing_bytes.size() > fixed_signing_fields);
+    const auto domain_bytes =
+        signing_bytes.size() - fixed_signing_fields;
+    auto trailing = canonical;
+    trailing.push_back(0);
+    auto unsupported_schema = canonical;
+    unsupported_schema[
+        domain_bytes + sizeof(std::uint32_t) - 1] = 2;
+    auto unsupported_mode = canonical;
+    unsupported_mode[domain_bytes + sizeof(std::uint32_t)] =
+        static_cast<std::uint8_t>(EpochProtocolMode::adaptive_v1);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block("committed", 10);
+    const auto expect_candidate_rejected = [&](
+        const bytearray_t &wire,
+        hotstuff::EpochChangeWireError expected) {
+        const auto candidate = history_block(
+            "malformed-candidate", 11, {committed}, wire);
+        const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+            *candidate,
+            *committed,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            0,
+            verifier,
+            active,
+            store);
+        CHECK(result.disposition == EpochChangeProposalDisposition::rejected);
+        CHECK(result.history_error == EpochChangeProposalHistoryError::none);
+        CHECK(result.wire_error == expected);
+        CHECK_FALSE(result.recovery_request.has_value());
+        CHECK(result.observations.empty());
+        REQUIRE(result.failure.has_value());
+        CHECK(result.failure->source ==
+              EpochChangeProposalChainFailureSource::candidate);
+        CHECK(result.failure->block_hash == candidate->get_hash());
+        CHECK_FALSE(result.failure->validation_disposition.has_value());
+    };
+    const auto expect_ancestor_rejected = [&](
+        const bytearray_t &wire,
+        hotstuff::EpochChangeWireError expected) {
+        const auto ancestor = history_block(
+            "malformed-ancestor", 11, {committed}, wire);
+        const auto candidate = history_block("candidate", 12, {ancestor});
+        const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+            *candidate,
+            *committed,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1,
+            verifier,
+            active,
+            store);
+        CHECK(result.disposition == EpochChangeProposalDisposition::rejected);
+        CHECK(result.history_error ==
+              EpochChangeProposalHistoryError::malformed_extra);
+        CHECK(result.wire_error == expected);
+        CHECK_FALSE(result.recovery_request.has_value());
+        CHECK(result.observations.empty());
+        CHECK_FALSE(result.failure.has_value());
+    };
+
+    SECTION("candidate trailing bytes")
+    {
+        expect_candidate_rejected(
+            trailing, hotstuff::EpochChangeWireError::trailing_bytes);
+    }
+    SECTION("candidate unsupported schema")
+    {
+        expect_candidate_rejected(
+            unsupported_schema,
+            hotstuff::EpochChangeWireError::unsupported_schema);
+    }
+    SECTION("candidate unsupported mode")
+    {
+        expect_candidate_rejected(
+            unsupported_mode,
+            hotstuff::EpochChangeWireError::unsupported_mode);
+    }
+    SECTION("ancestor trailing bytes")
+    {
+        expect_ancestor_rejected(
+            trailing, hotstuff::EpochChangeWireError::trailing_bytes);
+    }
+    SECTION("ancestor unsupported schema")
+    {
+        expect_ancestor_rejected(
+            unsupported_schema,
+            hotstuff::EpochChangeWireError::unsupported_schema);
+    }
+    SECTION("ancestor unsupported mode")
+    {
+        expect_ancestor_rejected(
+            unsupported_mode,
+            hotstuff::EpochChangeWireError::unsupported_mode);
+    }
+}
+
+TEST_CASE("C08b2c defers ancestor validation until the exact definition arrives",
+          "[c08b2c][epoch-change][proposal-chain][recovery]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next = successor(active.epoch_digest());
+    const auto next_digest = hotstuff::compute_epoch_digest(next);
+    const auto command = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, active.epoch_digest(), next_digest, 5},
+        kIssuerId,
+        key);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block("committed", 10);
+    const auto ancestor = history_block(
+        "ancestor",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(command));
+    const auto candidate = history_block("candidate", 12, {ancestor});
+    const auto evaluate = [&] {
+        return hotstuff::evaluate_epoch_change_proposal_chain(
+            *candidate,
+            *committed,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1,
+            verifier,
+            active,
+            store);
+    };
+
+    const auto missing = evaluate();
+    CHECK(missing.disposition == EpochChangeProposalDisposition::defer);
+    CHECK(missing.history_error == EpochChangeProposalHistoryError::none);
+    CHECK(missing.wire_error == hotstuff::EpochChangeWireError::none);
+    REQUIRE(missing.recovery_request.has_value());
+    CHECK(missing.recovery_request->wire_schema_version ==
+          hotstuff::kEpochWireSchemaVersionV2);
+    CHECK(missing.recovery_request->protocol_mode ==
+          EpochProtocolMode::adaptive_v2);
+    CHECK(missing.recovery_request->successor_epoch_digest == next_digest);
+    REQUIRE(missing.observations.size() == 1);
+    CHECK(missing.observations[0].block_hash == ancestor->get_hash());
+    CHECK_FALSE(missing.failure.has_value());
+    CHECK(store.size() == 1);
+
+    const auto reply_wire = hotstuff::encode_epoch_wire(
+        EpochDefinitionReply{
+            hotstuff::kEpochWireSchemaVersionV2,
+            EpochProtocolMode::adaptive_v2,
+            next_digest,
+            next},
+        limits());
+    const auto reply = hotstuff::decode_epoch_definition_reply(
+        reply_wire, EpochProtocolMode::adaptive_v2, limits());
+    REQUIRE(reply);
+    REQUIRE(store.stage_available_v2(reply.value->definition, active).disposition ==
+            hotstuff::DefinitionAvailabilityDisposition::staged);
+    CHECK(store.size() == 2);
+    const auto available = evaluate();
+    CHECK(available.disposition == EpochChangeProposalDisposition::accepted);
+    CHECK_FALSE(available.recovery_request.has_value());
+    REQUIRE(available.observations.size() == 1);
+    CHECK_FALSE(available.failure.has_value());
+}
+
+TEST_CASE("C08b2c invalid ancestor overrides a deferred candidate",
+          "[c08b2c][epoch-change][proposal-chain][precedence]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    auto other_key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc58");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next_digest = hotstuff::compute_epoch_digest(
+        successor(active.epoch_digest()));
+    const EpochChangePayload payload{
+        1, active.epoch_digest(), next_digest, 5};
+    const auto invalid_ancestor = hotstuff::authorize_epoch_change(
+        payload, kIssuerId, other_key);
+    const auto deferred_ancestor = hotstuff::authorize_epoch_change(
+        payload, kIssuerId, key);
+    const auto deferred_candidate = hotstuff::authorize_epoch_change(
+        payload, kIssuerId, key);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block("committed", 10);
+    const auto ancestor = history_block(
+        "invalid-ancestor",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(invalid_ancestor));
+    const auto newer_ancestor = history_block(
+        "deferred-ancestor",
+        12,
+        {ancestor},
+        hotstuff::encode_epoch_change_block_extra(deferred_ancestor));
+    const auto candidate = history_block(
+        "deferred-candidate",
+        13,
+        {newer_ancestor},
+        hotstuff::encode_epoch_change_block_extra(deferred_candidate));
+
+    const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+        *candidate,
+        *committed,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        2,
+        verifier,
+        active,
+        store);
+
+    check_chain_rejected(
+        result,
+        EpochChangeProposalChainFailureSource::ancestor,
+        EpochChangeDisposition::invalid_signature);
+    CHECK(result.failure->block_hash == ancestor->get_hash());
+}
+
+TEST_CASE("C08b2c coalesces identical exact V2 recovery requests",
+          "[c08b2c][epoch-change][proposal-chain][recovery][coalesce]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next_digest = hotstuff::compute_epoch_digest(
+        successor(active.epoch_digest()));
+    const auto command = hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, active.epoch_digest(), next_digest, 5},
+        kIssuerId,
+        key);
+    const auto wire = hotstuff::encode_epoch_change_block_extra(command);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block("committed", 10);
+    const auto older = history_block("older", 11, {committed}, wire);
+    const auto newer = history_block("newer", 12, {older}, wire);
+    const auto candidate = history_block("candidate", 13, {newer}, wire);
+
+    const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+        *candidate,
+        *committed,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        2,
+        verifier,
+        active,
+        store);
+
+    CHECK(result.disposition == EpochChangeProposalDisposition::defer);
+    REQUIRE(result.recovery_request.has_value());
+    CHECK(result.recovery_request->wire_schema_version ==
+          hotstuff::kEpochWireSchemaVersionV2);
+    CHECK(result.recovery_request->protocol_mode ==
+          EpochProtocolMode::adaptive_v2);
+    CHECK(result.recovery_request->successor_epoch_digest == next_digest);
+    REQUIRE(result.observations.size() == 2);
+    CHECK(result.observations[0].block_hash == newer->get_hash());
+    CHECK(result.observations[1].block_hash == older->get_hash());
+    CHECK_FALSE(result.failure.has_value());
+}
+
+TEST_CASE("C08b2c conflicting recovery digests fail closed without a request",
+          "[c08b2c][epoch-change][proposal-chain][recovery][conflict]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto first = hotstuff::authorize_epoch_change(
+        EpochChangePayload{
+            1, active.epoch_digest(), digest("missing-first"), 5},
+        kIssuerId,
+        key);
+    const auto second = hotstuff::authorize_epoch_change(
+        EpochChangePayload{
+            1, active.epoch_digest(), digest("missing-second"), 5},
+        kIssuerId,
+        key);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block("committed", 10);
+    const auto older = history_block(
+        "older",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(first));
+    const auto newer = history_block(
+        "newer",
+        12,
+        {older},
+        hotstuff::encode_epoch_change_block_extra(second));
+    const auto candidate = history_block("candidate", 13, {newer});
+
+    const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+        *candidate,
+        *committed,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        2,
+        verifier,
+        active,
+        store);
+
+    CHECK(result.disposition == EpochChangeProposalDisposition::rejected);
+    CHECK(result.history_error ==
+          EpochChangeProposalHistoryError::conflicting_history);
+    CHECK(result.wire_error == hotstuff::EpochChangeWireError::none);
+    CHECK_FALSE(result.recovery_request.has_value());
+    CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+    CHECK_FALSE(result.history.committed_payload_digest.has_value());
+    CHECK(result.observations.empty());
+    CHECK_FALSE(result.failure.has_value());
+}
+
+TEST_CASE("C08b2c does not revalidate a committed old-boundary command",
+          "[c08b2c][epoch-change][proposal-chain][committed-boundary]")
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto old_command = hotstuff::authorize_epoch_change(
+        EpochChangePayload{
+            1,
+            digest("old-predecessor"),
+            digest("missing-old-successor"),
+            5},
+        kIssuerId,
+        key);
+    const EpochChangeVerifier verifier(
+        EpochChangeIssuer{kIssuerId, hotstuff::PubKeySecp256k1(key)},
+        EpochChangeDelayBounds{2, 20});
+    const auto committed = committed_history_block(
+        "committed",
+        10,
+        hotstuff::encode_epoch_change_block_extra(old_command));
+    const auto candidate = history_block("candidate", 11, {committed});
+
+    const auto result = hotstuff::evaluate_epoch_change_proposal_chain(
+        *candidate,
+        *committed,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        0,
+        verifier,
+        active,
+        store);
+
+    CHECK(result.disposition == EpochChangeProposalDisposition::accepted);
+    CHECK_FALSE(result.recovery_request.has_value());
+    CHECK_FALSE(result.failure.has_value());
+    REQUIRE(result.observations.size() == 1);
+    CHECK(result.observations[0].committed_boundary);
+    CHECK(result.observations[0].block_hash == committed->get_hash());
 }

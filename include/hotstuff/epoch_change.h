@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "hotstuff/crypto.h"
 #include "hotstuff/epoch_store.h"
@@ -191,6 +192,16 @@ enum class EpochChangeProposalHistoryError : std::uint8_t
     internal_failure,
 };
 
+struct EpochChangeProposalHistoryObservation
+{
+    uint256_t block_hash;
+    std::uint32_t block_height{0};
+    bool committed_boundary{false};
+    AuthorizedEpochChange command;
+    uint256_t payload_digest;
+    uint256_t envelope_digest;
+};
+
 struct EpochChangeProposalHistoryResult
 {
     EpochChangeProposalHistoryDisposition disposition{
@@ -199,6 +210,7 @@ struct EpochChangeProposalHistoryResult
         EpochChangeProposalHistoryError::internal_failure};
     EpochChangeWireError wire_error{EpochChangeWireError::none};
     EpochChangeHistoryView history;
+    std::vector<EpochChangeProposalHistoryObservation> observations;
 
     explicit operator bool() const noexcept
     {
@@ -213,7 +225,9 @@ struct EpochChangeProposalHistoryResult
  *
  * The proposal itself is excluded. The exact committed boundary is parsed as
  * committed history and reconciled with its head-bound snapshot. Any malformed
- * or incomplete ancestry is rejected without exposing partial history.
+ * or incomplete ancestry is rejected without exposing partial history or
+ * observations. Nonempty blocks are observed in first-parent traversal order,
+ * from the proposal's parent through the exact committed boundary.
  *
  * This builder performs bounded structural and canonical extraction only.
  * Before voting, callers must authenticate and semantically validate every
@@ -280,6 +294,53 @@ EpochChangeProposalControlResult evaluate_epoch_change_proposal_control(
     const EpochDefinition &active_epoch,
     const EpochStore &store,
     const EpochChangeHistoryView &history) noexcept;
+
+enum class EpochChangeProposalChainFailureSource : std::uint8_t
+{
+    candidate = 0,
+    ancestor,
+};
+
+struct EpochChangeProposalChainFailure
+{
+    EpochChangeProposalChainFailureSource source{
+        EpochChangeProposalChainFailureSource::candidate};
+    uint256_t block_hash;
+    std::uint32_t block_height{0};
+    std::optional<EpochChangeDisposition> validation_disposition;
+};
+
+struct EpochChangeProposalChainResult
+{
+    EpochChangeProposalDisposition disposition{
+        EpochChangeProposalDisposition::rejected};
+    EpochChangeProposalHistoryError history_error{
+        EpochChangeProposalHistoryError::internal_failure};
+    EpochChangeWireError wire_error{EpochChangeWireError::none};
+    EpochChangeHistoryView history;
+    std::vector<EpochChangeProposalHistoryObservation> observations;
+    std::optional<EpochDefinitionRequest> recovery_request;
+    std::optional<EpochChangeProposalChainFailure> failure;
+};
+
+/**
+ * Produce one pure, bounded, fail-closed verdict for a proposal chain.
+ *
+ * The candidate command and every nonempty uncommitted first-parent ancestor
+ * are authenticated and semantically checked against the exact active epoch.
+ * The committed boundary remains structural history authority and is not
+ * revalidated against the newer active epoch. No store or block state is
+ * mutated.
+ */
+EpochChangeProposalChainResult evaluate_epoch_change_proposal_chain(
+    const Block &proposal,
+    const Block &committed_head,
+    const EpochChangeCommittedHistorySnapshot &committed_snapshot,
+    std::size_t maximum_block_extra_bytes,
+    std::size_t maximum_ancestry_blocks,
+    const EpochChangeVerifier &verifier,
+    const EpochDefinition &active_epoch,
+    const EpochStore &store) noexcept;
 
 } // namespace hotstuff
 
