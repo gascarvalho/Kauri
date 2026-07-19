@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "hotstuff/configuration.h"
+#include "hotstuff/evidence_reputation.h"
 
 namespace hotstuff
 {
@@ -78,10 +79,35 @@ struct CommitStructuredEvent
     std::uint64_t commit_batch_index{0};
 };
 
+/** Exact schedule installed after one adaptive-v2 command commits. */
+struct EpochCommandCommittedStructuredEvent
+{
+    std::uint64_t command_block_height{0};
+    uint256_t command_block_hash;
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::uint32_t successor_epoch_number{0};
+    uint256_t successor_epoch_digest;
+    uint256_t payload_digest;
+    std::uint64_t activation_delay_blocks{0};
+    std::uint64_t activation_height{0};
+};
+
+/** One accepted-ledger update already applied to the reputation projection. */
+struct ReputationEvidenceAppliedStructuredEvent
+{
+    std::uint64_t evidence_cutoff{0};
+    EvidenceReputationAuditUpdate update;
+};
+
 using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
     CommitStructuredEvent>;
+
+using AuditStructuredEventPayload = std::variant<
+    EpochCommandCommittedStructuredEvent,
+    ReputationEvidenceAppliedStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -167,10 +193,15 @@ enum class StructuredEventType : std::uint8_t
     aggregation_proposal_aborted,
     aggregation_root_quorum_progress,
     aggregation_root_qc_published,
+    epoch_command_committed,
+    reputation_evidence_applied,
 };
 
 StructuredEventType structured_event_type(
     const StructuredEventPayload &payload) noexcept;
+
+StructuredEventType structured_event_type(
+    const AuditStructuredEventPayload &payload) noexcept;
 
 const char *structured_event_type_name(StructuredEventType type) noexcept;
 
@@ -220,6 +251,8 @@ enum class StructuredEventFailure : std::uint8_t
     sequence_exhausted,
     write_failure,
     close_failure,
+    clock_failure,
+    sync_failure,
 };
 
 struct StructuredEventHealth
@@ -242,6 +275,21 @@ class StructuredEventClock
 public:
     virtual ~StructuredEventClock() = default;
     virtual std::uint64_t now_ns() noexcept = 0;
+    virtual bool healthy() const noexcept
+    {
+        return true;
+    }
+};
+
+/** Production clock in the same CLOCK_MONOTONIC_RAW domain as run markers. */
+class MonotonicRawStructuredEventClock final : public StructuredEventClock
+{
+public:
+    std::uint64_t now_ns() noexcept override;
+    bool healthy() const noexcept override;
+
+private:
+    bool healthy_{true};
 };
 
 enum class StructuredEventWriteStatus : std::uint8_t
@@ -264,7 +312,48 @@ public:
     virtual StructuredEventWriteResult write_some(
         const std::uint8_t *data,
         std::size_t size) noexcept = 0;
+    virtual bool sync() noexcept
+    {
+        return true;
+    }
     virtual bool close() noexcept = 0;
+};
+
+/**
+ * Exclusive-create raw JSONL output.
+ *
+ * Existing paths are rejected rather than truncated or appended. sync() uses
+ * fsync so a successful sink shutdown makes every drained record durable.
+ */
+class ExclusiveFileStructuredEventOutput final : public StructuredEventOutput
+{
+public:
+    explicit ExclusiveFileStructuredEventOutput(const std::string &path);
+    ~ExclusiveFileStructuredEventOutput() noexcept override;
+
+    ExclusiveFileStructuredEventOutput(
+        const ExclusiveFileStructuredEventOutput &) = delete;
+    ExclusiveFileStructuredEventOutput &operator=(
+        const ExclusiveFileStructuredEventOutput &) = delete;
+    ExclusiveFileStructuredEventOutput(
+        ExclusiveFileStructuredEventOutput &&) = delete;
+    ExclusiveFileStructuredEventOutput &operator=(
+        ExclusiveFileStructuredEventOutput &&) = delete;
+
+    StructuredEventWriteResult write_some(
+        const std::uint8_t *data,
+        std::size_t size) noexcept override;
+    bool sync() noexcept override;
+    bool close() noexcept override;
+
+    bool is_open() const noexcept;
+    bool healthy() const noexcept;
+
+private:
+    int descriptor_{-1};
+    bool healthy_{true};
+    bool closed_{false};
+    bool close_result_{true};
 };
 
 /**
@@ -292,6 +381,15 @@ public:
         const AdaptiveAggregationStructuredEvent &event) noexcept = 0;
 };
 
+/** Separate capability for consensus-command and accepted-reputation audit. */
+class AuditStructuredEventEmitter
+{
+public:
+    virtual ~AuditStructuredEventEmitter() = default;
+    virtual void emit_audit(
+        const AuditStructuredEventPayload &event) noexcept = 0;
+};
+
 /**
  * Sole externally serialized writer-owner capability.
  *
@@ -310,6 +408,7 @@ public:
 
 class StructuredEventSink final : public StructuredEventEmitter,
                                   public AdaptiveStructuredEventEmitter,
+                                  public AuditStructuredEventEmitter,
                                   public StructuredEventDrainOwner
 {
 public:
@@ -328,6 +427,8 @@ public:
     void emit(const StructuredEventPayload &payload) noexcept override;
     void emit_adaptive(
         const AdaptiveAggregationStructuredEvent &event) noexcept override;
+    void emit_audit(
+        const AuditStructuredEventPayload &event) noexcept override;
     void drain() noexcept override;
     void shutdown() noexcept override;
     StructuredEventHealth health() const noexcept override;

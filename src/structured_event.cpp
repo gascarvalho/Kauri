@@ -1,12 +1,19 @@
 #include "hotstuff/structured_event.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
+#include <ctime>
 #include <deque>
+#include <fcntl.h>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <system_error>
+#include <unistd.h>
 #include <utility>
 
 namespace hotstuff
@@ -319,6 +326,127 @@ bool payload_type(const StructuredEventPayload &payload,
     }
 }
 
+bool audit_payload_type(const AuditStructuredEventPayload &payload,
+                        StructuredEventType &type) noexcept
+{
+    switch (payload.index())
+    {
+        case 0:
+            type = StructuredEventType::epoch_command_committed;
+            return true;
+        case 1:
+            type = StructuredEventType::reputation_evidence_applied;
+            return true;
+        default:
+            return false;
+    }
+}
+
+const char *response_outcome_name(ResponseOutcome outcome) noexcept
+{
+    switch (outcome)
+    {
+        case ResponseOutcome::on_time:
+            return "on_time";
+        case ResponseOutcome::timeout:
+            return "timeout";
+        case ResponseOutcome::late:
+            return "late";
+    }
+    return nullptr;
+}
+
+const char *reputation_outcome_name(
+    SimpleReputationOutcome outcome) noexcept
+{
+    switch (outcome)
+    {
+        case SimpleReputationOutcome::response:
+            return "response";
+        case SimpleReputationOutcome::timeout:
+            return "timeout";
+    }
+    return nullptr;
+}
+
+bool valid_epoch_command_payload(
+    const EpochCommandCommittedStructuredEvent &event,
+    StructuredEventSourceKind source_kind) noexcept
+{
+    if (source_kind != StructuredEventSourceKind::replica ||
+        event.command_block_height == 0 ||
+        event.command_block_hash == uint256_t{} ||
+        event.predecessor_epoch_digest == uint256_t{} ||
+        event.successor_epoch_digest == uint256_t{} ||
+        event.payload_digest == uint256_t{} ||
+        event.predecessor_epoch_digest == event.successor_epoch_digest ||
+        event.predecessor_epoch_number ==
+            std::numeric_limits<std::uint32_t>::max() ||
+        event.successor_epoch_number !=
+            event.predecessor_epoch_number + 1 ||
+        event.activation_delay_blocks == 0 ||
+        event.activation_delay_blocks >
+            std::numeric_limits<std::uint64_t>::max() -
+                event.command_block_height)
+        return false;
+
+    return event.activation_height ==
+        event.command_block_height + event.activation_delay_blocks;
+}
+
+bool valid_reputation_payload(
+    const ReputationEvidenceAppliedStructuredEvent &event,
+    StructuredEventSourceKind source_kind) noexcept
+{
+    const auto &update = event.update;
+    if (source_kind != StructuredEventSourceKind::adaptation_manager ||
+        event.evidence_cutoff == 0 ||
+        update.ingestion_sequence == 0 ||
+        update.ingestion_sequence > event.evidence_cutoff ||
+        update.observation_id == uint256_t{} ||
+        update.reporter_id == update.target_id ||
+        response_outcome_name(update.evidence_outcome) == nullptr ||
+        reputation_outcome_name(update.reputation_outcome) == nullptr)
+        return false;
+
+    SimpleReputationOutcome expected_outcome{
+        SimpleReputationOutcome::response};
+    int expected_delta = 1;
+    if (update.evidence_outcome == ResponseOutcome::timeout)
+    {
+        expected_outcome = SimpleReputationOutcome::timeout;
+        expected_delta = -1;
+    }
+    if (update.reputation_outcome != expected_outcome ||
+        update.delta != expected_delta)
+        return false;
+
+    if ((update.delta == 1 &&
+         update.score == std::numeric_limits<int>::min()) ||
+        (update.delta == -1 &&
+         update.score == std::numeric_limits<int>::max()))
+        return false;
+    return true;
+}
+
+bool valid_audit_payload(const AuditStructuredEventPayload &payload,
+                         StructuredEventSourceKind source_kind) noexcept
+{
+    switch (payload.index())
+    {
+        case 0:
+            return valid_epoch_command_payload(
+                std::get<EpochCommandCommittedStructuredEvent>(payload),
+                source_kind);
+        case 1:
+            return valid_reputation_payload(
+                std::get<ReputationEvidenceAppliedStructuredEvent>(payload),
+                source_kind);
+        default:
+            return false;
+    }
+}
+
 bool adaptive_payload_type(
     const AdaptiveAggregationStructuredEvent &event,
     StructuredEventType &type) noexcept
@@ -521,6 +649,58 @@ void append_commit_payload(JsonLineBuilder &builder,
     builder.append('}');
 }
 
+void append_epoch_command_payload(
+    JsonLineBuilder &builder,
+    const EpochCommandCommittedStructuredEvent &event)
+{
+    builder.append("{\"command_block_height\":");
+    builder.append_integer(event.command_block_height);
+    builder.append(",\"command_block_hash\":");
+    builder.append_escaped(event.command_block_hash.to_hex());
+    builder.append(",\"payload_digest\":");
+    builder.append_escaped(event.payload_digest.to_hex());
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(event.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(event.predecessor_epoch_digest.to_hex());
+    builder.append(",\"successor_epoch_number\":");
+    builder.append_integer(event.successor_epoch_number);
+    builder.append(",\"successor_epoch_digest\":");
+    builder.append_escaped(event.successor_epoch_digest.to_hex());
+    builder.append(",\"activation_delay_blocks\":");
+    builder.append_integer(event.activation_delay_blocks);
+    builder.append(",\"activation_height\":");
+    builder.append_integer(event.activation_height);
+    builder.append('}');
+}
+
+void append_reputation_payload(
+    JsonLineBuilder &builder,
+    const ReputationEvidenceAppliedStructuredEvent &event)
+{
+    const auto &update = event.update;
+    builder.append("{\"evidence_cutoff\":");
+    builder.append_integer(event.evidence_cutoff);
+    builder.append(",\"ingestion_sequence\":");
+    builder.append_integer(update.ingestion_sequence);
+    builder.append(",\"observation_id\":");
+    builder.append_escaped(update.observation_id.to_hex());
+    builder.append(",\"reporter_id\":");
+    builder.append_integer(update.reporter_id);
+    builder.append(",\"target_id\":");
+    builder.append_integer(update.target_id);
+    builder.append(",\"evidence_outcome\":");
+    builder.append_escaped(response_outcome_name(update.evidence_outcome));
+    builder.append(",\"reputation_outcome\":");
+    builder.append_escaped(
+        reputation_outcome_name(update.reputation_outcome));
+    builder.append(",\"delta\":");
+    builder.append_integer(update.delta);
+    builder.append(",\"resulting_score\":");
+    builder.append_integer(update.score);
+    builder.append('}');
+}
+
 void append_replica_ids(JsonLineBuilder &builder,
                         const std::vector<ReplicaID> &values)
 {
@@ -660,6 +840,50 @@ std::string serialize_adaptive_event(
     builder.append_escaped(structured_event_type_name(type));
     builder.append(",\"payload\":");
     append_adaptive_payload(builder, event);
+    builder.append('}');
+    return builder.finish();
+}
+
+std::string serialize_audit_event(
+    const StructuredEventConfig &config,
+    const AuditStructuredEventPayload &event,
+    StructuredEventType type,
+    std::uint64_t sequence,
+    std::uint64_t monotonic_ns)
+{
+    JsonLineBuilder builder(config.limits.maximum_line_bytes);
+    builder.append("{\"event_schema_version\":");
+    builder.append_integer(kStructuredEventSchemaVersion);
+    builder.append(",\"run_id\":");
+    builder.append_escaped(config.run_id);
+    builder.append(",\"source_kind\":");
+    builder.append_escaped(source_kind_name(config.source.kind));
+    builder.append(",\"source_id\":");
+    builder.append_escaped(config.source.logical_id);
+    builder.append(",\"source_instance\":");
+    builder.append_escaped(config.source.instance_id);
+    builder.append(",\"source_sequence\":");
+    builder.append_integer(sequence);
+    builder.append(",\"source_monotonic_ns\":");
+    builder.append_integer(monotonic_ns);
+    builder.append(",\"event_type\":");
+    builder.append_escaped(structured_event_type_name(type));
+    builder.append(",\"payload\":");
+    switch (event.index())
+    {
+        case 0:
+            append_epoch_command_payload(
+                builder,
+                std::get<EpochCommandCommittedStructuredEvent>(event));
+            break;
+        case 1:
+            append_reputation_payload(
+                builder,
+                std::get<ReputationEvidenceAppliedStructuredEvent>(event));
+            break;
+        default:
+            throw std::bad_variant_access{};
+    }
     builder.append('}');
     return builder.finish();
 }
@@ -1034,6 +1258,15 @@ StructuredEventType structured_event_type(
     return static_cast<StructuredEventType>(0);
 }
 
+StructuredEventType structured_event_type(
+    const AuditStructuredEventPayload &payload) noexcept
+{
+    StructuredEventType type{};
+    if (audit_payload_type(payload, type))
+        return type;
+    return static_cast<StructuredEventType>(0);
+}
+
 const char *structured_event_type_name(StructuredEventType type) noexcept
 {
     switch (type)
@@ -1098,8 +1331,169 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "aggregation.root_quorum_progress";
         case StructuredEventType::aggregation_root_qc_published:
             return "aggregation.root_qc_published";
+        case StructuredEventType::epoch_command_committed:
+            return "epoch.command_committed";
+        case StructuredEventType::reputation_evidence_applied:
+            return "reputation.evidence_applied";
     }
     return "unknown";
+}
+
+std::uint64_t MonotonicRawStructuredEventClock::now_ns() noexcept
+{
+    if (!healthy_)
+        return 0;
+
+    struct timespec timestamp{};
+    if (::clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) != 0 ||
+        timestamp.tv_sec < 0 || timestamp.tv_nsec < 0 ||
+        timestamp.tv_nsec >= 1'000'000'000)
+    {
+        healthy_ = false;
+        return 0;
+    }
+
+    constexpr std::uint64_t nanoseconds_per_second = 1'000'000'000;
+    const auto seconds = static_cast<std::uint64_t>(timestamp.tv_sec);
+    const auto nanoseconds = static_cast<std::uint64_t>(timestamp.tv_nsec);
+    if (seconds >
+        (std::numeric_limits<std::uint64_t>::max() - nanoseconds) /
+            nanoseconds_per_second)
+    {
+        healthy_ = false;
+        return 0;
+    }
+    const auto result = seconds * nanoseconds_per_second + nanoseconds;
+    if (result == 0)
+        healthy_ = false;
+    return healthy_ ? result : 0;
+}
+
+bool MonotonicRawStructuredEventClock::healthy() const noexcept
+{
+    return healthy_;
+}
+
+ExclusiveFileStructuredEventOutput::ExclusiveFileStructuredEventOutput(
+    const std::string &path)
+{
+    if (path.empty() || path.find('\0') != std::string::npos)
+        throw std::invalid_argument("structured-event output path is invalid");
+
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    descriptor_ = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR);
+    if (descriptor_ < 0)
+        throw std::system_error(
+            errno,
+            std::generic_category(),
+            "cannot exclusively create structured-event output");
+
+    if (::fchmod(descriptor_, S_IRUSR | S_IWUSR) != 0)
+    {
+        const auto error = errno;
+        ::close(descriptor_);
+        descriptor_ = -1;
+        ::unlink(path.c_str());
+        throw std::system_error(
+            error,
+            std::generic_category(),
+            "cannot set structured-event output permissions");
+    }
+
+#ifndef O_CLOEXEC
+    if (::fcntl(descriptor_, F_SETFD, FD_CLOEXEC) != 0)
+    {
+        const auto error = errno;
+        ::close(descriptor_);
+        descriptor_ = -1;
+        ::unlink(path.c_str());
+        throw std::system_error(
+            error,
+            std::generic_category(),
+            "cannot protect structured-event output from exec inheritance");
+    }
+#endif
+}
+
+ExclusiveFileStructuredEventOutput::~ExclusiveFileStructuredEventOutput()
+    noexcept
+{
+    if (!closed_)
+    {
+        if (healthy_)
+            sync();
+        close();
+    }
+}
+
+StructuredEventWriteResult
+ExclusiveFileStructuredEventOutput::write_some(
+    const std::uint8_t *data,
+    std::size_t size) noexcept
+{
+    if (!healthy_ || closed_ || descriptor_ < 0 || data == nullptr ||
+        size == 0)
+        return {StructuredEventWriteStatus::failure, 0};
+
+    const auto maximum = static_cast<std::size_t>(
+        std::numeric_limits<ssize_t>::max());
+    const auto requested = std::min(size, maximum);
+    const auto written = ::write(descriptor_, data, requested);
+    if (written > 0)
+    {
+        return {
+            StructuredEventWriteStatus::progress,
+            static_cast<std::size_t>(written)};
+    }
+    if (written < 0 && errno == EINTR)
+        return {StructuredEventWriteStatus::interrupted, 0};
+
+    healthy_ = false;
+    return {StructuredEventWriteStatus::failure, 0};
+}
+
+bool ExclusiveFileStructuredEventOutput::sync() noexcept
+{
+    if (!healthy_ || closed_ || descriptor_ < 0)
+        return false;
+    while (::fsync(descriptor_) != 0)
+    {
+        if (errno == EINTR)
+            continue;
+        healthy_ = false;
+        return false;
+    }
+    return true;
+}
+
+bool ExclusiveFileStructuredEventOutput::close() noexcept
+{
+    if (closed_)
+        return close_result_;
+    closed_ = true;
+
+    const auto descriptor = descriptor_;
+    descriptor_ = -1;
+    if (descriptor < 0 || ::close(descriptor) != 0)
+        healthy_ = false;
+    close_result_ = healthy_;
+    return close_result_;
+}
+
+bool ExclusiveFileStructuredEventOutput::is_open() const noexcept
+{
+    return !closed_ && descriptor_ >= 0;
+}
+
+bool ExclusiveFileStructuredEventOutput::healthy() const noexcept
+{
+    return healthy_;
 }
 
 struct StructuredEventSink::State final
@@ -1186,6 +1580,11 @@ struct StructuredEventSink::State final
         {
             output_failed = true;
             discard_queue();
+            return;
+        }
+        if (!clock.healthy() || monotonic_ns == 0)
+        {
+            fail_admission(StructuredEventFailure::clock_failure);
             return;
         }
         if (status.has_last_monotonic_ns &&
@@ -1288,6 +1687,22 @@ void StructuredEventSink::emit_adaptive(
     });
 }
 
+void StructuredEventSink::emit_audit(
+    const AuditStructuredEventPayload &event) noexcept
+{
+    auto &state = *state_;
+    StructuredEventType type{};
+    const auto valid =
+        valid_audit_payload(event, state.config.source.kind) &&
+        audit_payload_type(event, type);
+    state.admit(valid, [&state, &event, type](
+                           std::uint64_t sequence,
+                           std::uint64_t monotonic_ns) {
+        return serialize_audit_event(
+            state.config, event, type, sequence, monotonic_ns);
+    });
+}
+
 void StructuredEventSink::drain() noexcept
 {
     auto &state = *state_;
@@ -1376,8 +1791,14 @@ void StructuredEventSink::shutdown() noexcept
     state.closed = true;
     state.status.stopped = true;
     ReentrancyScope scope(state.active_call);
+    const bool synced_cleanly =
+        state.output_failed || state.status.complete_records == 0
+        ? true
+        : state.output.sync();
     const bool closed_cleanly = state.output.close();
-    if (!closed_cleanly)
+    if (!synced_cleanly)
+        state.fail(StructuredEventFailure::sync_failure);
+    else if (!closed_cleanly)
         state.fail(StructuredEventFailure::close_failure);
 }
 

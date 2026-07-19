@@ -1,17 +1,23 @@
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <initializer_list>
 #include <limits>
 #include <locale>
 #include <memory>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <system_error>
+#include <sys/stat.h>
 #include <type_traits>
+#include <unistd.h>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -227,8 +233,9 @@ void operator delete[](void *allocation,
  * externally serialized with every owner call. The externally serialized
  * owner retains StructuredEventSink, is the only caller of drain/shutdown,
  * and keeps the borrowed clock and output alive until sink destruction. This
- * phase deliberately has no HotStuffCore hook, background writer, socket,
- * filesystem, or adaptation-manager dependency.
+ * The core sink has no HotStuffCore hook, background writer, or socket. Its
+ * production clock and exclusive file output remain explicitly owner-created,
+ * and the manager-facing audit capability remains behavior-neutral.
  * Sink construction is owner-only and may throw before publication; only emit,
  * drain, shutdown, health, output, clock, and prefix parsing are noexcept.
  *
@@ -502,15 +509,24 @@ namespace
 using hotstuff::AdaptiveAggregationStructuredEvent;
 using hotstuff::AdaptiveAggregationTransition;
 using hotstuff::AdaptiveStructuredEventEmitter;
+using hotstuff::AuditStructuredEventEmitter;
+using hotstuff::AuditStructuredEventPayload;
 using hotstuff::CommitStructuredEvent;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
+using hotstuff::EpochCommandCommittedStructuredEvent;
 using hotstuff::EpochLifecycleEvent;
 using hotstuff::EpochLifecycleTransition;
+using hotstuff::EvidenceReputationAuditUpdate;
+using hotstuff::ExclusiveFileStructuredEventOutput;
+using hotstuff::MonotonicRawStructuredEventClock;
 using hotstuff::ProcessLifecycleEvent;
 using hotstuff::ProcessLifecycleState;
 using hotstuff::ProposalKey;
 using hotstuff::RequiredBranchSignerGap;
+using hotstuff::ReputationEvidenceAppliedStructuredEvent;
+using hotstuff::ResponseOutcome;
+using hotstuff::SimpleReputationOutcome;
 using hotstuff::StructuredEventClock;
 using hotstuff::StructuredEventConfig;
 using hotstuff::StructuredEventCursor;
@@ -615,6 +631,46 @@ CommitStructuredEvent commit_event()
         2};
 }
 
+EpochCommandCommittedStructuredEvent epoch_command_event()
+{
+    return EpochCommandCommittedStructuredEvent{
+        2345,
+        digest("epoch-command-block"),
+        7,
+        digest("epoch-command-predecessor"),
+        8,
+        digest("epoch-command-successor"),
+        digest("epoch-command-payload"),
+        20,
+        2365};
+}
+
+ReputationEvidenceAppliedStructuredEvent reputation_event()
+{
+    return ReputationEvidenceAppliedStructuredEvent{
+        44,
+        EvidenceReputationAuditUpdate{
+            42,
+            digest("accepted-observation"),
+            2,
+            0,
+            ResponseOutcome::timeout,
+            SimpleReputationOutcome::timeout,
+            -1,
+            -3}};
+}
+
+StructuredEventConfig manager_event_config()
+{
+    auto config = event_config();
+    config.source = StructuredEventSource{
+        StructuredEventSourceKind::adaptation_manager,
+        "adaptive-manager",
+        "manager-spawn-4"};
+    config.designated_commit_observer.reset();
+    return config;
+}
+
 AdaptiveAggregationStructuredEvent adaptive_event(
     AdaptiveAggregationTransition transition =
         AdaptiveAggregationTransition::required_set_ready)
@@ -678,6 +734,29 @@ private:
     std::size_t calls_{0};
 };
 
+class FailingClock final : public StructuredEventClock
+{
+public:
+    std::uint64_t now_ns() noexcept override
+    {
+        ++calls_;
+        return 9002;
+    }
+
+    bool healthy() const noexcept override
+    {
+        return false;
+    }
+
+    std::size_t calls() const noexcept
+    {
+        return calls_;
+    }
+
+private:
+    std::size_t calls_{0};
+};
+
 class ReentrantProducerClock final : public StructuredEventClock
 {
 public:
@@ -738,8 +817,11 @@ class MemoryOutput final : public StructuredEventOutput
 public:
     explicit MemoryOutput(
         std::vector<WriteAction> actions = {},
-        bool close_result = true)
-        : actions_(std::move(actions)), close_result_(close_result)
+        bool close_result = true,
+        bool sync_result = true)
+        : actions_(std::move(actions)),
+          close_result_(close_result),
+          sync_result_(sync_result)
     {
     }
 
@@ -769,6 +851,12 @@ public:
         return {StructuredEventWriteStatus::progress, written};
     }
 
+    bool sync() noexcept override
+    {
+        ++sync_calls_;
+        return sync_result_;
+    }
+
     bool close() noexcept override
     {
         ++close_calls_;
@@ -790,6 +878,11 @@ public:
         return close_calls_;
     }
 
+    std::size_t sync_calls() const noexcept
+    {
+        return sync_calls_;
+    }
+
     void reserve(std::size_t bytes)
     {
         bytes_.reserve(bytes);
@@ -798,9 +891,11 @@ public:
 private:
     std::vector<WriteAction> actions_;
     bool close_result_{true};
+    bool sync_result_{true};
     bytearray_t bytes_;
     std::size_t next_action_{0};
     std::size_t write_calls_{0};
+    std::size_t sync_calls_{0};
     std::size_t close_calls_{0};
 };
 
@@ -1081,6 +1176,97 @@ std::string expected_commit_line(const CommitStructuredEvent &event,
             std::to_string(event.commit_batch_index) + "}}\n";
 }
 
+class TemporaryDirectory final
+{
+public:
+    TemporaryDirectory()
+    {
+        constexpr char path_template[] =
+            "/tmp/kauri-structured-event-XXXXXX";
+        std::array<char, sizeof(path_template)> path_buffer{};
+        std::copy(
+            std::begin(path_template),
+            std::end(path_template),
+            path_buffer.begin());
+        const auto *const created = ::mkdtemp(path_buffer.data());
+        if (created == nullptr)
+            throw std::system_error(errno, std::generic_category());
+        path_ = created;
+    }
+
+    ~TemporaryDirectory()
+    {
+        for (const auto &file : files_)
+            ::unlink(file.c_str());
+        ::rmdir(path_.c_str());
+    }
+
+    TemporaryDirectory(const TemporaryDirectory &) = delete;
+    TemporaryDirectory &operator=(const TemporaryDirectory &) = delete;
+
+    std::string file(const std::string &name)
+    {
+        const auto value = path_ + "/" + name;
+        files_.push_back(value);
+        return value;
+    }
+
+private:
+    std::string path_;
+    std::vector<std::string> files_;
+};
+
+class ScopedUmask final
+{
+public:
+    explicit ScopedUmask(mode_t value) noexcept
+        : previous_(::umask(value))
+    {
+    }
+
+    ~ScopedUmask()
+    {
+        ::umask(previous_);
+    }
+
+    ScopedUmask(const ScopedUmask &) = delete;
+    ScopedUmask &operator=(const ScopedUmask &) = delete;
+
+private:
+    mode_t previous_;
+};
+
+bytearray_t read_file(const std::string &path)
+{
+    const auto descriptor = ::open(path.c_str(), O_RDONLY);
+    if (descriptor < 0)
+        throw std::system_error(errno, std::generic_category());
+
+    bytearray_t result;
+    std::array<std::uint8_t, 4096> buffer{};
+    while (true)
+    {
+        const auto count = ::read(
+            descriptor, buffer.data(), buffer.size());
+        if (count > 0)
+        {
+            result.insert(
+                result.end(), buffer.begin(), buffer.begin() + count);
+            continue;
+        }
+        if (count == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        const auto error = errno;
+        ::close(descriptor);
+        throw std::system_error(error, std::generic_category());
+    }
+    if (::close(descriptor) != 0)
+        throw std::system_error(errno, std::generic_category());
+    return result;
+}
+
 } // namespace
 
 TEST_CASE("V13 exposes a closed payload-only protocol emitter",
@@ -1344,6 +1530,298 @@ TEST_CASE("WE06-C04 maps every adaptive transition to one canonical event",
                   mapping.name + "\"") != std::string::npos);
         observed_types.push_back(mapping.type);
         observed_names.emplace_back(mapping.name);
+    }
+}
+
+TEST_CASE("AE01 maps exact command and accepted reputation audit events",
+          "[adaptive-v2][structured-event][audit][schema]")
+{
+    using AuditEmit = void (AuditStructuredEventEmitter::*)(
+        const AuditStructuredEventPayload &) noexcept;
+    static_assert(
+        std::is_same<
+            decltype(&AuditStructuredEventEmitter::emit_audit),
+            AuditEmit>::value,
+        "audit emission cannot influence protocol or manager control flow");
+    static_assert(
+        std::variant_size<AuditStructuredEventPayload>::value == 2,
+        "the audit capability admits only committed commands and applied reputation");
+    static_assert(
+        std::is_base_of<
+            AuditStructuredEventEmitter,
+            StructuredEventSink>::value,
+        "the bounded sink shares one sequence and output across audit events");
+
+    const auto command_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{epoch_command_event()});
+    CHECK(command_type == StructuredEventType::epoch_command_committed);
+    CHECK(std::string(hotstuff::structured_event_type_name(command_type)) ==
+          "epoch.command_committed");
+
+    const auto reputation_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{reputation_event()});
+    CHECK(reputation_type ==
+          StructuredEventType::reputation_evidence_applied);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(reputation_type)) ==
+          "reputation.evidence_applied");
+}
+
+TEST_CASE("AE01 serializes exact command and accepted reputation identities",
+          "[adaptive-v2][structured-event][audit][ndjson]")
+{
+    SECTION("committed command includes the consensus block and schedule")
+    {
+        const auto event = epoch_command_event();
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"replica\","
+            "\"source_id\":\"replica-2\","
+            "\"source_instance\":\"spawn-9\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7000,"
+            "\"event_type\":\"epoch.command_committed\","
+            "\"payload\":{"
+            "\"command_block_height\":2345,"
+            "\"command_block_hash\":\"" +
+            event.command_block_hash.to_hex() + "\","
+            "\"payload_digest\":\"" + event.payload_digest.to_hex() + "\","
+            "\"predecessor_epoch_number\":7,"
+            "\"predecessor_epoch_digest\":\"" +
+            event.predecessor_epoch_digest.to_hex() + "\","
+            "\"successor_epoch_number\":8,"
+            "\"successor_epoch_digest\":\"" +
+            event.successor_epoch_digest.to_hex() + "\","
+            "\"activation_delay_blocks\":20,"
+            "\"activation_height\":2365}}\n";
+
+        FakeClock clock({7000});
+        MemoryOutput output;
+        StructuredEventSink sink(event_config(), clock, output);
+        AuditStructuredEventEmitter &audit = sink;
+        audit.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+    }
+
+    SECTION("applied reputation includes the accepted audit update and cutoff")
+    {
+        const auto event = reputation_event();
+        const auto &audit_update = event.update;
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7001,"
+            "\"event_type\":\"reputation.evidence_applied\","
+            "\"payload\":{"
+            "\"evidence_cutoff\":44,"
+            "\"ingestion_sequence\":42,"
+            "\"observation_id\":\"" +
+            audit_update.observation_id.to_hex() + "\","
+            "\"reporter_id\":2,"
+            "\"target_id\":0,"
+            "\"evidence_outcome\":\"timeout\","
+            "\"reputation_outcome\":\"timeout\","
+            "\"delta\":-1,"
+            "\"resulting_score\":-3}}\n";
+
+        FakeClock clock({7001});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        AuditStructuredEventEmitter &audit = sink;
+        audit.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+    }
+}
+
+TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
+          "[adaptive-v2][structured-event][audit][validation]")
+{
+    const auto rejects = [](
+                             StructuredEventConfig config,
+                             AuditStructuredEventPayload payload) {
+        FakeClock clock({8000});
+        MemoryOutput output;
+        StructuredEventSink sink(std::move(config), clock, output);
+        sink.emit_audit(payload);
+        const auto failed = sink.health();
+        return !failed.healthy && failed.stopped &&
+               failed.first_failure ==
+                   StructuredEventFailure::invalid_payload &&
+               failed.last_assigned_sequence == 0 &&
+               failed.dropped_records == 1 && clock.calls() == 0 &&
+               output.bytes().empty() && output.write_calls() == 0;
+    };
+
+    SECTION("command identity and derived activation must be exact")
+    {
+        auto invalid = epoch_command_event();
+        invalid.command_block_height = 0;
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.command_block_hash = uint256_t{};
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.payload_digest = uint256_t{};
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.predecessor_epoch_digest = uint256_t{};
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.successor_epoch_digest = uint256_t{};
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.successor_epoch_number = invalid.predecessor_epoch_number;
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        ++invalid.activation_height;
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.activation_delay_blocks = 0;
+        invalid.activation_height = invalid.command_block_height;
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.command_block_height =
+            std::numeric_limits<std::uint64_t>::max();
+        invalid.activation_delay_blocks = 1;
+        invalid.activation_height =
+            std::numeric_limits<std::uint64_t>::max();
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = epoch_command_event();
+        invalid.predecessor_epoch_number =
+            std::numeric_limits<std::uint32_t>::max();
+        invalid.successor_epoch_number = 0;
+        CHECK(rejects(event_config(), invalid));
+
+        CHECK(rejects(
+            manager_event_config(), epoch_command_event()));
+    }
+
+    SECTION("reputation event must be one accepted projection update")
+    {
+        auto invalid = reputation_event();
+        invalid.evidence_cutoff = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.ingestion_sequence = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.evidence_cutoff =
+            invalid.update.ingestion_sequence - 1;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.observation_id = uint256_t{};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.target_id = invalid.update.reporter_id;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.evidence_outcome = ResponseOutcome::on_time;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.reputation_outcome =
+            SimpleReputationOutcome::response;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.delta = 1;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.evidence_outcome =
+            static_cast<ResponseOutcome>(0);
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = reputation_event();
+        invalid.update.reputation_outcome =
+            static_cast<SimpleReputationOutcome>(0);
+        CHECK(rejects(manager_event_config(), invalid));
+
+        CHECK(rejects(event_config(), reputation_event()));
+    }
+}
+
+TEST_CASE("AE01 accepts only the exact evidence-to-reputation projection",
+          "[adaptive-v2][structured-event][audit][reputation]")
+{
+    struct Mapping
+    {
+        ResponseOutcome evidence;
+        SimpleReputationOutcome reputation;
+        int delta;
+        const char *evidence_name;
+        const char *reputation_name;
+    };
+    const std::array<Mapping, 3> mappings{{
+        {ResponseOutcome::on_time,
+         SimpleReputationOutcome::response,
+         1,
+         "on_time",
+         "response"},
+        {ResponseOutcome::timeout,
+         SimpleReputationOutcome::timeout,
+         -1,
+         "timeout",
+         "timeout"},
+        {ResponseOutcome::late,
+         SimpleReputationOutcome::response,
+         1,
+         "late",
+         "response"},
+    }};
+
+    for (std::size_t index = 0; index < mappings.size(); ++index)
+    {
+        CAPTURE(index);
+        const auto &mapping = mappings[index];
+        auto event = reputation_event();
+        event.update.evidence_outcome = mapping.evidence;
+        event.update.reputation_outcome = mapping.reputation;
+        event.update.delta = mapping.delta;
+
+        FakeClock clock({8100 + index});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(rendered(output).find(
+                  std::string{"\"evidence_outcome\":\""} +
+                  mapping.evidence_name + "\"") != std::string::npos);
+        CHECK(rendered(output).find(
+                  std::string{"\"reputation_outcome\":\""} +
+                  mapping.reputation_name + "\"") != std::string::npos);
+        CHECK(rendered(output).find(
+                  std::string{"\"delta\":"} +
+                  std::to_string(mapping.delta)) != std::string::npos);
     }
 }
 
@@ -2414,6 +2892,98 @@ TEST_CASE("V13 retries EINTR and short writes without duplicating a record",
     CHECK(sink.health().healthy);
     CHECK(sink.health().complete_records == 1);
     CHECK_FALSE(sink.health().interrupted_tail);
+}
+
+TEST_CASE("AE01 production monotonic clock uses the raw clock domain",
+          "[adaptive-v2][structured-event][clock][production]")
+{
+    MonotonicRawStructuredEventClock clock;
+    const auto first = clock.now_ns();
+    const auto second = clock.now_ns();
+
+    CHECK(clock.healthy());
+    CHECK(first > 0);
+    CHECK(second >= first);
+}
+
+TEST_CASE("AE01 sink rejects a production clock health failure atomically",
+          "[adaptive-v2][structured-event][clock][failure]")
+{
+    FailingClock clock;
+    MemoryOutput output;
+    StructuredEventSink sink(event_config(), clock, output);
+    sink.emit(process_event());
+
+    const auto failed = sink.health();
+    CHECK_FALSE(failed.healthy);
+    CHECK(failed.stopped);
+    CHECK(failed.first_failure == StructuredEventFailure::clock_failure);
+    CHECK(failed.last_assigned_sequence == 0);
+    CHECK_FALSE(failed.has_last_monotonic_ns);
+    CHECK(failed.dropped_records == 1);
+    CHECK(failed.queued_events == 0);
+    CHECK(failed.queued_bytes == 0);
+    CHECK(clock.calls() == 1);
+    CHECK(output.write_calls() == 0);
+}
+
+TEST_CASE("AE01 file output creates one durable raw JSONL artifact",
+          "[adaptive-v2][structured-event][output][file]")
+{
+    TemporaryDirectory temporary;
+    const auto path = temporary.file("replica-2.events.jsonl");
+    bytearray_t original;
+
+    {
+        ScopedUmask restrictive_umask{0777};
+        ExclusiveFileStructuredEventOutput output(path);
+        CHECK(output.is_open());
+        FakeClock clock({9000});
+        {
+            StructuredEventSink sink(event_config(), clock, output);
+            sink.emit(process_event());
+        }
+        CHECK_FALSE(output.is_open());
+        CHECK(output.healthy());
+    }
+
+    original = read_file(path);
+    REQUIRE_FALSE(original.empty());
+    const auto parsed = hotstuff::parse_structured_event_prefix(original);
+    CHECK(parsed.status == StructuredEventPrefixStatus::complete);
+    CHECK(parsed.complete_records == 1);
+    CHECK(parsed.complete_bytes == original.size());
+
+    struct stat metadata{};
+    REQUIRE(::stat(path.c_str(), &metadata) == 0);
+    CHECK((metadata.st_mode & 0777) == 0600);
+
+    CHECK_THROWS_AS(
+        ExclusiveFileStructuredEventOutput(path),
+        std::system_error);
+    CHECK(read_file(path) == original);
+}
+
+TEST_CASE("AE01 output sync failure invalidates the run before close",
+          "[adaptive-v2][structured-event][output][sync][failure]")
+{
+    FakeClock clock({9001});
+    MemoryOutput output({}, true, false);
+    StructuredEventSink sink(event_config(), clock, output);
+    sink.emit(process_event());
+    sink.shutdown();
+
+    const auto failed = sink.health();
+    CHECK_FALSE(failed.healthy);
+    CHECK(failed.stopped);
+    CHECK(failed.first_failure == StructuredEventFailure::sync_failure);
+    CHECK(failed.complete_records == 1);
+    CHECK(output.sync_calls() == 1);
+    CHECK(output.close_calls() == 1);
+
+    sink.shutdown();
+    CHECK(output.sync_calls() == 1);
+    CHECK(output.close_calls() == 1);
 }
 
 TEST_CASE("V13 output failure is permanent and leaves only a final tail",
