@@ -22,6 +22,10 @@ def _u8(value: int) -> bytes:
     return value.to_bytes(1, "big")
 
 
+def _u16(value: int) -> bytes:
+    return value.to_bytes(2, "big")
+
+
 def _u32(value: int) -> bytes:
     return value.to_bytes(4, "big")
 
@@ -39,7 +43,11 @@ def _string(value: str) -> bytes:
     return _u32(len(encoded)) + encoded
 
 
-def _synthetic_bundle(*, snapshot_seed: int = campaign.SNAPSHOT_SEED) -> bytes:
+def _synthetic_bundle(
+    *,
+    snapshot_seed: int = campaign.SNAPSHOT_SEED,
+    root_order: tuple[int, ...] = campaign.SURVIVORS,
+) -> bytes:
     predecessor = bytes.fromhex("aa" * 32)
     successor = bytes.fromhex("bb" * 32)
     command = b"".join(
@@ -56,7 +64,7 @@ def _synthetic_bundle(*, snapshot_seed: int = campaign.SNAPSHOT_SEED) -> bytes:
         )
     )
     trees = []
-    for tree_id, root in enumerate(range(2, 7)):
+    for tree_id, root in enumerate(root_order):
         members = [root, *[member for member in range(2, 7) if member != root], 0, 1]
         trees.append(
             b"".join(
@@ -65,10 +73,10 @@ def _synthetic_bundle(*, snapshot_seed: int = campaign.SNAPSHOT_SEED) -> bytes:
                     _u32(2),
                     _u32(2),
                     _u32(7),
-                    b"".join(_u32(member) for member in members),
+                    b"".join(_u16(member) for member in members),
                     _u32(2),
-                    _u32(0),
-                    _u32(1),
+                    _u16(0),
+                    _u16(1),
                 )
             )
         )
@@ -209,6 +217,23 @@ def test_decodes_exact_manager_bundle_without_inventing_topology() -> None:
     assert decoded.generation_seed == 0xA2F7
     assert [tree.members[0] for tree in decoded.trees] == [2, 3, 4, 5, 6]
     assert all(tree.wait_exempt == (0, 1) for tree in decoded.trees)
+
+
+def test_preserves_ranked_successor_root_order() -> None:
+    root_order = (2, 6, 3, 5, 4)
+
+    decoded = campaign.decode_epoch_change_bundle(
+        _synthetic_bundle(root_order=root_order)
+    )
+
+    assert tuple(tree.members[0] for tree in decoded.trees) == root_order
+
+
+def test_rejects_duplicate_successor_root() -> None:
+    with pytest.raises(campaign.RunnerError, match="five surviving replicas"):
+        campaign.decode_epoch_change_bundle(
+            _synthetic_bundle(root_order=(2, 2, 3, 4, 5))
+        )
 
 
 @pytest.mark.parametrize(

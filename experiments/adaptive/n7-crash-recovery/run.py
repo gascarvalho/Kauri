@@ -48,6 +48,8 @@ ISSUER_ID = 1
 MAX_REPLICA_MESSAGE_BYTES = 4 << 20
 MAX_COMMAND_BYTES = 4096
 MAX_ANCESTRY_BLOCKS = 128
+# Protocol ReplicaID is the uint16_t defined in include/hotstuff/type.h.
+REPLICA_ID_BYTES = 2
 MANAGER_LIMITS = {
     "maximum_members": 7,
     "readiness_wire_maximum_payload_bytes": 256,
@@ -268,9 +270,15 @@ def decode_epoch_change_bundle(payload: bytes) -> DecodedBundle:
         member_count = definition.unsigned(4)
         if tree_id != expected_tree_id or member_count != len(REPLICA_IDS):
             raise RunnerError("successor tree IDs or membership counts are invalid")
-        members = tuple(definition.unsigned(4) for _ in range(member_count))
+        members = tuple(
+            definition.unsigned(REPLICA_ID_BYTES)
+            for _ in range(member_count)
+        )
         wait_count = definition.unsigned(4)
-        wait_exempt = tuple(definition.unsigned(4) for _ in range(wait_count))
+        wait_exempt = tuple(
+            definition.unsigned(REPLICA_ID_BYTES)
+            for _ in range(wait_count)
+        )
         if len(set(members)) != len(REPLICA_IDS) or set(members) != set(REPLICA_IDS):
             raise RunnerError("successor tree does not preserve exact membership")
         if wait_exempt != CRASH_TARGETS:
@@ -286,8 +294,12 @@ def decode_epoch_change_bundle(payload: bytes) -> DecodedBundle:
         or generation_seed != SNAPSHOT_SEED
     ):
         raise RunnerError("successor bundle command and definition identities disagree")
-    if tuple(tree.members[0] for tree in trees) != SURVIVORS:
-        raise RunnerError("successor roots are not exactly replicas 2 through 6")
+    successor_roots = tuple(tree.members[0] for tree in trees)
+    if (
+        len(set(successor_roots)) != QUORUM
+        or set(successor_roots) != set(SURVIVORS)
+    ):
+        raise RunnerError("successor roots are not exactly the five surviving replicas")
     if any(tree.fanout != 2 or tree.pipeline_stretch != 2 for tree in trees):
         raise RunnerError("successor tree fanout or pipeline differs from the frozen profile")
     return DecodedBundle(
@@ -2076,6 +2088,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         post_start_ns = observer_activation_ns + ACTIVATION_GRACE_NS
         post_duration_ns = int(profile["post_bucket_count"]) * BUCKET_WIDTH_NS
         tree_roots = {tree.tree_id: tree.members[0] for tree in decoded.trees}
+        successor_root_cycle = tuple(tree.members[0] for tree in decoded.trees)
 
         def post_cycle() -> dict[str, Any] | None:
             if monotonic_raw_ns() < post_start_ns + post_duration_ns:
@@ -2087,7 +2100,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 participants=SURVIVORS,
                 epoch_number=1,
                 tree_roots=tree_roots,
-                expected_roots=SURVIVORS,
+                expected_roots=successor_root_cycle,
                 require_terminal=False,
             )
 
@@ -2106,7 +2119,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         state["post_start_ns"] = post_start_ns
         _replace_json(state_path, state)
         _wait(
-            "seven complete post buckets and common successor roots 2..6",
+            "seven complete post buckets and the ranked successor root cycle",
             args.phase_timeout,
             records,
             post_cycle,

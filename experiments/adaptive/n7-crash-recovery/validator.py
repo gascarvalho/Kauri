@@ -1679,8 +1679,12 @@ def load_epochs(path: Path) -> EpochDocument:
                 raise ValidationError(
                     f"replica {failed} is not a physical leaf in successor tree {tree_id}"
                 )
-    if tuple(tree.leader for tree in successor.trees) != SUCCESSOR_ROOTS:
-        raise ValidationError("successor roots must be exactly 2,3,4,5,6")
+    successor_roots = tuple(tree.leader for tree in successor.trees)
+    if (
+        len(set(successor_roots)) != QUORUM
+        or set(successor_roots) != set(SUCCESSOR_ROOTS)
+    ):
+        raise ValidationError("successor roots must be exactly the five surviving replicas")
 
     command = successor.command
     assert command is not None
@@ -2397,9 +2401,12 @@ def _validate_commits(
     if any(commit.epoch_number != 1 for commit in post):
         raise ValidationError("post-grace commits must use only successor epoch 1")
     post_leaders = _compressed(commit.leader_replica for commit in post)
-    if not _contains_contiguous(post_leaders, SUCCESSOR_ROOTS):
+    successor_root_cycle = tuple(
+        tree.leader for tree in epochs.successor.trees
+    )
+    if not _contains_contiguous(post_leaders, successor_root_cycle):
         raise IncompleteRun(
-            "post-grace commits do not contain one complete successor root cycle 2..6"
+            "post-grace commits do not contain one complete ranked successor root cycle"
         )
 
     by_replica = {
@@ -2698,10 +2705,10 @@ def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
         "epoch0_roots"
     ]:
         raise ValidationError("epoch-0 roots differ from manifest.runtime")
-    if [tree.leader for tree in epochs.successor.trees] != manifest.runtime[
-        "successor_roots"
-    ]:
-        raise ValidationError("successor roots differ from manifest.runtime")
+    if set(tree.leader for tree in epochs.successor.trees) != set(
+        manifest.runtime["successor_roots"]
+    ):
+        raise ValidationError("successor root set differs from manifest.runtime")
     streams, texts = _read_source_events(manifest)
     _validate_process_lifecycle(manifest, streams)
     crash_markers = _validate_crash_markers(manifest, streams)

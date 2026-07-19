@@ -91,6 +91,28 @@ def test_complete_synthetic_run_passes_and_writes_only_canonical_inputs(
     assert "post" in throughput
 
 
+def test_ranked_successor_root_cycle_is_accepted(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    value = synthetic_run.load(epochs)
+    root_order = (2, 6, 3, 5, 4)
+    for tree_id, root in enumerate(root_order):
+        other_survivors = [
+            replica for replica in root_order if replica != root
+        ]
+        tree = value["epochs"][1]["trees"][tree_id]
+        tree["members_breadth_first"] = [
+            root,
+            *other_survivors,
+            0,
+            1,
+        ]
+    synthetic_run.save(epochs, value)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "PASS"
+
+
 def test_missing_manager_reputation_is_incomplete_and_writes_no_plot_inputs(
     tmp_path: Path,
 ) -> None:

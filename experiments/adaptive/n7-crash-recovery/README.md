@@ -14,8 +14,9 @@ The validator accepts three kinds of input:
    non-interrupted run state, exact structured-event source instances,
    measurement boundaries, and the two crash records.
 2. Canonical epoch definitions. Epoch 0 contains the seven cyclic trees rooted
-   `0..6`. Epoch 1 has unchanged membership, roots `2..6`, and replicas `0` and
-   `1` as wait-exempt physical leaves in every binary tree.
+   `0..6`. Epoch 1 has unchanged membership, the exact root set `2..6` in its
+   committed tree-ID order generated from the manager snapshot ranking, and
+   replicas `0` and `1` as wait-exempt physical leaves in every binary tree.
 3. One raw `StructuredEventSink` JSONL file per declared source. These are bare
    JSON objects, one per line. A `KAURI_EVENT ` prefix is accepted only by
    `analysis.py` when its explicit diagnostic compatibility option is enabled;
@@ -80,8 +81,8 @@ requires all of the following:
   truth supplied to the manager;
 - an identical committed epoch command and one matching successor activation
   at every surviving replica;
-- successor roots exactly `2..6`, with failed replicas `0` and `1` both
-  wait-exempt physical leaves;
+- successor root set exactly `2..6`, preserving its committed tree-ID order,
+  with failed replicas `0` and `1` both wait-exempt physical leaves;
 - agreement by replicas `2..6` on every authoritative measurement height and
   hash;
 - raw, phase-local, zero-filled throughput buckets no wider than five seconds,
