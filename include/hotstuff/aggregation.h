@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <set>
 
 #include "hotstuff/proposal_context.h"
@@ -31,6 +32,7 @@ public:
     using Cancellation = std::function<void()>;
 
     virtual ~AggregationScheduler() = default;
+    virtual Duration monotonic_now() const noexcept = 0;
     virtual Cancellation schedule_after(Duration delay,
                                         Callback callback) = 0;
 };
@@ -100,6 +102,14 @@ public:
                           std::uint64_t timer_generation);
 
 private:
+    class ScheduledCancellation;
+
+    void schedule_until_deadline(
+        const ProposalKey &key,
+        std::uint64_t timer_generation,
+        AggregationScheduler &scheduler,
+        AggregationScheduler::Duration deadline,
+        const std::shared_ptr<ScheduledCancellation> &cancellation);
     void apply_timeout(const ProposalContextLease &lease);
 
     ProposalContextLifecycle &contexts_;

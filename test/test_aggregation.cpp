@@ -50,6 +50,7 @@ public:
     using Cancellation = std::function<void()>;
 
     virtual ~AggregationScheduler() = default;
+    virtual Duration monotonic_now() const noexcept = 0;
     virtual Cancellation schedule_after(Duration, Callback) = 0;
 };
 
@@ -282,6 +283,11 @@ class FakeAggregationScheduler final : public AggregationScheduler
 public:
     FakeAggregationScheduler(): scheduler_(clock_) {}
 
+    Duration monotonic_now() const noexcept override
+    {
+        return clock_.now().time_since_epoch();
+    }
+
     Cancellation schedule_after(Duration delay, Callback callback) override
     {
         const auto key = "aggregation-" + std::to_string(++next_key_);
@@ -304,6 +310,51 @@ private:
     FakeClock clock_;
     DeterministicScheduler scheduler_;
     std::uint64_t next_key_{0};
+};
+
+class EarlyAggregationScheduler final : public AggregationScheduler
+{
+public:
+    Duration monotonic_now() const noexcept override
+    {
+        return now_;
+    }
+
+    Cancellation schedule_after(Duration delay, Callback callback) override
+    {
+        const auto generation = ++generation_;
+        delay_ = delay;
+        callback_ = std::move(callback);
+        return [this, generation]() {
+            if (generation_ == generation)
+                callback_ = {};
+        };
+    }
+
+    void fire_after(Duration elapsed)
+    {
+        REQUIRE(callback_);
+        now_ += elapsed;
+        auto callback = std::move(callback_);
+        callback_ = {};
+        callback();
+    }
+
+    Duration delay() const noexcept
+    {
+        return delay_;
+    }
+
+    bool pending() const noexcept
+    {
+        return static_cast<bool>(callback_);
+    }
+
+private:
+    Duration now_{Duration::zero()};
+    Duration delay_{Duration::zero()};
+    Callback callback_;
+    std::uint64_t generation_{0};
 };
 
 struct SigningSpy
@@ -475,6 +526,42 @@ TEST_CASE("A06 deterministic scheduler runs and cancels at exact deadlines",
     scheduler.advance_by(test_delay);
     CHECK(calls == 1);
     CHECK(scheduler.pending() == 0);
+}
+
+TEST_CASE("A06 early timer callbacks wait for the strict deadline",
+          "[a06][aggregation][control][clock][deadline]")
+{
+    Harness harness(1);
+    EarlyAggregationScheduler scheduler;
+    const auto key = make_test_proposal_key(
+        make_digest(0x9a), 0x9b, 9, 1);
+    const auto lease = harness.admit(key, internal_tree());
+    const auto deadline = harness.policy.timeout_for(
+        internal_level, maximum_level);
+
+    REQUIRE(harness.coordinator.arm_timeout(
+                lease,
+                scheduler,
+                internal_level,
+                maximum_level) != 0);
+    REQUIRE(scheduler.pending());
+    CHECK(scheduler.delay() == deadline);
+
+    scheduler.fire_after(deadline - std::chrono::nanoseconds(1));
+
+    CHECK(harness.candidate_requests == 0);
+    CHECK(harness.transport.signer_sets.empty());
+    CHECK(harness.timeouts.keys.empty());
+    REQUIRE(scheduler.pending());
+    CHECK(scheduler.delay() == std::chrono::nanoseconds(1));
+
+    scheduler.fire_after(std::chrono::nanoseconds(1));
+
+    CHECK(harness.candidate_requests == 1);
+    REQUIRE(harness.timeouts.missing_children.size() == 1);
+    CHECK(harness.timeouts.missing_children.front() ==
+          std::set<ReplicaID>{3, 4});
+    CHECK_FALSE(scheduler.pending());
 }
 
 TEST_CASE("A06 lifecycle timer generations are exact-key isolated",

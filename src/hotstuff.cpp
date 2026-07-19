@@ -207,6 +207,12 @@ namespace hotstuff
                 : ec(ec), state(std::make_shared<State>())
             {}
 
+            Duration monotonic_now() const noexcept override
+            {
+                return std::chrono::duration_cast<Duration>(
+                    std::chrono::steady_clock::now().time_since_epoch());
+            }
+
             ~SalticidaeAggregationScheduler() override
             {
                 std::vector<std::shared_ptr<salticidae::TimerEvent>>

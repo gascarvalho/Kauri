@@ -10,10 +10,8 @@
 
 namespace hotstuff
 {
-namespace
-{
 
-class ScheduledCancellation final
+class AggregationTimeoutCoordinator::ScheduledCancellation final
 {
 public:
     using Cancellation = AggregationScheduler::Cancellation;
@@ -54,8 +52,6 @@ private:
     Cancellation cancellation_;
     bool cancel_requested_{false};
 };
-
-} // namespace
 
 AggregationTimeoutPolicy::AggregationTimeoutPolicy(
     Duration per_remaining_level)
@@ -127,13 +123,17 @@ std::uint64_t AggregationTimeoutCoordinator::arm_timeout(
 
     try
     {
-        auto scheduled = scheduler.schedule_after(
-            policy_.timeout_for(level, maximum_level),
-            [this, key = lease.key(), timer_generation]() {
-                static_cast<void>(
-                    dispatch_timeout(key, timer_generation));
-            });
-        cancellation->install(std::move(scheduled));
+        const auto duration = policy_.timeout_for(level, maximum_level);
+        const auto started = scheduler.monotonic_now();
+        if (started > AggregationScheduler::Duration::max() - duration)
+            throw std::overflow_error(
+                "aggregation timeout deadline overflow");
+        schedule_until_deadline(
+            lease.key(),
+            timer_generation,
+            scheduler,
+            started + duration,
+            cancellation);
     }
     catch (...)
     {
@@ -144,6 +144,49 @@ std::uint64_t AggregationTimeoutCoordinator::arm_timeout(
         throw;
     }
     return timer_generation;
+}
+
+void AggregationTimeoutCoordinator::schedule_until_deadline(
+    const ProposalKey &key,
+    std::uint64_t timer_generation,
+    AggregationScheduler &scheduler,
+    AggregationScheduler::Duration deadline,
+    const std::shared_ptr<ScheduledCancellation> &cancellation)
+{
+    const auto now = scheduler.monotonic_now();
+    if (now >= deadline)
+    {
+        static_cast<void>(dispatch_timeout(key, timer_generation));
+        return;
+    }
+
+    auto scheduled = scheduler.schedule_after(
+        deadline - now,
+        [this,
+         key,
+         timer_generation,
+         &scheduler,
+         deadline,
+         cancellation]() {
+            try
+            {
+                schedule_until_deadline(
+                    key,
+                    timer_generation,
+                    scheduler,
+                    deadline,
+                    cancellation);
+            }
+            catch (...)
+            {
+                // A scheduling failure cannot authorize early timeout
+                // effects. Leave the exact context open and fail closed.
+            }
+        });
+    if (!scheduled)
+        throw std::runtime_error(
+            "aggregation timeout scheduling failed");
+    cancellation->install(std::move(scheduled));
 }
 
 bool AggregationTimeoutCoordinator::dispatch_timeout(
