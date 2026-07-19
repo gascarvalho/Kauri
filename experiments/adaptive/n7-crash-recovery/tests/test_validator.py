@@ -173,27 +173,133 @@ def test_successor_requires_failed_replicas_as_wait_exempt_physical_leaves(
     assert "not a physical leaf" in verdict["reason"]
 
 
-def test_crash_requires_full_initial_root_cycle_ending_at_six(
+def test_crash_requires_full_initial_root_cycle_common_to_all_seven(
     tmp_path: Path,
 ) -> None:
     manifest, epochs = synthetic_run.create_run(tmp_path / "run")
-    observer = tmp_path / "run/raw/replica-2.jsonl"
+    replica_zero = tmp_path / "run/raw/replica-0.jsonl"
 
-    def change_final_root(values: list[dict[str, object]]) -> None:
-        commits = [
+    def contradict_root_three(values: list[dict[str, object]]) -> None:
+        commit = next(
             value
             for value in values
             if value["event_type"] == "block.committed"
-            and value["source_monotonic_ns"] < synthetic_run.CRASH_0_NS
-        ]
-        commits[-1]["payload"]["decision_proof"]["tree_id"] = 5
+            and value["payload"]["decision_proof"]["tree_id"] == 3
+        )
+        commit["payload"]["block_hash"] = "f" * 64
+        commit["payload"]["decision_proof"]["block_hash"] = "f" * 64
 
-    _rewrite_jsonl(observer, change_final_root)
+    _rewrite_jsonl(replica_zero, contradict_root_three)
 
     verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
 
     assert verdict["verdict"] == "FAIL"
     assert "root cycle 0..6" in verdict["reason"]
+
+
+def test_crash_boundary_requires_exact_common_epoch_zero_root_six(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    value = synthetic_run.load(manifest)
+    value["crash_configuration_boundary"]["tree_id"] = 0
+    synthetic_run.save(manifest, value)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "root 6" in verdict["reason"]
+
+
+def test_crash_boundary_rejects_intervening_configuration_activation(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    value = synthetic_run.load(manifest)
+    evidence = next(
+        item
+        for item in value["crash_configuration_boundary"]["replica_evidence"]
+        if item["source_id"] == "replica-2"
+    )
+    observer = tmp_path / "run/raw/replica-2.jsonl"
+
+    def insert_root_zero(values: list[dict[str, object]]) -> None:
+        boundary_index = next(
+            index
+            for index, item in enumerate(values)
+            if item["source_sequence"] == evidence["source_sequence"]
+        )
+        event = json.loads(json.dumps(values[boundary_index]))
+        event["source_monotonic_ns"] = synthetic_run.CRASH_0_NS - 1_000_000
+        event["payload"]["tree_id"] = 0
+        values.insert(boundary_index + 1, event)
+
+    _rewrite_jsonl(observer, insert_root_zero)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "intervening configuration activation" in verdict["reason"]
+
+
+def test_crash_boundary_rejects_boolean_integer_aliases(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    value = synthetic_run.load(manifest)
+    reference = value["crash_configuration_boundary"]["replica_evidence"][0]
+    replica_zero = tmp_path / "run/raw/replica-0.jsonl"
+
+    def replace_epoch_with_false(values: list[dict[str, object]]) -> None:
+        event = next(
+            item
+            for item in values
+            if item["source_sequence"] == reference["source_sequence"]
+        )
+        event["payload"]["epoch_number"] = False
+
+    _rewrite_jsonl(replica_zero, replace_epoch_with_false)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "epoch_number must be an integer" in verdict["reason"]
+
+
+def test_crash_boundary_audits_authoritative_sequence_not_global_timestamp(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    value = synthetic_run.load(manifest)
+    reference = value["crash_configuration_boundary"]["replica_evidence"][2]
+    observer = tmp_path / "run/raw/replica-2.jsonl"
+
+    def insert_root_change(values: list[dict[str, object]]) -> None:
+        boundary_index = next(
+            index
+            for index, item in enumerate(values)
+            if item["source_sequence"] == reference["source_sequence"]
+        )
+        event = json.loads(
+            json.dumps(
+                next(
+                    item
+                    for item in values
+                    if item["event_type"] == "block.committed"
+                    and item["payload"]["decision_proof"]["tree_id"] == 6
+                )
+            )
+        )
+        event["source_monotonic_ns"] = synthetic_run.CRASH_0_NS - 996_000_000
+        event["payload"]["decision_proof"]["tree_id"] = 0
+        values.insert(boundary_index + 1, event)
+
+    _rewrite_jsonl(observer, insert_root_change)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "authoritative root changed" in verdict["reason"]
 
 
 def test_survivor_common_height_disagreement_fails(tmp_path: Path) -> None:

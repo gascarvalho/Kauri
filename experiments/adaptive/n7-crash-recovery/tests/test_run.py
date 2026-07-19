@@ -139,6 +139,42 @@ def _event(
     }
 
 
+def _configuration_active_event(
+    *,
+    replica: int,
+    sequence: int,
+    timestamp_ns: int,
+    tree: int,
+    digest: str = "a" * 64,
+) -> dict[str, Any]:
+    return {
+        "event_schema_version": 1,
+        "run_id": "synthetic-non-evidence",
+        "source_kind": "replica",
+        "source_id": f"replica-{replica}",
+        "source_instance": f"synthetic-replica-{replica}",
+        "source_sequence": sequence,
+        "source_monotonic_ns": timestamp_ns,
+        "event_type": "adaptive.configuration_active",
+        "payload": {
+            "epoch_number": 0,
+            "tree_id": tree,
+            "epoch_digest": digest,
+            "block_hash": None,
+            "context_generation": None,
+            "observer_replica": replica,
+            "wait_exempt_signers": [],
+            "accepted_signers": [],
+            "absent_direct_children": [],
+            "missing_optional_signers": [],
+            "required_branch_gaps": [],
+            "root_signer_count": 0,
+            "global_quorum": 5,
+            "rejection_reason": None,
+        },
+    }
+
+
 class _ProcessDouble:
     def __init__(self, return_code: int | None = None) -> None:
         self.return_code = return_code
@@ -193,7 +229,7 @@ def test_rejects_bundle_with_noncanonical_snapshot_seed() -> None:
         campaign.decode_epoch_change_bundle(_synthetic_bundle(snapshot_seed=1))
 
 
-def test_baseline_gate_requires_terminal_common_root_cycle() -> None:
+def test_baseline_gate_requires_complete_common_root_cycle() -> None:
     events = [
         _event(
             sequence=index + 1,
@@ -219,20 +255,179 @@ def test_baseline_gate_requires_terminal_common_root_cycle() -> None:
         epoch_number=0,
         tree_roots={replica: replica for replica in range(7)},
         expected_roots=tuple(range(7)),
-        require_terminal=True,
+        require_terminal=False,
     )
 
     assert endpoint is not None
     assert endpoint["payload"]["block_height"] == 8
+    later_events = [
+        *events,
+        _event(
+            sequence=9,
+            timestamp_ns=9_000_000_000,
+            height=9,
+            epoch=0,
+            tree=0,
+        ),
+    ]
     assert campaign.find_common_root_cycle(
-        [*events, _event(sequence=9, timestamp_ns=9_000_000_000, height=9, epoch=0, tree=0)],
+        later_events,
         common,
         participants=tuple(range(7)),
         epoch_number=0,
         tree_roots={replica: replica for replica in range(7)},
         expected_roots=tuple(range(7)),
-        require_terminal=True,
+        require_terminal=False,
+    ) is not None
+
+    common[3].remove((4, f"{4:064x}"))
+    assert campaign.find_common_root_cycle(
+        later_events,
+        common,
+        participants=tuple(range(7)),
+        epoch_number=0,
+        tree_roots={replica: replica for replica in range(7)},
+        expected_roots=tuple(range(7)),
+        require_terminal=False,
     ) is None
+
+
+def test_fresh_common_root_six_boundary_binds_all_sources() -> None:
+    watermarks = {f"replica-{replica}": 10 for replica in range(7)}
+    streams = {
+        f"replica-{replica}": [
+            _configuration_active_event(
+                replica=replica,
+                sequence=11,
+                timestamp_ns=1_000_000_000 + replica,
+                tree=6,
+            )
+        ]
+        for replica in range(7)
+    }
+
+    boundary = campaign.common_active_configuration_boundary(
+        streams,
+        minimum_source_sequences=watermarks,
+        epoch_number=0,
+        tree_id=6,
+        root_replica=6,
+        members_breadth_first=(6, 0, 1, 2, 3, 4, 5),
+        fanout=2,
+        maximum_skew_ns=500_000_000,
+        observed_ns=1_100_000_000,
+    )
+
+    assert boundary is not None
+    assert boundary["epoch_number"] == 0
+    assert boundary["tree_id"] == 6
+    assert boundary["root_replica"] == 6
+    assert boundary["epoch_digest"] == "a" * 64
+    assert boundary["context_generation"] is None
+    assert [item["source_id"] for item in boundary["replica_evidence"]] == [
+        f"replica-{replica}" for replica in range(7)
+    ]
+    campaign.assert_crash_boundary_held(
+        boundary,
+        streams,
+        crash_request_ns=1_300_000_000,
+    )
+
+    streams["replica-2"].append(
+        _event(
+            sequence=12,
+            timestamp_ns=1_000_000_004,
+            height=1,
+            epoch=0,
+            tree=0,
+        )
+    )
+    with pytest.raises(campaign.RunnerError, match="authoritative root changed"):
+        campaign.assert_crash_boundary_held(
+            boundary,
+            streams,
+            crash_request_ns=1_300_000_000,
+        )
+    streams["replica-2"].pop()
+
+    streams["replica-3"].append(
+        _configuration_active_event(
+            replica=3,
+            sequence=12,
+            timestamp_ns=1_200_000_000,
+            tree=0,
+        )
+    )
+    assert campaign.common_active_configuration_boundary(
+        streams,
+        minimum_source_sequences=watermarks,
+        epoch_number=0,
+        tree_id=6,
+        root_replica=6,
+        members_breadth_first=(6, 0, 1, 2, 3, 4, 5),
+        fanout=2,
+        maximum_skew_ns=500_000_000,
+        observed_ns=1_300_000_000,
+    ) is None
+    with pytest.raises(campaign.RunnerError, match="configuration changed"):
+        campaign.assert_crash_boundary_held(
+            boundary,
+            streams,
+            crash_request_ns=1_300_000_000,
+        )
+
+
+def test_configuration_poller_tails_fresh_events_incrementally(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for replica in range(7):
+        history = [
+            _configuration_active_event(
+                replica=replica,
+                sequence=sequence,
+                timestamp_ns=sequence * 1_000_000 + replica,
+                tree=6,
+            )
+            for sequence in range(1, 513)
+        ]
+        (raw / f"replica-{replica}.jsonl").write_text(
+            "".join(
+                json.dumps(event, separators=(",", ":")) + "\n"
+                for event in history
+            ),
+            encoding="utf-8",
+        )
+
+    watermarks, offsets = campaign.replica_event_tail_snapshot(tmp_path)
+    assert set(watermarks.values()) == {512}
+    poller = campaign.FreshConfigurationPoller(
+        tmp_path,
+        watermarks,
+        start_offsets=offsets,
+        maximum_skew_ns=500_000_000,
+        clock_ns=lambda: 1_100_000_000,
+    )
+    assert poller.poll() is None
+
+    for replica in range(7):
+        event = _configuration_active_event(
+            replica=replica,
+            sequence=513,
+            timestamp_ns=1_000_000_000 + replica,
+            tree=6,
+        )
+        with (raw / f"replica-{replica}.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+    boundary = poller.poll()
+
+    assert boundary is not None
+    assert boundary["tree_id"] == 6
+    assert len(boundary["replica_evidence"]) == 7
 
 
 def test_crash_injection_targets_only_registered_replica_groups() -> None:

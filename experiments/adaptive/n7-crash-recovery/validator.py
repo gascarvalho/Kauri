@@ -96,6 +96,7 @@ _MANIFEST_FIELDS = frozenset(
         "end_ns",
         "sources",
         "crash_markers",
+        "crash_configuration_boundary",
         "runtime",
         "runtime_artifacts",
     }
@@ -166,6 +167,41 @@ _CONFIRMED_EXIT_FIELDS = frozenset(
         "signal",
         "signal_number",
         "observed_monotonic_raw_ns",
+    }
+)
+_CRASH_CONFIGURATION_BOUNDARY_FIELDS = frozenset(
+    {
+        "epoch_number",
+        "tree_id",
+        "root_replica",
+        "epoch_digest",
+        "context_generation",
+        "replica_evidence",
+    }
+)
+_CRASH_CONFIGURATION_EVIDENCE_FIELDS = frozenset(
+    {
+        "source_id",
+        "source_sequence",
+        "source_monotonic_ns",
+    }
+)
+_CONFIGURATION_ACTIVE_FIELDS = frozenset(
+    {
+        "epoch_number",
+        "tree_id",
+        "epoch_digest",
+        "block_hash",
+        "context_generation",
+        "observer_replica",
+        "wait_exempt_signers",
+        "accepted_signers",
+        "absent_direct_children",
+        "missing_optional_signers",
+        "required_branch_gaps",
+        "root_signer_count",
+        "global_quorum",
+        "rejection_reason",
     }
 )
 _EPOCH_DOCUMENT_FIELDS = frozenset(
@@ -366,6 +402,23 @@ class CrashMarkerSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class CrashConfigurationEvidenceSpec:
+    source_id: str
+    source_sequence: int
+    timestamp_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class CrashConfigurationBoundarySpec:
+    epoch_number: int
+    tree_id: int
+    root_replica: int
+    epoch_digest: str
+    context_generation: None
+    evidence: tuple[CrashConfigurationEvidenceSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeArtifactSpec:
     kind: str
     replica_id: int | None
@@ -397,6 +450,7 @@ class Manifest:
     runtime_artifacts: tuple[RuntimeArtifactSpec, ...]
     sources: tuple[SourceSpec, ...]
     crash_markers: tuple[CrashMarkerSpec, ...]
+    crash_configuration_boundary: CrashConfigurationBoundarySpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -1412,6 +1466,85 @@ def load_manifest(path: Path) -> Manifest:
     ):
         raise ValidationError("crash request/exit evidence must lie in the run window")
 
+    boundary = _object(
+        raw["crash_configuration_boundary"],
+        "manifest.crash_configuration_boundary",
+    )
+    _exact_fields(
+        boundary,
+        _CRASH_CONFIGURATION_BOUNDARY_FIELDS,
+        "manifest.crash_configuration_boundary",
+    )
+    epoch_number = _integer(
+        boundary["epoch_number"],
+        "crash_configuration_boundary.epoch_number",
+        maximum=analysis.UINT32_MAX,
+    )
+    tree_id = _integer(
+        boundary["tree_id"],
+        "crash_configuration_boundary.tree_id",
+        maximum=analysis.UINT32_MAX,
+    )
+    root_replica = _integer(
+        boundary["root_replica"],
+        "crash_configuration_boundary.root_replica",
+        maximum=analysis.UINT32_MAX,
+    )
+    epoch_digest = _hash(
+        boundary["epoch_digest"],
+        "crash_configuration_boundary.epoch_digest",
+    )
+    if boundary["context_generation"] is not None:
+        raise ValidationError(
+            "configuration-active evidence must record unavailable generation as null"
+        )
+    evidence_values = _list(
+        boundary["replica_evidence"],
+        "crash_configuration_boundary.replica_evidence",
+    )
+    evidence: list[CrashConfigurationEvidenceSpec] = []
+    for index, item in enumerate(evidence_values):
+        reference = _object(
+            item, f"crash_configuration_boundary.replica_evidence[{index}]"
+        )
+        _exact_fields(
+            reference,
+            _CRASH_CONFIGURATION_EVIDENCE_FIELDS,
+            f"crash_configuration_boundary.replica_evidence[{index}]",
+        )
+        source_id = _string(
+            reference["source_id"],
+            f"crash_configuration_boundary.replica_evidence[{index}].source_id",
+        )
+        source_sequence = _integer(
+            reference["source_sequence"],
+            f"crash_configuration_boundary.replica_evidence[{index}].source_sequence",
+            minimum=1,
+        )
+        timestamp_ns = _integer(
+            reference["source_monotonic_ns"],
+            f"crash_configuration_boundary.replica_evidence[{index}].source_monotonic_ns",
+            minimum=1,
+        )
+        evidence.append(
+            CrashConfigurationEvidenceSpec(
+                source_id,
+                source_sequence,
+                timestamp_ns,
+            )
+        )
+    expected_source_ids = tuple(f"replica-{replica}" for replica in MEMBERSHIP)
+    if tuple(item.source_id for item in evidence) != expected_source_ids:
+        raise ValidationError(
+            "crash boundary must bind replicas 0..6 in canonical source order"
+        )
+    if epoch_number != 0 or tree_id != 6 or root_replica != 6:
+        raise ValidationError("crash boundary must bind exact epoch-0 tree/root 6")
+    if max(item.timestamp_ns for item in evidence) >= min(
+        marker.requested_ns for marker in markers
+    ):
+        raise ValidationError("crash boundary evidence does not precede crash request")
+
     return Manifest(
         raw=raw,
         path=path.resolve(),
@@ -1433,6 +1566,14 @@ def load_manifest(path: Path) -> Manifest:
         runtime_artifacts=runtime_artifacts,
         sources=tuple(sources),
         crash_markers=tuple(markers),
+        crash_configuration_boundary=CrashConfigurationBoundarySpec(
+            epoch_number,
+            tree_id,
+            root_replica,
+            epoch_digest,
+            None,
+            tuple(evidence),
+        ),
     )
 
 
@@ -1737,6 +1878,145 @@ def _validate_crash_markers(
                 f"replica-{marker.replica_id} emitted after its confirmed SIGKILL exit"
             )
     return tuple(marker.requested_ns for marker in manifest.crash_markers)  # type: ignore[return-value]
+
+
+def _validate_crash_configuration_boundary(
+    manifest: Manifest,
+    epochs: EpochDocument,
+    streams: Mapping[tuple[str, str], Sequence[analysis.StructuredEvent]],
+    final_crash_request_ns: int,
+) -> int:
+    boundary = manifest.crash_configuration_boundary
+    initial_tree = epochs.initial.trees[6]
+    if (
+        boundary.epoch_number != initial_tree.epoch_number
+        or boundary.tree_id != initial_tree.tree_id
+        or boundary.root_replica != initial_tree.leader
+        or boundary.epoch_digest != initial_tree.epoch_digest
+    ):
+        raise ValidationError(
+            "crash boundary does not match the exact epoch-0 root 6 definition"
+        )
+    if initial_tree.fanout != 2 or initial_tree.members != (6, 0, 1, 2, 3, 4, 5):
+        raise ValidationError("crash boundary does not use the frozen tree-6 BFS")
+    positions = tuple(
+        initial_tree.members.index(replica) for replica in CRASHED_REPLICAS
+    )
+    if len(set(positions)) != 2 or any(
+        position == 0
+        or initial_tree.fanout * position + 1 >= len(initial_tree.members)
+        for position in positions
+    ):
+        raise ValidationError(
+            "crashed replicas are not distinct non-root internal tree-6 replicas"
+        )
+    timestamps: list[int] = []
+    observer_boundary_sequence: int | None = None
+    for replica, reference in zip(MEMBERSHIP, boundary.evidence):
+        events = streams[("replica", reference.source_id)]
+        event = _event_at_sequence(events, reference.source_sequence)
+        if event.timestamp_ns != reference.timestamp_ns:
+            raise ValidationError(
+                f"{reference.source_id} crash-boundary timestamp mismatch"
+            )
+        if event.event_type != "adaptive.configuration_active":
+            raise ValidationError(
+                f"{reference.source_id} crash boundary does not reference configuration activation"
+            )
+        payload = event.payload
+        _exact_fields(
+            payload,
+            _CONFIGURATION_ACTIVE_FIELDS,
+            "adaptive.configuration_active payload",
+        )
+        payload_epoch = _integer(
+            payload["epoch_number"],
+            "adaptive.configuration_active.epoch_number",
+            maximum=analysis.UINT32_MAX,
+        )
+        payload_tree = _integer(
+            payload["tree_id"],
+            "adaptive.configuration_active.tree_id",
+            maximum=analysis.UINT32_MAX,
+        )
+        payload_observer = _integer(
+            payload["observer_replica"],
+            "adaptive.configuration_active.observer_replica",
+            maximum=analysis.UINT32_MAX,
+        )
+        payload_root_signers = _integer(
+            payload["root_signer_count"],
+            "adaptive.configuration_active.root_signer_count",
+        )
+        payload_quorum = _integer(
+            payload["global_quorum"],
+            "adaptive.configuration_active.global_quorum",
+            minimum=1,
+        )
+        payload_digest = _hash(
+            payload["epoch_digest"],
+            "adaptive.configuration_active.epoch_digest",
+        )
+        if (
+            payload_epoch != boundary.epoch_number
+            or payload_tree != boundary.tree_id
+            or payload_digest != boundary.epoch_digest
+            or payload_observer != replica
+            or payload_quorum != QUORUM
+            or payload["block_hash"] is not None
+            or payload["context_generation"] is not None
+            or payload["wait_exempt_signers"] != []
+            or payload["accepted_signers"] != []
+            or payload["absent_direct_children"] != []
+            or payload["missing_optional_signers"] != []
+            or payload["required_branch_gaps"] != []
+            or payload_root_signers != 0
+            or payload["rejection_reason"] is not None
+        ):
+            raise ValidationError(
+                f"{reference.source_id} does not prove canonical epoch-0 root 6 active"
+            )
+        timestamps.append(event.timestamp_ns)
+        if any(
+            later.event_type == "adaptive.configuration_active"
+            and later.source_sequence > reference.source_sequence
+            and later.timestamp_ns <= final_crash_request_ns
+            for later in events
+        ):
+            raise ValidationError(
+                "intervening configuration activation before crash request on "
+                f"{reference.source_id}"
+            )
+        if reference.source_id == manifest.authoritative_observer:
+            observer_boundary_sequence = reference.source_sequence
+    if max(timestamps) - min(timestamps) > (
+        int(manifest.runtime["aggregation_timeout_ms"]) * 1_000_000
+    ):
+        raise ValidationError(
+            "common root-6 activation spread exceeds the aggregation timeout"
+        )
+    if max(timestamps) >= final_crash_request_ns:
+        raise ValidationError("tree-6 boundary is not ordered before crash request")
+    if observer_boundary_sequence is None:
+        raise ValidationError("crash boundary lacks authoritative observer evidence")
+
+    observer_events = streams[("replica", manifest.authoritative_observer)]
+    for event in observer_events:
+        if (
+            event.event_type != "block.committed"
+            or event.source_sequence <= observer_boundary_sequence
+            or event.timestamp_ns > final_crash_request_ns
+        ):
+            continue
+        proof = _object(
+            event.payload.get("decision_proof"),
+            "pre-crash authoritative decision proof",
+        )
+        if (proof.get("epoch_number"), proof.get("tree_id")) != (0, 6):
+            raise ValidationError(
+                "authoritative root changed after root-6 boundary before crash request"
+            )
+    return max(timestamps)
 
 
 def _parse_command_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -2077,10 +2357,36 @@ def _validate_commits(
     ]
     if any(commit.epoch_number != 0 for commit in pre_crash):
         raise ValidationError("pre-crash commits must use epoch 0")
-    initial_leaders = _compressed(commit.leader_replica for commit in pre_crash)
-    if len(initial_leaders) < 7 or initial_leaders[-7:] != list(MEMBERSHIP):
+    pre_crash_by_replica = {
+        replica: _commit_observations(
+            streams[("replica", f"replica-{replica}")], replica
+        )
+        for replica in MEMBERSHIP
+    }
+    for commit in pre_crash:
+        if any(
+            pre_crash_by_replica[replica].get(commit.height)
+            not in (None, commit.block_hash)
+            for replica in SURVIVING_REPLICAS
+        ):
+            raise ValidationError(
+                f"survivor commit disagreement at height {commit.height}"
+            )
+    common_pre_crash = [
+        commit
+        for commit in pre_crash
+        if all(
+            pre_crash_by_replica[replica].get(commit.height)
+            == commit.block_hash
+            for replica in MEMBERSHIP
+        )
+    ]
+    initial_leaders = _compressed(
+        commit.leader_replica for commit in common_pre_crash
+    )
+    if not _contains_contiguous(initial_leaders, MEMBERSHIP):
         raise ValidationError(
-            "crash must follow a complete final epoch-0 root cycle 0..6 ending at root 6"
+            "crash must follow a complete common epoch-0 root cycle 0..6"
         )
 
     post = [
@@ -2401,6 +2707,12 @@ def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
     crash_markers = _validate_crash_markers(manifest, streams)
     crash_ns = min(crash_markers)
     crash_complete_ns = max(marker.confirmed_ns for marker in manifest.crash_markers)
+    _validate_crash_configuration_boundary(
+        manifest,
+        epochs,
+        streams,
+        max(crash_markers),
+    )
     command_ns, activation_ns = _validate_command_and_activation(
         manifest, epochs, streams, crash_complete_ns
     )

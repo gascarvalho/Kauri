@@ -97,8 +97,28 @@ MANIFEST_FIELDS = frozenset(
         "end_ns",
         "sources",
         "crash_markers",
+        "crash_configuration_boundary",
         "runtime",
         "runtime_artifacts",
+    }
+)
+
+CONFIGURATION_ACTIVE_PAYLOAD_FIELDS = frozenset(
+    {
+        "epoch_number",
+        "tree_id",
+        "epoch_digest",
+        "block_hash",
+        "context_generation",
+        "observer_replica",
+        "wait_exempt_signers",
+        "accepted_signers",
+        "absent_direct_children",
+        "missing_optional_signers",
+        "required_branch_gaps",
+        "root_signer_count",
+        "global_quorum",
+        "rejection_reason",
     }
 )
 
@@ -1014,11 +1034,292 @@ def _event_streams(run_directory: Path) -> dict[str, list[dict[str, Any]]]:
     return streams
 
 
+def _source_sequence(event: Mapping[str, Any]) -> int:
+    value = event.get("source_sequence")
+    if type(value) is not int or value <= 0:
+        raise RunnerError("structured event has an invalid source sequence")
+    return value
+
+
 def _event_timestamp(event: Mapping[str, Any]) -> int:
     value = event.get("source_monotonic_ns")
     if type(value) is not int or value <= 0:
         raise RunnerError("structured event has an invalid monotonic timestamp")
     return value
+
+
+def _validate_crash_tree_roles(
+    members_breadth_first: Sequence[int],
+    *,
+    fanout: int,
+    root_replica: int,
+) -> None:
+    members = tuple(members_breadth_first)
+    if members != (6, 0, 1, 2, 3, 4, 5) or fanout != 2 or root_replica != 6:
+        raise RunnerError("frozen crash boundary must use epoch-0 tree-6 BFS")
+    if members[0] != root_replica:
+        raise RunnerError("frozen crash boundary root does not match tree-6 BFS")
+    positions = [members.index(target) for target in CRASH_TARGETS]
+    if len(set(positions)) != len(CRASH_TARGETS):
+        raise RunnerError("crash targets must occupy distinct tree positions")
+    for target, position in zip(CRASH_TARGETS, positions):
+        if position == 0 or fanout * position + 1 >= len(members):
+            raise RunnerError(
+                f"crash target {target} is not a non-root internal tree-6 replica"
+            )
+
+
+def _active_configuration_payload(
+    event: Mapping[str, Any],
+    *,
+    replica: int,
+) -> Mapping[str, Any]:
+    if event.get("event_type") != "adaptive.configuration_active":
+        raise RunnerError("expected adaptive.configuration_active evidence")
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or set(payload) != CONFIGURATION_ACTIVE_PAYLOAD_FIELDS:
+        raise RunnerError("configuration-active evidence has schema drift")
+    for field in (
+        "epoch_number",
+        "tree_id",
+        "observer_replica",
+        "root_signer_count",
+        "global_quorum",
+    ):
+        if type(payload.get(field)) is not int or int(payload[field]) < 0:
+            raise RunnerError("configuration-active evidence has an invalid integer")
+    if payload.get("observer_replica") != replica:
+        raise RunnerError("configuration-active observer does not match its source")
+    if (
+        payload.get("block_hash") is not None
+        or payload.get("context_generation") is not None
+        or payload.get("wait_exempt_signers") != []
+        or payload.get("accepted_signers") != []
+        or payload.get("absent_direct_children") != []
+        or payload.get("missing_optional_signers") != []
+        or payload.get("required_branch_gaps") != []
+        or payload.get("root_signer_count") != 0
+        or payload.get("global_quorum") != QUORUM
+        or payload.get("rejection_reason") is not None
+    ):
+        raise RunnerError("configuration-active evidence is not canonical epoch-0 state")
+    digest = payload.get("epoch_digest")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or digest == "0" * 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise RunnerError("configuration-active evidence has an invalid epoch digest")
+    return payload
+
+
+def common_active_configuration_boundary(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    minimum_source_sequences: Mapping[str, int],
+    epoch_number: int,
+    tree_id: int,
+    root_replica: int,
+    members_breadth_first: Sequence[int],
+    fanout: int,
+    maximum_skew_ns: int,
+    observed_ns: int,
+) -> dict[str, Any] | None:
+    _validate_crash_tree_roles(
+        members_breadth_first,
+        fanout=fanout,
+        root_replica=root_replica,
+    )
+    if maximum_skew_ns <= 0 or observed_ns <= 0:
+        raise RunnerError("configuration boundary clocks must be positive")
+    expected_sources = {f"replica-{replica}" for replica in REPLICA_IDS}
+    if set(streams) != expected_sources or set(minimum_source_sequences) != expected_sources:
+        raise RunnerError("configuration boundary requires all seven replica streams")
+
+    selected: list[dict[str, Any]] = []
+    digests: set[str] = set()
+    timestamps: list[int] = []
+    for replica in REPLICA_IDS:
+        source_id = f"replica-{replica}"
+        candidates = [
+            event
+            for event in streams[source_id]
+            if event.get("event_type") == "adaptive.configuration_active"
+            and _source_sequence(event) > minimum_source_sequences[source_id]
+        ]
+        if not candidates:
+            return None
+        event = candidates[-1]
+        payload = _active_configuration_payload(event, replica=replica)
+        if payload.get("epoch_number") != epoch_number or payload.get("tree_id") != tree_id:
+            return None
+        sequence = _source_sequence(event)
+        timestamp = _event_timestamp(event)
+        if timestamp > observed_ns:
+            raise RunnerError("configuration evidence timestamp follows observation")
+        digest = str(payload["epoch_digest"])
+        digests.add(digest)
+        timestamps.append(timestamp)
+        selected.append(
+            {
+                "source_id": source_id,
+                "source_sequence": sequence,
+                "source_monotonic_ns": timestamp,
+            }
+        )
+    if len(digests) != 1:
+        raise RunnerError("replicas disagree on the active epoch-0 digest")
+    if max(timestamps) - min(timestamps) > maximum_skew_ns:
+        return None
+    return {
+        "epoch_number": epoch_number,
+        "tree_id": tree_id,
+        "root_replica": root_replica,
+        "epoch_digest": next(iter(digests)),
+        "context_generation": None,
+        "replica_evidence": selected,
+    }
+
+
+class FreshConfigurationPoller:
+    """Incrementally tail the seven streams so the short tree-6 window is observable."""
+
+    def __init__(
+        self,
+        run_directory: Path,
+        minimum_source_sequences: Mapping[str, int],
+        *,
+        start_offsets: Mapping[str, int],
+        maximum_skew_ns: int,
+        clock_ns: Callable[[], int] = monotonic_raw_ns,
+    ) -> None:
+        self._paths = {
+            f"replica-{replica}": run_directory / "raw" / f"replica-{replica}.jsonl"
+            for replica in REPLICA_IDS
+        }
+        self._minimum = dict(minimum_source_sequences)
+        if set(self._minimum) != set(self._paths) or set(start_offsets) != set(
+            self._paths
+        ):
+            raise RunnerError("configuration poller requires seven source cursors")
+        self._maximum_skew_ns = maximum_skew_ns
+        self._clock_ns = clock_ns
+        self._offsets = dict(start_offsets)
+        if any(type(offset) is not int or offset < 0 for offset in self._offsets.values()):
+            raise RunnerError("configuration poller offsets must be non-negative")
+        self._pending = {source: b"" for source in self._paths}
+        self._events: dict[str, list[dict[str, Any]]] = {
+            source: [] for source in self._paths
+        }
+
+    def _consume(self) -> None:
+        for source_id, path in self._paths.items():
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(self._offsets[source_id])
+                    chunk = stream.read()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RunnerError(f"cannot tail structured events {path}: {exc}") from exc
+            self._offsets[source_id] += len(chunk)
+            payload = self._pending[source_id] + chunk
+            newline = payload.rfind(b"\n")
+            if newline < 0:
+                if len(payload) > 64 * 1024:
+                    raise RunnerError(f"unterminated structured event exceeds limit in {path}")
+                self._pending[source_id] = payload
+                continue
+            complete = payload[: newline + 1]
+            self._pending[source_id] = payload[newline + 1 :]
+            for line in complete.splitlines():
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RunnerError(
+                        f"malformed incremental structured event in {path}: {exc.msg}"
+                    ) from exc
+                if not isinstance(event, dict):
+                    raise RunnerError(f"non-object incremental structured event in {path}")
+                if (
+                    event.get("event_type") == "adaptive.configuration_active"
+                    and _source_sequence(event) > self._minimum[source_id]
+                ):
+                    self._events[source_id].append(event)
+
+    def poll(self) -> dict[str, Any] | None:
+        self._consume()
+        observed_ns = self._clock_ns()
+        candidate = common_active_configuration_boundary(
+            self._events,
+            minimum_source_sequences=self._minimum,
+            epoch_number=0,
+            tree_id=6,
+            root_replica=6,
+            members_breadth_first=(6, 0, 1, 2, 3, 4, 5),
+            fanout=2,
+            maximum_skew_ns=self._maximum_skew_ns,
+            observed_ns=observed_ns,
+        )
+        if candidate is None:
+            return None
+        # A second nonblocking pass closes the ordinary poll/read interleaving.
+        # The post-SIGKILL audit below remains the fail-closed race detector.
+        self._consume()
+        return common_active_configuration_boundary(
+            self._events,
+            minimum_source_sequences=self._minimum,
+            epoch_number=0,
+            tree_id=6,
+            root_replica=6,
+            members_breadth_first=(6, 0, 1, 2, 3, 4, 5),
+            fanout=2,
+            maximum_skew_ns=self._maximum_skew_ns,
+            observed_ns=self._clock_ns(),
+        )
+
+
+def replica_event_tail_snapshot(
+    run_directory: Path,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Capture the last complete source sequence and byte boundary per replica."""
+    watermarks: dict[str, int] = {}
+    offsets: dict[str, int] = {}
+    for replica in REPLICA_IDS:
+        source_id = f"replica-{replica}"
+        path = run_directory / "raw" / f"replica-{replica}.jsonl"
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RunnerError(f"cannot snapshot structured events {path}: {exc}") from exc
+        newline = payload.rfind(b"\n")
+        if newline < 0:
+            watermarks[source_id] = 0
+            offsets[source_id] = 0
+            continue
+        end = newline
+        while end > 0 and payload[end - 1 : end] == b"\n":
+            end -= 1
+        start = payload.rfind(b"\n", 0, end) + 1
+        line = payload[start:end]
+        if not line:
+            watermarks[source_id] = 0
+            offsets[source_id] = newline + 1
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RunnerError(
+                f"malformed final complete structured event in {path}: {exc.msg}"
+            ) from exc
+        if not isinstance(event, dict):
+            raise RunnerError(f"non-object final structured event in {path}")
+        watermarks[source_id] = _source_sequence(event)
+        offsets[source_id] = newline + 1
+    return watermarks, offsets
 
 
 def _commits(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1080,13 +1381,74 @@ def find_common_root_cycle(
     if require_terminal:
         if tuple(root for root, _, _ in groups[-len(expected) :]) != expected:
             return None
-        return groups[-1][1] if groups[-1][2] else None
+        terminal = groups[-len(expected) :]
+        return terminal[-1][1] if all(group[2] for group in terminal) else None
     for index in range(len(groups) - len(expected), -1, -1):
         if tuple(root for root, _, _ in groups[index : index + len(expected)]) == expected:
-            endpoint = groups[index + len(expected) - 1]
-            if endpoint[2]:
-                return endpoint[1]
+            cycle = groups[index : index + len(expected)]
+            if all(group[2] for group in cycle):
+                return cycle[-1][1]
     return None
+
+
+def assert_crash_boundary_held(
+    boundary: Mapping[str, Any],
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    crash_request_ns: int,
+) -> None:
+    evidence = boundary.get("replica_evidence")
+    if not isinstance(evidence, list) or len(evidence) != len(REPLICA_IDS):
+        raise RunnerError("tree-6 boundary lacks seven replica evidence references")
+    latest_boundary_ns = 0
+    observer_boundary_sequence: int | None = None
+    for replica, reference in zip(REPLICA_IDS, evidence):
+        if not isinstance(reference, dict):
+            raise RunnerError("tree-6 boundary contains malformed replica evidence")
+        source_id = f"replica-{replica}"
+        if reference.get("source_id") != source_id:
+            raise RunnerError("tree-6 boundary source order is not canonical")
+        sequence = reference.get("source_sequence")
+        timestamp = reference.get("source_monotonic_ns")
+        if type(sequence) is not int or type(timestamp) is not int:
+            raise RunnerError("tree-6 boundary reference is not integral")
+        matches = [
+            event for event in streams.get(source_id, ())
+            if event.get("source_sequence") == sequence
+        ]
+        if len(matches) != 1 or _event_timestamp(matches[0]) != timestamp:
+            raise RunnerError("tree-6 boundary no longer matches its source event")
+        latest_boundary_ns = max(latest_boundary_ns, timestamp)
+        if source_id == AUTHORITATIVE_SOURCE_ID:
+            observer_boundary_sequence = sequence
+        for event in streams[source_id]:
+            if (
+                event.get("event_type") == "adaptive.configuration_active"
+                and _source_sequence(event) > sequence
+                and _event_timestamp(event) <= crash_request_ns
+            ):
+                raise RunnerError(
+                    "configuration changed after tree-6 boundary before crash request"
+                )
+    if latest_boundary_ns >= crash_request_ns:
+        raise RunnerError("crash request does not follow the observed tree-6 boundary")
+    if observer_boundary_sequence is None:
+        raise RunnerError("tree-6 boundary lacks authoritative observer evidence")
+    for event in _commits(streams[AUTHORITATIVE_SOURCE_ID]):
+        timestamp = _event_timestamp(event)
+        if (
+            _source_sequence(event) <= observer_boundary_sequence
+            or timestamp > crash_request_ns
+        ):
+            continue
+        payload = event.get("payload")
+        proof = payload.get("decision_proof") if isinstance(payload, dict) else None
+        if not isinstance(proof, dict) or (
+            proof.get("epoch_number"), proof.get("tree_id")
+        ) != (0, 6):
+            raise RunnerError(
+                "authoritative root changed after tree-6 boundary before crash request"
+            )
 
 
 def _check_processes(records: Sequence[ProcessRecord], expected_crashed: set[int]) -> None:
@@ -1306,6 +1668,7 @@ def build_manifest(
     interrupted: bool,
     runtime_error: str | None,
     unexpected_survivor_exits: Sequence[Any],
+    crash_configuration_boundary: Mapping[str, Any] | None = None,
     runtime: Mapping[str, Any] | None = None,
     runtime_artifacts: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
@@ -1366,6 +1729,11 @@ def build_manifest(
         "end_ns": end_ns,
         "sources": sources,
         "crash_markers": [dict(marker) for marker in crash_markers],
+        "crash_configuration_boundary": (
+            dict(crash_configuration_boundary)
+            if crash_configuration_boundary is not None
+            else None
+        ),
         "runtime": dict(runtime or {}),
         "runtime_artifacts": [dict(artifact) for artifact in runtime_artifacts],
     }
@@ -1482,6 +1850,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     records: list[ProcessRecord] = []
     records_by_replica: dict[int, ProcessRecord] = {}
     crash_markers: list[dict[str, Any]] = []
+    crash_configuration_boundary: dict[str, Any] | None = None
     runtime_artifacts: list[dict[str, Any]] = []
     runtime = runtime_parameters(
         profile,
@@ -1509,6 +1878,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             baseline_start_ns=baseline_start_ns,
             end_ns=end_ns,
             crash_markers=crash_markers,
+            crash_configuration_boundary=crash_configuration_boundary,
             complete=complete,
             interrupted=interrupted,
             runtime_error=runtime_error,
@@ -1616,7 +1986,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 epoch_number=0,
                 tree_roots={tree: tree for tree in REPLICA_IDS},
                 expected_roots=REPLICA_IDS,
-                require_terminal=True,
+                require_terminal=False,
             )
 
         def baseline_health() -> None:
@@ -1629,19 +1999,42 @@ def run(argv: Sequence[str] | None = None) -> int:
             )
 
         _wait(
-            "seven complete baseline buckets and terminal common roots 0..6",
+            "seven complete baseline buckets and one common root cycle 0..6",
             args.phase_timeout,
             records,
             baseline_cycle,
             health=baseline_health,
         )
 
+        source_watermarks, source_offsets = replica_event_tail_snapshot(run_directory)
+        configuration_poller = FreshConfigurationPoller(
+            run_directory,
+            source_watermarks,
+            start_offsets=source_offsets,
+            maximum_skew_ns=runtime["aggregation_timeout_ms"] * 1_000_000,
+        )
+        crash_configuration_boundary = _wait(
+            "fresh common epoch-0 tree-6 active configuration",
+            args.phase_timeout,
+            records,
+            configuration_poller.poll,
+        )
+
         state["phase"] = "crash"
+        state["crash_configuration_boundary"] = crash_configuration_boundary
         _replace_json(state_path, state)
         crash_markers = inject_sigkill_crashes(
             records_by_replica,
             CRASH_TARGETS,
             timeout_s=args.crash_confirm_timeout,
+        )
+        assert crash_configuration_boundary is not None
+        assert_crash_boundary_held(
+            crash_configuration_boundary,
+            _event_streams(run_directory),
+            crash_request_ns=max(
+                marker["requested_monotonic_raw_ns"] for marker in crash_markers
+            ),
         )
         update_manifest()
 

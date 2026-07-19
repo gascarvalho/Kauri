@@ -114,6 +114,25 @@ def command_payload() -> dict[str, Any]:
     }
 
 
+def _configuration_active_payload(replica: int, tree: int = 6) -> dict[str, Any]:
+    return {
+        "epoch_number": 0,
+        "tree_id": tree,
+        "epoch_digest": EPOCH_0_DIGEST,
+        "block_hash": None,
+        "context_generation": None,
+        "observer_replica": replica,
+        "wait_exempt_signers": [],
+        "accepted_signers": [],
+        "absent_direct_children": [],
+        "missing_optional_signers": [],
+        "required_branch_gaps": [],
+        "root_signer_count": 0,
+        "global_quorum": 5,
+        "rejection_reason": None,
+    }
+
+
 def epochs_document() -> dict[str, Any]:
     initial_trees = [
         {
@@ -183,9 +202,6 @@ def _replica_events(replica: int) -> list[dict[str, Any]]:
             payload={"exit_status": None},
         )
     )
-    if replica in (0, 1):
-        return events
-
     schedule: list[tuple[int, int, int, int, int]] = []
     height = 1
     for root, timestamp in enumerate(range(2, 37, 5)):
@@ -198,6 +214,8 @@ def _replica_events(replica: int) -> list[dict[str, Any]]:
         schedule.append((height, timestamp * 1_000_000_000, 1, index % 5, 100))
         height += 1
     for height, timestamp, epoch, tree, transactions in schedule:
+        if replica in (0, 1) and timestamp >= (CRASH_0_NS, CRASH_1_NS)[replica]:
+            continue
         events.append(
             _envelope(
                 source_kind="replica",
@@ -214,6 +232,18 @@ def _replica_events(replica: int) -> list[dict[str, Any]]:
                 ),
             )
         )
+    events.append(
+        _envelope(
+            source_kind="replica",
+            source_id=source_id,
+            source_instance=instance,
+            timestamp_ns=35_000_000_000 + replica * 1_000_000,
+            event_type="adaptive.configuration_active",
+            payload=_configuration_active_payload(replica),
+        )
+    )
+    if replica in (0, 1):
+        return events
     events.append(
         _envelope(
             source_kind="replica",
@@ -612,10 +642,24 @@ def create_run(directory: Path) -> tuple[Path, Path]:
     raw_directory = directory / "raw"
     raw_directory.mkdir(parents=True)
     sources: list[dict[str, Any]] = []
+    boundary_evidence: list[dict[str, Any]] = []
     for replica in range(7):
         source_id = f"replica-{replica}"
         relative = f"raw/{source_id}.jsonl"
-        _write_stream(directory / relative, _replica_events(replica))
+        replica_events = _replica_events(replica)
+        _write_stream(directory / relative, replica_events)
+        active = next(
+            event
+            for event in replica_events
+            if event["event_type"] == "adaptive.configuration_active"
+        )
+        boundary_evidence.append(
+            {
+                "source_id": source_id,
+                "source_sequence": active["source_sequence"],
+                "source_monotonic_ns": active["source_monotonic_ns"],
+            }
+        )
         sources.append(
             {
                 "source_kind": "replica",
@@ -678,6 +722,14 @@ def create_run(directory: Path) -> tuple[Path, Path]:
         "sources": sources,
         "runtime": runtime,
         "runtime_artifacts": runtime_artifacts,
+        "crash_configuration_boundary": {
+            "epoch_number": 0,
+            "tree_id": 6,
+            "root_replica": 6,
+            "epoch_digest": EPOCH_0_DIGEST,
+            "context_generation": None,
+            "replica_evidence": boundary_evidence,
+        },
         "crash_markers": [
             {
                 "replica_id": replica,
