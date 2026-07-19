@@ -339,6 +339,203 @@ TEST_CASE("adaptive pn handlers authenticate the connection before delegation",
     }
 }
 
+TEST_CASE(
+    "adaptive v2 core reports only over pinned authenticated pn transport",
+    "[adaptive-v2][manager-reporting][pn][tls][lifecycle][retry]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto constructor = function_body(
+        implementation, "HotStuffBase::HotStuffBase(");
+    const auto connection = function_body(
+        implementation, "bool HotStuffBase::conn_handler(");
+    const auto authorize = function_body(
+        implementation, "bool HotStuffBase::authorize_manager_peer(");
+    const auto configure = function_body(
+        implementation, "void HotStuffBase::configure_epoch_manager(");
+    const auto initialize = function_body(
+        implementation, "void HotStuffBase::initialize_adaptive_epoch_runtime(");
+    const auto admit = function_body(
+        implementation, "HotStuffBase::admit_exact_context(");
+    const auto consensus = function_body(
+        implementation, "void HotStuffBase::do_consensus(");
+    const auto start = function_body(
+        implementation, "void HotStuffBase::start(");
+    const auto legacy_report = function_body(
+        implementation, "void HotStuffBase::on_report_timer(");
+    const auto bind = function_body(
+        implementation,
+        "void HotStuffBase::bind_adaptive_v2_manager_reporting_transport(");
+    const auto evidence = function_body(
+        implementation,
+        "HotStuffBase::enqueue_adaptive_v2_evidence_report(");
+    const auto readiness = function_body(
+        implementation,
+        "void HotStuffBase::enqueue_initial_adaptive_v2_readiness(");
+    const auto initialized = function_body(
+        implementation,
+        "void HotStuffBase::report_adaptive_v2_runtime_initialized(");
+    const auto committed = function_body(
+        implementation,
+        "void HotStuffBase::report_adaptive_v2_committed(");
+    const auto schedule = function_body(
+        implementation,
+        "void HotStuffBase::schedule_adaptive_v2_reporting_flush(");
+    const auto flush = function_body(
+        implementation,
+        "void HotStuffBase::flush_adaptive_v2_reporting(");
+    const auto transmit = function_body(
+        implementation,
+        "HotStuffBase::transmit_adaptive_v2_report(");
+
+    CHECK(contains_all(
+        header,
+        {"AdaptiveV2ReportingOutbox",
+         "adaptive_v2_reporting_outbox",
+         "adaptive_v2_reporting_flush_cancellation",
+         "adaptive_v2_readiness_enqueued",
+         "adaptive_v2_initialized_lifecycle_reports",
+         "epoch_manager_address"}));
+
+    REQUIRE_FALSE(constructor.empty());
+    CHECK(contains_in_order(
+        constructor,
+        {"EpochProtocolMode::adaptive_v2",
+         "AdaptiveV2ReportingOutboxConfig",
+         "adaptive_v2_reporting_outbox",
+         "AdaptiveV2ResponseEvidenceBridge"}));
+    CHECK(contains_all(
+        constructor,
+        {"adaptive_v2_reporting_maximum_delivery_attempts",
+         "initial_retry_backoff_ns",
+         "maximum_retry_backoff_ns"}));
+    CHECK(contains_in_order(
+        constructor,
+        {"if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)",
+         "rn.start()",
+         "rn.connect_sync(reputation_addr)"}));
+
+    REQUIRE_FALSE(connection.empty());
+    CHECK(contains_in_order(
+        connection,
+        {"conn->get_peer_cert()",
+         "EpochProtocolMode::adaptive_v2",
+         "cert != nullptr",
+         "valid_tls_certs.count"}));
+
+    REQUIRE_FALSE(authorize.empty());
+    CHECK(authorize.find("is_adaptive_epoch_mode") != std::string::npos);
+    REQUIRE_FALSE(configure.empty());
+    CHECK(contains_in_order(
+        configure,
+        {"is_adaptive_epoch_mode",
+         "manager_peer.is_null()",
+         "epoch_manager_peer.has_value()",
+         "epoch_manager_address.has_value()",
+         "epoch manager identity cannot be repinned",
+         "valid_tls_certs.insert",
+         "pn.add_peer(manager_peer)",
+         "pn.conn_peer(manager_peer)",
+         "EpochProtocolMode::adaptive_v2",
+         "bind_adaptive_v2_manager_reporting_transport",
+         "schedule_adaptive_v2_reporting_flush"}));
+
+    REQUIRE_FALSE(initialize.empty());
+    CHECK(contains_in_order(
+        initialize,
+        {"adaptive_epoch_runtime = std::move(runtime)",
+         "epoch_live_binding =",
+         "enqueue_initial_adaptive_v2_readiness"}));
+    REQUIRE_FALSE(readiness.empty());
+    CHECK(contains_all(
+        readiness,
+        {"adaptive_v2_readiness_enqueued",
+         "configuration.epoch_number != 0",
+         "configuration.tree_id != 0",
+         "generation.has_value()",
+         "*generation != 1",
+         "enqueue_readiness(",
+         "configuration, *generation, 0",
+         "schedule_adaptive_v2_reporting_flush"}));
+
+    REQUIRE_FALSE(admit.empty());
+    CHECK(contains_in_order(
+        admit,
+        {"initialize_accumulator(",
+         "report_adaptive_v2_runtime_initialized(metadata.key)"}));
+    REQUIRE_FALSE(initialized.empty());
+    CHECK(contains_all(
+        initialized,
+        {"NormalProposalRuntimeInitialized",
+         "enqueue_lifecycle",
+         "adaptive_v2_initialized_lifecycle_reports",
+         "schedule_adaptive_v2_reporting_flush"}));
+    REQUIRE_FALSE(consensus.empty());
+    CHECK(contains_in_order(
+        consensus,
+        {"cache_adaptive_v2_commit(blk, keys)",
+         "report_adaptive_v2_committed("}));
+    REQUIRE_FALSE(committed.empty());
+    CHECK(contains_all(
+        committed,
+        {"ProposalCommitted",
+         "enqueue_lifecycle",
+         "schedule_adaptive_v2_reporting_flush"}));
+
+    REQUIRE_FALSE(bind.empty());
+    CHECK(bind.find("adaptive_v2_response_evidence->bind_transport(") !=
+          std::string::npos);
+    REQUIRE_FALSE(evidence.empty());
+    CHECK(contains_in_order(
+        evidence,
+        {"adaptive_v2_reporting_outbox->enqueue_evidence(",
+         "AdaptiveV2ReportingEnqueueStatus::queued",
+         "schedule_adaptive_v2_reporting_flush",
+         "EvidenceTransportResult::accepted"}));
+    CHECK(evidence.find("rn.send_msg") == std::string::npos);
+
+    REQUIRE_FALSE(transmit.empty());
+    CHECK(contains_all(
+        transmit,
+        {"authorize_manager_peer",
+         "pn.get_peer_conn",
+         "is_terminated()",
+         "get_peer_cert()",
+         "PeerId(*manager_certificate) != manager_peer",
+         "MsgAdaptiveV2ReadinessNotice",
+         "MsgProposalLifecycleNotice",
+         "MsgEvidenceReport",
+         "pn.send_msg",
+         "manager_connection"}));
+    CHECK(transmit.find("rn.send_msg") == std::string::npos);
+    REQUIRE_FALSE(schedule.empty());
+    CHECK(contains_all(
+        schedule,
+        {"aggregation_scheduler->schedule_after(",
+         "exact_runtime_access",
+         "flush_adaptive_v2_reporting"}));
+    REQUIRE_FALSE(flush.empty());
+    CHECK(contains_all(
+        flush,
+        {"begin_delivery(",
+         "transmit_adaptive_v2_report(",
+         "acknowledge_delivery(",
+         "release_terminal(",
+         "retry_not_due",
+         "schedule_adaptive_v2_reporting_flush"}));
+
+    REQUIRE_FALSE(start.empty());
+    CHECK(contains_in_order(
+        start,
+        {"if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)",
+         "ev_report_timer = TimerEvent",
+         "ev_report_timer.add(report_period)"}));
+    REQUIRE_FALSE(legacy_report.empty());
+    CHECK(contains_in_order(
+        legacy_report,
+        {"EpochProtocolMode::adaptive_v2", "return", "rn.send_msg"}));
+}
+
 TEST_CASE("live topology is prepared before the nofail exact-height swap",
           "[rem-d11][epoch-live-binding][two-phase][intentional-red]")
 {

@@ -52,6 +52,10 @@ namespace hotstuff
             std::chrono::milliseconds(5);
         constexpr auto adaptive_v2_evidence_retry_delay =
             std::chrono::milliseconds(5);
+        constexpr std::uint32_t
+            adaptive_v2_reporting_maximum_delivery_attempts = 32;
+        constexpr auto adaptive_v2_reporting_maximum_retry_delay =
+            std::chrono::seconds(1);
 
         bool signer_sets_overlap(
             const std::set<ReplicaID> &left,
@@ -1587,6 +1591,7 @@ namespace hotstuff
             forget_proposal_view_generation(metadata.key);
             return std::nullopt;
         }
+        report_adaptive_v2_runtime_initialized(metadata.key);
         return lease;
     }
 
@@ -1664,6 +1669,7 @@ namespace hotstuff
         adaptive_epoch_runtime = std::move(runtime);
         epoch_live_binding = &adaptive_epoch_runtime->binding;
         adaptive_v2_rotation_coordinator = std::move(coordinator);
+        enqueue_initial_adaptive_v2_readiness();
     }
 
     EpochChangeProposalChainResult
@@ -5026,6 +5032,10 @@ namespace hotstuff
         {
             auto cert = conn->get_peer_cert();
             // SALTICIDAE_LOG_INFO("%s", salticidae::get_hash(cert->get_der()).to_hex().c_str());
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+                return cert != nullptr &&
+                       valid_tls_certs.count(
+                           salticidae::get_hash(cert->get_der())) != 0;
             return (!cert) || valid_tls_certs.count(salticidae::get_hash(cert->get_der()));
         }
         return true;
@@ -5138,6 +5148,21 @@ namespace hotstuff
         initialize_committed_epoch_change_history();
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
         {
+            AdaptiveV2ReportingOutboxConfig reporting_config;
+            reporting_config.source_replica_id = get_id();
+            reporting_config.limits.maximum_delivery_attempts =
+                adaptive_v2_reporting_maximum_delivery_attempts;
+            reporting_config.limits.initial_retry_backoff_ns =
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        adaptive_v2_evidence_retry_delay).count());
+            reporting_config.limits.maximum_retry_backoff_ns =
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        adaptive_v2_reporting_maximum_retry_delay).count());
+            adaptive_v2_reporting_outbox =
+                std::make_unique<AdaptiveV2ReportingOutbox>(
+                    std::move(reporting_config));
             adaptive_v2_response_evidence =
                 std::make_unique<AdaptiveV2ResponseEvidenceBridge>(
                     get_id());
@@ -5175,8 +5200,11 @@ namespace hotstuff
         pn.start();
         pn.listen(listen_addr);
 
-        rn.start();
-        reputation_server_conn = rn.connect_sync(reputation_addr);
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        {
+            rn.start();
+            reputation_server_conn = rn.connect_sync(reputation_addr);
+        }
     }
 
     void HotStuffBase::install_legacy_consensus_handlers()
@@ -5225,7 +5253,7 @@ namespace hotstuff
     bool HotStuffBase::authorize_manager_peer(
         const PeerId &peer) const noexcept
     {
-        return epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        return is_adaptive_epoch_mode(epoch_protocol_mode) &&
                epoch_manager_peer.has_value() && !peer.is_null() &&
                peer == *epoch_manager_peer;
     }
@@ -5234,16 +5262,377 @@ namespace hotstuff
         const PeerId &manager_peer,
         const NetAddr &manager_address)
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v1 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             manager_peer.is_null())
             throw std::logic_error(
                 "epoch manager is available only in adaptive mode");
+        if (epoch_manager_peer.has_value() ||
+            epoch_manager_address.has_value())
+        {
+            if (!epoch_manager_peer.has_value() ||
+                !epoch_manager_address.has_value() ||
+                *epoch_manager_peer != manager_peer ||
+                *epoch_manager_address != manager_address)
+                throw std::logic_error(
+                    "epoch manager identity cannot be repinned");
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+            {
+                bind_adaptive_v2_manager_reporting_transport();
+                schedule_adaptive_v2_reporting_flush(
+                    adaptive_v2_evidence_retry_delay);
+            }
+            return;
+        }
         epoch_manager_peer = manager_peer;
+        epoch_manager_address = manager_address;
         valid_tls_certs.insert(
             static_cast<const uint256_t &>(manager_peer));
         pn.add_peer(manager_peer);
         pn.set_peer_addr(manager_peer, manager_address);
         pn.conn_peer(manager_peer);
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        {
+            bind_adaptive_v2_manager_reporting_transport();
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+        }
+    }
+
+    void HotStuffBase::bind_adaptive_v2_manager_reporting_transport()
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_response_evidence == nullptr ||
+            adaptive_v2_reporting_outbox == nullptr)
+            return;
+        adaptive_v2_response_evidence->bind_transport(
+            [this](const EvidenceReportEnvelope &report) {
+                return enqueue_adaptive_v2_evidence_report(report);
+            });
+    }
+
+    EvidenceTransportResult HotStuffBase::enqueue_adaptive_v2_evidence_report(
+        const EvidenceReportEnvelope &report) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_reporting_outbox == nullptr)
+            return EvidenceTransportResult::permanent_failure;
+
+        const auto status =
+            adaptive_v2_reporting_outbox->enqueue_evidence(
+                report.canonical_payload);
+        if (status == AdaptiveV2ReportingEnqueueStatus::queued)
+        {
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+            return EvidenceTransportResult::accepted;
+        }
+        if (status ==
+            AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
+            return EvidenceTransportResult::temporary_failure;
+        return EvidenceTransportResult::permanent_failure;
+    }
+
+    void HotStuffBase::enqueue_initial_adaptive_v2_readiness() noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_readiness_enqueued ||
+            adaptive_v2_reporting_outbox == nullptr ||
+            adaptive_epoch_runtime == nullptr)
+            return;
+        try
+        {
+            const auto configuration = adaptive_epoch_runtime->activation
+                                           .active_effect().configuration;
+            if (configuration.epoch_number != 0 ||
+                configuration.tree_id != 0)
+                return;
+            const auto generation =
+                find_exact_runtime_generation(configuration);
+            if (!generation.has_value() || *generation != 1)
+                return;
+            if (adaptive_v2_reporting_outbox->enqueue_readiness(
+                    configuration, *generation, 0) !=
+                AdaptiveV2ReportingEnqueueStatus::queued)
+                return;
+            adaptive_v2_readiness_enqueued = true;
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+        }
+        catch (...)
+        {
+            // Reporting is observational and cannot affect consensus startup.
+        }
+    }
+
+    void HotStuffBase::report_adaptive_v2_runtime_initialized(
+        const ProposalKey &key) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_reporting_outbox == nullptr)
+            return;
+        try
+        {
+            if (adaptive_v2_initialized_lifecycle_reports.size() >=
+                maximum_proposal_view_generation_observations)
+                return;
+            const auto inserted =
+                adaptive_v2_initialized_lifecycle_reports.insert(key);
+            if (!inserted.second)
+                return;
+            const ProposalLifecycleFact fact =
+                NormalProposalRuntimeInitialized{key};
+            if (adaptive_v2_reporting_outbox->enqueue_lifecycle(fact) !=
+                AdaptiveV2ReportingEnqueueStatus::queued)
+            {
+                adaptive_v2_initialized_lifecycle_reports.erase(
+                    inserted.first);
+                return;
+            }
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+        }
+        catch (...)
+        {
+            // Lifecycle reporting is observational and fail-closed locally.
+        }
+    }
+
+    void HotStuffBase::report_adaptive_v2_committed(
+        const std::optional<ProposalKey> &key) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_reporting_outbox == nullptr ||
+            !key.has_value())
+            return;
+        try
+        {
+            const ProposalLifecycleFact fact = ProposalCommitted{*key};
+            if (adaptive_v2_reporting_outbox->enqueue_lifecycle(fact) ==
+                AdaptiveV2ReportingEnqueueStatus::queued)
+                schedule_adaptive_v2_reporting_flush(
+                    adaptive_v2_evidence_retry_delay);
+        }
+        catch (...)
+        {
+            // Lifecycle reporting is observational and fail-closed locally.
+        }
+    }
+
+    AdaptiveV2ReportingDeliveryResult
+    HotStuffBase::transmit_adaptive_v2_report(
+        const AdaptiveV2PendingReport &report) noexcept
+    {
+        if (!epoch_manager_peer.has_value() ||
+            !authorize_manager_peer(*epoch_manager_peer))
+            return AdaptiveV2ReportingDeliveryResult::permanent_failure;
+        try
+        {
+            const auto manager_peer = *epoch_manager_peer;
+            const auto manager_connection =
+                pn.get_peer_conn(manager_peer);
+            if (manager_connection == nullptr ||
+                manager_connection->is_terminated())
+                return AdaptiveV2ReportingDeliveryResult::temporary_failure;
+            const auto *manager_certificate =
+                manager_connection->get_peer_cert();
+            if (manager_certificate == nullptr ||
+                PeerId(*manager_certificate) != manager_peer)
+                return AdaptiveV2ReportingDeliveryResult::temporary_failure;
+
+            bool sent = false;
+            switch (report.stream)
+            {
+            case AdaptiveV2ReportingStream::readiness:
+                if (report.opcode !=
+                    MsgAdaptiveV2ReadinessNotice::opcode)
+                    return AdaptiveV2ReportingDeliveryResult::
+                        permanent_failure;
+                sent = pn.send_msg(
+                    MsgAdaptiveV2ReadinessNotice(
+                        DataStream(report.canonical_payload)),
+                    manager_connection);
+                break;
+            case AdaptiveV2ReportingStream::lifecycle:
+                if (report.opcode != MsgProposalLifecycleNotice::opcode)
+                    return AdaptiveV2ReportingDeliveryResult::
+                        permanent_failure;
+                sent = pn.send_msg(
+                    MsgProposalLifecycleNotice(
+                        DataStream(report.canonical_payload)),
+                    manager_connection);
+                break;
+            case AdaptiveV2ReportingStream::evidence:
+                if (report.opcode != MsgEvidenceReport::opcode)
+                    return AdaptiveV2ReportingDeliveryResult::
+                        permanent_failure;
+                sent = pn.send_msg(
+                    MsgEvidenceReport(
+                        DataStream(report.canonical_payload)),
+                    manager_connection);
+                break;
+            }
+            return sent
+                       ? AdaptiveV2ReportingDeliveryResult::delivered
+                       : AdaptiveV2ReportingDeliveryResult::
+                             temporary_failure;
+        }
+        catch (...)
+        {
+            return AdaptiveV2ReportingDeliveryResult::temporary_failure;
+        }
+    }
+
+    void HotStuffBase::schedule_adaptive_v2_reporting_flush(
+        AggregationScheduler::Duration delay) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_reporting_outbox == nullptr ||
+            aggregation_scheduler == nullptr ||
+            !epoch_manager_peer.has_value() ||
+            !authorize_manager_peer(*epoch_manager_peer) ||
+            adaptive_v2_reporting_flush_cancellation ||
+            delay <= AggregationScheduler::Duration::zero())
+            return;
+        try
+        {
+            const auto access = exact_runtime_access;
+            auto cancellation = aggregation_scheduler->schedule_after(
+                delay,
+                [access]() {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    auto &owner = runtime->owner();
+                    owner.adaptive_v2_reporting_flush_cancellation = {};
+                    owner.flush_adaptive_v2_reporting();
+                });
+            if (cancellation)
+                adaptive_v2_reporting_flush_cancellation =
+                    std::move(cancellation);
+        }
+        catch (...)
+        {
+            // Reporting scheduler failure cannot affect consensus progress.
+        }
+    }
+
+    void HotStuffBase::cancel_adaptive_v2_reporting_flush() noexcept
+    {
+        auto cancellation =
+            std::move(adaptive_v2_reporting_flush_cancellation);
+        adaptive_v2_reporting_flush_cancellation = {};
+        if (!cancellation)
+            return;
+        try
+        {
+            cancellation();
+        }
+        catch (...)
+        {
+            // Cancellation is best effort during shutdown.
+        }
+    }
+
+    void HotStuffBase::flush_adaptive_v2_reporting() noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_reporting_outbox == nullptr ||
+            !epoch_manager_peer.has_value() ||
+            !authorize_manager_peer(*epoch_manager_peer))
+            return;
+
+        while (true)
+        {
+            const auto now = adaptive_monotonic_now_ns();
+            const auto attempt =
+                adaptive_v2_reporting_outbox->begin_delivery(now);
+            if (attempt.status ==
+                AdaptiveV2ReportingAttemptStatus::empty ||
+                attempt.status ==
+                    AdaptiveV2ReportingAttemptStatus::already_in_flight ||
+                attempt.status ==
+                    AdaptiveV2ReportingAttemptStatus::stopped ||
+                attempt.status ==
+                    AdaptiveV2ReportingAttemptStatus::unhealthy)
+                return;
+
+            if (attempt.status ==
+                AdaptiveV2ReportingAttemptStatus::retry_not_due)
+            {
+                if (attempt.report == nullptr ||
+                    attempt.report->next_attempt_monotonic_ns <= now)
+                    return;
+                const auto remaining =
+                    attempt.report->next_attempt_monotonic_ns - now;
+                const auto maximum = static_cast<std::uint64_t>(
+                    std::numeric_limits<
+                        AggregationScheduler::Duration::rep>::max());
+                schedule_adaptive_v2_reporting_flush(
+                    AggregationScheduler::Duration(
+                        static_cast<
+                            AggregationScheduler::Duration::rep>(
+                            std::min(remaining, maximum))));
+                return;
+            }
+
+            if (attempt.status ==
+                AdaptiveV2ReportingAttemptStatus::terminal)
+            {
+                if (attempt.report == nullptr ||
+                    adaptive_v2_reporting_outbox->release_terminal(
+                        attempt.report->report_id) !=
+                        AdaptiveV2ReportingReleaseStatus::released)
+                    return;
+                continue;
+            }
+
+            if (attempt.status !=
+                    AdaptiveV2ReportingAttemptStatus::started ||
+                !attempt.token.has_value() || attempt.report == nullptr)
+                return;
+
+            const auto report_id = attempt.report->report_id;
+            const auto delivery =
+                transmit_adaptive_v2_report(*attempt.report);
+            const auto transition =
+                adaptive_v2_reporting_outbox->acknowledge_delivery(
+                    *attempt.token, delivery, now);
+            if (transition ==
+                AdaptiveV2ReportingTransitionStatus::delivered)
+            {
+                if (adaptive_v2_reporting_outbox->release_terminal(
+                        report_id) !=
+                    AdaptiveV2ReportingReleaseStatus::released)
+                    return;
+                continue;
+            }
+            if (transition ==
+                AdaptiveV2ReportingTransitionStatus::retry_scheduled)
+            {
+                const auto *pending =
+                    adaptive_v2_reporting_outbox->front();
+                if (pending == nullptr ||
+                    pending->next_attempt_monotonic_ns <= now)
+                    return;
+                const auto remaining =
+                    pending->next_attempt_monotonic_ns - now;
+                const auto maximum = static_cast<std::uint64_t>(
+                    std::numeric_limits<
+                        AggregationScheduler::Duration::rep>::max());
+                schedule_adaptive_v2_reporting_flush(
+                    AggregationScheduler::Duration(
+                        static_cast<
+                            AggregationScheduler::Duration::rep>(
+                            std::min(remaining, maximum))));
+                return;
+            }
+            if (transition ==
+                AdaptiveV2ReportingTransitionStatus::failed)
+                static_cast<void>(
+                    adaptive_v2_reporting_outbox->release_terminal(
+                        report_id));
+            return;
+        }
     }
 
     ReplicaStageIngressResult HotStuffBase::trusted_local_stage_epoch(
@@ -5935,6 +6324,7 @@ namespace hotstuff
         try
         {
             proposal_view_generations.erase(key);
+            adaptive_v2_initialized_lifecycle_reports.erase(key);
         }
         catch (...)
         {}
@@ -5952,6 +6342,17 @@ namespace hotstuff
                     observation = proposal_view_generations.erase(observation);
                 else
                     ++observation;
+            }
+            for (auto report =
+                     adaptive_v2_initialized_lifecycle_reports.begin();
+                 report !=
+                     adaptive_v2_initialized_lifecycle_reports.end();)
+            {
+                if (report->block_hash == block_hash)
+                    report = adaptive_v2_initialized_lifecycle_reports.erase(
+                        report);
+                else
+                    ++report;
             }
         }
         catch (...)
@@ -5971,6 +6372,17 @@ namespace hotstuff
                     observation = proposal_view_generations.erase(observation);
                 else
                     ++observation;
+            }
+            for (auto report =
+                     adaptive_v2_initialized_lifecycle_reports.begin();
+                 report !=
+                     adaptive_v2_initialized_lifecycle_reports.end();)
+            {
+                if (report->configuration.epoch_number < first_live_epoch)
+                    report = adaptive_v2_initialized_lifecycle_reports.erase(
+                        report);
+                else
+                    ++report;
             }
         }
         catch (...)
@@ -6205,6 +6617,10 @@ namespace hotstuff
         // Preserve the authoritative committed key for protocol cadence and
         // copy optional evidence metadata before terminal cache cleanup.
         cache_adaptive_v2_commit(blk, keys);
+        report_adaptive_v2_committed(
+            pending_adaptive_v2_commit.has_value()
+                ? pending_adaptive_v2_commit->committed_key
+                : std::nullopt);
         record_adaptive_commit_marker(blk, keys);
         pending_exact_contributions.purge_block(blk->get_hash());
         for (const auto &key : keys)
@@ -6554,6 +6970,7 @@ namespace hotstuff
     HotStuffBase::~HotStuffBase()
     {
         pmaker->shutdown();
+        cancel_adaptive_v2_reporting_flush();
         epoch_live_binding = nullptr;
         adaptive_epoch_runtime.reset();
         cancel_all_exact_forwarding_retries();
@@ -6566,6 +6983,11 @@ namespace hotstuff
         {
             adaptive_v2_response_evidence->unbind_transport();
             adaptive_v2_response_evidence.reset();
+        }
+        if (adaptive_v2_reporting_outbox != nullptr)
+        {
+            adaptive_v2_reporting_outbox->shutdown();
+            adaptive_v2_reporting_outbox.reset();
         }
         blk_delivery_orchestrator.cancel(nullptr);
     }
@@ -6969,6 +7391,9 @@ namespace hotstuff
 
     void HotStuffBase::on_report_timer()
     {
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+            return;
+
         HOTSTUFF_LOG_INFO("[REPORT TIMER] Timer triggered for sending reports to reputation server.");
 
         if (!peer_latencies.empty())
@@ -7158,9 +7583,12 @@ namespace hotstuff
         final_buffer.reserve(blk_size);
         cmd_pending_buffer.reserve(max_cmd_pending_size);
 
-        ev_report_timer = TimerEvent(ec, [this](TimerEvent &)
-                                     { this->on_report_timer(); });
-        ev_report_timer.add(report_period);
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        {
+            ev_report_timer = TimerEvent(ec, [this](TimerEvent &)
+                                         { this->on_report_timer(); });
+            ev_report_timer.add(report_period);
+        }
 
         ev_beat_timer = TimerEvent(ec, [this](TimerEvent &)
                                    {

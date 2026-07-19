@@ -29,6 +29,7 @@
 #include "salticidae/network.h"
 #include "salticidae/msg.h"
 #include "hotstuff/util.h"
+#include "hotstuff/adaptive_v2_reporting_outbox.h"
 #include "hotstuff/adaptive_v2_response_evidence.h"
 #include "hotstuff/aggregation.h"
 #include "hotstuff/block_delivery_orchestration.h"
@@ -989,6 +990,7 @@ namespace hotstuff
         Net pn;
         const EpochProtocolMode epoch_protocol_mode;
         std::optional<PeerId> epoch_manager_peer;
+        std::optional<NetAddr> epoch_manager_address;
         EpochWireLimits epoch_wire_limits{4 << 20, 128, 4096, 4096};
         std::uint64_t epoch_activation_grace_blocks{1};
         bool adaptive_demo_markers{false};
@@ -1081,6 +1083,13 @@ namespace hotstuff
             aggregation_timeout_coordinator;
         std::unique_ptr<AdaptiveV2ResponseEvidenceBridge>
             adaptive_v2_response_evidence;
+        std::unique_ptr<AdaptiveV2ReportingOutbox>
+            adaptive_v2_reporting_outbox;
+        AggregationScheduler::Cancellation
+            adaptive_v2_reporting_flush_cancellation;
+        bool adaptive_v2_readiness_enqueued{false};
+        std::set<ProposalKey>
+            adaptive_v2_initialized_lifecycle_reports;
         enum class ExactForwardingRole
         {
             initial_aggregate,
@@ -1211,6 +1220,21 @@ namespace hotstuff
             MsgEpochDefinitionReply &&message,
             const Net::conn_t &conn);
         bool authorize_manager_peer(const PeerId &peer) const noexcept;
+        void bind_adaptive_v2_manager_reporting_transport();
+        EvidenceTransportResult enqueue_adaptive_v2_evidence_report(
+            const EvidenceReportEnvelope &report) noexcept;
+        void enqueue_initial_adaptive_v2_readiness() noexcept;
+        void report_adaptive_v2_runtime_initialized(
+            const ProposalKey &key) noexcept;
+        void report_adaptive_v2_committed(
+            const std::optional<ProposalKey> &key) noexcept;
+        AdaptiveV2ReportingDeliveryResult
+        transmit_adaptive_v2_report(
+            const AdaptiveV2PendingReport &report) noexcept;
+        void schedule_adaptive_v2_reporting_flush(
+            AggregationScheduler::Duration delay) noexcept;
+        void cancel_adaptive_v2_reporting_flush() noexcept;
+        void flush_adaptive_v2_reporting() noexcept;
         void rebuild_aggregation_timeout_coordinator();
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,

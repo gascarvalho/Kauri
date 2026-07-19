@@ -283,6 +283,88 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "one bootstrap readiness precedes monotonic exact proposal lifecycle facts",
+    "[adaptive-v2][reporting-outbox][bootstrap][lifecycle][sequence]")
+{
+    AdaptiveV2ReportingOutbox outbox(config());
+    const auto epoch_zero = configuration(0, 0, "bootstrap-epoch-zero");
+    const auto exact_proposal = proposal(epoch_zero, "bootstrap-proposal");
+
+    REQUIRE(outbox.enqueue_readiness(epoch_zero, 1, 0) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.enqueue_lifecycle(
+                ProposalLifecycleFact{
+                    NormalProposalRuntimeInitialized{exact_proposal}}) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.enqueue_lifecycle(
+                ProposalLifecycleFact{
+                    ProposalCommitted{exact_proposal}}) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+
+    auto diagnostics = outbox.diagnostics();
+    CHECK(diagnostics.last_readiness_sequence == 1);
+    CHECK(diagnostics.last_lifecycle_sequence == 2);
+    CHECK(diagnostics.pending_reports == 3);
+
+    REQUIRE(outbox.front() != nullptr);
+    const auto readiness = hotstuff::decode_adaptive_v2_readiness_notice(
+        outbox.front()->canonical_payload, limits().readiness_wire);
+    REQUIRE(readiness);
+    CHECK(readiness.notice->source_sequence == 1);
+    CHECK(readiness.notice->active_configuration == epoch_zero);
+    CHECK(readiness.notice->activation_generation == 1);
+    const auto readiness_bytes = outbox.front()->canonical_payload;
+    const auto unavailable = outbox.begin_delivery(100);
+    REQUIRE(unavailable.token.has_value());
+    CHECK(outbox.acknowledge_delivery(
+              *unavailable.token,
+              AdaptiveV2ReportingDeliveryResult::temporary_failure,
+              100) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    CHECK(outbox.begin_delivery(109).status ==
+          AdaptiveV2ReportingAttemptStatus::retry_not_due);
+    const auto connected = outbox.begin_delivery(110);
+    REQUIRE(connected.token.has_value());
+    REQUIRE(connected.report != nullptr);
+    CHECK(connected.report->canonical_payload == readiness_bytes);
+    CHECK(outbox.acknowledge_delivery(
+              *connected.token,
+              AdaptiveV2ReportingDeliveryResult::delivered,
+              110) ==
+          AdaptiveV2ReportingTransitionStatus::delivered);
+    CHECK(outbox.release_terminal(1) ==
+          AdaptiveV2ReportingReleaseStatus::released);
+
+    REQUIRE(outbox.front() != nullptr);
+    const auto initialized = hotstuff::decode_proposal_lifecycle_notice(
+        outbox.front()->canonical_payload, limits().lifecycle_wire);
+    REQUIRE(initialized);
+    CHECK(initialized.notice->source_sequence == 1);
+    REQUIRE(std::holds_alternative<NormalProposalRuntimeInitialized>(
+        initialized.notice->fact));
+    CHECK(std::get<NormalProposalRuntimeInitialized>(
+              initialized.notice->fact)
+              .proposal == exact_proposal);
+    deliver_and_release(outbox, 2);
+
+    REQUIRE(outbox.front() != nullptr);
+    const auto committed = hotstuff::decode_proposal_lifecycle_notice(
+        outbox.front()->canonical_payload, limits().lifecycle_wire);
+    REQUIRE(committed);
+    CHECK(committed.notice->source_sequence == 2);
+    REQUIRE(std::holds_alternative<ProposalCommitted>(
+        committed.notice->fact));
+    CHECK(std::get<ProposalCommitted>(committed.notice->fact).proposal ==
+          exact_proposal);
+    deliver_and_release(outbox, 3);
+
+    diagnostics = outbox.diagnostics();
+    CHECK(diagnostics.pending_reports == 0);
+    CHECK(diagnostics.delivered_reports == 3);
+    CHECK(diagnostics.temporary_failures == 1);
+}
+
+TEST_CASE(
     "temporary delivery failures retry immutable bytes with capped backoff",
     "[adaptive-v2][reporting-outbox][retry][backoff][bytes]")
 {
