@@ -2343,8 +2343,14 @@ namespace hotstuff
                             owner.proposal_contexts->acquire_open_context(metadata.key);
                         if (!timing_lease.has_value())
                         {
+                            // A successful non-root send may close its exact
+                            // context synchronously. Keep only its already-
+                            // scheduled, immutable own-vote fallback alive so
+                            // a crashed parent cannot strand that verified
+                            // vote. Abort, commit, retirement, and shutdown
+                            // still use the default full cleanup path.
                             owner.purge_pending_exact_contributions(
-                                metadata.key);
+                                metadata.key, true);
                             return;
                         }
                         owner.create_expected_vote_state(metadata.key);
@@ -2496,10 +2502,12 @@ namespace hotstuff
     }
 
     void HotStuffBase::purge_pending_exact_contributions(
-        const ProposalKey &key)
+        const ProposalKey &key,
+        bool preserve_scheduled_vote_fallback)
     {
         discard_exact_forwarding_retries(key);
-        discard_exact_fallbacks(key);
+        discard_exact_fallbacks(
+            key, preserve_scheduled_vote_fallback);
         static_cast<void>(pending_exact_contributions.purge(key));
         if (adaptive_v2_response_evidence != nullptr)
             static_cast<void>(
@@ -3399,11 +3407,14 @@ namespace hotstuff
         }
     }
 
-    void HotStuffBase::discard_exact_fallbacks(const ProposalKey &key)
+    void HotStuffBase::discard_exact_fallbacks(
+        const ProposalKey &key,
+        bool preserve_scheduled_vote_fallback)
     {
         std::vector<AggregationScheduler::Cancellation> cancellations;
         const auto vote = exact_vote_fallback_jobs.find(key);
-        if (vote != exact_vote_fallback_jobs.end())
+        if (!preserve_scheduled_vote_fallback &&
+            vote != exact_vote_fallback_jobs.end())
         {
             if (vote->second->cancellation)
                 cancellations.push_back(

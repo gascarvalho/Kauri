@@ -1301,7 +1301,9 @@ namespace hotstuff
         void dispatch_exact_contribution(
             PendingExactContribution contribution);
         void drain_pending_exact_contributions(const ProposalKey &key);
-        void purge_pending_exact_contributions(const ProposalKey &key);
+        void purge_pending_exact_contributions(
+            const ProposalKey &key,
+            bool preserve_scheduled_vote_fallback = false);
         promise_t deliver_exact_contribution(
             const ProposalKey &key,
             const PeerId &source_peer);
@@ -1366,7 +1368,9 @@ namespace hotstuff
             const ProposalContextLease &lease,
             std::uint64_t epoch_generation,
             const Proposal &proposal);
-        void discard_exact_fallbacks(const ProposalKey &key);
+        void discard_exact_fallbacks(
+            const ProposalKey &key,
+            bool preserve_scheduled_vote_fallback = false);
         void cancel_all_exact_fallbacks() noexcept;
         bool forward_exact_direct(
             const ProposalContextLease &lease,

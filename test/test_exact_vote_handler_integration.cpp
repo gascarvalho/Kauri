@@ -656,6 +656,14 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
         source,
         "void HotStuffBase::purge_pending_exact_contributions",
         "promise_t HotStuffBase::deliver_exact_contribution");
+    const auto active_proposal = source_slice(
+        source,
+        "void HotStuffBase::process_active",
+        "promise_t HotStuffBase::verify_exact_contribution");
+    const auto fallback_cleanup = source_slice(
+        source,
+        "void HotStuffBase::discard_exact_fallbacks",
+        "void HotStuffBase::cancel_all_exact_fallbacks");
 
     const auto primary = broadcast.find(
         "for (const auto child : metadata->tree.direct_children)");
@@ -689,7 +697,17 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
     CHECK(vote_send.find("config.get_peer_id(root)") !=
           std::string::npos);
     CHECK(vote_send.find("MsgVote") != std::string::npos);
-    CHECK(purge.find("discard_exact_fallbacks(key)") !=
+    CHECK(purge.find("preserve_scheduled_vote_fallback") !=
+          std::string::npos);
+    CHECK(purge.find("discard_exact_fallbacks(") !=
+          std::string::npos);
+    CHECK(active_proposal.find(
+              "metadata.key, true") != std::string::npos);
+    CHECK(fallback_cleanup.find(
+              "!preserve_scheduled_vote_fallback") !=
+          std::string::npos);
+    CHECK(fallback_cleanup.find(
+              "exact_proposal_fallback_jobs.find(key)") !=
           std::string::npos);
 }
 
