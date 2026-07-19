@@ -184,6 +184,7 @@ add_library(hotstuff
     src/epoch_activation.cpp
     src/epoch_change.cpp
     src/epoch_change_bundle.cpp
+    src/epoch_change_inbox.cpp
     src/epoch_live_binding.cpp
     src/epoch_runtime.cpp
     src/epoch_runtime_wiring.cpp
