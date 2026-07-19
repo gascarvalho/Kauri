@@ -82,6 +82,16 @@ std::size_t count_occurrences(
     return count;
 }
 
+bool accepts_adaptive_v2(const std::string &contents)
+{
+    return contents.find("EpochProtocolMode::adaptive_v2") !=
+               std::string::npos ||
+           contents.find(
+               "epoch_protocol_mode != EpochProtocolMode::legacy_static") !=
+               std::string::npos ||
+           contents.find("is_adaptive_epoch_mode") != std::string::npos;
+}
+
 } // namespace
 
 TEST_CASE("HotStuffBase owns one explicitly selected epoch protocol binding",
@@ -248,7 +258,7 @@ TEST_CASE("adaptive outbound consensus uses exact envelopes and legacy bytes rem
         REQUIRE_FALSE(outbound.empty());
         CHECK(contains_all(
             outbound,
-            {"EpochProtocolMode::adaptive_v1",
+            {"is_adaptive_epoch_mode(",
              "find_exact_runtime_generation(",
              "adaptive_epoch_consensus_message(",
              expected.second}));
@@ -447,8 +457,8 @@ TEST_CASE("adaptive v2 recovery handlers authenticate and retry off ingress",
     REQUIRE_FALSE(constructor.empty());
     CHECK(contains_in_order(
         constructor,
-        {"install_legacy_consensus_handlers();",
-         "EpochProtocolMode::adaptive_v2",
+        {"EpochProtocolMode::adaptive_v2",
+         "install_adaptive_consensus_handlers();",
          "install_adaptive_v2_definition_handlers();"}));
 
     REQUIRE_FALSE(install.empty());
@@ -899,6 +909,139 @@ TEST_CASE("adaptive v2 pre-vote authorization is pinned once",
          "configuration is already pinned",
          "std::make_unique<EpochChangeVerifier>(",
          "epoch_change_verifier = std::move(verifier)"}));
+}
+
+TEST_CASE("adaptive v2 startup is pinned and bootstraps a schedule-free epoch",
+          "[c08][adaptive-v2][startup][bootstrap][intentional-red]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto bootstrap = function_body(
+        implementation, "HotStuffBase::register_initial_epoch(");
+    const auto legacy = function_body(
+        implementation, "HotStuffBase::register_legacy_epoch(");
+    const auto tree_config = function_body(
+        implementation, "void HotStuffBase::tree_config(");
+    const auto start = function_body(
+        implementation, "void HotStuffBase::start(");
+
+    CHECK(header.find("register_initial_epoch") != std::string::npos);
+    CHECK_FALSE(bootstrap.empty());
+    CHECK(contains_in_order(
+        bootstrap,
+        {"EpochProtocolMode::adaptive_v2",
+         "kEpochDefinitionSchemaVersionV2",
+         "activation_height = 0",
+         "generation_seed = 0",
+         "exact_epochs->stage("}));
+
+    REQUIRE_FALSE(legacy.empty());
+    CHECK(contains_all(
+        legacy,
+        {"kEpochDefinitionSchemaVersion",
+         "static_cast<std::uint64_t>(input.epoch_number) * 1000"}));
+    REQUIRE_FALSE(tree_config.empty());
+    CHECK(tree_config.find("register_initial_epoch(epochs.back())") !=
+          std::string::npos);
+    CHECK(tree_config.find("register_legacy_epoch(epochs.back())") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(start.empty());
+    CHECK(contains_in_order(
+        start,
+        {"EpochProtocolMode::adaptive_v2",
+         "epoch_change_verifier",
+         "epoch_change_maximum_block_extra_bytes",
+         "epoch_change_maximum_ancestry_blocks",
+         "throw HotStuffError(",
+         "tree_scheduler("}));
+    CHECK(contains_all(
+        start,
+        {"derive_byzantine_quorum(config.nreplicas)",
+         "byzantine->fault_threshold",
+         "config.nmajority",
+         "byzantine->quorum",
+         "EpochProtocolMode::adaptive_v1",
+         "initialize_adaptive_epoch_runtime()"}));
+    const auto runtime_init = start.find(
+        "initialize_adaptive_epoch_runtime()");
+    REQUIRE(runtime_init != std::string::npos);
+    CHECK(start.rfind("EpochProtocolMode::adaptive_v2", runtime_init) !=
+          std::string::npos);
+}
+
+TEST_CASE("adaptive v2 uses adaptive consensus handlers without stage or arm",
+          "[c08][adaptive-v2][startup][transport][intentional-red]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto wiring = source("src/epoch_live_binding.cpp");
+    const auto constructor = function_body(
+        implementation, "HotStuffBase::HotStuffBase(");
+    const auto control = function_body(
+        implementation, "HotStuffBase::install_adaptive_epoch_handlers(");
+    const auto consensus = function_body(
+        implementation,
+        "HotStuffBase::install_adaptive_consensus_handlers(");
+    const auto definitions = function_body(
+        implementation,
+        "HotStuffBase::install_adaptive_v2_definition_handlers(");
+    const auto encoder = function_body(
+        wiring, "bytearray_t adaptive_epoch_consensus_message(");
+
+    CHECK(header.find("install_adaptive_consensus_handlers") !=
+          std::string::npos);
+    REQUIRE_FALSE(constructor.empty());
+    CHECK(contains_all(
+        constructor,
+        {"EpochProtocolMode::adaptive_v1",
+         "EpochProtocolMode::adaptive_v2",
+         "install_adaptive_epoch_handlers()",
+         "install_adaptive_consensus_handlers()",
+         "install_adaptive_v2_definition_handlers()",
+         "install_legacy_consensus_handlers()"}));
+
+    REQUIRE_FALSE(control.empty());
+    CHECK(contains_all(
+        control,
+        {"adaptive_stage_epoch_handler", "adaptive_arm_epoch_handler"}));
+    CHECK(control.find("adaptive_propose_handler") == std::string::npos);
+    CHECK(control.find("adaptive_vote_handler") == std::string::npos);
+    CHECK(control.find("adaptive_relay_handler") == std::string::npos);
+
+    CHECK_FALSE(consensus.empty());
+    CHECK(contains_all(
+        consensus,
+        {"adaptive_propose_handler",
+         "adaptive_vote_handler",
+         "adaptive_relay_handler"}));
+    CHECK(consensus.find("adaptive_stage_epoch_handler") ==
+          std::string::npos);
+    CHECK(consensus.find("adaptive_arm_epoch_handler") ==
+          std::string::npos);
+    REQUIRE_FALSE(definitions.empty());
+    CHECK(definitions.find("adaptive_arm_epoch_handler") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(encoder.empty());
+    CHECK(encoder.find("protocol_mode") != std::string::npos);
+    CHECK(encoder.find("EpochProtocolMode::adaptive_v1") ==
+          std::string::npos);
+
+    for (const auto *signature : {
+             "HotStuffBase::find_exact_runtime_tree(",
+             "HotStuffBase::find_exact_runtime_generation(",
+             "uint32_t HotStuffBase::get_tree_id(",
+             "uint32_t HotStuffBase::get_cur_epoch_nr(",
+             "void HotStuffBase::do_broadcast_proposal(",
+             "void HotStuffBase::do_vote(",
+             "bool HotStuffBase::send_exact_relay("})
+    {
+        const auto body = function_body(implementation, signature);
+        CAPTURE(signature);
+        REQUIRE_FALSE(body.empty());
+        CHECK(accepts_adaptive_v2(body));
+    }
 }
 
 TEST_CASE("local executables ignore SIGPIPE before opening network sockets",

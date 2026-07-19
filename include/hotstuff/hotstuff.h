@@ -1142,6 +1142,7 @@ namespace hotstuff
         bool deliver_blk_without_finalization(const block_t &blk);
         bool on_deliver_blk(const block_t &blk);
 
+        const EpochDefinition &register_initial_epoch(const Epoch &epoch);
         const EpochDefinition &register_legacy_epoch(const Epoch &epoch);
         ConfigurationId exact_configuration(
             uint32_t epoch_number, uint32_t tree_id) const;
@@ -1180,6 +1181,7 @@ namespace hotstuff
             const block_t &block) noexcept;
         void install_legacy_consensus_handlers();
         void install_adaptive_epoch_handlers();
+        void install_adaptive_consensus_handlers();
         void install_adaptive_v2_definition_handlers();
         void adaptive_definition_request_handler(
             MsgEpochDefinitionRequest &&message,

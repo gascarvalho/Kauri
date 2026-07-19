@@ -79,6 +79,12 @@ namespace hotstuff
                 std::chrono::duration<double>(seconds));
         }
 
+        bool is_adaptive_epoch_mode(EpochProtocolMode mode) noexcept
+        {
+            return mode == EpochProtocolMode::adaptive_v1 ||
+                   mode == EpochProtocolMode::adaptive_v2;
+        }
+
         EpochChangeProposalChainResult bypass_epoch_change_gate() noexcept
         {
             EpochChangeProposalChainResult result;
@@ -115,6 +121,40 @@ namespace hotstuff
             input.evidence_cutoff = definition.evidence_cutoff();
             input.epoch_digest = definition.epoch_digest();
             return input;
+        }
+
+        void append_epoch_trees(
+            EpochDefinitionInput &input,
+            const Epoch &epoch)
+        {
+            for (const auto &network : epoch.get_tree_networks())
+            {
+                const auto &tree = network.get_tree();
+                EpochTreeDefinition definition;
+                definition.tree_id = tree.get_tid();
+                definition.fanout = tree.get_fanout();
+                definition.pipeline_stretch =
+                    tree.get_pipeline_stretch();
+                for (const auto member : tree.get_tree_array())
+                    definition.members_breadth_first.push_back(
+                        static_cast<ReplicaID>(member));
+                input.trees.push_back(std::move(definition));
+            }
+
+            if (!input.trees.empty())
+                return;
+            for (const auto &tree : epoch.get_trees())
+            {
+                EpochTreeDefinition definition;
+                definition.tree_id = tree.get_tid();
+                definition.fanout = tree.get_fanout();
+                definition.pipeline_stretch =
+                    tree.get_pipeline_stretch();
+                for (const auto member : tree.get_tree_array())
+                    definition.members_breadth_first.push_back(
+                        static_cast<ReplicaID>(member));
+                input.trees.push_back(std::move(definition));
+            }
         }
 
         class SalticidaeAggregationScheduler final
@@ -1331,6 +1371,45 @@ namespace hotstuff
         HOTSTUFF_LOG_INFO("STORED NEW EPOCH READY TO DEPLOY IT IN FUTURE BLOCK");
     }
 
+    const EpochDefinition &HotStuffBase::register_initial_epoch(
+        const Epoch &epoch)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            return register_legacy_epoch(epoch);
+        if (exact_epochs == nullptr)
+            throw std::logic_error(
+                "exact epoch store is not initialized");
+        if (epoch.get_epoch_num() != 0)
+            throw std::invalid_argument(
+                "adaptive-v2 bootstrap must be epoch 0");
+
+        EpochDefinitionInput input;
+        input.schema_version = kEpochDefinitionSchemaVersionV2;
+        input.epoch_number = 0;
+        input.previous_epoch_digest = uint256_t{};
+        input.membership_digest =
+            canonical_membership_digest(fixed_membership);
+        input.activation_height = 0;
+        input.generation_seed = 0;
+        input.policy_version = "adaptive-v2-bootstrap";
+        input.evidence_snapshot_id = "adaptive-v2-bootstrap-epoch-zero";
+        input.evidence_cutoff = 0;
+        append_epoch_trees(input, epoch);
+
+        if (const auto *existing = exact_epochs->find_epoch(0))
+        {
+            if (existing->epoch_digest() != compute_epoch_digest(input))
+                throw std::invalid_argument(
+                    "initial epoch conflicts with staged exact definition");
+            return *existing;
+        }
+
+        EpochValidationContext context;
+        context.current_height = 0;
+        context.minimum_activation_grace = 0;
+        return exact_epochs->stage(input, context);
+    }
+
     const EpochDefinition &HotStuffBase::register_legacy_epoch(
         const Epoch &epoch)
     {
@@ -1365,35 +1444,7 @@ namespace hotstuff
             input.previous_epoch_digest = predecessor->epoch_digest();
         }
 
-        for (const auto &network : epoch.get_tree_networks())
-        {
-            const auto &tree = network.get_tree();
-            EpochTreeDefinition definition;
-            definition.tree_id = tree.get_tid();
-            definition.fanout = tree.get_fanout();
-            definition.pipeline_stretch =
-                tree.get_pipeline_stretch();
-            for (const auto member : tree.get_tree_array())
-                definition.members_breadth_first.push_back(
-                    static_cast<ReplicaID>(member));
-            input.trees.push_back(std::move(definition));
-        }
-
-        if (input.trees.empty())
-        {
-            for (const auto &tree : epoch.get_trees())
-            {
-                EpochTreeDefinition definition;
-                definition.tree_id = tree.get_tid();
-                definition.fanout = tree.get_fanout();
-                definition.pipeline_stretch =
-                    tree.get_pipeline_stretch();
-                for (const auto member : tree.get_tree_array())
-                    definition.members_breadth_first.push_back(
-                        static_cast<ReplicaID>(member));
-                input.trees.push_back(std::move(definition));
-            }
-        }
+        append_epoch_trees(input, epoch);
 
         if (const auto *existing =
                 exact_epochs->find_epoch(input.epoch_number))
@@ -1429,7 +1480,7 @@ namespace hotstuff
     const TreeNetwork *HotStuffBase::find_exact_runtime_tree(
         const ConfigurationId &configuration) const noexcept
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        if (is_adaptive_epoch_mode(epoch_protocol_mode) &&
             adaptive_epoch_runtime != nullptr)
             return adaptive_epoch_runtime->topology.find_tree(configuration);
 
@@ -1469,7 +1520,7 @@ namespace hotstuff
     HotStuffBase::find_exact_runtime_generation(
         const ConfigurationId &configuration) const noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v1 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             adaptive_epoch_runtime == nullptr ||
             !adaptive_epoch_runtime->activation.may_drain_exact_context(
                 configuration))
@@ -2416,7 +2467,7 @@ namespace hotstuff
         {
             VoteRelay relay(
                 lease.key(), std::move(certificate), this);
-            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
+            if (is_adaptive_epoch_mode(epoch_protocol_mode))
             {
                 if (adaptive_epoch_runtime == nullptr)
                     return false;
@@ -2433,7 +2484,8 @@ namespace hotstuff
                     get_id(),
                     lease.tree().root,
                     static_cast<bytearray_t>(native.serialized),
-                    epoch_wire_limits);
+                    epoch_wire_limits,
+                    epoch_protocol_mode);
                 if (encoded.empty())
                     return false;
                 return pn.send_msg(
@@ -4923,13 +4975,17 @@ namespace hotstuff
 
         /* register the handlers for msg from replicas */
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
-            install_adaptive_epoch_handlers();
-        else
         {
-            install_legacy_consensus_handlers();
-            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
-                install_adaptive_v2_definition_handlers();
+            install_adaptive_epoch_handlers();
+            install_adaptive_consensus_handlers();
         }
+        else if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        {
+            install_adaptive_consensus_handlers();
+            install_adaptive_v2_definition_handlers();
+        }
+        else
+            install_legacy_consensus_handlers();
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::req_blk_handler, this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::resp_blk_handler, this, _1, _2));
         pn.reg_conn_handler(salticidae::generic_bind(&HotStuffBase::conn_handler, this, _1, _2));
@@ -4958,6 +5014,10 @@ namespace hotstuff
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_arm_epoch_handler,
             this, _1, _2));
+    }
+
+    void HotStuffBase::install_adaptive_consensus_handlers()
+    {
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_propose_handler,
             this, _1, _2));
@@ -5396,7 +5456,7 @@ namespace hotstuff
         }
 
         bytearray_t adaptive_payload;
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
+        if (is_adaptive_epoch_mode(epoch_protocol_mode))
         {
             if (adaptive_epoch_runtime == nullptr)
                 return;
@@ -5415,7 +5475,8 @@ namespace hotstuff
                     prop.proposer,
                     prop.proposer,
                     static_cast<bytearray_t>(native.serialized),
-                    epoch_wire_limits);
+                    epoch_wire_limits,
+                    epoch_protocol_mode);
             }
             catch (...)
             {
@@ -5427,7 +5488,7 @@ namespace hotstuff
 
         for (const auto child : metadata->tree.direct_children)
         {
-            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
+            if (is_adaptive_epoch_mode(epoch_protocol_mode))
                 pn.send_msg(
                     MsgPropose(DataStream(adaptive_payload)),
                     config.get_peer_id(child));
@@ -5523,8 +5584,8 @@ namespace hotstuff
                     }
                     const auto parent = owner.config.get_peer_id(
                         *lease->tree().parent);
-                    if (owner.epoch_protocol_mode ==
-                        EpochProtocolMode::adaptive_v1)
+                    if (is_adaptive_epoch_mode(
+                            owner.epoch_protocol_mode))
                     {
                         if (owner.adaptive_epoch_runtime == nullptr)
                             return;
@@ -5546,7 +5607,8 @@ namespace hotstuff
                                     prop.proposer,
                                     static_cast<bytearray_t>(
                                         native.serialized),
-                                    owner.epoch_wire_limits);
+                                    owner.epoch_wire_limits,
+                                    owner.epoch_protocol_mode);
                             if (encoded.empty())
                                 return;
                             owner.pn.send_msg(
@@ -5925,7 +5987,7 @@ namespace hotstuff
      */
     uint32_t HotStuffBase::get_tree_id()
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        if (is_adaptive_epoch_mode(epoch_protocol_mode) &&
             adaptive_epoch_runtime != nullptr)
             return adaptive_epoch_runtime->activation
                 .active_effect().configuration.tree_id;
@@ -5937,7 +5999,7 @@ namespace hotstuff
      */
     uint32_t HotStuffBase::get_cur_epoch_nr()
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        if (is_adaptive_epoch_mode(epoch_protocol_mode) &&
             adaptive_epoch_runtime != nullptr)
             return adaptive_epoch_runtime->activation
                 .active_effect().configuration.epoch_number;
@@ -6012,7 +6074,7 @@ namespace hotstuff
 
     size_t HotStuffBase::get_total_system_trees()
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        if (is_adaptive_epoch_mode(epoch_protocol_mode) &&
             adaptive_epoch_runtime != nullptr)
             return adaptive_epoch_runtime->topology.tree_count();
         return system_trees.size();
@@ -6020,7 +6082,7 @@ namespace hotstuff
 
     ReplicaID HotStuffBase::get_system_tree_root(int tid)
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        if (is_adaptive_epoch_mode(epoch_protocol_mode) &&
             adaptive_epoch_runtime != nullptr)
         {
             const auto *tree = adaptive_epoch_runtime->topology.active_tree(
@@ -6035,7 +6097,7 @@ namespace hotstuff
 
     ReplicaID HotStuffBase::get_current_system_tree_root()
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        if (is_adaptive_epoch_mode(epoch_protocol_mode) &&
             adaptive_epoch_runtime != nullptr)
             return adaptive_epoch_runtime->topology.current_tree()
                 .get_tree().get_tree_root();
@@ -6044,7 +6106,7 @@ namespace hotstuff
 
     TreeNetwork HotStuffBase::get_current_tree_network()
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 &&
+        if (is_adaptive_epoch_mode(epoch_protocol_mode) &&
             adaptive_epoch_runtime != nullptr)
             return adaptive_epoch_runtime->topology.current_tree();
         return current_tree_network;
@@ -6176,7 +6238,7 @@ namespace hotstuff
         }
 
         epochs.push_back(Epoch(0, default_trees));
-        register_legacy_epoch(epochs.back());
+        register_initial_epoch(epochs.back());
     }
 
     // TO BE REMOVED JUST TEST
@@ -6580,6 +6642,21 @@ namespace hotstuff
     void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop)
     {
 
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            (epoch_change_verifier == nullptr ||
+             epoch_change_maximum_block_extra_bytes == 0 ||
+             epoch_change_maximum_ancestry_blocks == 0))
+        {
+            throw HotStuffError(
+                "adaptive-v2 startup requires a pinned pre-vote verifier and bounds");
+        }
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            !derive_byzantine_quorum(replicas.size()).has_value())
+        {
+            throw HotStuffError(
+                "adaptive-v2 startup requires exact N = 3f + 1");
+        }
+
         /* ./examples/hotstuff-client */
         // snprintf(client_prog, sizeof(client_prog), "./examples/hotstuff-client --idx %d --iter -1 --max-async 50 > clientlog%d &", get_id(), get_id());
 
@@ -6618,7 +6695,8 @@ namespace hotstuff
         // Due to how the system is deployed, this is an alternative to correctly setup the PM's first proposer
         get_pace_maker()->update_tree_proposer();
         activate_initial_leader_view();
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 ||
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
             initialize_adaptive_epoch_runtime();
         get_pace_maker()->setup();
 

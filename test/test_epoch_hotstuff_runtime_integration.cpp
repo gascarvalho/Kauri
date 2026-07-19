@@ -1040,3 +1040,65 @@ TEST_CASE("adaptive outbound helper binds the active configuration and generatio
               limits())
               .empty());
 }
+
+TEST_CASE("consensus envelopes bind the exact adaptive protocol mode",
+          "[c08][adaptive-v2][consensus][wire][mode][intentional-red]")
+{
+    const ConfigurationId configuration{
+        0, 0, digest("adaptive-mode-epoch")};
+    EpochConsensusEnvelope adaptive_v1{
+        configuration,
+        1,
+        digest("adaptive-mode-block"),
+        1,
+        0,
+        bytearray_t{0xC0, 0x08},
+        kEpochConsensusWireSchemaVersion,
+        EpochProtocolMode::adaptive_v1,
+        EpochConsensusWireKind::proposal};
+    auto adaptive_v2 = adaptive_v1;
+    adaptive_v2.protocol_mode = EpochProtocolMode::adaptive_v2;
+
+    const auto v1_wire = encode_epoch_consensus_envelope(
+        adaptive_v1, limits());
+    const auto v2_wire = encode_epoch_consensus_envelope(
+        adaptive_v2, limits());
+
+    const auto decoded_v1 = decode_epoch_consensus_envelope(
+        v1_wire,
+        EpochConsensusWireKind::proposal,
+        EpochProtocolMode::adaptive_v1,
+        limits());
+    REQUIRE(decoded_v1);
+    CHECK(decoded_v1.value->protocol_mode ==
+          EpochProtocolMode::adaptive_v1);
+
+    const auto decoded_v2 = decode_epoch_consensus_envelope(
+        v2_wire,
+        EpochConsensusWireKind::proposal,
+        EpochProtocolMode::adaptive_v2,
+        limits());
+    CHECK(decoded_v2);
+    if (decoded_v2)
+        CHECK(decoded_v2.value->protocol_mode ==
+              EpochProtocolMode::adaptive_v2);
+
+    CHECK(decode_epoch_consensus_envelope(
+              v1_wire,
+              EpochConsensusWireKind::proposal,
+              EpochProtocolMode::adaptive_v2,
+              limits())
+              .error == EpochConsensusWireError::mode_mismatch);
+    CHECK(decode_epoch_consensus_envelope(
+              v2_wire,
+              EpochConsensusWireKind::proposal,
+              EpochProtocolMode::adaptive_v1,
+              limits())
+              .error == EpochConsensusWireError::mode_mismatch);
+
+    auto legacy = adaptive_v1;
+    legacy.protocol_mode = EpochProtocolMode::legacy_static;
+    CHECK_THROWS_AS(
+        encode_epoch_consensus_envelope(legacy, limits()),
+        std::invalid_argument);
+}

@@ -156,7 +156,8 @@ bytearray_t adaptive_epoch_consensus_message(
     ReplicaID originator,
     ReplicaID proposer,
     const bytearray_t &body,
-    const EpochWireLimits &limits);
+    const EpochWireLimits &limits,
+    EpochProtocolMode protocol_mode = EpochProtocolMode::adaptive_v1);
 
 bytearray_t adaptive_epoch_consensus_message(
     const EpochActivationEffect &active,

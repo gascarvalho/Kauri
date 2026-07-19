@@ -208,7 +208,8 @@ bytearray_t adaptive_epoch_consensus_message(
     ReplicaID originator,
     ReplicaID proposer,
     const bytearray_t &body,
-    const EpochWireLimits &limits)
+    const EpochWireLimits &limits,
+    EpochProtocolMode protocol_mode)
 {
     if (key.configuration != configuration || generation == 0)
         return {};
@@ -222,7 +223,7 @@ bytearray_t adaptive_epoch_consensus_message(
             proposer,
             body,
             kEpochConsensusWireSchemaVersion,
-            EpochProtocolMode::adaptive_v1,
+            protocol_mode,
             kind},
         limits);
 }

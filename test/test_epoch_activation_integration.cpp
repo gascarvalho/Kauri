@@ -2150,14 +2150,9 @@ TEST_CASE("real consensus opcodes carry one bounded canonical envelope",
 
     auto mixed = current;
     mixed.protocol_mode = EpochProtocolMode::legacy_static;
-    const auto mixed_bytes = hotstuff::encode_epoch_consensus_envelope(
-        mixed, wire_limits());
-    CHECK(hotstuff::decode_epoch_consensus_envelope(
-              mixed_bytes,
-              EpochConsensusWireKind::proposal,
-              EpochProtocolMode::adaptive_v1,
-              wire_limits())
-              .error == EpochConsensusWireError::mode_mismatch);
+    CHECK_THROWS_AS(
+        hotstuff::encode_epoch_consensus_envelope(mixed, wire_limits()),
+        std::invalid_argument);
     CHECK(hotstuff::decode_epoch_consensus_envelope(
               encoded,
               EpochConsensusWireKind::vote,
@@ -2217,8 +2212,25 @@ TEST_CASE("adaptive consensus rejects a legacy mode even when configured",
         bytearray_t{FixedConsensusBodyValidator::invalid_marker});
     legacy.protocol_mode = EpochProtocolMode::legacy_static;
 
+    hotstuff::DataStream forged;
+    forged << hotstuff::htole(legacy.wire_schema_version)
+           << static_cast<std::uint8_t>(legacy.protocol_mode)
+           << static_cast<std::uint8_t>(legacy.kind)
+           << hotstuff::htole(legacy.configuration.epoch_number)
+           << hotstuff::htole(legacy.configuration.tree_id)
+           << legacy.configuration.epoch_digest
+           << hotstuff::htole(legacy.view_generation)
+           << legacy.block_hash
+           << hotstuff::htole(legacy.originator)
+           << hotstuff::htole(legacy.proposer)
+           << hotstuff::htole(
+                  static_cast<std::uint32_t>(legacy.body.size()))
+           << legacy.body;
+    const auto forged_bytes = static_cast<bytearray_t>(forged);
+
     const auto rejected = harness.transport.dispatch_proposal(
-        proposal_message(legacy), AuthenticatedEpochPeer::replica(4));
+        MsgPropose(hotstuff::DataStream(forged_bytes)),
+        AuthenticatedEpochPeer::replica(4));
     CHECK(rejected.error == EpochIngressError::wire_rejected);
     CHECK(rejected.wire_error == EpochConsensusWireError::mode_mismatch);
     CHECK(rejected.permission ==
