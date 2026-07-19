@@ -1109,6 +1109,16 @@ namespace hotstuff
         };
         std::optional<PendingCommittedEpochChange>
             pending_committed_epoch_change;
+        struct PendingAdaptiveV2Commit
+        {
+            uint256_t block_hash;
+            std::optional<ProposalKey> committed_key;
+        };
+        std::optional<PendingAdaptiveV2Commit>
+            pending_adaptive_v2_commit;
+        std::optional<std::size_t> adaptive_v2_tree_switch_period;
+        std::unique_ptr<AdaptiveV2RotationCoordinator>
+            adaptive_v2_rotation_coordinator;
         static constexpr std::size_t
             maximum_pending_epoch_definition_digests{8};
         static constexpr std::size_t
@@ -1194,6 +1204,11 @@ namespace hotstuff
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
             const std::vector<ProposalKey> &committed_keys) const;
+        void cache_adaptive_v2_commit(
+            const block_t &blk,
+            const std::vector<ProposalKey> &committed_keys);
+        void rotate_adaptive_v2_after_commit(
+            const std::optional<ProposalKey> &committed_key) noexcept;
         void record_adaptive_commit_marker(
             const block_t &blk,
             const std::vector<ProposalKey> &committed_keys) const;
@@ -1378,6 +1393,7 @@ namespace hotstuff
         void exec_command(uint256_t cmd_hash, commit_cb_t callback);
         void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                    bool ec_loop = false);
+        void set_tree_period(size_t nblocks);
         void set_aggregation_timeout(double timeout_seconds);
         /**
          * Pin adaptive-v2 authorization and resource bounds before startup.

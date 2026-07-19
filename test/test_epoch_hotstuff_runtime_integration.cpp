@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <utility>
@@ -160,6 +162,30 @@ EpochDefinitionInput epoch_v2_input(
     input.evidence_snapshot_id =
         "c08-runtime-v2-" + std::to_string(epoch_number);
     input.evidence_cutoff = epoch_number;
+    input.epoch_digest.reset();
+    return input;
+}
+
+EpochDefinitionInput rooted_epoch_v2_input(
+    std::uint32_t epoch_number,
+    const std::vector<ReplicaID> &roots,
+    const uint256_t &previous = {})
+{
+    auto input = epoch_v2_input(epoch_number, previous);
+    input.trees.clear();
+    for (std::size_t index = 0; index < roots.size(); ++index)
+    {
+        auto members = membership();
+        const auto root = std::find(members.begin(), members.end(), roots[index]);
+        if (root == members.end())
+            throw std::logic_error("fixture root is outside membership");
+        std::rotate(members.begin(), root, std::next(root));
+        input.trees.push_back(EpochTreeDefinition{
+            static_cast<std::uint32_t>(index),
+            2,
+            2,
+            std::move(members)});
+    }
     input.epoch_digest.reset();
     return input;
 }
@@ -448,11 +474,13 @@ struct V2Harness
 {
     static const EpochDefinition &stage_successor(
         EpochStore &store,
-        const EpochDefinition &active)
+        const EpochDefinition &active,
+        const std::vector<ReplicaID> &successor_roots)
     {
         const auto staged = store.stage_available_v2(
-            epoch_v2_input(
+            rooted_epoch_v2_input(
                 active.epoch_number() + 1,
+                successor_roots,
                 active.epoch_digest()),
             active);
         if (staged.definition == nullptr)
@@ -477,10 +505,16 @@ struct V2Harness
     ContinuationsSpy continuations;
     HotStuffEpochLiveBinding binding;
 
-    V2Harness()
-        : epoch0(store.stage(epoch_v2_input(0), validation_context(0))),
-          epoch1(stage_successor(store, epoch0)),
-          activation(store, epoch0, 0, 0),
+    explicit V2Harness(
+        EpochDefinitionInput initial = epoch_v2_input(0),
+        std::vector<ReplicaID> successor_roots = {2, 3})
+        : epoch0(store.stage(std::move(initial), validation_context(0))),
+          epoch1(stage_successor(store, epoch0, successor_roots)),
+          activation(
+              store,
+              epoch0,
+              0,
+              epoch0.trees().front().tree_id),
           admission(
               store,
               activation.active_effect().configuration,
@@ -518,7 +552,358 @@ struct V2Harness
     }
 };
 
+ReplicaID active_root(const EpochActivationEffect &active)
+{
+    if (active.definition == nullptr)
+        throw std::logic_error("fixture has no active definition");
+    const auto found = std::find_if(
+        active.definition->trees().begin(),
+        active.definition->trees().end(),
+        [&active](const EpochTreeDefinition &tree) {
+            return tree.tree_id == active.configuration.tree_id;
+        });
+    if (found == active.definition->trees().end() ||
+        found->members_breadth_first.empty())
+        throw std::logic_error("fixture has no active root");
+    return found->members_breadth_first.front();
+}
+
+class FailOnceRotationEffects final : public AdaptiveV2RotationEffects
+{
+public:
+    explicit FailOnceRotationEffects(HotStuffEpochLiveBinding &binding)
+        : binding_(binding)
+    {}
+
+    std::optional<EpochActivationEffect> active_view()
+        const noexcept override
+    {
+        return binding_.active_view();
+    }
+
+    std::optional<std::uint32_t> next_tree_id() const noexcept override
+    {
+        return binding_.next_tree_id();
+    }
+
+    EpochRotationResult rotate_to_tree(
+        std::uint32_t tree_id) noexcept override
+    {
+        if (fail_next_)
+        {
+            fail_next_ = false;
+            return {EpochIngressError::state_rejected, std::nullopt};
+        }
+        return binding_.rotate_to_tree(tree_id);
+    }
+
+private:
+    HotStuffEpochLiveBinding &binding_;
+    bool fail_next_{true};
+};
+
 } // namespace
+
+TEST_CASE("adaptive v2 commit cadence counts only the exact active configuration",
+          "[c08][adaptive-v2][commit-cadence]")
+{
+    const ConfigurationId active{0, 7, digest("epoch-zero")};
+    const ProposalKey first{active, digest("first")};
+    const ProposalKey second{active, digest("second")};
+    AdaptiveV2CommitCadence cadence(2);
+
+    CHECK(cadence.period() == 2);
+    CHECK(cadence.observed_commits() == 0);
+    CHECK_FALSE(cadence.observe(std::nullopt, active));
+    CHECK_FALSE(cadence.observe(
+        ProposalKey{{1, 7, active.epoch_digest}, digest("wrong-epoch")},
+        active));
+    CHECK_FALSE(cadence.observe(
+        ProposalKey{{0, 42, active.epoch_digest}, digest("draining-tree")},
+        active));
+    CHECK_FALSE(cadence.observe(
+        ProposalKey{{0, 7, digest("wrong-digest")}, digest("wrong-epoch-id")},
+        active));
+    CHECK(cadence.observed_commits() == 0);
+
+    CHECK_FALSE(cadence.observe(first, active));
+    CHECK(cadence.observed_commits() == 1);
+    CHECK(cadence.observe(second, active));
+    CHECK(cadence.observed_commits() == 2);
+
+    INFO("a failed rotation remains due without overflowing the counter");
+    CHECK(cadence.observe(
+        ProposalKey{active, digest("retry-after-failure")}, active));
+    CHECK(cadence.observed_commits() == 2);
+
+    cadence.reset();
+    CHECK(cadence.observed_commits() == 0);
+    CHECK_FALSE(cadence.observe(first, active));
+}
+
+TEST_CASE("adaptive v2 commit cadence rejects a zero period",
+          "[c08][adaptive-v2][commit-cadence][configuration]")
+{
+    CHECK_THROWS_AS(AdaptiveV2CommitCadence(0), std::invalid_argument);
+}
+
+TEST_CASE("adaptive v2 coordinator keeps a failed periodic rotation due",
+          "[c08][adaptive-v2][rotation-coordinator][commit]")
+{
+    auto initial = epoch_v2_input(0);
+    initial.trees[0].tree_id = 7;
+    initial.trees[1].tree_id = 42;
+    V2Harness harness(std::move(initial));
+    FailOnceRotationEffects effects(harness.binding);
+    AdaptiveV2RotationCoordinator coordinator(2, effects);
+    const auto expected = harness.activation.active_effect();
+
+    CHECK(coordinator.on_commit(
+              std::nullopt,
+              expected.configuration,
+              expected.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+    CHECK(coordinator.observed_commits() == 0);
+
+    CHECK(coordinator.on_commit(
+              ProposalKey{
+                  ConfigurationId{
+                      expected.configuration.epoch_number,
+                      999,
+                      expected.configuration.epoch_digest},
+                  digest("wrong-configuration")},
+              expected.configuration,
+              expected.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+    CHECK(coordinator.observed_commits() == 0);
+
+    CHECK(coordinator.on_commit(
+              ProposalKey{expected.configuration, digest("first")},
+              expected.configuration,
+              expected.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+    CHECK(coordinator.observed_commits() == 1);
+
+    CHECK(coordinator.on_commit(
+              ProposalKey{expected.configuration, digest("second")},
+              expected.configuration,
+              expected.generation)
+              .disposition == AdaptiveV2RotationDisposition::rejected);
+    CHECK(coordinator.observed_commits() == 2);
+    CHECK(harness.activation.active_effect().configuration.tree_id == 7);
+
+    const auto retried = coordinator.on_commit(
+        ProposalKey{expected.configuration, digest("retry")},
+        expected.configuration,
+        expected.generation);
+    REQUIRE(retried.disposition ==
+            AdaptiveV2RotationDisposition::rotated);
+    REQUIRE(retried.update.has_value());
+    CHECK(retried.update->activation.configuration.tree_id == 42);
+    CHECK(coordinator.observed_commits() == 0);
+}
+
+TEST_CASE("adaptive v2 timeout reset rejects a stale expected view",
+          "[c08][adaptive-v2][rotation-coordinator][timeout][stale]")
+{
+    V2Harness harness(rooted_epoch_v2_input(0, {0, 1, 2}));
+    AdaptiveV2RotationCoordinator coordinator(3, harness.binding);
+    const auto expired = harness.activation.active_effect();
+
+    CHECK(coordinator.on_commit(
+              ProposalKey{expired.configuration, digest("partial")},
+              expired.configuration,
+              expired.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+    CHECK(coordinator.observed_commits() == 1);
+
+    const auto rotated = coordinator.on_timeout(
+        expired.configuration, expired.generation);
+    REQUIRE(rotated.disposition == AdaptiveV2RotationDisposition::rotated);
+    CHECK(active_root(harness.activation.active_effect()) == 1);
+    CHECK(coordinator.observed_commits() == 0);
+
+    const auto stale = coordinator.on_timeout(
+        expired.configuration, expired.generation);
+    CHECK(stale.disposition == AdaptiveV2RotationDisposition::stale_view);
+    CHECK_FALSE(stale.update.has_value());
+    CHECK(active_root(harness.activation.active_effect()) == 1);
+    CHECK(coordinator.observed_commits() == 0);
+}
+
+TEST_CASE("adaptive v2 activation resets cadence and excludes its predecessor key",
+          "[c08][adaptive-v2][rotation-coordinator][activation]")
+{
+    constexpr std::uint64_t commit_height = 40;
+    constexpr std::uint64_t delay = 5;
+    V2Harness harness;
+    AdaptiveV2RotationCoordinator coordinator(3, harness.binding);
+    const auto predecessor = harness.activation.active_effect();
+    const ProposalKey predecessor_key{
+        predecessor.configuration, digest("activation-predecessor")};
+
+    CHECK(coordinator.on_commit(
+              predecessor_key,
+              predecessor.configuration,
+              predecessor.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+    CHECK(coordinator.observed_commits() == 1);
+
+    REQUIRE(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+            EpochIngressError::none);
+    REQUIRE(harness.activation.record_committed_v2(
+                harness.command(delay), commit_height)
+                .disposition == ActivationRecordDisposition::recorded);
+    REQUIRE(harness.binding.on_v2_post_block_commit(
+                commit_height + delay,
+                harness.epoch0.epoch_digest())
+                .transition == ActivationTransition::activated);
+    coordinator.reset_for_activation();
+    const auto successor = harness.activation.active_effect();
+    CHECK(coordinator.observed_commits() == 0);
+
+    CHECK(coordinator.on_commit(
+              predecessor_key,
+              successor.configuration,
+              successor.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+    CHECK(coordinator.observed_commits() == 0);
+    for (std::size_t index = 0; index < 2; ++index)
+    {
+        CHECK(coordinator.on_commit(
+                  ProposalKey{
+                      successor.configuration,
+                      DataStream(std::to_string(index)).get_hash()},
+                  successor.configuration,
+                  successor.generation)
+                  .disposition == AdaptiveV2RotationDisposition::not_due);
+    }
+    const auto due = coordinator.on_commit(
+        ProposalKey{successor.configuration, digest("successor-third")},
+        successor.configuration,
+        successor.generation);
+    REQUIRE(due.disposition == AdaptiveV2RotationDisposition::rotated);
+    CHECK(active_root(harness.activation.active_effect()) == 3);
+}
+
+TEST_CASE("adaptive v2 coordinator cycles N7 and the contained successor order",
+          "[c08][adaptive-v2][rotation-coordinator][n7][quorum]")
+{
+    constexpr std::uint64_t commit_height = 60;
+    constexpr std::uint64_t delay = 5;
+    V2Harness harness(
+        rooted_epoch_v2_input(0, {0, 1, 2, 3, 4, 5, 6}),
+        {2, 3, 4, 5, 6});
+    AdaptiveV2RotationCoordinator coordinator(1, harness.binding);
+    const auto quorum = derive_byzantine_quorum(membership().size());
+    REQUIRE(quorum.has_value());
+    CHECK(quorum->replica_count == 7);
+    CHECK(quorum->fault_threshold == 2);
+    CHECK(quorum->quorum == 5);
+    for (const auto &tree : harness.epoch0.trees())
+        CHECK(tree.members_breadth_first.size() == 7);
+    for (const auto &tree : harness.epoch1.trees())
+        CHECK(tree.members_breadth_first.size() == 7);
+
+    for (const ReplicaID expected_root : {1, 2, 3, 4, 5, 6, 0})
+    {
+        const auto active = harness.activation.active_effect();
+        const auto result = coordinator.on_commit(
+            ProposalKey{
+                active.configuration,
+                DataStream(std::to_string(expected_root)).get_hash()},
+            active.configuration,
+            active.generation);
+        REQUIRE(result.disposition == AdaptiveV2RotationDisposition::rotated);
+        CHECK(active_root(harness.activation.active_effect()) == expected_root);
+    }
+
+    const auto activation_key = ProposalKey{
+        harness.activation.active_effect().configuration,
+        digest("n7-activation")};
+    REQUIRE(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+            EpochIngressError::none);
+    REQUIRE(harness.activation.record_committed_v2(
+                harness.command(delay), commit_height)
+                .disposition == ActivationRecordDisposition::recorded);
+    REQUIRE(harness.binding.on_v2_post_block_commit(
+                commit_height + delay,
+                harness.epoch0.epoch_digest())
+                .transition == ActivationTransition::activated);
+    coordinator.reset_for_activation();
+    CHECK(active_root(harness.activation.active_effect()) == 2);
+
+    const auto successor = harness.activation.active_effect();
+    CHECK(coordinator.on_commit(
+              activation_key,
+              successor.configuration,
+              successor.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+    for (const ReplicaID expected_root : {3, 4, 5, 6, 2})
+    {
+        const auto active = harness.activation.active_effect();
+        const auto result = coordinator.on_commit(
+            ProposalKey{
+                active.configuration,
+                DataStream(std::to_string(expected_root + 10)).get_hash()},
+            active.configuration,
+            active.generation);
+        REQUIRE(result.disposition == AdaptiveV2RotationDisposition::rotated);
+        const auto root = active_root(harness.activation.active_effect());
+        CHECK(root == expected_root);
+        CHECK(root != 0);
+        CHECK(root != 1);
+    }
+
+    const auto successor_quorum = derive_byzantine_quorum(membership().size());
+    REQUIRE(successor_quorum.has_value());
+    CHECK(successor_quorum->replica_count == 7);
+    CHECK(successor_quorum->fault_threshold == 2);
+    CHECK(successor_quorum->quorum == 5);
+}
+
+TEST_CASE("adaptive v2 activation does not count the predecessor commit",
+          "[c08][adaptive-v2][commit-cadence][activation]")
+{
+    const ConfigurationId predecessor{0, 7, digest("epoch-zero")};
+    const ConfigurationId successor{1, 42, digest("epoch-one")};
+    AdaptiveV2CommitCadence cadence(2);
+
+    CHECK_FALSE(cadence.observe(
+        ProposalKey{predecessor, digest("activation-block")}, successor));
+    CHECK(cadence.observed_commits() == 0);
+
+    CHECK_FALSE(cadence.observe(
+        ProposalKey{successor, digest("first-successor-block")}, successor));
+    CHECK(cadence.observed_commits() == 1);
+}
+
+TEST_CASE("adaptive v2 live binding cycles non-contiguous tree identifiers",
+          "[c08][adaptive-v2][epoch-live-binding][rotation]")
+{
+    auto initial = epoch_v2_input(0);
+    initial.trees[0].tree_id = 7;
+    initial.trees[1].tree_id = 42;
+    V2Harness harness(std::move(initial));
+
+    const auto first = harness.activation.active_effect();
+    REQUIRE(first.configuration.tree_id == 7);
+
+    const auto second = harness.binding.rotate_to_tree(42);
+    REQUIRE(second.error == EpochIngressError::none);
+    REQUIRE(second.update.has_value());
+    CHECK(second.update->activation.configuration.tree_id == 42);
+    CHECK(second.update->activation.generation > first.generation);
+
+    const auto cycled = harness.binding.rotate_to_tree(7);
+    REQUIRE(cycled.error == EpochIngressError::none);
+    REQUIRE(cycled.update.has_value());
+    CHECK(cycled.update->activation.configuration.tree_id == 7);
+    CHECK(cycled.update->activation.generation >
+          second.update->activation.generation);
+    CHECK(harness.live_effects.rotation_arm_count == 2);
+    CHECK(harness.live_effects.apply_count == 2);
+}
 
 TEST_CASE("live binding emits only a successful stage acknowledgement",
           "[rem-d11][epoch-live-binding][stage][intentional-red]")

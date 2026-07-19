@@ -1627,9 +1627,22 @@ namespace hotstuff
             throw std::logic_error(
                 "adaptive epoch runtime has no exact active epoch");
 
-        adaptive_epoch_runtime =
+        auto runtime =
             std::make_unique<AdaptiveEpochRuntime>(*this, *active);
+        std::unique_ptr<AdaptiveV2RotationCoordinator> coordinator;
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        {
+            if (!adaptive_v2_tree_switch_period.has_value())
+                throw std::logic_error(
+                    "adaptive-v2 tree switch period is not configured");
+            coordinator =
+                std::make_unique<AdaptiveV2RotationCoordinator>(
+                    *adaptive_v2_tree_switch_period,
+                    runtime->binding);
+        }
+        adaptive_epoch_runtime = std::move(runtime);
         epoch_live_binding = &adaptive_epoch_runtime->binding;
+        adaptive_v2_rotation_coordinator = std::move(coordinator);
     }
 
     EpochChangeProposalChainResult
@@ -5314,6 +5327,24 @@ namespace hotstuff
         rebuild_aggregation_timeout_coordinator();
     }
 
+    void HotStuffBase::set_tree_period(size_t nblocks)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        {
+            HotStuffCore::set_tree_period(nblocks);
+            return;
+        }
+        if (nblocks == 0)
+            throw std::invalid_argument(
+                "adaptive-v2 tree switch period must be positive");
+        if (adaptive_epoch_runtime != nullptr)
+            throw std::logic_error(
+                "adaptive-v2 tree switch period must be configured before startup");
+
+        HotStuffCore::set_tree_period(nblocks);
+        adaptive_v2_tree_switch_period = nblocks;
+    }
+
     void HotStuffBase::configure_epoch_change_pre_vote_gate(
         EpochChangeIssuer issuer,
         EpochChangeDelayBounds delay_bounds,
@@ -5713,6 +5744,9 @@ namespace hotstuff
             adaptive_epoch_runtime == nullptr)
             return;
 
+        if (adaptive_v2_rotation_coordinator != nullptr)
+            adaptive_v2_rotation_coordinator->reset_for_activation();
+
         const auto drain = adaptive_epoch_runtime->adapter
                                .drain_activated_futures();
         const auto &configuration =
@@ -5833,12 +5867,25 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::cache_adaptive_v2_commit(
+        const block_t &blk,
+        const std::vector<ProposalKey> &committed_keys)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            return;
+        pending_adaptive_v2_commit.emplace(
+            PendingAdaptiveV2Commit{
+                blk->get_hash(),
+                committed_proposal_key(blk, committed_keys)});
+    }
+
     void HotStuffBase::do_consensus(const block_t &blk)
     {
         record_committed_epoch_change_history(blk);
         retire_deferred_epoch_changes_for_block(blk->get_hash());
         const auto keys =
             proposal_contexts->close_committed_block(blk->get_hash());
+        cache_adaptive_v2_commit(blk, keys);
         record_adaptive_commit_marker(blk, keys);
         pending_exact_contributions.purge_block(blk->get_hash());
         for (const auto &key : keys)
@@ -5877,8 +5924,15 @@ namespace hotstuff
 
     void HotStuffBase::do_post_block_commit(const block_t &blk)
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            blk == nullptr)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            return;
+
+        std::optional<ProposalKey> committed_key;
+        if (blk != nullptr && pending_adaptive_v2_commit &&
+            pending_adaptive_v2_commit->block_hash == blk->get_hash())
+            committed_key = pending_adaptive_v2_commit->committed_key;
+        pending_adaptive_v2_commit.reset();
+        if (blk == nullptr)
             return;
 
         const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
@@ -5972,6 +6026,7 @@ namespace hotstuff
                 epoch_live_binding->on_v2_post_block_commit(
                     blk->get_height(), configuration.epoch_digest);
             finish_adaptive_epoch_commit(blk, activation);
+            rotate_adaptive_v2_after_commit(committed_key);
         }
         catch (...)
         {
@@ -5980,6 +6035,33 @@ namespace hotstuff
             HOTSTUFF_LOG_WARN(
                 "[EPOCH] Failed adaptive-v2 post-block commit processing");
         }
+    }
+
+    void HotStuffBase::rotate_adaptive_v2_after_commit(
+        const std::optional<ProposalKey> &committed_key) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_epoch_runtime == nullptr ||
+            adaptive_v2_rotation_coordinator == nullptr)
+            return;
+
+        const auto active =
+            adaptive_epoch_runtime->activation.active_effect();
+        const auto rotation =
+            adaptive_v2_rotation_coordinator->on_commit(
+                committed_key,
+                active.configuration,
+                active.generation);
+        if (rotation.disposition !=
+                AdaptiveV2RotationDisposition::rotated ||
+            !rotation.update.has_value())
+            return;
+
+        HOTSTUFF_LOG_INFO(
+            "[EPOCH] Rotated active epoch=%u to tree=%u after %zu commits",
+            rotation.update->activation.configuration.epoch_number,
+            rotation.update->activation.configuration.tree_id,
+            adaptive_v2_rotation_coordinator->period());
     }
 
     /**
@@ -6044,11 +6126,31 @@ namespace hotstuff
     HotStuffBase::rotate_tree_on_leader_timeout(
         const LeaderViewId &expired_view) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v1)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v1 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return LeaderTimeoutRotationDisposition::legacy_fallback;
         if (adaptive_epoch_runtime == nullptr ||
             epoch_live_binding == nullptr)
             return LeaderTimeoutRotationDisposition::rejected;
+
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        {
+            if (adaptive_v2_rotation_coordinator == nullptr)
+                return LeaderTimeoutRotationDisposition::rejected;
+            const auto rotation =
+                adaptive_v2_rotation_coordinator->on_timeout(
+                    expired_view.configuration,
+                    expired_view.view_generation);
+            if (rotation.disposition !=
+                    AdaptiveV2RotationDisposition::rotated ||
+                !rotation.update.has_value())
+                return LeaderTimeoutRotationDisposition::rejected;
+            HOTSTUFF_LOG_INFO(
+                "[EPOCH] Rotated active epoch=%u to tree=%u after leader timeout",
+                rotation.update->activation.configuration.epoch_number,
+                rotation.update->activation.configuration.tree_id);
+            return LeaderTimeoutRotationDisposition::rotated;
+        }
 
         const auto active =
             adaptive_epoch_runtime->activation.active_effect();
@@ -6642,6 +6744,12 @@ namespace hotstuff
     void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop)
     {
 
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            !adaptive_v2_tree_switch_period.has_value())
+        {
+            throw HotStuffError(
+                "adaptive-v2 startup requires a positive tree switch period");
+        }
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
             (epoch_change_verifier == nullptr ||
              epoch_change_maximum_block_extra_bytes == 0 ||

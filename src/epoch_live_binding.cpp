@@ -1,6 +1,8 @@
 #include "hotstuff/epoch_live_binding.h"
 
+#include <algorithm>
 #include <exception>
+#include <iterator>
 #include <utility>
 
 namespace hotstuff
@@ -160,6 +162,48 @@ EpochCommitIngressResult HotStuffEpochLiveBinding::replay_blocked_commit()
     noexcept
 {
     return finish_commit(adapter_.replay_blocked_commit());
+}
+
+std::optional<EpochActivationEffect>
+HotStuffEpochLiveBinding::active_view() const noexcept
+{
+    try
+    {
+        return activation_.active_effect();
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::uint32_t>
+HotStuffEpochLiveBinding::next_tree_id() const noexcept
+{
+    const auto active = active_view();
+    if (!active.has_value() || active->definition == nullptr ||
+        active->definition->trees().size() < 2)
+        return std::nullopt;
+    try
+    {
+        const auto &trees = active->definition->trees();
+        const auto current = std::find_if(
+            trees.begin(),
+            trees.end(),
+            [&active](const EpochTreeDefinition &tree) {
+                return tree.tree_id == active->configuration.tree_id;
+            });
+        if (current == trees.end())
+            return std::nullopt;
+        const auto next = std::next(current) == trees.end()
+                              ? trees.begin()
+                              : std::next(current);
+        return next->tree_id;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
 }
 
 EpochRotationResult HotStuffEpochLiveBinding::rotate_to_tree(

@@ -102,7 +102,7 @@ private:
     std::unique_ptr<State> state_;
 };
 
-class HotStuffEpochLiveBinding final
+class HotStuffEpochLiveBinding final : public AdaptiveV2RotationEffects
 {
 public:
     HotStuffEpochLiveBinding(
@@ -126,7 +126,11 @@ public:
         std::uint64_t height,
         const uint256_t &predecessor_digest) noexcept;
     EpochCommitIngressResult replay_blocked_commit() noexcept;
-    EpochRotationResult rotate_to_tree(std::uint32_t tree_id) noexcept;
+    std::optional<EpochActivationEffect> active_view()
+        const noexcept override;
+    std::optional<std::uint32_t> next_tree_id() const noexcept override;
+    EpochRotationResult rotate_to_tree(
+        std::uint32_t tree_id) noexcept override;
     EpochConsensusIngressResult handle_proposal(
         MsgPropose &&message,
         const AuthenticatedEpochPeer &peer) noexcept;

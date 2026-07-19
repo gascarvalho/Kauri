@@ -1059,6 +1059,91 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
          "do_post_block_commit(blk);"}));
 }
 
+TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
+          "[c08][adaptive-v2][commit-cadence][post-block]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto runtime_header = source("include/hotstuff/epoch_runtime.h");
+    const auto runtime = source("src/epoch_runtime.cpp");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto consensus = function_body(
+        implementation, "void HotStuffBase::do_consensus(");
+    const auto cache = function_body(
+        implementation, "void HotStuffBase::cache_adaptive_v2_commit(");
+    const auto post_commit = function_body(
+        implementation, "void HotStuffBase::do_post_block_commit(");
+    const auto finish_commit = function_body(
+        implementation,
+        "void HotStuffBase::finish_adaptive_epoch_commit(");
+    const auto periodic_rotation = function_body(
+        implementation,
+        "void HotStuffBase::rotate_adaptive_v2_after_commit(");
+    const auto timeout_rotation = function_body(
+        implementation,
+        "HotStuffBase::rotate_tree_on_leader_timeout(");
+
+    CHECK(runtime_header.find("AdaptiveV2RotationCoordinator") !=
+          std::string::npos);
+    CHECK(runtime_header.find("std::mutex mutex_") != std::string::npos);
+    CHECK(header.find("PendingAdaptiveV2Commit") != std::string::npos);
+
+    REQUIRE_FALSE(consensus.empty());
+    CHECK(contains_in_order(
+        consensus,
+        {"proposal_contexts->close_committed_block(",
+         "cache_adaptive_v2_commit(blk, keys)"}));
+    CHECK(consensus.find("rotate_adaptive_v2_after_commit(") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(cache.empty());
+    CHECK(contains_in_order(
+        cache,
+        {"EpochProtocolMode::adaptive_v2",
+         "pending_adaptive_v2_commit.emplace(",
+         "committed_proposal_key(blk, committed_keys)"}));
+
+    REQUIRE_FALSE(post_commit.empty());
+    CHECK(contains_in_order(
+        post_commit,
+        {"pending_adaptive_v2_commit",
+         "block_hash == blk->get_hash()",
+         "committed_key =",
+         "pending_adaptive_v2_commit.reset()",
+         "epoch_live_binding->on_v2_post_block_commit(",
+         "finish_adaptive_epoch_commit(blk, activation)",
+         "rotate_adaptive_v2_after_commit(committed_key)"}));
+
+    REQUIRE_FALSE(finish_commit.empty());
+    CHECK(contains_in_order(
+        finish_commit,
+        {"ActivationTransition::activated",
+         "adaptive_v2_rotation_coordinator->reset_for_activation()"}));
+
+    REQUIRE_FALSE(periodic_rotation.empty());
+    CHECK(contains_in_order(
+        periodic_rotation,
+        {"activation.active_effect()",
+         "adaptive_v2_rotation_coordinator->on_commit(",
+         "committed_key",
+         "active.configuration",
+         "active.generation"}));
+    CHECK(periodic_rotation.find("nmajority") == std::string::npos);
+
+    REQUIRE_FALSE(timeout_rotation.empty());
+    CHECK(accepts_adaptive_v2(timeout_rotation));
+    CHECK(contains_in_order(
+        timeout_rotation,
+        {"EpochProtocolMode::adaptive_v2",
+         "adaptive_v2_rotation_coordinator->on_timeout(",
+         "expired_view.configuration",
+         "expired_view.view_generation"}));
+    CHECK(timeout_rotation.find("nmajority") == std::string::npos);
+
+    CHECK(runtime.find("const std::lock_guard<std::mutex> lock(mutex_)") !=
+          std::string::npos);
+    CHECK(runtime.find("matches_expected_view(") != std::string::npos);
+}
+
 TEST_CASE("adaptive v2 pre-vote authorization is pinned once",
           "[c08][epoch-change][pre-vote][configuration]")
 {
@@ -1444,6 +1529,63 @@ TEST_CASE("adaptive v2 executable rejects semantic bounds and malformed keys",
         CHECK(rejected.output.find("replica idx out of range") ==
               std::string::npos);
         CHECK(rejected.output.find("adaptive-v2") != std::string::npos);
+    }
+}
+
+TEST_CASE("adaptive v2 executable rejects a zero commit rotation period",
+          "[c08][adaptive-v2][commit-cadence][cli][subprocess]")
+{
+    auto adaptive_v2 = valid_adaptive_v2_arguments();
+    adaptive_v2.insert(
+        adaptive_v2.end(), {"--tree-switch-period", "0"});
+    const auto rejected = run_hotstuff_app(adaptive_v2);
+    CHECK(rejected.status != 0);
+    CHECK(rejected.output.find("adaptive-v2 tree switch period") !=
+          std::string::npos);
+    CHECK(rejected.output.find("replica idx out of range") ==
+          std::string::npos);
+
+    const auto adaptive_v1 = run_hotstuff_app(
+        {"--epoch-protocol-mode", "adaptive_v1",
+         "--tree-switch-period", "0"});
+    CHECK(adaptive_v1.status != 0);
+    CHECK(adaptive_v1.output.find("replica idx out of range") !=
+          std::string::npos);
+    CHECK(adaptive_v1.output.find("adaptive-v2 tree switch period") ==
+          std::string::npos);
+}
+
+TEST_CASE("adaptive v2 executable accepts only finite integral rotation periods",
+          "[c08][adaptive-v2][commit-cadence][cli][subprocess][bounds]")
+{
+    for (const auto *invalid : {
+             "-1", "0.5", "1.5", "nan", "inf", "1e300",
+             "18446744073709551616"})
+    {
+        auto arguments = valid_adaptive_v2_arguments();
+        arguments.insert(
+            arguments.end(), {"--tree-switch-period", invalid});
+        const auto rejected = run_hotstuff_app(arguments);
+        CAPTURE(invalid);
+        CAPTURE(rejected.output);
+        CHECK(rejected.status != 0);
+        CHECK(rejected.output.find("adaptive-v2 tree switch period") !=
+              std::string::npos);
+        CHECK(rejected.output.find("replica idx out of range") ==
+              std::string::npos);
+    }
+
+    for (const auto *mode : {"legacy_static", "adaptive_v1"})
+    {
+        const auto compatible = run_hotstuff_app(
+            {"--epoch-protocol-mode", mode,
+             "--tree-switch-period", "1.5"});
+        CAPTURE(mode);
+        CHECK(compatible.status != 0);
+        CHECK(compatible.output.find("replica idx out of range") !=
+              std::string::npos);
+        CHECK(compatible.output.find("adaptive-v2 tree switch period") ==
+              std::string::npos);
     }
 }
 

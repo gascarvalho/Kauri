@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -249,6 +250,94 @@ struct EpochRotationResult
 {
     EpochIngressError error{EpochIngressError::none};
     std::optional<EpochRuntimeUpdate> update;
+};
+
+/**
+ * Commit-count cadence for deterministic adaptive-v2 tree rotation.
+ *
+ * The caller supplies the authoritative commit identity and the exact active
+ * configuration after post-commit activation processing. A due cadence stays
+ * due until the caller confirms a successful rotation by calling reset().
+ */
+class AdaptiveV2CommitCadence final
+{
+public:
+    explicit AdaptiveV2CommitCadence(std::size_t period);
+
+    bool observe(
+        const std::optional<ProposalKey> &committed_key,
+        const ConfigurationId &active_configuration) noexcept;
+    void reset() noexcept;
+    std::size_t period() const noexcept;
+    std::size_t observed_commits() const noexcept;
+
+private:
+    std::size_t period_;
+    std::size_t observed_commits_{0};
+};
+
+enum class AdaptiveV2RotationDisposition : std::uint8_t
+{
+    not_due = 1,
+    rotated,
+    stale_view,
+    rejected,
+};
+
+struct AdaptiveV2RotationResult
+{
+    AdaptiveV2RotationDisposition disposition{
+        AdaptiveV2RotationDisposition::not_due};
+    std::optional<EpochRuntimeUpdate> update;
+};
+
+class AdaptiveV2RotationEffects
+{
+public:
+    virtual ~AdaptiveV2RotationEffects() = default;
+
+    virtual std::optional<EpochActivationEffect> active_view()
+        const noexcept = 0;
+    virtual std::optional<std::uint32_t> next_tree_id() const noexcept = 0;
+    virtual EpochRotationResult rotate_to_tree(
+        std::uint32_t tree_id) noexcept = 0;
+};
+
+/**
+ * Single serialized owner for adaptive-v2 periodic and timeout rotations.
+ * Every trigger carries the exact view it observed. The coordinator compares
+ * that view again while holding its lock immediately before selecting and
+ * applying the next configured tree.
+ */
+class AdaptiveV2RotationCoordinator final
+{
+public:
+    AdaptiveV2RotationCoordinator(
+        std::size_t period,
+        AdaptiveV2RotationEffects &effects);
+
+    AdaptiveV2RotationResult on_commit(
+        const std::optional<ProposalKey> &committed_key,
+        const ConfigurationId &expected_configuration,
+        std::uint64_t expected_generation) noexcept;
+    AdaptiveV2RotationResult on_timeout(
+        const ConfigurationId &expected_configuration,
+        std::uint64_t expected_generation) noexcept;
+    void reset_for_activation() noexcept;
+    std::size_t period() const noexcept;
+    std::size_t observed_commits() const noexcept;
+
+private:
+    bool matches_expected_view(
+        const ConfigurationId &expected_configuration,
+        std::uint64_t expected_generation) const noexcept;
+    AdaptiveV2RotationResult compare_and_rotate(
+        const ConfigurationId &expected_configuration,
+        std::uint64_t expected_generation) noexcept;
+
+    mutable std::mutex mutex_;
+    AdaptiveV2CommitCadence cadence_;
+    AdaptiveV2RotationEffects &effects_;
 };
 
 struct EpochCommitIngressResult

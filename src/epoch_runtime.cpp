@@ -10,6 +10,169 @@
 
 namespace hotstuff
 {
+
+AdaptiveV2CommitCadence::AdaptiveV2CommitCadence(std::size_t period)
+    : period_(period)
+{
+    if (period_ == 0)
+        throw std::invalid_argument(
+            "adaptive-v2 commit rotation period must be positive");
+}
+
+bool AdaptiveV2CommitCadence::observe(
+    const std::optional<ProposalKey> &committed_key,
+    const ConfigurationId &active_configuration) noexcept
+{
+    if (!committed_key.has_value() ||
+        committed_key->configuration != active_configuration)
+        return false;
+
+    if (observed_commits_ < period_)
+        ++observed_commits_;
+    return observed_commits_ == period_;
+}
+
+void AdaptiveV2CommitCadence::reset() noexcept
+{
+    observed_commits_ = 0;
+}
+
+std::size_t AdaptiveV2CommitCadence::period() const noexcept
+{
+    return period_;
+}
+
+std::size_t AdaptiveV2CommitCadence::observed_commits() const noexcept
+{
+    return observed_commits_;
+}
+
+AdaptiveV2RotationCoordinator::AdaptiveV2RotationCoordinator(
+    std::size_t period,
+    AdaptiveV2RotationEffects &effects)
+    : cadence_(period), effects_(effects)
+{}
+
+bool AdaptiveV2RotationCoordinator::matches_expected_view(
+    const ConfigurationId &expected_configuration,
+    std::uint64_t expected_generation) const noexcept
+{
+    const auto active = effects_.active_view();
+    return active.has_value() &&
+           active->configuration == expected_configuration &&
+           active->generation == expected_generation;
+}
+
+AdaptiveV2RotationResult
+AdaptiveV2RotationCoordinator::compare_and_rotate(
+    const ConfigurationId &expected_configuration,
+    std::uint64_t expected_generation) noexcept
+{
+    if (!matches_expected_view(
+            expected_configuration, expected_generation))
+        return {AdaptiveV2RotationDisposition::stale_view, std::nullopt};
+
+    const auto next_tree = effects_.next_tree_id();
+    if (!next_tree.has_value() ||
+        !matches_expected_view(
+            expected_configuration, expected_generation))
+        return {
+            next_tree.has_value()
+                ? AdaptiveV2RotationDisposition::stale_view
+                : AdaptiveV2RotationDisposition::rejected,
+            std::nullopt};
+
+    const auto rotation = effects_.rotate_to_tree(*next_tree);
+    if (rotation.error != EpochIngressError::none ||
+        !rotation.update.has_value())
+        return {AdaptiveV2RotationDisposition::rejected, std::nullopt};
+
+    cadence_.reset();
+    return {
+        AdaptiveV2RotationDisposition::rotated,
+        std::move(rotation.update)};
+}
+
+AdaptiveV2RotationResult AdaptiveV2RotationCoordinator::on_commit(
+    const std::optional<ProposalKey> &committed_key,
+    const ConfigurationId &expected_configuration,
+    std::uint64_t expected_generation) noexcept
+{
+    try
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (!matches_expected_view(
+                expected_configuration, expected_generation))
+            return {
+                AdaptiveV2RotationDisposition::stale_view,
+                std::nullopt};
+        if (!cadence_.observe(
+                committed_key, expected_configuration))
+            return {
+                AdaptiveV2RotationDisposition::not_due,
+                std::nullopt};
+        return compare_and_rotate(
+            expected_configuration, expected_generation);
+    }
+    catch (...)
+    {
+        return {AdaptiveV2RotationDisposition::rejected, std::nullopt};
+    }
+}
+
+AdaptiveV2RotationResult AdaptiveV2RotationCoordinator::on_timeout(
+    const ConfigurationId &expected_configuration,
+    std::uint64_t expected_generation) noexcept
+{
+    try
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return compare_and_rotate(
+            expected_configuration, expected_generation);
+    }
+    catch (...)
+    {
+        return {AdaptiveV2RotationDisposition::rejected, std::nullopt};
+    }
+}
+
+void AdaptiveV2RotationCoordinator::reset_for_activation() noexcept
+{
+    try
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        cadence_.reset();
+    }
+    catch (...)
+    {}
+}
+
+std::size_t AdaptiveV2RotationCoordinator::period() const noexcept
+{
+    try
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return cadence_.period();
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+std::size_t AdaptiveV2RotationCoordinator::observed_commits() const noexcept
+{
+    try
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return cadence_.observed_commits();
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
 namespace
 {
 
