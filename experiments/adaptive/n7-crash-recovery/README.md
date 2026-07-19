@@ -81,6 +81,9 @@ requires all of the following:
   truth supplied to the manager;
 - an identical committed epoch command and one matching successor activation
   at every surviving replica;
+- predecessor work admitted before activation may drain under its exact Epoch
+  0 identity only inside the frozen activation grace and before the first
+  Epoch 1 commit; it is excluded from the post-change measurement window;
 - successor root set exactly `2..6`, preserving its committed tree-ID order,
   with failed replicas `0` and `1` both wait-exempt physical leaves;
 - agreement by replicas `2..6` on every authoritative measurement height and

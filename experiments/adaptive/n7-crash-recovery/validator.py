@@ -2251,6 +2251,51 @@ def _maximum_commit_stalls(
     return result
 
 
+def _validate_epoch_transition(
+    commits: Sequence[analysis.CommitEvent],
+    *,
+    activation_height: int,
+    activation_ns: int,
+    post_start_ns: int,
+) -> None:
+    """Accept only the bounded, exact-predecessor drain across activation."""
+    successor_seen = False
+    for commit in commits:
+        if commit.height <= activation_height:
+            if commit.epoch_number != 0:
+                raise ValidationError(
+                    f"commit height {commit.height} activates epoch 1 before "
+                    "the predecessor activation-height commit"
+                )
+            continue
+        if commit.epoch_number == 0:
+            if successor_seen:
+                raise ValidationError(
+                    f"predecessor commit height {commit.height} follows a "
+                    "successor commit"
+                )
+            if commit.timestamp_ns >= post_start_ns:
+                raise ValidationError(
+                    f"predecessor commit height {commit.height} exceeds the "
+                    "frozen activation grace"
+                )
+            continue
+        if commit.epoch_number == 1:
+            if commit.timestamp_ns < activation_ns:
+                raise ValidationError(
+                    f"successor commit height {commit.height} precedes the "
+                    "common activation event"
+                )
+            successor_seen = True
+            continue
+        raise ValidationError(
+            f"commit height {commit.height} uses unexpected epoch "
+            f"{commit.epoch_number}"
+        )
+    if not successor_seen:
+        raise IncompleteRun("no successor commit was observed after activation")
+
+
 def _validate_commits(
     manifest: Manifest,
     epochs: EpochDocument,
@@ -2345,15 +2390,12 @@ def _validate_commits(
         )
     if activation_commit.timestamp_ns > activation_ns:
         raise ValidationError("epoch activation event precedes its activating commit")
-    for commit in commits:
-        if not manifest.baseline_start_ns <= commit.timestamp_ns < manifest.end_ns:
-            continue
-        expected_epoch = 0 if commit.height <= activation_height else 1
-        if commit.epoch_number != expected_epoch:
-            raise ValidationError(
-                f"commit height {commit.height} uses epoch {commit.epoch_number}; "
-                f"expected epoch {expected_epoch} at the exact activation height"
-            )
+    _validate_epoch_transition(
+        commits,
+        activation_height=activation_height,
+        activation_ns=activation_ns,
+        post_start_ns=post_start_ns,
+    )
     pre_crash = [
         commit
         for commit in commits

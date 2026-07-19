@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -111,6 +112,54 @@ def test_ranked_successor_root_cycle_is_accepted(tmp_path: Path) -> None:
     verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
 
     assert verdict["verdict"] == "PASS"
+
+
+def test_activation_grace_accepts_bounded_predecessor_drain() -> None:
+    commits = [
+        SimpleNamespace(height=770, timestamp_ns=100, epoch_number=0),
+        SimpleNamespace(height=771, timestamp_ns=110, epoch_number=0),
+        SimpleNamespace(height=779, timestamp_ns=120, epoch_number=0),
+        SimpleNamespace(height=780, timestamp_ns=130, epoch_number=1),
+    ]
+
+    validator._validate_epoch_transition(
+        commits,
+        activation_height=770,
+        activation_ns=105,
+        post_start_ns=200,
+    )
+
+
+@pytest.mark.parametrize(
+    ("commits", "reason"),
+    (
+        (
+            [
+                SimpleNamespace(height=770, timestamp_ns=100, epoch_number=0),
+                SimpleNamespace(height=771, timestamp_ns=120, epoch_number=1),
+                SimpleNamespace(height=772, timestamp_ns=130, epoch_number=0),
+            ],
+            "follows a successor commit",
+        ),
+        (
+            [
+                SimpleNamespace(height=770, timestamp_ns=100, epoch_number=0),
+                SimpleNamespace(height=771, timestamp_ns=200, epoch_number=0),
+            ],
+            "exceeds the frozen activation grace",
+        ),
+    ),
+)
+def test_activation_grace_rejects_unbounded_or_interleaved_predecessor(
+    commits: list[SimpleNamespace], reason: str
+) -> None:
+    with pytest.raises(validator.ValidationError, match=reason):
+        validator._validate_epoch_transition(
+            commits,
+            activation_height=770,
+            activation_ns=105,
+            post_start_ns=200,
+        )
 
 
 def test_missing_manager_reputation_is_incomplete_and_writes_no_plot_inputs(
