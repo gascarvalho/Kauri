@@ -79,6 +79,24 @@ namespace hotstuff
                 std::chrono::duration<double>(seconds));
         }
 
+        EpochChangeProposalChainResult bypass_epoch_change_gate() noexcept
+        {
+            EpochChangeProposalChainResult result;
+            result.disposition = EpochChangeProposalDisposition::accepted;
+            result.history_error = EpochChangeProposalHistoryError::none;
+            result.wire_error = EpochChangeWireError::none;
+            return result;
+        }
+
+        EpochChangeProposalChainResult reject_epoch_change_gate() noexcept
+        {
+            EpochChangeProposalChainResult result;
+            result.disposition = EpochChangeProposalDisposition::rejected;
+            result.history_error = EpochChangeProposalHistoryError::none;
+            result.wire_error = EpochChangeWireError::internal_failure;
+            return result;
+        }
+
         class SalticidaeAggregationScheduler final
             : public AggregationScheduler
         {
@@ -1539,6 +1557,160 @@ namespace hotstuff
         epoch_live_binding = &adaptive_epoch_runtime->binding;
     }
 
+    EpochChangeProposalChainResult
+    HotStuffBase::pre_vote_epoch_change_gate(
+        const Proposal &proposal) const noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            return bypass_epoch_change_gate();
+        try
+        {
+            if (epoch_change_verifier == nullptr ||
+                exact_epochs == nullptr || proposal_contexts == nullptr ||
+                proposal.blk == nullptr ||
+                epoch_change_maximum_block_extra_bytes == 0 ||
+                epoch_change_maximum_ancestry_blocks == 0)
+                return reject_epoch_change_gate();
+
+            const auto active_configuration =
+                proposal_contexts->active_configuration();
+            if (!active_configuration.has_value() ||
+                *active_configuration != proposal.configuration())
+                return reject_epoch_change_gate();
+
+            const auto *active_epoch = exact_epochs->find_epoch(
+                active_configuration->epoch_number);
+            if (active_epoch == nullptr ||
+                active_epoch->epoch_digest() !=
+                    active_configuration->epoch_digest)
+                return reject_epoch_change_gate();
+
+            const auto &committed = committed_epoch_change_history;
+            if (!committed || committed->head == nullptr)
+                return reject_epoch_change_gate();
+            if (committed->snapshot.committed_head_hash !=
+                    committed->head->get_hash() ||
+                committed->snapshot.committed_head_height !=
+                    committed->head->get_height())
+                return reject_epoch_change_gate();
+
+            auto result = evaluate_epoch_change_proposal_chain(
+                *proposal.blk,
+                *committed->head,
+                committed->snapshot,
+                epoch_change_maximum_block_extra_bytes,
+                epoch_change_maximum_ancestry_blocks,
+                *epoch_change_verifier,
+                *active_epoch,
+                *exact_epochs);
+            switch (result.disposition)
+            {
+            case EpochChangeProposalDisposition::accepted:
+            case EpochChangeProposalDisposition::duplicate:
+                if (result.recovery_request)
+                    return reject_epoch_change_gate();
+                return result;
+            case EpochChangeProposalDisposition::defer:
+                if (!result.recovery_request)
+                    return reject_epoch_change_gate();
+                return result;
+            case EpochChangeProposalDisposition::rejected:
+                return result;
+            }
+            return reject_epoch_change_gate();
+        }
+        catch (...)
+        {
+            return reject_epoch_change_gate();
+        }
+    }
+
+    void HotStuffBase::initialize_committed_epoch_change_history() noexcept
+    {
+        committed_epoch_change_history.reset();
+        const auto &genesis = committed_head();
+        if (genesis == nullptr || genesis->get_decision() != 1)
+            return;
+        try
+        {
+            committed_epoch_change_history =
+                CommittedEpochChangeHistoryState{
+                    genesis,
+                    EpochChangeCommittedHistorySnapshot{
+                        genesis->get_hash(),
+                        genesis->get_height(),
+                        std::nullopt}};
+        }
+        catch (...)
+        {
+            committed_epoch_change_history.reset();
+        }
+    }
+
+    void HotStuffBase::record_committed_epoch_change_history(
+        const block_t &block) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            !committed_epoch_change_history)
+            return;
+        try
+        {
+            const auto &previous = *committed_epoch_change_history;
+            if (previous.head == nullptr || block == nullptr ||
+                block->get_decision() != 1 ||
+                epoch_change_maximum_block_extra_bytes == 0 ||
+                previous.snapshot.committed_head_hash !=
+                    previous.head->get_hash() ||
+                previous.snapshot.committed_head_height !=
+                    previous.head->get_height())
+            {
+                committed_epoch_change_history.reset();
+                return;
+            }
+
+            const auto &parent_hashes = block->get_parent_hashes();
+            const auto &parents = block->get_parents();
+            if (parent_hashes.empty() || parents.empty() ||
+                parents.front() != previous.head ||
+                parent_hashes.front() != previous.head->get_hash())
+            {
+                committed_epoch_change_history.reset();
+                return;
+            }
+
+            auto command = previous.snapshot.command;
+            const auto extracted = extract_epoch_change_block_extra(
+                block->get_extra(),
+                epoch_change_maximum_block_extra_bytes);
+            if (extracted.disposition ==
+                    EpochChangeExtraDisposition::present &&
+                extracted.command && extracted.payload_digest)
+            {
+                command = EpochChangeCommittedHistoryEntry{
+                    extracted.command->payload.predecessor_epoch_digest,
+                    *extracted.payload_digest};
+            }
+            else if (extracted.disposition !=
+                         EpochChangeExtraDisposition::absent)
+            {
+                committed_epoch_change_history.reset();
+                return;
+            }
+
+            committed_epoch_change_history =
+                CommittedEpochChangeHistoryState{
+                    block,
+                    EpochChangeCommittedHistorySnapshot{
+                        block->get_hash(),
+                        block->get_height(),
+                        std::move(command)}};
+        }
+        catch (...)
+        {
+            committed_epoch_change_history.reset();
+        }
+    }
+
     void HotStuffBase::relay_once(const BufferedProposal &proposal)
     {
         const auto *tree =
@@ -1634,6 +1806,19 @@ namespace hotstuff
 
                     try
                     {
+                        const auto gate =
+                            owner.pre_vote_epoch_change_gate(parsed);
+                        switch (gate.disposition)
+                        {
+                        case EpochChangeProposalDisposition::accepted:
+                        case EpochChangeProposalDisposition::duplicate:
+                            break;
+                        case EpochChangeProposalDisposition::defer:
+                        case EpochChangeProposalDisposition::rejected:
+                            abort();
+                            return;
+                        }
+
                         auto lease = owner.proposal_contexts->admit_remote(
                             metadata);
                         if (!lease.has_value() ||
@@ -4254,6 +4439,7 @@ namespace hotstuff
                                                           reconfig_count(0),
                                                           warmup_finished(false)
     {
+        initialize_committed_epoch_change_history();
         rebuild_aggregation_timeout_coordinator();
 
         /* register the handlers for msg from replicas */
@@ -4575,6 +4761,35 @@ namespace hotstuff
         rebuild_aggregation_timeout_coordinator();
     }
 
+    void HotStuffBase::configure_epoch_change_pre_vote_gate(
+        EpochChangeIssuer issuer,
+        EpochChangeDelayBounds delay_bounds,
+        std::size_t maximum_block_extra_bytes,
+        std::size_t maximum_ancestry_blocks)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            throw std::logic_error(
+                "epoch-change voting is available only in adaptive-v2");
+        if (proposal_contexts->active_configuration().has_value())
+            throw std::logic_error(
+                "epoch-change voting must be configured before startup");
+        if (epoch_change_verifier != nullptr)
+            throw std::logic_error(
+                "epoch-change voting configuration is already pinned");
+        if (maximum_block_extra_bytes == 0 ||
+            maximum_ancestry_blocks == 0)
+            throw std::invalid_argument(
+                "epoch-change voting bounds must be nonzero");
+
+        auto verifier = std::make_unique<EpochChangeVerifier>(
+            std::move(issuer), delay_bounds);
+        epoch_change_maximum_block_extra_bytes =
+            maximum_block_extra_bytes;
+        epoch_change_maximum_ancestry_blocks =
+            maximum_ancestry_blocks;
+        epoch_change_verifier = std::move(verifier);
+    }
+
     void HotStuffBase::bind_structured_event_emitters(
         StructuredEventEmitter *lifecycle_emitter,
         AdaptiveStructuredEventEmitter *aggregation_emitter) noexcept
@@ -4590,6 +4805,12 @@ namespace hotstuff
             return false;
         const auto active = proposal_contexts->active_configuration();
         if (!active.has_value() || *active != prop.configuration())
+            return false;
+        const auto gate = pre_vote_epoch_change_gate(prop);
+        if (gate.disposition !=
+                EpochChangeProposalDisposition::accepted &&
+            gate.disposition !=
+                EpochChangeProposalDisposition::duplicate)
             return false;
         return admit_exact_context(
                    *metadata,
@@ -5006,6 +5227,7 @@ namespace hotstuff
 
     void HotStuffBase::do_consensus(const block_t &blk)
     {
+        record_committed_epoch_change_history(blk);
         const auto keys =
             proposal_contexts->close_committed_block(blk->get_hash());
         record_adaptive_commit_marker(blk, keys);

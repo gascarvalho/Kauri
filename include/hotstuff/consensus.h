@@ -85,6 +85,8 @@ namespace hotstuff
     protected:
         ReplicaID id; /**< identity of the replica itself */
 
+        const block_t &committed_head() const noexcept { return b_exec; }
+
         block_t get_delivered_blk(const uint256_t &blk_hash);
 
         block_t get_potentially_not_delivered_blk(const uint256_t &blk_hash);

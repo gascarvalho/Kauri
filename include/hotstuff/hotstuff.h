@@ -1092,6 +1092,16 @@ namespace hotstuff
         struct AdaptiveEpochRuntime;
         std::unique_ptr<AdaptiveEpochRuntime> adaptive_epoch_runtime;
         HotStuffEpochLiveBinding *epoch_live_binding{nullptr};
+        std::unique_ptr<EpochChangeVerifier> epoch_change_verifier;
+        std::size_t epoch_change_maximum_block_extra_bytes{0};
+        std::size_t epoch_change_maximum_ancestry_blocks{0};
+        struct CommittedEpochChangeHistoryState
+        {
+            block_t head;
+            EpochChangeCommittedHistorySnapshot snapshot;
+        };
+        std::optional<CommittedEpochChangeHistoryState>
+            committed_epoch_change_history;
         mutable TreeNetwork current_tree_network;
         mutable Tree current_tree;
         uint32_t lastCheckedHeight;
@@ -1128,6 +1138,11 @@ namespace hotstuff
             const ConfigurationId &configuration);
         void activate_initial_leader_view();
         void initialize_adaptive_epoch_runtime();
+        EpochChangeProposalChainResult pre_vote_epoch_change_gate(
+            const Proposal &proposal) const noexcept;
+        void initialize_committed_epoch_change_history() noexcept;
+        void record_committed_epoch_change_history(
+            const block_t &block) noexcept;
         void install_legacy_consensus_handlers();
         void install_adaptive_epoch_handlers();
         bool authorize_manager_peer(const PeerId &peer) const noexcept;
@@ -1319,6 +1334,15 @@ namespace hotstuff
         void start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas,
                    bool ec_loop = false);
         void set_aggregation_timeout(double timeout_seconds);
+        /**
+         * Pin adaptive-v2 authorization and resource bounds before startup.
+         * Until this is configured, adaptive-v2 proposal voting fails closed.
+         */
+        void configure_epoch_change_pre_vote_gate(
+            EpochChangeIssuer issuer,
+            EpochChangeDelayBounds delay_bounds,
+            std::size_t maximum_block_extra_bytes,
+            std::size_t maximum_ancestry_blocks);
         /**
          * Borrow event emitters without taking ownership. Passing null
          * unbinds a capability; bound emitters must outlive HotStuffBase.

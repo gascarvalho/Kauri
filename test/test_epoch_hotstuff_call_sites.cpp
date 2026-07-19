@@ -296,6 +296,181 @@ TEST_CASE("adaptive commit markers retain the committed proposal configuration",
          "proposal_admission->retire_proposal(key)"}));
 }
 
+TEST_CASE("adaptive v2 exposes one fail-closed pre-vote semantic gate",
+          "[c08][epoch-change][pre-vote][intentional-red]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto gate = function_body(
+        implementation,
+        "HotStuffBase::pre_vote_epoch_change_gate(");
+
+    REQUIRE_FALSE(gate.empty());
+    CHECK(contains_all(
+        gate,
+        {"EpochProtocolMode::adaptive_v2",
+         "evaluate_epoch_change_proposal_chain(",
+         "EpochChangeProposalDisposition::accepted",
+         "EpochChangeProposalDisposition::duplicate",
+         "EpochChangeProposalDisposition::defer",
+         "EpochChangeProposalDisposition::rejected"}));
+    CHECK(contains_in_order(
+        gate,
+        {"case EpochChangeProposalDisposition::defer:",
+         "if (!result.recovery_request)",
+         "return reject_epoch_change_gate();",
+         "return result;"}));
+}
+
+TEST_CASE("active proposals pass the semantic gate before protocol mutation",
+          "[c08][epoch-change][pre-vote][integration][intentional-red]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto local = function_body(
+        implementation, "bool HotStuffBase::admit_local(");
+    const auto remote = function_body(
+        implementation, "void HotStuffBase::process_active(");
+    const auto ingress = function_body(
+        implementation, "void HotStuffBase::propose_handler(");
+
+    REQUIRE_FALSE(local.empty());
+    CHECK(contains_in_order(
+        local,
+        {"pre_vote_epoch_change_gate(", "admit_exact_context("}));
+
+    REQUIRE_FALSE(remote.empty());
+    CHECK(contains_in_order(
+        remote,
+        {"delivered->get_hash() != metadata.key.block_hash",
+         "pre_vote_epoch_change_gate(",
+         "EpochChangeProposalDisposition::defer",
+         "abort();",
+         "return;",
+         "proposal_contexts->admit_remote(",
+         "on_receive_proposal(parsed)",
+         "create_expected_vote_state(metadata.key)",
+         "start_latency_deadline(metadata.key)",
+         "start_aggregation_timer(metadata.key)"}));
+
+    const auto gate = remote.find("pre_vote_epoch_change_gate(");
+    const auto context = remote.find(
+        "proposal_contexts->admit_remote(", gate);
+    REQUIRE(gate != std::string::npos);
+    REQUIRE(context != std::string::npos);
+    const auto fail_closed_path = remote.substr(gate, context - gate);
+    CHECK(contains_all(fail_closed_path, {"abort();", "return;"}));
+    for (const auto *forbidden : {
+             "recovery_request",
+             "deferred_epoch_change",
+             "retry_deferred"})
+    {
+        CAPTURE(forbidden);
+        CHECK(fail_closed_path.find(forbidden) == std::string::npos);
+    }
+
+    REQUIRE_FALSE(ingress.empty());
+    CHECK(ingress.find("pre_vote_epoch_change_gate(") ==
+          std::string::npos);
+}
+
+TEST_CASE("committed epoch history owns one coherent exact head snapshot",
+          "[c08][epoch-change][pre-vote][committed-history]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto core = source("src/consensus.cpp");
+    const auto constructor = function_body(
+        implementation, "HotStuffBase::HotStuffBase(");
+    const auto initialize = function_body(
+        implementation,
+        "HotStuffBase::initialize_committed_epoch_change_history(");
+    const auto record = function_body(
+        implementation,
+        "HotStuffBase::record_committed_epoch_change_history(");
+    const auto gate = function_body(
+        implementation,
+        "HotStuffBase::pre_vote_epoch_change_gate(");
+    const auto consensus = function_body(
+        implementation, "void HotStuffBase::do_consensus(");
+
+    CHECK(contains_all(
+        header,
+        {"struct CommittedEpochChangeHistoryState",
+         "block_t head;",
+         "EpochChangeCommittedHistorySnapshot snapshot;",
+         "committed_epoch_change_history;"}));
+    for (const auto *removed : {
+             "DeferredEpochChangeProposal",
+             "deferred_epoch_changes",
+             "coalesced_epoch_definition_requests"})
+    {
+        CAPTURE(removed);
+        CHECK(header.find(removed) == std::string::npos);
+        CHECK(implementation.find(removed) == std::string::npos);
+    }
+
+    REQUIRE_FALSE(constructor.empty());
+    CHECK(constructor.find(
+              "initialize_committed_epoch_change_history();") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(initialize.empty());
+    CHECK(contains_in_order(
+        initialize,
+        {"const auto &genesis = committed_head()",
+         "genesis->get_decision()",
+         "CommittedEpochChangeHistoryState{",
+         "genesis",
+         "EpochChangeCommittedHistorySnapshot{",
+         "genesis->get_hash()",
+         "genesis->get_height()"}));
+
+    REQUIRE_FALSE(record.empty());
+    CHECK(contains_in_order(
+        record,
+        {"const auto &previous = *committed_epoch_change_history",
+         "parents.front() != previous.head",
+         "extract_epoch_change_block_extra(",
+         "committed_epoch_change_history =",
+         "CommittedEpochChangeHistoryState{",
+         "block",
+         "EpochChangeCommittedHistorySnapshot{"}));
+
+    REQUIRE_FALSE(gate.empty());
+    CHECK(contains_in_order(
+        gate,
+        {"const auto &committed = committed_epoch_change_history",
+         "*committed->head",
+         "committed->snapshot"}));
+    CHECK(gate.find("b_exec") == std::string::npos);
+    CHECK(gate.find("committed_head()") == std::string::npos);
+
+    REQUIRE_FALSE(consensus.empty());
+    CHECK(contains_in_order(
+        consensus,
+        {"record_committed_epoch_change_history(blk)",
+         "close_committed_block(blk->get_hash())"}));
+    CHECK(contains_in_order(
+        core,
+        {"do_consensus(blk);", "b_exec = blk;"}));
+}
+
+TEST_CASE("adaptive v2 pre-vote authorization is pinned once",
+          "[c08][epoch-change][pre-vote][configuration]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto configure = function_body(
+        implementation,
+        "HotStuffBase::configure_epoch_change_pre_vote_gate(");
+
+    REQUIRE_FALSE(configure.empty());
+    CHECK(contains_in_order(
+        configure,
+        {"epoch_change_verifier != nullptr",
+         "configuration is already pinned",
+         "std::make_unique<EpochChangeVerifier>(",
+         "epoch_change_verifier = std::move(verifier)"}));
+}
+
 TEST_CASE("local executables ignore SIGPIPE before opening network sockets",
           "[rem-d11][local-demo][sigpipe][intentional-red]")
 {
