@@ -89,6 +89,12 @@ constexpr std::uint64_t kSnapshotSeed = 0xA2F7;
 constexpr std::uint32_t kTimeoutsPerReporter = 2;
 constexpr std::uint32_t kMinimumScoreDrop =
     (kSmokeFaultThreshold + 1) * kTimeoutsPerReporter;
+constexpr std::size_t kMaximumExactProposals = 8192;
+constexpr std::size_t kMaximumEvidenceRecords = 131072;
+constexpr std::size_t kMaximumQuarantinedRecords = 1024;
+constexpr std::size_t kMaximumQuarantinedBytes = 256 * 1024;
+constexpr std::size_t kMaximumQuarantinedSignerEntries = 8192;
+constexpr std::size_t kMaximumQuarantinedPerReporter = 128;
 
 static_assert(kMinimumScoreDrop == 6);
 
@@ -229,12 +235,21 @@ AdaptiveV2ManagerIngressLimits smoke_ingress_limits()
     limits.readiness_wire.maximum_payload_bytes = 256;
     limits.lifecycle_wire.maximum_payload_bytes = 512;
     limits.evidence_wire = {4096, 8, kSmokeReplicaCount};
-    limits.proposal_index = {256, 16};
-    limits.evidence_store = {512, 128};
+    limits.proposal_index = {kMaximumExactProposals, 16};
+    limits.evidence_store = {
+        kMaximumEvidenceRecords, kMaximumEvidenceRecords};
     limits.lifecycle = {
-        64, 32 * 1024, kSmokeReplicaCount, 512, 256,
-        kSmokeReplicaCount, 8};
-    limits.lifecycle_accounting = {64, 32 * 1024, 512};
+        kMaximumQuarantinedRecords,
+        kMaximumQuarantinedBytes,
+        kSmokeReplicaCount,
+        kMaximumQuarantinedSignerEntries,
+        kMaximumQuarantinedRecords,
+        kSmokeReplicaCount,
+        kMaximumQuarantinedPerReporter};
+    limits.lifecycle_accounting = {
+        kMaximumQuarantinedRecords,
+        kMaximumQuarantinedBytes,
+        kMaximumQuarantinedSignerEntries};
     limits.maximum_pending_lifecycle_facts_per_source = 64;
     return limits;
 }
@@ -268,6 +283,8 @@ AdaptiveV2ManagerControllerConfig smoke_controller_config(
     config.selection.responsiveness_policy
         .latency_percentile_basis_points = 5'000;
     config.selection.snapshot_seed = kSnapshotSeed;
+    config.reputation_limits.maximum_audit_updates =
+        kMaximumEvidenceRecords;
     config.placement = TreePlacementInput{
         smoke_membership(),
         TreeShape{2, 2, 5},

@@ -209,11 +209,16 @@ struct Fixture
     std::array<std::uint64_t, 7> evidence_sequences{};
     std::uint64_t proposal_counter{0};
 
-    explicit Fixture(std::uint64_t activation_delay_blocks = 5)
-        : config(controller_config(key, activation_delay_blocks)),
-          controller(std::make_unique<AdaptiveV2ManagerController>(
-              ingress, config))
-    {}
+    explicit Fixture(
+        std::uint64_t activation_delay_blocks = 5,
+        std::size_t maximum_audit_updates = 4096)
+        : config(controller_config(key, activation_delay_blocks))
+    {
+        config.reputation_limits.maximum_audit_updates =
+            maximum_audit_updates;
+        controller = std::make_unique<AdaptiveV2ManagerController>(
+            ingress, config);
+    }
 
     void ready(ReplicaID source)
     {
@@ -640,6 +645,22 @@ TEST_CASE(
     CHECK(fixture.controller->successor_bundle() == nullptr);
     CHECK(fixture.controller->evaluate() ==
           AdaptiveV2ManagerControllerStatus::unhealthy);
+}
+
+TEST_CASE(
+    "controller propagates its bounded reputation audit capacity",
+    "[adaptive-v2][manager-controller][capacity][reputation][n7]")
+{
+    Fixture fixture(5, 13);
+    fixture.ready_all();
+    fixture.complete_responsive_baseline();
+
+    CHECK(fixture.ingress.ledger().accepted().size() == 14);
+    CHECK(fixture.controller->evaluate() ==
+          AdaptiveV2ManagerControllerStatus::unhealthy);
+    CHECK_FALSE(fixture.controller->healthy());
+    CHECK(fixture.controller->score_trajectory().empty());
+    CHECK(fixture.controller->successor_bundle() == nullptr);
 }
 
 TEST_CASE(

@@ -18,6 +18,7 @@ namespace hotstuff
 struct AdaptiveV2ManagerControllerConfig
 {
     AdaptiveV2SelectionConfig selection;
+    EvidenceReputationLimits reputation_limits;
     TreePlacementInput placement;
     std::uint64_t activation_delay_blocks{0};
     EpochChangeIssuerId issuer_id{0};

@@ -361,6 +361,9 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
     manager_launch = launch["processes"][-1]
     assert manager_launch["effective_options"]["activation_delay_blocks"] == 5
     assert manager_launch["effective_options"]["snapshot_seed"] == 0xA2F7
+    assert manager_launch["effective_options"]["manager_limits"] == (
+        campaign.MANAGER_LIMITS
+    )
     assert manager_launch["argv"][manager_launch["argv"].index("--tls-privkey") + 1] == (
         "<redacted>"
     )
@@ -384,6 +387,7 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
         manager_binary=manager_binary,
     )
     assert runtime["snapshot_seed"] == 0xA2F7
+    assert runtime["manager_limits"] == campaign.MANAGER_LIMITS
     assert runtime["executables"]["hotstuff_app"]["sha256"] == hashlib.sha256(
         app_binary.read_bytes()
     ).hexdigest()

@@ -142,7 +142,8 @@ struct AdaptiveV2ManagerController::State
               ingress.ledger(),
               ingress.membership(),
               epoch,
-              config.selection)
+              config.selection,
+              config.reputation_limits)
     {
         locally_healthy = ingress.healthy() && selector.healthy();
     }

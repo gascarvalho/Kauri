@@ -21,6 +21,30 @@ COMMAND_NS = 54_100_000_000
 ACTIVATION_NS = 74_100_000_000
 GRACE_NS = 1_000_000_000
 END_NS = 111_000_000_000
+MANAGER_LIMITS = {
+    "maximum_members": 7,
+    "readiness_wire_maximum_payload_bytes": 256,
+    "lifecycle_wire_maximum_payload_bytes": 512,
+    "evidence_wire_maximum_payload_bytes": 4096,
+    "evidence_wire_maximum_observations": 8,
+    "evidence_wire_maximum_signers_per_observation": 7,
+    "proposal_maximum_exact_records": 8192,
+    "proposal_maximum_retired_configurations": 16,
+    "evidence_maximum_accepted_records": 131072,
+    "evidence_maximum_rejected_records": 131072,
+    "reputation_maximum_audit_updates": 131072,
+    "quarantine_maximum_records": 1024,
+    "quarantine_maximum_canonical_bytes": 256 * 1024,
+    "quarantine_maximum_reporter_queues": 7,
+    "quarantine_maximum_signer_entries": 8192,
+    "quarantine_maximum_deduplication_entries": 1024,
+    "quarantine_maximum_lifecycle_sources": 7,
+    "quarantine_maximum_records_per_reporter": 128,
+    "accounting_maximum_records": 1024,
+    "accounting_maximum_canonical_bytes": 256 * 1024,
+    "accounting_maximum_signer_entries": 8192,
+    "maximum_pending_lifecycle_facts_per_source": 64,
+}
 
 
 def _json_line(value: Mapping[str, Any]) -> str:
@@ -372,6 +396,7 @@ def _runtime_parameters(profile: Mapping[str, Any]) -> dict[str, Any]:
         "successor_wait_exempt": list(profile["successor_wait_exempt"]),
         "tree_switch_period_blocks": profile["tree_switch_period_blocks"],
         "snapshot_seed": profile["snapshot_seed"],
+        "manager_limits": dict(MANAGER_LIMITS),
     }
 
 
@@ -565,6 +590,7 @@ def _write_runtime_artifacts(
                             "activation_delay_blocks"
                         ],
                         "snapshot_seed": runtime["snapshot_seed"],
+                        "manager_limits": runtime["manager_limits"],
                         "binary_sha256": runtime["executables"][
                             "adaptation_manager"
                         ]["sha256"],

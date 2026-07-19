@@ -48,6 +48,30 @@ ISSUER_ID = 1
 MAX_REPLICA_MESSAGE_BYTES = 4 << 20
 MAX_COMMAND_BYTES = 4096
 MAX_ANCESTRY_BLOCKS = 128
+MANAGER_LIMITS = {
+    "maximum_members": 7,
+    "readiness_wire_maximum_payload_bytes": 256,
+    "lifecycle_wire_maximum_payload_bytes": 512,
+    "evidence_wire_maximum_payload_bytes": 4096,
+    "evidence_wire_maximum_observations": 8,
+    "evidence_wire_maximum_signers_per_observation": 7,
+    "proposal_maximum_exact_records": 8192,
+    "proposal_maximum_retired_configurations": 16,
+    "evidence_maximum_accepted_records": 131072,
+    "evidence_maximum_rejected_records": 131072,
+    "reputation_maximum_audit_updates": 131072,
+    "quarantine_maximum_records": 1024,
+    "quarantine_maximum_canonical_bytes": 256 * 1024,
+    "quarantine_maximum_reporter_queues": 7,
+    "quarantine_maximum_signer_entries": 8192,
+    "quarantine_maximum_deduplication_entries": 1024,
+    "quarantine_maximum_lifecycle_sources": 7,
+    "quarantine_maximum_records_per_reporter": 128,
+    "accounting_maximum_records": 1024,
+    "accounting_maximum_canonical_bytes": 256 * 1024,
+    "accounting_maximum_signer_entries": 8192,
+    "maximum_pending_lifecycle_facts_per_source": 64,
+}
 BUNDLE_DOMAIN = b"kauri-adaptive-v2-epoch-change-bundle-v1"
 AUTHORIZED_COMMAND_DOMAIN = b"kauri-authorized-epoch-change-v1"
 FORBIDDEN_COMMAND_TOKENS = frozenset({"killall", "pkill", "sudo", "ssh"})
@@ -550,6 +574,7 @@ def runtime_parameters(
         "successor_wait_exempt": list(CRASH_TARGETS),
         "tree_switch_period_blocks": int(profile["tree_switch_period_blocks"]),
         "snapshot_seed": int(profile["snapshot_seed"]),
+        "manager_limits": dict(MANAGER_LIMITS),
     }
     if (app_binary is None) != (manager_binary is None):
         raise RunnerError("runtime executable provenance requires both launched binaries")
@@ -865,6 +890,7 @@ def write_runtime_inputs(
                 "effective_options": {
                     "activation_delay_blocks": runtime["activation_delay_blocks"],
                     "snapshot_seed": runtime["snapshot_seed"],
+                    "manager_limits": runtime["manager_limits"],
                     "binary_sha256": manager_sha256,
                     "tls_certificate_sha256": manager_tls_certificate_sha256,
                     "issuer_public_key_sha256": issuer_public_key_sha256,

@@ -294,6 +294,22 @@ def test_manifest_runtime_must_equal_frozen_profile(tmp_path: Path) -> None:
     assert "exact frozen effective runtime" in verdict["reason"]
 
 
+def test_manifest_runtime_must_bind_manager_capacity_envelope(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    value = synthetic_run.load(manifest)
+    value["runtime"]["manager_limits"][
+        "evidence_maximum_accepted_records"
+    ] = 512
+    synthetic_run.save(manifest, value)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "exact frozen effective runtime" in verdict["reason"]
+
+
 def test_runtime_artifact_bytes_are_sha_bound(tmp_path: Path) -> None:
     manifest, epochs = synthetic_run.create_run(tmp_path / "run")
     artifact = tmp_path / "run/runtime/replica-3.effective.json"

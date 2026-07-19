@@ -36,6 +36,30 @@ FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-v1"
 FROZEN_PROFILE_SHA256 = (
     "529d93344ecb69e73133d832a89d4098f39700f428589d2985bd7e52ed99d80b"
 )
+MANAGER_LIMITS = {
+    "maximum_members": 7,
+    "readiness_wire_maximum_payload_bytes": 256,
+    "lifecycle_wire_maximum_payload_bytes": 512,
+    "evidence_wire_maximum_payload_bytes": 4096,
+    "evidence_wire_maximum_observations": 8,
+    "evidence_wire_maximum_signers_per_observation": 7,
+    "proposal_maximum_exact_records": 8192,
+    "proposal_maximum_retired_configurations": 16,
+    "evidence_maximum_accepted_records": 131072,
+    "evidence_maximum_rejected_records": 131072,
+    "reputation_maximum_audit_updates": 131072,
+    "quarantine_maximum_records": 1024,
+    "quarantine_maximum_canonical_bytes": 256 * 1024,
+    "quarantine_maximum_reporter_queues": 7,
+    "quarantine_maximum_signer_entries": 8192,
+    "quarantine_maximum_deduplication_entries": 1024,
+    "quarantine_maximum_lifecycle_sources": 7,
+    "quarantine_maximum_records_per_reporter": 128,
+    "accounting_maximum_records": 1024,
+    "accounting_maximum_canonical_bytes": 256 * 1024,
+    "accounting_maximum_signer_entries": 8192,
+    "maximum_pending_lifecycle_facts_per_source": 64,
+}
 CANONICAL_OUTPUT_NAMES = (
     "validation.json",
     "manifest.json",
@@ -219,6 +243,7 @@ _RUNTIME_FIELDS = frozenset(
         "successor_wait_exempt",
         "tree_switch_period_blocks",
         "snapshot_seed",
+        "manager_limits",
         "executables",
     }
 )
@@ -226,6 +251,7 @@ _RUNTIME_EXECUTABLE_FIELDS = frozenset(
     {"hotstuff_app", "adaptation_manager"}
 )
 _RUNTIME_EXECUTABLE_DESCRIPTOR_FIELDS = frozenset({"path", "sha256"})
+_MANAGER_LIMIT_FIELDS = frozenset(MANAGER_LIMITS)
 _RUNTIME_ARTIFACT_FIELDS = frozenset(
     {"kind", "replica_id", "path", "sha256"}
 )
@@ -298,6 +324,7 @@ _MANAGER_EFFECTIVE_OPTION_FIELDS = frozenset(
     {
         "activation_delay_blocks",
         "snapshot_seed",
+        "manager_limits",
         "binary_sha256",
         "tls_certificate_sha256",
         "issuer_public_key_sha256",
@@ -658,6 +685,7 @@ def _expected_runtime(profile: Mapping[str, Any]) -> dict[str, Any]:
         "successor_wait_exempt": list(profile["successor_wait_exempt"]),
         "tree_switch_period_blocks": profile["tree_switch_period_blocks"],
         "snapshot_seed": profile["snapshot_seed"],
+        "manager_limits": dict(MANAGER_LIMITS),
     }
 
 
@@ -666,6 +694,14 @@ def _validate_runtime(
 ) -> Mapping[str, Any]:
     runtime = _object(value, "manifest.runtime")
     _exact_fields(runtime, _RUNTIME_FIELDS, "manifest.runtime")
+    manager_limits = _object(
+        runtime["manager_limits"], "manifest.runtime.manager_limits"
+    )
+    _exact_fields(
+        manager_limits,
+        _MANAGER_LIMIT_FIELDS,
+        "manifest.runtime.manager_limits",
+    )
     expected = _expected_runtime(profile)
     static_runtime = {
         field: runtime[field] for field in _RUNTIME_FIELDS if field != "executables"
@@ -966,7 +1002,11 @@ def _validate_launch_arguments(
             )
             if options["activation_delay_blocks"] != runtime[
                 "activation_delay_blocks"
-            ] or options["snapshot_seed"] != runtime["snapshot_seed"]:
+            ] or options["snapshot_seed"] != runtime["snapshot_seed"] or not (
+                _json_values_equal(
+                    options["manager_limits"], runtime["manager_limits"]
+                )
+            ):
                 raise ValidationError(
                     "manager launch effective_options differ from manifest.runtime"
                 )
