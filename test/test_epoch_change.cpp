@@ -20,6 +20,11 @@ using hotstuff::EpochChangeIssuer;
 using hotstuff::EpochChangePayload;
 using hotstuff::EpochChangeExtraDisposition;
 using hotstuff::EpochChangeProposalDisposition;
+using hotstuff::EpochChangeProposalHistoryDisposition;
+using hotstuff::EpochChangeProposalHistoryError;
+using hotstuff::EpochChangeCommittedHistoryEntry;
+using hotstuff::EpochChangeCommittedHistorySnapshot;
+using hotstuff::EpochChangeProposalHistoryResult;
 using hotstuff::EpochChangeVerifier;
 using hotstuff::EpochDefinitionInput;
 using hotstuff::EpochDefinitionReply;
@@ -47,6 +52,20 @@ static_assert(noexcept(hotstuff::evaluate_epoch_change_proposal_control(
     std::declval<const EpochStore &>(),
     std::declval<const EpochChangeHistoryView &>())),
     "proposal-control evaluation must reject internal failures, not throw");
+
+static_assert(noexcept(hotstuff::build_epoch_change_proposal_history(
+    std::declval<const hotstuff::Block &>(),
+    std::declval<const hotstuff::Block &>(),
+    std::declval<const uint256_t &>(),
+    std::declval<const EpochChangeCommittedHistorySnapshot &>(),
+    std::declval<std::size_t>(),
+    std::declval<std::size_t>())),
+    "proposal-history construction must reject internal failures, not throw");
+
+static_assert(
+    EpochChangeProposalHistoryError::allocation_failure !=
+        EpochChangeProposalHistoryError::internal_failure,
+    "allocation and internal builder failures must remain distinguishable");
 
 uint256_t digest(const char *label)
 {
@@ -181,6 +200,69 @@ block_t proposal_with_extra(
         1,
         nullptr,
         nullptr));
+}
+
+block_t history_block(
+    const char *label,
+    std::uint32_t height,
+    std::vector<block_t> parents = {},
+    bytearray_t extra = {},
+    std::int8_t decision = 0)
+{
+    quorum_cert_bt qc = new QuorumCertDummy();
+    return block_t(new hotstuff::Block(
+        parents,
+        {digest(label)},
+        qc->clone(),
+        std::move(extra),
+        height,
+        nullptr,
+        nullptr,
+        decision));
+}
+
+block_t committed_history_block(
+    const char *label,
+    std::uint32_t height,
+    bytearray_t extra = {})
+{
+    return history_block(label, height, {}, std::move(extra), 1);
+}
+
+EpochChangeCommittedHistorySnapshot history_snapshot(
+    const block_t &committed_head,
+    std::optional<EpochChangeCommittedHistoryEntry> command = std::nullopt)
+{
+    return {
+        committed_head->get_hash(),
+        committed_head->get_height(),
+        std::move(command)};
+}
+
+void check_history_rejected(
+    const EpochChangeProposalHistoryResult &result,
+    EpochChangeProposalHistoryError error,
+    hotstuff::EpochChangeWireError wire_error =
+        hotstuff::EpochChangeWireError::none)
+{
+    CHECK(result.disposition ==
+          EpochChangeProposalHistoryDisposition::rejected);
+    CHECK(result.error == error);
+    CHECK(result.wire_error == wire_error);
+    CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+    CHECK_FALSE(result.history.committed_payload_digest.has_value());
+}
+
+AuthorizedEpochChange history_command(
+    const uint256_t &predecessor,
+    const char *successor_label)
+{
+    auto key = private_key(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    return hotstuff::authorize_epoch_change(
+        EpochChangePayload{1, predecessor, digest(successor_label), 5},
+        kIssuerId,
+        key);
 }
 
 bytearray_t high_s_epoch_change_wire(bytearray_t wire)
@@ -1068,4 +1150,572 @@ TEST_CASE("C08b1 block extra changes identity without becoming an app command",
     CHECK(without_control->get_hash() != with_control->get_hash());
     CHECK(without_control->get_extra().empty());
     CHECK_FALSE(with_control->get_extra().empty());
+}
+
+TEST_CASE("C08b2b proposal history accepts a clean immediate boundary",
+          "[c08b2b][epoch-change][proposal-history][boundary]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto candidate_command = history_command(
+        predecessor, "candidate-is-not-history");
+    const auto committed = committed_history_block("committed", 10);
+    const auto candidate = history_block(
+        "candidate",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(candidate_command));
+
+    const auto result = hotstuff::build_epoch_change_proposal_history(
+        *candidate,
+        *committed,
+        predecessor,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        0);
+
+    CHECK(result.disposition ==
+          EpochChangeProposalHistoryDisposition::complete);
+    CHECK(result.error == EpochChangeProposalHistoryError::none);
+    CHECK(result.wire_error == hotstuff::EpochChangeWireError::none);
+    CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+    CHECK_FALSE(result.history.committed_payload_digest.has_value());
+}
+
+TEST_CASE("C08b2b proposal history treats repeated ancestor commands idempotently",
+          "[c08b2b][epoch-change][proposal-history][duplicate]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto command = history_command(predecessor, "same-successor");
+    const auto wire = hotstuff::encode_epoch_change_block_extra(command);
+    const auto payload_digest =
+        hotstuff::epoch_change_payload_digest(command.payload);
+    const auto committed = committed_history_block("committed", 10);
+    const auto older = history_block("older", 11, {committed}, wire);
+    const auto newer = history_block("newer", 12, {older}, wire);
+    const auto candidate = history_block("candidate", 13, {newer});
+
+    const auto result = hotstuff::build_epoch_change_proposal_history(
+        *candidate,
+        *committed,
+        predecessor,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        2);
+
+    REQUIRE(result.disposition ==
+            EpochChangeProposalHistoryDisposition::complete);
+    REQUIRE(result.history.ancestry_payload_digest.has_value());
+    CHECK(*result.history.ancestry_payload_digest == payload_digest);
+    CHECK_FALSE(result.history.committed_payload_digest.has_value());
+}
+
+TEST_CASE("C08b2b proposal history rejects conflicting ancestor commands",
+          "[c08b2b][epoch-change][proposal-history][conflict]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto first = history_command(predecessor, "first-successor");
+    const auto second = history_command(predecessor, "second-successor");
+    const auto committed = committed_history_block("committed", 10);
+    const auto older = history_block(
+        "older",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(first));
+    const auto newer = history_block(
+        "newer",
+        12,
+        {older},
+        hotstuff::encode_epoch_change_block_extra(second));
+    const auto candidate = history_block("candidate", 13, {newer});
+
+    const auto result = hotstuff::build_epoch_change_proposal_history(
+        *candidate,
+        *committed,
+        predecessor,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        2);
+
+    check_history_rejected(
+        result, EpochChangeProposalHistoryError::conflicting_history);
+}
+
+TEST_CASE("C08b2b proposal history ignores conflicting uncles",
+          "[c08b2b][epoch-change][proposal-history][first-parent]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto accepted_command = history_command(
+        predecessor, "first-parent-successor");
+    const auto uncle_command = history_command(
+        predecessor, "uncle-successor");
+    const auto accepted_digest =
+        hotstuff::epoch_change_payload_digest(accepted_command.payload);
+    const auto committed = committed_history_block("committed", 10);
+    const auto first_parent = history_block(
+        "first-parent",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(accepted_command));
+    const auto uncle = history_block(
+        "uncle",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(uncle_command));
+    const auto candidate = history_block(
+        "candidate", 12, {first_parent, uncle});
+
+    const auto result = hotstuff::build_epoch_change_proposal_history(
+        *candidate,
+        *committed,
+        predecessor,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        1);
+
+    REQUIRE(result.disposition ==
+            EpochChangeProposalHistoryDisposition::complete);
+    REQUIRE(result.history.ancestry_payload_digest.has_value());
+    CHECK(*result.history.ancestry_payload_digest == accepted_digest);
+}
+
+TEST_CASE("C08b2b proposal history ignores older-predecessor commands",
+          "[c08b2b][epoch-change][proposal-history][predecessor]")
+{
+    const auto candidate_predecessor = digest("history-predecessor");
+    const auto older_command = history_command(
+        digest("older-predecessor"), "older-successor");
+    const auto committed = committed_history_block("committed", 10);
+    const auto ancestor = history_block(
+        "ancestor",
+        11,
+        {committed},
+        hotstuff::encode_epoch_change_block_extra(older_command));
+    const auto candidate = history_block("candidate", 12, {ancestor});
+
+    const auto result = hotstuff::build_epoch_change_proposal_history(
+        *candidate,
+        *committed,
+        candidate_predecessor,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        1);
+
+    CHECK(result.disposition ==
+          EpochChangeProposalHistoryDisposition::complete);
+    CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+    CHECK_FALSE(result.history.committed_payload_digest.has_value());
+}
+
+TEST_CASE("C08b2b proposal history exposes malformed ancestor wire errors",
+          "[c08b2b][epoch-change][proposal-history][wire]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto older_command = history_command(
+        digest("older-predecessor"), "older-successor");
+    const auto canonical =
+        hotstuff::encode_epoch_change_block_extra(older_command);
+    const auto committed = committed_history_block("committed", 10);
+
+    SECTION("trailing bytes")
+    {
+        auto malformed = canonical;
+        malformed.push_back(0);
+        const auto ancestor = history_block(
+            "ancestor", 11, {committed}, std::move(malformed));
+        const auto candidate = history_block("candidate", 12, {ancestor});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result,
+            EpochChangeProposalHistoryError::malformed_extra,
+            hotstuff::EpochChangeWireError::trailing_bytes);
+    }
+
+    SECTION("noncanonical signature")
+    {
+        const auto ancestor = history_block(
+            "ancestor",
+            11,
+            {committed},
+            high_s_epoch_change_wire(canonical));
+        const auto candidate = history_block("candidate", 12, {ancestor});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result,
+            EpochChangeProposalHistoryError::malformed_extra,
+            hotstuff::EpochChangeWireError::noncanonical_encoding);
+    }
+}
+
+TEST_CASE("C08b2b proposal history rejects incomplete or invalid ancestry",
+          "[c08b2b][epoch-change][proposal-history][structure]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto committed = committed_history_block("committed", 10);
+
+    SECTION("committed boundary is not decided")
+    {
+        const auto undecided = history_block("undecided", 10);
+        const auto candidate = history_block("candidate", 11, {undecided});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *undecided,
+            predecessor,
+            history_snapshot(undecided),
+            limits().maximum_payload_bytes,
+            0);
+        check_history_rejected(
+            result,
+            EpochChangeProposalHistoryError::invalid_committed_boundary);
+    }
+
+    SECTION("committed snapshot is bound to another head")
+    {
+        const auto candidate = history_block(
+            "candidate", 11, {committed});
+        auto snapshot = history_snapshot(committed);
+        snapshot.committed_head_height += 1;
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            snapshot,
+            limits().maximum_payload_bytes,
+            0);
+        check_history_rejected(
+            result,
+            EpochChangeProposalHistoryError::incoherent_committed_snapshot);
+    }
+
+    SECTION("missing first parent")
+    {
+        const auto candidate = history_block("candidate", 11);
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result, EpochChangeProposalHistoryError::missing_parent);
+    }
+
+    SECTION("null first parent")
+    {
+        const auto candidate = history_block(
+            "candidate", 11, {committed});
+        auto &resolved_parents =
+            const_cast<std::vector<block_t> &>(candidate->get_parents());
+        resolved_parents[0] = block_t{};
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result, EpochChangeProposalHistoryError::missing_parent);
+    }
+
+    SECTION("resolved first parent differs from its declared hash")
+    {
+        const auto original_parent = history_block(
+            "original-parent", 11, {committed});
+        const auto replacement_parent = history_block(
+            "replacement-parent", 11, {committed});
+        const auto candidate = history_block(
+            "candidate", 12, {original_parent});
+        auto &resolved_parents =
+            const_cast<std::vector<block_t> &>(candidate->get_parents());
+        resolved_parents[0] = replacement_parent;
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result, EpochChangeProposalHistoryError::parent_hash_mismatch);
+    }
+
+    SECTION("nondecreasing first-parent height")
+    {
+        const auto parent = history_block("parent", 11, {committed});
+        const auto candidate = history_block("candidate", 11, {parent});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result,
+            EpochChangeProposalHistoryError::nondecreasing_height);
+    }
+
+    SECTION("exact committed boundary is not reached")
+    {
+        const auto conflicting_boundary = history_block(
+            "same-height-different-boundary", 10);
+        const auto candidate = history_block(
+            "candidate", 11, {conflicting_boundary});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result, EpochChangeProposalHistoryError::boundary_not_reached);
+    }
+
+    SECTION("zero block-extra limit is invalid")
+    {
+        const auto candidate = history_block(
+            "candidate", 11, {committed});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            0,
+            0);
+        check_history_rejected(
+            result, EpochChangeProposalHistoryError::invalid_limit);
+    }
+}
+
+TEST_CASE("C08b2b proposal history enforces the ancestry walk bound",
+          "[c08b2b][epoch-change][proposal-history][bound]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto committed = committed_history_block("committed", 10);
+    const auto older = history_block("older", 11, {committed});
+    const auto newer = history_block("newer", 12, {older});
+    const auto candidate = history_block("candidate", 13, {newer});
+
+    const auto exact = hotstuff::build_epoch_change_proposal_history(
+        *candidate,
+        *committed,
+        predecessor,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        2);
+    CHECK(exact.disposition ==
+          EpochChangeProposalHistoryDisposition::complete);
+
+    const auto one_over = hotstuff::build_epoch_change_proposal_history(
+        *candidate,
+        *committed,
+        predecessor,
+        history_snapshot(committed),
+        limits().maximum_payload_bytes,
+        1);
+
+    check_history_rejected(
+        one_over,
+        EpochChangeProposalHistoryError::ancestry_limit_exceeded);
+}
+
+TEST_CASE("C08b2b proposal history reconciles the committed boundary command",
+          "[c08b2b][epoch-change][proposal-history][committed-boundary]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto command = history_command(predecessor, "boundary-successor");
+    const auto payload_digest =
+        hotstuff::epoch_change_payload_digest(command.payload);
+    const auto committed = committed_history_block(
+        "committed",
+        10,
+        hotstuff::encode_epoch_change_block_extra(command));
+    const auto candidate = history_block("candidate", 11, {committed});
+
+    SECTION("boundary fills an empty snapshot")
+    {
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(committed),
+            limits().maximum_payload_bytes,
+            0);
+        REQUIRE(result.disposition ==
+                EpochChangeProposalHistoryDisposition::complete);
+        CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+        REQUIRE(result.history.committed_payload_digest.has_value());
+        CHECK(*result.history.committed_payload_digest == payload_digest);
+    }
+
+    SECTION("boundary repeats the matching snapshot idempotently")
+    {
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(
+                committed,
+                EpochChangeCommittedHistoryEntry{
+                    predecessor, payload_digest}),
+            limits().maximum_payload_bytes,
+            0);
+        REQUIRE(result.disposition ==
+                EpochChangeProposalHistoryDisposition::complete);
+        REQUIRE(result.history.committed_payload_digest.has_value());
+        CHECK(*result.history.committed_payload_digest == payload_digest);
+    }
+
+    SECTION("boundary conflicts with the matching snapshot")
+    {
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(
+                committed,
+                EpochChangeCommittedHistoryEntry{
+                    predecessor, digest("different-payload")}),
+            limits().maximum_payload_bytes,
+            0);
+        check_history_rejected(
+            result, EpochChangeProposalHistoryError::conflicting_history);
+    }
+
+    SECTION("malformed boundary extra is rejected")
+    {
+        auto malformed =
+            hotstuff::encode_epoch_change_block_extra(command);
+        malformed.push_back(0);
+        const auto malformed_committed = committed_history_block(
+            "malformed-committed", 10, std::move(malformed));
+        const auto malformed_candidate = history_block(
+            "malformed-candidate", 11, {malformed_committed});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *malformed_candidate,
+            *malformed_committed,
+            predecessor,
+            history_snapshot(malformed_committed),
+            limits().maximum_payload_bytes,
+            0);
+        check_history_rejected(
+            result,
+            EpochChangeProposalHistoryError::malformed_extra,
+            hotstuff::EpochChangeWireError::trailing_bytes);
+    }
+}
+
+TEST_CASE("C08b2b proposal history merges only a matching committed snapshot",
+          "[c08b2b][epoch-change][proposal-history][committed-snapshot]")
+{
+    const auto predecessor = digest("history-predecessor");
+    const auto command = history_command(predecessor, "successor");
+    const auto payload_digest =
+        hotstuff::epoch_change_payload_digest(command.payload);
+    const auto committed = committed_history_block("committed", 10);
+
+    SECTION("matching snapshot entry contributes committed history")
+    {
+        const auto candidate = history_block(
+            "candidate", 11, {committed});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(
+                committed,
+                EpochChangeCommittedHistoryEntry{
+                    predecessor, payload_digest}),
+            limits().maximum_payload_bytes,
+            0);
+        REQUIRE(result.disposition ==
+                EpochChangeProposalHistoryDisposition::complete);
+        CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+        REQUIRE(result.history.committed_payload_digest.has_value());
+        CHECK(*result.history.committed_payload_digest == payload_digest);
+    }
+
+    SECTION("older snapshot entry is ignored")
+    {
+        const auto candidate = history_block(
+            "candidate", 11, {committed});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(
+                committed,
+                EpochChangeCommittedHistoryEntry{
+                    digest("older-predecessor"), digest("older-payload")}),
+            limits().maximum_payload_bytes,
+            0);
+        REQUIRE(result.disposition ==
+                EpochChangeProposalHistoryDisposition::complete);
+        CHECK_FALSE(result.history.ancestry_payload_digest.has_value());
+        CHECK_FALSE(result.history.committed_payload_digest.has_value());
+    }
+
+    SECTION("matching snapshot entry repeats idempotently in ancestry")
+    {
+        const auto ancestor = history_block(
+            "ancestor",
+            11,
+            {committed},
+            hotstuff::encode_epoch_change_block_extra(command));
+        const auto candidate = history_block("candidate", 12, {ancestor});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(
+                committed,
+                EpochChangeCommittedHistoryEntry{
+                    predecessor, payload_digest}),
+            limits().maximum_payload_bytes,
+            1);
+        REQUIRE(result.disposition ==
+                EpochChangeProposalHistoryDisposition::complete);
+        REQUIRE(result.history.ancestry_payload_digest.has_value());
+        REQUIRE(result.history.committed_payload_digest.has_value());
+        CHECK(*result.history.ancestry_payload_digest == payload_digest);
+        CHECK(*result.history.committed_payload_digest == payload_digest);
+    }
+
+    SECTION("matching snapshot entry conflicts with ancestry")
+    {
+        const auto conflicting = history_command(
+            predecessor, "conflicting-successor");
+        const auto ancestor = history_block(
+            "ancestor",
+            11,
+            {committed},
+            hotstuff::encode_epoch_change_block_extra(conflicting));
+        const auto candidate = history_block("candidate", 12, {ancestor});
+        const auto result = hotstuff::build_epoch_change_proposal_history(
+            *candidate,
+            *committed,
+            predecessor,
+            history_snapshot(
+                committed,
+                EpochChangeCommittedHistoryEntry{
+                    predecessor, payload_digest}),
+            limits().maximum_payload_bytes,
+            1);
+        check_history_rejected(
+            result, EpochChangeProposalHistoryError::conflicting_history);
+    }
 }

@@ -4,7 +4,10 @@
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
+
+#include "hotstuff/entity.h"
 
 namespace hotstuff
 {
@@ -226,6 +229,27 @@ EpochChangeValidationResult validation_result(
     result.payload_digest = payload_digest;
     result.envelope_digest = envelope_digest;
     return result;
+}
+
+EpochChangeProposalHistoryResult rejected_proposal_history(
+    EpochChangeProposalHistoryError error,
+    EpochChangeWireError wire_error = EpochChangeWireError::none) noexcept
+{
+    return {
+        EpochChangeProposalHistoryDisposition::rejected,
+        error,
+        wire_error,
+        {}};
+}
+
+EpochChangeProposalHistoryResult complete_proposal_history(
+    EpochChangeHistoryView history) noexcept
+{
+    return {
+        EpochChangeProposalHistoryDisposition::complete,
+        EpochChangeProposalHistoryError::none,
+        EpochChangeWireError::none,
+        std::move(history)};
 }
 
 } // namespace
@@ -508,6 +532,193 @@ EpochChangeBlockExtraResult extract_epoch_change_block_extra(
             std::nullopt,
             std::nullopt,
             std::nullopt};
+    }
+}
+
+EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
+    const Block &proposal,
+    const Block &committed_head,
+    const uint256_t &candidate_predecessor_digest,
+    const EpochChangeCommittedHistorySnapshot &committed_snapshot,
+    std::size_t maximum_block_extra_bytes,
+    std::size_t maximum_ancestry_blocks) noexcept
+{
+    if (maximum_block_extra_bytes == 0)
+    {
+        return rejected_proposal_history(
+            EpochChangeProposalHistoryError::invalid_limit);
+    }
+    if (committed_head.get_decision() != 1)
+    {
+        return rejected_proposal_history(
+            EpochChangeProposalHistoryError::invalid_committed_boundary);
+    }
+    if (committed_snapshot.committed_head_hash != committed_head.get_hash() ||
+        committed_snapshot.committed_head_height !=
+            committed_head.get_height())
+    {
+        return rejected_proposal_history(
+            EpochChangeProposalHistoryError::incoherent_committed_snapshot);
+    }
+
+    try
+    {
+        EpochChangeHistoryView history;
+        if (committed_snapshot.command &&
+            committed_snapshot.command->predecessor_epoch_digest ==
+                candidate_predecessor_digest)
+        {
+            history.committed_payload_digest =
+                committed_snapshot.command->payload_digest;
+        }
+
+        EpochChangeProposalHistoryError merge_error{
+            EpochChangeProposalHistoryError::internal_failure};
+        EpochChangeWireError merge_wire_error{EpochChangeWireError::none};
+        const auto merge_block_extra = [&](const Block &block,
+                                           bool committed) {
+            if (block.get_extra().empty())
+                return true;
+
+            auto extracted = extract_epoch_change_block_extra(
+                block.get_extra(), maximum_block_extra_bytes);
+            if (extracted.disposition !=
+                EpochChangeExtraDisposition::present)
+            {
+                if (extracted.disposition !=
+                        EpochChangeExtraDisposition::rejected ||
+                    extracted.wire_error == EpochChangeWireError::none)
+                {
+                    merge_error =
+                        EpochChangeProposalHistoryError::internal_failure;
+                    return false;
+                }
+                switch (extracted.wire_error)
+                {
+                case EpochChangeWireError::allocation_failure:
+                    merge_error =
+                        EpochChangeProposalHistoryError::allocation_failure;
+                    break;
+                case EpochChangeWireError::internal_failure:
+                    merge_error =
+                        EpochChangeProposalHistoryError::internal_failure;
+                    break;
+                default:
+                    merge_error =
+                        EpochChangeProposalHistoryError::malformed_extra;
+                    merge_wire_error = extracted.wire_error;
+                    break;
+                }
+                return false;
+            }
+            if (!extracted.command ||
+                !extracted.payload_digest ||
+                !extracted.envelope_digest)
+            {
+                merge_error =
+                    EpochChangeProposalHistoryError::internal_failure;
+                return false;
+            }
+            if (extracted.command->payload.predecessor_epoch_digest !=
+                candidate_predecessor_digest)
+            {
+                return true;
+            }
+
+            auto &target = committed
+                               ? history.committed_payload_digest
+                               : history.ancestry_payload_digest;
+            const auto &other = committed
+                                    ? history.ancestry_payload_digest
+                                    : history.committed_payload_digest;
+            if ((target && *target != *extracted.payload_digest) ||
+                (other && *other != *extracted.payload_digest))
+            {
+                merge_error =
+                    EpochChangeProposalHistoryError::conflicting_history;
+                return false;
+            }
+            target = *extracted.payload_digest;
+            return true;
+        };
+
+        std::unordered_set<const Block *> visited_pointers;
+        std::unordered_set<uint256_t> visited_hashes;
+        visited_pointers.insert(&proposal);
+        visited_hashes.insert(proposal.get_hash());
+
+        const Block *child = &proposal;
+        std::size_t ancestry_blocks = 0;
+        while (true)
+        {
+            const auto &parents = child->get_parents();
+            if (parents.empty() || !parents[0])
+            {
+                return rejected_proposal_history(
+                    EpochChangeProposalHistoryError::missing_parent);
+            }
+
+            const Block *const parent = parents[0].get();
+            const auto &declared_parent_hashes = child->get_parent_hashes();
+            if (declared_parent_hashes.empty() ||
+                declared_parent_hashes[0] != parent->get_hash())
+            {
+                return rejected_proposal_history(
+                    EpochChangeProposalHistoryError::parent_hash_mismatch);
+            }
+            if (!visited_pointers.insert(parent).second ||
+                !visited_hashes.insert(parent->get_hash()).second)
+            {
+                return rejected_proposal_history(
+                    EpochChangeProposalHistoryError::cycle);
+            }
+            if (parent->get_height() >= child->get_height())
+            {
+                return rejected_proposal_history(
+                    EpochChangeProposalHistoryError::nondecreasing_height);
+            }
+
+            const bool reached_committed_boundary =
+                parent->get_height() == committed_head.get_height() &&
+                parent->get_hash() == committed_head.get_hash();
+            if (reached_committed_boundary)
+            {
+                if (!merge_block_extra(committed_head, true))
+                {
+                    return rejected_proposal_history(
+                        merge_error, merge_wire_error);
+                }
+                return complete_proposal_history(std::move(history));
+            }
+            if (parent->get_height() <= committed_head.get_height())
+            {
+                return rejected_proposal_history(
+                    EpochChangeProposalHistoryError::boundary_not_reached);
+            }
+            if (ancestry_blocks >= maximum_ancestry_blocks)
+            {
+                return rejected_proposal_history(
+                    EpochChangeProposalHistoryError::ancestry_limit_exceeded);
+            }
+            if (!merge_block_extra(*parent, false))
+            {
+                return rejected_proposal_history(
+                    merge_error, merge_wire_error);
+            }
+
+            ++ancestry_blocks;
+            child = parent;
+        }
+    }
+    catch (const std::bad_alloc &)
+    {
+        return rejected_proposal_history(
+            EpochChangeProposalHistoryError::allocation_failure);
+    }
+    catch (...)
+    {
+        return rejected_proposal_history(
+            EpochChangeProposalHistoryError::internal_failure);
     }
 }
 

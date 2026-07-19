@@ -16,6 +16,8 @@
 namespace hotstuff
 {
 
+class Block;
+
 constexpr std::uint32_t kEpochChangeSchemaVersionV1 = 1;
 using EpochChangeIssuerId = std::uint32_t;
 
@@ -151,6 +153,80 @@ struct EpochChangeHistoryView
     std::optional<uint256_t> ancestry_payload_digest;
     std::optional<uint256_t> committed_payload_digest;
 };
+
+struct EpochChangeCommittedHistoryEntry
+{
+    uint256_t predecessor_epoch_digest;
+    uint256_t payload_digest;
+};
+
+struct EpochChangeCommittedHistorySnapshot
+{
+    uint256_t committed_head_hash;
+    std::uint32_t committed_head_height{0};
+    std::optional<EpochChangeCommittedHistoryEntry> command;
+};
+
+enum class EpochChangeProposalHistoryDisposition : std::uint8_t
+{
+    complete = 0,
+    rejected,
+};
+
+enum class EpochChangeProposalHistoryError : std::uint8_t
+{
+    none = 0,
+    invalid_limit,
+    invalid_committed_boundary,
+    incoherent_committed_snapshot,
+    missing_parent,
+    parent_hash_mismatch,
+    cycle,
+    nondecreasing_height,
+    ancestry_limit_exceeded,
+    boundary_not_reached,
+    malformed_extra,
+    conflicting_history,
+    allocation_failure,
+    internal_failure,
+};
+
+struct EpochChangeProposalHistoryResult
+{
+    EpochChangeProposalHistoryDisposition disposition{
+        EpochChangeProposalHistoryDisposition::rejected};
+    EpochChangeProposalHistoryError error{
+        EpochChangeProposalHistoryError::internal_failure};
+    EpochChangeWireError wire_error{EpochChangeWireError::none};
+    EpochChangeHistoryView history;
+
+    explicit operator bool() const noexcept
+    {
+        return disposition == EpochChangeProposalHistoryDisposition::complete &&
+               error == EpochChangeProposalHistoryError::none &&
+               wire_error == EpochChangeWireError::none;
+    }
+};
+
+/**
+ * Build the epoch-command history of a proposal's first-parent ancestry.
+ *
+ * The proposal itself is excluded. The exact committed boundary is parsed as
+ * committed history and reconciled with its head-bound snapshot. Any malformed
+ * or incomplete ancestry is rejected without exposing partial history.
+ *
+ * This builder performs bounded structural and canonical extraction only.
+ * Before voting, callers must authenticate and semantically validate every
+ * traversed nonempty ancestor; block delivery alone does not establish that
+ * invariant.
+ */
+EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
+    const Block &proposal,
+    const Block &committed_head,
+    const uint256_t &candidate_predecessor_digest,
+    const EpochChangeCommittedHistorySnapshot &committed_snapshot,
+    std::size_t maximum_block_extra_bytes,
+    std::size_t maximum_ancestry_blocks) noexcept;
 
 struct EpochChangeValidationResult
 {
