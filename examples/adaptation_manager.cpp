@@ -316,6 +316,43 @@ const char *controller_status_name(
     return "unknown";
 }
 
+const char *ingress_status_name(
+    AdaptiveV2ManagerIngressStatus status) noexcept
+{
+    switch (status)
+    {
+    case AdaptiveV2ManagerIngressStatus::processed:
+        return "processed";
+    case AdaptiveV2ManagerIngressStatus::rejected_nonmember:
+        return "rejected_nonmember";
+    case AdaptiveV2ManagerIngressStatus::rejected_spoofed_source:
+        return "rejected_spoofed_source";
+    case AdaptiveV2ManagerIngressStatus::rejected_sequence:
+        return "rejected_sequence";
+    case AdaptiveV2ManagerIngressStatus::rejected_configuration:
+        return "rejected_configuration";
+    case AdaptiveV2ManagerIngressStatus::rejected_generation:
+        return "rejected_generation";
+    case AdaptiveV2ManagerIngressStatus::rejected_height_regression:
+        return "rejected_height_regression";
+    case AdaptiveV2ManagerIngressStatus::awaiting_corroboration:
+        return "awaiting_corroboration";
+    case AdaptiveV2ManagerIngressStatus::already_applied:
+        return "already_applied";
+    case AdaptiveV2ManagerIngressStatus::rejected_capacity:
+        return "rejected_capacity";
+    case AdaptiveV2ManagerIngressStatus::rejected_wire:
+        return "rejected_wire";
+    case AdaptiveV2ManagerIngressStatus::rejected_lifecycle:
+        return "rejected_lifecycle";
+    case AdaptiveV2ManagerIngressStatus::evidence_unhealthy:
+        return "evidence_unhealthy";
+    case AdaptiveV2ManagerIngressStatus::stopped:
+        return "stopped";
+    }
+    return "unknown";
+}
+
 void write_exclusive_bundle(
     const std::string &path,
     const bytearray_t &bytes)
@@ -851,8 +888,83 @@ private:
         }
     }
 
+    void log_ingress_failure(
+        const char *message_kind,
+        AdaptiveV2ManagerIngressStatus status,
+        ReplicaID source) const noexcept
+    {
+        const auto audit = ingress_.audit_stats();
+        const auto lifecycle = ingress_.lifecycle_stats();
+        const auto &ledger = ingress_.ledger();
+        HOTSTUFF_LOG_WARN(
+            "KAURI_ADAPTIVE_MANAGER ingress_failure "
+            "kind=%s status=%s status_code=%u source=%u "
+            "audit_readiness_wire_rejections=%llu "
+            "audit_lifecycle_wire_rejections=%llu "
+            "audit_evidence_wire_rejections=%llu "
+            "audit_nonmember_rejections=%llu "
+            "audit_spoofed_source_rejections=%llu "
+            "audit_state_rejections=%llu "
+            "audit_lifecycle_quota_rejections=%llu "
+            "audit_capacity_failures=%llu "
+            "audit_corroboration_threshold=%zu "
+            "audit_pending_facts=%zu "
+            "audit_pending_associations=%zu "
+            "lifecycle_quarantined_records=%zu "
+            "lifecycle_quarantined_bytes=%zu "
+            "lifecycle_reporter_queues=%zu "
+            "lifecycle_signer_entries=%zu "
+            "lifecycle_deduplication_entries=%zu "
+            "lifecycle_sources=%zu "
+            "lifecycle_duplicate_observations=%llu "
+            "lifecycle_applied_notices=%llu "
+            "lifecycle_capacity_failures=%llu "
+            "lifecycle_healthy=%d lifecycle_stopped=%d "
+            "ledger_accepted=%zu ledger_rejected=%zu "
+            "ledger_high_watermark=%llu",
+            message_kind,
+            ingress_status_name(status),
+            static_cast<unsigned>(status),
+            static_cast<unsigned>(source),
+            static_cast<unsigned long long>(
+                audit.readiness_wire_rejections),
+            static_cast<unsigned long long>(
+                audit.lifecycle_wire_rejections),
+            static_cast<unsigned long long>(
+                audit.evidence_wire_rejections),
+            static_cast<unsigned long long>(
+                audit.nonmember_rejections),
+            static_cast<unsigned long long>(
+                audit.spoofed_source_rejections),
+            static_cast<unsigned long long>(audit.state_rejections),
+            static_cast<unsigned long long>(
+                audit.lifecycle_quota_rejections),
+            static_cast<unsigned long long>(audit.capacity_failures),
+            audit.lifecycle_corroboration_threshold,
+            audit.pending_lifecycle_facts,
+            audit.pending_lifecycle_associations,
+            lifecycle.quarantined_records,
+            lifecycle.quarantined_bytes,
+            lifecycle.reporter_queues,
+            lifecycle.signer_entries,
+            lifecycle.deduplication_entries,
+            lifecycle.lifecycle_sources,
+            static_cast<unsigned long long>(
+                lifecycle.duplicate_observations),
+            static_cast<unsigned long long>(
+                lifecycle.applied_lifecycle_notices),
+            static_cast<unsigned long long>(
+                lifecycle.capacity_failures),
+            lifecycle.healthy ? 1 : 0,
+            lifecycle.stopped ? 1 : 0,
+            ledger.accepted().size(),
+            ledger.rejected().size(),
+            static_cast<unsigned long long>(ledger.high_watermark()));
+    }
+
     template <typename Message, typename Ingest>
     void ingest(
+        const char *message_kind,
         Message &&message,
         const ManagerNetwork::conn_t &connection,
         Ingest &&operation)
@@ -866,6 +978,8 @@ private:
                 AdaptiveV2ManagerIngressStatus::evidence_unhealthy ||
             result.status == AdaptiveV2ManagerIngressStatus::stopped)
         {
+            log_ingress_failure(
+                message_kind, result.status, *source);
             fail("manager_ingress_unhealthy");
             return;
         }
@@ -888,7 +1002,7 @@ private:
         network_.reg_handler(
             [this](MsgAdaptiveV2ReadinessNotice &&message,
                    const ManagerNetwork::conn_t &connection) {
-                ingest(
+                ingest("readiness",
                     std::move(message), connection,
                     [this](const AuthenticatedReporter &source,
                            const MsgAdaptiveV2ReadinessNotice &value) {
@@ -898,7 +1012,7 @@ private:
         network_.reg_handler(
             [this](MsgProposalLifecycleNotice &&message,
                    const ManagerNetwork::conn_t &connection) {
-                ingest(
+                ingest("lifecycle",
                     std::move(message), connection,
                     [this](const AuthenticatedReporter &source,
                            const MsgProposalLifecycleNotice &value) {
@@ -908,7 +1022,7 @@ private:
         network_.reg_handler(
             [this](MsgEvidenceReport &&message,
                    const ManagerNetwork::conn_t &connection) {
-                ingest(
+                ingest("evidence",
                     std::move(message), connection,
                     [this](const AuthenticatedReporter &source,
                            const MsgEvidenceReport &value) {

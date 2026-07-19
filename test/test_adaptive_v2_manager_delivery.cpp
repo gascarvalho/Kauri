@@ -105,3 +105,73 @@ TEST_CASE(
     CHECK(dispatch < network_stop);
     CHECK(network_stop < ingress_shutdown);
 }
+
+TEST_CASE(
+    "fatal manager ingress logs one bounded diagnostic before shutdown",
+    "[adaptive-v2][manager-ingress][diagnostic]")
+{
+    const auto source = read_source("examples/adaptation_manager.cpp");
+    const auto diagnostic_begin = source.find(
+        "void log_ingress_failure(");
+    const auto diagnostic_end = source.find(
+        "template <typename Message", diagnostic_begin);
+    REQUIRE(diagnostic_begin != std::string::npos);
+    REQUIRE(diagnostic_end != std::string::npos);
+    const auto diagnostic = source.substr(
+        diagnostic_begin, diagnostic_end - diagnostic_begin);
+
+    for (const auto *field : {
+             "kind=%s", "status=%s", "status_code=%u", "source=%u",
+             "audit_readiness_wire_rejections=%llu",
+             "audit_lifecycle_wire_rejections=%llu",
+             "audit_evidence_wire_rejections=%llu",
+             "audit_nonmember_rejections=%llu",
+             "audit_spoofed_source_rejections=%llu",
+             "audit_state_rejections=%llu",
+             "audit_lifecycle_quota_rejections=%llu",
+             "audit_capacity_failures=%llu",
+             "audit_corroboration_threshold=%zu",
+             "audit_pending_facts=%zu",
+             "audit_pending_associations=%zu",
+             "lifecycle_quarantined_records=%zu",
+             "lifecycle_quarantined_bytes=%zu",
+             "lifecycle_reporter_queues=%zu",
+             "lifecycle_signer_entries=%zu",
+             "lifecycle_deduplication_entries=%zu",
+             "lifecycle_sources=%zu",
+             "lifecycle_duplicate_observations=%llu",
+             "lifecycle_applied_notices=%llu",
+             "lifecycle_capacity_failures=%llu",
+             "lifecycle_healthy=%d",
+             "lifecycle_stopped=%d",
+             "ledger_accepted=%zu",
+             "ledger_rejected=%zu",
+             "ledger_high_watermark=%llu"})
+    {
+        CAPTURE(field);
+        CHECK(diagnostic.find(field) != std::string::npos);
+    }
+    CHECK(diagnostic.find("HOTSTUFF_LOG_WARN") != std::string::npos);
+    CHECK(diagnostic.find("options_") == std::string::npos);
+    CHECK(diagnostic.find("private_key") == std::string::npos);
+    CHECK(diagnostic.find("certificate") == std::string::npos);
+    CHECK(diagnostic.find("canonical_bytes") == std::string::npos);
+
+    const auto ingest = source.find("void ingest(");
+    const auto log = source.find("log_ingress_failure(", ingest);
+    const auto fail = source.find(
+        "fail(\"manager_ingress_unhealthy\")", ingest);
+    REQUIRE(ingest != std::string::npos);
+    REQUIRE(log != std::string::npos);
+    REQUIRE(fail != std::string::npos);
+    CHECK(log < fail);
+
+    const auto handlers = source.find("void register_handlers()");
+    REQUIRE(handlers != std::string::npos);
+    CHECK(source.find("ingest(\"readiness\"", handlers) !=
+          std::string::npos);
+    CHECK(source.find("ingest(\"lifecycle\"", handlers) !=
+          std::string::npos);
+    CHECK(source.find("ingest(\"evidence\"", handlers) !=
+          std::string::npos);
+}
