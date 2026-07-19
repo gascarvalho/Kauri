@@ -232,6 +232,13 @@ set_tests_properties(
     LABELS "unit;adaptive;readiness;wire;adaptive-v2"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_adaptive_v2_reporting_outbox
+    test_adaptive_v2_reporting_outbox.cpp)
+set_tests_properties(
+    test_adaptive_v2_reporting_outbox PROPERTIES
+    LABELS "unit;adaptive;adaptive-v2;reporting-outbox;evidence"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_tree_policy
     test_tree_policy.cpp)
 target_compile_definitions(
