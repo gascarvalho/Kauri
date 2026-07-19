@@ -239,6 +239,13 @@ set_tests_properties(
     LABELS "adaptive-v2;manager-ingress;n7;evidence;unit"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_adaptive_v2_manager_controller
+    test_adaptive_v2_manager_controller.cpp)
+set_tests_properties(
+    test_adaptive_v2_manager_controller PROPERTIES
+    LABELS "adaptive-v2;manager-controller;n7;evidence;selection;epoch-factory;unit"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_adaptive_v2_reporting_outbox
     test_adaptive_v2_reporting_outbox.cpp)
 set_tests_properties(
