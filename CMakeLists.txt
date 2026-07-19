@@ -192,6 +192,7 @@ add_library(hotstuff
     src/epoch_wire.cpp
     src/evidence.cpp
     src/evidence_lifecycle.cpp
+    src/evidence_lifecycle_wire.cpp
     src/evidence_ingress.cpp
     src/evidence_reporter.cpp
     src/evidence_reputation.cpp

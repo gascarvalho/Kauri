@@ -194,6 +194,13 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;evidence;evidence-lifecycle"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_evidence_lifecycle_wire
+    test_evidence_lifecycle_wire.cpp)
+set_tests_properties(
+    test_evidence_lifecycle_wire PROPERTIES
+    LABELS "unit;adaptive;evidence;evidence-lifecycle;wire;adaptive-v2"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_adaptation
     test_adaptation.cpp)
 target_compile_definitions(
