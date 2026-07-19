@@ -1102,6 +1102,19 @@ namespace hotstuff
         };
         std::optional<CommittedEpochChangeHistoryState>
             committed_epoch_change_history;
+        static constexpr std::size_t
+            maximum_pending_epoch_definition_digests{8};
+        static constexpr std::size_t
+            maximum_deferred_epoch_change_proposals{256};
+        struct DeferredEpochDefinitionRecovery
+        {
+            EpochDefinitionRequest request;
+            bool request_live{true};
+            std::map<ProposalKey, BufferedProposal> proposals;
+        };
+        std::map<uint256_t, DeferredEpochDefinitionRecovery>
+            deferred_epoch_definition_recoveries;
+        std::size_t deferred_epoch_change_proposal_count{0};
         mutable TreeNetwork current_tree_network;
         mutable Tree current_tree;
         uint32_t lastCheckedHeight;
@@ -1140,11 +1153,33 @@ namespace hotstuff
         void initialize_adaptive_epoch_runtime();
         EpochChangeProposalChainResult pre_vote_epoch_change_gate(
             const Proposal &proposal) const noexcept;
+        bool retain_deferred_epoch_change(
+            BufferedProposal proposal,
+            const EpochDefinitionRequest &request) noexcept;
+        void erase_deferred_epoch_change(
+            const ProposalKey &key) noexcept;
+        void retire_deferred_epoch_changes_for_block(
+            const uint256_t &block_hash) noexcept;
+        void retire_deferred_epoch_changes_before_epoch(
+            std::uint32_t first_live_epoch) noexcept;
+        void send_epoch_definition_request(
+            const EpochDefinitionRequest &request) noexcept;
+        bool queue_deferred_epoch_change_retries(
+            const uint256_t &successor_epoch_digest) noexcept;
+        void retry_deferred_epoch_changes(
+            const uint256_t &successor_epoch_digest) noexcept;
         void initialize_committed_epoch_change_history() noexcept;
         void record_committed_epoch_change_history(
             const block_t &block) noexcept;
         void install_legacy_consensus_handlers();
         void install_adaptive_epoch_handlers();
+        void install_adaptive_v2_definition_handlers();
+        void adaptive_definition_request_handler(
+            MsgEpochDefinitionRequest &&message,
+            const Net::conn_t &conn);
+        void adaptive_definition_reply_handler(
+            MsgEpochDefinitionReply &&message,
+            const Net::conn_t &conn);
         bool authorize_manager_peer(const PeerId &peer) const noexcept;
         void rebuild_aggregation_timeout_coordinator();
         std::optional<ProposalKey> committed_proposal_key(

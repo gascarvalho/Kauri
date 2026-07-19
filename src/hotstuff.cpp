@@ -97,6 +97,26 @@ namespace hotstuff
             return result;
         }
 
+        EpochDefinitionInput available_epoch_definition(
+            const EpochDefinition &definition)
+        {
+            EpochDefinitionInput input;
+            input.schema_version = definition.schema_version();
+            input.epoch_number = definition.epoch_number();
+            input.previous_epoch_digest =
+                definition.previous_epoch_digest();
+            input.membership_digest = definition.membership_digest();
+            input.trees = definition.trees();
+            input.activation_height = definition.activation_height();
+            input.generation_seed = definition.generation_seed();
+            input.policy_version = definition.policy_version();
+            input.evidence_snapshot_id =
+                definition.evidence_snapshot_id();
+            input.evidence_cutoff = definition.evidence_cutoff();
+            input.epoch_digest = definition.epoch_digest();
+            return input;
+        }
+
         class SalticidaeAggregationScheduler final
             : public AggregationScheduler
         {
@@ -1625,6 +1645,221 @@ namespace hotstuff
         }
     }
 
+    bool HotStuffBase::retain_deferred_epoch_change(
+        BufferedProposal proposal,
+        const EpochDefinitionRequest &request) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            request.wire_schema_version != kEpochWireSchemaVersionV2 ||
+            request.protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            request.successor_epoch_digest == uint256_t{} ||
+            exact_epochs == nullptr ||
+            exact_epochs->find_epoch_by_digest(
+                request.successor_epoch_digest) != nullptr)
+            return false;
+
+        try
+        {
+            auto recovery = deferred_epoch_definition_recoveries.find(
+                request.successor_epoch_digest);
+            bool created = false;
+            if (recovery == deferred_epoch_definition_recoveries.end())
+            {
+                if (deferred_epoch_definition_recoveries.size() >=
+                    maximum_pending_epoch_definition_digests)
+                    return false;
+                const auto inserted =
+                    deferred_epoch_definition_recoveries.emplace(
+                        request.successor_epoch_digest,
+                        DeferredEpochDefinitionRecovery{
+                            request, true, {}});
+                if (!inserted.second)
+                    return false;
+                recovery = inserted.first;
+                created = true;
+            }
+            else if (recovery->second.request.wire_schema_version !=
+                         request.wire_schema_version ||
+                     recovery->second.request.protocol_mode !=
+                         request.protocol_mode ||
+                     recovery->second.request.successor_epoch_digest !=
+                         request.successor_epoch_digest)
+            {
+                return false;
+            }
+
+            const auto key = proposal.metadata.key();
+            if (recovery->second.proposals.count(key) != 0)
+                return true;
+            if (deferred_epoch_change_proposal_count >=
+                maximum_deferred_epoch_change_proposals)
+            {
+                if (created)
+                    deferred_epoch_definition_recoveries.erase(recovery);
+                return false;
+            }
+            const auto inserted = recovery->second.proposals.emplace(
+                key, std::move(proposal));
+            if (!inserted.second)
+                return true;
+            ++deferred_epoch_change_proposal_count;
+            if (created)
+                send_epoch_definition_request(request);
+            return true;
+        }
+        catch (...)
+        {
+            for (auto recovery =
+                     deferred_epoch_definition_recoveries.begin();
+                 recovery != deferred_epoch_definition_recoveries.end();)
+            {
+                if (recovery->second.proposals.empty())
+                    recovery = deferred_epoch_definition_recoveries.erase(
+                        recovery);
+                else
+                    ++recovery;
+            }
+            return false;
+        }
+    }
+
+    void HotStuffBase::erase_deferred_epoch_change(
+        const ProposalKey &key) noexcept
+    {
+        for (auto recovery =
+                 deferred_epoch_definition_recoveries.begin();
+             recovery != deferred_epoch_definition_recoveries.end();)
+        {
+            const auto proposal = recovery->second.proposals.find(key);
+            if (proposal == recovery->second.proposals.end())
+            {
+                ++recovery;
+                continue;
+            }
+            recovery->second.proposals.erase(proposal);
+            if (deferred_epoch_change_proposal_count != 0)
+                --deferred_epoch_change_proposal_count;
+            if (recovery->second.proposals.empty())
+                deferred_epoch_definition_recoveries.erase(recovery);
+            return;
+        }
+    }
+
+    void HotStuffBase::send_epoch_definition_request(
+        const EpochDefinitionRequest &request) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            return;
+        try
+        {
+            std::vector<std::pair<ReplicaID, PeerId>> targets;
+            targets.reserve(peer_id_map.size());
+            for (const auto &authenticated : peer_id_map)
+            {
+                if (authenticated.first.is_null() ||
+                    authenticated.second >= fixed_membership.size())
+                    continue;
+                const auto replica = static_cast<ReplicaID>(
+                    authenticated.second);
+                if (fixed_membership[authenticated.second] != replica)
+                    continue;
+                targets.emplace_back(replica, authenticated.first);
+            }
+            std::sort(
+                targets.begin(), targets.end(),
+                [](const auto &left, const auto &right) {
+                    return left.first < right.first;
+                });
+            ReplicaID previous = 0;
+            bool have_previous = false;
+            for (const auto &target : targets)
+            {
+                if (have_previous && target.first == previous)
+                    continue;
+                previous = target.first;
+                have_previous = true;
+                try
+                {
+                    const MsgEpochDefinitionRequest message(
+                        request, epoch_wire_limits);
+                    pn.send_msg(message, target.second);
+                }
+                catch (...)
+                {
+                    HOTSTUFF_LOG_WARN(
+                        "[EPOCH] Failed to request definition from replica %u",
+                        target.first);
+                }
+            }
+        }
+        catch (...)
+        {
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Failed to fan out definition request");
+        }
+    }
+
+    bool HotStuffBase::queue_deferred_epoch_change_retries(
+        const uint256_t &successor_epoch_digest) noexcept
+    {
+        try
+        {
+            const auto access = exact_runtime_access;
+            tcall.async_call(
+                [access, successor_epoch_digest](
+                    salticidae::ThreadCall::Handle &)
+                {
+                    const auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    runtime->owner().retry_deferred_epoch_changes(
+                        successor_epoch_digest);
+                });
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void HotStuffBase::retry_deferred_epoch_changes(
+        const uint256_t &successor_epoch_digest) noexcept
+    {
+        const auto recovery = deferred_epoch_definition_recoveries.find(
+            successor_epoch_digest);
+        if (recovery == deferred_epoch_definition_recoveries.end() ||
+            recovery->second.request_live || exact_epochs == nullptr ||
+            exact_epochs->find_epoch_by_digest(
+                successor_epoch_digest) == nullptr)
+            return;
+
+        try
+        {
+            std::vector<BufferedProposal> proposals;
+            proposals.reserve(recovery->second.proposals.size());
+            for (const auto &proposal : recovery->second.proposals)
+                proposals.push_back(proposal.second);
+            for (const auto &proposal : proposals)
+                process_active(proposal);
+        }
+        catch (...)
+        {
+            const auto retryable =
+                deferred_epoch_definition_recoveries.find(
+                    successor_epoch_digest);
+            if (retryable !=
+                deferred_epoch_definition_recoveries.end())
+            {
+                retryable->second.request_live = true;
+                send_epoch_definition_request(
+                    retryable->second.request);
+            }
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Failed to retry deferred epoch-change proposals");
+        }
+    }
+
     void HotStuffBase::initialize_committed_epoch_change_history() noexcept
     {
         committed_epoch_change_history.reset();
@@ -1737,11 +1972,57 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::retire_deferred_epoch_changes_before_epoch(
+        std::uint32_t first_live_epoch) noexcept
+    {
+        for (auto recovery =
+                 deferred_epoch_definition_recoveries.begin();
+             recovery != deferred_epoch_definition_recoveries.end();)
+        {
+            auto &proposals = recovery->second.proposals;
+            for (auto proposal = proposals.begin();
+                 proposal != proposals.end();)
+            {
+                if (proposal->first.configuration.epoch_number >=
+                    first_live_epoch)
+                {
+                    ++proposal;
+                    continue;
+                }
+                const auto key = proposal->first;
+                if (proposal_admission != nullptr)
+                {
+                    try
+                    {
+                        proposal_admission->retire_proposal(key);
+                    }
+                    catch (...)
+                    {}
+                }
+                try
+                {
+                    purge_pending_exact_contributions(key);
+                }
+                catch (...)
+                {}
+                proposal = proposals.erase(proposal);
+                if (deferred_epoch_change_proposal_count != 0)
+                    --deferred_epoch_change_proposal_count;
+            }
+            if (proposals.empty())
+                recovery =
+                    deferred_epoch_definition_recoveries.erase(recovery);
+            else
+                ++recovery;
+        }
+    }
+
     void HotStuffBase::process_active(const BufferedProposal &proposal)
     {
         const auto proposal_key = proposal.metadata.key();
         if (proposal.source_peer.is_null())
         {
+            erase_deferred_epoch_change(proposal_key);
             proposal_contexts->close(
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
@@ -1780,7 +2061,8 @@ namespace hotstuff
             delivery.then(
                 [access,
                  metadata = std::move(*metadata),
-                 parsed = std::move(parsed)](
+                 parsed = std::move(parsed),
+                 deferred = proposal](
                     const block_t &delivered) mutable
                 {
                     auto runtime = access->acquire();
@@ -1788,6 +2070,7 @@ namespace hotstuff
                         return;
                     auto &owner = runtime->owner();
                     const auto abort = [&owner, &metadata]() {
+                        owner.erase_deferred_epoch_change(metadata.key);
                         owner.proposal_contexts->close(
                             metadata.key,
                             ProposalContextEvent::proposal_aborted);
@@ -1812,8 +2095,16 @@ namespace hotstuff
                         {
                         case EpochChangeProposalDisposition::accepted:
                         case EpochChangeProposalDisposition::duplicate:
+                            owner.erase_deferred_epoch_change(
+                                metadata.key);
                             break;
                         case EpochChangeProposalDisposition::defer:
+                            if (!gate.recovery_request ||
+                                !owner.retain_deferred_epoch_change(
+                                    std::move(deferred),
+                                    *gate.recovery_request))
+                                abort();
+                            return;
                         case EpochChangeProposalDisposition::rejected:
                             abort();
                             return;
@@ -1867,6 +2158,7 @@ namespace hotstuff
                     if (!runtime.has_value())
                         return;
                     auto &owner = runtime->owner();
+                    owner.erase_deferred_epoch_change(delivery_key);
                     owner.proposal_contexts->close(
                         delivery_key,
                         ProposalContextEvent::proposal_aborted);
@@ -1878,6 +2170,7 @@ namespace hotstuff
         }
         catch (const std::exception &error)
         {
+            erase_deferred_epoch_change(proposal_key);
             proposal_contexts->close(
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
@@ -1890,6 +2183,7 @@ namespace hotstuff
         }
         catch (...)
         {
+            erase_deferred_epoch_change(proposal_key);
             proposal_contexts->close(
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
@@ -3409,6 +3703,117 @@ namespace hotstuff
             std::move(message), AuthenticatedEpochPeer::manager()));
     }
 
+    void HotStuffBase::adaptive_definition_request_handler(
+        MsgEpochDefinitionRequest &&message,
+        const Net::conn_t &conn)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            exact_epochs == nullptr)
+            return;
+        const auto peer = conn->get_peer_id();
+        const auto authenticated = peer_id_map.find(peer);
+        if (peer.is_null() || authenticated == peer_id_map.end())
+            return;
+
+        const auto decoded = decode_epoch_definition_request(
+            static_cast<bytearray_t>(message.serialized),
+            EpochProtocolMode::adaptive_v2,
+            epoch_wire_limits);
+        if (!decoded)
+            return;
+        const auto *definition = exact_epochs->find_epoch_by_digest(
+            decoded.value->successor_epoch_digest);
+        if (definition == nullptr ||
+            definition->schema_version() !=
+                kEpochDefinitionSchemaVersionV2 ||
+            definition->epoch_digest() !=
+                decoded.value->successor_epoch_digest)
+            return;
+
+        try
+        {
+            const EpochDefinitionReply reply{
+                kEpochWireSchemaVersionV2,
+                EpochProtocolMode::adaptive_v2,
+                definition->epoch_digest(),
+                available_epoch_definition(*definition)};
+            const MsgEpochDefinitionReply response(
+                reply, epoch_wire_limits);
+            pn.send_msg(response, peer);
+        }
+        catch (...)
+        {
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Failed to reply with an available definition");
+        }
+    }
+
+    void HotStuffBase::adaptive_definition_reply_handler(
+        MsgEpochDefinitionReply &&message,
+        const Net::conn_t &conn)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            exact_epochs == nullptr || proposal_admission == nullptr)
+            return;
+        const auto peer = conn->get_peer_id();
+        const auto authenticated = peer_id_map.find(peer);
+        if (peer.is_null() || authenticated == peer_id_map.end())
+            return;
+
+        const auto decoded = decode_epoch_definition_reply(
+            static_cast<bytearray_t>(message.serialized),
+            EpochProtocolMode::adaptive_v2,
+            epoch_wire_limits);
+        if (!decoded)
+            return;
+        auto recovery = deferred_epoch_definition_recoveries.find(
+            decoded.value->successor_epoch_digest);
+        if (recovery == deferred_epoch_definition_recoveries.end() ||
+            !recovery->second.request_live ||
+            recovery->second.request.successor_epoch_digest !=
+                decoded.value->successor_epoch_digest)
+            return;
+
+        const auto &active_configuration =
+            proposal_admission->active_configuration();
+        const auto *active = exact_epochs->find_epoch(
+            active_configuration.epoch_number);
+        if (active == nullptr ||
+            active->epoch_digest() != active_configuration.epoch_digest)
+            return;
+
+        DefinitionAvailabilityResult staged;
+        try
+        {
+            staged = exact_epochs->stage_available_v2(
+                decoded.value->definition, *active);
+        }
+        catch (...)
+        {
+            return;
+        }
+        if ((staged.disposition !=
+                 DefinitionAvailabilityDisposition::staged &&
+             staged.disposition !=
+                 DefinitionAvailabilityDisposition::duplicate) ||
+            staged.definition == nullptr ||
+            staged.definition->epoch_digest() !=
+                recovery->second.request.successor_epoch_digest ||
+            staged.definition->epoch_digest() !=
+                decoded.value->successor_epoch_digest)
+            return;
+
+        recovery = deferred_epoch_definition_recoveries.find(
+            decoded.value->successor_epoch_digest);
+        if (recovery == deferred_epoch_definition_recoveries.end() ||
+            !recovery->second.request_live)
+            return;
+        recovery->second.request_live = false;
+        if (!queue_deferred_epoch_change_retries(
+                decoded.value->successor_epoch_digest))
+            recovery->second.request_live = true;
+    }
+
     void HotStuffBase::adaptive_propose_handler(
         MsgPropose &&message,
         const Net::conn_t &conn)
@@ -4446,7 +4851,11 @@ namespace hotstuff
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1)
             install_adaptive_epoch_handlers();
         else
+        {
             install_legacy_consensus_handlers();
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+                install_adaptive_v2_definition_handlers();
+        }
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::req_blk_handler, this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::resp_blk_handler, this, _1, _2));
         pn.reg_conn_handler(salticidae::generic_bind(&HotStuffBase::conn_handler, this, _1, _2));
@@ -4483,6 +4892,16 @@ namespace hotstuff
             this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_relay_handler,
+            this, _1, _2));
+    }
+
+    void HotStuffBase::install_adaptive_v2_definition_handlers()
+    {
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_definition_request_handler,
+            this, _1, _2));
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_definition_reply_handler,
             this, _1, _2));
     }
 
@@ -5216,6 +5635,8 @@ namespace hotstuff
             if (proposal_contexts->has_open_context_before_epoch(
                     first_live_epoch))
                 return;
+            retire_deferred_epoch_changes_before_epoch(
+                first_live_epoch);
             proposal_admission->advance_retirement_floor(
                 first_live_epoch);
             pending_exact_contributions.purge_before_epoch(
@@ -5225,9 +5646,54 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::retire_deferred_epoch_changes_for_block(
+        const uint256_t &block_hash) noexcept
+    {
+        for (auto recovery =
+                 deferred_epoch_definition_recoveries.begin();
+             recovery != deferred_epoch_definition_recoveries.end();)
+        {
+            auto &proposals = recovery->second.proposals;
+            for (auto proposal = proposals.begin();
+                 proposal != proposals.end();)
+            {
+                if (proposal->first.block_hash != block_hash)
+                {
+                    ++proposal;
+                    continue;
+                }
+                const auto key = proposal->first;
+                if (proposal_admission != nullptr)
+                {
+                    try
+                    {
+                        proposal_admission->retire_proposal(key);
+                    }
+                    catch (...)
+                    {}
+                }
+                try
+                {
+                    purge_pending_exact_contributions(key);
+                }
+                catch (...)
+                {}
+                proposal = proposals.erase(proposal);
+                if (deferred_epoch_change_proposal_count != 0)
+                    --deferred_epoch_change_proposal_count;
+            }
+            if (proposals.empty())
+                recovery =
+                    deferred_epoch_definition_recoveries.erase(recovery);
+            else
+                ++recovery;
+        }
+    }
+
     void HotStuffBase::do_consensus(const block_t &blk)
     {
         record_committed_epoch_change_history(blk);
+        retire_deferred_epoch_changes_for_block(blk->get_hash());
         const auto keys =
             proposal_contexts->close_committed_block(blk->get_hash());
         record_adaptive_commit_marker(blk, keys);
@@ -5235,6 +5701,7 @@ namespace hotstuff
         for (const auto &key : keys)
         {
             purge_pending_exact_contributions(key);
+            erase_deferred_epoch_change(key);
             proposal_admission->retire_proposal(key);
         }
         const auto activation = epoch_live_binding == nullptr
@@ -5400,6 +5867,8 @@ namespace hotstuff
         adaptive_epoch_runtime.reset();
         cancel_all_exact_forwarding_retries();
         exact_runtime_access->close_and_wait();
+        deferred_epoch_definition_recoveries.clear();
+        deferred_epoch_change_proposal_count = 0;
         proposal_contexts->shutdown();
         pending_exact_contributions.clear();
         blk_delivery_orchestrator.cancel(nullptr);

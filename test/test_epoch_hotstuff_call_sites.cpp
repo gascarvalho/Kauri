@@ -343,8 +343,10 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
         {"delivered->get_hash() != metadata.key.block_hash",
          "pre_vote_epoch_change_gate(",
          "EpochChangeProposalDisposition::defer",
-         "abort();",
+         "retain_deferred_epoch_change(",
          "return;",
+         "EpochChangeProposalDisposition::rejected",
+         "abort();",
          "proposal_contexts->admit_remote(",
          "on_receive_proposal(parsed)",
          "create_expected_vote_state(metadata.key)",
@@ -357,11 +359,18 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
     REQUIRE(gate != std::string::npos);
     REQUIRE(context != std::string::npos);
     const auto fail_closed_path = remote.substr(gate, context - gate);
-    CHECK(contains_all(fail_closed_path, {"abort();", "return;"}));
+    CHECK(contains_all(
+        fail_closed_path,
+        {"gate.recovery_request",
+         "retain_deferred_epoch_change(",
+         "abort();",
+         "return;"}));
     for (const auto *forbidden : {
-             "recovery_request",
-             "deferred_epoch_change",
-             "retry_deferred"})
+             "proposal_contexts->admit_remote(",
+             "on_receive_proposal(parsed)",
+             "create_expected_vote_state(",
+             "start_latency_deadline(",
+             "start_aggregation_timer("})
     {
         CAPTURE(forbidden);
         CHECK(fail_closed_path.find(forbidden) == std::string::npos);
@@ -370,6 +379,202 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
     REQUIRE_FALSE(ingress.empty());
     CHECK(ingress.find("pre_vote_epoch_change_gate(") ==
           std::string::npos);
+}
+
+TEST_CASE("adaptive v2 definition recovery is bounded and digest coalesced",
+          "[c08][epoch-change][definition-recovery][intentional-red]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto retain = function_body(
+        implementation,
+        "HotStuffBase::retain_deferred_epoch_change(");
+    const auto request = function_body(
+        implementation,
+        "HotStuffBase::send_epoch_definition_request(");
+
+    CHECK(contains_all(
+        header,
+        {"struct DeferredEpochDefinitionRecovery",
+         "EpochDefinitionRequest request;",
+         "bool request_live",
+         "std::map<ProposalKey, BufferedProposal> proposals;",
+         "maximum_pending_epoch_definition_digests",
+         "maximum_deferred_epoch_change_proposals",
+         "deferred_epoch_definition_recoveries"}));
+
+    REQUIRE_FALSE(retain.empty());
+    CHECK(contains_all(
+        retain,
+        {"EpochProtocolMode::adaptive_v2",
+         "request.successor_epoch_digest",
+         "maximum_pending_epoch_definition_digests",
+         "maximum_deferred_epoch_change_proposals",
+         ".emplace(",
+         "send_epoch_definition_request("}));
+
+    REQUIRE_FALSE(request.empty());
+    CHECK(contains_in_order(
+        request,
+        {"peer_id_map",
+         "MsgEpochDefinitionRequest message(",
+         "pn.send_msg("}));
+    CHECK(request.find("epoch_manager_peer") == std::string::npos);
+}
+
+TEST_CASE("adaptive v2 recovery handlers authenticate and retry off ingress",
+          "[c08][epoch-change][definition-recovery][network][intentional-red]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto constructor = function_body(
+        implementation, "HotStuffBase::HotStuffBase(");
+    const auto install = function_body(
+        implementation,
+        "HotStuffBase::install_adaptive_v2_definition_handlers(");
+    const auto request = function_body(
+        implementation,
+        "HotStuffBase::adaptive_definition_request_handler(");
+    const auto reply = function_body(
+        implementation,
+        "HotStuffBase::adaptive_definition_reply_handler(");
+    const auto queue = function_body(
+        implementation,
+        "HotStuffBase::queue_deferred_epoch_change_retries(");
+    const auto retry = function_body(
+        implementation,
+        "HotStuffBase::retry_deferred_epoch_changes(");
+
+    REQUIRE_FALSE(constructor.empty());
+    CHECK(contains_in_order(
+        constructor,
+        {"install_legacy_consensus_handlers();",
+         "EpochProtocolMode::adaptive_v2",
+         "install_adaptive_v2_definition_handlers();"}));
+
+    REQUIRE_FALSE(install.empty());
+    CHECK(contains_all(
+        install,
+        {"adaptive_definition_request_handler",
+         "adaptive_definition_reply_handler"}));
+    CHECK(install.find("adaptive_stage_epoch_handler") ==
+          std::string::npos);
+    CHECK(install.find("adaptive_arm_epoch_handler") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(request.empty());
+    CHECK(contains_in_order(
+        request,
+        {"conn->get_peer_id()",
+         "peer_id_map.find(peer)",
+         "decode_epoch_definition_request(",
+         "find_epoch_by_digest(",
+         "kEpochDefinitionSchemaVersionV2",
+         "MsgEpochDefinitionReply response(",
+         "pn.send_msg("}));
+
+    REQUIRE_FALSE(reply.empty());
+    CHECK(contains_in_order(
+        reply,
+        {"conn->get_peer_id()",
+         "peer_id_map.find(peer)",
+         "decode_epoch_definition_reply(",
+         "deferred_epoch_definition_recoveries.find(",
+         "request_live",
+         "stage_available_v2(",
+         "successor_epoch_digest",
+         "queue_deferred_epoch_change_retries("}));
+
+    REQUIRE_FALSE(queue.empty());
+    CHECK(queue.find("tcall.async_call(") != std::string::npos);
+    REQUIRE_FALSE(retry.empty());
+    CHECK(retry.find("process_active(") != std::string::npos);
+    CHECK(retry.find("process_claimed_active(") == std::string::npos);
+    CHECK(contains_in_order(
+        retry,
+        {"try",
+         "proposals.reserve(",
+         "process_active(",
+         "catch (...)",
+         "deferred_epoch_definition_recoveries.find(",
+         "request_live = true",
+         "send_epoch_definition_request("}));
+}
+
+TEST_CASE("deferred recovery is cleared only on deterministic terminal paths",
+          "[c08][epoch-change][definition-recovery][lifecycle][intentional-red]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto remote = function_body(
+        implementation, "void HotStuffBase::process_active(");
+    const auto activate = function_body(
+        implementation,
+        "void HotStuffBase::activate_proposal_configuration(");
+    const auto retire = function_body(
+        implementation,
+        "void HotStuffBase::advance_committed_retirement_floor(");
+    const auto retire_block = function_body(
+        implementation,
+        "void HotStuffBase::retire_deferred_epoch_changes_for_block(");
+    const auto consensus = function_body(
+        implementation, "void HotStuffBase::do_consensus(");
+    const auto reply = function_body(
+        implementation,
+        "HotStuffBase::adaptive_definition_reply_handler(");
+    const auto destructor = function_body(
+        implementation, "HotStuffBase::~HotStuffBase(");
+
+    REQUIRE_FALSE(remote.empty());
+    CHECK(contains_in_order(
+        remote,
+        {"case EpochChangeProposalDisposition::accepted:",
+         "case EpochChangeProposalDisposition::duplicate:",
+         "erase_deferred_epoch_change(",
+         "case EpochChangeProposalDisposition::defer:",
+         "retain_deferred_epoch_change(",
+         "case EpochChangeProposalDisposition::rejected:",
+         "abort();"}));
+
+    REQUIRE_FALSE(activate.empty());
+    CHECK(activate.find(
+              "retire_deferred_epoch_changes_before_epoch(") ==
+          std::string::npos);
+    REQUIRE_FALSE(retire.empty());
+    CHECK(retire.find(
+              "retire_deferred_epoch_changes_before_epoch(") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(retire_block.empty());
+    CHECK(contains_in_order(
+        retire_block,
+        {"proposal->first.block_hash != block_hash",
+         "proposal_admission->retire_proposal(key)",
+         "purge_pending_exact_contributions(key)",
+         "proposal = proposals.erase(proposal)",
+         "deferred_epoch_definition_recoveries.erase(recovery)"}));
+
+    REQUIRE_FALSE(consensus.empty());
+    CHECK(contains_in_order(
+        consensus,
+        {"retire_deferred_epoch_changes_for_block(blk->get_hash())",
+         "close_committed_block(blk->get_hash())",
+         "for (const auto &key : keys)",
+         "erase_deferred_epoch_change(key)",
+         "proposal_admission->retire_proposal(key)"}));
+
+    REQUIRE_FALSE(reply.empty());
+    CHECK(contains_in_order(
+        reply,
+        {"deferred_epoch_definition_recoveries.find(",
+         "recovery == deferred_epoch_definition_recoveries.end()",
+         "return;"}));
+
+    REQUIRE_FALSE(destructor.empty());
+    CHECK(contains_in_order(
+        destructor,
+        {"exact_runtime_access->close_and_wait()",
+         "deferred_epoch_definition_recoveries.clear()",
+         "deferred_epoch_change_proposal_count = 0",
+         "proposal_contexts->shutdown()"}));
 }
 
 TEST_CASE("committed epoch history owns one coherent exact head snapshot",
@@ -398,16 +603,6 @@ TEST_CASE("committed epoch history owns one coherent exact head snapshot",
          "block_t head;",
          "EpochChangeCommittedHistorySnapshot snapshot;",
          "committed_epoch_change_history;"}));
-    for (const auto *removed : {
-             "DeferredEpochChangeProposal",
-             "deferred_epoch_changes",
-             "coalesced_epoch_definition_requests"})
-    {
-        CAPTURE(removed);
-        CHECK(header.find(removed) == std::string::npos);
-        CHECK(implementation.find(removed) == std::string::npos);
-    }
-
     REQUIRE_FALSE(constructor.empty());
     CHECK(constructor.find(
               "initialize_committed_epoch_change_history();") !=
