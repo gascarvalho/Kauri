@@ -334,11 +334,13 @@ add_kauri_catch_test(
     test_epoch_hotstuff_call_sites.cpp)
 target_compile_definitions(
     test_epoch_hotstuff_call_sites PRIVATE
-    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+    KAURI_HOTSTUFF_APP_PATH="$<TARGET_FILE:hotstuff-app>")
+add_dependencies(test_epoch_hotstuff_call_sites hotstuff-app)
 set_tests_properties(
     test_epoch_hotstuff_call_sites PROPERTIES
     LABELS "unit;adaptive;intentional-red;epoch-runtime;d11;integration"
-    TIMEOUT 10)
+    TIMEOUT 20)
 
 add_kauri_catch_test(
     test_structured_event

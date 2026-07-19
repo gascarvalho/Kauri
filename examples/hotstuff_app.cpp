@@ -19,8 +19,12 @@
 #include <cstring>
 #include <cassert>
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <csignal>
+#include <optional>
 #include <random>
+#include <system_error>
 #include <unistd.h>
 #include <signal.h>
 
@@ -151,6 +155,111 @@ std::pair<std::string, std::string> split_ip_port_cport(const std::string &s)
     return std::make_pair(ret[0], ret[1]);
 }
 
+struct AdaptiveV2PreVoteConfig
+{
+    hotstuff::EpochChangeIssuer issuer;
+    hotstuff::EpochChangeDelayBounds delay_bounds;
+    std::size_t maximum_block_extra_bytes{0};
+    std::size_t maximum_ancestry_blocks{0};
+};
+
+template<typename Value>
+Value parse_adaptive_v2_unsigned(
+    const std::string &raw_value,
+    const char *name,
+    bool must_be_positive)
+{
+    if (raw_value.empty())
+        throw HotStuffError(
+            std::string("adaptive-v2 ") + name + " is required");
+
+    Value value{0};
+    const auto *begin = raw_value.data();
+    const auto *end = begin + raw_value.size();
+    const auto parsed = std::from_chars(begin, end, value, 10);
+    if (parsed.ec != std::errc{} || parsed.ptr != end)
+        throw HotStuffError(
+            std::string("adaptive-v2 ") + name +
+            " must be a canonical unsigned decimal in range");
+    if (must_be_positive && value == 0)
+        throw HotStuffError(
+            std::string("adaptive-v2 ") + name + " must be positive");
+    return value;
+}
+
+hotstuff::PubKeySecp256k1 parse_adaptive_v2_issuer_public_key(
+    const std::string &issuer_public_key_hex)
+{
+    if (issuer_public_key_hex.empty())
+        throw HotStuffError(
+            "adaptive-v2 epoch-change issuer public key is required");
+    if (issuer_public_key_hex.size() != 66 ||
+        !std::all_of(
+            issuer_public_key_hex.begin(),
+            issuer_public_key_hex.end(),
+            [](unsigned char character)
+            {
+                return std::isxdigit(character) != 0;
+            }))
+        throw HotStuffError(
+            "adaptive-v2 epoch-change issuer public key is invalid");
+    try
+    {
+        return hotstuff::PubKeySecp256k1(
+            hotstuff::from_hex(issuer_public_key_hex));
+    }
+    catch (const std::exception &)
+    {
+        throw HotStuffError(
+            "adaptive-v2 epoch-change issuer public key is invalid");
+    }
+}
+
+std::optional<AdaptiveV2PreVoteConfig>
+parse_adaptive_v2_pre_vote_config(
+    const std::string &protocol_mode,
+    const std::string &issuer_id,
+    const std::string &issuer_public_key,
+    const std::string &minimum_activation_delay,
+    const std::string &maximum_activation_delay,
+    const std::string &maximum_block_extra_bytes,
+    const std::string &maximum_ancestry_blocks)
+{
+    if (protocol_mode != "adaptive_v2")
+        return std::nullopt;
+
+    const auto minimum_delay = parse_adaptive_v2_unsigned<std::uint64_t>(
+        minimum_activation_delay,
+        "minimum activation delay",
+        true);
+    const auto maximum_delay = parse_adaptive_v2_unsigned<std::uint64_t>(
+        maximum_activation_delay,
+        "maximum activation delay",
+        true);
+    if (maximum_delay < minimum_delay)
+        throw HotStuffError(
+            "adaptive-v2 activation delay bounds must be ordered");
+
+    return AdaptiveV2PreVoteConfig{
+        hotstuff::EpochChangeIssuer{
+            parse_adaptive_v2_unsigned<hotstuff::EpochChangeIssuerId>(
+                issuer_id,
+                "epoch-change issuer ID",
+                false),
+            parse_adaptive_v2_issuer_public_key(issuer_public_key)},
+        hotstuff::EpochChangeDelayBounds{
+            minimum_delay,
+            maximum_delay},
+        parse_adaptive_v2_unsigned<std::size_t>(
+            maximum_block_extra_bytes,
+            "maximum block-extra bytes",
+            true),
+        parse_adaptive_v2_unsigned<std::size_t>(
+            maximum_ancestry_blocks,
+            "maximum ancestry blocks",
+            true)};
+}
+
 salticidae::BoxObj<HotStuffApp> papp = nullptr;
 
 int main(int argc, char **argv)
@@ -202,6 +311,17 @@ int main(int argc, char **argv)
         Config::OptValStr::create("legacy_static");
     auto opt_adaptive_epoch_file = Config::OptValStr::create("");
     auto opt_adaptive_activation_height = Config::OptValInt::create(20);
+    auto opt_epoch_change_issuer_id = Config::OptValStr::create("");
+    auto opt_epoch_change_issuer_public_key =
+        Config::OptValStr::create("");
+    auto opt_epoch_change_minimum_activation_delay =
+        Config::OptValStr::create("");
+    auto opt_epoch_change_maximum_activation_delay =
+        Config::OptValStr::create("");
+    auto opt_epoch_change_maximum_block_extra_bytes =
+        Config::OptValStr::create("");
+    auto opt_epoch_change_maximum_ancestry_blocks =
+        Config::OptValStr::create("");
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
     config.add_opt("client-ip", opt_client_ip, Config::SET_VAL);
@@ -244,7 +364,7 @@ int main(int argc, char **argv)
         opt_epoch_protocol_mode,
         Config::SET_VAL,
         -1,
-        "epoch protocol mode (legacy_static, adaptive_v1)");
+        "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2)");
     config.add_opt(
         "adaptive-epoch-file",
         opt_adaptive_epoch_file,
@@ -257,6 +377,42 @@ int main(int argc, char **argv)
         Config::SET_VAL,
         -1,
         "committed height for trusted-local epoch activation");
+    config.add_opt(
+        "epoch-change-issuer-id",
+        opt_epoch_change_issuer_id,
+        Config::SET_VAL,
+        -1,
+        "authorized adaptive-v2 epoch-change issuer ID");
+    config.add_opt(
+        "epoch-change-issuer-public-key",
+        opt_epoch_change_issuer_public_key,
+        Config::SET_VAL,
+        -1,
+        "authorized adaptive-v2 epoch-change issuer public key");
+    config.add_opt(
+        "epoch-change-minimum-activation-delay",
+        opt_epoch_change_minimum_activation_delay,
+        Config::SET_VAL,
+        -1,
+        "minimum adaptive-v2 activation delay in committed blocks");
+    config.add_opt(
+        "epoch-change-maximum-activation-delay",
+        opt_epoch_change_maximum_activation_delay,
+        Config::SET_VAL,
+        -1,
+        "maximum adaptive-v2 activation delay in committed blocks");
+    config.add_opt(
+        "epoch-change-maximum-block-extra-bytes",
+        opt_epoch_change_maximum_block_extra_bytes,
+        Config::SET_VAL,
+        -1,
+        "maximum adaptive-v2 epoch-change block-extra bytes");
+    config.add_opt(
+        "epoch-change-maximum-ancestry-blocks",
+        opt_epoch_change_maximum_ancestry_blocks,
+        Config::SET_VAL,
+        -1,
+        "maximum adaptive-v2 proposal ancestry blocks");
 
     EventContext ec;
     config.parse(argc, argv);
@@ -265,6 +421,15 @@ int main(int argc, char **argv)
         config.print_help();
         exit(0);
     }
+    const auto adaptive_v2_pre_vote_config =
+        parse_adaptive_v2_pre_vote_config(
+            opt_epoch_protocol_mode->get(),
+            opt_epoch_change_issuer_id->get(),
+            opt_epoch_change_issuer_public_key->get(),
+            opt_epoch_change_minimum_activation_delay->get(),
+            opt_epoch_change_maximum_activation_delay->get(),
+            opt_epoch_change_maximum_block_extra_bytes->get(),
+            opt_epoch_change_maximum_ancestry_blocks->get());
     auto idx = opt_idx->get();
     auto client_port = opt_client_port->get();
     std::vector<std::tuple<std::string, std::string, std::string>> replicas;
@@ -284,6 +449,8 @@ int main(int argc, char **argv)
         epoch_protocol_mode = EpochProtocolMode::legacy_static;
     else if (opt_epoch_protocol_mode->get() == "adaptive_v1")
         epoch_protocol_mode = EpochProtocolMode::adaptive_v1;
+    else if (opt_epoch_protocol_mode->get() == "adaptive_v2")
+        epoch_protocol_mode = EpochProtocolMode::adaptive_v2;
     else
         throw HotStuffError("invalid epoch protocol mode");
     if (opt_adaptive_activation_height->get() < 0)
@@ -379,6 +546,18 @@ int main(int argc, char **argv)
         static_cast<std::uint64_t>(
             opt_adaptive_activation_height->get()));
     papp->set_aggregation_timeout(opt_aggregation_timeout->get());
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+    {
+        if (!adaptive_v2_pre_vote_config.has_value())
+            throw HotStuffError(
+                "adaptive-v2 pre-vote configuration is unavailable");
+        const auto &pre_vote_config = *adaptive_v2_pre_vote_config;
+        papp->configure_epoch_change_pre_vote_gate(
+            pre_vote_config.issuer,
+            pre_vote_config.delay_bounds,
+            pre_vote_config.maximum_block_extra_bytes,
+            pre_vote_config.maximum_ancestry_blocks);
+    }
 
     HOTSTUFF_LOG_INFO("*** thread info ***");
     HOTSTUFF_LOG_INFO("Verification workers = %lu", opt_nworker->get());

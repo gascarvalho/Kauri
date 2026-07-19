@@ -1,13 +1,26 @@
+#include <cerrno>
 #include <cstddef>
+#include <cctype>
 #include <fstream>
 #include <initializer_list>
+#include <optional>
+#include <stdexcept>
 #include <sstream>
 #include <string>
+#include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "catch.hpp"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
 #error "KAURI_PROJECT_SOURCE_DIR must name the repository root"
+#endif
+
+#ifndef KAURI_HOTSTUFF_APP_PATH
+#error "KAURI_HOTSTUFF_APP_PATH must name the hotstuff-app executable"
 #endif
 
 namespace
@@ -80,6 +93,158 @@ std::size_t count_occurrences(
          cursor += needle.size())
         ++count;
     return count;
+}
+
+std::optional<std::string> option_binding(
+    const std::string &contents,
+    const std::string &option)
+{
+    const auto option_literal = "\"" + option + "\"";
+    const auto option_position = contents.find(option_literal);
+    if (option_position == std::string::npos)
+        return std::nullopt;
+    const auto add_option = contents.rfind("config.add_opt(", option_position);
+    if (add_option == std::string::npos)
+        return std::nullopt;
+    auto cursor = contents.find(',', option_position + option_literal.size());
+    if (cursor == std::string::npos)
+        return std::nullopt;
+    ++cursor;
+    while (cursor < contents.size() &&
+           std::isspace(static_cast<unsigned char>(contents[cursor])) != 0)
+        ++cursor;
+    const auto begin = cursor;
+    while (cursor < contents.size())
+    {
+        const auto character =
+            static_cast<unsigned char>(contents[cursor]);
+        if (std::isalnum(character) == 0 && contents[cursor] != '_')
+            break;
+        ++cursor;
+    }
+    if (cursor == begin)
+        return std::nullopt;
+    return contents.substr(begin, cursor - begin);
+}
+
+std::string without_whitespace(const std::string &contents)
+{
+    std::string compact;
+    compact.reserve(contents.size());
+    for (const auto character : contents)
+        if (std::isspace(static_cast<unsigned char>(character)) == 0)
+            compact.push_back(character);
+    return compact;
+}
+
+struct ProcessResult
+{
+    int status{0};
+    std::string output;
+};
+
+ProcessResult run_hotstuff_app(const std::vector<std::string> &arguments)
+{
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0)
+        throw std::runtime_error("failed to create subprocess pipe");
+
+    const auto child = fork();
+    if (child < 0)
+    {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        throw std::runtime_error("failed to fork hotstuff-app");
+    }
+    if (child == 0)
+    {
+        close(output_pipe[0]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(output_pipe[1], STDERR_FILENO) < 0)
+            _exit(126);
+        close(output_pipe[1]);
+
+        std::vector<std::string> owned_arguments;
+        owned_arguments.reserve(arguments.size() + 1);
+        owned_arguments.emplace_back(KAURI_HOTSTUFF_APP_PATH);
+        owned_arguments.insert(
+            owned_arguments.end(), arguments.begin(), arguments.end());
+        std::vector<char *> raw_arguments;
+        raw_arguments.reserve(owned_arguments.size() + 1);
+        for (auto &argument : owned_arguments)
+            raw_arguments.push_back(&argument[0]);
+        raw_arguments.push_back(nullptr);
+        execv(KAURI_HOTSTUFF_APP_PATH, raw_arguments.data());
+        _exit(127);
+    }
+
+    close(output_pipe[1]);
+    ProcessResult result;
+    char buffer[4096];
+    while (true)
+    {
+        const auto count = read(output_pipe[0], buffer, sizeof(buffer));
+        if (count > 0)
+        {
+            result.output.append(buffer, static_cast<std::size_t>(count));
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    close(output_pipe[0]);
+
+    int wait_status = 0;
+    while (waitpid(child, &wait_status, 0) < 0)
+        if (errno != EINTR)
+            throw std::runtime_error("failed to wait for hotstuff-app");
+    result.status = WIFEXITED(wait_status)
+                        ? WEXITSTATUS(wait_status)
+                        : 128 + WTERMSIG(wait_status);
+    return result;
+}
+
+std::vector<std::string> valid_adaptive_v2_arguments()
+{
+    return {
+        "--epoch-protocol-mode", "adaptive_v2",
+        "--epoch-change-issuer-id", "0",
+        "--epoch-change-issuer-public-key",
+        "022543a7f8dd080a3e44c4fac62194129ac260a3896ee9d546bfb08bbb379067c1",
+        "--epoch-change-minimum-activation-delay", "2",
+        "--epoch-change-maximum-activation-delay", "20",
+        "--epoch-change-maximum-block-extra-bytes", "4096",
+        "--epoch-change-maximum-ancestry-blocks", "128"};
+}
+
+void set_option_value(
+    std::vector<std::string> &arguments,
+    const std::string &option,
+    const std::string &value)
+{
+    for (std::size_t index = 0; index + 1 < arguments.size(); ++index)
+    {
+        if (arguments[index] != option)
+            continue;
+        arguments[index + 1] = value;
+        return;
+    }
+    throw std::runtime_error("test option was not found");
+}
+
+void remove_option(
+    std::vector<std::string> &arguments,
+    const std::string &option)
+{
+    for (auto item = arguments.begin(); item != arguments.end(); ++item)
+    {
+        if (*item != option)
+            continue;
+        arguments.erase(item, item + 2);
+        return;
+    }
+    throw std::runtime_error("test option was not found");
 }
 
 bool accepts_adaptive_v2(const std::string &contents)
@@ -1042,6 +1207,255 @@ TEST_CASE("adaptive v2 uses adaptive consensus handlers without stage or arm",
         REQUIRE_FALSE(body.empty());
         CHECK(accepts_adaptive_v2(body));
     }
+}
+
+TEST_CASE("adaptive v2 server CLI exposes every pinned pre-vote input",
+          "[c08][adaptive-v2][cli][configuration][intentional-red]")
+{
+    const auto app = source("examples/hotstuff_app.cpp");
+    const auto main = function_body(app, "int main(");
+    REQUIRE_FALSE(main.empty());
+
+    CHECK(app.find(
+              "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2)") !=
+          std::string::npos);
+    CHECK(contains_in_order(
+        main,
+        {"opt_epoch_protocol_mode->get() == \"adaptive_v1\"",
+         "opt_epoch_protocol_mode->get() == \"adaptive_v2\"",
+         "EpochProtocolMode::adaptive_v2"}));
+
+    struct RequiredOption
+    {
+        const char *name;
+        const char *missing_sentinel;
+    };
+    for (const RequiredOption expected : {
+             RequiredOption{"epoch-change-issuer-id",
+                            "Config::OptValStr::create(\"\")"},
+             {"epoch-change-issuer-public-key",
+              "Config::OptValStr::create(\"\")"},
+             {"epoch-change-minimum-activation-delay",
+              "Config::OptValStr::create(\"\")"},
+             {"epoch-change-maximum-activation-delay",
+              "Config::OptValStr::create(\"\")"},
+             {"epoch-change-maximum-block-extra-bytes",
+              "Config::OptValStr::create(\"\")"},
+             {"epoch-change-maximum-ancestry-blocks",
+              "Config::OptValStr::create(\"\")"}})
+    {
+        CAPTURE(expected.name);
+        const auto binding = option_binding(app, expected.name);
+        REQUIRE(binding.has_value());
+        const auto declaration = app.find("auto " + *binding);
+        REQUIRE(declaration != std::string::npos);
+        const auto terminator = app.find(';', declaration);
+        REQUIRE(terminator != std::string::npos);
+        CHECK(app.substr(declaration, terminator - declaration)
+                  .find(expected.missing_sentinel) != std::string::npos);
+    }
+}
+
+TEST_CASE("adaptive v2 server CLI rejects missing and invalid pre-vote inputs",
+          "[c08][adaptive-v2][cli][fail-closed][intentional-red]")
+{
+    const auto app = source("examples/hotstuff_app.cpp");
+    const auto numeric_parser = function_body(
+        app, "Value parse_adaptive_v2_unsigned(");
+    const auto key_parser = function_body(
+        app, "parse_adaptive_v2_issuer_public_key(");
+    const auto config_parser = function_body(
+        app, "parse_adaptive_v2_pre_vote_config(");
+
+    REQUIRE_FALSE(numeric_parser.empty());
+    CHECK(contains_all(
+        numeric_parser,
+        {"raw_value.empty()",
+         "std::from_chars(begin, end, value, 10)",
+         "parsed.ec != std::errc{}",
+         "parsed.ptr != end",
+         "must_be_positive && value == 0",
+         "throw HotStuffError("}));
+    REQUIRE_FALSE(key_parser.empty());
+    CHECK(contains_all(
+        key_parser,
+        {"issuer_public_key_hex.empty()",
+         "issuer_public_key_hex.size() != 66",
+         "std::isxdigit(character)",
+         "hotstuff::PubKeySecp256k1(",
+         "hotstuff::from_hex(issuer_public_key_hex)",
+         "catch (const std::exception &)",
+         "throw HotStuffError("}));
+    REQUIRE_FALSE(config_parser.empty());
+    CHECK(contains_all(
+        config_parser,
+        {"protocol_mode != \"adaptive_v2\"",
+         "parse_adaptive_v2_unsigned<hotstuff::EpochChangeIssuerId>(",
+         "parse_adaptive_v2_unsigned<std::uint64_t>(",
+         "parse_adaptive_v2_unsigned<std::size_t>(",
+         "maximum_delay < minimum_delay",
+         "hotstuff::EpochChangeIssuer{",
+         "hotstuff::EpochChangeDelayBounds{"}));
+}
+
+TEST_CASE("accepted adaptive v2 CLI pins the configured verifier before start",
+          "[c08][adaptive-v2][cli][wiring][intentional-red]")
+{
+    const auto app = source("examples/hotstuff_app.cpp");
+    const auto main = function_body(app, "int main(");
+    const auto configure = main.find(
+        "papp->configure_epoch_change_pre_vote_gate(");
+    const auto start = main.find("papp->start(reps)");
+    REQUIRE(configure != std::string::npos);
+    REQUIRE(start != std::string::npos);
+    CHECK(configure < start);
+    CHECK(count_occurrences(
+              main, "papp->configure_epoch_change_pre_vote_gate(") == 1);
+
+    const auto guard = main.rfind(
+        "if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)",
+        configure);
+    REQUIRE(guard != std::string::npos);
+    CHECK(main.find('}', guard) > configure);
+
+    const auto call_end = main.find(';', configure);
+    REQUIRE(call_end != std::string::npos);
+    const auto call = main.substr(configure, call_end - configure);
+    CHECK(contains_all(
+        call,
+        {"pre_vote_config.issuer",
+         "pre_vote_config.delay_bounds",
+         "pre_vote_config.maximum_block_extra_bytes",
+         "pre_vote_config.maximum_ancestry_blocks"}));
+
+    const auto parser_call = main.find(
+        "parse_adaptive_v2_pre_vote_config(");
+    REQUIRE(parser_call != std::string::npos);
+    const auto parser_call_end = main.find(';', parser_call);
+    REQUIRE(parser_call_end != std::string::npos);
+    const auto parsed_options = main.substr(
+        parser_call, parser_call_end - parser_call);
+    for (const auto *option : {
+             "epoch-change-issuer-id",
+             "epoch-change-issuer-public-key",
+             "epoch-change-minimum-activation-delay",
+             "epoch-change-maximum-activation-delay",
+             "epoch-change-maximum-block-extra-bytes",
+             "epoch-change-maximum-ancestry-blocks"})
+    {
+        const auto binding = option_binding(app, option);
+        CAPTURE(option);
+        REQUIRE(binding.has_value());
+        CHECK(parsed_options.find(*binding + "->get()") !=
+              std::string::npos);
+    }
+    CHECK(parser_call < main.find("replica idx out of range"));
+}
+
+TEST_CASE("adaptive v2 executable validates exact pre-vote configuration",
+          "[c08][adaptive-v2][cli][subprocess][intentional-red]")
+{
+    const auto accepted = run_hotstuff_app(valid_adaptive_v2_arguments());
+    CHECK(accepted.status != 0);
+    CHECK(accepted.output.find("replica idx out of range") !=
+          std::string::npos);
+    CHECK(accepted.output.find("adaptive-v2 epoch-change") ==
+          std::string::npos);
+
+    for (const auto *option : {
+             "--epoch-change-issuer-id",
+             "--epoch-change-issuer-public-key",
+             "--epoch-change-minimum-activation-delay",
+             "--epoch-change-maximum-activation-delay",
+             "--epoch-change-maximum-block-extra-bytes",
+             "--epoch-change-maximum-ancestry-blocks"})
+    {
+        auto arguments = valid_adaptive_v2_arguments();
+        remove_option(arguments, option);
+        const auto missing = run_hotstuff_app(arguments);
+        CAPTURE(option);
+        CAPTURE(missing.output);
+        CHECK(missing.status != 0);
+        CHECK(missing.output.find("replica idx out of range") ==
+              std::string::npos);
+        CHECK(missing.output.find("adaptive-v2") != std::string::npos);
+    }
+}
+
+TEST_CASE("adaptive v2 numeric options reject noncanonical and overflowing input",
+          "[c08][adaptive-v2][cli][subprocess][fail-closed][intentional-red]")
+{
+    struct InvalidValue
+    {
+        const char *option;
+        const char *value;
+    };
+    for (const InvalidValue invalid : {
+             InvalidValue{"--epoch-change-issuer-id", "-1"},
+             {"--epoch-change-issuer-id", "+1"},
+             {"--epoch-change-minimum-activation-delay", " 2"},
+             {"--epoch-change-maximum-activation-delay", "20 "},
+             {"--epoch-change-maximum-block-extra-bytes", "2junk"},
+             {"--epoch-change-maximum-ancestry-blocks", ""},
+             {"--epoch-change-issuer-id",
+              "9999999999999999999999999999999999999999"},
+             {"--epoch-change-maximum-activation-delay",
+              "9999999999999999999999999999999999999999"},
+             {"--epoch-change-maximum-block-extra-bytes",
+              "9999999999999999999999999999999999999999"}})
+    {
+        auto arguments = valid_adaptive_v2_arguments();
+        set_option_value(arguments, invalid.option, invalid.value);
+        const auto rejected = run_hotstuff_app(arguments);
+        CAPTURE(invalid.option);
+        CAPTURE(invalid.value);
+        CAPTURE(rejected.output);
+        CHECK(rejected.status != 0);
+        CHECK(rejected.output.find("replica idx out of range") ==
+              std::string::npos);
+        CHECK(rejected.output.find("adaptive-v2") != std::string::npos);
+    }
+}
+
+TEST_CASE("adaptive v2 executable rejects semantic bounds and malformed keys",
+          "[c08][adaptive-v2][cli][subprocess][fail-closed][intentional-red]")
+{
+    struct InvalidValue
+    {
+        const char *option;
+        const char *value;
+    };
+    for (const InvalidValue invalid : {
+             InvalidValue{"--epoch-change-minimum-activation-delay", "0"},
+             {"--epoch-change-maximum-activation-delay", "1"},
+             {"--epoch-change-maximum-block-extra-bytes", "0"},
+             {"--epoch-change-maximum-ancestry-blocks", "0"},
+             {"--epoch-change-issuer-public-key", "02not-hex"},
+             {"--epoch-change-issuer-public-key",
+              "000000000000000000000000000000000000000000000000000000000000000000"}})
+    {
+        auto arguments = valid_adaptive_v2_arguments();
+        set_option_value(arguments, invalid.option, invalid.value);
+        const auto rejected = run_hotstuff_app(arguments);
+        CAPTURE(invalid.option);
+        CAPTURE(invalid.value);
+        CAPTURE(rejected.output);
+        CHECK(rejected.status != 0);
+        CHECK(rejected.output.find("replica idx out of range") ==
+              std::string::npos);
+        CHECK(rejected.output.find("adaptive-v2") != std::string::npos);
+    }
+}
+
+TEST_CASE("adaptive v1 executable does not require adaptive v2 inputs",
+          "[c08][adaptive-v1][cli][subprocess][compatibility]")
+{
+    const auto result = run_hotstuff_app(
+        {"--epoch-protocol-mode", "adaptive_v1"});
+    CHECK(result.status != 0);
+    CHECK(result.output.find("replica idx out of range") !=
+          std::string::npos);
+    CHECK(result.output.find("adaptive-v2") == std::string::npos);
 }
 
 TEST_CASE("local executables ignore SIGPIPE before opening network sockets",
