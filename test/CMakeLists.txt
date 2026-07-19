@@ -116,6 +116,13 @@ set_tests_properties(
     LABELS "unit;adaptive;epoch-change;c07"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_epoch_change_bundle
+    test_epoch_change_bundle.cpp)
+set_tests_properties(
+    test_epoch_change_bundle PROPERTIES
+    LABELS "unit;adaptive;epoch-change;bundle;c09"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_evidence
     test_evidence.cpp)
 set_tests_properties(
