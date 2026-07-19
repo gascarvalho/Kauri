@@ -20,6 +20,20 @@ struct CommittedBlock
     uint256_t hash;
 };
 
+enum class CommitCallbackKind : std::uint8_t
+{
+    consensus = 0,
+    decide,
+    post_block_commit,
+};
+
+struct CommitCallbackObservation
+{
+    CommitCallbackKind kind;
+    std::uint32_t height;
+    uint256_t hash;
+};
+
 class CommitRuleCore final : public HotStuffCore
 {
 public:
@@ -49,7 +63,33 @@ public:
 
     block_t add_block(const block_t &parent, const block_t &qc_reference)
     {
-        block_t block = make_block(parent, qc_reference);
+        return add_block(parent, qc_reference, false);
+    }
+
+    block_t add_empty_block(const block_t &parent,
+                            const block_t &qc_reference)
+    {
+        return add_block(parent, qc_reference, true);
+    }
+
+    block_t make_undelivered_block(const block_t &parent,
+                                   const block_t &qc_reference)
+    {
+        return make_block(parent, qc_reference, false);
+    }
+
+    const std::vector<CommitCallbackObservation> &callbacks() const
+    {
+        return callbacks_;
+    }
+
+private:
+    block_t add_block(const block_t &parent,
+                      const block_t &qc_reference,
+                      bool empty_commands)
+    {
+        block_t block = make_block(
+            parent, qc_reference, empty_commands);
 
         storage->add_blk(block);
         if (!on_deliver_blk(block))
@@ -57,11 +97,7 @@ public:
         return block;
     }
 
-    block_t make_undelivered_block(const block_t &parent,
-                                   const block_t &qc_reference)
-    {
-        return make_block(parent, qc_reference);
-    }
+public:
 
     void corrupt_qc_object_hash(const block_t &block,
                                 const uint256_t &wrong_hash)
@@ -135,12 +171,30 @@ public:
     }
 
 protected:
-    void do_decide(Finality &&) override {}
+    void do_decide(Finality &&finality) override
+    {
+        callbacks_.push_back(CommitCallbackObservation{
+            CommitCallbackKind::decide,
+            finality.cmd_height,
+            finality.blk_hash});
+    }
 
     void do_consensus(const block_t &block) override
     {
+        callbacks_.push_back(CommitCallbackObservation{
+            CommitCallbackKind::consensus,
+            block->get_height(),
+            block->get_hash()});
         committed_.push_back(
             CommittedBlock{block->get_height(), block->get_hash()});
+    }
+
+    void do_post_block_commit(const block_t &block) override
+    {
+        callbacks_.push_back(CommitCallbackObservation{
+            CommitCallbackKind::post_block_commit,
+            block->get_height(),
+            block->get_hash()});
     }
 
     void do_broadcast_proposal(const Proposal &) override {}
@@ -154,7 +208,8 @@ protected:
 
 private:
     block_t make_block(const block_t &parent,
-                       const block_t &qc_reference)
+                       const block_t &qc_reference,
+                       bool empty_commands)
     {
         if (!parent)
             throw std::invalid_argument("test block requires a parent");
@@ -167,8 +222,12 @@ private:
                 : make_test_proposal_key(qc_reference->get_hash());
             certificate = create_quorum_cert(key);
         }
-        std::vector<uint256_t> commands{
-            make_digest(static_cast<std::uint8_t>(next_marker_++))};
+        std::vector<uint256_t> commands;
+        if (!empty_commands)
+        {
+            commands.push_back(
+                make_digest(static_cast<std::uint8_t>(next_marker_++)));
+        }
 
         block_t block = new Block(
             std::vector<block_t>{parent},
@@ -183,6 +242,7 @@ private:
 
     std::uint16_t next_marker_ = 1;
     std::vector<CommittedBlock> committed_;
+    std::vector<CommitCallbackObservation> callbacks_;
 };
 
 inline std::vector<block_t> add_direct_chain(CommitRuleCore &core,

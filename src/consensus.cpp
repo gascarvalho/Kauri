@@ -326,8 +326,11 @@ namespace hotstuff
 
             decided_blk_counter++;
             for (size_t i = 0; i < blk->cmds.size(); i++)
+            {
                 do_decide(Finality(id, get_cur_epoch_nr(), get_tree_id(), 1, i, blk->height,
                                    blk->cmds[i], blk->get_hash()));
+            }
+            do_post_block_commit(blk);
         }
 
         if (!commit_queue.empty() && blk1->qc != nullptr)

@@ -2,6 +2,7 @@
 #include "support/commit_rule_fixture.h"
 
 using hotstuff::block_t;
+using hotstuff::test::CommitCallbackKind;
 using hotstuff::test::CommitRuleCore;
 using hotstuff::test::add_direct_chain;
 
@@ -119,4 +120,85 @@ TEST_CASE("null and nonadvancing certified ancestry fail closed",
         CHECK(core.committed().empty());
         CHECK(high2->get_decision() == 0);
     }
+}
+
+TEST_CASE("post-block commit follows every application decision",
+          "[c08b2a][commit-rule][post-block]")
+{
+    CommitRuleCore core;
+    const auto chain = add_direct_chain(core, core.get_genesis(), 4);
+
+    REQUIRE_NOTHROW(core.apply_update(chain[3]));
+
+    const auto &callbacks = core.callbacks();
+    REQUIRE(callbacks.size() == 3);
+    CHECK(callbacks[0].kind == CommitCallbackKind::consensus);
+    CHECK(callbacks[1].kind == CommitCallbackKind::decide);
+    CHECK(callbacks[2].kind == CommitCallbackKind::post_block_commit);
+    for (const auto &callback : callbacks)
+    {
+        CHECK(callback.height == chain[0]->get_height());
+        CHECK(callback.hash == chain[0]->get_hash());
+    }
+}
+
+TEST_CASE("empty-command commits still run the post-block hook",
+          "[c08b2a][commit-rule][post-block][empty]")
+{
+    CommitRuleCore core;
+    const block_t genesis = core.get_genesis();
+    const block_t block1 = core.add_empty_block(genesis, genesis);
+    const block_t block2 = core.add_block(block1, block1);
+    const block_t block3 = core.add_block(block2, block2);
+    const block_t block4 = core.add_block(block3, block3);
+
+    REQUIRE(block1->get_cmds().empty());
+    REQUIRE_NOTHROW(core.apply_update(block4));
+
+    const auto &callbacks = core.callbacks();
+    REQUIRE(callbacks.size() == 2);
+    CHECK(callbacks[0].kind == CommitCallbackKind::consensus);
+    CHECK(callbacks[1].kind == CommitCallbackKind::post_block_commit);
+    for (const auto &callback : callbacks)
+    {
+        CHECK(callback.height == block1->get_height());
+        CHECK(callback.hash == block1->get_hash());
+    }
+}
+
+TEST_CASE("post-block commit preserves ordering across one commit queue",
+          "[c08b2a][commit-rule][post-block][queue]")
+{
+    CommitRuleCore core;
+    const auto chain = add_direct_chain(core, core.get_genesis(), 5);
+
+    REQUIRE_NOTHROW(core.apply_update(chain[4]));
+
+    const auto &callbacks = core.callbacks();
+    REQUIRE(callbacks.size() == 6);
+    REQUIRE(core.committed().size() == 2);
+    for (std::size_t block_index = 0; block_index < 2; ++block_index)
+    {
+        CHECK(core.committed()[block_index].height ==
+              chain[block_index]->get_height());
+        CHECK(core.committed()[block_index].hash ==
+              chain[block_index]->get_hash());
+        const auto callback_index = block_index * 3;
+        CHECK(callbacks[callback_index].kind ==
+              CommitCallbackKind::consensus);
+        CHECK(callbacks[callback_index + 1].kind ==
+              CommitCallbackKind::decide);
+        CHECK(callbacks[callback_index + 2].kind ==
+              CommitCallbackKind::post_block_commit);
+        for (std::size_t offset = 0; offset < 3; ++offset)
+        {
+            const auto &callback = callbacks[callback_index + offset];
+            CHECK(callback.height == chain[block_index]->get_height());
+            CHECK(callback.hash == chain[block_index]->get_hash());
+        }
+    }
+
+    REQUIRE_NOTHROW(core.apply_update(chain[4]));
+    CHECK(callbacks.size() == 6);
+    CHECK(core.committed().size() == 2);
 }

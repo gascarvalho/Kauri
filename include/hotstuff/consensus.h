@@ -238,6 +238,8 @@ namespace hotstuff
         /** Called by HotStuffCore upon the decision being made for cmd. */
         virtual void do_decide(Finality &&fin) = 0;
         virtual void do_consensus(const block_t &blk) = 0;
+        /** Called once per committed block after all application decisions. */
+        virtual void do_post_block_commit(const block_t &) {}
         /** Called by HotStuffCore upon broadcasting a new proposal.
          * The user should send the proposal message to all replicas except for
          * itself. */
