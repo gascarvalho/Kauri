@@ -1,0 +1,791 @@
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "catch.hpp"
+#include "hotstuff/adaptive_v2_selection.h"
+#include "hotstuff/configuration.h"
+#include "hotstuff/epoch_store.h"
+#include "hotstuff/evidence.h"
+
+namespace
+{
+
+using hotstuff::AdaptationEpochId;
+using hotstuff::AdaptiveV2ByzantineSelection;
+using hotstuff::AdaptiveV2CandidateAudit;
+using hotstuff::AdaptiveV2ReplicaScore;
+using hotstuff::AdaptiveV2SelectionConfig;
+using hotstuff::AdaptiveV2SelectionStatus;
+using hotstuff::AuthenticatedReporter;
+using hotstuff::ConfigurationId;
+using hotstuff::EpochDefinitionInput;
+using hotstuff::EpochStore;
+using hotstuff::EpochTreeDefinition;
+using hotstuff::EpochValidationContext;
+using hotstuff::EvidenceLedger;
+using hotstuff::EvidenceReputationAuditUpdate;
+using hotstuff::EvidenceReputationLimits;
+using hotstuff::EvidenceStoreLimits;
+using hotstuff::ExpectedMessageType;
+using hotstuff::ProposalEvidenceStatus;
+using hotstuff::ProposalEvidenceWindow;
+using hotstuff::ProposalKey;
+using hotstuff::ReplicaID;
+using hotstuff::ResponseObservation;
+using hotstuff::ResponseOutcome;
+using hotstuff::ResponsivenessClass;
+using hotstuff::uint256_t;
+
+constexpr std::size_t kReplicaCount = 7;
+
+std::vector<ReplicaID> fixed_membership()
+{
+    return {0, 1, 2, 3, 4, 5, 6};
+}
+
+uint256_t digest(const std::string &label)
+{
+    hotstuff::DataStream stream(label);
+    return stream.get_hash();
+}
+
+std::uint32_t tree_id(ReplicaID reporter, ReplicaID target)
+{
+    return static_cast<std::uint32_t>(
+        1U + static_cast<std::uint32_t>(reporter) *
+                 kReplicaCount +
+        static_cast<std::uint32_t>(target));
+}
+
+std::vector<EpochTreeDefinition> all_reporter_target_trees()
+{
+    std::vector<EpochTreeDefinition> trees;
+    trees.reserve(kReplicaCount * (kReplicaCount - 1));
+    for (const auto reporter : fixed_membership())
+    {
+        for (const auto target : fixed_membership())
+        {
+            if (reporter == target)
+                continue;
+            std::vector<ReplicaID> ordered{reporter, target};
+            for (const auto replica : fixed_membership())
+            {
+                if (replica != reporter && replica != target)
+                    ordered.push_back(replica);
+            }
+            trees.push_back(EpochTreeDefinition{
+                tree_id(reporter, target),
+                2,
+                2,
+                std::move(ordered),
+                {}});
+        }
+    }
+    return trees;
+}
+
+EpochDefinitionInput epoch_input(
+    std::uint32_t epoch_number,
+    const uint256_t &previous_epoch_digest,
+    std::uint64_t activation_height)
+{
+    EpochDefinitionInput input;
+    input.schema_version = hotstuff::kEpochDefinitionSchemaVersion;
+    input.epoch_number = epoch_number;
+    input.previous_epoch_digest = previous_epoch_digest;
+    input.membership_digest =
+        hotstuff::canonical_membership_digest(fixed_membership());
+    input.trees = all_reporter_target_trees();
+    input.activation_height = activation_height;
+    input.generation_seed = 0xA2'0000 + epoch_number;
+    input.policy_version = "adaptive-v2-selection-test-v1";
+    input.evidence_snapshot_id =
+        "adaptive-v2-selection-fixture-" +
+        std::to_string(epoch_number);
+    input.evidence_cutoff = 0;
+    return input;
+}
+
+EpochValidationContext validation_context(
+    std::uint64_t current_height)
+{
+    EpochValidationContext context;
+    context.current_height = current_height;
+    context.minimum_activation_grace = 5;
+    return context;
+}
+
+class MutableEvidenceWindow final : public ProposalEvidenceWindow
+{
+public:
+    void admit(const ProposalKey &proposal)
+    {
+        statuses_[proposal] = ProposalEvidenceStatus::admissible;
+    }
+
+    ProposalEvidenceStatus classify(
+        const ProposalKey &proposal) const noexcept override
+    {
+        const auto found = statuses_.find(proposal);
+        return found == statuses_.end()
+                   ? ProposalEvidenceStatus::unknown
+                   : found->second;
+    }
+
+private:
+    std::map<ProposalKey, ProposalEvidenceStatus> statuses_;
+};
+
+AdaptiveV2SelectionConfig selection_config(
+    std::uint32_t minimum_score_drop = 6,
+    std::uint32_t minimum_timeouts_per_reporter = 2,
+    std::size_t maximum_attempts = 128)
+{
+    AdaptiveV2SelectionConfig config;
+    config.required_nonresponsive = 2;
+    config.minimum_score_drop = minimum_score_drop;
+    config.minimum_timeouts_per_reporter =
+        minimum_timeouts_per_reporter;
+    config.maximum_post_baseline_timeout_attempts =
+        maximum_attempts;
+    config.snapshot_seed = 0xA2'5EED;
+    config.responsiveness_policy.policy_version =
+        "adaptive-v2-selection-test-v1";
+    config.responsiveness_policy.attempt_window = 64;
+    config.responsiveness_policy.minimum_attempts = 1;
+    config.responsiveness_policy.minimum_response_rate_ppm = 600'000;
+    config.responsiveness_policy.maximum_timeout_rate_ppm = 400'000;
+    config.responsiveness_policy.trailing_timeout_streak = 2;
+    config.responsiveness_policy.latency_percentile_basis_points = 5'000;
+    return config;
+}
+
+struct Fixture
+{
+    std::vector<ReplicaID> members{fixed_membership()};
+    EpochStore epochs{members};
+    MutableEvidenceWindow window;
+    AdaptationEpochId epoch;
+    std::unique_ptr<EvidenceLedger> ledger;
+    std::map<ReplicaID, std::uint64_t> reporter_sequences;
+    std::uint64_t monotonic_clock{0};
+    std::uint64_t attempt_number{0};
+
+    explicit Fixture(std::size_t accepted_capacity = 256)
+    {
+        const auto &definition = epochs.stage(
+            epoch_input(0, uint256_t{}, 15),
+            validation_context(10));
+        epoch = {definition.epoch_number(), definition.epoch_digest()};
+        ledger = std::make_unique<EvidenceLedger>(
+            epochs,
+            window,
+            EvidenceStoreLimits{accepted_capacity, 64});
+    }
+
+    ConfigurationId configuration(
+        ReplicaID reporter,
+        ReplicaID target,
+        const AdaptationEpochId &for_epoch) const
+    {
+        return {
+            for_epoch.epoch_number,
+            tree_id(reporter, target),
+            for_epoch.epoch_digest};
+    }
+
+    ResponseObservation observation(
+        ReplicaID reporter,
+        ReplicaID target,
+        ResponseOutcome outcome,
+        const AdaptationEpochId &for_epoch)
+    {
+        ResponseObservation value;
+        value.reporter_id = reporter;
+        value.observed_replica_id = target;
+        value.configuration =
+            configuration(reporter, target, for_epoch);
+        value.block_hash = digest(
+            "adaptive-v2-attempt-" +
+            std::to_string(++attempt_number));
+        value.expected_message_type =
+            ExpectedMessageType::aggregate_relay;
+        value.outcome = outcome;
+        value.response_duration_us =
+            outcome == ResponseOutcome::timeout
+                ? 0
+                : (outcome == ResponseOutcome::late ? 150 : 50);
+        value.deadline_duration_us = 100;
+        value.reporter_monotonic_ns = ++monotonic_clock * 1'000;
+        value.reporter_sequence = ++reporter_sequences[reporter];
+        if (outcome != ResponseOutcome::timeout)
+            value.signer_set = {target};
+        value.observation_id =
+            hotstuff::compute_response_observation_id(
+                value.attempt_identity());
+        window.admit(value.proposal_key());
+        return value;
+    }
+
+    ResponseObservation observation(
+        ReplicaID reporter,
+        ReplicaID target,
+        ResponseOutcome outcome)
+    {
+        return observation(reporter, target, outcome, epoch);
+    }
+
+    void ingest(const ResponseObservation &observation)
+    {
+        const auto accepted_before = ledger->accepted().size();
+        ledger->ingest(
+            AuthenticatedReporter{observation.reporter_id},
+            observation);
+        REQUIRE(ledger->accepted().size() == accepted_before + 1);
+    }
+
+    ResponseObservation timeout(ReplicaID reporter, ReplicaID target)
+    {
+        auto value = observation(
+            reporter, target, ResponseOutcome::timeout);
+        ingest(value);
+        return value;
+    }
+
+    void late(const ResponseObservation &timeout_observation)
+    {
+        auto value = timeout_observation;
+        value.outcome = ResponseOutcome::late;
+        value.response_duration_us = 150;
+        value.signer_set = {value.observed_replica_id};
+        value.reporter_monotonic_ns = ++monotonic_clock * 1'000;
+        value.reporter_sequence =
+            ++reporter_sequences[value.reporter_id];
+        // The attempt identity, and therefore observation ID, is unchanged.
+        ingest(value);
+    }
+
+    void on_time(ReplicaID reporter, ReplicaID target)
+    {
+        ingest(observation(reporter, target, ResponseOutcome::on_time));
+    }
+
+    void baseline_all()
+    {
+        for (const auto target : members)
+        {
+            on_time(
+                static_cast<ReplicaID>((target + 1U) % kReplicaCount),
+                target);
+        }
+    }
+
+    void persistent_timeouts(
+        ReplicaID target,
+        const std::vector<ReplicaID> &reporters,
+        std::uint32_t attempts_per_reporter)
+    {
+        for (const auto reporter : reporters)
+        {
+            for (std::uint32_t attempt = 0;
+                 attempt < attempts_per_reporter;
+                 ++attempt)
+            {
+                timeout(reporter, target);
+            }
+        }
+    }
+
+    AdaptationEpochId stage_next_epoch()
+    {
+        const auto &definition = epochs.stage(
+            epoch_input(1, epoch.epoch_digest, 25),
+            validation_context(20));
+        return {
+            definition.epoch_number(), definition.epoch_digest()};
+    }
+};
+
+int baseline_score(
+    const std::vector<AdaptiveV2ReplicaScore> &scores,
+    ReplicaID replica_id)
+{
+    for (const auto &entry : scores)
+    {
+        if (entry.replica_id == replica_id)
+            return entry.score;
+    }
+    throw std::logic_error("missing baseline score");
+}
+
+const AdaptiveV2CandidateAudit *candidate(
+    const std::vector<AdaptiveV2CandidateAudit> &candidates,
+    ReplicaID replica_id)
+{
+    for (const auto &entry : candidates)
+    {
+        if (entry.replica_id == replica_id)
+            return &entry;
+    }
+    return nullptr;
+}
+
+static_assert(
+    std::is_same<
+        decltype(std::declval<const AdaptiveV2ByzantineSelection &>()
+                     .score_trajectory()),
+        const std::vector<EvidenceReputationAuditUpdate> &>::value,
+    "score trajectory must be an immutable borrowed audit view");
+
+} // namespace
+
+TEST_CASE(
+    "adaptive-v2 freezes baseline scores and immutable score history",
+    "[adaptive-v2][selection][baseline]")
+{
+    Fixture fixture;
+    fixture.on_time(1, 0);
+    fixture.timeout(2, 1);
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config());
+
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    CHECK(selector.baseline_frozen());
+    CHECK(selector.baseline_cutoff() == 2);
+    CHECK(selector.current_cutoff() == 2);
+    CHECK(baseline_score(selector.baseline_scores(), 0) == 1);
+    CHECK(baseline_score(selector.baseline_scores(), 1) == -1);
+    REQUIRE(selector.score_trajectory().size() == 2);
+    CHECK(selector.score_trajectory()[0].delta == 1);
+    CHECK(selector.score_trajectory()[1].delta == -1);
+    CHECK(selector.healthy());
+}
+
+TEST_CASE(
+    "f Byzantine reporters cannot select a responsive replica",
+    "[adaptive-v2][selection][byzantine-guard]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config(4, 2));
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    fixture.persistent_timeouts(0, {2, 3}, 2);
+    const auto result =
+        selector.select_through(fixture.ledger->high_watermark());
+
+    REQUIRE(result.status ==
+            AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    REQUIRE(result.snapshot != nullptr);
+    CHECK(result.selected_replicas.empty());
+    CHECK(candidate(result.eligible_candidates, 0) == nullptr);
+    const auto &ranking = result.snapshot->ranking();
+    const auto target = std::find_if(
+        ranking.begin(), ranking.end(), [](const auto &entry) {
+            return entry.replica_id == 0;
+        });
+    REQUIRE(target != ranking.end());
+    CHECK(target->classification == ResponsivenessClass::nonresponsive);
+}
+
+TEST_CASE(
+    "f plus one reporters require per-reporter persistence and score drop",
+    "[adaptive-v2][selection][persistence][score]")
+{
+    SECTION("one timeout from each reporter is below K")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config(3, 2));
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+        fixture.persistent_timeouts(0, {2, 3, 4}, 1);
+
+        const auto result = selector.select_through(
+            fixture.ledger->high_watermark());
+        CHECK(result.status == AdaptiveV2SelectionStatus::
+                                   insufficient_guarded_candidates);
+        CHECK(candidate(result.eligible_candidates, 0) == nullptr);
+    }
+
+    SECTION("persistent reports below the score threshold do not qualify")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config(7, 2));
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+        fixture.persistent_timeouts(0, {2, 3, 4}, 2);
+
+        const auto result = selector.select_through(
+            fixture.ledger->high_watermark());
+        CHECK(result.status == AdaptiveV2SelectionStatus::
+                                   insufficient_guarded_candidates);
+        CHECK(candidate(result.eligible_candidates, 0) == nullptr);
+    }
+
+    SECTION("three reporters with two attempts produce one guarded candidate")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config());
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+        fixture.persistent_timeouts(0, {2, 3, 4}, 2);
+
+        const auto result = selector.select_through(
+            fixture.ledger->high_watermark());
+        REQUIRE(result.status == AdaptiveV2SelectionStatus::
+                                     insufficient_guarded_candidates);
+        const auto *audit = candidate(result.eligible_candidates, 0);
+        REQUIRE(audit != nullptr);
+        CHECK(audit->qualifying_reporters ==
+              std::vector<ReplicaID>{2, 3, 4});
+        CHECK(audit->total_uncompensated_timeouts == 6);
+        CHECK(audit->baseline_score_delta == -6);
+        CHECK(audit->guarded_eligible);
+        CHECK(result.selected_replicas.empty());
+    }
+}
+
+TEST_CASE(
+    "late evidence compensates score and removes a timeout attempt",
+    "[adaptive-v2][selection][late]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config(5, 2));
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    const auto compensated = fixture.timeout(2, 0);
+    fixture.timeout(2, 0);
+    fixture.persistent_timeouts(0, {3, 4}, 2);
+    fixture.late(compensated);
+    const auto result =
+        selector.select_through(fixture.ledger->high_watermark());
+
+    CHECK(result.status == AdaptiveV2SelectionStatus::
+                               insufficient_guarded_candidates);
+    CHECK(candidate(result.eligible_candidates, 0) == nullptr);
+    REQUIRE(selector.score_trajectory().size() == 14);
+    CHECK(selector.score_trajectory().back().evidence_outcome ==
+          ResponseOutcome::late);
+    CHECK(selector.score_trajectory().back().delta == 1);
+    CHECK(selector.score_trajectory().back().score == -4);
+}
+
+TEST_CASE(
+    "two deterministic crash targets preserve N f Q metadata",
+    "[adaptive-v2][selection][n7][deterministic]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config());
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    // Target 0 has more qualifying reporters but fewer total timeouts than 1.
+    fixture.persistent_timeouts(0, {2, 3, 4, 5}, 2);
+    fixture.persistent_timeouts(1, {2, 3, 4}, 3);
+    const auto cutoff = fixture.ledger->high_watermark();
+    const auto result = selector.select_through(cutoff);
+
+    REQUIRE(result.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(result.selected_replicas ==
+          std::vector<ReplicaID>{0, 1});
+    CHECK(result.eligible_roots ==
+          std::vector<ReplicaID>{2, 3, 4, 5, 6});
+    REQUIRE(result.eligible_candidates.size() == 2);
+    CHECK(result.eligible_candidates[0].replica_id == 0);
+    CHECK(result.eligible_candidates[0].qualifying_reporters.size() == 4);
+    CHECK(result.eligible_candidates[0].total_uncompensated_timeouts == 8);
+    CHECK(result.eligible_candidates[1].replica_id == 1);
+    CHECK(result.eligible_candidates[1].qualifying_reporters.size() == 3);
+    CHECK(result.eligible_candidates[1].total_uncompensated_timeouts == 9);
+    CHECK(result.metadata.replica_count == 7);
+    CHECK(result.metadata.fault_threshold == 2);
+    CHECK(result.metadata.quorum == 5);
+    CHECK(result.metadata.required_nonresponsive == 2);
+    CHECK(result.metadata.required_qualifying_reporters == 3);
+    CHECK(result.metadata.minimum_timeouts_per_reporter == 2);
+    CHECK(result.metadata.minimum_score_drop == 6);
+    CHECK(result.metadata.baseline_cutoff == 7);
+    CHECK(result.metadata.evidence_cutoff == cutoff);
+    CHECK(selector.quorum_metadata().replica_count == 7);
+    CHECK(selector.quorum_metadata().fault_threshold == 2);
+    CHECK(selector.quorum_metadata().quorum == 5);
+    CHECK(selector.membership() == fixed_membership());
+    CHECK(selector.current_epoch() == fixture.epoch);
+    CHECK(fixture.epochs.size() == 1);
+    CHECK(fixture.ledger->healthy());
+}
+
+TEST_CASE(
+    "selection fails closed when fewer than Q responsive roots remain",
+    "[adaptive-v2][selection][roots][fail-closed]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config());
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    fixture.persistent_timeouts(0, {2, 3, 4}, 2);
+    fixture.persistent_timeouts(1, {2, 3, 4}, 2);
+    fixture.persistent_timeouts(2, {3}, 2);
+    const auto result =
+        selector.select_through(fixture.ledger->high_watermark());
+
+    CHECK(result.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    CHECK(result.selected_replicas.empty());
+    CHECK(result.eligible_roots.empty());
+    CHECK(result.eligible_candidates.size() == 2);
+}
+
+TEST_CASE(
+    "selection enforces cutoffs exact epoch and bounded capacity",
+    "[adaptive-v2][selection][bounds][epoch]")
+{
+    SECTION("cutoffs are monotonic after a single baseline freeze")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config());
+        CHECK(selector.select_through(
+                  fixture.ledger->high_watermark())
+                  .status == AdaptiveV2SelectionStatus::invalid_state);
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+        CHECK(selector.freeze_baseline(
+                  fixture.ledger->high_watermark()) ==
+              AdaptiveV2SelectionStatus::invalid_state);
+        CHECK(selector.select_through(
+                  fixture.ledger->high_watermark())
+                  .status == AdaptiveV2SelectionStatus::invalid_cutoff);
+        CHECK(selector.select_through(
+                  fixture.ledger->high_watermark() + 1)
+                  .status == AdaptiveV2SelectionStatus::invalid_cutoff);
+        CHECK(selector.healthy());
+    }
+
+    SECTION("a later epoch cannot enter the fixed selection prefix")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config());
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+        const auto next_epoch = fixture.stage_next_epoch();
+        fixture.ingest(fixture.observation(
+            2, 0, ResponseOutcome::timeout, next_epoch));
+
+        CHECK(selector.select_through(
+                  fixture.ledger->high_watermark())
+                  .status == AdaptiveV2SelectionStatus::mixed_epoch);
+        CHECK(selector.current_cutoff() == 7);
+    }
+
+    SECTION("timeout replay capacity is a terminal fail-closed error")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config(5, 2, 5));
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+        fixture.persistent_timeouts(0, {2, 3, 4}, 2);
+
+        CHECK(selector.select_through(
+                  fixture.ledger->high_watermark())
+                  .status == AdaptiveV2SelectionStatus::capacity_exceeded);
+        CHECK_FALSE(selector.healthy());
+        CHECK(selector.current_cutoff() == 7);
+    }
+
+    SECTION("compensated timeouts still consume total replay capacity")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config(5, 2, 2));
+        REQUIRE(selector.freeze_baseline(
+                    fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+
+        for (std::size_t attempt = 0; attempt < 3; ++attempt)
+        {
+            const auto timed_out = fixture.timeout(2, 0);
+            fixture.late(timed_out);
+        }
+
+        CHECK(selector.select_through(
+                  fixture.ledger->high_watermark())
+                  .status == AdaptiveV2SelectionStatus::capacity_exceeded);
+        CHECK_FALSE(selector.healthy());
+        CHECK(selector.current_cutoff() == 7);
+    }
+
+    SECTION("projection audit capacity is a terminal failure")
+    {
+        Fixture fixture;
+        fixture.baseline_all();
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger,
+            fixture.members,
+            fixture.epoch,
+            selection_config(),
+            EvidenceReputationLimits{6});
+
+        CHECK(selector.freeze_baseline(
+                  fixture.ledger->high_watermark()) ==
+              AdaptiveV2SelectionStatus::projection_failed);
+        CHECK_FALSE(selector.healthy());
+        CHECK_FALSE(selector.baseline_frozen());
+    }
+}
+
+TEST_CASE(
+    "adaptive-v2 constructor rejects invalid Byzantine and guard bounds",
+    "[adaptive-v2][selection][validation][overflow]")
+{
+    Fixture fixture;
+
+    SECTION("membership must satisfy exact N equals 3f plus 1")
+    {
+        REQUIRE_THROWS_AS(
+            AdaptiveV2ByzantineSelection(
+                *fixture.ledger,
+                std::vector<ReplicaID>{0, 1, 2, 3, 4, 5},
+                fixture.epoch,
+                selection_config()),
+            std::invalid_argument);
+    }
+
+    SECTION("membership must be unique")
+    {
+        REQUIRE_THROWS_AS(
+            AdaptiveV2ByzantineSelection(
+                *fixture.ledger,
+                std::vector<ReplicaID>{0, 1, 2, 3, 4, 5, 5},
+                fixture.epoch,
+                selection_config()),
+            std::invalid_argument);
+    }
+
+    SECTION("the required selection count is the derived f")
+    {
+        auto config = selection_config();
+        config.required_nonresponsive = 1;
+        REQUIRE_THROWS_AS(
+            AdaptiveV2ByzantineSelection(
+                *fixture.ledger,
+                fixture.members,
+                fixture.epoch,
+                config),
+            std::invalid_argument);
+    }
+
+    SECTION("K cannot exceed bounded replay capacity")
+    {
+        auto config = selection_config();
+        config.minimum_timeouts_per_reporter =
+            std::numeric_limits<std::uint32_t>::max();
+        REQUIRE_THROWS_AS(
+            AdaptiveV2ByzantineSelection(
+                *fixture.ledger,
+                fixture.members,
+                fixture.epoch,
+                config),
+            std::invalid_argument);
+    }
+
+    SECTION("replay capacity cannot overflow snapshot evidence bounds")
+    {
+        auto config = selection_config();
+        config.maximum_post_baseline_timeout_attempts =
+            hotstuff::kMaximumAdaptationEvidenceRecords + 1U;
+        REQUIRE_THROWS_AS(
+            AdaptiveV2ByzantineSelection(
+                *fixture.ledger,
+                fixture.members,
+                fixture.epoch,
+                config),
+            std::invalid_argument);
+    }
+
+    SECTION("the exact epoch digest is mandatory")
+    {
+        auto missing_epoch = fixture.epoch;
+        missing_epoch.epoch_digest = {};
+        REQUIRE_THROWS_AS(
+            AdaptiveV2ByzantineSelection(
+                *fixture.ledger,
+                fixture.members,
+                missing_epoch,
+                selection_config()),
+            std::invalid_argument);
+    }
+}

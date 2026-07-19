@@ -211,6 +211,13 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;adaptation"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_adaptive_v2_selection
+    test_adaptive_v2_selection.cpp)
+set_tests_properties(
+    test_adaptive_v2_selection PROPERTIES
+    LABELS "unit;adaptive;selection;byzantine-guard;n7"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_tree_policy
     test_tree_policy.cpp)
 target_compile_definitions(
