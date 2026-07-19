@@ -1338,6 +1338,16 @@ def _commits(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return [dict(event) for event in events if event.get("event_type") == "block.committed"]
 
 
+def _commit_observations(
+    events: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        dict(event)
+        for event in events
+        if event.get("event_type") == "block.commit_observed"
+    ]
+
+
 def _commit_key(event: Mapping[str, Any]) -> tuple[int, str]:
     payload = event.get("payload")
     if not isinstance(payload, dict):
@@ -1351,7 +1361,10 @@ def _commit_key(event: Mapping[str, Any]) -> tuple[int, str]:
 
 def common_commit_keys(streams: Mapping[str, Sequence[Mapping[str, Any]]], participants: Sequence[int]) -> dict[int, set[tuple[int, str]]]:
     return {
-        replica: {_commit_key(event) for event in _commits(streams[f"replica-{replica}"])}
+        replica: {
+            _commit_key(event)
+            for event in _commit_observations(streams[f"replica-{replica}"])
+        }
         for replica in participants
     }
 

@@ -22,6 +22,17 @@ The validator accepts three kinds of input:
    `analysis.py` when its explicit diagnostic compatibility option is enabled;
    the evidence validator always rejects it.
 
+Commit evidence has two layers. Every replica emits a minimal
+`block.commit_observed` witness for each locally committed block. Its height and
+hash are the cross-replica agreement key; its parent hash, transaction count,
+and commit-batch index make the local commit sequence auditable without
+requiring proposal-time metadata. Replica 2 additionally supplies the rich
+`block.committed` stream used for throughput and epoch/tree/leader attribution.
+The runner derives root cycles only from that rich observer stream, but treats
+a cycle as common only when every current participant has emitted the matching
+`block.commit_observed` witnesses. A rich event from a participant does not
+substitute for a missing witness.
+
 Each crash record is manifest-owned because the current process-lifecycle event
 does not identify its subject and a `SIGKILL`ed process cannot emit its own
 exit. The record binds replica, PID, PGID, `SIGKILL` number, request time in the
@@ -75,6 +86,9 @@ requires all of the following:
 - exact `N=7`, `f=2`, fixed quorum `Q=5`, and unchanged membership `0..6`;
 - complete, contiguous, source-bound raw JSONL with replica 2 as the sole
   designated authoritative commit observer;
+- a complete rich `block.committed` chain at replica 2 for throughput and
+  epoch/tree/leader attribution, plus `block.commit_observed` witnesses from
+  every current participant for runner readiness and agreement checks;
 - a complete final epoch-0 root cycle `0..6`, ending at root 6 before either
   crash request;
 - confirmed crashes of replicas 0 and 1 only, with no crash event or ground
@@ -86,8 +100,8 @@ requires all of the following:
   Epoch 1 commit; it is excluded from the post-change measurement window;
 - successor root set exactly `2..6`, preserving its committed tree-ID order,
   with failed replicas `0` and `1` both wait-exempt physical leaves;
-- agreement by replicas `2..6` on every authoritative measurement height and
-  hash;
+- `block.commit_observed` agreement by replicas `2..6` on every authoritative
+  measurement height and hash;
 - raw, phase-local, zero-filled throughput buckets no wider than five seconds,
   with at least seven complete raw buckets in both baseline and post phases and
   seven leader columns that conserve aggregate throughput exactly;

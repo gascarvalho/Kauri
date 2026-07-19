@@ -100,6 +100,20 @@ def _commit_payload(
     }
 
 
+def _commit_observed_payload(
+    *,
+    height: int,
+    transaction_count: int,
+) -> dict[str, Any]:
+    return {
+        "block_height": height,
+        "block_hash": f"{height:064x}",
+        "parent_hash": None if height == 1 else f"{height - 1:064x}",
+        "transaction_count": transaction_count,
+        "commit_batch_index": 0,
+    }
+
+
 def command_payload() -> dict[str, Any]:
     return {
         "command_block_height": 12,
@@ -216,6 +230,19 @@ def _replica_events(replica: int) -> list[dict[str, Any]]:
     for height, timestamp, epoch, tree, transactions in schedule:
         if replica in (0, 1) and timestamp >= (CRASH_0_NS, CRASH_1_NS)[replica]:
             continue
+        events.append(
+            _envelope(
+                source_kind="replica",
+                source_id=source_id,
+                source_instance=instance,
+                timestamp_ns=timestamp + replica * 1_000_000,
+                event_type="block.commit_observed",
+                payload=_commit_observed_payload(
+                    height=height,
+                    transaction_count=transactions,
+                ),
+            )
+        )
         events.append(
             _envelope(
                 source_kind="replica",

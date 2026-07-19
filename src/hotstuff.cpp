@@ -3692,6 +3692,32 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::emit_commit_observed_event(
+        const block_t &blk,
+        std::uint64_t commit_batch_index) noexcept
+    {
+        if (structured_event_emitter == nullptr || blk == nullptr)
+            return;
+        try
+        {
+            std::optional<uint256_t> parent_hash;
+            const auto &parent_hashes = blk->get_parent_hashes();
+            if (!parent_hashes.empty())
+                parent_hash = parent_hashes.front();
+            structured_event_emitter->emit(
+                StructuredEventPayload{CommitObservedStructuredEvent{
+                    blk->get_height(),
+                    blk->get_hash(),
+                    parent_hash,
+                    static_cast<std::uint64_t>(blk->get_cmds().size()),
+                    commit_batch_index}});
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
+        }
+    }
+
     void HotStuffBase::emit_epoch_command_committed_event(
         const block_t &blk,
         const AuthorizedEpochChange &command,
@@ -7183,9 +7209,16 @@ namespace hotstuff
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
 
+        if (blk == nullptr)
+        {
+            pending_adaptive_v2_commit.reset();
+            return;
+        }
+        emit_commit_observed_event(blk, commit_batch_index);
+
         std::optional<ProposalKey> committed_key;
         std::optional<std::uint64_t> view_generation;
-        if (blk != nullptr && pending_adaptive_v2_commit &&
+        if (pending_adaptive_v2_commit &&
             pending_adaptive_v2_commit->block_hash == blk->get_hash())
         {
             committed_key = pending_adaptive_v2_commit->committed_key;
@@ -7193,8 +7226,6 @@ namespace hotstuff
                 pending_adaptive_v2_commit->view_generation;
         }
         pending_adaptive_v2_commit.reset();
-        if (blk == nullptr)
-            return;
         emit_committed_block_event(
             blk, committed_key, view_generation, commit_batch_index);
 

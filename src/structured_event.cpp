@@ -321,6 +321,9 @@ bool payload_type(const StructuredEventPayload &payload,
         case 2:
             type = StructuredEventType::block_committed;
             return true;
+        case 3:
+            type = StructuredEventType::block_commit_observed;
+            return true;
         default:
             return false;
     }
@@ -649,6 +652,26 @@ void append_commit_payload(JsonLineBuilder &builder,
     builder.append('}');
 }
 
+void append_commit_observed_payload(
+    JsonLineBuilder &builder,
+    const CommitObservedStructuredEvent &event)
+{
+    builder.append("{\"block_height\":");
+    builder.append_integer(event.block_height);
+    builder.append(",\"block_hash\":");
+    builder.append_escaped(event.block_hash.to_hex());
+    builder.append(",\"parent_hash\":");
+    if (event.parent_hash)
+        builder.append_escaped(event.parent_hash->to_hex());
+    else
+        builder.append("null");
+    builder.append(",\"transaction_count\":");
+    builder.append_integer(event.transaction_count);
+    builder.append(",\"commit_batch_index\":");
+    builder.append_integer(event.commit_batch_index);
+    builder.append('}');
+}
+
 void append_epoch_command_payload(
     JsonLineBuilder &builder,
     const EpochCommandCommittedStructuredEvent &event)
@@ -806,6 +829,11 @@ std::string serialize_event(const StructuredEventConfig &config,
         case 2:
             append_commit_payload(
                 builder, config, std::get<CommitStructuredEvent>(payload));
+            break;
+        case 3:
+            append_commit_observed_payload(
+                builder,
+                std::get<CommitObservedStructuredEvent>(payload));
             break;
         default:
             throw std::bad_variant_access{};
@@ -1295,6 +1323,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "epoch.activated";
         case StructuredEventType::block_committed:
             return "block.committed";
+        case StructuredEventType::block_commit_observed:
+            return "block.commit_observed";
         case StructuredEventType::adaptive_configuration_active:
             return "adaptive.configuration_active";
         case StructuredEventType::aggregation_required_set_ready:

@@ -314,10 +314,20 @@ struct CommitStructuredEvent
     std::uint64_t commit_batch_index{0};
 };
 
+struct CommitObservedStructuredEvent
+{
+    std::uint64_t block_height{0};
+    uint256_t block_hash;
+    std::optional<uint256_t> parent_hash;
+    std::uint64_t transaction_count{0};
+    std::uint64_t commit_batch_index{0};
+};
+
 using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
-    CommitStructuredEvent>;
+    CommitStructuredEvent,
+    CommitObservedStructuredEvent>;
 
 enum class StructuredEventType : std::uint8_t
 {
@@ -333,6 +343,7 @@ enum class StructuredEventType : std::uint8_t
     epoch_activation_armed,
     epoch_activated,
     block_committed,
+    block_commit_observed,
 };
 
 StructuredEventType structured_event_type(
@@ -511,6 +522,7 @@ using hotstuff::AdaptiveAggregationTransition;
 using hotstuff::AdaptiveStructuredEventEmitter;
 using hotstuff::AuditStructuredEventEmitter;
 using hotstuff::AuditStructuredEventPayload;
+using hotstuff::CommitObservedStructuredEvent;
 using hotstuff::CommitStructuredEvent;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
@@ -628,6 +640,16 @@ CommitStructuredEvent commit_event()
         7,
         ProposalKey{proof_configuration, digest("decision-proof-block")},
         19,
+        2};
+}
+
+CommitObservedStructuredEvent commit_observed_event()
+{
+    return CommitObservedStructuredEvent{
+        1234,
+        digest("observed-committed-block"),
+        digest("observed-committed-parent"),
+        7,
         2};
 }
 
@@ -1176,6 +1198,30 @@ std::string expected_commit_line(const CommitStructuredEvent &event,
             std::to_string(event.commit_batch_index) + "}}\n";
 }
 
+std::string expected_commit_observed_line(
+    const CommitObservedStructuredEvent &event,
+    std::uint64_t sequence,
+    std::uint64_t monotonic_ns)
+{
+    return
+        "{\"event_schema_version\":1,"
+        "\"run_id\":\"run-structured-event\","
+        "\"source_kind\":\"replica\","
+        "\"source_id\":\"replica-2\","
+        "\"source_instance\":\"spawn-9\","
+        "\"source_sequence\":" + std::to_string(sequence) + ","
+        "\"source_monotonic_ns\":" + std::to_string(monotonic_ns) + ","
+        "\"event_type\":\"block.commit_observed\","
+        "\"payload\":{"
+        "\"block_height\":" + std::to_string(event.block_height) + ","
+        "\"block_hash\":\"" + event.block_hash.to_hex() + "\","
+        "\"parent_hash\":\"" + event.parent_hash->to_hex() + "\","
+        "\"transaction_count\":" +
+            std::to_string(event.transaction_count) + ","
+        "\"commit_batch_index\":" +
+            std::to_string(event.commit_batch_index) + "}}\n";
+}
+
 class TemporaryDirectory final
 {
 public:
@@ -1275,8 +1321,8 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
     CHECK(KAURI_HAS_STRUCTURED_EVENT_API == 1);
     CHECK(hotstuff::kStructuredEventSchemaVersion == 1);
 
-    static_assert(std::variant_size<StructuredEventPayload>::value == 3,
-                  "phase one has only process, epoch and commit payloads");
+    static_assert(std::variant_size<StructuredEventPayload>::value == 4,
+                  "protocol evidence has lifecycle and two commit payloads");
     static_assert(std::is_final<StructuredEventSink>::value,
                   "one owner controls the queue and output path");
     static_assert(!std::is_copy_constructible<StructuredEventSink>::value,
@@ -1408,6 +1454,21 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
     CHECK(std::find(
               observed_types.begin(), observed_types.end(), commit_type) ==
           observed_types.end());
+    observed_types.push_back(commit_type);
+    observed_names.emplace_back("block.committed");
+
+    const auto observed_type = hotstuff::structured_event_type(
+        StructuredEventPayload{commit_observed_event()});
+    CHECK(observed_type == StructuredEventType::block_commit_observed);
+    CHECK(std::string(hotstuff::structured_event_type_name(observed_type)) ==
+          "block.commit_observed");
+    CHECK(std::find(
+              observed_types.begin(), observed_types.end(), observed_type) ==
+          observed_types.end());
+    CHECK(std::find(
+              observed_names.begin(),
+              observed_names.end(),
+              "block.commit_observed") == observed_names.end());
 
 #if defined(HOTSTUFF_PROTO_LOG)
     INFO("the same structured contract is exercised with human logs enabled");
@@ -1432,8 +1493,8 @@ TEST_CASE("WE06-C04 maps every adaptive transition to one canonical event",
             StructuredEventSink>::value,
         "the bounded sink implements the separate adaptive capability");
     static_assert(
-        std::variant_size<StructuredEventPayload>::value == 3,
-        "adaptive evidence does not broaden the legacy payload variant");
+        std::variant_size<StructuredEventPayload>::value == 4,
+        "adaptive aggregation evidence stays outside protocol payloads");
 
     struct Mapping
     {
@@ -2266,6 +2327,39 @@ TEST_CASE("V13 derives designated commit observer from exact source config",
             CHECK(rendered(output).find("\"designated_observer\":true") ==
                   std::string::npos);
         }
+    }
+}
+
+TEST_CASE("adaptive commit witness serializes without proposal metadata",
+          "[adaptive-v2][structured-event][commit-observed][schema]")
+{
+    auto event = commit_observed_event();
+    const auto expected = expected_commit_observed_line(event, 1, 1100);
+    FakeClock clock({1100});
+    MemoryOutput output;
+    StructuredEventSink sink(event_config(), clock, output);
+
+    sink.emit(StructuredEventPayload{event});
+    sink.shutdown();
+
+    CHECK(rendered(output) == expected);
+    CHECK(rendered(output).find("\"decision_proof\"") ==
+          std::string::npos);
+    CHECK(rendered(output).find("\"view_generation\"") ==
+          std::string::npos);
+    CHECK(rendered(output).find("\"designated_observer\"") ==
+          std::string::npos);
+
+    SECTION("a missing parent remains an explicit null")
+    {
+        event.parent_hash.reset();
+        FakeClock null_clock({1101});
+        MemoryOutput null_output;
+        StructuredEventSink null_sink(event_config(), null_clock, null_output);
+        null_sink.emit(StructuredEventPayload{event});
+        null_sink.shutdown();
+        CHECK(rendered(null_output).find("\"parent_hash\":null") !=
+              std::string::npos);
     }
 }
 

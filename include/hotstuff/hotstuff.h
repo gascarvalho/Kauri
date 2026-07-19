@@ -1403,6 +1403,9 @@ namespace hotstuff
             const std::optional<ProposalKey> &committed_key,
             const std::optional<std::uint64_t> &view_generation,
             std::uint64_t commit_batch_index) noexcept;
+        void emit_commit_observed_event(
+            const block_t &blk,
+            std::uint64_t commit_batch_index) noexcept;
         void emit_epoch_command_committed_event(
             const block_t &blk,
             const AuthorizedEpochChange &command,

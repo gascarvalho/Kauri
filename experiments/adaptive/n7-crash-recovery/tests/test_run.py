@@ -147,6 +147,34 @@ def _event(
     }
 
 
+def _commit_observed_event(
+    *,
+    replica: int,
+    sequence: int,
+    timestamp_ns: int,
+    height: int,
+    block_hash: str | None = None,
+) -> dict[str, Any]:
+    block_hash = block_hash or f"{height:064x}"
+    return {
+        "event_schema_version": 1,
+        "run_id": "synthetic-non-evidence",
+        "source_kind": "replica",
+        "source_id": f"replica-{replica}",
+        "source_instance": f"synthetic-replica-{replica}",
+        "source_sequence": sequence,
+        "source_monotonic_ns": timestamp_ns,
+        "event_type": "block.commit_observed",
+        "payload": {
+            "block_height": height,
+            "block_hash": block_hash,
+            "parent_hash": None,
+            "transaction_count": 1,
+            "commit_batch_index": 0,
+        },
+    }
+
+
 def _configuration_active_event(
     *,
     replica: int,
@@ -265,13 +293,20 @@ def test_baseline_gate_requires_complete_common_root_cycle() -> None:
         )
         for index, tree in enumerate((0, 0, 1, 2, 3, 4, 5, 6))
     ]
-    common = {
-        replica: {
-            (int(event["payload"]["block_height"]), str(event["payload"]["block_hash"]))
-            for event in events
-        }
+    streams = {
+        f"replica-{replica}": [
+            _commit_observed_event(
+                replica=replica,
+                sequence=index + 1,
+                timestamp_ns=(index + 1) * 1_000_000_000 + replica,
+                height=int(event["payload"]["block_height"]),
+                block_hash=str(event["payload"]["block_hash"]),
+            )
+            for index, event in enumerate(events)
+        ]
         for replica in range(7)
     }
+    common = campaign.common_commit_keys(streams, tuple(range(7)))
 
     endpoint = campaign.find_common_root_cycle(
         events,
@@ -305,10 +340,14 @@ def test_baseline_gate_requires_complete_common_root_cycle() -> None:
         require_terminal=False,
     ) is not None
 
-    common[3].remove((4, f"{4:064x}"))
+    streams["replica-3"] = [
+        event
+        for event in streams["replica-3"]
+        if event["payload"]["block_height"] != 4
+    ]
     assert campaign.find_common_root_cycle(
         later_events,
-        common,
+        campaign.common_commit_keys(streams, tuple(range(7))),
         participants=tuple(range(7)),
         epoch_number=0,
         tree_roots={replica: replica for replica in range(7)},

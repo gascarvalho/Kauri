@@ -251,14 +251,21 @@ def test_crash_requires_full_initial_root_cycle_common_to_all_seven(
     replica_zero = tmp_path / "run/raw/replica-0.jsonl"
 
     def contradict_root_three(values: list[dict[str, object]]) -> None:
-        commit = next(
+        witness = next(
+            value
+            for value in values
+            if value["event_type"] == "block.commit_observed"
+            and value["payload"]["block_height"] == 4
+        )
+        witness["payload"]["block_hash"] = "f" * 64
+        rich = next(
             value
             for value in values
             if value["event_type"] == "block.committed"
-            and value["payload"]["decision_proof"]["tree_id"] == 3
+            and value["payload"]["block_height"] == 4
         )
-        commit["payload"]["block_hash"] = "f" * 64
-        commit["payload"]["decision_proof"]["block_hash"] = "f" * 64
+        rich["payload"]["block_hash"] = "f" * 64
+        rich["payload"]["decision_proof"]["block_hash"] = "f" * 64
 
     _rewrite_jsonl(replica_zero, contradict_root_three)
 
@@ -373,16 +380,26 @@ def test_crash_boundary_audits_authoritative_sequence_not_global_timestamp(
     assert "authoritative root changed" in verdict["reason"]
 
 
-def test_survivor_common_height_disagreement_fails(tmp_path: Path) -> None:
+def test_conflicting_survivor_commit_witness_fails(tmp_path: Path) -> None:
     manifest, epochs = synthetic_run.create_run(tmp_path / "run")
     survivor = tmp_path / "run/raw/replica-6.jsonl"
 
     def conflict(values: list[dict[str, object]]) -> None:
-        commit = next(
-            value for value in values if value["event_type"] == "block.committed"
+        witness = next(
+            value
+            for value in values
+            if value["event_type"] == "block.commit_observed"
         )
-        commit["payload"]["block_hash"] = "f" * 64
-        commit["payload"]["decision_proof"]["block_hash"] = "f" * 64
+        witness["payload"]["block_hash"] = "f" * 64
+        rich = next(
+            value
+            for value in values
+            if value["event_type"] == "block.committed"
+            and value["payload"]["block_height"]
+            == witness["payload"]["block_height"]
+        )
+        rich["payload"]["block_hash"] = "f" * 64
+        rich["payload"]["decision_proof"]["block_hash"] = "f" * 64
 
     _rewrite_jsonl(survivor, conflict)
 
@@ -390,6 +407,181 @@ def test_survivor_common_height_disagreement_fails(tmp_path: Path) -> None:
 
     assert verdict["verdict"] == "FAIL"
     assert "disagreement at height 1" in verdict["reason"]
+
+
+def test_nonobserver_cannot_claim_designated_commit_stream(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-6.jsonl"
+
+    def mark_designated(values: list[dict[str, object]]) -> None:
+        commit = next(
+            value for value in values if value["event_type"] == "block.committed"
+        )
+        commit["payload"]["designated_observer"] = True
+
+    _rewrite_jsonl(survivor, mark_designated)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "designated-observer flag is inconsistent" in verdict["reason"]
+
+
+def test_rich_commit_must_match_same_replica_witness(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-5.jsonl"
+
+    def contradict_witness(values: list[dict[str, object]]) -> None:
+        commit = next(
+            value for value in values if value["event_type"] == "block.committed"
+        )
+        commit["payload"]["block_hash"] = "f" * 64
+        commit["payload"]["decision_proof"]["block_hash"] = "f" * 64
+
+    _rewrite_jsonl(survivor, contradict_witness)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "rich commit disagrees with commit witness at height 1" in verdict["reason"]
+
+
+def test_rich_commit_transaction_count_must_match_witness(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    observer = tmp_path / "run/raw/replica-2.jsonl"
+
+    def change_transaction_count(values: list[dict[str, object]]) -> None:
+        commit = next(
+            value for value in values if value["event_type"] == "block.committed"
+        )
+        commit["payload"]["transaction_count"] = 101
+
+    _rewrite_jsonl(observer, change_transaction_count)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "rich commit disagrees with commit witness at height 1" in verdict["reason"]
+
+
+def test_commit_witness_must_precede_rich_event(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-5.jsonl"
+
+    def move_witness_after_rich(values: list[dict[str, object]]) -> None:
+        witness_index = next(
+            index
+            for index, value in enumerate(values)
+            if value["event_type"] == "block.commit_observed"
+        )
+        rich_index = next(
+            index
+            for index, value in enumerate(values)
+            if value["event_type"] == "block.committed"
+            and value["payload"]["block_height"]
+            == values[witness_index]["payload"]["block_height"]
+        )
+        values[witness_index], values[rich_index] = (
+            values[rich_index],
+            values[witness_index],
+        )
+
+    _rewrite_jsonl(survivor, move_witness_after_rich)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "commit witness does not precede rich commit at height 1" in verdict["reason"]
+
+
+def test_nonobserver_rich_commit_gap_is_covered_by_witness(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-4.jsonl"
+
+    def remove_rich_commit(values: list[dict[str, object]]) -> None:
+        values[:] = [
+            value
+            for value in values
+            if not (
+                value["event_type"] == "block.committed"
+                and value["payload"]["block_height"] == 10
+            )
+        ]
+
+    _rewrite_jsonl(survivor, remove_rich_commit)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "PASS"
+
+
+def test_authoritative_witness_without_rich_commit_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    observer = tmp_path / "run/raw/replica-2.jsonl"
+
+    def remove_rich_commit(values: list[dict[str, object]]) -> None:
+        values[:] = [
+            value
+            for value in values
+            if not (
+                value["event_type"] == "block.committed"
+                and value["payload"]["block_height"] == 10
+            )
+        ]
+
+    _rewrite_jsonl(observer, remove_rich_commit)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "INCOMPLETE"
+    assert "replica-2 commit witness at height 10 has no rich commit" in verdict[
+        "reason"
+    ]
+
+
+def test_missing_survivor_commit_witness_is_incomplete(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-4.jsonl"
+
+    def remove_witness(values: list[dict[str, object]]) -> None:
+        values[:] = [
+            value
+            for value in values
+            if not (
+                value["event_type"] == "block.commit_observed"
+                and value["payload"]["block_height"] == 10
+            )
+        ]
+
+    _rewrite_jsonl(survivor, remove_witness)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "INCOMPLETE"
+    assert "replica-4 rich commit at height 10 has no commit witness" in verdict["reason"]
+
+
+def test_commit_witness_requires_exact_payload_fields(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-5.jsonl"
+
+    def remove_transaction_count(values: list[dict[str, object]]) -> None:
+        witness = next(
+            value
+            for value in values
+            if value["event_type"] == "block.commit_observed"
+        )
+        del witness["payload"]["transaction_count"]
+
+    _rewrite_jsonl(survivor, remove_transaction_count)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "block.commit_observed payload fields are invalid" in verdict["reason"]
+    assert "transaction_count" in verdict["reason"]
 
 
 def test_terminal_verdict_is_immutable(tmp_path: Path) -> None:

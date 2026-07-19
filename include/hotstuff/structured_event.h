@@ -79,6 +79,23 @@ struct CommitStructuredEvent
     std::uint64_t commit_batch_index{0};
 };
 
+/**
+ * Replica-local witness that one block reached the commit callback.
+ *
+ * Unlike CommitStructuredEvent, this payload deliberately carries no exact
+ * proposal or view identity. Every replica knows these fields at commit time,
+ * including when an indirectly committed ancestor has no retained local
+ * ProposalKey metadata.
+ */
+struct CommitObservedStructuredEvent
+{
+    std::uint64_t block_height{0};
+    uint256_t block_hash;
+    std::optional<uint256_t> parent_hash;
+    std::uint64_t transaction_count{0};
+    std::uint64_t commit_batch_index{0};
+};
+
 /** Exact schedule installed after one adaptive-v2 command commits. */
 struct EpochCommandCommittedStructuredEvent
 {
@@ -103,7 +120,8 @@ struct ReputationEvidenceAppliedStructuredEvent
 using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
-    CommitStructuredEvent>;
+    CommitStructuredEvent,
+    CommitObservedStructuredEvent>;
 
 using AuditStructuredEventPayload = std::variant<
     EpochCommandCommittedStructuredEvent,
@@ -195,6 +213,7 @@ enum class StructuredEventType : std::uint8_t
     aggregation_root_qc_published,
     epoch_command_committed,
     reputation_evidence_applied,
+    block_commit_observed,
 };
 
 StructuredEventType structured_event_type(

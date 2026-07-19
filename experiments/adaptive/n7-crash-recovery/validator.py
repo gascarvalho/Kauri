@@ -262,6 +262,15 @@ _COMMIT_FIELDS = frozenset(
         "commit_batch_index",
     }
 )
+_COMMIT_OBSERVED_FIELDS = frozenset(
+    {
+        "block_height",
+        "block_hash",
+        "parent_hash",
+        "transaction_count",
+        "commit_batch_index",
+    }
+)
 _DECISION_FIELDS = frozenset(
     {"epoch_number", "tree_id", "epoch_digest", "block_hash"}
 )
@@ -496,6 +505,24 @@ class ReputationPoint:
     source_sequence: int | None
     evidence_outcome: str
     delta: int
+
+
+@dataclass(frozen=True, slots=True)
+class CommitObservation:
+    block_hash: str
+    parent_hash: str | None
+    transaction_count: int
+    commit_batch_index: int
+    source_sequence: int
+
+    @property
+    def shared_identity(self) -> tuple[str, str | None, int, int]:
+        return (
+            self.block_hash,
+            self.parent_hash,
+            self.transaction_count,
+            self.commit_batch_index,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2149,10 +2176,10 @@ def _contains_contiguous(values: Sequence[int], expected: Sequence[int]) -> bool
     return any(list(values[index : index + width]) == list(expected) for index in range(len(values) - width + 1))
 
 
-def _commit_observations(
+def _rich_commit_observations(
     events: Sequence[analysis.StructuredEvent], replica: int
-) -> dict[int, str]:
-    observations: dict[int, str] = {}
+) -> dict[int, CommitObservation]:
+    observations: dict[int, CommitObservation] = {}
     hashes: dict[str, int] = {}
     for event in events:
         if event.event_type != "block.committed":
@@ -2170,8 +2197,10 @@ def _commit_observations(
         block_hash = _hash(payload["block_hash"], "commit.block_hash")
         parent = payload["parent_hash"]
         if parent is not None:
-            _hash(parent, "commit.parent_hash")
-        _integer(payload["transaction_count"], "commit.transaction_count")
+            parent = _hash(parent, "commit.parent_hash")
+        transaction_count = _integer(
+            payload["transaction_count"], "commit.transaction_count"
+        )
         proof = _object(payload["decision_proof"], "commit.decision_proof")
         _exact_fields(proof, _DECISION_FIELDS, "commit.decision_proof")
         _integer(
@@ -2190,20 +2219,129 @@ def _commit_observations(
         view = payload["view_generation"]
         if view is not None:
             _integer(view, "commit.view_generation")
-        _integer(payload["commit_batch_index"], "commit.commit_batch_index")
-        previous_hash = observations.get(height)
-        if previous_hash is not None and previous_hash != block_hash:
+        commit_batch_index = _integer(
+            payload["commit_batch_index"], "commit.commit_batch_index"
+        )
+        observation = CommitObservation(
+            block_hash=block_hash,
+            parent_hash=parent,
+            transaction_count=transaction_count,
+            commit_batch_index=commit_batch_index,
+            source_sequence=event.source_sequence,
+        )
+        previous = observations.get(height)
+        if (
+            previous is not None
+            and previous.shared_identity != observation.shared_identity
+        ):
             raise ValidationError(
-                f"replica-{replica} has conflicting commits at height {height}"
+                f"replica-{replica} has conflicting rich commits at height {height}"
             )
         previous_height = hashes.get(block_hash)
         if previous_height is not None and previous_height != height:
             raise ValidationError(
-                f"replica-{replica} reuses one commit hash at two heights"
+                f"replica-{replica} reuses one rich commit hash at two heights"
             )
-        observations[height] = block_hash
+        if previous is None:
+            observations[height] = observation
         hashes[block_hash] = height
     return observations
+
+
+def _commit_witness_observations(
+    events: Sequence[analysis.StructuredEvent], replica: int
+) -> dict[int, CommitObservation]:
+    observations: dict[int, CommitObservation] = {}
+    hashes: dict[str, int] = {}
+    for event in events:
+        if event.event_type != "block.commit_observed":
+            continue
+        payload = event.payload
+        _exact_fields(
+            payload,
+            _COMMIT_OBSERVED_FIELDS,
+            "block.commit_observed payload",
+        )
+        height = _integer(
+            payload["block_height"],
+            "commit witness.block_height",
+            minimum=1,
+        )
+        block_hash = _hash(
+            payload["block_hash"],
+            "commit witness.block_hash",
+        )
+        parent = payload["parent_hash"]
+        if parent is not None:
+            parent = _hash(parent, "commit witness.parent_hash")
+        transaction_count = _integer(
+            payload["transaction_count"],
+            "commit witness.transaction_count",
+        )
+        commit_batch_index = _integer(
+            payload["commit_batch_index"],
+            "commit witness.commit_batch_index",
+        )
+        observation = CommitObservation(
+            block_hash=block_hash,
+            parent_hash=parent,
+            transaction_count=transaction_count,
+            commit_batch_index=commit_batch_index,
+            source_sequence=event.source_sequence,
+        )
+        previous = observations.get(height)
+        if (
+            previous is not None
+            and previous.shared_identity != observation.shared_identity
+        ):
+            raise ValidationError(
+                f"replica-{replica} has conflicting commit witnesses at height "
+                f"{height}"
+            )
+        previous_height = hashes.get(block_hash)
+        if previous_height is not None and previous_height != height:
+            raise ValidationError(
+                f"replica-{replica} reuses one commit witness hash at two heights"
+            )
+        if previous is None:
+            observations[height] = observation
+        hashes[block_hash] = height
+    return observations
+
+
+def _commit_observations(
+    events: Sequence[analysis.StructuredEvent], replica: int
+) -> dict[int, str]:
+    witnesses = _commit_witness_observations(events, replica)
+    rich_commits = _rich_commit_observations(events, replica)
+    for height, rich_commit in rich_commits.items():
+        witness = witnesses.get(height)
+        if witness is None:
+            raise IncompleteRun(
+                f"replica-{replica} rich commit at height {height} has no "
+                "commit witness"
+            )
+        if witness.shared_identity != rich_commit.shared_identity:
+            raise ValidationError(
+                f"replica-{replica} rich commit disagrees with commit witness "
+                f"at height {height}"
+            )
+        if witness.source_sequence >= rich_commit.source_sequence:
+            raise ValidationError(
+                f"replica-{replica} commit witness does not precede rich commit "
+                f"at height {height}"
+            )
+    if replica == analysis.AUTHORITATIVE_OBSERVER:
+        for height in sorted(witnesses):
+            if height not in rich_commits:
+                raise IncompleteRun(
+                    f"replica-{replica} commit witness at height {height} has "
+                    "no rich commit"
+                )
+    return {
+        height: observation.block_hash
+        for height, observation in witnesses.items()
+    }
 
 
 def _complete_bucket_counts(
@@ -2410,14 +2548,17 @@ def _validate_commits(
         for replica in MEMBERSHIP
     }
     for commit in pre_crash:
-        if any(
-            pre_crash_by_replica[replica].get(commit.height)
-            not in (None, commit.block_hash)
-            for replica in SURVIVING_REPLICAS
-        ):
-            raise ValidationError(
-                f"survivor commit disagreement at height {commit.height}"
-            )
+        for replica in SURVIVING_REPLICAS:
+            observed_hash = pre_crash_by_replica[replica].get(commit.height)
+            if observed_hash is None:
+                raise IncompleteRun(
+                    f"replica-{replica} is missing authoritative height "
+                    f"{commit.height}"
+                )
+            if observed_hash != commit.block_hash:
+                raise ValidationError(
+                    f"survivor commit disagreement at height {commit.height}"
+                )
     common_pre_crash = [
         commit
         for commit in pre_crash

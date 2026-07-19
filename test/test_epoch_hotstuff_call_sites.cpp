@@ -1320,6 +1320,8 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
         implementation, "void HotStuffBase::bind_structured_event_emitters(");
     const auto commit_event = function_body(
         implementation, "void HotStuffBase::emit_committed_block_event(");
+    const auto commit_observed_event = function_body(
+        implementation, "void HotStuffBase::emit_commit_observed_event(");
     const auto command_event = function_body(
         implementation,
         "void HotStuffBase::emit_epoch_command_committed_event(");
@@ -1389,6 +1391,23 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     CHECK(commit_event.find("activation.active_effect()") ==
           std::string::npos);
     CHECK(commit_event.find("find_exact_runtime_generation(") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(commit_observed_event.empty());
+    CHECK(contains_all(
+        commit_observed_event,
+        {"structured_event_emitter == nullptr",
+         "blk == nullptr",
+         "blk->get_height()",
+         "blk->get_hash()",
+         "blk->get_parent_hashes()",
+         "blk->get_cmds().size()",
+         "commit_batch_index",
+         "CommitObservedStructuredEvent",
+         "StructuredEventPayload"}));
+    CHECK(commit_observed_event.find("ProposalKey") == std::string::npos);
+    CHECK(commit_observed_event.find("committed_key") == std::string::npos);
+    CHECK(commit_observed_event.find("view_generation") ==
           std::string::npos);
 
     REQUIRE_FALSE(observe_generation.empty());
@@ -1468,12 +1487,18 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
 
     REQUIRE_FALSE(post_commit.empty());
     CHECK(count_occurrences(
+              post_commit, "emit_commit_observed_event(") == 1);
+    CHECK(count_occurrences(
               post_commit, "emit_committed_block_event(") == 1);
     CHECK(count_occurrences(
               post_commit, "emit_epoch_command_committed_event(") == 1);
     CHECK(contains_in_order(
         post_commit,
-        {"committed_key = pending_adaptive_v2_commit->committed_key",
+        {"EpochProtocolMode::adaptive_v2",
+         "if (blk == nullptr)",
+         "emit_commit_observed_event(",
+         "std::optional<ProposalKey> committed_key",
+         "committed_key = pending_adaptive_v2_commit->committed_key",
          "view_generation =",
          "pending_adaptive_v2_commit->view_generation",
          "pending_adaptive_v2_commit.reset()",
