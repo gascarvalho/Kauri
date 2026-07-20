@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "profile_id": "n7-f2-q5-epoch1-convergence-v1",
+  "frozen": true,
+  "base_profile": {
+    "identity": "n7-f2-q5-crash-recovery-v2",
+    "sha256": "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
+  },
+  "claim_scope": "epoch1_convergence_only",
+  "replica_ids": [0, 1, 2, 3, 4, 5, 6],
+  "fault_threshold": 2,
+  "quorum": 5,
+  "crash_targets": [0, 1],
+  "survivors": [2, 3, 4, 5, 6],
+  "successor_epoch": 1,
+  "activation_delay_blocks": 5,
+  "fault_injection": {
+    "bundle_delivery": {
+      "recipient": 2,
+      "attempt": 1
+    },
+    "activation_ack": {
+      "positive_ack_ordinal": 1
+    }
+  },
+  "requirements": {
+    "matching_activation_sources": 5,
+    "exactly_one_converged": true,
+    "exactly_one_ready": true,
+    "require_ack_retransmission": true,
+    "require_common_successor_commit": true,
+    "forbid_epoch_above": 1,
+    "throughput_claim": false
+  },
+  "timeouts": {
+    "startup_s": 90,
+    "phase_s": 240,
+    "crash_confirm_s": 5,
+    "ack_drain_s": 2
+  }
+}

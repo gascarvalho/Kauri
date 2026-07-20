@@ -696,6 +696,7 @@ def build_manager_command(
     source_instance: str,
     structured_event_path: Path,
     bundle_path: Path,
+    manager_extra_args: Sequence[str] = (),
 ) -> tuple[str, ...]:
     if len(replicas_tls) != 7:
         raise RunnerError("manager command requires exactly seven replica TLS identities")
@@ -729,6 +730,7 @@ def build_manager_command(
                 f"{replica_id},127.0.0.1:{peer_port + replica_id},{tls['crt']}",
             )
         )
+    command.extend(manager_extra_args)
     result = tuple(command)
     _assert_safe_command(result)
     return result
@@ -972,6 +974,7 @@ def write_runtime_inputs(
     source_instances: Mapping[str, str],
     app_binary: Path,
     manager_binary: Path,
+    manager_extra_args: Sequence[str] = (),
 ) -> tuple[Path, list[Path], tuple[str, ...], list[tuple[str, ...]], list[dict[str, Any]]]:
     config_directory = run_directory / "config"
     runtime_directory = run_directory / "runtime"
@@ -1044,6 +1047,7 @@ def write_runtime_inputs(
         source_instance=source_instances[MANAGER_SOURCE_ID],
         structured_event_path=raw_directory / "adaptive-manager.jsonl",
         bundle_path=run_directory / "successor.bundle",
+        manager_extra_args=manager_extra_args,
     )
     epoch_input_path = runtime_directory / "epoch-input.json"
     _write_json_exclusive(epoch_input_path, _initial_epoch_input())
@@ -1517,9 +1521,14 @@ def find_first_common_epoch_commit(
     *,
     participants: Sequence[int],
     epoch_number: int,
+    strictly_after_ns: int | None = None,
 ) -> CommonEpochCommit | None:
     if not participants:
         raise RunnerError("common epoch commit requires at least one participant")
+    if strictly_after_ns is not None and (
+        type(strictly_after_ns) is not int or strictly_after_ns <= 0
+    ):
+        raise RunnerError("common epoch commit boundary must be a positive integer")
     for event in _commits(observer_events):
         payload = event.get("payload")
         if not isinstance(payload, dict):
@@ -1527,13 +1536,22 @@ def find_first_common_epoch_commit(
         proof = payload.get("decision_proof")
         if not isinstance(proof, dict) or proof.get("epoch_number") != epoch_number:
             continue
+        observer_timestamp = _event_timestamp(event)
+        if strictly_after_ns is not None and observer_timestamp <= strictly_after_ns:
+            continue
         key = _commit_key(event)
         witness_timestamps = [
             witnesses.get(replica, {}).get(key) for replica in participants
         ]
-        if all(timestamp is not None for timestamp in witness_timestamps):
+        if all(timestamp is not None for timestamp in witness_timestamps) and (
+            strictly_after_ns is None
+            or all(
+                int(timestamp) > strictly_after_ns
+                for timestamp in witness_timestamps
+            )
+        ):
             common_timestamps = [
-                _event_timestamp(event),
+                observer_timestamp,
                 *(int(timestamp) for timestamp in witness_timestamps),
             ]
             return CommonEpochCommit(
