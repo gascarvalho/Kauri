@@ -734,9 +734,9 @@ def build_manager_command(
     return result
 
 
-def write_runtime_inputs(
-    run_directory: Path,
+def _main_config_payload(
     profile: Mapping[str, Any],
+    runtime: Mapping[str, Any],
     bls: Sequence[Mapping[str, str]],
     tls: Sequence[Mapping[str, str]],
     issuer: Mapping[str, str],
@@ -744,20 +744,7 @@ def write_runtime_inputs(
     peer_port: int,
     client_port: int,
     manager_port: int,
-    run_id: str,
-    source_instances: Mapping[str, str],
-    app_binary: Path,
-    manager_binary: Path,
-) -> tuple[Path, list[Path], tuple[str, ...], list[tuple[str, ...]], list[dict[str, Any]]]:
-    config_directory = run_directory / "config"
-    runtime_directory = run_directory / "runtime"
-    runtime_directory.mkdir(mode=0o700)
-    raw_directory = run_directory / "raw"
-    runtime = runtime_parameters(
-        profile,
-        app_binary=app_binary,
-        manager_binary=manager_binary,
-    )
+) -> bytes:
     lines = [
         f"block-size = {runtime['block_size']}",
         "nworker = 2",
@@ -792,73 +779,57 @@ def write_runtime_inputs(
             f"127.0.0.1:{peer_port + replica_id};{client_port + replica_id}, "
             f"{bls[replica_id]['pub']}, {tls[replica_id]['cid']}"
         )
-    main_config = config_directory / "hotstuff.gen.conf"
-    _write_private(main_config, ("\n".join(lines) + "\n").encode())
+    return ("\n".join(lines) + "\n").encode()
 
-    replica_configs: list[Path] = []
-    replica_commands: list[tuple[str, ...]] = []
-    runtime_artifacts: list[dict[str, Any]] = []
-    for replica_id in REPLICA_IDS:
-        event_path = raw_directory / f"replica-{replica_id}.jsonl"
-        replica_config = config_directory / f"replica-{replica_id}.conf"
-        content = (
-            f"privkey = {bls[replica_id]['sec']}\n"
-            f"tls-privkey = {tls[replica_id]['sec']}\n"
-            f"tls-cert = {tls[replica_id]['crt']}\n"
-            f"idx = {replica_id}\n"
-            f"structured-event-run-id = {run_id}\n"
-            f"structured-event-source-instance = {source_instances[f'replica-{replica_id}']}\n"
-            f"structured-event-output = {event_path}\n"
-            f"structured-event-commit-observer-id = {AUTHORITATIVE_SOURCE_ID}\n"
-            f"structured-event-commit-observer-instance = {source_instances[AUTHORITATIVE_SOURCE_ID]}\n"
-        )
-        _write_private(replica_config, content.encode())
-        replica_configs.append(replica_config)
-        replica_commands.append(build_replica_command(app_binary, main_config, replica_config))
 
-        normalized_path = runtime_directory / f"replica-{replica_id}.effective.json"
-        normalized = {
-            "schema_version": 1,
-            "replica_id": replica_id,
-            "protocol_mode": "adaptive-v2",
-            "replica_count": 7,
-            "fault_threshold": 2,
-            "quorum": 5,
-            "membership": list(REPLICA_IDS),
-            "authoritative_observer": AUTHORITATIVE_SOURCE_ID,
-            "block_size": runtime["block_size"],
-            "pipeline_depth": runtime["pipeline_depth"],
-            "aggregation_timeout_ms": runtime["aggregation_timeout_ms"],
-            "leader_progress_timeout_ms": runtime["leader_progress_timeout_ms"],
-            "leader_activation_grace_ms": runtime["leader_activation_grace_ms"],
-            "fanout": runtime["fanout"],
-            "tree_switch_period_blocks": runtime["tree_switch_period_blocks"],
-        }
-        _write_json_exclusive(normalized_path, normalized)
-        runtime_artifacts.append(
-            {
-                "kind": "replica_config",
-                "replica_id": replica_id,
-                "path": str(normalized_path.relative_to(run_directory)),
-                "sha256": sha256_file(normalized_path),
-            }
-        )
-
-    manager_command = build_manager_command(
-        manager_binary,
-        replicas_tls=tls[:7],
-        manager_tls=tls[7],
-        issuer=issuer,
-        manager_port=manager_port,
-        peer_port=peer_port,
-        activation_delay_blocks=runtime["activation_delay_blocks"],
-        run_id=run_id,
-        source_instance=source_instances[MANAGER_SOURCE_ID],
-        structured_event_path=raw_directory / "adaptive-manager.jsonl",
-        bundle_path=run_directory / "successor.bundle",
+def _replica_config_payload(
+    replica_id: int,
+    bls: Sequence[Mapping[str, str]],
+    tls: Sequence[Mapping[str, str]],
+    *,
+    raw_directory: Path,
+    run_id: str,
+    source_instances: Mapping[str, str],
+) -> bytes:
+    source_id = f"replica-{replica_id}"
+    content = (
+        f"privkey = {bls[replica_id]['sec']}\n"
+        f"tls-privkey = {tls[replica_id]['sec']}\n"
+        f"tls-cert = {tls[replica_id]['crt']}\n"
+        f"idx = {replica_id}\n"
+        f"structured-event-run-id = {run_id}\n"
+        f"structured-event-source-instance = {source_instances[source_id]}\n"
+        f"structured-event-output = {raw_directory / f'{source_id}.jsonl'}\n"
+        f"structured-event-commit-observer-id = {AUTHORITATIVE_SOURCE_ID}\n"
+        f"structured-event-commit-observer-instance = {source_instances[AUTHORITATIVE_SOURCE_ID]}\n"
     )
-    epoch_input_path = runtime_directory / "epoch-input.json"
-    epoch_input = {
+    return content.encode()
+
+
+def _replica_effective_runtime(
+    replica_id: int, runtime: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "replica_id": replica_id,
+        "protocol_mode": "adaptive-v2",
+        "replica_count": 7,
+        "fault_threshold": 2,
+        "quorum": 5,
+        "membership": list(REPLICA_IDS),
+        "authoritative_observer": AUTHORITATIVE_SOURCE_ID,
+        "block_size": runtime["block_size"],
+        "pipeline_depth": runtime["pipeline_depth"],
+        "aggregation_timeout_ms": runtime["aggregation_timeout_ms"],
+        "leader_progress_timeout_ms": runtime["leader_progress_timeout_ms"],
+        "leader_activation_grace_ms": runtime["leader_activation_grace_ms"],
+        "fanout": runtime["fanout"],
+        "tree_switch_period_blocks": runtime["tree_switch_period_blocks"],
+    }
+
+
+def _initial_epoch_input() -> dict[str, Any]:
+    return {
         "schema_version": 1,
         "replica_count": 7,
         "membership": list(REPLICA_IDS),
@@ -869,22 +840,42 @@ def write_runtime_inputs(
                 "tree_id": root,
                 "fanout": 2,
                 "pipeline_depth": 2,
-                "members_breadth_first": [(root + offset) % 7 for offset in range(7)],
+                "members_breadth_first": [
+                    (root + offset) % 7 for offset in range(7)
+                ],
                 "wait_exempt": [],
             }
             for root in REPLICA_IDS
         ],
     }
-    _write_json_exclusive(epoch_input_path, epoch_input)
-    runtime_artifacts.append(
-        {
-            "kind": "epoch_input",
-            "replica_id": None,
-            "path": str(epoch_input_path.relative_to(run_directory)),
-            "sha256": sha256_file(epoch_input_path),
-        }
-    )
-    launch_path = runtime_directory / "launch-arguments.json"
+
+
+def _runtime_artifact(
+    run_directory: Path,
+    path: Path,
+    *,
+    kind: str,
+    replica_id: int | None,
+) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "replica_id": replica_id,
+        "path": str(path.relative_to(run_directory)),
+        "sha256": sha256_file(path),
+    }
+
+
+def _launch_arguments(
+    *,
+    runtime: Mapping[str, Any],
+    replica_commands: Sequence[Sequence[str]],
+    manager_command: Sequence[str],
+    main_config: Path,
+    replica_configs: Sequence[Path],
+    bls: Sequence[Mapping[str, str]],
+    tls: Sequence[Mapping[str, str]],
+    issuer: Mapping[str, str],
+) -> dict[str, Any]:
     app_sha256 = runtime["executables"]["hotstuff_app"]["sha256"]
     manager_sha256 = runtime["executables"]["adaptation_manager"]["sha256"]
     issuer_public_key_sha256 = sha256_hex_value(
@@ -894,11 +885,14 @@ def write_runtime_inputs(
         tls[7]["crt"], "manager TLS certificate"
     )
     replica_tls_certificate_sha256 = [
-        sha256_hex_value(tls[replica_id]["crt"], f"replica-{replica_id} TLS certificate")
+        sha256_hex_value(
+            tls[replica_id]["crt"],
+            f"replica-{replica_id} TLS certificate",
+        )
         for replica_id in REPLICA_IDS
     ]
     main_config_sha256 = sha256_file(main_config)
-    launch_arguments = {
+    return {
         "schema_version": 1,
         "processes": [
             *[
@@ -909,8 +903,12 @@ def write_runtime_inputs(
                     "effective_options": {
                         "block_size": runtime["block_size"],
                         "pipeline_depth": runtime["pipeline_depth"],
-                        "aggregation_timeout_ms": runtime["aggregation_timeout_ms"],
-                        "leader_progress_timeout_ms": runtime["leader_progress_timeout_ms"],
+                        "aggregation_timeout_ms": runtime[
+                            "aggregation_timeout_ms"
+                        ],
+                        "leader_progress_timeout_ms": runtime[
+                            "leader_progress_timeout_ms"
+                        ],
                         "leader_activation_grace_ms": runtime[
                             "leader_activation_grace_ms"
                         ],
@@ -927,9 +925,9 @@ def write_runtime_inputs(
                             bls[replica_id]["pub"],
                             f"replica-{replica_id} BLS public key",
                         ),
-                        "tls_certificate_sha256": replica_tls_certificate_sha256[
-                            replica_id
-                        ],
+                        "tls_certificate_sha256": (
+                            replica_tls_certificate_sha256[replica_id]
+                        ),
                         "issuer_public_key_sha256": issuer_public_key_sha256,
                         "manager_tls_certificate_sha256": (
                             manager_tls_certificate_sha256
@@ -943,7 +941,9 @@ def write_runtime_inputs(
                 "source_id": MANAGER_SOURCE_ID,
                 "argv": normalized_manager_argv(manager_command),
                 "effective_options": {
-                    "activation_delay_blocks": runtime["activation_delay_blocks"],
+                    "activation_delay_blocks": runtime[
+                        "activation_delay_blocks"
+                    ],
                     "snapshot_seed": runtime["snapshot_seed"],
                     "manager_limits": runtime["manager_limits"],
                     "binary_sha256": manager_sha256,
@@ -956,14 +956,126 @@ def write_runtime_inputs(
             },
         ],
     }
-    _write_json_exclusive(launch_path, launch_arguments)
+
+
+def write_runtime_inputs(
+    run_directory: Path,
+    profile: Mapping[str, Any],
+    bls: Sequence[Mapping[str, str]],
+    tls: Sequence[Mapping[str, str]],
+    issuer: Mapping[str, str],
+    *,
+    peer_port: int,
+    client_port: int,
+    manager_port: int,
+    run_id: str,
+    source_instances: Mapping[str, str],
+    app_binary: Path,
+    manager_binary: Path,
+) -> tuple[Path, list[Path], tuple[str, ...], list[tuple[str, ...]], list[dict[str, Any]]]:
+    config_directory = run_directory / "config"
+    runtime_directory = run_directory / "runtime"
+    runtime_directory.mkdir(mode=0o700)
+    raw_directory = run_directory / "raw"
+    runtime = runtime_parameters(
+        profile,
+        app_binary=app_binary,
+        manager_binary=manager_binary,
+    )
+    main_config = config_directory / "hotstuff.gen.conf"
+    _write_private(
+        main_config,
+        _main_config_payload(
+            profile,
+            runtime,
+            bls,
+            tls,
+            issuer,
+            peer_port=peer_port,
+            client_port=client_port,
+            manager_port=manager_port,
+        ),
+    )
+
+    replica_configs: list[Path] = []
+    replica_commands: list[tuple[str, ...]] = []
+    runtime_artifacts: list[dict[str, Any]] = []
+    for replica_id in REPLICA_IDS:
+        replica_config = config_directory / f"replica-{replica_id}.conf"
+        _write_private(
+            replica_config,
+            _replica_config_payload(
+                replica_id,
+                bls,
+                tls,
+                raw_directory=raw_directory,
+                run_id=run_id,
+                source_instances=source_instances,
+            ),
+        )
+        replica_configs.append(replica_config)
+        replica_commands.append(
+            build_replica_command(app_binary, main_config, replica_config)
+        )
+
+        normalized_path = runtime_directory / f"replica-{replica_id}.effective.json"
+        _write_json_exclusive(
+            normalized_path,
+            _replica_effective_runtime(replica_id, runtime),
+        )
+        runtime_artifacts.append(
+            _runtime_artifact(
+                run_directory,
+                normalized_path,
+                kind="replica_config",
+                replica_id=replica_id,
+            )
+        )
+
+    manager_command = build_manager_command(
+        manager_binary,
+        replicas_tls=tls[:7],
+        manager_tls=tls[7],
+        issuer=issuer,
+        manager_port=manager_port,
+        peer_port=peer_port,
+        activation_delay_blocks=runtime["activation_delay_blocks"],
+        run_id=run_id,
+        source_instance=source_instances[MANAGER_SOURCE_ID],
+        structured_event_path=raw_directory / "adaptive-manager.jsonl",
+        bundle_path=run_directory / "successor.bundle",
+    )
+    epoch_input_path = runtime_directory / "epoch-input.json"
+    _write_json_exclusive(epoch_input_path, _initial_epoch_input())
     runtime_artifacts.append(
-        {
-            "kind": "launch_arguments",
-            "replica_id": None,
-            "path": str(launch_path.relative_to(run_directory)),
-            "sha256": sha256_file(launch_path),
-        }
+        _runtime_artifact(
+            run_directory,
+            epoch_input_path,
+            kind="epoch_input",
+            replica_id=None,
+        )
+    )
+    launch_path = runtime_directory / "launch-arguments.json"
+    _write_json_exclusive(
+        launch_path,
+        _launch_arguments(
+            runtime=runtime,
+            replica_commands=replica_commands,
+            manager_command=manager_command,
+            main_config=main_config,
+            replica_configs=replica_configs,
+            bls=bls,
+            tls=tls,
+            issuer=issuer,
+        ),
+    )
+    runtime_artifacts.append(
+        _runtime_artifact(
+            run_directory,
+            launch_path,
+            kind="launch_arguments",
+            replica_id=None,
+        )
     )
     return main_config, replica_configs, manager_command, replica_commands, runtime_artifacts
 

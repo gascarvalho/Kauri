@@ -751,6 +751,18 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
     assert "tree-switch-period = 1\n" in config
     assert "epoch-change-minimum-activation-delay = 5\n" in config
     assert "epoch-change-maximum-activation-delay = 5\n" in config
+    assert hashlib.sha256(main_config.read_bytes()).hexdigest() == (
+        "3cc7809056713164037a4f9bc11a9e8cc2e32ea1984601813f5c2776962d3508"
+    )
+    replica_zero_payload = (
+        tmp_path / "config" / "replica-0.conf"
+    ).read_bytes().replace(
+        str(tmp_path / "raw").encode(),
+        b"/synthetic/run/raw",
+    )
+    assert hashlib.sha256(replica_zero_payload).hexdigest() == (
+        "a6e9412cd67b07d70062c20b56f8dc916828e06c57dcbccf6a7d86d9df510be3"
+    )
     assert manager_command[manager_command.index("--activation-delay-blocks") + 1] == "5"
     assert len(replica_commands) == 7
     assert [artifact["path"] for artifact in artifacts] == [
@@ -762,6 +774,16 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
         (tmp_path / "runtime" / "replica-0.effective.json").read_text()
     )
     assert effective["tree_switch_period_blocks"] == 1
+    assert hashlib.sha256(
+        (tmp_path / "runtime" / "replica-0.effective.json").read_bytes()
+    ).hexdigest() == (
+        "8f61ecdc9ff9abd1a6d3c01d1c1925a82924b6bc10409522a08a038b00d4c37f"
+    )
+    assert hashlib.sha256(
+        (tmp_path / "runtime" / "epoch-input.json").read_bytes()
+    ).hexdigest() == (
+        "97d85da2d5395f6c443f89a8271f395f53c6d7e62f54d3f1d2447e3b19331850"
+    )
     launch = json.loads(
         (tmp_path / "runtime" / "launch-arguments.json").read_text()
     )

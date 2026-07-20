@@ -595,20 +595,9 @@ def _phase_intervals(
     )
 
 
-def build_throughput_buckets(
+def _validated_unique_commits(
     events: Sequence[CommitEvent],
-    boundaries: PhaseBoundaries,
-) -> tuple[ThroughputBucket, ...]:
-    """Build max-five-second phase-local buckets with explicit zero rows.
-
-    Buckets are half-open.  A crash- or activation-boundary commit therefore
-    belongs to the new phase.  Each phase starts a fresh five-second grid so a
-    bucket never mixes two phases; a phase's final bucket may be shorter than
-    five seconds and uses its actual elapsed duration. Exact hash replays are
-    defensively deduplicated again before attribution.
-    """
-    _validate_boundaries(boundaries)
-
+) -> list[CommitEvent]:
     previous_timestamp_ns: int | None = None
     commits_by_hash: dict[str, CommitEvent] = {}
     heights: dict[int, str] = {}
@@ -698,7 +687,13 @@ def build_throughput_buckets(
         commits_by_hash[event.block_hash] = event
         heights[event.height] = event.block_hash
         unique_events.append(event)
+    return unique_events
 
+
+def _build_phase_buckets(
+    unique_events: Sequence[CommitEvent],
+    boundaries: PhaseBoundaries,
+) -> tuple[ThroughputBucket, ...]:
     in_window = [
         event
         for event in unique_events
@@ -759,6 +754,23 @@ def build_throughput_buckets(
             bucket_start_ns = bucket_end_ns
 
     return tuple(buckets)
+
+
+def build_throughput_buckets(
+    events: Sequence[CommitEvent],
+    boundaries: PhaseBoundaries,
+) -> tuple[ThroughputBucket, ...]:
+    """Build max-five-second phase-local buckets with explicit zero rows.
+
+    Buckets are half-open.  A crash- or activation-boundary commit therefore
+    belongs to the new phase.  Each phase starts a fresh five-second grid so a
+    bucket never mixes two phases; a phase's final bucket may be shorter than
+    five seconds and uses its actual elapsed duration. Exact hash replays are
+    defensively deduplicated again before attribution.
+    """
+    _validate_boundaries(boundaries)
+    unique_events = _validated_unique_commits(events)
+    return _build_phase_buckets(unique_events, boundaries)
 
 
 def compute_phase_medians(
