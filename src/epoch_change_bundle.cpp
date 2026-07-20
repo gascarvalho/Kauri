@@ -2,8 +2,9 @@
 
 #include <limits>
 #include <stdexcept>
-#include <type_traits>
 #include <utility>
+
+#include "detail/canonical_wire_codec.h"
 
 namespace hotstuff
 {
@@ -17,6 +18,11 @@ struct BundleFailure
 {
     EpochChangeBundleWireError error;
 };
+
+using Writer = detail::CanonicalWireWriter;
+using Reader = detail::CanonicalWireReader<
+    BundleFailure,
+    EpochChangeBundleWireError>;
 
 [[noreturn]] void fail(EpochChangeBundleWireError error)
 {
@@ -46,129 +52,22 @@ void require_limits(const EpochChangeBundleLimits &limits)
             "epoch-change bundle limits must be nonzero");
 }
 
-class Writer final
+void append_component(Writer &writer, const bytearray_t &value)
 {
-public:
-    explicit Writer(std::size_t maximum_size) : maximum_size_(maximum_size) {}
+    if (value.size() > std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error(
+            "epoch-change bundle component exceeds uint32 length");
+    writer.integer(static_cast<std::uint32_t>(value.size()));
+    writer.bytes(value);
+}
 
-    template <typename UInt>
-    void integer(UInt value)
-    {
-        static_assert(
-            std::is_unsigned<UInt>::value,
-            "epoch-change bundle integers must be unsigned");
-        ensure(sizeof(UInt));
-        for (std::size_t shift = sizeof(UInt); shift > 0; --shift)
-        {
-            bytes_.push_back(static_cast<std::uint8_t>(
-                value >> ((shift - 1) * 8)));
-        }
-    }
-
-    void domain(const std::string &value)
-    {
-        append(
-            reinterpret_cast<const std::uint8_t *>(value.data()),
-            value.size());
-    }
-
-    void component(const bytearray_t &value)
-    {
-        if (value.size() > std::numeric_limits<std::uint32_t>::max())
-            throw std::length_error(
-                "epoch-change bundle component exceeds uint32 length");
-        integer(static_cast<std::uint32_t>(value.size()));
-        append(value.data(), value.size());
-    }
-
-    bytearray_t finish() &&
-    {
-        return std::move(bytes_);
-    }
-
-private:
-    void ensure(std::size_t additional)
-    {
-        if (bytes_.size() > maximum_size_ ||
-            additional > maximum_size_ - bytes_.size())
-        {
-            throw std::length_error(
-                "epoch-change bundle payload exceeds limit");
-        }
-    }
-
-    void append(const std::uint8_t *data, std::size_t size)
-    {
-        ensure(size);
-        bytes_.insert(bytes_.end(), data, data + size);
-    }
-
-    std::size_t maximum_size_;
-    bytearray_t bytes_;
-};
-
-class Reader final
+bytearray_t read_component(Reader &reader, std::size_t maximum_size)
 {
-public:
-    explicit Reader(const bytearray_t &bytes) : bytes_(bytes) {}
-
-    void domain(const std::string &expected)
-    {
-        require(expected.size());
-        if (!std::equal(
-                expected.begin(),
-                expected.end(),
-                bytes_.begin() + offset_))
-        {
-            fail(EpochChangeBundleWireError::invalid_domain);
-        }
-        offset_ += expected.size();
-    }
-
-    template <typename UInt>
-    UInt integer()
-    {
-        static_assert(
-            std::is_unsigned<UInt>::value,
-            "epoch-change bundle integers must be unsigned");
-        require(sizeof(UInt));
-        UInt value = 0;
-        for (std::size_t index = 0; index < sizeof(UInt); ++index)
-        {
-            value = static_cast<UInt>(
-                (value << 8) | bytes_[offset_ + index]);
-        }
-        offset_ += sizeof(UInt);
-        return value;
-    }
-
-    bytearray_t component(std::size_t maximum_size)
-    {
-        const auto size = integer<std::uint32_t>();
-        if (size > maximum_size)
-            fail(EpochChangeBundleWireError::component_too_large);
-        require(size);
-        bytearray_t value(
-            bytes_.begin() + offset_, bytes_.begin() + offset_ + size);
-        offset_ += size;
-        return value;
-    }
-
-    bool empty() const noexcept
-    {
-        return offset_ == bytes_.size();
-    }
-
-private:
-    void require(std::size_t size) const
-    {
-        if (offset_ > bytes_.size() || size > bytes_.size() - offset_)
-            fail(EpochChangeBundleWireError::truncated);
-    }
-
-    const bytearray_t &bytes_;
-    std::size_t offset_{0};
-};
+    const auto size = reader.integer<std::uint32_t>();
+    if (size > maximum_size)
+        fail(EpochChangeBundleWireError::component_too_large);
+    return reader.bytes(size);
+}
 
 struct NormalizedComponents
 {
@@ -251,13 +150,15 @@ bytearray_t encode_bundle(
     const bytearray_t &definition,
     const EpochChangeBundleLimits &limits)
 {
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "epoch-change bundle payload exceeds limit");
     writer.domain(kBundleDomain);
     writer.integer(kEpochChangeBundleSchemaVersionV1);
     writer.integer(
         static_cast<std::uint8_t>(EpochProtocolMode::adaptive_v2));
-    writer.component(command);
-    writer.component(definition);
+    append_component(writer, command);
+    append_component(writer, definition);
     return std::move(writer).finish();
 }
 
@@ -300,8 +201,10 @@ EpochChangeBundleDecodeResult decode_adaptive_v2_epoch_change_bundle(
 
     try
     {
-        Reader reader(payload);
-        reader.domain(kBundleDomain);
+        Reader reader(payload, EpochChangeBundleWireError::truncated);
+        reader.domain(
+            kBundleDomain,
+            EpochChangeBundleWireError::invalid_domain);
         const auto schema = reader.integer<std::uint32_t>();
         if (schema != kEpochChangeBundleSchemaVersionV1)
             return rejected(EpochChangeBundleWireError::unsupported_schema);
@@ -310,8 +213,10 @@ EpochChangeBundleDecodeResult decode_adaptive_v2_epoch_change_bundle(
         if (mode != EpochProtocolMode::adaptive_v2)
             return rejected(EpochChangeBundleWireError::mode_mismatch);
 
-        auto command_bytes = reader.component(limits.maximum_command_bytes);
-        auto definition_bytes = reader.component(
+        auto command_bytes = read_component(
+            reader, limits.maximum_command_bytes);
+        auto definition_bytes = read_component(
+            reader,
             limits.definition_limits.maximum_payload_bytes);
         if (!reader.empty())
             return rejected(EpochChangeBundleWireError::trailing_bytes);

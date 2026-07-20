@@ -5,8 +5,10 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
+#include <string_view>
 #include <utility>
+
+#include "detail/canonical_wire_codec.h"
 
 namespace hotstuff
 {
@@ -17,6 +19,9 @@ struct WireFailure
 {
     EpochWireError error;
 };
+
+using Writer = detail::CanonicalWireWriter;
+using Reader = detail::CanonicalWireReader<WireFailure, EpochWireError>;
 
 [[noreturn]] void fail(EpochWireError error)
 {
@@ -40,140 +45,34 @@ void require_encode_limits(const EpochWireLimits &limits)
     }
 }
 
-class Writer final
+void append_digest(Writer &writer, const uint256_t &value)
 {
-public:
-    explicit Writer(std::size_t maximum_size) : maximum_size_(maximum_size) {}
+    writer.digest(value, "epoch wire digest is not 32 bytes");
+}
 
-    template <typename UInt>
-    void integer(UInt value)
-    {
-        static_assert(std::is_unsigned<UInt>::value,
-                      "epoch wire integers must be unsigned");
-        ensure(sizeof(UInt));
-        for (std::size_t shift = sizeof(UInt); shift > 0; --shift)
-        {
-            bytes_.push_back(static_cast<std::uint8_t>(
-                value >> ((shift - 1) * 8)));
-        }
-    }
-
-    void digest(const uint256_t &value)
-    {
-        const bytearray_t bytes = static_cast<bytearray_t>(value);
-        if (bytes.size() != 32)
-        {
-            throw std::logic_error("epoch wire digest is not 32 bytes");
-        }
-        append(bytes.data(), bytes.size());
-    }
-
-    void string(
-        const std::string &value,
-        std::uint32_t maximum_string_bytes)
-    {
-        if (value.size() > maximum_string_bytes ||
-            value.size() > std::numeric_limits<std::uint32_t>::max())
-        {
-            throw std::length_error("epoch wire string exceeds limit");
-        }
-        integer(static_cast<std::uint32_t>(value.size()));
-        append(
-            reinterpret_cast<const std::uint8_t *>(value.data()),
-            value.size());
-    }
-
-    bytearray_t finish() &&
-    {
-        return std::move(bytes_);
-    }
-
-private:
-    void ensure(std::size_t additional)
-    {
-        if (additional > maximum_size_ - bytes_.size())
-        {
-            throw std::length_error("epoch wire payload exceeds limit");
-        }
-    }
-
-    void append(const std::uint8_t *data, std::size_t size)
-    {
-        ensure(size);
-        bytes_.insert(bytes_.end(), data, data + size);
-    }
-
-    const std::size_t maximum_size_;
-    bytearray_t bytes_;
-};
-
-class Reader final
+void append_string(
+    Writer &writer,
+    const std::string &value,
+    std::uint32_t maximum_string_bytes)
 {
-public:
-    explicit Reader(const bytearray_t &bytes) : bytes_(bytes) {}
-
-    template <typename UInt>
-    UInt integer()
+    if (value.size() > maximum_string_bytes ||
+        value.size() > std::numeric_limits<std::uint32_t>::max())
     {
-        static_assert(std::is_unsigned<UInt>::value,
-                      "epoch wire integers must be unsigned");
-        require(sizeof(UInt));
-        UInt value = 0;
-        for (std::size_t index = 0; index < sizeof(UInt); ++index)
-        {
-            value = static_cast<UInt>(
-                (value << 8) | bytes_[offset_ + index]);
-        }
-        offset_ += sizeof(UInt);
-        return value;
+        throw std::length_error("epoch wire string exceeds limit");
     }
+    writer.integer(static_cast<std::uint32_t>(value.size()));
+    writer.bytes(std::string_view(value));
+}
 
-    uint256_t digest()
-    {
-        constexpr std::size_t digest_size = 32;
-        require(digest_size);
-        const uint256_t value(bytes_.data() + offset_);
-        offset_ += digest_size;
-        return value;
-    }
-
-    std::string string(std::uint32_t maximum_string_bytes)
-    {
-        const auto size = integer<std::uint32_t>();
-        if (size > maximum_string_bytes)
-        {
-            fail(EpochWireError::string_length_exceeded);
-        }
-        require(size);
-        const auto *const begin = reinterpret_cast<const char *>(
-            bytes_.data() + offset_);
-        std::string value(begin, begin + size);
-        offset_ += size;
-        return value;
-    }
-
-    std::size_t remaining() const noexcept
-    {
-        return bytes_.size() - offset_;
-    }
-
-    bool empty() const noexcept
-    {
-        return offset_ == bytes_.size();
-    }
-
-    void require(std::size_t size) const
-    {
-        if (size > remaining())
-        {
-            fail(EpochWireError::truncated);
-        }
-    }
-
-private:
-    const bytearray_t &bytes_;
-    std::size_t offset_{0};
-};
+std::string read_string(
+    Reader &reader,
+    std::uint32_t maximum_string_bytes)
+{
+    const auto size = reader.integer<std::uint32_t>();
+    if (size > maximum_string_bytes)
+        fail(EpochWireError::string_length_exceeded);
+    return reader.string(size);
+}
 
 void append_header(
     Writer &writer,
@@ -296,9 +195,9 @@ void append_identity(
     const EpochActivationIdentity &identity)
 {
     writer.integer(identity.predecessor_epoch_number);
-    writer.digest(identity.predecessor_epoch_digest);
+    append_digest(writer, identity.predecessor_epoch_digest);
     writer.integer(identity.successor_epoch_number);
-    writer.digest(identity.successor_epoch_digest);
+    append_digest(writer, identity.successor_epoch_digest);
     writer.integer(identity.activation_height);
 }
 
@@ -455,13 +354,17 @@ void append_definition(
 {
     writer.integer(definition.schema_version);
     writer.integer(definition.epoch_number);
-    writer.digest(definition.previous_epoch_digest);
-    writer.digest(definition.membership_digest);
+    append_digest(writer, definition.previous_epoch_digest);
+    append_digest(writer, definition.membership_digest);
     if (mode != EpochProtocolMode::adaptive_v2)
         writer.integer(definition.activation_height);
     writer.integer(definition.generation_seed);
-    writer.string(definition.policy_version, limits.maximum_string_bytes);
-    writer.string(
+    append_string(
+        writer,
+        definition.policy_version,
+        limits.maximum_string_bytes);
+    append_string(
+        writer,
         definition.evidence_snapshot_id,
         limits.maximum_string_bytes);
     writer.integer(definition.evidence_cutoff);
@@ -509,9 +412,10 @@ EpochDefinitionInput read_definition(
             ? reader.integer<std::uint64_t>()
             : activation_height;
     definition.generation_seed = reader.integer<std::uint64_t>();
-    definition.policy_version = reader.string(limits.maximum_string_bytes);
+    definition.policy_version = read_string(
+        reader, limits.maximum_string_bytes);
     definition.evidence_snapshot_id =
-        reader.string(limits.maximum_string_bytes);
+        read_string(reader, limits.maximum_string_bytes);
     definition.evidence_cutoff = reader.integer<std::uint64_t>();
 
     const auto tree_count = reader.integer<std::uint32_t>();
@@ -611,7 +515,7 @@ EpochWireDecodeResult<Value> decode(
 
     try
     {
-        Reader reader(payload);
+        Reader reader(payload, EpochWireError::truncated);
         auto value = decode_value(reader);
         if (!reader.empty())
         {
@@ -661,7 +565,9 @@ bytearray_t encode_epoch_wire(
         value.protocol_mode,
         EpochWireKind::stage_epoch_definition);
     auto definition = normalized_definition(value, limits);
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "epoch wire payload exceeds limit");
     append_header(
         writer,
         value.wire_schema_version,
@@ -681,7 +587,9 @@ bytearray_t encode_epoch_wire(
         value.wire_schema_version,
         value.protocol_mode,
         EpochWireKind::stage_ack);
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "epoch wire payload exceeds limit");
     append_header(
         writer,
         value.wire_schema_version,
@@ -701,7 +609,9 @@ bytearray_t encode_epoch_wire(
         value.wire_schema_version,
         value.protocol_mode,
         EpochWireKind::arm_activation);
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "epoch wire payload exceeds limit");
     append_header(
         writer,
         value.wire_schema_version,
@@ -724,7 +634,9 @@ bytearray_t encode_epoch_wire(
     {
         throw std::invalid_argument("invalid activation recovery need");
     }
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "epoch wire payload exceeds limit");
     append_header(
         writer,
         value.wire_schema_version,
@@ -745,13 +657,15 @@ bytearray_t encode_epoch_wire(
         value.wire_schema_version,
         value.protocol_mode,
         EpochWireKind::definition_request);
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "epoch wire payload exceeds limit");
     append_header(
         writer,
         value.wire_schema_version,
         value.protocol_mode,
         EpochWireKind::definition_request);
-    writer.digest(value.successor_epoch_digest);
+    append_digest(writer, value.successor_epoch_digest);
     return std::move(writer).finish();
 }
 
@@ -765,13 +679,15 @@ bytearray_t encode_epoch_wire(
         value.protocol_mode,
         EpochWireKind::definition_reply);
     auto definition = normalized_definition_reply(value, limits);
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "epoch wire payload exceeds limit");
     append_header(
         writer,
         value.wire_schema_version,
         value.protocol_mode,
         EpochWireKind::definition_reply);
-    writer.digest(value.successor_epoch_digest);
+    append_digest(writer, value.successor_epoch_digest);
     append_definition(
         writer, definition, value.protocol_mode, limits);
     return std::move(writer).finish();

@@ -3,10 +3,11 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
-#include <type_traits>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
+#include "detail/canonical_wire_codec.h"
 #include "hotstuff/entity.h"
 
 namespace hotstuff
@@ -43,50 +44,7 @@ bool has_canonical_low_s_signature(const bytearray_t &wire) noexcept
                std::begin(kSecp256k1HalfOrder));
 }
 
-class Writer final
-{
-public:
-    template <typename UInt>
-    void integer(UInt value)
-    {
-        static_assert(std::is_unsigned<UInt>::value,
-                      "epoch-change integers must be unsigned");
-        for (std::size_t shift = sizeof(UInt); shift > 0; --shift)
-        {
-            bytes_.push_back(static_cast<std::uint8_t>(
-                value >> ((shift - 1) * 8)));
-        }
-    }
-
-    void digest(const uint256_t &value)
-    {
-        const bytearray_t bytes = static_cast<bytearray_t>(value);
-        if (bytes.size() != 32)
-        {
-            throw std::logic_error(
-                "epoch-change digest is not exactly 32 bytes");
-        }
-        append(bytes);
-    }
-
-    void domain(const char *value, std::size_t size)
-    {
-        bytes_.insert(bytes_.end(), value, value + size);
-    }
-
-    void append(const bytearray_t &value)
-    {
-        bytes_.insert(bytes_.end(), value.begin(), value.end());
-    }
-
-    bytearray_t finish() &&
-    {
-        return std::move(bytes_);
-    }
-
-private:
-    bytearray_t bytes_;
-};
+using Writer = detail::CanonicalWireWriter;
 
 enum class ReadFailure : std::uint8_t
 {
@@ -101,79 +59,20 @@ struct ReadException
     ReadFailure failure;
 };
 
-class Reader final
+using Reader = detail::CanonicalWireReader<ReadException, ReadFailure>;
+
+void append_digest(Writer &writer, const uint256_t &value)
 {
-public:
-    explicit Reader(const bytearray_t &bytes) : bytes_(bytes) {}
-
-    void domain(const char *expected, std::size_t size)
-    {
-        require(size);
-        if (!std::equal(
-                expected, expected + size, bytes_.begin() + offset_))
-        {
-            throw ReadException{ReadFailure::invalid_domain};
-        }
-        offset_ += size;
-    }
-
-    template <typename UInt>
-    UInt integer()
-    {
-        static_assert(std::is_unsigned<UInt>::value,
-                      "epoch-change integers must be unsigned");
-        require(sizeof(UInt));
-        UInt value = 0;
-        for (std::size_t index = 0; index < sizeof(UInt); ++index)
-        {
-            value = static_cast<UInt>(
-                (value << 8) | bytes_[offset_ + index]);
-        }
-        offset_ += sizeof(UInt);
-        return value;
-    }
-
-    uint256_t digest()
-    {
-        constexpr std::size_t digest_bytes = 32;
-        require(digest_bytes);
-        const uint256_t value(bytes_.data() + offset_);
-        offset_ += digest_bytes;
-        return value;
-    }
-
-    bytearray_t bytes(std::size_t size)
-    {
-        require(size);
-        bytearray_t result(
-            bytes_.begin() + offset_, bytes_.begin() + offset_ + size);
-        offset_ += size;
-        return result;
-    }
-
-    bool empty() const noexcept
-    {
-        return offset_ == bytes_.size();
-    }
-
-private:
-    void require(std::size_t size) const
-    {
-        if (size > bytes_.size() - offset_)
-        {
-            throw ReadException{ReadFailure::truncated};
-        }
-    }
-
-    const bytearray_t &bytes_;
-    std::size_t offset_{0};
-};
+    writer.digest(
+        value,
+        "epoch-change digest is not exactly 32 bytes");
+}
 
 void append_payload_fields(Writer &writer, const EpochChangePayload &payload)
 {
     writer.integer(payload.successor_epoch_number);
-    writer.digest(payload.predecessor_epoch_digest);
-    writer.digest(payload.successor_epoch_digest);
+    append_digest(writer, payload.predecessor_epoch_digest);
+    append_digest(writer, payload.successor_epoch_digest);
     writer.integer(payload.activation_delay_blocks);
 }
 
@@ -195,9 +94,9 @@ bytearray_t canonical_unsigned_command(
     }
 
     Writer writer;
-    writer.domain(
+    writer.domain(std::string_view(
         kAuthorizedEpochChangeDomain,
-        sizeof(kAuthorizedEpochChangeDomain) - 1);
+        sizeof(kAuthorizedEpochChangeDomain) - 1));
     writer.integer(schema_version);
     writer.integer(static_cast<std::uint8_t>(protocol_mode));
     writer.integer(issuer_id);
@@ -326,9 +225,9 @@ bytearray_t canonical_serialize_epoch_change_payload(
     const EpochChangePayload &payload)
 {
     Writer writer;
-    writer.domain(
+    writer.domain(std::string_view(
         kEpochChangePayloadDomain,
-        sizeof(kEpochChangePayloadDomain) - 1);
+        sizeof(kEpochChangePayloadDomain) - 1));
     append_payload_fields(writer, payload);
     return std::move(writer).finish();
 }
@@ -433,10 +332,12 @@ EpochChangeDecodeResult decode_authorized_epoch_change(
 
     try
     {
-        Reader reader(payload);
+        Reader reader(payload, ReadFailure::truncated);
         reader.domain(
-            kAuthorizedEpochChangeDomain,
-            sizeof(kAuthorizedEpochChangeDomain) - 1);
+            std::string_view(
+                kAuthorizedEpochChangeDomain,
+                sizeof(kAuthorizedEpochChangeDomain) - 1),
+            ReadFailure::invalid_domain);
         const auto schema_version = reader.integer<std::uint32_t>();
         if (schema_version != kEpochChangeSchemaVersionV1)
         {

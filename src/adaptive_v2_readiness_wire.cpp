@@ -1,10 +1,10 @@
 #include "hotstuff/adaptive_v2_readiness_wire.h"
 
-#include <algorithm>
 #include <new>
 #include <stdexcept>
-#include <type_traits>
 #include <utility>
+
+#include "detail/canonical_wire_codec.h"
 
 namespace hotstuff
 {
@@ -13,7 +13,6 @@ namespace
 
 const std::string kReadinessNoticeDomain =
     "kauri-adaptive-v2-runtime-readiness-notice-v1";
-constexpr std::size_t kDigestSize = 32;
 constexpr std::uint8_t kCanonicalFlags = 0;
 
 struct WireFailure
@@ -21,10 +20,10 @@ struct WireFailure
     AdaptiveV2ReadinessWireError error;
 };
 
-[[noreturn]] void fail(AdaptiveV2ReadinessWireError error)
-{
-    throw WireFailure{error};
-}
+using Writer = detail::CanonicalWireWriter;
+using Reader = detail::CanonicalWireReader<
+    WireFailure,
+    AdaptiveV2ReadinessWireError>;
 
 bool valid_limits(
     const AdaptiveV2ReadinessWireLimits &limits) noexcept
@@ -77,140 +76,15 @@ AdaptiveV2ReadinessWireError validate_notice(
     }
 }
 
-class Writer final
-{
-public:
-    explicit Writer(std::size_t maximum_size)
-        : maximum_size_(maximum_size)
-    {}
-
-    template<typename UInt>
-    void integer(UInt value)
-    {
-        static_assert(
-            std::is_unsigned<UInt>::value,
-            "adaptive-v2 readiness integers must be unsigned");
-        ensure(sizeof(UInt));
-        for (std::size_t shift = sizeof(UInt); shift > 0; --shift)
-        {
-            bytes_.push_back(static_cast<std::uint8_t>(
-                value >> ((shift - 1) * 8)));
-        }
-    }
-
-    void domain(const std::string &value)
-    {
-        append(
-            reinterpret_cast<const std::uint8_t *>(value.data()),
-            value.size());
-    }
-
-    void digest(const uint256_t &value)
-    {
-        const bytearray_t bytes = static_cast<bytearray_t>(value);
-        if (bytes.size() != kDigestSize)
-        {
-            throw std::logic_error(
-                "adaptive-v2 readiness digest is not 32 bytes");
-        }
-        append(bytes.data(), bytes.size());
-    }
-
-    bytearray_t finish() &&
-    {
-        return std::move(bytes_);
-    }
-
-private:
-    void ensure(std::size_t additional)
-    {
-        if (bytes_.size() > maximum_size_ ||
-            additional > maximum_size_ - bytes_.size())
-        {
-            throw std::length_error(
-                "adaptive-v2 readiness payload exceeds byte limit");
-        }
-    }
-
-    void append(const std::uint8_t *data, std::size_t size)
-    {
-        ensure(size);
-        bytes_.insert(bytes_.end(), data, data + size);
-    }
-
-    std::size_t maximum_size_;
-    bytearray_t bytes_;
-};
-
-class Reader final
-{
-public:
-    explicit Reader(const bytearray_t &bytes) : bytes_(bytes) {}
-
-    void domain(const std::string &expected)
-    {
-        require(expected.size());
-        if (!std::equal(
-                expected.begin(),
-                expected.end(),
-                bytes_.begin() + offset_))
-        {
-            fail(AdaptiveV2ReadinessWireError::invalid_domain);
-        }
-        offset_ += expected.size();
-    }
-
-    template<typename UInt>
-    UInt integer()
-    {
-        static_assert(
-            std::is_unsigned<UInt>::value,
-            "adaptive-v2 readiness integers must be unsigned");
-        require(sizeof(UInt));
-        UInt value = 0;
-        for (std::size_t index = 0; index < sizeof(UInt); ++index)
-        {
-            value = static_cast<UInt>(
-                (value << 8) | bytes_[offset_ + index]);
-        }
-        offset_ += sizeof(UInt);
-        return value;
-    }
-
-    uint256_t digest()
-    {
-        require(kDigestSize);
-        const uint256_t result(bytes_.data() + offset_);
-        offset_ += kDigestSize;
-        return result;
-    }
-
-    bool empty() const noexcept
-    {
-        return offset_ == bytes_.size();
-    }
-
-private:
-    void require(std::size_t size) const
-    {
-        if (offset_ > bytes_.size() ||
-            size > bytes_.size() - offset_)
-        {
-            fail(AdaptiveV2ReadinessWireError::truncated);
-        }
-    }
-
-    const bytearray_t &bytes_;
-    std::size_t offset_{0};
-};
-
 void encode_configuration(
     Writer &writer,
     const ConfigurationId &configuration)
 {
     writer.integer(configuration.epoch_number);
     writer.integer(configuration.tree_id);
-    writer.digest(configuration.epoch_digest);
+    writer.digest(
+        configuration.epoch_digest,
+        "adaptive-v2 readiness digest is not 32 bytes");
 }
 
 ConfigurationId decode_configuration(Reader &reader)
@@ -240,8 +114,11 @@ AdaptiveV2ReadinessDecodeResult decode_impl(
             AdaptiveV2ReadinessWireError::payload_too_large);
     }
 
-    Reader reader(payload);
-    reader.domain(kReadinessNoticeDomain);
+    Reader reader(
+        payload, AdaptiveV2ReadinessWireError::truncated);
+    reader.domain(
+        kReadinessNoticeDomain,
+        AdaptiveV2ReadinessWireError::invalid_domain);
 
     AdaptiveV2ReadinessNotice notice;
     notice.schema_version = reader.integer<std::uint32_t>();
@@ -317,7 +194,9 @@ bytearray_t encode_adaptive_v2_readiness_notice(
     if (validation != AdaptiveV2ReadinessWireError::none)
         throw_encoding_error(validation);
 
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "adaptive-v2 readiness payload exceeds byte limit");
     writer.domain(kReadinessNoticeDomain);
     writer.integer(notice.schema_version);
     writer.integer(kCanonicalFlags);

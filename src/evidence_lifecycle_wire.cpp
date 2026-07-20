@@ -1,11 +1,12 @@
 #include "hotstuff/evidence_lifecycle_wire.h"
 
-#include <algorithm>
 #include <limits>
 #include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+
+#include "detail/canonical_wire_codec.h"
 
 namespace hotstuff
 {
@@ -14,7 +15,6 @@ namespace
 
 const std::string kLifecycleNoticeDomain =
     "kauri-proposal-lifecycle-notice-v2";
-constexpr std::size_t kDigestSize = 32;
 constexpr std::uint8_t kCanonicalFlags = 0;
 
 struct WireFailure
@@ -22,10 +22,10 @@ struct WireFailure
     ProposalLifecycleWireError error;
 };
 
-[[noreturn]] void fail(ProposalLifecycleWireError error)
-{
-    throw WireFailure{error};
-}
+using Writer = detail::CanonicalWireWriter;
+using Reader = detail::CanonicalWireReader<
+    WireFailure,
+    ProposalLifecycleWireError>;
 
 bool valid_limits(const ProposalLifecycleWireLimits &limits) noexcept
 {
@@ -168,139 +168,21 @@ ProposalLifecycleWireError validate_notice(
     }
 }
 
-class Writer final
-{
-public:
-    explicit Writer(std::size_t maximum_size)
-        : maximum_size_(maximum_size)
-    {}
-
-    template<typename UInt>
-    void integer(UInt value)
-    {
-        static_assert(
-            std::is_unsigned<UInt>::value,
-            "proposal lifecycle integers must be unsigned");
-        ensure(sizeof(UInt));
-        for (std::size_t shift = sizeof(UInt); shift > 0; --shift)
-        {
-            bytes_.push_back(static_cast<std::uint8_t>(
-                value >> ((shift - 1) * 8)));
-        }
-    }
-
-    void domain(const std::string &value)
-    {
-        append(
-            reinterpret_cast<const std::uint8_t *>(value.data()),
-            value.size());
-    }
-
-    void digest(const uint256_t &value)
-    {
-        const bytearray_t bytes = static_cast<bytearray_t>(value);
-        if (bytes.size() != kDigestSize)
-            throw std::logic_error(
-                "proposal lifecycle digest is not 32 bytes");
-        append(bytes.data(), bytes.size());
-    }
-
-    bytearray_t finish() &&
-    {
-        return std::move(bytes_);
-    }
-
-private:
-    void ensure(std::size_t additional)
-    {
-        if (bytes_.size() > maximum_size_ ||
-            additional > maximum_size_ - bytes_.size())
-        {
-            throw std::length_error(
-                "proposal lifecycle payload exceeds byte limit");
-        }
-    }
-
-    void append(const std::uint8_t *data, std::size_t size)
-    {
-        ensure(size);
-        bytes_.insert(bytes_.end(), data, data + size);
-    }
-
-    std::size_t maximum_size_;
-    bytearray_t bytes_;
-};
-
-class Reader final
-{
-public:
-    explicit Reader(const bytearray_t &bytes) : bytes_(bytes) {}
-
-    void domain(const std::string &expected)
-    {
-        require(expected.size());
-        if (!std::equal(
-                expected.begin(),
-                expected.end(),
-                bytes_.begin() + offset_))
-        {
-            fail(ProposalLifecycleWireError::invalid_domain);
-        }
-        offset_ += expected.size();
-    }
-
-    template<typename UInt>
-    UInt integer()
-    {
-        static_assert(
-            std::is_unsigned<UInt>::value,
-            "proposal lifecycle integers must be unsigned");
-        require(sizeof(UInt));
-        UInt value = 0;
-        for (std::size_t index = 0; index < sizeof(UInt); ++index)
-        {
-            value = static_cast<UInt>(
-                (value << 8) | bytes_[offset_ + index]);
-        }
-        offset_ += sizeof(UInt);
-        return value;
-    }
-
-    uint256_t digest()
-    {
-        require(kDigestSize);
-        const uint256_t result(bytes_.data() + offset_);
-        offset_ += kDigestSize;
-        return result;
-    }
-
-    bool empty() const noexcept
-    {
-        return offset_ == bytes_.size();
-    }
-
-private:
-    void require(std::size_t size) const
-    {
-        if (offset_ > bytes_.size() || size > bytes_.size() - offset_)
-            fail(ProposalLifecycleWireError::truncated);
-    }
-
-    const bytearray_t &bytes_;
-    std::size_t offset_{0};
-};
-
 void encode_configuration(Writer &writer, const ConfigurationId &value)
 {
     writer.integer(value.epoch_number);
     writer.integer(value.tree_id);
-    writer.digest(value.epoch_digest);
+    writer.digest(
+        value.epoch_digest,
+        "proposal lifecycle digest is not 32 bytes");
 }
 
 void encode_proposal(Writer &writer, const ProposalKey &value)
 {
     encode_configuration(writer, value.configuration);
-    writer.digest(value.block_hash);
+    writer.digest(
+        value.block_hash,
+        "proposal lifecycle digest is not 32 bytes");
 }
 
 ConfigurationId decode_configuration(Reader &reader)
@@ -335,8 +217,10 @@ ProposalLifecycleDecodeResult decode_impl(
     if (payload.size() > limits.maximum_payload_bytes)
         return rejected(ProposalLifecycleWireError::payload_too_large);
 
-    Reader reader(payload);
-    reader.domain(kLifecycleNoticeDomain);
+    Reader reader(payload, ProposalLifecycleWireError::truncated);
+    reader.domain(
+        kLifecycleNoticeDomain,
+        ProposalLifecycleWireError::invalid_domain);
 
     ProposalLifecycleNotice notice;
     notice.schema_version = reader.integer<std::uint32_t>();
@@ -413,7 +297,9 @@ bytearray_t encode_proposal_lifecycle_notice(
     if (validation != ProposalLifecycleWireError::none)
         throw_encoding_error(validation);
 
-    Writer writer(limits.maximum_payload_bytes);
+    Writer writer(
+        limits.maximum_payload_bytes,
+        "proposal lifecycle payload exceeds byte limit");
     writer.domain(kLifecycleNoticeDomain);
     writer.integer(notice.schema_version);
     writer.integer(notice.source_replica_id);
