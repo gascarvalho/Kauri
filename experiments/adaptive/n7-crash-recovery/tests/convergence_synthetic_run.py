@@ -410,7 +410,7 @@ def manager_events() -> list[dict[str, Any]]:
                 source_instance=instance,
                 timestamp_ns=4_600_000_000,
                 event_type="process.stopped",
-                payload={"exit_status": 0},
+                payload={"exit_status": None},
             ),
         )
     )
@@ -517,7 +517,7 @@ def replica_events(replica: int) -> list[dict[str, Any]]:
                 source_instance=instance,
                 timestamp_ns=4_600_000_000 + replica,
                 event_type="process.stopped",
-                payload={"exit_status": 0},
+                payload={"exit_status": None},
             ),
         )
     )

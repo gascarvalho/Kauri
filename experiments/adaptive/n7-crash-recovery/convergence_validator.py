@@ -899,6 +899,11 @@ def _validate_process_streams(
             if len(values) != 1:
                 raise IncompleteRun(f"{source_id} lacks exactly one {event_type}")
             _exact_fields(values[0].payload, _PROCESS_FIELDS, f"{event_type}.payload")
+            if values[0].payload["exit_status"] is not None:
+                raise ValidationError(f"{event_type} exit_status must be null")
+        if _events(stream, "process.exited"):
+            raise ValidationError(f"{source_id} emitted an unexpected process.exited")
+        stopping = _events(stream, "process.stopping")
         stopped = _events(stream, "process.stopped")
         replica = (
             int(source_id.removeprefix("replica-"))
@@ -906,14 +911,28 @@ def _validate_process_streams(
             else None
         )
         if replica in crash_requests:
-            if stopped:
-                raise ValidationError(f"{source_id} emitted process.stopped after SIGKILL")
+            if stopping or stopped:
+                raise ValidationError(
+                    f"{source_id} emitted orderly shutdown after SIGKILL"
+                )
             continue
-        if len(stopped) != 1:
-            raise IncompleteRun(f"{source_id} lacks exactly one process.stopped")
-        _exact_fields(stopped[0].payload, _PROCESS_FIELDS, "process.stopped.payload")
-        if stopped[0].payload["exit_status"] != 0:
-            raise ValidationError(f"{source_id} did not stop with exit status zero")
+        if len(stopping) != 1 or len(stopped) != 1:
+            raise IncompleteRun(
+                f"{source_id} lacks exactly one process.stopping/process.stopped pair"
+            )
+        for event in (stopping[0], stopped[0]):
+            _exact_fields(event.payload, _PROCESS_FIELDS, f"{event.event_type}.payload")
+            if event.payload["exit_status"] is not None:
+                raise ValidationError(
+                    f"{event.event_type} exit_status must be null"
+                )
+        started = _single_event(_events(stream, "process.started"), "process.started")
+        ready = _single_event(_events(stream, "process.ready"), "process.ready")
+        if not (
+            started.source_sequence < ready.source_sequence
+            < stopping[0].source_sequence < stopped[0].source_sequence
+        ):
+            raise ValidationError(f"{source_id} process lifecycle ordering is invalid")
 
 
 def _validate_replica_activations(

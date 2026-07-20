@@ -207,7 +207,7 @@ def test_synthetic_sigkill_streams_have_exact_runner_ground_truth(
             if event["event_type"] == "process.stopped"
         ]
         assert len(stopped) == 1
-        assert stopped[0]["payload"]["exit_status"] == 0
+        assert stopped[0]["payload"]["exit_status"] is None
 
 
 def test_synthetic_events_bind_exactly_to_manifest_run_and_revision(
@@ -422,6 +422,29 @@ def test_survivors_and_manager_still_require_clean_stop(
 
     assert verdict["verdict"] == "INCOMPLETE"
     assert "process.stopped" in verdict["reason"]
+
+
+@pytest.mark.parametrize("source_id", ("replica-2", "adaptive-manager"))
+def test_self_reported_shutdown_status_must_remain_null(
+    tmp_path: Path, source_id: str
+) -> None:
+    manifest, epochs = convergence_run.create_run(tmp_path / source_id)
+
+    def add_impossible_exit_status(values: list[dict[str, Any]]) -> None:
+        stopped = next(
+            event for event in values if event["event_type"] == "process.stopped"
+        )
+        stopped["payload"]["exit_status"] = 0
+
+    convergence_run.rewrite_events(
+        manifest, source_id, add_impossible_exit_status
+    )
+    verdict = _validator().validate_run(
+        manifest, epochs, tmp_path / f"validated-{source_id}"
+    )
+
+    assert verdict["verdict"] == "FAIL"
+    assert "exit_status" in verdict["reason"]
 
 
 def test_unexpected_survivor_exit_keeps_run_incomplete(tmp_path: Path) -> None:
