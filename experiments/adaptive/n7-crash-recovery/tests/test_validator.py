@@ -54,7 +54,7 @@ def test_complete_synthetic_run_passes_and_writes_only_canonical_inputs(
 
     assert verdict["verdict"] == "PASS"
     assert verdict["kauri_revision"] == synthetic_run.REVISION
-    assert verdict["profile_identity"] == "n7-f2-q5-crash-recovery-v1"
+    assert verdict["profile_identity"] == "n7-f2-q5-crash-recovery-v2"
     assert verdict["run_complete"] is True
     assert verdict["metrics"]["post_median_tps"] > verdict["metrics"][
         "degraded_median_tps"
@@ -76,6 +76,19 @@ def test_complete_synthetic_run_passes_and_writes_only_canonical_inputs(
         2,
         2,
     ]
+    assert verdict["boundaries"]["minimum_post_start_ns"] == (
+        synthetic_run.ACTIVATION_NS
+        + 2_000_000
+        + synthetic_run.MINIMUM_POST_ACTIVATION_GRACE_NS
+    )
+    assert verdict["boundaries"]["first_common_successor_ns"] == 76_006_000_000
+    assert verdict["boundaries"]["post_start_ns"] == 76_006_000_000
+    assert validator._phase_for_timestamp(
+        75_500_000_000,
+        baseline_ns=synthetic_run.BASELINE_NS,
+        crash_ns=synthetic_run.CRASH_0_NS,
+        post_ns=verdict["boundaries"]["post_start_ns"],
+    ) == "degraded"
     assert {path.name for path in output.iterdir()} == {
         "manifest.json",
         "profile.json",
@@ -114,51 +127,168 @@ def test_ranked_successor_root_cycle_is_accepted(tmp_path: Path) -> None:
     assert verdict["verdict"] == "PASS"
 
 
-def test_activation_grace_accepts_bounded_predecessor_drain() -> None:
+def test_epoch_transition_accepts_predecessor_drain_beyond_minimum_grace() -> None:
+    minimum_post_start_ns = 205
     commits = [
         SimpleNamespace(height=770, timestamp_ns=100, epoch_number=0),
-        SimpleNamespace(height=771, timestamp_ns=110, epoch_number=0),
-        SimpleNamespace(height=779, timestamp_ns=120, epoch_number=0),
-        SimpleNamespace(height=780, timestamp_ns=130, epoch_number=1),
+        SimpleNamespace(height=771, timestamp_ns=210, epoch_number=0),
+        SimpleNamespace(height=779, timestamp_ns=220, epoch_number=0),
+        SimpleNamespace(height=780, timestamp_ns=230, epoch_number=1),
     ]
+    assert commits[1].timestamp_ns > minimum_post_start_ns
+    assert commits[2].timestamp_ns > minimum_post_start_ns
 
-    validator._validate_epoch_transition(
+    first_successor = validator._validate_epoch_transition(
         commits,
         activation_height=770,
         activation_ns=105,
-        post_start_ns=200,
     )
+    assert first_successor.height == 780
+    assert first_successor.timestamp_ns == 230
 
 
-@pytest.mark.parametrize(
-    ("commits", "reason"),
-    (
-        (
-            [
-                SimpleNamespace(height=770, timestamp_ns=100, epoch_number=0),
-                SimpleNamespace(height=771, timestamp_ns=120, epoch_number=1),
-                SimpleNamespace(height=772, timestamp_ns=130, epoch_number=0),
-            ],
-            "follows a successor commit",
-        ),
-        (
-            [
-                SimpleNamespace(height=770, timestamp_ns=100, epoch_number=0),
-                SimpleNamespace(height=771, timestamp_ns=200, epoch_number=0),
-            ],
-            "exceeds the frozen activation grace",
-        ),
-    ),
-)
-def test_activation_grace_rejects_unbounded_or_interleaved_predecessor(
-    commits: list[SimpleNamespace], reason: str
-) -> None:
-    with pytest.raises(validator.ValidationError, match=reason):
+def test_epoch_transition_rejects_predecessor_after_successor() -> None:
+    commits = [
+        SimpleNamespace(height=770, timestamp_ns=100, epoch_number=0),
+        SimpleNamespace(height=771, timestamp_ns=120, epoch_number=1),
+        SimpleNamespace(height=772, timestamp_ns=230, epoch_number=0),
+    ]
+
+    with pytest.raises(
+        validator.ValidationError,
+        match="follows a successor commit",
+    ):
         validator._validate_epoch_transition(
             commits,
             activation_height=770,
             activation_ns=105,
-            post_start_ns=200,
+        )
+
+
+def test_successor_beyond_frozen_recovery_deadline_fails(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    observer = tmp_path / "run/raw/replica-2.jsonl"
+
+    def delay_first_successor(values: list[dict[str, object]]) -> None:
+        for value in values:
+            if value["event_type"] not in (
+                "block.commit_observed",
+                "block.committed",
+            ):
+                continue
+            height = value["payload"]["block_height"]
+            if height == 18:
+                value["source_monotonic_ns"] = 85_002_000_000
+            elif height == 19:
+                value["source_monotonic_ns"] = 86_002_000_000
+
+    _rewrite_jsonl(observer, delay_first_successor)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "first common successor commit exceeds" in verdict["reason"]
+    assert "10s" in verdict["reason"]
+
+
+def test_delayed_survivor_witness_exceeds_common_recovery_deadline(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-6.jsonl"
+
+    def delay_survivor_successor(values: list[dict[str, object]]) -> None:
+        for value in values:
+            if value["event_type"] not in (
+                "block.commit_observed",
+                "block.committed",
+            ):
+                continue
+            height = value["payload"]["block_height"]
+            if height == 18:
+                value["source_monotonic_ns"] = 85_006_000_000
+            elif height == 19:
+                value["source_monotonic_ns"] = 86_006_000_000
+
+    _rewrite_jsonl(survivor, delay_survivor_successor)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "first common successor commit exceeds" in verdict["reason"]
+    assert "10s" in verdict["reason"]
+
+
+def test_activation_spread_uses_frozen_leader_grace(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-6.jsonl"
+
+    def delay_activation(values: list[dict[str, object]]) -> None:
+        activation = next(
+            value
+            for value in values
+            if value["event_type"] == "epoch.activated"
+        )
+        activation["source_monotonic_ns"] = 75_200_000_000
+
+    _rewrite_jsonl(survivor, delay_activation)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "survivor activation spread exceeds frozen leader activation grace" in (
+        verdict["reason"]
+    )
+
+
+def test_first_successor_commit_must_be_common_to_survivors(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-4.jsonl"
+
+    def remove_first_successor(values: list[dict[str, object]]) -> None:
+        values[:] = [
+            value
+            for value in values
+            if not (
+                value["event_type"]
+                in ("block.commit_observed", "block.committed")
+                and value["payload"]["block_height"] == 18
+            )
+        ]
+
+    _rewrite_jsonl(survivor, remove_first_successor)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "INCOMPLETE"
+    assert "replica-4 is missing first successor height 18" in verdict["reason"]
+
+
+def test_repository_profile_has_exact_v2_recovery_fields() -> None:
+    profile_path = Path(validator.__file__).resolve().with_name("profile.json")
+    profile_bytes = profile_path.read_bytes()
+    profile = json.loads(profile_bytes)
+
+    assert profile["profile_id"] == "n7-f2-q5-crash-recovery-v2"
+    assert profile["minimum_post_activation_grace_s"] == 1
+    assert profile["maximum_activation_to_successor_s"] == 10
+    assert "activation_grace_s" not in profile
+    assert hashlib.sha256(profile_bytes).hexdigest() == (
+        validator.FROZEN_PROFILE_SHA256
+    )
+
+
+def test_frozen_profile_rejects_boolean_numeric_alias() -> None:
+    profile_path = Path(validator.__file__).resolve().with_name("profile.json")
+    profile = json.loads(profile_path.read_bytes())
+    profile["maximum_activation_to_successor_s"] = True
+
+    with pytest.raises(validator.ValidationError, match="exact frozen v2"):
+        validator._decode_frozen_profile(
+            json.dumps(profile).encode(),
+            "mutated frozen profile",
         )
 
 

@@ -32,9 +32,9 @@ QUORUM = 5
 CRASHED_REPLICAS = (0, 1)
 SURVIVING_REPLICAS = (2, 3, 4, 5, 6)
 SUCCESSOR_ROOTS = SURVIVING_REPLICAS
-FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-v1"
+FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 FROZEN_PROFILE_SHA256 = (
-    "529d93344ecb69e73133d832a89d4098f39700f428589d2985bd7e52ed99d80b"
+    "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
 )
 MANAGER_LIMITS = {
     "maximum_members": 7,
@@ -91,7 +91,7 @@ _MANIFEST_FIELDS = frozenset(
         "authoritative_observer",
         "manager",
         "bucket_width_ns",
-        "activation_grace_ns",
+        "minimum_post_activation_grace_ns",
         "baseline_start_ns",
         "end_ns",
         "sources",
@@ -123,7 +123,8 @@ _FROZEN_PROFILE_FIELDS = frozenset(
         "tree_switch_period_blocks",
         "bucket_width_s",
         "baseline_bucket_count",
-        "activation_grace_s",
+        "minimum_post_activation_grace_s",
+        "maximum_activation_to_successor_s",
         "post_bucket_count",
         "minimum_qualifying_reporters",
         "minimum_timeout_observations_per_reporter",
@@ -450,7 +451,8 @@ class Manifest:
     manager_source_id: str
     baseline_start_ns: int
     end_ns: int
-    activation_grace_ns: int
+    minimum_post_activation_grace_ns: int
+    maximum_activation_to_successor_ns: int
     baseline_bucket_count: int
     post_bucket_count: int
     maximum_stall_ns: int
@@ -514,6 +516,7 @@ class CommitObservation:
     transaction_count: int
     commit_batch_index: int
     source_sequence: int
+    timestamp_ns: int
 
     @property
     def shared_identity(self) -> tuple[str, str | None, int, int]:
@@ -533,6 +536,8 @@ class Evaluation:
     crash_ns: int
     command_ns: int
     activation_ns: int
+    minimum_post_start_ns: int
+    first_common_successor_ns: int
     post_start_ns: int
     throughput: analysis.ThroughputAnalysis
     reputation: tuple[ReputationPoint, ...]
@@ -715,7 +720,8 @@ def _decode_frozen_profile(payload: bytes, label: str) -> Mapping[str, Any]:
         "tree_switch_period_blocks": 1,
         "bucket_width_s": 5,
         "baseline_bucket_count": 7,
-        "activation_grace_s": 1,
+        "minimum_post_activation_grace_s": 1,
+        "maximum_activation_to_successor_s": 10,
         "post_bucket_count": 7,
         "minimum_qualifying_reporters": 3,
         "minimum_timeout_observations_per_reporter": 2,
@@ -731,8 +737,8 @@ def _decode_frozen_profile(payload: bytes, label: str) -> Mapping[str, Any]:
         "block_size": 1,
         "snapshot_seed": 41719,
     }
-    if value != expected or value.get("frozen") is not True:
-        raise ValidationError(f"{label} differs from the exact frozen v1 settings")
+    if not _json_values_equal(value, expected) or value.get("frozen") is not True:
+        raise ValidationError(f"{label} differs from the exact frozen v2 settings")
     return value
 
 
@@ -1306,7 +1312,7 @@ def load_manifest(path: Path) -> Manifest:
         raise ValidationError("profile sha256 does not match the preserved profile")
     canonical_profile = _repository_frozen_profile()
     if profile_bytes != canonical_profile:
-        raise ValidationError("run profile is not byte-exact canonical frozen v1")
+        raise ValidationError("run profile is not byte-exact canonical frozen v2")
     profile_json = _decode_frozen_profile(profile_bytes, "run frozen profile")
     runtime = _validate_runtime(raw["runtime"], profile_json)
     runtime_artifacts = _load_runtime_artifacts(
@@ -1340,13 +1346,22 @@ def load_manifest(path: Path) -> Manifest:
     end_ns = _integer(raw["end_ns"], "manifest.end_ns", minimum=1)
     if end_ns <= baseline_start_ns:
         raise ValidationError("manifest end must follow baseline start")
-    activation_grace_ns = _integer(
-        raw["activation_grace_ns"],
-        "manifest.activation_grace_ns",
+    minimum_post_activation_grace_ns = _integer(
+        raw["minimum_post_activation_grace_ns"],
+        "manifest.minimum_post_activation_grace_ns",
         minimum=1,
     )
-    if activation_grace_ns != int(profile_json["activation_grace_s"]) * 1_000_000_000:
-        raise ValidationError("activation grace differs from the frozen profile")
+    if minimum_post_activation_grace_ns != (
+        int(profile_json["minimum_post_activation_grace_s"]) * 1_000_000_000
+    ):
+        raise ValidationError(
+            "minimum post-activation grace differs from the frozen profile"
+        )
+    maximum_activation_to_successor_ns = _integer(
+        profile_json["maximum_activation_to_successor_s"],
+        "profile.maximum_activation_to_successor_s",
+        minimum=1,
+    ) * 1_000_000_000
     baseline_bucket_count = _integer(
         profile_json["baseline_bucket_count"],
         "profile.baseline_bucket_count",
@@ -1584,7 +1599,8 @@ def load_manifest(path: Path) -> Manifest:
         manager_source_id=manager_id,
         baseline_start_ns=baseline_start_ns,
         end_ns=end_ns,
-        activation_grace_ns=activation_grace_ns,
+        minimum_post_activation_grace_ns=minimum_post_activation_grace_ns,
+        maximum_activation_to_successor_ns=maximum_activation_to_successor_ns,
         baseline_bucket_count=baseline_bucket_count,
         post_bucket_count=post_bucket_count,
         maximum_stall_ns=maximum_stall_ns,
@@ -2156,10 +2172,17 @@ def _validate_command_and_activation(
 
     observer_command_ns = command_times[analysis.AUTHORITATIVE_OBSERVER]
     observer_activation_ns = activation_times[analysis.AUTHORITATIVE_OBSERVER]
+    leader_activation_grace_ns = _integer(
+        manifest.runtime["leader_activation_grace_ms"],
+        "runtime.leader_activation_grace_ms",
+        minimum=1,
+    ) * 1_000_000
     if max(activation_times.values()) - min(activation_times.values()) > (
-        manifest.activation_grace_ns
+        leader_activation_grace_ns
     ):
-        raise ValidationError("survivor activation spread exceeds activation grace")
+        raise ValidationError(
+            "survivor activation spread exceeds frozen leader activation grace"
+        )
     return observer_command_ns, observer_activation_ns
 
 
@@ -2228,6 +2251,7 @@ def _rich_commit_observations(
             transaction_count=transaction_count,
             commit_batch_index=commit_batch_index,
             source_sequence=event.source_sequence,
+            timestamp_ns=event.timestamp_ns,
         )
         previous = observations.get(height)
         if (
@@ -2288,6 +2312,7 @@ def _commit_witness_observations(
             transaction_count=transaction_count,
             commit_batch_index=commit_batch_index,
             source_sequence=event.source_sequence,
+            timestamp_ns=event.timestamp_ns,
         )
         previous = observations.get(height)
         if (
@@ -2394,10 +2419,9 @@ def _validate_epoch_transition(
     *,
     activation_height: int,
     activation_ns: int,
-    post_start_ns: int,
-) -> None:
-    """Accept only the bounded, exact-predecessor drain across activation."""
-    successor_seen = False
+) -> analysis.CommitEvent:
+    """Accept one predecessor prefix and return the first successor commit."""
+    first_successor: analysis.CommitEvent | None = None
     for commit in commits:
         if commit.height <= activation_height:
             if commit.epoch_number != 0:
@@ -2407,15 +2431,10 @@ def _validate_epoch_transition(
                 )
             continue
         if commit.epoch_number == 0:
-            if successor_seen:
+            if first_successor is not None:
                 raise ValidationError(
                     f"predecessor commit height {commit.height} follows a "
                     "successor commit"
-                )
-            if commit.timestamp_ns >= post_start_ns:
-                raise ValidationError(
-                    f"predecessor commit height {commit.height} exceeds the "
-                    "frozen activation grace"
                 )
             continue
         if commit.epoch_number == 1:
@@ -2424,14 +2443,16 @@ def _validate_epoch_transition(
                     f"successor commit height {commit.height} precedes the "
                     "common activation event"
                 )
-            successor_seen = True
+            if first_successor is None:
+                first_successor = commit
             continue
         raise ValidationError(
             f"commit height {commit.height} uses unexpected epoch "
             f"{commit.epoch_number}"
         )
-    if not successor_seen:
+    if first_successor is None:
         raise IncompleteRun("no successor commit was observed after activation")
+    return first_successor
 
 
 def _validate_commits(
@@ -2442,12 +2463,14 @@ def _validate_commits(
     crash_ns: int,
     command_ns: int,
     activation_ns: int,
-    post_start_ns: int,
 ) -> tuple[
     analysis.ThroughputAnalysis,
     int,
     Mapping[str, int],
     Mapping[str, int],
+    int,
+    int,
+    int,
 ]:
     observer_key = ("replica", manifest.authoritative_observer)
     try:
@@ -2464,6 +2487,59 @@ def _validate_commits(
         )
     except analysis.AnalysisError as exc:
         raise ValidationError(f"authoritative commit stream is invalid: {exc}") from exc
+    command = epochs.successor.command
+    assert command is not None
+    activation_height = int(command["activation_height"])
+    first_successor = _validate_epoch_transition(
+        commits,
+        activation_height=activation_height,
+        activation_ns=activation_ns,
+    )
+    first_successor_observations = {
+        replica: _commit_witness_observations(
+            streams[("replica", f"replica-{replica}")], replica
+        )
+        for replica in SURVIVING_REPLICAS
+    }
+    common_successor_timestamps = [first_successor.timestamp_ns]
+    for replica, observations in first_successor_observations.items():
+        witness = observations.get(first_successor.height)
+        if witness is None:
+            raise IncompleteRun(
+                f"replica-{replica} is missing first successor height "
+                f"{first_successor.height}"
+            )
+        if witness.block_hash != first_successor.block_hash:
+            raise ValidationError(
+                "survivor commit disagreement at first successor height "
+                f"{first_successor.height}"
+            )
+        common_successor_timestamps.append(witness.timestamp_ns)
+    first_common_successor_ns = max(common_successor_timestamps)
+    activation_to_successor_ns = first_common_successor_ns - activation_ns
+    if activation_to_successor_ns > manifest.maximum_activation_to_successor_ns:
+        raise ValidationError(
+            "first common successor commit exceeds the frozen "
+            f"{manifest.maximum_activation_to_successor_ns / 1_000_000_000:g}s "
+            "activation-to-successor maximum"
+        )
+    if activation_ns > (
+        analysis.UINT64_MAX - manifest.minimum_post_activation_grace_ns
+    ):
+        raise ValidationError(
+            "minimum post-activation grace overflows the monotonic clock"
+        )
+    minimum_post_start_ns = (
+        activation_ns + manifest.minimum_post_activation_grace_ns
+    )
+    post_start_ns = max(
+        minimum_post_start_ns,
+        first_common_successor_ns,
+    )
+    if not crash_ns < command_ns <= activation_ns < post_start_ns < manifest.end_ns:
+        raise ValidationError(
+            "boundaries must satisfy crash < command <= activation < post < end"
+        )
     boundaries = analysis.PhaseBoundaries(
         baseline_start_ns=manifest.baseline_start_ns,
         crash_ns=crash_ns,
@@ -2508,8 +2584,6 @@ def _validate_commits(
                 f"{limit_ns / 1_000_000_000:g}s"
             )
     commits_by_height = {commit.height: commit for commit in commits}
-    command = epochs.successor.command
-    assert command is not None
     command_height = int(command["command_block_height"])
     command_commit = commits_by_height.get(command_height)
     if command_commit is None:
@@ -2520,7 +2594,6 @@ def _validate_commits(
         raise ValidationError("committed command hash does not match its consensus block")
     if command_commit.timestamp_ns > command_ns:
         raise ValidationError("epoch command event precedes its committed consensus block")
-    activation_height = int(command["activation_height"])
     activation_commit = commits_by_height.get(activation_height)
     if activation_commit is None:
         raise IncompleteRun(
@@ -2528,12 +2601,6 @@ def _validate_commits(
         )
     if activation_commit.timestamp_ns > activation_ns:
         raise ValidationError("epoch activation event precedes its activating commit")
-    _validate_epoch_transition(
-        commits,
-        activation_height=activation_height,
-        activation_ns=activation_ns,
-        post_start_ns=post_start_ns,
-    )
     pre_crash = [
         commit
         for commit in commits
@@ -2546,6 +2613,10 @@ def _validate_commits(
             streams[("replica", f"replica-{replica}")], replica
         )
         for replica in MEMBERSHIP
+    }
+    by_replica = {
+        replica: pre_crash_by_replica[replica]
+        for replica in SURVIVING_REPLICAS
     }
     for commit in pre_crash:
         for replica in SURVIVING_REPLICAS:
@@ -2582,22 +2653,19 @@ def _validate_commits(
         if post_start_ns <= commit.timestamp_ns < manifest.end_ns
     ]
     if any(commit.epoch_number != 1 for commit in post):
-        raise ValidationError("post-grace commits must use only successor epoch 1")
+        raise ValidationError(
+            "post-measurement commits must use only successor epoch 1"
+        )
     post_leaders = _compressed(commit.leader_replica for commit in post)
     successor_root_cycle = tuple(
         tree.leader for tree in epochs.successor.trees
     )
     if not _contains_contiguous(post_leaders, successor_root_cycle):
         raise IncompleteRun(
-            "post-grace commits do not contain one complete ranked successor root cycle"
+            "post-measurement commits do not contain one complete ranked "
+            "successor root cycle"
         )
 
-    by_replica = {
-        replica: _commit_observations(
-            streams[("replica", f"replica-{replica}")], replica
-        )
-        for replica in SURVIVING_REPLICAS
-    }
     authoritative_in_window = {
         commit.height: commit.block_hash
         for commit in commits
@@ -2641,7 +2709,15 @@ def _validate_commits(
         raise ValidationError("post median throughput must exceed degraded median")
     if throughput.medians.baseline_tps <= 0:
         raise ValidationError("baseline median must be positive to report recovery ratio")
-    return throughput, len(common), complete_bucket_counts, maximum_stalls
+    return (
+        throughput,
+        len(common),
+        complete_bucket_counts,
+        maximum_stalls,
+        minimum_post_start_ns,
+        first_common_successor_ns,
+        post_start_ns,
+    )
 
 
 def _phase_for_timestamp(
@@ -2906,18 +2982,18 @@ def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
     command_ns, activation_ns = _validate_command_and_activation(
         manifest, epochs, streams, crash_complete_ns
     )
-    if activation_ns > analysis.UINT64_MAX - manifest.activation_grace_ns:
-        raise ValidationError("activation grace overflows the monotonic clock")
-    post_start_ns = activation_ns + manifest.activation_grace_ns
-    if not crash_ns < command_ns <= activation_ns < post_start_ns < manifest.end_ns:
+    if not crash_ns < command_ns <= activation_ns < manifest.end_ns:
         raise ValidationError(
-            "boundaries must satisfy crash < command <= activation < post < end"
+            "boundaries must satisfy crash < command <= activation < end"
         )
     (
         throughput,
         common_heights,
         complete_bucket_counts,
         maximum_stalls,
+        minimum_post_start_ns,
+        first_common_successor_ns,
+        post_start_ns,
     ) = _validate_commits(
         manifest,
         epochs,
@@ -2926,7 +3002,6 @@ def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
         crash_ns,
         command_ns,
         activation_ns,
-        post_start_ns,
     )
     reputation, final_scores = _validate_reputation(
         manifest, streams, crash_ns, command_ns, post_start_ns
@@ -2938,6 +3013,8 @@ def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
         crash_ns=crash_ns,
         command_ns=command_ns,
         activation_ns=activation_ns,
+        minimum_post_start_ns=minimum_post_start_ns,
+        first_common_successor_ns=first_common_successor_ns,
         post_start_ns=post_start_ns,
         throughput=throughput,
         reputation=reputation,
@@ -2992,6 +3069,10 @@ def _pass_record(
             "crash_ns": evaluation.crash_ns,
             "command_ns": evaluation.command_ns,
             "activation_ns": evaluation.activation_ns,
+            "minimum_post_start_ns": evaluation.minimum_post_start_ns,
+            "first_common_successor_ns": (
+                evaluation.first_common_successor_ns
+            ),
             "post_start_ns": evaluation.post_start_ns,
             "end_ns": evaluation.manifest.end_ns,
         },

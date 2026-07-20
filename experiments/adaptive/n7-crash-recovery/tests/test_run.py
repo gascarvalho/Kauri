@@ -306,7 +306,7 @@ def test_baseline_gate_requires_complete_common_root_cycle() -> None:
         ]
         for replica in range(7)
     }
-    common = campaign.common_commit_keys(streams, tuple(range(7)))
+    common = campaign.commit_witness_timestamps(streams, tuple(range(7)))
 
     endpoint = campaign.find_common_root_cycle(
         events,
@@ -347,13 +347,161 @@ def test_baseline_gate_requires_complete_common_root_cycle() -> None:
     ]
     assert campaign.find_common_root_cycle(
         later_events,
-        campaign.common_commit_keys(streams, tuple(range(7))),
+        campaign.commit_witness_timestamps(streams, tuple(range(7))),
         participants=tuple(range(7)),
         epoch_number=0,
         tree_roots={replica: replica for replica in range(7)},
         expected_roots=tuple(range(7)),
         require_terminal=False,
     ) is None
+
+
+def test_first_common_successor_commit_requires_every_survivor_witness() -> None:
+    first = _event(
+        sequence=1,
+        timestamp_ns=1_000_000_000,
+        height=10,
+        epoch=1,
+        tree=0,
+    )
+    second = _event(
+        sequence=2,
+        timestamp_ns=2_000_000_000,
+        height=11,
+        epoch=1,
+        tree=1,
+    )
+    streams = {
+        f"replica-{replica}": [
+            _commit_observed_event(
+                replica=replica,
+                sequence=1,
+                timestamp_ns=1_000_000_000 + replica,
+                height=10,
+                block_hash=str(first["payload"]["block_hash"]),
+            ),
+            _commit_observed_event(
+                replica=replica,
+                sequence=2,
+                timestamp_ns=2_000_000_000 + replica,
+                height=11,
+                block_hash=str(second["payload"]["block_hash"]),
+            ),
+        ]
+        for replica in campaign.SURVIVORS
+    }
+    streams["replica-6"] = streams["replica-6"][1:]
+
+    result = campaign.find_first_common_epoch_commit(
+        [first, second],
+        campaign.commit_witness_timestamps(streams, campaign.SURVIVORS),
+        participants=campaign.SURVIVORS,
+        epoch_number=1,
+    )
+
+    assert result is not None
+    assert result.observer_event == second
+    assert result.common_ns == 2_000_000_006
+    streams["replica-6"] = []
+    assert campaign.find_first_common_epoch_commit(
+        [first, second],
+        campaign.commit_witness_timestamps(streams, campaign.SURVIVORS),
+        participants=campaign.SURVIVORS,
+        epoch_number=1,
+    ) is None
+
+
+def test_common_successor_deadline_includes_latest_survivor_witness() -> None:
+    activation_ns = 1_000_000_000
+    deadline_ns = activation_ns + 10_000_000_000
+    observer_event = _event(
+        sequence=1,
+        timestamp_ns=10_000_000_000,
+        height=10,
+        epoch=1,
+        tree=0,
+    )
+    streams = {
+        f"replica-{replica}": [
+            _commit_observed_event(
+                replica=replica,
+                sequence=1,
+                timestamp_ns=(
+                    12_000_000_000 if replica == 6 else 10_000_000_000 + replica
+                ),
+                height=10,
+            )
+        ]
+        for replica in campaign.SURVIVORS
+    }
+    streams["replica-6"].append(
+        _commit_observed_event(
+            replica=6,
+            sequence=2,
+            timestamp_ns=13_000_000_000,
+            height=10,
+        )
+    )
+
+    result = campaign.find_first_common_epoch_commit(
+        [observer_event],
+        campaign.commit_witness_timestamps(streams, campaign.SURVIVORS),
+        participants=campaign.SURVIVORS,
+        epoch_number=1,
+    )
+
+    assert result is not None
+    assert result.common_ns == 12_000_000_000
+    with pytest.raises(campaign.RunnerError, match="exceeded"):
+        campaign.enforce_common_epoch_commit_deadline(
+            result,
+            now_ns=result.common_ns,
+            deadline_ns=deadline_ns,
+        )
+    with pytest.raises(campaign.RunnerError, match="exceeded"):
+        campaign.enforce_common_epoch_commit_deadline(
+            None,
+            now_ns=deadline_ns + 1,
+            deadline_ns=deadline_ns,
+        )
+    assert campaign.post_measurement_boundaries(
+        activation_ns=activation_ns,
+        first_common_successor_ns=result.common_ns,
+        minimum_post_activation_grace_ns=1_000_000_000,
+    ) == (2_000_000_000, 12_000_000_000)
+
+
+@pytest.mark.parametrize(
+    ("first_common_successor_ns", "expected"),
+    (
+        (120, (150, 150)),
+        (180, (150, 180)),
+    ),
+)
+def test_post_measurement_boundary_is_dynamic(
+    first_common_successor_ns: int,
+    expected: tuple[int, int],
+) -> None:
+    assert campaign.post_measurement_boundaries(
+        activation_ns=100,
+        first_common_successor_ns=first_common_successor_ns,
+        minimum_post_activation_grace_ns=50,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        campaign.MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD,
+        campaign.MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD,
+    ),
+)
+def test_frozen_profile_timing_fields_are_positive_seconds(field: str) -> None:
+    assert campaign._profile_duration_ns({field: 1}, field) == 1_000_000_000
+    with pytest.raises(campaign.RunnerError, match=field):
+        campaign._profile_duration_ns({field: 0}, field)
+    with pytest.raises(campaign.RunnerError, match=field):
+        campaign._profile_duration_ns({}, field)
 
 
 def test_fresh_common_root_six_boundary_binds_all_sources() -> None:
@@ -677,6 +825,7 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
         profile_bytes=b"{}\n",
         records=[*records, manager],
         source_instances=instances,
+        minimum_post_activation_grace_ns=1_000_000_000,
         baseline_start_ns=100,
         end_ns=200,
         crash_markers=[],
@@ -752,6 +901,7 @@ def test_manifest_uses_validator_schema_and_explicit_false_ground_truth(tmp_path
         profile_bytes=profile,
         records=[*records, manager],
         source_instances=instances,
+        minimum_post_activation_grace_ns=1_000_000_000,
         baseline_start_ns=100,
         end_ns=200,
         crash_markers=[],
@@ -769,6 +919,7 @@ def test_manifest_uses_validator_schema_and_explicit_false_ground_truth(tmp_path
     assert manifest["replica_count"] == 7
     assert manifest["fault_threshold"] == 2
     assert manifest["quorum"] == 5
+    assert manifest["minimum_post_activation_grace_ns"] == 1_000_000_000
     assert manifest["profile"]["sha256"] == hashlib.sha256(profile).hexdigest()
     assert len(manifest["sources"]) == 8
     json.dumps(manifest)

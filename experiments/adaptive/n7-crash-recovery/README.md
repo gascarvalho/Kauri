@@ -40,11 +40,15 @@ shared monotonic-raw clock, and a confirmed exit with the same PID/PGID/signal.
 The manager declaration must state that it receives no crash ground truth.
 
 The runner-owned frozen settings are checked in as `profile.json`, with profile
-identity `n7-f2-q5-crash-recovery-v1`. The validator pins its exact schema,
+identity `n7-f2-q5-crash-recovery-v2`. The validator pins its exact schema,
 values, bytes, and SHA-256; changing arbitrary profile bytes and merely updating
-the manifest hash cannot pass. `tests/synthetic_run.py` copies this profile as
-an executable schema example, but its output is never acceptable experiment
-evidence.
+the manifest hash cannot pass. Campaign v2 distinguishes the minimum
+post-activation measurement grace from the leader-suspicion activation grace.
+The former only excludes transition work from throughput measurement; the
+latter remains a protocol timer that prevents premature suspicion after exact
+activation. Neither value substitutes for the other. `tests/synthetic_run.py`
+copies this profile as an executable schema example, but its output is never
+acceptable experiment evidence.
 
 ## Real campaign
 
@@ -61,7 +65,7 @@ binaries exist, and the default loopback ports are free. It generates fresh
 run-local identities, launches seven replicas plus the authenticated adaptation
 manager in separate process groups, waits for seven complete baseline buckets
 and a terminal `0..6` leader cycle, sends `SIGKILL` only to replicas 0 and 1,
-then waits for the committed successor and seven complete post-grace buckets.
+then waits for the committed successor and seven complete post-start buckets.
 Alternative binary, results-root, port, and timeout paths are available through
 `python3 experiments/adaptive/n7-crash-recovery/run.py --help`.
 
@@ -75,8 +79,8 @@ proof.
 
 The runner itself never declares scientific success. It invokes `validator.py`
 after cleanup, and invokes `plot.py` only if the immutable validator verdict is
-`PASS`. An incomplete, interrupted, inconsistent, or rejected attempt remains
-on disk without a thesis graph.
+`PASS`. A failed, incomplete, interrupted, inconsistent, or rejected attempt
+remains on disk and is never plotted.
 
 ## PASS gate
 
@@ -95,9 +99,16 @@ requires all of the following:
   truth supplied to the manager;
 - an identical committed epoch command and one matching successor activation
   at every surviving replica;
-- predecessor work admitted before activation may drain under its exact Epoch
-  0 identity only inside the frozen activation grace and before the first
-  Epoch 1 commit; it is excluded from the post-change measurement window;
+- predecessor work admitted before activation may drain contiguously under its
+  exact Epoch 0 identity until the first common Epoch 1 commit; any predecessor
+  commit after that successor commit is rejected;
+- the first common Epoch 1 commit becomes common when every survivor has
+  emitted its matching commit witness; that common time must occur no later
+  than the frozen ten-second maximum activation-to-successor interval;
+- `post_start` is the later of activation plus the frozen minimum
+  post-activation measurement grace and the first common Epoch 1 commit; legal
+  predecessor drain before that boundary is excluded from the post-change
+  measurement window;
 - successor root set exactly `2..6`, preserving its committed tree-ID order,
   with failed replicas `0` and `1` both wait-exempt physical leaves;
 - `block.commit_observed` agreement by replicas `2..6` on every authoritative
@@ -154,9 +165,9 @@ python3 experiments/adaptive/n7-crash-recovery/plot.py \
 The upper panel contains the raw aggregate throughput line and seven raw lines
 attributed to the scheduled replica leader. It shades baseline, degraded, and
 post-activation phases; shows both crash requests, the command, activation,
-and activation-grace interval; labels the three regions as normal Epoch 0,
-crashed Epoch 0, and Epoch 1 with crashed replicas at leaves; and draws the
-three raw phase medians. The lower panel contains seven stepwise manager
+and activation-to-post transition interval; labels the three regions as normal
+Epoch 0, crashed Epoch 0, and Epoch 1 with crashed replicas at leaves; and draws
+the three raw phase medians. The lower panel contains seven stepwise manager
 reputation trajectories, emphasizing the two crashed replicas.
 
 Run the synthetic non-evidence suite with:

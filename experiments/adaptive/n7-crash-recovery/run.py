@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -36,11 +37,12 @@ AUTHORITATIVE_OBSERVER = 2
 AUTHORITATIVE_SOURCE_ID = "replica-2"
 MANAGER_SOURCE_ID = "adaptive-manager"
 REQUIRED_BRANCH = "feature/adaptive-epoch-throughput"
-PROFILE_ID = "n7-f2-q5-crash-recovery-v1"
-PROFILE_SHA256 = "529d93344ecb69e73133d832a89d4098f39700f428589d2985bd7e52ed99d80b"
+PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
+PROFILE_SHA256 = "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
 SCENARIO = "n7-crash-recovery"
 BUCKET_WIDTH_NS = 5_000_000_000
-ACTIVATION_GRACE_NS = 1_000_000_000
+MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD = "minimum_post_activation_grace_s"
+MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD = "maximum_activation_to_successor_s"
 ACTIVATION_DELAY_BLOCKS = 5
 TREE_SWITCH_PERIOD_BLOCKS = 1
 SNAPSHOT_SEED = 0xA2F7
@@ -94,7 +96,7 @@ MANIFEST_FIELDS = frozenset(
         "authoritative_observer",
         "manager",
         "bucket_width_ns",
-        "activation_grace_ns",
+        "minimum_post_activation_grace_ns",
         "baseline_start_ns",
         "end_ns",
         "sources",
@@ -133,6 +135,12 @@ class RunnerError(RuntimeError):
 class RepositorySnapshot:
     revision: str
     worktree_clean: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CommonEpochCommit:
+    observer_event: dict[str, Any]
+    common_ns: int
 
 
 @dataclass(slots=True)
@@ -435,7 +443,22 @@ def load_frozen_profile(path: Path) -> tuple[dict[str, Any], bytes]:
     for field, expected_value in expected.items():
         if value.get(field) != expected_value:
             raise RunnerError(f"frozen profile field {field} differs from {expected_value!r}")
+    for field in (
+        MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD,
+        MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD,
+    ):
+        _profile_duration_ns(value, field)
     return value, payload
+
+
+def _profile_duration_ns(profile: Mapping[str, Any], field: str) -> int:
+    value = profile.get(field)
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise RunnerError(f"frozen profile field {field} must be positive seconds")
+    nanoseconds = int(value * 1_000_000_000)
+    if nanoseconds <= 0 or nanoseconds > (1 << 64) - 1:
+        raise RunnerError(f"frozen profile field {field} is outside nanosecond range")
+    return nanoseconds
 
 
 def _write_private(path: Path, payload: bytes) -> None:
@@ -1359,19 +1382,107 @@ def _commit_key(event: Mapping[str, Any]) -> tuple[int, str]:
     return height, block_hash
 
 
-def common_commit_keys(streams: Mapping[str, Sequence[Mapping[str, Any]]], participants: Sequence[int]) -> dict[int, set[tuple[int, str]]]:
-    return {
-        replica: {
-            _commit_key(event)
-            for event in _commit_observations(streams[f"replica-{replica}"])
-        }
-        for replica in participants
-    }
+def commit_witness_timestamps(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    participants: Sequence[int],
+) -> dict[int, dict[tuple[int, str], int]]:
+    result: dict[int, dict[tuple[int, str], int]] = {}
+    for replica in participants:
+        timestamps: dict[tuple[int, str], int] = {}
+        for event in _commit_observations(streams[f"replica-{replica}"]):
+            key = _commit_key(event)
+            timestamp_ns = _event_timestamp(event)
+            previous = timestamps.get(key)
+            if previous is None or timestamp_ns < previous:
+                timestamps[key] = timestamp_ns
+        result[replica] = timestamps
+    return result
+
+
+def find_first_common_epoch_commit(
+    observer_events: Sequence[Mapping[str, Any]],
+    witnesses: Mapping[int, Mapping[tuple[int, str], int]],
+    *,
+    participants: Sequence[int],
+    epoch_number: int,
+) -> CommonEpochCommit | None:
+    if not participants:
+        raise RunnerError("common epoch commit requires at least one participant")
+    for event in _commits(observer_events):
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        proof = payload.get("decision_proof")
+        if not isinstance(proof, dict) or proof.get("epoch_number") != epoch_number:
+            continue
+        key = _commit_key(event)
+        witness_timestamps = [
+            witnesses.get(replica, {}).get(key) for replica in participants
+        ]
+        if all(timestamp is not None for timestamp in witness_timestamps):
+            common_timestamps = [
+                _event_timestamp(event),
+                *(int(timestamp) for timestamp in witness_timestamps),
+            ]
+            return CommonEpochCommit(
+                observer_event=event,
+                common_ns=max(common_timestamps),
+            )
+    return None
+
+
+def enforce_common_epoch_commit_deadline(
+    result: CommonEpochCommit | None,
+    *,
+    now_ns: int,
+    deadline_ns: int,
+) -> CommonEpochCommit | None:
+    if (
+        type(now_ns) is not int
+        or now_ns <= 0
+        or type(deadline_ns) is not int
+        or deadline_ns <= 0
+    ):
+        raise RunnerError("common epoch commit deadline inputs are invalid")
+    if result is not None:
+        if result.common_ns > deadline_ns:
+            raise RunnerError(
+                "first common successor commit exceeded "
+                "maximum_activation_to_successor_s"
+            )
+        return result
+    if now_ns > deadline_ns:
+        raise RunnerError(
+            "first common successor commit exceeded "
+            "maximum_activation_to_successor_s"
+        )
+    return None
+
+
+def post_measurement_boundaries(
+    *,
+    activation_ns: int,
+    first_common_successor_ns: int,
+    minimum_post_activation_grace_ns: int,
+) -> tuple[int, int]:
+    if (
+        type(activation_ns) is not int
+        or activation_ns <= 0
+        or type(first_common_successor_ns) is not int
+        or first_common_successor_ns < activation_ns
+        or type(minimum_post_activation_grace_ns) is not int
+        or minimum_post_activation_grace_ns <= 0
+    ):
+        raise RunnerError("post measurement boundary inputs are invalid")
+    minimum_post_start_ns = activation_ns + minimum_post_activation_grace_ns
+    return minimum_post_start_ns, max(
+        minimum_post_start_ns, first_common_successor_ns
+    )
 
 
 def find_common_root_cycle(
     observer_events: Sequence[Mapping[str, Any]],
-    common: Mapping[int, set[tuple[int, str]]],
+    common: Mapping[int, Mapping[tuple[int, str], int]],
     *,
     participants: Sequence[int],
     epoch_number: int,
@@ -1686,6 +1797,7 @@ def build_manifest(
     profile_bytes: bytes,
     records: Sequence[ProcessRecord],
     source_instances: Mapping[str, str],
+    minimum_post_activation_grace_ns: int,
     baseline_start_ns: int,
     end_ns: int,
     crash_markers: Sequence[Mapping[str, Any]],
@@ -1697,6 +1809,11 @@ def build_manifest(
     runtime: Mapping[str, Any] | None = None,
     runtime_artifacts: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
+    if (
+        type(minimum_post_activation_grace_ns) is not int
+        or minimum_post_activation_grace_ns <= 0
+    ):
+        raise RunnerError("manifest minimum post-activation grace must be positive")
     record_by_replica = {record.replica_id: record for record in records if record.replica_id is not None}
     manager = next((record for record in records if record.name == MANAGER_SOURCE_ID), None)
     if set(record_by_replica) != set(REPLICA_IDS) or manager is None:
@@ -1749,7 +1866,7 @@ def build_manifest(
             "receives_crash_ground_truth": False,
         },
         "bucket_width_ns": BUCKET_WIDTH_NS,
-        "activation_grace_ns": ACTIVATION_GRACE_NS,
+        "minimum_post_activation_grace_ns": minimum_post_activation_grace_ns,
         "baseline_start_ns": baseline_start_ns,
         "end_ns": end_ns,
         "sources": sources,
@@ -1832,6 +1949,12 @@ def run(argv: Sequence[str] | None = None) -> int:
     repository = args.repository.resolve()
     profile_path = args.profile.resolve()
     profile, profile_bytes = load_frozen_profile(profile_path)
+    minimum_post_activation_grace_ns = _profile_duration_ns(
+        profile, MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD
+    )
+    maximum_activation_to_successor_ns = _profile_duration_ns(
+        profile, MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD
+    )
     snapshot = verify_repository_state(repository)
     binaries = {
         "app": args.app_binary.resolve(),
@@ -1900,6 +2023,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             profile_bytes=profile_bytes,
             records=records,
             source_instances=source_instances,
+            minimum_post_activation_grace_ns=minimum_post_activation_grace_ns,
             baseline_start_ns=baseline_start_ns,
             end_ns=end_ns,
             crash_markers=crash_markers,
@@ -1978,17 +2102,17 @@ def run(argv: Sequence[str] | None = None) -> int:
 
         _wait("all structured process.ready events", args.startup_timeout, records, all_ready)
 
-        def first_common_commit() -> dict[str, Any] | None:
+        def first_common_commit() -> CommonEpochCommit | None:
             streams = _event_streams(run_directory)
-            common = common_commit_keys(streams, REPLICA_IDS)
-            for event in _commits(streams[AUTHORITATIVE_SOURCE_ID]):
-                key = _commit_key(event)
-                if all(key in common[replica] for replica in REPLICA_IDS):
-                    return event
-            return None
+            return find_first_common_epoch_commit(
+                streams[AUTHORITATIVE_SOURCE_ID],
+                commit_witness_timestamps(streams, REPLICA_IDS),
+                participants=REPLICA_IDS,
+                epoch_number=0,
+            )
 
         first_commit = _wait("first common authoritative commit", args.startup_timeout, records, first_common_commit)
-        baseline_start_ns = _event_timestamp(first_commit)
+        baseline_start_ns = first_commit.common_ns
         end_ns = baseline_start_ns + 1
         update_manifest()
         state["phase"] = "baseline"
@@ -2006,7 +2130,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             streams = _event_streams(run_directory)
             return find_common_root_cycle(
                 streams[AUTHORITATIVE_SOURCE_ID],
-                common_commit_keys(streams, REPLICA_IDS),
+                commit_witness_timestamps(streams, REPLICA_IDS),
                 participants=REPLICA_IDS,
                 epoch_number=0,
                 tree_roots={tree: tree for tree in REPLICA_IDS},
@@ -2098,7 +2222,69 @@ def run(argv: Sequence[str] | None = None) -> int:
         epochs_document = build_epochs_document(decoded, command_payload)
         _write_json_exclusive(run_directory / "epochs.json", epochs_document)
         observer_activation_ns = _event_timestamp(observer_activation)
-        post_start_ns = observer_activation_ns + ACTIVATION_GRACE_NS
+        minimum_post_start_ns = (
+            observer_activation_ns + minimum_post_activation_grace_ns
+        )
+        maximum_successor_deadline_ns = (
+            observer_activation_ns + maximum_activation_to_successor_ns
+        )
+        state["phase"] = "awaiting_first_common_successor_commit"
+        state["command_ns"] = _event_timestamp(observer_command)
+        state["activation_ns"] = observer_activation_ns
+        state["minimum_post_start_ns"] = minimum_post_start_ns
+        _replace_json(state_path, state)
+
+        def first_common_successor_commit() -> CommonEpochCommit | None:
+            streams = _event_streams(run_directory)
+            result = find_first_common_epoch_commit(
+                streams[AUTHORITATIVE_SOURCE_ID],
+                commit_witness_timestamps(streams, SURVIVORS),
+                participants=SURVIVORS,
+                epoch_number=1,
+            )
+            return enforce_common_epoch_commit_deadline(
+                result,
+                now_ns=monotonic_raw_ns(),
+                deadline_ns=maximum_successor_deadline_ns,
+            )
+
+        def successor_commit_health() -> None:
+            now_ns = monotonic_raw_ns()
+            streams = _event_streams(run_directory)
+            enforce_common_epoch_commit_deadline(
+                find_first_common_epoch_commit(
+                    streams[AUTHORITATIVE_SOURCE_ID],
+                    commit_witness_timestamps(streams, SURVIVORS),
+                    participants=SURVIVORS,
+                    epoch_number=1,
+                ),
+                now_ns=now_ns,
+                deadline_ns=maximum_successor_deadline_ns,
+            )
+            _enforce_observer_stall(
+                streams[AUTHORITATIVE_SOURCE_ID],
+                window_start_ns=min(
+                    marker["requested_monotonic_raw_ns"]
+                    for marker in crash_markers
+                ),
+                now_ns=now_ns,
+                maximum_gap_ns=degraded_maximum_gap_ns,
+            )
+
+        first_common_successor = _wait(
+            "first common epoch-1 commit from every survivor",
+            float(profile[MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD]) + 1.0,
+            records,
+            first_common_successor_commit,
+            expected_crashed=set(CRASH_TARGETS),
+            health=successor_commit_health,
+        )
+        first_common_successor_ns = first_common_successor.common_ns
+        minimum_post_start_ns, post_start_ns = post_measurement_boundaries(
+            activation_ns=observer_activation_ns,
+            first_common_successor_ns=first_common_successor_ns,
+            minimum_post_activation_grace_ns=minimum_post_activation_grace_ns,
+        )
         post_duration_ns = int(profile["post_bucket_count"]) * BUCKET_WIDTH_NS
         tree_roots = {tree.tree_id: tree.members[0] for tree in decoded.trees}
         successor_root_cycle = tuple(tree.members[0] for tree in decoded.trees)
@@ -2107,9 +2293,15 @@ def run(argv: Sequence[str] | None = None) -> int:
             if monotonic_raw_ns() < post_start_ns + post_duration_ns:
                 return None
             streams = _event_streams(run_directory)
+            post_observer_events = [
+                event
+                for event in streams[AUTHORITATIVE_SOURCE_ID]
+                if event.get("event_type") == "block.committed"
+                and _event_timestamp(event) >= post_start_ns
+            ]
             return find_common_root_cycle(
-                streams[AUTHORITATIVE_SOURCE_ID],
-                common_commit_keys(streams, SURVIVORS),
+                post_observer_events,
+                commit_witness_timestamps(streams, SURVIVORS),
                 participants=SURVIVORS,
                 epoch_number=1,
                 tree_roots=tree_roots,
@@ -2127,8 +2319,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             )
 
         state["phase"] = "post_successor"
-        state["command_ns"] = _event_timestamp(observer_command)
-        state["activation_ns"] = observer_activation_ns
+        state["first_common_successor_ns"] = first_common_successor_ns
+        state["minimum_post_start_ns"] = minimum_post_start_ns
         state["post_start_ns"] = post_start_ns
         _replace_json(state_path, state)
         _wait(

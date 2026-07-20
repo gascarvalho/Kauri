@@ -19,8 +19,8 @@ CRASH_0_NS = 36_000_000_000
 CRASH_1_NS = 36_100_000_000
 COMMAND_NS = 54_100_000_000
 ACTIVATION_NS = 74_100_000_000
-GRACE_NS = 1_000_000_000
-END_NS = 111_000_000_000
+MINIMUM_POST_ACTIVATION_GRACE_NS = 1_000_000_000
+END_NS = 111_006_000_000
 MANAGER_LIMITS = {
     "maximum_members": 7,
     "readiness_wire_maximum_payload_bytes": 256,
@@ -224,7 +224,9 @@ def _replica_events(replica: int) -> list[dict[str, Any]]:
     for tree, timestamp in enumerate((38, 42, 46, 50, 54, 58, 62, 66, 70, 74)):
         schedule.append((height, timestamp * 1_000_000_000, 0, tree % 7, 20))
         height += 1
-    for index, timestamp in enumerate((76, 81, 86, 91, 96, 101, 106)):
+    for index, timestamp in enumerate(
+        (76, 81, 86, 91, 96, 101, 106, 107, 108, 109)
+    ):
         schedule.append((height, timestamp * 1_000_000_000, 1, index % 5, 100))
         height += 1
     for height, timestamp, epoch, tree, transactions in schedule:
@@ -723,7 +725,7 @@ def create_run(directory: Path) -> tuple[Path, Path]:
         "kauri_revision": REVISION,
         "kauri_worktree_clean": True,
         "profile": {
-            "identity": "n7-f2-q5-crash-recovery-v1",
+            "identity": "n7-f2-q5-crash-recovery-v2",
             "path": "profile.json",
             "sha256": profile_sha,
         },
@@ -743,7 +745,9 @@ def create_run(directory: Path) -> tuple[Path, Path]:
             "receives_crash_ground_truth": False,
         },
         "bucket_width_ns": 5_000_000_000,
-        "activation_grace_ns": GRACE_NS,
+        "minimum_post_activation_grace_ns": (
+            MINIMUM_POST_ACTIVATION_GRACE_NS
+        ),
         "baseline_start_ns": BASELINE_NS,
         "end_ns": END_NS,
         "sources": sources,

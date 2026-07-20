@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "n7-f2-q5-crash-recovery-v1",
+  "profile_id": "n7-f2-q5-crash-recovery-v2",
   "frozen": true,
   "replica_ids": [0, 1, 2, 3, 4, 5, 6],
   "fault_threshold": 2,
@@ -18,7 +18,8 @@
   "tree_switch_period_blocks": 1,
   "bucket_width_s": 5,
   "baseline_bucket_count": 7,
-  "activation_grace_s": 1,
+  "minimum_post_activation_grace_s": 1,
+  "maximum_activation_to_successor_s": 10,
   "post_bucket_count": 7,
   "minimum_qualifying_reporters": 3,
   "minimum_timeout_observations_per_reporter": 2,
