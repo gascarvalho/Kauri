@@ -383,9 +383,10 @@ TEST_CASE("remote and leader-local proposal paths open context before protocol w
         "void HotStuffCore::on_receive_proposal");
 
     const auto remote_delivery = remote.find("async_deliver_blk");
-    const auto remote_open = remote.find("admit_remote");
+    const auto remote_open = remote.find("admit_exact_context");
     const auto remote_protocol = remote.find("on_receive_proposal");
-    INFO("remote admission must occur after delivery but before proposal processing");
+    INFO("remote exact-context admission must occur after delivery but before "
+         "proposal processing");
     CHECK(remote_delivery != std::string::npos);
     CHECK(remote_open != std::string::npos);
     CHECK(remote_protocol != std::string::npos);
@@ -407,6 +408,10 @@ TEST_CASE("remote protocol acceptance initializes aggregation before drain",
 {
     const auto hotstuff = read_source("src/hotstuff.cpp");
     const auto admission = read_source("src/proposal_admission.cpp");
+    const auto exact_admission = source_slice(
+        hotstuff,
+        "HotStuffBase::admit_exact_context",
+        "void HotStuffBase::activate_proposal_configuration");
     const auto active = source_slice(
         hotstuff,
         "void HotStuffBase::process_active",
@@ -417,8 +422,9 @@ TEST_CASE("remote protocol acceptance initializes aggregation before drain",
         "const ConfigurationId &");
 
     const auto delivery = active.find("async_deliver_blk");
-    const auto admitted = active.find("admit_remote");
-    const auto accumulator = active.find("initialize_accumulator");
+    const auto admitted = exact_admission.find("admit_remote");
+    const auto accumulator = exact_admission.find("initialize_accumulator");
+    const auto admission_call = active.find("admit_exact_context");
     const auto child_state = active.find("create_expected_vote_state");
     const auto latency = active.find("start_latency_deadline");
     const auto deadline = active.find("start_aggregation_timer");
@@ -434,6 +440,7 @@ TEST_CASE("remote protocol acceptance initializes aggregation before drain",
     CHECK(delivery != std::string::npos);
     CHECK(admitted != std::string::npos);
     CHECK(accumulator != std::string::npos);
+    CHECK(admission_call != std::string::npos);
     CHECK(protocol != std::string::npos);
     CHECK(still_open != std::string::npos);
     CHECK(child_state != std::string::npos);
@@ -443,6 +450,7 @@ TEST_CASE("remote protocol acceptance initializes aggregation before drain",
     if (delivery != std::string::npos &&
         admitted != std::string::npos &&
         accumulator != std::string::npos &&
+        admission_call != std::string::npos &&
         protocol != std::string::npos &&
         still_open != std::string::npos &&
         child_state != std::string::npos &&
@@ -450,9 +458,9 @@ TEST_CASE("remote protocol acceptance initializes aggregation before drain",
         deadline != std::string::npos &&
         drain != std::string::npos)
     {
-        CHECK(delivery < admitted);
         CHECK(admitted < accumulator);
-        CHECK(accumulator < protocol);
+        CHECK(delivery < admission_call);
+        CHECK(admission_call < protocol);
         CHECK(protocol < still_open);
         CHECK(still_open < child_state);
         CHECK(child_state < latency);

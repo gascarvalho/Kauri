@@ -99,19 +99,26 @@ enum class PrefixStatus : std::uint8_t
     nonmember,
 };
 
-PrefixStatus validate_prefix(
+struct ValidatedPrefix
+{
+    PrefixStatus status{PrefixStatus::valid};
+    std::size_t size{0};
+};
+
+ValidatedPrefix validate_prefix(
     const std::vector<AcceptedEvidenceRecord> &accepted,
     const std::vector<ReplicaID> &membership,
     const AdaptationEpochId &epoch,
     std::uint64_t cutoff) noexcept
 {
     std::uint64_t previous_sequence = 0;
+    std::size_t prefix_size = 0;
     for (const auto &record : accepted)
     {
         if (record.ingestion_sequence == 0 ||
             record.ingestion_sequence <= previous_sequence)
         {
-            return PrefixStatus::invalid_order;
+            return {PrefixStatus::invalid_order, prefix_size};
         }
         previous_sequence = record.ingestion_sequence;
         if (record.ingestion_sequence > cutoff)
@@ -123,21 +130,22 @@ PrefixStatus validate_prefix(
             observation.configuration.epoch_digest !=
                 epoch.epoch_digest)
         {
-            return PrefixStatus::mixed_epoch;
+            return {PrefixStatus::mixed_epoch, prefix_size};
         }
         if (!is_member(membership, observation.reporter_id) ||
             !is_member(
                 membership, observation.observed_replica_id))
         {
-            return PrefixStatus::nonmember;
+            return {PrefixStatus::nonmember, prefix_size};
         }
         for (const auto signer : observation.signer_set)
         {
             if (!is_member(membership, signer))
-                return PrefixStatus::nonmember;
+                return {PrefixStatus::nonmember, prefix_size};
         }
+        ++prefix_size;
     }
-    return PrefixStatus::valid;
+    return {PrefixStatus::valid, prefix_size};
 }
 
 AdaptiveV2SelectionStatus selection_status(
@@ -446,6 +454,172 @@ struct AdaptiveV2ByzantineSelection::State
         return output;
     }
 
+    std::unique_ptr<AdaptationSnapshot> build_snapshot(
+        const std::vector<AcceptedEvidenceRecord> &accepted,
+        std::size_t prefix_size,
+        std::uint64_t evidence_cutoff) const
+    {
+        return std::make_unique<AdaptationSnapshot>(
+            build_adaptation_snapshot(
+                membership,
+                current_epoch,
+                AcceptedEvidenceView{
+                    accepted.empty() ? nullptr : accepted.data(),
+                    prefix_size},
+                evidence_cutoff,
+                config.responsiveness_policy,
+                config.snapshot_seed));
+    }
+
+    AdaptiveV2SelectionResult select_candidates(
+        std::unique_ptr<AdaptationSnapshot> snapshot,
+        const TargetTimeoutCounts &timeout_counts,
+        std::uint64_t evidence_cutoff)
+    {
+        auto output = result(
+            AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
+            evidence_cutoff);
+        output.snapshot = std::move(snapshot);
+        try
+        {
+            std::map<ReplicaID, const ReplicaAdaptationResult *>
+                snapshot_by_replica;
+            for (const auto &entry : output.snapshot->ranking())
+                snapshot_by_replica.emplace(entry.replica_id, &entry);
+
+            output.eligible_candidates.reserve(membership.size());
+            for (std::size_t index = 0;
+                 index < membership.size();
+                 ++index)
+            {
+                const auto replica_id = membership[index];
+                const auto snapshot_found =
+                    snapshot_by_replica.find(replica_id);
+                if (snapshot_found == snapshot_by_replica.end())
+                {
+                    healthy = false;
+                    output.status =
+                        AdaptiveV2SelectionStatus::snapshot_failed;
+                    output.eligible_candidates.clear();
+                    return output;
+                }
+
+                AdaptiveV2CandidateAudit audit;
+                audit.replica_id = replica_id;
+                audit.snapshot_classification =
+                    snapshot_found->second->classification;
+                audit.baseline_score = baseline_scores[index].score;
+                audit.current_score = reputation.score(replica_id);
+                audit.baseline_score_delta =
+                    static_cast<std::int64_t>(audit.current_score) -
+                    static_cast<std::int64_t>(audit.baseline_score);
+                audit.guard_drawdown = guard_drawdowns[index];
+
+                const auto target_found = timeout_counts.find(replica_id);
+                if (target_found != timeout_counts.end())
+                {
+                    for (const auto &reporter : target_found->second)
+                    {
+                        if (std::numeric_limits<std::uint64_t>::max() -
+                                audit.total_uncompensated_timeouts <
+                            reporter.second)
+                        {
+                            healthy = false;
+                            output.status =
+                                AdaptiveV2SelectionStatus::capacity_exceeded;
+                            output.eligible_candidates.clear();
+                            return output;
+                        }
+                        audit.total_uncompensated_timeouts +=
+                            reporter.second;
+                        if (reporter.second >=
+                            config.minimum_timeouts_per_reporter)
+                        {
+                            audit.qualifying_reporters.push_back(
+                                reporter.first);
+                        }
+                    }
+                }
+
+                audit.snapshot_nonresponsive =
+                    audit.snapshot_classification ==
+                    ResponsivenessClass::nonresponsive;
+                audit.score_drop_satisfied =
+                    audit.guard_drawdown <=
+                    -static_cast<std::int64_t>(
+                        config.minimum_score_drop);
+                audit.reporter_guard_satisfied =
+                    audit.qualifying_reporters.size() >=
+                    static_cast<std::size_t>(
+                        quorum.fault_threshold + 1U);
+                audit.guarded_eligible =
+                    audit.snapshot_nonresponsive &&
+                    audit.score_drop_satisfied &&
+                    audit.reporter_guard_satisfied;
+                if (audit.guarded_eligible)
+                {
+                    output.eligible_candidates.push_back(
+                        std::move(audit));
+                }
+            }
+
+            std::sort(
+                output.eligible_candidates.begin(),
+                output.eligible_candidates.end(),
+                candidate_ranks_before);
+            if (output.eligible_candidates.size() <
+                config.required_nonresponsive)
+            {
+                return output;
+            }
+
+            output.selected_replicas.reserve(
+                config.required_nonresponsive);
+            for (std::size_t index = 0;
+                 index < config.required_nonresponsive;
+                 ++index)
+            {
+                output.selected_replicas.push_back(
+                    output.eligible_candidates[index].replica_id);
+            }
+
+            const std::set<ReplicaID> selected(
+                output.selected_replicas.begin(),
+                output.selected_replicas.end());
+            output.eligible_roots.reserve(quorum.quorum);
+            for (const auto &entry : output.snapshot->ranking())
+            {
+                if (entry.classification ==
+                        ResponsivenessClass::responsive &&
+                    entry.eligible &&
+                    selected.find(entry.replica_id) == selected.end())
+                {
+                    output.eligible_roots.push_back(entry.replica_id);
+                }
+            }
+            if (output.eligible_roots.size() < quorum.quorum)
+            {
+                output.status =
+                    AdaptiveV2SelectionStatus::insufficient_eligible_roots;
+                output.selected_replicas.clear();
+                output.eligible_roots.clear();
+                return output;
+            }
+        }
+        catch (...)
+        {
+            healthy = false;
+            output.status = AdaptiveV2SelectionStatus::internal_failure;
+            output.eligible_candidates.clear();
+            output.selected_replicas.clear();
+            output.eligible_roots.clear();
+            return output;
+        }
+
+        output.status = AdaptiveV2SelectionStatus::selected;
+        return output;
+    }
+
     const EvidenceLedger &ledger;
     std::vector<ReplicaID> membership;
     ByzantineQuorum quorum;
@@ -509,8 +683,8 @@ AdaptiveV2ByzantineSelection::freeze_baseline(
         state.membership,
         state.current_epoch,
         evidence_cutoff);
-    if (prefix != PrefixStatus::valid)
-        return selection_status(prefix);
+    if (prefix.status != PrefixStatus::valid)
+        return selection_status(prefix.status);
 
     const auto applied = state.projection.apply_through(evidence_cutoff);
     if (!projection_applied(applied.status))
@@ -571,8 +745,11 @@ AdaptiveV2ByzantineSelection::select_through(
         state.membership,
         state.current_epoch,
         evidence_cutoff);
-    if (prefix != PrefixStatus::valid)
-        return state.result(selection_status(prefix), evidence_cutoff);
+    if (prefix.status != PrefixStatus::valid)
+    {
+        return state.result(
+            selection_status(prefix.status), evidence_cutoff);
+    }
 
     TargetTimeoutCounts timeout_counts;
     const auto replay = replay_post_baseline_timeouts(
@@ -594,23 +771,8 @@ AdaptiveV2ByzantineSelection::select_through(
     std::unique_ptr<AdaptationSnapshot> snapshot;
     try
     {
-        std::size_t accepted_prefix_size = 0;
-        while (accepted_prefix_size < accepted.size() &&
-               accepted[accepted_prefix_size].ingestion_sequence <=
-                   evidence_cutoff)
-        {
-            ++accepted_prefix_size;
-        }
-        snapshot = std::make_unique<AdaptationSnapshot>(
-            build_adaptation_snapshot(
-                state.membership,
-                state.current_epoch,
-                AcceptedEvidenceView{
-                    accepted.empty() ? nullptr : accepted.data(),
-                    accepted_prefix_size},
-                evidence_cutoff,
-                state.config.responsiveness_policy,
-                state.config.snapshot_seed));
+        snapshot = state.build_snapshot(
+            accepted, prefix.size, evidence_cutoff);
     }
     catch (...)
     {
@@ -672,151 +834,8 @@ AdaptiveV2ByzantineSelection::select_through(
         planned_outstanding_timeouts);
     state.guard_audit_cursor = planned_audit_cursor;
     state.current_cutoff = evidence_cutoff;
-
-    auto output = state.result(
-        AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
-        evidence_cutoff);
-    output.snapshot = std::move(snapshot);
-    try
-    {
-        std::map<ReplicaID, const ReplicaAdaptationResult *>
-            snapshot_by_replica;
-        for (const auto &entry : output.snapshot->ranking())
-            snapshot_by_replica.emplace(entry.replica_id, &entry);
-
-        output.eligible_candidates.reserve(state.membership.size());
-        for (std::size_t index = 0;
-             index < state.membership.size();
-             ++index)
-        {
-            const auto replica_id = state.membership[index];
-            const auto snapshot_found =
-                snapshot_by_replica.find(replica_id);
-            if (snapshot_found == snapshot_by_replica.end())
-            {
-                state.healthy = false;
-                output.status =
-                    AdaptiveV2SelectionStatus::snapshot_failed;
-                output.eligible_candidates.clear();
-                return output;
-            }
-
-            AdaptiveV2CandidateAudit audit;
-            audit.replica_id = replica_id;
-            audit.snapshot_classification =
-                snapshot_found->second->classification;
-            audit.baseline_score =
-                state.baseline_scores[index].score;
-            audit.current_score =
-                state.reputation.score(replica_id);
-            audit.baseline_score_delta =
-                static_cast<std::int64_t>(audit.current_score) -
-                static_cast<std::int64_t>(audit.baseline_score);
-            audit.guard_drawdown = state.guard_drawdowns[index];
-
-            const auto target_found = timeout_counts.find(replica_id);
-            if (target_found != timeout_counts.end())
-            {
-                for (const auto &reporter : target_found->second)
-                {
-                    if (std::numeric_limits<std::uint64_t>::max() -
-                            audit.total_uncompensated_timeouts <
-                        reporter.second)
-                    {
-                        state.healthy = false;
-                        output.status =
-                            AdaptiveV2SelectionStatus::capacity_exceeded;
-                        output.eligible_candidates.clear();
-                        return output;
-                    }
-                    audit.total_uncompensated_timeouts +=
-                        reporter.second;
-                    if (reporter.second >=
-                        state.config.minimum_timeouts_per_reporter)
-                    {
-                        audit.qualifying_reporters.push_back(
-                            reporter.first);
-                    }
-                }
-            }
-
-            audit.snapshot_nonresponsive =
-                audit.snapshot_classification ==
-                ResponsivenessClass::nonresponsive;
-            audit.score_drop_satisfied =
-                audit.guard_drawdown <=
-                -static_cast<std::int64_t>(
-                    state.config.minimum_score_drop);
-            audit.reporter_guard_satisfied =
-                audit.qualifying_reporters.size() >=
-                static_cast<std::size_t>(
-                    state.quorum.fault_threshold + 1U);
-            audit.guarded_eligible =
-                audit.snapshot_nonresponsive &&
-                audit.score_drop_satisfied &&
-                audit.reporter_guard_satisfied;
-            if (audit.guarded_eligible)
-            {
-                output.eligible_candidates.push_back(
-                    std::move(audit));
-            }
-        }
-
-        std::sort(
-            output.eligible_candidates.begin(),
-            output.eligible_candidates.end(),
-            candidate_ranks_before);
-        if (output.eligible_candidates.size() <
-            state.config.required_nonresponsive)
-        {
-            return output;
-        }
-
-        output.selected_replicas.reserve(
-            state.config.required_nonresponsive);
-        for (std::size_t index = 0;
-             index < state.config.required_nonresponsive;
-             ++index)
-        {
-            output.selected_replicas.push_back(
-                output.eligible_candidates[index].replica_id);
-        }
-
-        const std::set<ReplicaID> selected(
-            output.selected_replicas.begin(),
-            output.selected_replicas.end());
-        output.eligible_roots.reserve(state.quorum.quorum);
-        for (const auto &entry : output.snapshot->ranking())
-        {
-            if (entry.classification ==
-                    ResponsivenessClass::responsive &&
-                entry.eligible &&
-                selected.find(entry.replica_id) == selected.end())
-            {
-                output.eligible_roots.push_back(entry.replica_id);
-            }
-        }
-        if (output.eligible_roots.size() < state.quorum.quorum)
-        {
-            output.status =
-                AdaptiveV2SelectionStatus::insufficient_eligible_roots;
-            output.selected_replicas.clear();
-            output.eligible_roots.clear();
-            return output;
-        }
-    }
-    catch (...)
-    {
-        state.healthy = false;
-        output.status = AdaptiveV2SelectionStatus::internal_failure;
-        output.eligible_candidates.clear();
-        output.selected_replicas.clear();
-        output.eligible_roots.clear();
-        return output;
-    }
-
-    output.status = AdaptiveV2SelectionStatus::selected;
-    return output;
+    return state.select_candidates(
+        std::move(snapshot), timeout_counts, evidence_cutoff);
 }
 
 const std::vector<AdaptiveV2ReplicaScore> &

@@ -159,6 +159,120 @@ struct AdaptiveV2ManagerController::State
         return AdaptiveV2ManagerControllerStatus::unhealthy;
     }
 
+    AdaptiveV2ManagerControllerStatus freeze_baseline(
+        std::uint64_t cutoff)
+    {
+        if (baseline_examined)
+        {
+            if (cutoff < last_baseline_examined_cutoff)
+                return fail_closed();
+            if (cutoff == last_baseline_examined_cutoff)
+            {
+                return AdaptiveV2ManagerControllerStatus::
+                    awaiting_responsive_baseline;
+            }
+        }
+        baseline_examined = true;
+        last_baseline_examined_cutoff = cutoff;
+
+        const auto prefix = accepted_prefix(
+            ingress.ledger(), ingress.membership(), epoch, cutoff);
+        auto candidate = std::make_unique<AdaptationSnapshot>(
+            build_adaptation_snapshot(
+                ingress.membership(),
+                epoch,
+                prefix,
+                cutoff,
+                config.selection.responsiveness_policy,
+                config.selection.snapshot_seed));
+        const auto baseline = validate_baseline_snapshot(
+            *candidate,
+            ingress.membership(),
+            epoch,
+            cutoff,
+            prefix.size,
+            config.selection.responsiveness_policy,
+            config.selection.snapshot_seed);
+        if (baseline == BaselineSnapshotStatus::invalid)
+            return fail_closed();
+        if (baseline == BaselineSnapshotStatus::incomplete)
+        {
+            return AdaptiveV2ManagerControllerStatus::
+                awaiting_responsive_baseline;
+        }
+
+        const auto frozen = selector.freeze_baseline(cutoff);
+        if (frozen != AdaptiveV2SelectionStatus::baseline_frozen ||
+            !selector.healthy() ||
+            selector.baseline_cutoff() != cutoff ||
+            selector.current_cutoff() != cutoff)
+        {
+            return fail_closed();
+        }
+        baseline_snapshot = std::move(candidate);
+        return AdaptiveV2ManagerControllerStatus::baseline_frozen;
+    }
+
+    AdaptiveV2ManagerControllerStatus build_successor()
+    {
+        if (factory_attempted)
+            return fail_closed();
+        factory_attempted = true;
+        auto built = build_adaptive_v2_successor_bundle(
+            ingress.current_epoch(),
+            *latest_selection,
+            config.placement,
+            config.activation_delay_blocks,
+            config.issuer_id,
+            config.issuer_private_key,
+            config.bundle_limits);
+        if (!built || built.bundle == nullptr)
+            return fail_closed();
+        successor = std::move(built.bundle);
+        return AdaptiveV2ManagerControllerStatus::successor_ready;
+    }
+
+    AdaptiveV2ManagerControllerStatus select_successor(
+        std::uint64_t cutoff)
+    {
+        if (cutoff < selector.current_cutoff())
+            return fail_closed();
+        if (cutoff == selector.current_cutoff())
+        {
+            return AdaptiveV2ManagerControllerStatus::
+                awaiting_guarded_selection;
+        }
+
+        auto selected = selector.select_through(cutoff);
+        latest_selection =
+            std::make_unique<AdaptiveV2SelectionResult>(
+                std::move(selected));
+        if (!selector.healthy())
+            return fail_closed();
+
+        switch (latest_selection->status)
+        {
+        case AdaptiveV2SelectionStatus::insufficient_guarded_candidates:
+        case AdaptiveV2SelectionStatus::insufficient_eligible_roots:
+            return AdaptiveV2ManagerControllerStatus::
+                awaiting_guarded_selection;
+        case AdaptiveV2SelectionStatus::selected:
+            break;
+        case AdaptiveV2SelectionStatus::baseline_frozen:
+        case AdaptiveV2SelectionStatus::invalid_state:
+        case AdaptiveV2SelectionStatus::invalid_cutoff:
+        case AdaptiveV2SelectionStatus::ledger_unhealthy:
+        case AdaptiveV2SelectionStatus::mixed_epoch:
+        case AdaptiveV2SelectionStatus::nonmember_evidence:
+        case AdaptiveV2SelectionStatus::projection_failed:
+        case AdaptiveV2SelectionStatus::capacity_exceeded:
+        case AdaptiveV2SelectionStatus::snapshot_failed:
+        case AdaptiveV2SelectionStatus::internal_failure:
+            return fail_closed();
+        }
+        return build_successor();
+    }
+
     const AdaptiveV2ManagerIngress &ingress;
     AdaptiveV2ManagerControllerConfig config;
     AdaptationEpochId epoch;
@@ -195,112 +309,8 @@ AdaptiveV2ManagerController::evaluate() noexcept
 
         const auto cutoff = state.ingress.ledger().high_watermark();
         if (!state.selector.baseline_frozen())
-        {
-            if (state.baseline_examined)
-            {
-                if (cutoff < state.last_baseline_examined_cutoff)
-                    return state.fail_closed();
-                if (cutoff == state.last_baseline_examined_cutoff)
-                {
-                    return AdaptiveV2ManagerControllerStatus::
-                        awaiting_responsive_baseline;
-                }
-            }
-            state.baseline_examined = true;
-            state.last_baseline_examined_cutoff = cutoff;
-
-            const auto prefix = accepted_prefix(
-                state.ingress.ledger(),
-                state.ingress.membership(),
-                state.epoch,
-                cutoff);
-            auto candidate = std::make_unique<AdaptationSnapshot>(
-                build_adaptation_snapshot(
-                    state.ingress.membership(),
-                    state.epoch,
-                    prefix,
-                    cutoff,
-                    state.config.selection.responsiveness_policy,
-                    state.config.selection.snapshot_seed));
-            const auto baseline = validate_baseline_snapshot(
-                *candidate,
-                state.ingress.membership(),
-                state.epoch,
-                cutoff,
-                prefix.size,
-                state.config.selection.responsiveness_policy,
-                state.config.selection.snapshot_seed);
-            if (baseline == BaselineSnapshotStatus::invalid)
-                return state.fail_closed();
-            if (baseline == BaselineSnapshotStatus::incomplete)
-            {
-                return AdaptiveV2ManagerControllerStatus::
-                    awaiting_responsive_baseline;
-            }
-
-            const auto frozen = state.selector.freeze_baseline(cutoff);
-            if (frozen != AdaptiveV2SelectionStatus::baseline_frozen ||
-                !state.selector.healthy() ||
-                state.selector.baseline_cutoff() != cutoff ||
-                state.selector.current_cutoff() != cutoff)
-            {
-                return state.fail_closed();
-            }
-            state.baseline_snapshot = std::move(candidate);
-            return AdaptiveV2ManagerControllerStatus::baseline_frozen;
-        }
-
-        if (cutoff < state.selector.current_cutoff())
-            return state.fail_closed();
-        if (cutoff == state.selector.current_cutoff())
-        {
-            return AdaptiveV2ManagerControllerStatus::
-                awaiting_guarded_selection;
-        }
-
-        auto selected = state.selector.select_through(cutoff);
-        state.latest_selection =
-            std::make_unique<AdaptiveV2SelectionResult>(
-                std::move(selected));
-        if (!state.selector.healthy())
-            return state.fail_closed();
-
-        switch (state.latest_selection->status)
-        {
-        case AdaptiveV2SelectionStatus::insufficient_guarded_candidates:
-        case AdaptiveV2SelectionStatus::insufficient_eligible_roots:
-            return AdaptiveV2ManagerControllerStatus::
-                awaiting_guarded_selection;
-        case AdaptiveV2SelectionStatus::selected:
-            break;
-        case AdaptiveV2SelectionStatus::baseline_frozen:
-        case AdaptiveV2SelectionStatus::invalid_state:
-        case AdaptiveV2SelectionStatus::invalid_cutoff:
-        case AdaptiveV2SelectionStatus::ledger_unhealthy:
-        case AdaptiveV2SelectionStatus::mixed_epoch:
-        case AdaptiveV2SelectionStatus::nonmember_evidence:
-        case AdaptiveV2SelectionStatus::projection_failed:
-        case AdaptiveV2SelectionStatus::capacity_exceeded:
-        case AdaptiveV2SelectionStatus::snapshot_failed:
-        case AdaptiveV2SelectionStatus::internal_failure:
-            return state.fail_closed();
-        }
-
-        if (state.factory_attempted)
-            return state.fail_closed();
-        state.factory_attempted = true;
-        auto built = build_adaptive_v2_successor_bundle(
-            state.ingress.current_epoch(),
-            *state.latest_selection,
-            state.config.placement,
-            state.config.activation_delay_blocks,
-            state.config.issuer_id,
-            state.config.issuer_private_key,
-            state.config.bundle_limits);
-        if (!built || built.bundle == nullptr)
-            return state.fail_closed();
-        state.successor = std::move(built.bundle);
-        return AdaptiveV2ManagerControllerStatus::successor_ready;
+            return state.freeze_baseline(cutoff);
+        return state.select_successor(cutoff);
     }
     catch (...)
     {

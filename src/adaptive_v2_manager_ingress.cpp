@@ -468,10 +468,8 @@ struct AdaptiveV2ManagerIngress::State
     {
         if (increment(counter))
             return true;
-        if (increment(audit.capacity_failures))
-            fail_closed();
-        else
-            fail_closed();
+        increment(audit.capacity_failures);
+        fail_closed();
         return false;
     }
 

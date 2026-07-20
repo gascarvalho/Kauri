@@ -450,69 +450,99 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
     }
 }
 
+struct AdaptiveEventDescriptor
+{
+    AdaptiveAggregationTransition transition;
+    StructuredEventType type;
+    const char *name;
+};
+
+constexpr AdaptiveEventDescriptor kAdaptiveEventDescriptors[] = {
+    {AdaptiveAggregationTransition::configuration_active,
+     StructuredEventType::adaptive_configuration_active,
+     "adaptive.configuration_active"},
+    {AdaptiveAggregationTransition::required_set_ready,
+     StructuredEventType::aggregation_required_set_ready,
+     "aggregation.required_set_ready"},
+    {AdaptiveAggregationTransition::initial_reserved,
+     StructuredEventType::aggregation_initial_reserved,
+     "aggregation.initial_reserved"},
+    {AdaptiveAggregationTransition::initial_enqueued,
+     StructuredEventType::aggregation_initial_enqueued,
+     "aggregation.initial_enqueued"},
+    {AdaptiveAggregationTransition::initial_committed,
+     StructuredEventType::aggregation_initial_committed,
+     "aggregation.initial_committed"},
+    {AdaptiveAggregationTransition::initial_released,
+     StructuredEventType::aggregation_initial_released,
+     "aggregation.initial_released"},
+    {AdaptiveAggregationTransition::delta_reserved,
+     StructuredEventType::aggregation_delta_reserved,
+     "aggregation.delta_reserved"},
+    {AdaptiveAggregationTransition::delta_enqueued,
+     StructuredEventType::aggregation_delta_enqueued,
+     "aggregation.delta_enqueued"},
+    {AdaptiveAggregationTransition::delta_committed,
+     StructuredEventType::aggregation_delta_committed,
+     "aggregation.delta_committed"},
+    {AdaptiveAggregationTransition::delta_released,
+     StructuredEventType::aggregation_delta_released,
+     "aggregation.delta_released"},
+    {AdaptiveAggregationTransition::delta_rejected,
+     StructuredEventType::aggregation_delta_rejected,
+     "aggregation.delta_rejected"},
+    {AdaptiveAggregationTransition::required_branch_incomplete,
+     StructuredEventType::aggregation_required_branch_incomplete,
+     "aggregation.required_branch_incomplete"},
+    {AdaptiveAggregationTransition::
+         wait_exempt_absent_at_observation_deadline,
+     StructuredEventType::aggregation_wait_exempt_absent,
+     "aggregation.wait_exempt_absent_at_observation_deadline"},
+    {AdaptiveAggregationTransition::wait_exempt_late_accepted,
+     StructuredEventType::aggregation_wait_exempt_late_accepted,
+     "aggregation.wait_exempt_late_accepted"},
+    {AdaptiveAggregationTransition::retry_exhausted,
+     StructuredEventType::aggregation_retry_exhausted,
+     "aggregation.retry_exhausted"},
+    {AdaptiveAggregationTransition::proposal_aborted,
+     StructuredEventType::aggregation_proposal_aborted,
+     "aggregation.proposal_aborted"},
+    {AdaptiveAggregationTransition::root_quorum_progress,
+     StructuredEventType::aggregation_root_quorum_progress,
+     "aggregation.root_quorum_progress"},
+    {AdaptiveAggregationTransition::root_qc_published,
+     StructuredEventType::aggregation_root_qc_published,
+     "aggregation.root_qc_published"},
+};
+
+constexpr std::size_t kAdaptiveEventDescriptorCount =
+    sizeof(kAdaptiveEventDescriptors) /
+    sizeof(kAdaptiveEventDescriptors[0]);
+
 bool adaptive_payload_type(
     const AdaptiveAggregationStructuredEvent &event,
     StructuredEventType &type) noexcept
 {
-    switch (event.transition)
-    {
-        case AdaptiveAggregationTransition::configuration_active:
-            type = StructuredEventType::adaptive_configuration_active;
-            return true;
-        case AdaptiveAggregationTransition::required_set_ready:
-            type = StructuredEventType::aggregation_required_set_ready;
-            return true;
-        case AdaptiveAggregationTransition::initial_reserved:
-            type = StructuredEventType::aggregation_initial_reserved;
-            return true;
-        case AdaptiveAggregationTransition::initial_enqueued:
-            type = StructuredEventType::aggregation_initial_enqueued;
-            return true;
-        case AdaptiveAggregationTransition::initial_committed:
-            type = StructuredEventType::aggregation_initial_committed;
-            return true;
-        case AdaptiveAggregationTransition::initial_released:
-            type = StructuredEventType::aggregation_initial_released;
-            return true;
-        case AdaptiveAggregationTransition::delta_reserved:
-            type = StructuredEventType::aggregation_delta_reserved;
-            return true;
-        case AdaptiveAggregationTransition::delta_enqueued:
-            type = StructuredEventType::aggregation_delta_enqueued;
-            return true;
-        case AdaptiveAggregationTransition::delta_committed:
-            type = StructuredEventType::aggregation_delta_committed;
-            return true;
-        case AdaptiveAggregationTransition::delta_released:
-            type = StructuredEventType::aggregation_delta_released;
-            return true;
-        case AdaptiveAggregationTransition::delta_rejected:
-            type = StructuredEventType::aggregation_delta_rejected;
-            return true;
-        case AdaptiveAggregationTransition::required_branch_incomplete:
-            type = StructuredEventType::aggregation_required_branch_incomplete;
-            return true;
-        case AdaptiveAggregationTransition::
-                 wait_exempt_absent_at_observation_deadline:
-            type = StructuredEventType::aggregation_wait_exempt_absent;
-            return true;
-        case AdaptiveAggregationTransition::wait_exempt_late_accepted:
-            type = StructuredEventType::aggregation_wait_exempt_late_accepted;
-            return true;
-        case AdaptiveAggregationTransition::retry_exhausted:
-            type = StructuredEventType::aggregation_retry_exhausted;
-            return true;
-        case AdaptiveAggregationTransition::proposal_aborted:
-            type = StructuredEventType::aggregation_proposal_aborted;
-            return true;
-        case AdaptiveAggregationTransition::root_quorum_progress:
-            type = StructuredEventType::aggregation_root_quorum_progress;
-            return true;
-        case AdaptiveAggregationTransition::root_qc_published:
-            type = StructuredEventType::aggregation_root_qc_published;
-            return true;
-    }
-    return false;
+    const auto value = static_cast<std::uint8_t>(event.transition);
+    if (value == 0 || value > kAdaptiveEventDescriptorCount)
+        return false;
+    const auto &descriptor = kAdaptiveEventDescriptors[value - 1];
+    if (descriptor.transition != event.transition)
+        return false;
+    type = descriptor.type;
+    return true;
+}
+
+const char *adaptive_event_type_name(StructuredEventType type) noexcept
+{
+    const auto first = static_cast<std::uint8_t>(
+        StructuredEventType::adaptive_configuration_active);
+    const auto value = static_cast<std::uint8_t>(type);
+    if (value < first || value - first >= kAdaptiveEventDescriptorCount)
+        return nullptr;
+    const auto &descriptor =
+        kAdaptiveEventDescriptors[value - first];
+    return descriptor.type == type ? descriptor.name : nullptr;
 }
 
 bool strictly_increasing(const std::vector<ReplicaID> &values) noexcept
@@ -525,10 +555,10 @@ bool strictly_increasing(const std::vector<ReplicaID> &values) noexcept
 }
 
 bool valid_adaptive_payload(
-    const AdaptiveAggregationStructuredEvent &event) noexcept
+    const AdaptiveAggregationStructuredEvent &event,
+    StructuredEventType &type) noexcept
 {
-    StructuredEventType ignored{};
-    if (!adaptive_payload_type(event, ignored) ||
+    if (!adaptive_payload_type(event, type) ||
         event.configuration.epoch_digest == uint256_t{} ||
         !valid_utf8(event.rejection_reason) ||
         !strictly_increasing(event.wait_exempt_signers) ||
@@ -842,14 +872,13 @@ std::string serialize_event(const StructuredEventConfig &config,
     return builder.finish();
 }
 
-std::string serialize_adaptive_event(
+void append_new_event_envelope(
+    JsonLineBuilder &builder,
     const StructuredEventConfig &config,
-    const AdaptiveAggregationStructuredEvent &event,
     StructuredEventType type,
     std::uint64_t sequence,
     std::uint64_t monotonic_ns)
 {
-    JsonLineBuilder builder(config.limits.maximum_line_bytes);
     builder.append("{\"event_schema_version\":");
     builder.append_integer(kStructuredEventSchemaVersion);
     builder.append(",\"run_id\":");
@@ -867,6 +896,18 @@ std::string serialize_adaptive_event(
     builder.append(",\"event_type\":");
     builder.append_escaped(structured_event_type_name(type));
     builder.append(",\"payload\":");
+}
+
+std::string serialize_adaptive_event(
+    const StructuredEventConfig &config,
+    const AdaptiveAggregationStructuredEvent &event,
+    StructuredEventType type,
+    std::uint64_t sequence,
+    std::uint64_t monotonic_ns)
+{
+    JsonLineBuilder builder(config.limits.maximum_line_bytes);
+    append_new_event_envelope(
+        builder, config, type, sequence, monotonic_ns);
     append_adaptive_payload(builder, event);
     builder.append('}');
     return builder.finish();
@@ -880,23 +921,8 @@ std::string serialize_audit_event(
     std::uint64_t monotonic_ns)
 {
     JsonLineBuilder builder(config.limits.maximum_line_bytes);
-    builder.append("{\"event_schema_version\":");
-    builder.append_integer(kStructuredEventSchemaVersion);
-    builder.append(",\"run_id\":");
-    builder.append_escaped(config.run_id);
-    builder.append(",\"source_kind\":");
-    builder.append_escaped(source_kind_name(config.source.kind));
-    builder.append(",\"source_id\":");
-    builder.append_escaped(config.source.logical_id);
-    builder.append(",\"source_instance\":");
-    builder.append_escaped(config.source.instance_id);
-    builder.append(",\"source_sequence\":");
-    builder.append_integer(sequence);
-    builder.append(",\"source_monotonic_ns\":");
-    builder.append_integer(monotonic_ns);
-    builder.append(",\"event_type\":");
-    builder.append_escaped(structured_event_type_name(type));
-    builder.append(",\"payload\":");
+    append_new_event_envelope(
+        builder, config, type, sequence, monotonic_ns);
     switch (event.index())
     {
         case 0:
@@ -1297,6 +1323,12 @@ StructuredEventType structured_event_type(
 
 const char *structured_event_type_name(StructuredEventType type) noexcept
 {
+    if (const auto *const adaptive_name =
+            adaptive_event_type_name(type))
+    {
+        return adaptive_name;
+    }
+
     switch (type)
     {
         case StructuredEventType::process_started:
@@ -1325,46 +1357,12 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "block.committed";
         case StructuredEventType::block_commit_observed:
             return "block.commit_observed";
-        case StructuredEventType::adaptive_configuration_active:
-            return "adaptive.configuration_active";
-        case StructuredEventType::aggregation_required_set_ready:
-            return "aggregation.required_set_ready";
-        case StructuredEventType::aggregation_initial_reserved:
-            return "aggregation.initial_reserved";
-        case StructuredEventType::aggregation_initial_enqueued:
-            return "aggregation.initial_enqueued";
-        case StructuredEventType::aggregation_initial_committed:
-            return "aggregation.initial_committed";
-        case StructuredEventType::aggregation_initial_released:
-            return "aggregation.initial_released";
-        case StructuredEventType::aggregation_delta_reserved:
-            return "aggregation.delta_reserved";
-        case StructuredEventType::aggregation_delta_enqueued:
-            return "aggregation.delta_enqueued";
-        case StructuredEventType::aggregation_delta_committed:
-            return "aggregation.delta_committed";
-        case StructuredEventType::aggregation_delta_released:
-            return "aggregation.delta_released";
-        case StructuredEventType::aggregation_delta_rejected:
-            return "aggregation.delta_rejected";
-        case StructuredEventType::aggregation_required_branch_incomplete:
-            return "aggregation.required_branch_incomplete";
-        case StructuredEventType::aggregation_wait_exempt_absent:
-            return "aggregation.wait_exempt_absent_at_observation_deadline";
-        case StructuredEventType::aggregation_wait_exempt_late_accepted:
-            return "aggregation.wait_exempt_late_accepted";
-        case StructuredEventType::aggregation_retry_exhausted:
-            return "aggregation.retry_exhausted";
-        case StructuredEventType::aggregation_proposal_aborted:
-            return "aggregation.proposal_aborted";
-        case StructuredEventType::aggregation_root_quorum_progress:
-            return "aggregation.root_quorum_progress";
-        case StructuredEventType::aggregation_root_qc_published:
-            return "aggregation.root_qc_published";
         case StructuredEventType::epoch_command_committed:
             return "epoch.command_committed";
         case StructuredEventType::reputation_evidence_applied:
             return "reputation.evidence_applied";
+        default:
+            break;
     }
     return "unknown";
 }
@@ -1707,8 +1705,7 @@ void StructuredEventSink::emit_adaptive(
 {
     auto &state = *state_;
     StructuredEventType type{};
-    const auto valid = valid_adaptive_payload(event) &&
-                       adaptive_payload_type(event, type);
+    const auto valid = valid_adaptive_payload(event, type);
     state.admit(valid, [&state, &event, type](
                            std::uint64_t sequence,
                            std::uint64_t monotonic_ns) {

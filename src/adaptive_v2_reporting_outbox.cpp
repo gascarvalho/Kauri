@@ -166,6 +166,53 @@ struct AdaptiveV2ReportingOutbox::State
         return AdaptiveV2ReportingEnqueueStatus::queued;
     }
 
+    std::optional<AdaptiveV2ReportingEnqueueStatus>
+    enqueue_precondition() const noexcept
+    {
+        if (!configured_limits)
+        {
+            return AdaptiveV2ReportingEnqueueStatus::
+                invalid_configuration;
+        }
+        if (!diagnostics.healthy)
+            return AdaptiveV2ReportingEnqueueStatus::unhealthy;
+        if (diagnostics.stopped)
+            return AdaptiveV2ReportingEnqueueStatus::stopped;
+        return std::nullopt;
+    }
+
+    template <typename Operation>
+    AdaptiveV2ReportingEnqueueStatus guarded_enqueue(
+        Operation &&operation) noexcept
+    {
+        try
+        {
+            return std::forward<Operation>(operation)();
+        }
+        catch (const std::bad_alloc &)
+        {
+            increment(diagnostics.allocation_failures);
+            diagnostics.healthy = false;
+            return AdaptiveV2ReportingEnqueueStatus::allocation_failure;
+        }
+        catch (const std::invalid_argument &)
+        {
+            increment(diagnostics.payload_failures);
+            return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
+        }
+        catch (const std::length_error &)
+        {
+            increment(diagnostics.payload_failures);
+            return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
+        }
+        catch (...)
+        {
+            increment(diagnostics.internal_failures);
+            diagnostics.healthy = false;
+            return AdaptiveV2ReportingEnqueueStatus::internal_failure;
+        }
+    }
+
     std::uint64_t retry_delay(
         std::uint32_t temporary_failure_count) const noexcept
     {
@@ -214,15 +261,8 @@ AdaptiveV2ReportingOutbox::enqueue_readiness(
     std::uint64_t activation_generation,
     std::uint64_t committed_height) noexcept
 {
-    if (!state_->configured_limits)
-    {
-        return AdaptiveV2ReportingEnqueueStatus::
-            invalid_configuration;
-    }
-    if (!state_->diagnostics.healthy)
-        return AdaptiveV2ReportingEnqueueStatus::unhealthy;
-    if (state_->diagnostics.stopped)
-        return AdaptiveV2ReportingEnqueueStatus::stopped;
+    if (const auto blocked = state_->enqueue_precondition())
+        return *blocked;
     if (state_->diagnostics.last_readiness_sequence ==
         std::numeric_limits<std::uint64_t>::max())
     {
@@ -232,8 +272,7 @@ AdaptiveV2ReportingOutbox::enqueue_readiness(
 
     const auto next_sequence =
         state_->diagnostics.last_readiness_sequence + 1;
-    try
-    {
+    return state_->guarded_enqueue([&]() {
         AdaptiveV2ReadinessNotice notice;
         notice.claimed_source_replica_id =
             state_->config.source_replica_id;
@@ -255,44 +294,15 @@ AdaptiveV2ReportingOutbox::enqueue_readiness(
                 next_sequence;
         }
         return status;
-    }
-    catch (const std::bad_alloc &)
-    {
-        increment(state_->diagnostics.allocation_failures);
-        state_->diagnostics.healthy = false;
-        return AdaptiveV2ReportingEnqueueStatus::allocation_failure;
-    }
-    catch (const std::invalid_argument &)
-    {
-        increment(state_->diagnostics.payload_failures);
-        return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
-    }
-    catch (const std::length_error &)
-    {
-        increment(state_->diagnostics.payload_failures);
-        return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
-    }
-    catch (...)
-    {
-        increment(state_->diagnostics.internal_failures);
-        state_->diagnostics.healthy = false;
-        return AdaptiveV2ReportingEnqueueStatus::internal_failure;
-    }
+    });
 }
 
 AdaptiveV2ReportingEnqueueStatus
 AdaptiveV2ReportingOutbox::enqueue_lifecycle(
     const ProposalLifecycleFact &fact) noexcept
 {
-    if (!state_->configured_limits)
-    {
-        return AdaptiveV2ReportingEnqueueStatus::
-            invalid_configuration;
-    }
-    if (!state_->diagnostics.healthy)
-        return AdaptiveV2ReportingEnqueueStatus::unhealthy;
-    if (state_->diagnostics.stopped)
-        return AdaptiveV2ReportingEnqueueStatus::stopped;
+    if (const auto blocked = state_->enqueue_precondition())
+        return *blocked;
 
     const auto maximum = std::numeric_limits<std::uint64_t>::max();
     // The lifecycle wire reserves UINT64_MAX as integer_overflow.
@@ -310,8 +320,7 @@ AdaptiveV2ReportingOutbox::enqueue_lifecycle(
 
     const auto next_sequence =
         state_->diagnostics.last_lifecycle_sequence + 1;
-    try
-    {
+    return state_->guarded_enqueue([&]() {
         ProposalLifecycleNotice notice;
         notice.source_replica_id = state_->config.source_replica_id;
         notice.source_sequence = next_sequence;
@@ -339,44 +348,15 @@ AdaptiveV2ReportingOutbox::enqueue_lifecycle(
                 next_sequence;
         }
         return status;
-    }
-    catch (const std::bad_alloc &)
-    {
-        increment(state_->diagnostics.allocation_failures);
-        state_->diagnostics.healthy = false;
-        return AdaptiveV2ReportingEnqueueStatus::allocation_failure;
-    }
-    catch (const std::invalid_argument &)
-    {
-        increment(state_->diagnostics.payload_failures);
-        return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
-    }
-    catch (const std::length_error &)
-    {
-        increment(state_->diagnostics.payload_failures);
-        return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
-    }
-    catch (...)
-    {
-        increment(state_->diagnostics.internal_failures);
-        state_->diagnostics.healthy = false;
-        return AdaptiveV2ReportingEnqueueStatus::internal_failure;
-    }
+    });
 }
 
 AdaptiveV2ReportingEnqueueStatus
 AdaptiveV2ReportingOutbox::enqueue_evidence(
     const bytearray_t &canonical_payload) noexcept
 {
-    if (!state_->configured_limits)
-    {
-        return AdaptiveV2ReportingEnqueueStatus::
-            invalid_configuration;
-    }
-    if (!state_->diagnostics.healthy)
-        return AdaptiveV2ReportingEnqueueStatus::unhealthy;
-    if (state_->diagnostics.stopped)
-        return AdaptiveV2ReportingEnqueueStatus::stopped;
+    if (const auto blocked = state_->enqueue_precondition())
+        return *blocked;
     if (!state_->has_capacity(canonical_payload.size()))
     {
         return AdaptiveV2ReportingEnqueueStatus::capacity_exceeded;
@@ -435,8 +415,7 @@ AdaptiveV2ReportingOutbox::enqueue_evidence(
         previous_sequence = observation.reporter_sequence;
     }
 
-    try
-    {
+    return state_->guarded_enqueue([&]() {
         const auto reencoded = encode_evidence_batch(
             *decoded.batch, state_->config.limits.evidence_wire);
         if (reencoded != canonical_payload)
@@ -462,29 +441,7 @@ AdaptiveV2ReportingOutbox::enqueue_evidence(
                 last_sequence;
         }
         return status;
-    }
-    catch (const std::bad_alloc &)
-    {
-        increment(state_->diagnostics.allocation_failures);
-        state_->diagnostics.healthy = false;
-        return AdaptiveV2ReportingEnqueueStatus::allocation_failure;
-    }
-    catch (const std::invalid_argument &)
-    {
-        increment(state_->diagnostics.payload_failures);
-        return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
-    }
-    catch (const std::length_error &)
-    {
-        increment(state_->diagnostics.payload_failures);
-        return AdaptiveV2ReportingEnqueueStatus::invalid_payload;
-    }
-    catch (...)
-    {
-        increment(state_->diagnostics.internal_failures);
-        state_->diagnostics.healthy = false;
-        return AdaptiveV2ReportingEnqueueStatus::internal_failure;
-    }
+    });
 }
 
 const AdaptiveV2PendingReport *

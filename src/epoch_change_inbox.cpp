@@ -124,6 +124,13 @@ struct AdaptiveV2CommandInbox::State
         std::optional<ProposalKey> in_flight_proposal;
         std::optional<ConfigurationId> latest_configuration;
         std::optional<std::uint64_t> latest_generation;
+
+        void clear_reservation() noexcept
+        {
+            reservation_token.reset();
+            reservation_configuration.reset();
+            reservation_generation.reset();
+        }
     };
 
     explicit State(AdaptiveV2CommandInboxLimits configured_limits)
@@ -412,9 +419,7 @@ bool AdaptiveV2CommandInbox::release(
         return false;
     }
     record.disposition = AdaptiveV2CommandInboxState::available;
-    record.reservation_token.reset();
-    record.reservation_configuration.reset();
-    record.reservation_generation.reset();
+    record.clear_reservation();
     return true;
 }
 
@@ -438,9 +443,7 @@ bool AdaptiveV2CommandInbox::mark_proposed(
     }
     record.disposition = AdaptiveV2CommandInboxState::in_flight;
     record.in_flight_proposal = proposal;
-    record.reservation_token.reset();
-    record.reservation_configuration.reset();
-    record.reservation_generation.reset();
+    record.clear_reservation();
     return true;
 }
 
@@ -467,9 +470,7 @@ bool AdaptiveV2CommandInbox::observe_authoritative_commit(
     }
 
     record.disposition = AdaptiveV2CommandInboxState::retired;
-    record.reservation_token.reset();
-    record.reservation_configuration.reset();
-    record.reservation_generation.reset();
+    record.clear_reservation();
     record.in_flight_proposal.reset();
     return true;
 }
