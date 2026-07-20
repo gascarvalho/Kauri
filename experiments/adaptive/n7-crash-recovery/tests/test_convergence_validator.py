@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -95,6 +96,55 @@ def test_complete_exact_n7_f2_q5_convergence_run_passes_only_canonical_inputs(
         for path in output.rglob("*")
         for token in ("throughput", "tps", "figure", "plot")
     )
+
+
+@pytest.mark.parametrize("mutation", ("missing", "wrong", "duplicate"))
+def test_manager_deadline_control_must_be_exact_and_unique(
+    tmp_path: Path, mutation: str
+) -> None:
+    manifest, epochs = convergence_run.create_run(tmp_path / mutation)
+    document = convergence_run.load(manifest)
+    arguments = document["manager_argv"]
+    option_index = arguments.index("--convergence-deadline-seconds")
+    if mutation == "missing":
+        del arguments[option_index : option_index + 2]
+    elif mutation == "wrong":
+        arguments[option_index + 1] = "119"
+    else:
+        arguments[option_index:option_index] = [
+            "--convergence-deadline-seconds",
+            "120",
+        ]
+    convergence_run.save(manifest, document)
+
+    verdict = _validator().validate_run(
+        manifest, epochs, tmp_path / f"validated-{mutation}"
+    )
+
+    assert verdict["verdict"] == "FAIL"
+
+
+def test_byte_frozen_profile_rejects_semantically_equivalent_reformat(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = convergence_run.create_run(tmp_path / "reformatted")
+    document = convergence_run.load(manifest)
+    profile_artifact = next(
+        item for item in document["artifacts"] if item["kind"] == "profile"
+    )
+    profile_path = manifest.parent / profile_artifact["path"]
+    profile = convergence_run.load(profile_path)
+    profile_path.write_text(json.dumps(profile, indent=1) + "\n", encoding="utf-8")
+    digest = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    profile_artifact["sha256"] = digest
+    document["profile"]["sha256"] = digest
+    convergence_run.save(manifest, document)
+
+    verdict = _validator().validate_run(
+        manifest, epochs, tmp_path / "validated-reformatted"
+    )
+
+    assert verdict["verdict"] == "FAIL"
 
 
 def test_synthetic_sigkill_streams_have_exact_runner_ground_truth(

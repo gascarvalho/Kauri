@@ -18,8 +18,8 @@ import uuid
 import run as base
 
 
-PROFILE_ID = "n7-f2-q5-epoch1-convergence-v1"
-PROFILE_SHA256 = "0e8aa163a8c73fa4fae3a4c129b4648aa387013344c94b93a87bab2c36d1937a"
+PROFILE_ID = "n7-f2-q5-epoch1-convergence-v2"
+PROFILE_SHA256 = "4146e736501e5b6f07409ccf83cd3b2b39fbefee3a89590f47b03bdcc1db16ae"
 SCENARIO = "n7-epoch1-convergence"
 RESULT_ROOT_NAME = "n7-epoch1-convergence"
 MANAGER_SOURCE_ID = "adaptive-manager"
@@ -62,6 +62,7 @@ def _expected_profile() -> dict[str, Any]:
         "timeouts": {
             "startup_s": 90,
             "phase_s": 240,
+            "manager_convergence_deadline_s": 120,
             "crash_confirm_s": 5,
             "ack_drain_s": 2,
         },
@@ -99,6 +100,22 @@ def loss_control_arguments(profile: Mapping[str, Any]) -> tuple[str, ...]:
         bundle_attempt,
         "--experiment-drop-activation-ack",
         acknowledgement_ordinal,
+    )
+
+
+def manager_convergence_arguments(
+    profile: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Translate the exact v2 manager deadline and one-shot loss controls."""
+    if dict(profile) != _expected_profile():
+        raise RunnerError("manager controls require the exact convergence profile")
+    deadline_seconds = profile["timeouts"][
+        "manager_convergence_deadline_s"
+    ]
+    return (
+        "--convergence-deadline-seconds",
+        str(deadline_seconds),
+        *loss_control_arguments(profile),
     )
 
 
@@ -438,7 +455,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             source_instances=source_instances,
             app_binary=binaries["app"],
             manager_binary=binaries["manager"],
-            manager_extra_args=loss_control_arguments(profile),
+            manager_extra_args=manager_convergence_arguments(profile),
         )
         state["phase"] = "launch"
         base._replace_json(state_path, state)

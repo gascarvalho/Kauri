@@ -420,6 +420,24 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager exposes a bounded convergence deadline while preserving the default",
+    "[adaptive-v2][convergence][manager][deadline][configuration]")
+{
+    const auto manager = source("examples/adaptation_manager.cpp");
+    const auto compact = without_whitespace(
+        code_without_comments_or_literals(manager));
+
+    CHECK(manager.find("convergence-deadline-seconds") !=
+          std::string::npos);
+    CHECK(manager.find("kConvergenceDefaultDeadlineTicks = 120") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "convergence_config.convergence_deadline_tick="
+              "convergence_tick_+options_.convergence_deadline_ticks") !=
+          std::string::npos);
+}
+
+TEST_CASE(
     "manager pre-bounds convergence observations before copying network payloads",
     "[adaptive-v2][convergence][manager][wire][payload-bound][allocation]")
 {

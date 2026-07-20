@@ -12,7 +12,7 @@ import synthetic_run
 
 RUN_ID = "synthetic-n7-epoch1-convergence"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
-PROFILE_ID = "n7-f2-q5-epoch1-convergence-v1"
+PROFILE_ID = "n7-f2-q5-epoch1-convergence-v2"
 BASE_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 BASE_PROFILE_SHA256 = (
     "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
@@ -65,6 +65,7 @@ def profile_document() -> dict[str, Any]:
         "timeouts": {
             "startup_s": 90,
             "phase_s": 240,
+            "manager_convergence_deadline_s": 120,
             "crash_confirm_s": 5,
             "ack_drain_s": 2,
         },
@@ -572,7 +573,10 @@ def create_run(directory: Path) -> tuple[Path, Path]:
     )
 
     profile_path = directory / "convergence-profile.json"
-    save(profile_path, profile_document())
+    profile_path.write_bytes(
+        (Path(__file__).resolve().parents[1] / "convergence-profile.json")
+        .read_bytes()
+    )
     bundle_path = directory / "successor.bundle"
     bundle_path.write_bytes(BUNDLE_BYTES)
     epochs_path = directory / "epochs.json"
@@ -651,6 +655,8 @@ def create_run(directory: Path) -> tuple[Path, Path]:
         "artifacts": artifacts,
         "manager_argv": [
             "adaptation-manager",
+            "--convergence-deadline-seconds",
+            "120",
             "--experiment-drop-bundle-attempt",
             "2:1",
             "--experiment-drop-activation-ack",

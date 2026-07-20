@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "n7-f2-q5-epoch1-convergence-v1",
+  "profile_id": "n7-f2-q5-epoch1-convergence-v2",
   "frozen": true,
   "base_profile": {
     "identity": "n7-f2-q5-crash-recovery-v2",
@@ -35,6 +35,7 @@
   "timeouts": {
     "startup_s": 90,
     "phase_s": 240,
+    "manager_convergence_deadline_s": 120,
     "crash_confirm_s": 5,
     "ack_drain_s": 2
   }

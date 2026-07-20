@@ -107,7 +107,8 @@ constexpr std::size_t kMaximumQuarantinedSignerEntries = 8192;
 constexpr std::size_t kMaximumQuarantinedPerReporter = 128;
 constexpr std::uint64_t kConvergenceRetryIntervalTicks = 1;
 constexpr std::uint32_t kConvergenceMaximumAttempts = 5;
-constexpr std::uint64_t kConvergenceDeadlineTick = 120;
+constexpr std::uint64_t kConvergenceTicksPerSecond = 10;
+constexpr std::uint64_t kConvergenceDefaultDeadlineTicks = 120;
 constexpr double kConvergenceTimerSeconds = 0.1;
 // Cover the replica outbox's one-second capped ACK retry backoff and leave
 // one convergence timer interval for scheduling and transport dispatch.
@@ -142,6 +143,8 @@ struct ManagerOptions
     hotstuff::EpochChangeIssuerId issuer_id{0};
     PrivKeySecp256k1 issuer_private_key;
     std::uint64_t activation_delay_blocks{5};
+    std::uint64_t convergence_deadline_ticks{
+        kConvergenceDefaultDeadlineTicks};
     std::string bundle_output;
     std::string structured_event_run_id;
     std::string structured_event_source_instance;
@@ -529,6 +532,8 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_issuer_id = Config::OptValStr::create();
     auto opt_issuer_private_key = Config::OptValStr::create();
     auto opt_activation_delay = Config::OptValStr::create("5");
+    auto opt_convergence_deadline_seconds =
+        Config::OptValStr::create("12");
     auto opt_bundle_output = Config::OptValStr::create();
     auto opt_structured_event_run_id = Config::OptValStr::create();
     auto opt_structured_event_source_instance =
@@ -549,6 +554,10 @@ ManagerOptions parse_options(int argc, char **argv)
         "issuer-private-key", opt_issuer_private_key, Config::SET_VAL);
     config.add_opt(
         "activation-delay-blocks", opt_activation_delay,
+        Config::SET_VAL);
+    config.add_opt(
+        "convergence-deadline-seconds",
+        opt_convergence_deadline_seconds,
         Config::SET_VAL);
     config.add_opt("bundle-output", opt_bundle_output, Config::SET_VAL);
     config.add_opt(
@@ -604,6 +613,19 @@ ManagerOptions parse_options(int argc, char **argv)
     (void)issuer_public_key;
     options.activation_delay_blocks = parse_unsigned<std::uint64_t>(
         opt_activation_delay->get(), "activation delay", true);
+    const auto convergence_deadline_seconds =
+        parse_unsigned<std::uint64_t>(
+            opt_convergence_deadline_seconds->get(),
+            "convergence deadline seconds", true);
+    if (convergence_deadline_seconds >
+        std::numeric_limits<std::uint64_t>::max() /
+            kConvergenceTicksPerSecond)
+    {
+        throw std::invalid_argument(
+            "convergence deadline seconds are out of range");
+    }
+    options.convergence_deadline_ticks =
+        convergence_deadline_seconds * kConvergenceTicksPerSecond;
     options.bundle_output = opt_bundle_output->get();
     if (options.bundle_output.empty())
         throw std::invalid_argument("bundle output path is required");
@@ -1019,8 +1041,15 @@ private:
                 kConvergenceRetryIntervalTicks;
             convergence_config.maximum_attempts_per_recipient =
                 kConvergenceMaximumAttempts;
+            if (options_.convergence_deadline_ticks >
+                std::numeric_limits<std::uint64_t>::max() -
+                    convergence_tick_)
+            {
+                throw std::overflow_error(
+                    "convergence deadline tick overflow");
+            }
             convergence_config.convergence_deadline_tick =
-                kConvergenceDeadlineTick;
+                convergence_tick_ + options_.convergence_deadline_ticks;
             convergence_ =
                 std::make_unique<AdaptiveV2ManagerConvergence>(
                     *bundle,

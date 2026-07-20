@@ -45,6 +45,14 @@ def test_repository_convergence_profile_is_the_exact_frozen_contract() -> None:
     assert runner.PROFILE_SHA256 == hashlib.sha256(payload).hexdigest()
 
 
+def test_convergence_profile_versions_the_live_manager_deadline() -> None:
+    path = SCENARIO_DIRECTORY / "convergence-profile.json"
+    profile = json.loads(path.read_bytes())
+
+    assert profile["profile_id"] == "n7-f2-q5-epoch1-convergence-v2"
+    assert profile["timeouts"]["manager_convergence_deadline_s"] == 120
+
+
 def test_runner_reuses_existing_n7_helpers_without_mutating_base_profile() -> None:
     runner = _runner()
 
@@ -63,13 +71,18 @@ def test_base_runner_threads_optional_manager_extra_args_without_changing_defaul
 ) -> None:
     runner = _runner()
     profile = convergence_run.profile_document()
-    loss_arguments = (
+    convergence_arguments = (
+        "--convergence-deadline-seconds",
+        "120",
         "--experiment-drop-bundle-attempt",
         "2:1",
         "--experiment-drop-activation-ack",
         "1",
     )
-    assert runner.loss_control_arguments(profile) == loss_arguments
+    assert (
+        runner.manager_convergence_arguments(profile)
+        == convergence_arguments
+    )
     common = {
         "replicas_tls": [{"crt": f"replica-{replica}.crt"} for replica in range(7)],
         "manager_tls": {"sec": "manager.key", "crt": "manager.crt"},
@@ -86,12 +99,13 @@ def test_base_runner_threads_optional_manager_extra_args_without_changing_defaul
         tmp_path / "adaptation-manager",
         **common,
     )
+    assert "--convergence-deadline-seconds" not in default_command
     convergence_command = base_runner.build_manager_command(
         tmp_path / "adaptation-manager",
-        manager_extra_args=loss_arguments,
+        manager_extra_args=convergence_arguments,
         **common,
     )
-    assert convergence_command == default_command + loss_arguments
+    assert convergence_command == default_command + convergence_arguments
     parameter = inspect.signature(
         base_runner.write_runtime_inputs
     ).parameters["manager_extra_args"]

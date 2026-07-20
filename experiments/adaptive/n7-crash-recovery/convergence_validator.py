@@ -13,7 +13,10 @@ from typing import Any, Mapping, Sequence
 
 
 SCENARIO = "n7-epoch1-convergence"
-PROFILE_ID = "n7-f2-q5-epoch1-convergence-v1"
+PROFILE_ID = "n7-f2-q5-epoch1-convergence-v2"
+PROFILE_SHA256 = (
+    "4146e736501e5b6f07409ccf83cd3b2b39fbefee3a89590f47b03bdcc1db16ae"
+)
 BASE_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 BASE_PROFILE_SHA256 = (
     "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
@@ -384,6 +387,7 @@ def _profile_document() -> dict[str, Any]:
         "timeouts": {
             "startup_s": 90,
             "phase_s": 240,
+            "manager_convergence_deadline_s": 120,
             "crash_confirm_s": 5,
             "ack_drain_s": 2,
         },
@@ -433,7 +437,12 @@ def _load_artifacts(
     if artifacts["epochs"][0] != epochs_path.resolve():
         raise ValidationError("--epochs does not select the manifest epoch artifact")
 
-    profile, _ = _load_json(artifacts["profile"][0], "convergence profile")
+    profile_path, profile_payload = artifacts["profile"]
+    if hashlib.sha256(profile_payload).hexdigest() != PROFILE_SHA256:
+        raise ValidationError(
+            "convergence profile bytes differ from the frozen contract"
+        )
+    profile, _ = _load_json(profile_path, "convergence profile")
     if profile != _profile_document():
         raise ValidationError("convergence profile differs from the frozen contract")
     runner_state, _ = _load_json(artifacts["runner_state"][0], "runner state")
@@ -1376,7 +1385,9 @@ def _validate(
     manifest, manifest_bytes = _load_json(manifest_path, "manifest")
     _exact_fields(manifest, _MANIFEST_FIELDS, "manifest")
     if manifest.get("schema_version") != 1 or manifest.get("scenario") != SCENARIO:
-        raise ValidationError("manifest schema or scenario is not convergence-only v1")
+        raise ValidationError(
+            "manifest schema or scenario is not convergence-only"
+        )
     run_id = _string(manifest.get("run_id"), "manifest.run_id")
     revision = _string(manifest.get("kauri_revision"), "manifest.kauri_revision")
     if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
@@ -1447,13 +1458,22 @@ def _validate(
 
     manager_argv = _list(manifest["manager_argv"], "manifest.manager_argv")
     expected_suffix = [
+        "--convergence-deadline-seconds",
+        "120",
         "--experiment-drop-bundle-attempt",
         "2:1",
         "--experiment-drop-activation-ack",
         "1",
     ]
+    for option in expected_suffix[::2]:
+        if manager_argv.count(option) != 1:
+            raise ValidationError(
+                "manager argv does not contain each convergence control exactly once"
+            )
     if manager_argv[-len(expected_suffix) :] != expected_suffix:
-        raise ValidationError("manager argv does not contain the exact loss controls")
+        raise ValidationError(
+            "manager argv does not contain the exact convergence controls"
+        )
     _validate_runner_state(
         runner_state,
         run_id=run_id,
