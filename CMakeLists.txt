@@ -171,8 +171,11 @@ add_library(hotstuff
     OBJECT
     src/adaptation.cpp
     src/adaptation_manager.cpp
+    src/adaptive_v2_convergence_ack_wire.cpp
+    src/adaptive_v2_convergence_wire.cpp
     src/adaptive_v2_epoch_factory.cpp
     src/adaptive_v2_manager_controller.cpp
+    src/adaptive_v2_manager_convergence.cpp
     src/adaptive_v2_manager_delivery.cpp
     src/adaptive_v2_manager_ingress.cpp
     src/adaptive_v2_reporting_outbox.cpp

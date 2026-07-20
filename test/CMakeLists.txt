@@ -256,6 +256,50 @@ set_tests_properties(
     LABELS "adaptive-v2;manager-delivery;one-shot;quorum;unit"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_adaptive_v2_convergence_wire
+    test_adaptive_v2_convergence_wire.cpp)
+set_tests_properties(
+    test_adaptive_v2_convergence_wire PROPERTIES
+    LABELS "unit;adaptive;adaptive-v2;convergence;wire;c1"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_adaptive_v2_convergence_ack_wire
+    test_adaptive_v2_convergence_ack_wire.cpp)
+set_tests_properties(
+    test_adaptive_v2_convergence_ack_wire PROPERTIES
+    LABELS "unit;adaptive;adaptive-v2;convergence;ack;wire"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_adaptive_v2_manager_convergence
+    test_adaptive_v2_manager_convergence.cpp)
+target_compile_definitions(
+    test_adaptive_v2_manager_convergence PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_adaptive_v2_manager_convergence PROPERTIES
+    LABELS "unit;adaptive;adaptive-v2;manager-convergence;c3"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_adaptive_v2_replica_convergence_wiring
+    test_adaptive_v2_replica_convergence_wiring.cpp)
+target_compile_definitions(
+    test_adaptive_v2_replica_convergence_wiring PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_adaptive_v2_replica_convergence_wiring PROPERTIES
+    LABELS "integration;adaptive;adaptive-v2;convergence;c5;replica-wiring"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_adaptive_v2_manager_convergence_wiring
+    test_adaptive_v2_manager_convergence_wiring.cpp)
+target_compile_definitions(
+    test_adaptive_v2_manager_convergence_wiring PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_adaptive_v2_manager_convergence_wiring PROPERTIES
+    LABELS "integration;adaptive;adaptive-v2;convergence;c6;manager-wiring;structured-event"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_adaptive_v2_reporting_outbox
     test_adaptive_v2_reporting_outbox.cpp)
 set_tests_properties(

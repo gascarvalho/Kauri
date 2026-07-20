@@ -520,6 +520,9 @@ namespace
 using hotstuff::AdaptiveAggregationStructuredEvent;
 using hotstuff::AdaptiveAggregationTransition;
 using hotstuff::AdaptiveStructuredEventEmitter;
+using hotstuff::AdaptiveV2ConvergenceStructuredEvent;
+using hotstuff::AdaptiveV2ConvergenceTransition;
+using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AuditStructuredEventEmitter;
 using hotstuff::AuditStructuredEventPayload;
 using hotstuff::CommitObservedStructuredEvent;
@@ -691,6 +694,78 @@ StructuredEventConfig manager_event_config()
         "manager-spawn-4"};
     config.designated_commit_observer.reset();
     return config;
+}
+
+AdaptiveV2EpochChangeIdentity convergence_event_identity()
+{
+    return {
+        7,
+        digest("convergence-audit-predecessor"),
+        8,
+        digest("convergence-audit-successor"),
+        digest("convergence-audit-command-payload"),
+        2345,
+        digest("convergence-audit-command-block"),
+        20,
+        2365};
+}
+
+template<typename Event, typename = void>
+struct has_convergence_disposition : std::false_type
+{};
+
+template<typename Event>
+struct has_convergence_disposition<
+    Event,
+    std::void_t<decltype(std::declval<Event &>().disposition)>>
+    : std::true_type
+{};
+
+template<typename Event>
+Event convergence_event(
+    AdaptiveV2ConvergenceTransition transition,
+    std::string disposition = {})
+{
+    Event event;
+    event.transition = transition;
+    event.required_activation_count = 5;
+    event.disposition = std::move(disposition);
+    switch (transition)
+    {
+    case AdaptiveV2ConvergenceTransition::delivery_attempt:
+        event.replica_id = 4;
+        event.delivery_attempt = 3;
+        event.canonical_payload_digest =
+            digest("convergence-audit-canonical-payload");
+        break;
+    case AdaptiveV2ConvergenceTransition::commit_observed:
+        event.replica_id = 4;
+        event.identity = convergence_event_identity();
+        event.accepted_commit_count = 1;
+        event.canonical_payload_digest =
+            digest("convergence-audit-canonical-payload");
+        break;
+    case AdaptiveV2ConvergenceTransition::activation_observed:
+        event.replica_id = 4;
+        event.identity = convergence_event_identity();
+        event.accepted_commit_count = 1;
+        event.accepted_activation_count = 1;
+        event.canonical_payload_digest =
+            digest("convergence-audit-canonical-payload");
+        break;
+    case AdaptiveV2ConvergenceTransition::converged:
+    case AdaptiveV2ConvergenceTransition::ready:
+        event.identity = convergence_event_identity();
+        event.accepted_commit_count = 3;
+        event.accepted_activation_count = 5;
+        break;
+    case AdaptiveV2ConvergenceTransition::failure:
+        event.accepted_commit_count = 2;
+        event.accepted_activation_count = 4;
+        event.failure_reason = "activation_deadline_exceeded";
+        break;
+    }
+    return event;
 }
 
 AdaptiveAggregationStructuredEvent adaptive_event(
@@ -1605,8 +1680,13 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 2,
-        "the audit capability admits only committed commands and applied reputation");
+        std::variant_size<AuditStructuredEventPayload>::value == 3,
+        "the audit capability also admits convergence audit events");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<2, AuditStructuredEventPayload>,
+            AdaptiveV2ConvergenceStructuredEvent>::value,
+        "the third audit payload is the adaptive-v2 convergence event");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -1826,6 +1906,313 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         CHECK(rejects(manager_event_config(), invalid));
 
         CHECK(rejects(event_config(), reputation_event()));
+    }
+}
+
+template<typename Event>
+std::string expected_convergence_record(
+    const Event &event,
+    const std::string &event_type,
+    std::uint64_t monotonic_ns)
+{
+    std::string expected =
+        "{\"event_schema_version\":1,"
+        "\"run_id\":\"run-structured-event\","
+        "\"source_kind\":\"adaptation_manager\","
+        "\"source_id\":\"adaptive-manager\","
+        "\"source_instance\":\"manager-spawn-4\","
+        "\"source_sequence\":1,"
+        "\"source_monotonic_ns\":" +
+        std::to_string(monotonic_ns) +
+        ",\"event_type\":\"" + event_type + "\","
+        "\"payload\":{\"replica_id\":";
+    expected += event.replica_id.has_value()
+                    ? std::to_string(*event.replica_id)
+                    : "null";
+    expected += ",\"delivery_attempt\":";
+    expected += event.delivery_attempt != 0
+                    ? std::to_string(event.delivery_attempt)
+                    : "null";
+    expected += ",\"disposition\":";
+    expected += event.disposition.empty()
+                    ? "null"
+                    : "\"" + event.disposition + "\"";
+    expected += ",\"identity\":";
+    if (!event.identity.has_value())
+    {
+        expected += "null";
+    }
+    else
+    {
+        const auto &identity = *event.identity;
+        expected +=
+            "{\"predecessor_epoch_number\":" +
+            std::to_string(identity.predecessor_epoch_number) +
+            ",\"predecessor_epoch_digest\":\"" +
+            identity.predecessor_epoch_digest.to_hex() +
+            "\",\"successor_epoch_number\":" +
+            std::to_string(identity.successor_epoch_number) +
+            ",\"successor_epoch_digest\":\"" +
+            identity.successor_epoch_digest.to_hex() +
+            "\",\"command_payload_digest\":\"" +
+            identity.command_payload_digest.to_hex() +
+            "\",\"command_block_height\":" +
+            std::to_string(identity.command_block_height) +
+            ",\"command_block_hash\":\"" +
+            identity.command_block_hash.to_hex() +
+            "\",\"activation_delay_blocks\":" +
+            std::to_string(identity.activation_delay_blocks) +
+            ",\"activation_height\":" +
+            std::to_string(identity.activation_height) + "}";
+    }
+    expected +=
+        ",\"accepted_commit_count\":" +
+        std::to_string(event.accepted_commit_count) +
+        ",\"accepted_activation_count\":" +
+        std::to_string(event.accepted_activation_count) +
+        ",\"required_activation_count\":" +
+        std::to_string(event.required_activation_count) +
+        ",\"canonical_payload_digest\":";
+    expected += event.canonical_payload_digest.has_value()
+                    ? "\"" +
+                          event.canonical_payload_digest->to_hex() + "\""
+                    : "null";
+    expected += ",\"failure_reason\":";
+    expected += event.failure_reason.empty()
+                    ? "null"
+                    : "\"" + event.failure_reason + "\"";
+    expected += "}}\n";
+    return expected;
+}
+
+template<typename Event>
+void exercise_convergence_structured_event_contract()
+{
+    struct Mapping
+    {
+        AdaptiveV2ConvergenceTransition transition;
+        StructuredEventType type;
+        const char *name;
+        const char *disposition;
+    };
+    const std::array<Mapping, 9> mappings{{
+        {AdaptiveV2ConvergenceTransition::delivery_attempt,
+         StructuredEventType::adaptive_v2_delivery_attempt,
+         "adaptive_v2_delivery_attempt",
+         "enqueued"},
+        {AdaptiveV2ConvergenceTransition::delivery_attempt,
+         StructuredEventType::adaptive_v2_delivery_attempt,
+         "adaptive_v2_delivery_attempt",
+         "injected_drop"},
+        {AdaptiveV2ConvergenceTransition::commit_observed,
+         StructuredEventType::adaptive_v2_commit_observed,
+         "adaptive_v2_commit_observed",
+         "accepted"},
+        {AdaptiveV2ConvergenceTransition::activation_observed,
+         StructuredEventType::adaptive_v2_activation_observed,
+         "adaptive_v2_activation_observed",
+         "accepted"},
+        {AdaptiveV2ConvergenceTransition::activation_observed,
+         StructuredEventType::adaptive_v2_activation_observed,
+         "adaptive_v2_activation_observed",
+         "ack_injected_drop"},
+        {AdaptiveV2ConvergenceTransition::activation_observed,
+         StructuredEventType::adaptive_v2_activation_observed,
+         "adaptive_v2_activation_observed",
+         "ack_sent"},
+        {AdaptiveV2ConvergenceTransition::converged,
+         StructuredEventType::adaptive_v2_converged,
+         "adaptive_v2_converged",
+         ""},
+        {AdaptiveV2ConvergenceTransition::ready,
+         StructuredEventType::adaptive_v2_ready,
+         "adaptive_v2_ready",
+         ""},
+        {AdaptiveV2ConvergenceTransition::failure,
+         StructuredEventType::adaptive_v2_convergence_failure,
+         "adaptive_v2_convergence_failure",
+         ""},
+    }};
+
+    std::uint64_t monotonic_ns = 8100;
+    for (const auto &mapping : mappings)
+    {
+        CAPTURE(mapping.name);
+        const auto event = convergence_event<Event>(
+            mapping.transition, mapping.disposition);
+        const auto type = hotstuff::structured_event_type(
+            AuditStructuredEventPayload{event});
+        CHECK(type == mapping.type);
+        CHECK(std::string(hotstuff::structured_event_type_name(type)) ==
+              mapping.name);
+
+        FakeClock clock({monotonic_ns});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected_convergence_record(
+                  event, mapping.name, monotonic_ns));
+        ++monotonic_ns;
+    }
+
+    const auto rejects = [](
+                             StructuredEventConfig config,
+                             Event event) {
+        FakeClock clock({8200});
+        MemoryOutput output;
+        StructuredEventSink sink(std::move(config), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{std::move(event)});
+        const auto health = sink.health();
+        return !health.healthy && health.stopped &&
+               health.first_failure ==
+                   StructuredEventFailure::invalid_payload &&
+               health.last_assigned_sequence == 0 &&
+               output.bytes().empty();
+    };
+
+    SECTION("delivery outcome distinguishes accepted and failed enqueue")
+    {
+        auto failed = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::delivery_attempt,
+            "enqueue_failed");
+        FakeClock clock({8300});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{failed});
+        sink.shutdown();
+        REQUIRE(sink.health().healthy);
+        CHECK(rendered(output).find(
+                  "\"disposition\":\"enqueue_failed\"") !=
+              std::string::npos);
+
+        failed.disposition = "accepted";
+        CHECK(rejects(manager_event_config(), failed));
+    }
+
+    SECTION("terminal success requires the exact Q-winning identity")
+    {
+        auto missing = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::converged);
+        missing.identity.reset();
+        CHECK(rejects(manager_event_config(), missing));
+
+        missing = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::ready);
+        missing.identity.reset();
+        CHECK(rejects(manager_event_config(), missing));
+    }
+
+    SECTION("terminal success is manager-wide and rejects a replica id")
+    {
+        auto invalid = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::converged);
+        invalid.replica_id = 4;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::ready);
+        invalid.replica_id = 4;
+        CHECK(rejects(manager_event_config(), invalid));
+    }
+
+    SECTION("identity and failure reason validation fail closed")
+    {
+        auto invalid = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::activation_observed,
+            "accepted");
+        invalid.identity->command_block_hash = uint256_t{};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::activation_observed,
+            "accepted");
+        ++invalid.identity->activation_height;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        auto failure = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::failure);
+        failure.failure_reason.clear();
+        CHECK(rejects(manager_event_config(), failure));
+
+        failure = convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::failure);
+        failure.failure_reason = raw_bytes({0xff});
+        CHECK(rejects(manager_event_config(), failure));
+    }
+
+    SECTION("every ingress disposition is auditable without changing authority")
+    {
+        struct IngressCase
+        {
+            const char *disposition;
+            bool authenticated;
+            bool decoded;
+        };
+        const std::array<IngressCase, 9> cases{{
+            {"rejected_unauthenticated_source", false, false},
+            {"rejected_wire_decode", true, false},
+            {"accepted", true, true},
+            {"duplicate", true, true},
+            {"rejected_nonmember", true, true},
+            {"rejected_spoofed_source", true, true},
+            {"rejected_stale", true, true},
+            {"rejected_wrong_identity", true, true},
+            {"conflicting_observation", true, true},
+        }};
+        for (const auto &item : cases)
+        {
+            CAPTURE(item.disposition);
+            Event observation;
+            observation.transition =
+                AdaptiveV2ConvergenceTransition::activation_observed;
+            observation.required_activation_count = 5;
+            observation.disposition = item.disposition;
+            if (item.authenticated)
+                observation.replica_id = 4;
+            if (item.decoded)
+            {
+                observation.identity = convergence_event_identity();
+                observation.canonical_payload_digest =
+                    digest("convergence-audit-canonical-payload");
+            }
+
+            FakeClock clock({8400});
+            MemoryOutput output;
+            StructuredEventSink sink(
+                manager_event_config(), clock, output);
+            sink.emit_audit(AuditStructuredEventPayload{observation});
+            sink.shutdown();
+            CHECK(sink.health().healthy);
+            CHECK(sink.health().complete_records == 1);
+            CHECK(rendered(output).find(
+                      std::string("\"disposition\":\"") +
+                      item.disposition + "\"") != std::string::npos);
+        }
+    }
+
+    CHECK(rejects(
+        event_config(),
+        convergence_event<Event>(
+            AdaptiveV2ConvergenceTransition::delivery_attempt,
+            "enqueued")));
+}
+
+TEST_CASE(
+    "adaptive-v2 convergence audit has exact semantic NDJSON for all six transitions",
+    "[adaptive-v2][structured-event][convergence][semantic][ndjson]")
+{
+    if constexpr (has_convergence_disposition<
+                      AdaptiveV2ConvergenceStructuredEvent>::value)
+    {
+        exercise_convergence_structured_event_contract<
+            AdaptiveV2ConvergenceStructuredEvent>();
+    }
+    else
+    {
+        FAIL("convergence audit lacks an explicit delivery and observation disposition");
     }
 }
 

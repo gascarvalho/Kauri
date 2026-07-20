@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 
+#include "hotstuff/adaptive_v2_convergence_ack_wire.h"
 #include "hotstuff/adaptive_v2_readiness_wire.h"
 #include "hotstuff/evidence_ingress.h"
 #include "hotstuff/evidence_lifecycle_wire.h"
@@ -22,6 +23,7 @@ enum class AdaptiveV2ReportingStream : std::uint8_t
     readiness = 1,
     lifecycle = 2,
     evidence = 3,
+    convergence = 4,
 };
 
 enum class AdaptiveV2ReportingDeliveryState : std::uint8_t
@@ -29,6 +31,7 @@ enum class AdaptiveV2ReportingDeliveryState : std::uint8_t
     queued = 1,
     in_flight,
     retry_wait,
+    awaiting_ack,
     delivered,
     failed,
 };
@@ -106,6 +109,7 @@ struct AdaptiveV2ReportingOutboxLimits
     AdaptiveV2ReadinessWireLimits readiness_wire;
     ProposalLifecycleWireLimits lifecycle_wire;
     EvidenceWireLimits evidence_wire;
+    AdaptiveV2ConvergenceWireLimits convergence_wire;
 };
 
 struct AdaptiveV2ReportingOutboxConfig
@@ -147,6 +151,11 @@ struct AdaptiveV2PendingReport
     std::uint32_t delivery_attempts{0};
     std::uint32_t temporary_failures{0};
     std::uint64_t next_attempt_monotonic_ns{0};
+    std::optional<AdaptiveV2ConvergenceObservationKind>
+        convergence_observation_kind;
+    std::optional<AdaptiveV2EpochChangeIdentity>
+        convergence_identity;
+    uint256_t convergence_observation_digest;
 };
 
 struct AdaptiveV2ReportingAttemptResult
@@ -222,6 +231,16 @@ public:
     AdaptiveV2ReportingEnqueueStatus enqueue_evidence(
         const bytearray_t &canonical_payload) noexcept;
 
+    AdaptiveV2ReportingEnqueueStatus enqueue_epoch_change_committed(
+        const AdaptiveV2EpochChangeIdentity &identity) noexcept;
+
+    AdaptiveV2ReportingEnqueueStatus enqueue_epoch_activated(
+        const AdaptiveV2EpochChangeIdentity &identity) noexcept;
+
+    AdaptiveV2ReportingEnqueueStatus enqueue_convergence_observation(
+        AdaptiveV2ConvergenceObservationKind kind,
+        const AdaptiveV2EpochChangeIdentity &identity) noexcept;
+
     const AdaptiveV2PendingReport *front() const noexcept;
 
     AdaptiveV2ReportingAttemptResult begin_delivery(
@@ -231,6 +250,11 @@ public:
         const AdaptiveV2ReportingDeliveryToken &token,
         AdaptiveV2ReportingDeliveryResult result,
         std::uint64_t current_monotonic_ns) noexcept;
+
+    AdaptiveV2ReportingTransitionStatus
+    acknowledge_convergence_observation(
+        const AdaptiveV2ConvergenceObservationAck &acknowledgement)
+        noexcept;
 
     AdaptiveV2ReportingReleaseStatus release_terminal(
         std::uint64_t report_id) noexcept;

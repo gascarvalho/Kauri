@@ -13,6 +13,7 @@
 #include <variant>
 #include <vector>
 
+#include "hotstuff/adaptive_v2_convergence_wire.h"
 #include "hotstuff/configuration.h"
 #include "hotstuff/evidence_reputation.h"
 
@@ -117,6 +118,39 @@ struct ReputationEvidenceAppliedStructuredEvent
     EvidenceReputationAuditUpdate update;
 };
 
+enum class AdaptiveV2ConvergenceTransition : std::uint8_t
+{
+    delivery_attempt = 1,
+    commit_observed,
+    activation_observed,
+    converged,
+    ready,
+    failure,
+};
+
+/**
+ * Manager-owned audit of delivery and activation-observation convergence.
+ *
+ * The optional identity is the complete commit-derived identity reported by a
+ * replica. Delivery attempts occur before that identity is known. Counters are
+ * observational and never replace the fixed quorum used by consensus or the
+ * convergence state machine.
+ */
+struct AdaptiveV2ConvergenceStructuredEvent
+{
+    AdaptiveV2ConvergenceTransition transition{
+        AdaptiveV2ConvergenceTransition::delivery_attempt};
+    std::optional<ReplicaID> replica_id;
+    std::uint32_t delivery_attempt{0};
+    std::string disposition;
+    std::optional<AdaptiveV2EpochChangeIdentity> identity;
+    std::size_t accepted_commit_count{0};
+    std::size_t accepted_activation_count{0};
+    std::size_t required_activation_count{0};
+    std::optional<uint256_t> canonical_payload_digest;
+    std::string failure_reason;
+};
+
 using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
@@ -125,7 +159,8 @@ using StructuredEventPayload = std::variant<
 
 using AuditStructuredEventPayload = std::variant<
     EpochCommandCommittedStructuredEvent,
-    ReputationEvidenceAppliedStructuredEvent>;
+    ReputationEvidenceAppliedStructuredEvent,
+    AdaptiveV2ConvergenceStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -214,6 +249,12 @@ enum class StructuredEventType : std::uint8_t
     epoch_command_committed,
     reputation_evidence_applied,
     block_commit_observed,
+    adaptive_v2_delivery_attempt,
+    adaptive_v2_commit_observed,
+    adaptive_v2_activation_observed,
+    adaptive_v2_converged,
+    adaptive_v2_ready,
+    adaptive_v2_convergence_failure,
 };
 
 StructuredEventType structured_event_type(
@@ -400,7 +441,7 @@ public:
         const AdaptiveAggregationStructuredEvent &event) noexcept = 0;
 };
 
-/** Separate capability for consensus-command and accepted-reputation audit. */
+/** Separate capability for consensus, reputation, and convergence audit. */
 class AuditStructuredEventEmitter
 {
 public:

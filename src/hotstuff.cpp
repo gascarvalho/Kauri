@@ -5716,8 +5716,14 @@ namespace hotstuff
 
     void HotStuffBase::install_adaptive_v2_definition_handlers()
     {
+        static_assert(
+            MsgAdaptiveV2ConvergenceObservationAck::opcode == 0x1E,
+            "adaptive-v2 convergence ACK opcode must stay registered");
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_v2_epoch_change_bundle_handler,
+            this, _1, _2));
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_v2_convergence_ack_handler,
             this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_definition_request_handler,
@@ -5733,6 +5739,65 @@ namespace hotstuff
         return is_adaptive_epoch_mode(epoch_protocol_mode) &&
                epoch_manager_peer.has_value() && !peer.is_null() &&
                peer == *epoch_manager_peer;
+    }
+
+    void HotStuffBase::adaptive_v2_convergence_ack_handler(
+        MsgAdaptiveV2ConvergenceObservationAck &&message,
+        const Net::conn_t &connection)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            adaptive_v2_reporting_outbox == nullptr ||
+            !epoch_manager_peer.has_value() || connection == nullptr)
+            return;
+
+        const auto manager_peer = *epoch_manager_peer;
+        if (!authorize_manager_peer(manager_peer))
+            return;
+        const auto pinned_connection = pn.get_peer_conn(manager_peer);
+        const auto *manager_certificate = connection->get_peer_cert();
+        if (pinned_connection == nullptr ||
+            pinned_connection != connection ||
+            manager_certificate == nullptr ||
+            PeerId(*manager_certificate) != manager_peer)
+            return;
+
+        const AdaptiveV2ConvergenceWireLimits convergence_wire_limits;
+        if (message.serialized.size() >
+            convergence_wire_limits.maximum_payload_bytes)
+            return;
+        const auto canonical_ack =
+            static_cast<bytearray_t>(message.serialized);
+        const auto decoded =
+            decode_adaptive_v2_convergence_observation_ack(
+                canonical_ack, convergence_wire_limits);
+        if (!decoded ||
+            decoded.acknowledgement->target_replica_id != get_id())
+            return;
+
+        const auto *pending = adaptive_v2_reporting_outbox->front();
+        if (pending == nullptr)
+            return;
+        const auto report_id = pending->report_id;
+        const auto transition =
+            adaptive_v2_reporting_outbox
+                ->acknowledge_convergence_observation(
+                    *decoded.acknowledgement);
+        if (transition == AdaptiveV2ReportingTransitionStatus::delivered)
+        {
+            if (adaptive_v2_reporting_outbox->release_terminal(report_id) !=
+                AdaptiveV2ReportingReleaseStatus::released)
+                return;
+            enqueue_pending_adaptive_v2_commit_observation();
+            enqueue_pending_adaptive_v2_activation_observation();
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+        }
+        else if (transition ==
+                 AdaptiveV2ReportingTransitionStatus::failed)
+        {
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "convergence_observation_permanently_rejected");
+        }
     }
 
     void HotStuffBase::configure_epoch_manager(
@@ -5947,6 +6012,29 @@ namespace hotstuff
                         DataStream(report.canonical_payload)),
                     manager_connection);
                 break;
+            case AdaptiveV2ReportingStream::convergence:
+                if (report.opcode ==
+                    MsgAdaptiveV2EpochChangeCommittedObservation::opcode)
+                {
+                    sent = pn.send_msg(
+                        MsgAdaptiveV2EpochChangeCommittedObservation(
+                            DataStream(report.canonical_payload)),
+                        manager_connection);
+                }
+                else if (report.opcode ==
+                         MsgAdaptiveV2EpochActivatedObservation::opcode)
+                {
+                    sent = pn.send_msg(
+                        MsgAdaptiveV2EpochActivatedObservation(
+                            DataStream(report.canonical_payload)),
+                        manager_connection);
+                }
+                else
+                {
+                    return AdaptiveV2ReportingDeliveryResult::
+                        permanent_failure;
+                }
+                break;
             }
             return sent
                        ? AdaptiveV2ReportingDeliveryResult::delivered
@@ -6018,6 +6106,9 @@ namespace hotstuff
             !authorize_manager_peer(*epoch_manager_peer))
             return;
 
+        enqueue_pending_adaptive_v2_commit_observation();
+        enqueue_pending_adaptive_v2_activation_observation();
+
         while (true)
         {
             const auto now = adaptive_monotonic_now_ns();
@@ -6060,6 +6151,8 @@ namespace hotstuff
                         attempt.report->report_id) !=
                         AdaptiveV2ReportingReleaseStatus::released)
                     return;
+                enqueue_pending_adaptive_v2_commit_observation();
+                enqueue_pending_adaptive_v2_activation_observation();
                 continue;
             }
 
@@ -6081,6 +6174,8 @@ namespace hotstuff
                         report_id) !=
                     AdaptiveV2ReportingReleaseStatus::released)
                     return;
+                enqueue_pending_adaptive_v2_commit_observation();
+                enqueue_pending_adaptive_v2_activation_observation();
                 continue;
             }
             if (transition ==
@@ -6110,6 +6205,87 @@ namespace hotstuff
                         report_id));
             return;
         }
+    }
+
+    void HotStuffBase::mark_adaptive_v2_convergence_evidence_unhealthy(
+        const char *reason) noexcept
+    {
+        if (!adaptive_v2_convergence_evidence_healthy)
+            return;
+        adaptive_v2_convergence_evidence_healthy = false;
+        adaptive_v2_commit_observation_enqueued = false;
+        adaptive_v2_activation_observation_pending = false;
+        adaptive_v2_committed_convergence_identity.reset();
+        HOTSTUFF_LOG_WARN(
+            "[EPOCH] Adaptive-v2 convergence evidence unhealthy: %s",
+            reason == nullptr ? "unknown" : reason);
+    }
+
+    void HotStuffBase::enqueue_pending_adaptive_v2_commit_observation()
+        noexcept
+    {
+        if (!adaptive_v2_convergence_evidence_healthy ||
+            adaptive_v2_commit_observation_enqueued ||
+            !adaptive_v2_committed_convergence_identity.has_value() ||
+            adaptive_v2_reporting_outbox == nullptr)
+            return;
+
+        const auto status =
+            adaptive_v2_reporting_outbox->enqueue_convergence_observation(
+                AdaptiveV2ConvergenceObservationKind::commit,
+                *adaptive_v2_committed_convergence_identity);
+        if (status == AdaptiveV2ReportingEnqueueStatus::queued)
+        {
+            adaptive_v2_commit_observation_enqueued = true;
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+            return;
+        }
+        if (status ==
+            AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
+        {
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+            return;
+        }
+        mark_adaptive_v2_convergence_evidence_unhealthy(
+            "commit_observation_enqueue_failed");
+    }
+
+    void HotStuffBase::enqueue_pending_adaptive_v2_activation_observation(
+        ) noexcept
+    {
+        if (!adaptive_v2_convergence_evidence_healthy ||
+            !adaptive_v2_activation_observation_pending ||
+            !adaptive_v2_committed_convergence_identity.has_value() ||
+            adaptive_v2_reporting_outbox == nullptr)
+            return;
+
+        enqueue_pending_adaptive_v2_commit_observation();
+        if (!adaptive_v2_commit_observation_enqueued)
+            return;
+
+        const auto status =
+            adaptive_v2_reporting_outbox->enqueue_epoch_activated(
+                *adaptive_v2_committed_convergence_identity);
+        if (status == AdaptiveV2ReportingEnqueueStatus::queued)
+        {
+            adaptive_v2_activation_observation_pending = false;
+            adaptive_v2_commit_observation_enqueued = false;
+            adaptive_v2_committed_convergence_identity.reset();
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+            return;
+        }
+        if (status ==
+            AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
+        {
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+            return;
+        }
+        mark_adaptive_v2_convergence_evidence_unhealthy(
+            "activation_observation_enqueue_failed");
     }
 
     ReplicaStageIngressResult HotStuffBase::trusted_local_stage_epoch(
@@ -6965,6 +7141,9 @@ namespace hotstuff
             adaptive_epoch_runtime == nullptr)
             return;
 
+        const bool report_adaptive_v2_activation =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2;
+
         if (adaptive_v2_rotation_coordinator != nullptr)
             adaptive_v2_rotation_coordinator->reset_for_activation();
 
@@ -6974,6 +7153,25 @@ namespace hotstuff
             activation.update->activation.configuration;
         const auto generation =
             activation.update->activation.generation;
+        if (report_adaptive_v2_activation &&
+            adaptive_v2_reporting_outbox != nullptr &&
+            adaptive_v2_committed_convergence_identity.has_value())
+        {
+            const auto &identity =
+                *adaptive_v2_committed_convergence_identity;
+            const auto successor_epoch_number =
+                identity.successor_epoch_number;
+            const auto committed_height = blk->get_height();
+            const auto activation_height = identity.activation_height;
+            if (configuration.epoch_number == successor_epoch_number &&
+                configuration.epoch_digest ==
+                    identity.successor_epoch_digest &&
+                committed_height == activation_height)
+            {
+                adaptive_v2_activation_observation_pending = true;
+                enqueue_pending_adaptive_v2_activation_observation();
+            }
+        }
         if (adaptive_v2_command_inbox != nullptr)
         {
             static_cast<void>(adaptive_v2_command_inbox->observe_activation(
@@ -7231,6 +7429,8 @@ namespace hotstuff
 
         const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
             pending_committed_epoch_change.reset();
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "activation_pipeline_failed");
             committed_epoch_change_history.reset();
             if (adaptive_epoch_runtime != nullptr)
                 adaptive_epoch_runtime->adapter.fail_committed_v2(reason);
@@ -7311,8 +7511,54 @@ namespace hotstuff
                                     ActivationRecordDisposition::recorded &&
                                 recorded.record.has_value())
                             {
+                                AdaptiveV2EpochChangeIdentity identity{
+                                    recorded.record->predecessor_epoch_number,
+                                    recorded.record->predecessor_epoch_digest,
+                                    recorded.record->successor_epoch_number,
+                                    recorded.record->successor_epoch_digest,
+                                    recorded.record->payload_digest,
+                                    blk->get_height(),
+                                    blk->get_hash(),
+                                    recorded.record->activation_delay_blocks,
+                                    recorded.record->activation_height};
+                                adaptive_v2_committed_convergence_identity =
+                                    identity;
+                                adaptive_v2_commit_observation_enqueued =
+                                    false;
                                 emit_epoch_command_committed_event(
                                     blk, command, *recorded.record);
+                                if (adaptive_v2_reporting_outbox == nullptr)
+                                {
+                                    mark_adaptive_v2_convergence_evidence_unhealthy(
+                                        "commit_observation_outbox_missing");
+                                }
+                                else
+                                {
+                                    const auto reporting_status =
+                                        adaptive_v2_reporting_outbox
+                                            ->enqueue_epoch_change_committed(
+                                                identity);
+                                    if (reporting_status ==
+                                        AdaptiveV2ReportingEnqueueStatus::queued)
+                                    {
+                                        adaptive_v2_commit_observation_enqueued =
+                                            true;
+                                        schedule_adaptive_v2_reporting_flush(
+                                            adaptive_v2_evidence_retry_delay);
+                                    }
+                                    else if (reporting_status ==
+                                             AdaptiveV2ReportingEnqueueStatus::
+                                                 capacity_exceeded)
+                                    {
+                                        schedule_adaptive_v2_reporting_flush(
+                                            adaptive_v2_evidence_retry_delay);
+                                    }
+                                    else
+                                    {
+                                        mark_adaptive_v2_convergence_evidence_unhealthy(
+                                            "commit_observation_enqueue_failed");
+                                    }
+                                }
                             }
                             pending_committed_epoch_change.reset();
                         }
@@ -7528,6 +7774,7 @@ namespace hotstuff
         deferred_epoch_change_proposal_count = 0;
         proposal_contexts->shutdown();
         pending_exact_contributions.clear();
+        adaptive_v2_committed_convergence_identity.reset();
         if (adaptive_v2_response_evidence != nullptr)
         {
             adaptive_v2_response_evidence->unbind_transport();

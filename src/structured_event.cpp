@@ -329,6 +329,34 @@ bool payload_type(const StructuredEventPayload &payload,
     }
 }
 
+bool convergence_payload_type(
+    const AdaptiveV2ConvergenceStructuredEvent &event,
+    StructuredEventType &type) noexcept
+{
+    switch (event.transition)
+    {
+        case AdaptiveV2ConvergenceTransition::delivery_attempt:
+            type = StructuredEventType::adaptive_v2_delivery_attempt;
+            return true;
+        case AdaptiveV2ConvergenceTransition::commit_observed:
+            type = StructuredEventType::adaptive_v2_commit_observed;
+            return true;
+        case AdaptiveV2ConvergenceTransition::activation_observed:
+            type = StructuredEventType::adaptive_v2_activation_observed;
+            return true;
+        case AdaptiveV2ConvergenceTransition::converged:
+            type = StructuredEventType::adaptive_v2_converged;
+            return true;
+        case AdaptiveV2ConvergenceTransition::ready:
+            type = StructuredEventType::adaptive_v2_ready;
+            return true;
+        case AdaptiveV2ConvergenceTransition::failure:
+            type = StructuredEventType::adaptive_v2_convergence_failure;
+            return true;
+    }
+    return false;
+}
+
 bool audit_payload_type(const AuditStructuredEventPayload &payload,
                         StructuredEventType &type) noexcept
 {
@@ -340,6 +368,10 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 1:
             type = StructuredEventType::reputation_evidence_applied;
             return true;
+        case 2:
+            return convergence_payload_type(
+                std::get<AdaptiveV2ConvergenceStructuredEvent>(payload),
+                type);
         default:
             return false;
     }
@@ -432,19 +464,145 @@ bool valid_reputation_payload(
     return true;
 }
 
+bool valid_convergence_identity(
+    const AdaptiveV2EpochChangeIdentity &identity) noexcept
+{
+    if (identity.command_block_height == 0 ||
+        identity.command_block_hash == uint256_t{} ||
+        identity.predecessor_epoch_digest == uint256_t{} ||
+        identity.successor_epoch_digest == uint256_t{} ||
+        identity.command_payload_digest == uint256_t{} ||
+        identity.predecessor_epoch_digest == identity.successor_epoch_digest ||
+        identity.predecessor_epoch_number ==
+            std::numeric_limits<std::uint32_t>::max() ||
+        identity.successor_epoch_number !=
+            identity.predecessor_epoch_number + 1 ||
+        identity.activation_delay_blocks == 0 ||
+        identity.activation_delay_blocks >
+            std::numeric_limits<std::uint64_t>::max() -
+                identity.command_block_height)
+    {
+        return false;
+    }
+
+    return identity.activation_height ==
+        identity.command_block_height + identity.activation_delay_blocks;
+}
+
+bool valid_convergence_payload(
+    const AdaptiveV2ConvergenceStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    const auto delivery_disposition = [&event]() noexcept {
+        return event.disposition == "enqueued" ||
+            event.disposition == "enqueue_failed" ||
+            event.disposition == "injected_drop";
+    };
+    const auto observation_disposition = [&event]() noexcept {
+        return event.disposition == "rejected_unauthenticated_source" ||
+            event.disposition == "rejected_wire_decode" ||
+            event.disposition == "accepted" ||
+            event.disposition == "duplicate" ||
+            event.disposition == "rejected_nonmember" ||
+            event.disposition == "rejected_spoofed_source" ||
+            event.disposition == "rejected_stale" ||
+            event.disposition == "rejected_wrong_identity" ||
+            event.disposition == "conflicting_observation" ||
+            event.disposition == "terminal" ||
+            event.disposition == "ack_sent" ||
+            event.disposition == "ack_injected_drop" ||
+            event.disposition == "ack_send_failed";
+    };
+
+    StructuredEventType ignored{};
+    if (config.source.kind !=
+            StructuredEventSourceKind::adaptation_manager ||
+        !convergence_payload_type(event, ignored) ||
+        event.required_activation_count == 0 ||
+        !valid_utf8(event.disposition) ||
+        event.disposition.size() >
+            config.limits.maximum_identity_bytes ||
+        !valid_utf8(event.failure_reason) ||
+        event.failure_reason.size() >
+            config.limits.maximum_identity_bytes ||
+        (event.canonical_payload_digest.has_value() &&
+         *event.canonical_payload_digest == uint256_t{}) ||
+        (event.identity.has_value() &&
+         !valid_convergence_identity(*event.identity)))
+    {
+        return false;
+    }
+
+    if (event.transition != AdaptiveV2ConvergenceTransition::failure &&
+        !event.failure_reason.empty())
+        return false;
+
+    switch (event.transition)
+    {
+        case AdaptiveV2ConvergenceTransition::delivery_attempt:
+            return event.replica_id.has_value() &&
+                event.delivery_attempt != 0 &&
+                delivery_disposition() &&
+                event.canonical_payload_digest.has_value() &&
+                !event.identity.has_value();
+        case AdaptiveV2ConvergenceTransition::commit_observed:
+        case AdaptiveV2ConvergenceTransition::activation_observed:
+            if (event.delivery_attempt != 0 ||
+                !observation_disposition())
+                return false;
+            if (event.disposition ==
+                "rejected_unauthenticated_source")
+            {
+                return !event.replica_id.has_value() &&
+                    !event.identity.has_value() &&
+                    !event.canonical_payload_digest.has_value();
+            }
+            if (event.disposition == "rejected_wire_decode")
+            {
+                return event.replica_id.has_value() &&
+                    !event.identity.has_value() &&
+                    !event.canonical_payload_digest.has_value();
+            }
+            return event.replica_id.has_value() &&
+                event.identity.has_value() &&
+                (event.canonical_payload_digest.has_value() ||
+                 event.disposition == "ack_send_failed");
+        case AdaptiveV2ConvergenceTransition::converged:
+        case AdaptiveV2ConvergenceTransition::ready:
+            return !event.replica_id.has_value() &&
+                event.delivery_attempt == 0 &&
+                event.disposition.empty() &&
+                event.identity.has_value() &&
+                !event.canonical_payload_digest.has_value() &&
+                event.accepted_activation_count >=
+                    event.required_activation_count;
+        case AdaptiveV2ConvergenceTransition::failure:
+            return event.disposition.empty() &&
+                !event.canonical_payload_digest.has_value() &&
+                !event.failure_reason.empty() &&
+                (event.delivery_attempt == 0 ||
+                 event.replica_id.has_value());
+    }
+    return false;
+}
+
 bool valid_audit_payload(const AuditStructuredEventPayload &payload,
-                         StructuredEventSourceKind source_kind) noexcept
+                         const StructuredEventConfig &config) noexcept
 {
     switch (payload.index())
     {
         case 0:
             return valid_epoch_command_payload(
                 std::get<EpochCommandCommittedStructuredEvent>(payload),
-                source_kind);
+                config.source.kind);
         case 1:
             return valid_reputation_payload(
                 std::get<ReputationEvidenceAppliedStructuredEvent>(payload),
-                source_kind);
+                config.source.kind);
+        case 2:
+            return valid_convergence_payload(
+                std::get<AdaptiveV2ConvergenceStructuredEvent>(payload),
+                config);
         default:
             return false;
     }
@@ -754,6 +912,75 @@ void append_reputation_payload(
     builder.append('}');
 }
 
+void append_convergence_identity(
+    JsonLineBuilder &builder,
+    const AdaptiveV2EpochChangeIdentity &identity)
+{
+    builder.append("{\"predecessor_epoch_number\":");
+    builder.append_integer(identity.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(identity.predecessor_epoch_digest.to_hex());
+    builder.append(",\"successor_epoch_number\":");
+    builder.append_integer(identity.successor_epoch_number);
+    builder.append(",\"successor_epoch_digest\":");
+    builder.append_escaped(identity.successor_epoch_digest.to_hex());
+    builder.append(",\"command_payload_digest\":");
+    builder.append_escaped(identity.command_payload_digest.to_hex());
+    builder.append(",\"command_block_height\":");
+    builder.append_integer(identity.command_block_height);
+    builder.append(",\"command_block_hash\":");
+    builder.append_escaped(identity.command_block_hash.to_hex());
+    builder.append(",\"activation_delay_blocks\":");
+    builder.append_integer(identity.activation_delay_blocks);
+    builder.append(",\"activation_height\":");
+    builder.append_integer(identity.activation_height);
+    builder.append('}');
+}
+
+void append_convergence_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2ConvergenceStructuredEvent &event)
+{
+    builder.append("{\"replica_id\":");
+    if (event.replica_id.has_value())
+        builder.append_integer(*event.replica_id);
+    else
+        builder.append("null");
+    builder.append(",\"delivery_attempt\":");
+    if (event.delivery_attempt != 0)
+        builder.append_integer(event.delivery_attempt);
+    else
+        builder.append("null");
+    builder.append(",\"disposition\":");
+    if (event.disposition.empty())
+        builder.append("null");
+    else
+        builder.append_escaped(event.disposition);
+    builder.append(",\"identity\":");
+    if (event.identity.has_value())
+        append_convergence_identity(builder, *event.identity);
+    else
+        builder.append("null");
+    builder.append(",\"accepted_commit_count\":");
+    builder.append_integer(event.accepted_commit_count);
+    builder.append(",\"accepted_activation_count\":");
+    builder.append_integer(event.accepted_activation_count);
+    builder.append(",\"required_activation_count\":");
+    builder.append_integer(event.required_activation_count);
+    builder.append(",\"canonical_payload_digest\":");
+    if (event.canonical_payload_digest.has_value())
+        builder.append_escaped(
+            event.canonical_payload_digest->to_hex());
+    else
+        builder.append("null");
+    builder.append(",\"failure_reason\":");
+    if (event.failure_reason.empty())
+        builder.append("null");
+    else
+        builder.append_escaped(event.failure_reason);
+    builder.append('}');
+}
+
 void append_replica_ids(JsonLineBuilder &builder,
                         const std::vector<ReplicaID> &values)
 {
@@ -934,6 +1161,11 @@ std::string serialize_audit_event(
             append_reputation_payload(
                 builder,
                 std::get<ReputationEvidenceAppliedStructuredEvent>(event));
+            break;
+        case 2:
+            append_convergence_payload(
+                builder,
+                std::get<AdaptiveV2ConvergenceStructuredEvent>(event));
             break;
         default:
             throw std::bad_variant_access{};
@@ -1361,6 +1593,18 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "epoch.command_committed";
         case StructuredEventType::reputation_evidence_applied:
             return "reputation.evidence_applied";
+        case StructuredEventType::adaptive_v2_delivery_attempt:
+            return "adaptive_v2_delivery_attempt";
+        case StructuredEventType::adaptive_v2_commit_observed:
+            return "adaptive_v2_commit_observed";
+        case StructuredEventType::adaptive_v2_activation_observed:
+            return "adaptive_v2_activation_observed";
+        case StructuredEventType::adaptive_v2_converged:
+            return "adaptive_v2_converged";
+        case StructuredEventType::adaptive_v2_ready:
+            return "adaptive_v2_ready";
+        case StructuredEventType::adaptive_v2_convergence_failure:
+            return "adaptive_v2_convergence_failure";
         default:
             break;
     }
@@ -1720,7 +1964,7 @@ void StructuredEventSink::emit_audit(
     auto &state = *state_;
     StructuredEventType type{};
     const auto valid =
-        valid_audit_payload(event, state.config.source.kind) &&
+        valid_audit_payload(event, state.config) &&
         audit_payload_type(event, type);
     state.admit(valid, [&state, &event, type](
                            std::uint64_t sequence,

@@ -29,6 +29,7 @@ bool valid_limits(
                limits.maximum_retry_backoff_ns &&
            limits.readiness_wire.maximum_payload_bytes != 0 &&
            limits.lifecycle_wire.maximum_payload_bytes != 0 &&
+           limits.convergence_wire.maximum_payload_bytes != 0 &&
            limits.evidence_wire.maximum_payload_bytes != 0 &&
            limits.evidence_wire.maximum_observations != 0 &&
            limits.evidence_wire.maximum_signers_per_observation != 0;
@@ -444,6 +445,87 @@ AdaptiveV2ReportingOutbox::enqueue_evidence(
     });
 }
 
+AdaptiveV2ReportingEnqueueStatus
+AdaptiveV2ReportingOutbox::enqueue_epoch_change_committed(
+    const AdaptiveV2EpochChangeIdentity &identity) noexcept
+{
+    return enqueue_convergence_observation(
+        AdaptiveV2ConvergenceObservationKind::commit, identity);
+}
+
+AdaptiveV2ReportingEnqueueStatus
+AdaptiveV2ReportingOutbox::enqueue_epoch_activated(
+    const AdaptiveV2EpochChangeIdentity &identity) noexcept
+{
+    return enqueue_convergence_observation(
+        AdaptiveV2ConvergenceObservationKind::activation, identity);
+}
+
+AdaptiveV2ReportingEnqueueStatus
+AdaptiveV2ReportingOutbox::enqueue_convergence_observation(
+    AdaptiveV2ConvergenceObservationKind kind,
+    const AdaptiveV2EpochChangeIdentity &identity) noexcept
+{
+    if (const auto blocked = state_->enqueue_precondition())
+        return *blocked;
+
+    return state_->guarded_enqueue([&]() {
+        bytearray_t payload;
+        opcode_t opcode = 0;
+        if (kind == AdaptiveV2ConvergenceObservationKind::commit)
+        {
+            AdaptiveV2EpochChangeCommittedObservation observation;
+            observation.claimed_source_replica_id =
+                state_->config.source_replica_id;
+            observation.identity = identity;
+            payload =
+                encode_adaptive_v2_epoch_change_committed_observation(
+                    observation,
+                    state_->config.limits.convergence_wire);
+            opcode =
+                MsgAdaptiveV2EpochChangeCommittedObservation::opcode;
+        }
+        else if (kind ==
+                 AdaptiveV2ConvergenceObservationKind::activation)
+        {
+            AdaptiveV2EpochActivatedObservation observation;
+            observation.claimed_source_replica_id =
+                state_->config.source_replica_id;
+            observation.identity = identity;
+            observation.activated_epoch_number =
+                identity.successor_epoch_number;
+            observation.activated_epoch_digest =
+                identity.successor_epoch_digest;
+            payload = encode_adaptive_v2_epoch_activated_observation(
+                observation,
+                state_->config.limits.convergence_wire);
+            opcode = MsgAdaptiveV2EpochActivatedObservation::opcode;
+        }
+        else
+        {
+            throw std::invalid_argument(
+                "invalid adaptive-v2 convergence observation kind");
+        }
+        const auto observation_digest =
+            adaptive_v2_convergence_observation_digest(
+                opcode, payload);
+        const auto status = state_->enqueue_owned(
+            AdaptiveV2ReportingStream::convergence,
+            opcode,
+            0,
+            0,
+            std::move(payload));
+        if (status == AdaptiveV2ReportingEnqueueStatus::queued)
+        {
+            auto &report = state_->pending.back();
+            report.convergence_observation_kind = kind;
+            report.convergence_identity = identity;
+            report.convergence_observation_digest = observation_digest;
+        }
+        return status;
+    });
+}
+
 const AdaptiveV2PendingReport *
 AdaptiveV2ReportingOutbox::front() const noexcept
 {
@@ -488,6 +570,7 @@ AdaptiveV2ReportingOutbox::begin_delivery(
                 std::nullopt,
                 &report};
     case AdaptiveV2ReportingDeliveryState::retry_wait:
+    case AdaptiveV2ReportingDeliveryState::awaiting_ack:
         if (current_monotonic_ns <
             report.next_attempt_monotonic_ns)
         {
@@ -565,6 +648,26 @@ AdaptiveV2ReportingOutbox::acknowledge_delivery(
     switch (result)
     {
     case AdaptiveV2ReportingDeliveryResult::delivered:
+        if (report.stream == AdaptiveV2ReportingStream::convergence)
+        {
+            const auto delay = state_->retry_delay(
+                report.delivery_attempts);
+            if (current_monotonic_ns >
+                std::numeric_limits<std::uint64_t>::max() - delay)
+            {
+                state_->fail(
+                    report,
+                    AdaptiveV2ReportingFailureReason::backoff_overflow);
+                return AdaptiveV2ReportingTransitionStatus::failed;
+            }
+            report.delivery_state =
+                AdaptiveV2ReportingDeliveryState::awaiting_ack;
+            report.failure_reason =
+                AdaptiveV2ReportingFailureReason::none;
+            report.next_attempt_monotonic_ns =
+                current_monotonic_ns + delay;
+            return AdaptiveV2ReportingTransitionStatus::retry_scheduled;
+        }
         report.delivery_state =
             AdaptiveV2ReportingDeliveryState::delivered;
         report.failure_reason =
@@ -604,6 +707,74 @@ AdaptiveV2ReportingOutbox::acknowledge_delivery(
     }
 
     case AdaptiveV2ReportingDeliveryResult::permanent_failure:
+        state_->fail(
+            report,
+            AdaptiveV2ReportingFailureReason::permanent_failure);
+        return AdaptiveV2ReportingTransitionStatus::failed;
+    }
+
+    increment(state_->diagnostics.invalid_transitions);
+    state_->fail(
+        report,
+        AdaptiveV2ReportingFailureReason::invalid_delivery_result);
+    return AdaptiveV2ReportingTransitionStatus::failed;
+}
+
+AdaptiveV2ReportingTransitionStatus
+AdaptiveV2ReportingOutbox::acknowledge_convergence_observation(
+    const AdaptiveV2ConvergenceObservationAck &acknowledgement) noexcept
+{
+    if (!state_->diagnostics.healthy)
+        return AdaptiveV2ReportingTransitionStatus::unhealthy;
+    if (state_->diagnostics.stopped)
+        return AdaptiveV2ReportingTransitionStatus::stopped;
+    if (state_->pending.empty())
+    {
+        increment(state_->diagnostics.invalid_transitions);
+        return AdaptiveV2ReportingTransitionStatus::stale_report;
+    }
+
+    auto &report = state_->pending.front();
+    if (report.stream != AdaptiveV2ReportingStream::convergence ||
+        acknowledgement.schema_version !=
+            kAdaptiveV2ConvergenceAckSchemaVersionV1 ||
+        acknowledgement.target_replica_id !=
+            state_->config.source_replica_id ||
+        !report.convergence_observation_kind.has_value() ||
+        acknowledgement.observation_kind !=
+            *report.convergence_observation_kind ||
+        !report.convergence_identity.has_value() ||
+        acknowledgement.identity != *report.convergence_identity ||
+        acknowledgement.observation_digest !=
+            report.convergence_observation_digest)
+    {
+        increment(state_->diagnostics.invalid_transitions);
+        return AdaptiveV2ReportingTransitionStatus::stale_report;
+    }
+
+    if (report.delivery_state ==
+        AdaptiveV2ReportingDeliveryState::delivered)
+    {
+        increment(state_->diagnostics.duplicate_acknowledgements);
+        return AdaptiveV2ReportingTransitionStatus::duplicate;
+    }
+    if (report.delivery_state == AdaptiveV2ReportingDeliveryState::failed)
+    {
+        increment(state_->diagnostics.invalid_transitions);
+        return AdaptiveV2ReportingTransitionStatus::invalid_transition;
+    }
+
+    switch (acknowledgement.disposition)
+    {
+    case AdaptiveV2ConvergenceAckDisposition::positive:
+        report.delivery_state =
+            AdaptiveV2ReportingDeliveryState::delivered;
+        report.failure_reason = AdaptiveV2ReportingFailureReason::none;
+        report.next_attempt_monotonic_ns = 0;
+        increment(state_->diagnostics.delivered_reports);
+        return AdaptiveV2ReportingTransitionStatus::delivered;
+
+    case AdaptiveV2ConvergenceAckDisposition::permanent_rejection:
         state_->fail(
             report,
             AdaptiveV2ReportingFailureReason::permanent_failure);

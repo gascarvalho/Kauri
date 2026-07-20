@@ -8,12 +8,21 @@
 #include <vector>
 
 #include "catch.hpp"
+#include "hotstuff/adaptive_v2_convergence_wire.h"
 #include "hotstuff/adaptive_v2_reporting_outbox.h"
+
+#if __has_include("hotstuff/adaptive_v2_convergence_ack_wire.h")
+#include "hotstuff/adaptive_v2_convergence_ack_wire.h"
+#define KAURI_HAS_ADAPTIVE_V2_CONVERGENCE_ACK_WIRE 1
+#else
+#define KAURI_HAS_ADAPTIVE_V2_CONVERGENCE_ACK_WIRE 0
+#endif
 
 namespace
 {
 
 using hotstuff::AdaptiveV2PendingReport;
+using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ReportingAttemptStatus;
 using hotstuff::AdaptiveV2ReportingDeliveryResult;
 using hotstuff::AdaptiveV2ReportingDeliveryState;
@@ -55,6 +64,39 @@ uint256_t digest(const std::string &label)
 {
     return DataStream(label).get_hash();
 }
+
+AdaptiveV2EpochChangeIdentity convergence_identity()
+{
+    return {
+        0,
+        digest("reporting-convergence-predecessor"),
+        1,
+        digest("reporting-convergence-successor"),
+        digest("reporting-convergence-command"),
+        760,
+        digest("reporting-convergence-command-block"),
+        5,
+        765};
+}
+
+template<typename Outbox, typename = void>
+struct has_convergence_observation_enqueue : std::false_type
+{};
+
+template<typename Outbox>
+struct has_convergence_observation_enqueue<
+    Outbox,
+    std::void_t<
+        decltype(std::declval<Outbox &>()
+                     .enqueue_epoch_change_committed(
+                         std::declval<
+                             const AdaptiveV2EpochChangeIdentity &>())),
+        decltype(std::declval<Outbox &>()
+                     .enqueue_epoch_activated(
+                         std::declval<
+                             const AdaptiveV2EpochChangeIdentity &>()))>>
+    : std::true_type
+{};
 
 ConfigurationId configuration(
     std::uint32_t epoch,
@@ -161,7 +203,359 @@ void deliver_and_release(
           AdaptiveV2ReportingReleaseStatus::released);
 }
 
+#if KAURI_HAS_ADAPTIVE_V2_CONVERGENCE_ACK_WIRE
+
+hotstuff::AdaptiveV2ConvergenceObservationAck observation_ack(
+    hotstuff::AdaptiveV2ConvergenceObservationKind kind,
+    const bytearray_t &canonical_observation,
+    hotstuff::AdaptiveV2ConvergenceAckDisposition disposition =
+        hotstuff::AdaptiveV2ConvergenceAckDisposition::positive)
+{
+    const auto opcode =
+        kind == hotstuff::AdaptiveV2ConvergenceObservationKind::commit
+            ? hotstuff::MsgAdaptiveV2EpochChangeCommittedObservation::opcode
+            : hotstuff::MsgAdaptiveV2EpochActivatedObservation::opcode;
+    hotstuff::AdaptiveV2ConvergenceObservationAck acknowledgement;
+    acknowledgement.schema_version =
+        hotstuff::kAdaptiveV2ConvergenceAckSchemaVersionV1;
+    acknowledgement.target_replica_id = kSource;
+    acknowledgement.observation_kind = kind;
+    acknowledgement.identity = convergence_identity();
+    acknowledgement.observation_digest =
+        hotstuff::adaptive_v2_convergence_observation_digest(
+            opcode, canonical_observation);
+    acknowledgement.disposition = disposition;
+    return acknowledgement;
+}
+
+#endif
+
+template<typename Outbox>
+void exercise_convergence_observation_retry()
+{
+    Outbox outbox(config(limits(16, 64 * 1024, 3, 10, 25)));
+    const auto exact_identity = convergence_identity();
+
+    REQUIRE(outbox.enqueue_epoch_change_committed(exact_identity) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->opcode ==
+          hotstuff::MsgAdaptiveV2EpochChangeCommittedObservation::opcode);
+    const auto commit_bytes = outbox.front()->canonical_payload;
+    const auto decoded_commit =
+        hotstuff::decode_adaptive_v2_epoch_change_committed_observation(
+            commit_bytes,
+            hotstuff::AdaptiveV2ConvergenceWireLimits{});
+    REQUIRE(decoded_commit);
+    CHECK(decoded_commit.observation->claimed_source_replica_id ==
+          kSource);
+    CHECK(decoded_commit.observation->identity == exact_identity);
+
+    const auto first_commit_attempt = outbox.begin_delivery(100);
+    REQUIRE(first_commit_attempt.token.has_value());
+    CHECK(outbox.acknowledge_delivery(
+              *first_commit_attempt.token,
+              AdaptiveV2ReportingDeliveryResult::temporary_failure,
+              100) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    CHECK(outbox.begin_delivery(109).status ==
+          AdaptiveV2ReportingAttemptStatus::retry_not_due);
+    const auto commit_retry = outbox.begin_delivery(110);
+    REQUIRE(commit_retry.report != nullptr);
+    CHECK(commit_retry.report->canonical_payload == commit_bytes);
+    CHECK(commit_retry.report->opcode ==
+          hotstuff::MsgAdaptiveV2EpochChangeCommittedObservation::opcode);
+    REQUIRE(commit_retry.token.has_value());
+    const auto commit_delivery = outbox.acknowledge_delivery(
+        *commit_retry.token,
+        AdaptiveV2ReportingDeliveryResult::delivered,
+        110);
+#if KAURI_HAS_ADAPTIVE_V2_CONVERGENCE_ACK_WIRE
+    CHECK(commit_delivery ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    CHECK(outbox.acknowledge_convergence_observation(observation_ack(
+              hotstuff::AdaptiveV2ConvergenceObservationKind::commit,
+              commit_bytes)) ==
+          AdaptiveV2ReportingTransitionStatus::delivered);
+#else
+    CHECK(commit_delivery ==
+          AdaptiveV2ReportingTransitionStatus::delivered);
+#endif
+    CHECK(outbox.release_terminal(commit_retry.report->report_id) ==
+          AdaptiveV2ReportingReleaseStatus::released);
+
+    REQUIRE(outbox.enqueue_epoch_activated(exact_identity) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->opcode ==
+          hotstuff::MsgAdaptiveV2EpochActivatedObservation::opcode);
+    const auto activation_bytes = outbox.front()->canonical_payload;
+    const auto decoded_activation =
+        hotstuff::decode_adaptive_v2_epoch_activated_observation(
+            activation_bytes,
+            hotstuff::AdaptiveV2ConvergenceWireLimits{});
+    REQUIRE(decoded_activation);
+    CHECK(decoded_activation.observation->claimed_source_replica_id ==
+          kSource);
+    CHECK(decoded_activation.observation->identity == exact_identity);
+    CHECK(decoded_activation.observation->activated_epoch_number ==
+          exact_identity.successor_epoch_number);
+    CHECK(decoded_activation.observation->activated_epoch_digest ==
+          exact_identity.successor_epoch_digest);
+
+    const auto first_activation_attempt = outbox.begin_delivery(200);
+    REQUIRE(first_activation_attempt.token.has_value());
+    CHECK(outbox.acknowledge_delivery(
+              *first_activation_attempt.token,
+              AdaptiveV2ReportingDeliveryResult::temporary_failure,
+              200) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    const auto activation_retry = outbox.begin_delivery(210);
+    REQUIRE(activation_retry.report != nullptr);
+    CHECK(activation_retry.report->canonical_payload == activation_bytes);
+    CHECK(activation_retry.report->opcode ==
+          hotstuff::MsgAdaptiveV2EpochActivatedObservation::opcode);
+}
+
+#if KAURI_HAS_ADAPTIVE_V2_CONVERGENCE_ACK_WIRE
+
+hotstuff::AdaptiveV2ConvergenceObservationAck activation_ack(
+    const bytearray_t &canonical_observation,
+    hotstuff::AdaptiveV2ConvergenceAckDisposition disposition =
+        hotstuff::AdaptiveV2ConvergenceAckDisposition::positive)
+{
+    return observation_ack(
+        hotstuff::AdaptiveV2ConvergenceObservationKind::activation,
+        canonical_observation,
+        disposition);
+}
+
+template<typename Outbox>
+void exercise_activation_ack_retransmission()
+{
+    Outbox outbox(config(limits(4, 64 * 1024, 5, 10, 40)));
+    const auto exact_identity = convergence_identity();
+    REQUIRE(outbox.enqueue_epoch_activated(exact_identity) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    const auto exact_bytes = outbox.front()->canonical_payload;
+
+    // Salticidae accepting bytes into a nonblocking send buffer does not
+    // prove that the manager received the authoritative observation.
+    const auto first = outbox.begin_delivery(100);
+    REQUIRE(first.token.has_value());
+    REQUIRE(first.report != nullptr);
+    CHECK(outbox.acknowledge_delivery(
+              *first.token,
+              AdaptiveV2ReportingDeliveryResult::delivered,
+              100) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->delivery_state ==
+          AdaptiveV2ReportingDeliveryState::awaiting_ack);
+    CHECK(outbox.release_terminal(outbox.front()->report_id) ==
+          AdaptiveV2ReportingReleaseStatus::not_terminal);
+
+    // Deliberately lose that first observation. The outbox must retransmit
+    // the byte-identical authority, not synthesize another activation fact.
+    CHECK(outbox.begin_delivery(109).status ==
+          AdaptiveV2ReportingAttemptStatus::retry_not_due);
+    const auto retry = outbox.begin_delivery(110);
+    REQUIRE(retry.token.has_value());
+    REQUIRE(retry.report != nullptr);
+    CHECK(retry.report->canonical_payload == exact_bytes);
+    CHECK(retry.report->opcode ==
+          hotstuff::MsgAdaptiveV2EpochActivatedObservation::opcode);
+    CHECK(outbox.acknowledge_delivery(
+              *retry.token,
+              AdaptiveV2ReportingDeliveryResult::delivered,
+              110) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+
+    auto wrong = activation_ack(exact_bytes);
+    wrong.target_replica_id = kSource + 1;
+    CHECK(outbox.acknowledge_convergence_observation(wrong) ==
+          AdaptiveV2ReportingTransitionStatus::stale_report);
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->canonical_payload == exact_bytes);
+
+    wrong = activation_ack(exact_bytes);
+    wrong.observation_kind =
+        hotstuff::AdaptiveV2ConvergenceObservationKind::commit;
+    CHECK(outbox.acknowledge_convergence_observation(wrong) ==
+          AdaptiveV2ReportingTransitionStatus::stale_report);
+
+    wrong = activation_ack(exact_bytes);
+    wrong.identity.command_block_hash = digest("wrong-ack-identity");
+    CHECK(outbox.acknowledge_convergence_observation(wrong) ==
+          AdaptiveV2ReportingTransitionStatus::stale_report);
+
+    wrong = activation_ack(exact_bytes);
+    wrong.observation_digest = digest("wrong-observation-bytes");
+    CHECK(outbox.acknowledge_convergence_observation(wrong) ==
+          AdaptiveV2ReportingTransitionStatus::stale_report);
+
+    const auto positive = activation_ack(exact_bytes);
+    CHECK(outbox.acknowledge_convergence_observation(positive) ==
+          AdaptiveV2ReportingTransitionStatus::delivered);
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->delivery_state ==
+          AdaptiveV2ReportingDeliveryState::delivered);
+    const auto report_id = outbox.front()->report_id;
+    CHECK(outbox.release_terminal(report_id) ==
+          AdaptiveV2ReportingReleaseStatus::released);
+    CHECK(outbox.diagnostics().pending_reports == 0);
+
+    Outbox rejected(config(limits(4, 64 * 1024, 5, 10, 40)));
+    REQUIRE(rejected.enqueue_epoch_activated(exact_identity) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(rejected.front() != nullptr);
+    const auto rejected_bytes = rejected.front()->canonical_payload;
+    const auto rejected_attempt = rejected.begin_delivery(200);
+    REQUIRE(rejected_attempt.token.has_value());
+    CHECK(rejected.acknowledge_delivery(
+              *rejected_attempt.token,
+              AdaptiveV2ReportingDeliveryResult::delivered,
+              200) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    CHECK(rejected.acknowledge_convergence_observation(activation_ack(
+              rejected_bytes,
+              hotstuff::AdaptiveV2ConvergenceAckDisposition::
+                  permanent_rejection)) ==
+          AdaptiveV2ReportingTransitionStatus::failed);
+    REQUIRE(rejected.front() != nullptr);
+    CHECK(rejected.front()->delivery_state ==
+          AdaptiveV2ReportingDeliveryState::failed);
+    CHECK_FALSE(rejected.healthy());
+}
+
+#endif
+
 } // namespace
+
+TEST_CASE(
+    "convergence observations use the reporting FIFO and retry canonical bytes",
+    "[adaptive-v2][reporting-outbox][convergence][c5][retry][bytes]")
+{
+    if constexpr (has_convergence_observation_enqueue<
+                      AdaptiveV2ReportingOutbox>::value)
+    {
+        exercise_convergence_observation_retry<
+            AdaptiveV2ReportingOutbox>();
+    }
+    else
+    {
+        FAIL("reporting outbox lacks commit and activation observation enqueue seams");
+    }
+}
+
+TEST_CASE(
+    "activation enqueue capacity failure preserves the exact observation for retry",
+    "[adaptive-v2][reporting-outbox][convergence][activation][capacity]")
+{
+    AdaptiveV2ReportingOutbox outbox(config(limits(1, 64 * 1024)));
+    const auto active = configuration(0, 0, "capacity-active");
+    REQUIRE(outbox.enqueue_readiness(active, 1, 0) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+
+    const auto retained_identity = convergence_identity();
+    CHECK(outbox.enqueue_epoch_activated(retained_identity) ==
+          AdaptiveV2ReportingEnqueueStatus::capacity_exceeded);
+    CHECK(outbox.diagnostics().pending_reports == 1);
+    CHECK(outbox.diagnostics().capacity_failures == 1);
+
+    deliver_and_release(outbox, 1);
+    REQUIRE(outbox.enqueue_epoch_activated(retained_identity) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    const auto decoded =
+        hotstuff::decode_adaptive_v2_epoch_activated_observation(
+            outbox.front()->canonical_payload,
+            hotstuff::AdaptiveV2ConvergenceWireLimits{});
+    REQUIRE(decoded);
+    CHECK(decoded.observation->identity == retained_identity);
+}
+
+TEST_CASE(
+    "locally accepted activation status retransmits until exact manager acknowledgement",
+    "[adaptive-v2][reporting-outbox][convergence][activation][ack][loss]")
+{
+#if KAURI_HAS_ADAPTIVE_V2_CONVERGENCE_ACK_WIRE
+    exercise_activation_ack_retransmission<
+        AdaptiveV2ReportingOutbox>();
+#else
+    FAIL("reporting outbox lacks convergence acknowledgement support");
+#endif
+}
+
+TEST_CASE(
+    "a dropped high-attempt convergence ACK retransmits at the capped backoff before drain exit",
+    "[adaptive-v2][reporting-outbox][convergence][ack][loss][maximum-backoff][drain]")
+{
+#if KAURI_HAS_ADAPTIVE_V2_CONVERGENCE_ACK_WIRE
+    constexpr std::uint64_t initial_backoff_ns = 1'000'000;
+    constexpr std::uint64_t maximum_backoff_ns = 1'000'000'000;
+    constexpr std::uint64_t scheduling_margin_ns = 100'000'000;
+    AdaptiveV2ReportingOutbox outbox(config(
+        limits(4, 64 * 1024, 12,
+               initial_backoff_ns, maximum_backoff_ns)));
+    REQUIRE(outbox.enqueue_epoch_activated(convergence_identity()) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.front() != nullptr);
+    const auto canonical = outbox.front()->canonical_payload;
+
+    std::uint64_t now = 10'000'000'000;
+    for (std::uint32_t attempt_number = 1;
+         attempt_number <= 11;
+         ++attempt_number)
+    {
+        const auto attempt = outbox.begin_delivery(now);
+        REQUIRE(attempt.status ==
+                AdaptiveV2ReportingAttemptStatus::started);
+        REQUIRE(attempt.token.has_value());
+        REQUIRE(attempt.report != nullptr);
+        CHECK(attempt.token->attempt_number == attempt_number);
+        CHECK(attempt.report->canonical_payload == canonical);
+        REQUIRE(outbox.acknowledge_delivery(
+                    *attempt.token,
+                    AdaptiveV2ReportingDeliveryResult::delivered,
+                    now) ==
+                AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+        REQUIRE(outbox.front() != nullptr);
+        const auto retry_at = outbox.front()->next_attempt_monotonic_ns;
+        REQUIRE(retry_at > now);
+
+        if (attempt_number == 11)
+        {
+            // The decisive manager ACK is lost at the capped retry attempt.
+            CHECK(retry_at - now == maximum_backoff_ns);
+            const auto manager_drain_exit =
+                now + maximum_backoff_ns + scheduling_margin_ns;
+            CHECK(retry_at < manager_drain_exit);
+            CHECK(outbox.begin_delivery(retry_at - 1).status ==
+                  AdaptiveV2ReportingAttemptStatus::retry_not_due);
+            const auto retransmission = outbox.begin_delivery(retry_at);
+            REQUIRE(retransmission.status ==
+                    AdaptiveV2ReportingAttemptStatus::started);
+            REQUIRE(retransmission.report != nullptr);
+            CHECK(retransmission.report->canonical_payload == canonical);
+            CHECK(outbox.acknowledge_convergence_observation(
+                      activation_ack(canonical)) ==
+                  AdaptiveV2ReportingTransitionStatus::delivered);
+            CHECK(outbox.healthy());
+            REQUIRE(outbox.front() != nullptr);
+            CHECK(outbox.release_terminal(
+                      outbox.front()->report_id) ==
+                  AdaptiveV2ReportingReleaseStatus::released);
+            CHECK(outbox.diagnostics().pending_reports == 0);
+            break;
+        }
+        now = retry_at;
+    }
+#else
+    FAIL("convergence ACK wire support is required for drain recovery");
+#endif
+}
 
 TEST_CASE(
     "reporting outbox preserves FIFO order independent stream sequences and exact identities",

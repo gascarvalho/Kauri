@@ -1138,6 +1138,11 @@ namespace hotstuff
         };
         std::optional<PendingCommittedEpochChange>
             pending_committed_epoch_change;
+        std::optional<AdaptiveV2EpochChangeIdentity>
+            adaptive_v2_committed_convergence_identity;
+        bool adaptive_v2_commit_observation_enqueued{false};
+        bool adaptive_v2_activation_observation_pending{false};
+        bool adaptive_v2_convergence_evidence_healthy{true};
         struct PendingAdaptiveV2Commit
         {
             uint256_t block_hash;
@@ -1238,6 +1243,9 @@ namespace hotstuff
         void adaptive_v2_epoch_change_bundle_handler(
             MsgAdaptiveV2EpochChangeBundle &&message,
             const Net::conn_t &conn);
+        void adaptive_v2_convergence_ack_handler(
+            MsgAdaptiveV2ConvergenceObservationAck &&message,
+            const Net::conn_t &connection);
         bool authorize_manager_peer(const PeerId &peer) const noexcept;
         void bind_adaptive_v2_manager_reporting_transport();
         EvidenceTransportResult enqueue_adaptive_v2_evidence_report(
@@ -1254,6 +1262,11 @@ namespace hotstuff
             AggregationScheduler::Duration delay) noexcept;
         void cancel_adaptive_v2_reporting_flush() noexcept;
         void flush_adaptive_v2_reporting() noexcept;
+        void enqueue_pending_adaptive_v2_commit_observation() noexcept;
+        void enqueue_pending_adaptive_v2_activation_observation()
+            noexcept;
+        void mark_adaptive_v2_convergence_evidence_unhealthy(
+            const char *reason) noexcept;
         void rebuild_aggregation_timeout_coordinator();
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
