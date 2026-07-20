@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "n7-f2-q5-epoch1-convergence-v2",
+  "profile_id": "n7-f2-q5-epoch1-convergence-v3",
   "frozen": true,
   "base_profile": {
     "identity": "n7-f2-q5-crash-recovery-v2",
@@ -20,14 +20,14 @@
       "attempt": 1
     },
     "activation_ack": {
-      "positive_ack_ordinal": 1
+      "accepted_activation_ordinal": 5
     }
   },
   "requirements": {
     "matching_activation_sources": 5,
     "exactly_one_converged": true,
     "exactly_one_ready": true,
-    "require_ack_retransmission": true,
+    "require_post_ready_ack_retransmission": true,
     "require_common_successor_commit": true,
     "forbid_epoch_above": 1,
     "throughput_claim": false

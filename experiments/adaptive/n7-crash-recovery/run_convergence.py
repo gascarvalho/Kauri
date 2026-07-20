@@ -18,8 +18,8 @@ import uuid
 import run as base
 
 
-PROFILE_ID = "n7-f2-q5-epoch1-convergence-v2"
-PROFILE_SHA256 = "4146e736501e5b6f07409ccf83cd3b2b39fbefee3a89590f47b03bdcc1db16ae"
+PROFILE_ID = "n7-f2-q5-epoch1-convergence-v3"
+PROFILE_SHA256 = "31f4e6ee2aab324521ae62f569b1a7a55c61f41f51ac6a7b80adb95bf4e2d38f"
 SCENARIO = "n7-epoch1-convergence"
 RESULT_ROOT_NAME = "n7-epoch1-convergence"
 MANAGER_SOURCE_ID = "adaptive-manager"
@@ -48,13 +48,13 @@ def _expected_profile() -> dict[str, Any]:
         "activation_delay_blocks": base.ACTIVATION_DELAY_BLOCKS,
         "fault_injection": {
             "bundle_delivery": {"recipient": 2, "attempt": 1},
-            "activation_ack": {"positive_ack_ordinal": 1},
+            "activation_ack": {"accepted_activation_ordinal": 5},
         },
         "requirements": {
             "matching_activation_sources": base.QUORUM,
             "exactly_one_converged": True,
             "exactly_one_ready": True,
-            "require_ack_retransmission": True,
+            "require_post_ready_ack_retransmission": True,
             "require_common_successor_commit": True,
             "forbid_epoch_above": 1,
             "throughput_claim": False,
@@ -91,9 +91,9 @@ def loss_control_arguments(profile: Mapping[str, Any]) -> tuple[str, ...]:
     acknowledgement = profile["fault_injection"]["activation_ack"]
     bundle_attempt = f"{bundle['recipient']}:{bundle['attempt']}"
     acknowledgement_ordinal = str(
-        acknowledgement["positive_ack_ordinal"]
+        acknowledgement["accepted_activation_ordinal"]
     )
-    if bundle_attempt != "2:1" or acknowledgement_ordinal != "1":
+    if bundle_attempt != "2:1" or acknowledgement_ordinal != "5":
         raise RunnerError("frozen loss-control arguments are not exact")
     return (
         "--experiment-drop-bundle-attempt",
@@ -187,7 +187,7 @@ def _loss_control_state(
     ]
     if len(ready_events) != 1:
         raise RunnerError("ACK recovery boundary requires exactly one ready event")
-    ready_ns = base._event_timestamp(ready_events[0])
+    ready_sequence = base._source_sequence(ready_events[0])
     acknowledgement_target = acknowledgement_payload.get("replica_id")
     recovered_acknowledgements = [
         event
@@ -195,7 +195,7 @@ def _loss_control_state(
         if payload.get("disposition") == "ack_sent"
         and payload.get("replica_id") == acknowledgement_target
         and payload.get("canonical_payload_digest") == acknowledgement_digest
-        and base._event_timestamp(event) > ready_ns
+        and base._source_sequence(event) > ready_sequence
     ]
     if len(recovered_acknowledgements) != 1:
         raise RunnerError("manager did not audit one exact post-ready ACK recovery")
@@ -210,7 +210,7 @@ def _loss_control_state(
             "canonical_payload_digest": bundle_digest,
         },
         "activation_ack": {
-            "positive_ack_ordinal": 1,
+            "accepted_activation_ordinal": 5,
             "observed": True,
             "replica_id": acknowledgement_target,
             "canonical_payload_digest": acknowledgement_digest,

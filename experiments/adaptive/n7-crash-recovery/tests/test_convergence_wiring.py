@@ -65,7 +65,7 @@ def test_convergence_runner_requests_exact_loss_controls_without_environment_fla
     assert '"--experiment-drop-bundle-attempt"' in source
     assert '"2:1"' in source
     assert '"--experiment-drop-activation-ack"' in source
-    assert '"1"' in source
+    assert '"5"' in source
     assert "manager_extra_args=" in source
     assert "os.environ" not in source
 

@@ -438,6 +438,36 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager drops the ACK for the Q completing accepted activation",
+    "[adaptive-v2][convergence][manager][ack][loss][deterministic]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+    const auto handler = function_body(
+        manager, "MsgAdaptiveV2EpochActivatedObservation &&message");
+    const auto compact = without_whitespace(handler);
+    REQUIRE_FALSE(handler.empty());
+
+    CHECK(compact.find(
+              "if(disposition=="
+              "AdaptiveV2ManagerConvergenceDisposition::accepted){"
+              "++accepted_activation_ack_ordinal_") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "*options_.experiment_drop_activation_ack=="
+              "accepted_activation_ack_ordinal_") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "convergence_->status()=="
+              "AdaptiveV2ManagerConvergenceStatus::"
+              "ready_for_optimization") !=
+          std::string::npos);
+    CHECK(raw_manager.find(
+              "experiment activation ACK ordinal must equal quorum") !=
+          std::string::npos);
+}
+
+TEST_CASE(
     "manager pre-bounds convergence observations before copying network payloads",
     "[adaptive-v2][convergence][manager][wire][payload-bound][allocation]")
 {

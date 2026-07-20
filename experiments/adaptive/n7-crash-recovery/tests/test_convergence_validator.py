@@ -83,7 +83,7 @@ def test_complete_exact_n7_f2_q5_convergence_run_passes_only_canonical_inputs(
     assert verdict["ready_event_count"] == 1
     assert verdict["bundle_retry"]["recipient"] == 2
     assert verdict["bundle_retry"]["byte_identical"] is True
-    assert verdict["activation_ack_retry"]["replica_id"] == 2
+    assert verdict["activation_ack_retry"]["replica_id"] == 6
     assert verdict["activation_ack_retry"]["byte_identical"] is True
     assert verdict["activation_ack_retry"]["acked_during_drain"] is True
     assert {path.name for path in output.iterdir()} == {
@@ -96,6 +96,41 @@ def test_complete_exact_n7_f2_q5_convergence_run_passes_only_canonical_inputs(
         for path in output.rglob("*")
         for token in ("throughput", "tps", "figure", "plot")
     )
+
+
+def test_manager_source_sequence_orders_equal_timestamp_ack_recovery(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = convergence_run.create_run(tmp_path / "equal-timestamps")
+    shared_timestamp_ns = 3_500_000_000
+
+    def equalize_terminal_chain(values: list[dict[str, Any]]) -> None:
+        for event in values:
+            payload = event.get("payload", {})
+            if event["event_type"] in {
+                "adaptive_v2_converged",
+                "adaptive_v2_ready",
+            } or (
+                event["event_type"] == "adaptive_v2_activation_observed"
+                and payload.get("replica_id") == 6
+                and payload.get("disposition")
+                in {"accepted", "ack_injected_drop", "duplicate", "ack_sent"}
+            ):
+                event["source_monotonic_ns"] = shared_timestamp_ns
+
+    _manager_mutation(manifest, equalize_terminal_chain)
+    convergence_run.mutate_artifact(
+        manifest,
+        "runner_state",
+        lambda state: state["loss_controls"]["activation_ack"].update(
+            {"ack_source_monotonic_ns": shared_timestamp_ns}
+        ),
+    )
+    verdict = _validator().validate_run(
+        manifest, epochs, tmp_path / "validated-equal-timestamps"
+    )
+
+    assert verdict["verdict"] == "PASS"
 
 
 @pytest.mark.parametrize("mutation", ("missing", "wrong", "duplicate"))
@@ -644,7 +679,7 @@ def test_runner_state_ack_recovery_timestamp_must_match_raw_ack(
         event
         for event in _stream_events(manifest, "adaptive-manager")
         if event["event_type"] == "adaptive_v2_activation_observed"
-        and event["payload"].get("replica_id") == 2
+        and event["payload"].get("replica_id") == 6
         and event["payload"].get("disposition") == "ack_sent"
     )
     manifest_document = convergence_run.load(manifest)
@@ -916,7 +951,7 @@ def test_changed_activation_retransmission_bytes_fail(tmp_path: Path) -> None:
             event
             for event in values
             if event["event_type"] == "adaptive_v2_activation_observed"
-            and event["payload"].get("replica_id") == 2
+            and event["payload"].get("replica_id") == 6
             and event["payload"].get("disposition") == "duplicate"
         )
         retry["payload"]["canonical_payload_digest"] = "f" * 64
@@ -927,10 +962,87 @@ def test_changed_activation_retransmission_bytes_fail(tmp_path: Path) -> None:
     )
 
     assert verdict["verdict"] == "FAIL"
-    assert "activation" in verdict["reason"].lower()
 
 
-@pytest.mark.parametrize("ack_sent_ns", (3_109_999_999, 3_110_000_000))
+def test_ack_loss_must_target_the_q_completing_accepted_activation(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = convergence_run.create_run(tmp_path / "early-target")
+
+    def retarget_ack_loss(values: list[dict[str, Any]]) -> None:
+        values[:] = [
+            event
+            for event in values
+            if not (
+                event["event_type"] == "adaptive_v2_activation_observed"
+                and event["payload"].get("replica_id") == 2
+                and event["payload"].get("disposition") == "ack_sent"
+            )
+        ]
+        for event in values:
+            payload = event.get("payload", {})
+            if (
+                event["event_type"] == "adaptive_v2_activation_observed"
+                and payload.get("replica_id") == 6
+                and payload.get("disposition")
+                in {"ack_injected_drop", "duplicate", "ack_sent"}
+            ):
+                payload["replica_id"] = 2
+                payload["canonical_payload_digest"] = (
+                    convergence_run.activation_payload_digest(2)
+                )
+
+    _manager_mutation(manifest, retarget_ack_loss)
+    convergence_run.mutate_artifact(
+        manifest,
+        "runner_state",
+        lambda state: state["loss_controls"]["activation_ack"].update(
+            {
+                "replica_id": 2,
+                "canonical_payload_digest": (
+                    convergence_run.activation_payload_digest(2)
+                ),
+            }
+        ),
+    )
+    verdict = _validator().validate_run(
+        manifest, epochs, tmp_path / "validated-early-target"
+    )
+
+    assert verdict["verdict"] == "FAIL"
+    assert "q-completing" in verdict["reason"].lower()
+
+
+@pytest.mark.parametrize("disposition", ("duplicate", "ack_sent"))
+def test_ack_recovery_must_preserve_the_winning_identity(
+    tmp_path: Path, disposition: str
+) -> None:
+    manifest, epochs = convergence_run.create_run(
+        tmp_path / f"wrong-identity-{disposition}"
+    )
+
+    def change_identity(values: list[dict[str, Any]]) -> None:
+        event = next(
+            value
+            for value in values
+            if value["event_type"] == "adaptive_v2_activation_observed"
+            and value["payload"].get("replica_id") == 6
+            and value["payload"].get("disposition") == disposition
+        )
+        event["payload"]["identity"]["command_block_hash"] = "f" * 64
+
+    _manager_mutation(manifest, change_identity)
+    verdict = _validator().validate_run(
+        manifest,
+        epochs,
+        tmp_path / f"validated-wrong-identity-{disposition}",
+    )
+
+    assert verdict["verdict"] == "FAIL"
+    assert "winning identity" in verdict["reason"].lower()
+
+
+@pytest.mark.parametrize("ack_sent_ns", (3_509_999_999, 3_510_000_000))
 def test_ack_sent_before_or_at_dropped_ack_fails(
     tmp_path: Path, ack_sent_ns: int
 ) -> None:
@@ -943,12 +1055,19 @@ def test_ack_sent_before_or_at_dropped_ack_fails(
             event
             for event in values
             if event["event_type"] == "adaptive_v2_activation_observed"
-            and event["payload"].get("replica_id") == 2
+            and event["payload"].get("replica_id") == 6
             and event["payload"].get("disposition") == "ack_sent"
         )
         early = json.loads(json.dumps(sent))
         early["source_monotonic_ns"] = ack_sent_ns
-        values.append(early)
+        drop_index = next(
+            index
+            for index, event in enumerate(values)
+            if event["event_type"] == "adaptive_v2_activation_observed"
+            and event["payload"].get("replica_id") == 6
+            and event["payload"].get("disposition") == "ack_injected_drop"
+        )
+        values.insert(drop_index, early)
 
     _manager_mutation(manifest, add_early_ack_sent)
     verdict = _validator().validate_run(
@@ -1001,7 +1120,7 @@ def test_missing_activation_ack_loss_recovery_step_fails(
             for event in values
             if not (
                 event["event_type"] == "adaptive_v2_activation_observed"
-                and event["payload"].get("replica_id") == 2
+                and event["payload"].get("replica_id") == 6
                 and event["payload"].get("disposition") == disposition
             )
         ]

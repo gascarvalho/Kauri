@@ -49,7 +49,13 @@ def test_convergence_profile_versions_the_live_manager_deadline() -> None:
     path = SCENARIO_DIRECTORY / "convergence-profile.json"
     profile = json.loads(path.read_bytes())
 
-    assert profile["profile_id"] == "n7-f2-q5-epoch1-convergence-v2"
+    assert profile["profile_id"] == "n7-f2-q5-epoch1-convergence-v3"
+    assert (
+        profile["fault_injection"]["activation_ack"][
+            "accepted_activation_ordinal"
+        ]
+        == 5
+    )
     assert profile["timeouts"]["manager_convergence_deadline_s"] == 120
 
 
@@ -77,7 +83,7 @@ def test_base_runner_threads_optional_manager_extra_args_without_changing_defaul
         "--experiment-drop-bundle-attempt",
         "2:1",
         "--experiment-drop-activation-ack",
-        "1",
+        "5",
     )
     assert (
         runner.manager_convergence_arguments(profile)
@@ -128,6 +134,45 @@ def test_runner_accepts_manager_exit_zero_only_after_exactly_one_ready(
             runner.validate_manager_exit(exit_code, ready_count)
 
 
+def test_runner_uses_source_sequence_for_equal_timestamp_ack_recovery(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    manifest, _ = convergence_run.create_run(tmp_path / "equal-timestamps")
+    document = convergence_run.load(manifest)
+    manager_source = next(
+        source
+        for source in document["sources"]
+        if source["source_id"] == "adaptive-manager"
+    )
+    events = [
+        json.loads(line)
+        for line in (manifest.parent / manager_source["path"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line
+    ]
+    ready = next(
+        event for event in events if event["event_type"] == "adaptive_v2_ready"
+    )
+    recovered_ack = next(
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v2_activation_observed"
+        and event["payload"].get("replica_id") == 6
+        and event["payload"].get("disposition") == "ack_sent"
+    )
+    recovered_ack["source_monotonic_ns"] = ready["source_monotonic_ns"]
+
+    loss_controls = runner._loss_control_state(events)
+
+    assert loss_controls["activation_ack"]["observed"] is True
+    assert (
+        loss_controls["activation_ack"]["ack_source_monotonic_ns"]
+        == ready["source_monotonic_ns"]
+    )
+
+
 def test_runner_preserves_exact_sigkill_markers_and_crash_boundary() -> None:
     runner = _runner()
     manifest_parameters = inspect.signature(runner._manifest).parameters
@@ -174,8 +219,14 @@ def test_runner_waits_for_and_records_common_epoch_one_commit_after_ack_drain() 
 
 def test_loss_control_state_records_the_exact_ack_recovery_boundary() -> None:
     runner = _runner()
+    events = sorted(
+        convergence_run.manager_events(),
+        key=lambda event: event["source_monotonic_ns"],
+    )
+    for sequence, event in enumerate(events, start=1):
+        event["source_sequence"] = sequence
 
-    state = runner._loss_control_state(convergence_run.manager_events())
+    state = runner._loss_control_state(events)
 
     assert state["activation_ack"]["ack_source_monotonic_ns"] == 4_110_000_000
 

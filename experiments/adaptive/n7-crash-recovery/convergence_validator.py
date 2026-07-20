@@ -13,9 +13,9 @@ from typing import Any, Mapping, Sequence
 
 
 SCENARIO = "n7-epoch1-convergence"
-PROFILE_ID = "n7-f2-q5-epoch1-convergence-v2"
+PROFILE_ID = "n7-f2-q5-epoch1-convergence-v3"
 PROFILE_SHA256 = (
-    "4146e736501e5b6f07409ccf83cd3b2b39fbefee3a89590f47b03bdcc1db16ae"
+    "31f4e6ee2aab324521ae62f569b1a7a55c61f41f51ac6a7b80adb95bf4e2d38f"
 )
 BASE_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 BASE_PROFILE_SHA256 = (
@@ -373,13 +373,13 @@ def _profile_document() -> dict[str, Any]:
         "activation_delay_blocks": 5,
         "fault_injection": {
             "bundle_delivery": {"recipient": 2, "attempt": 1},
-            "activation_ack": {"positive_ack_ordinal": 1},
+            "activation_ack": {"accepted_activation_ordinal": 5},
         },
         "requirements": {
             "matching_activation_sources": QUORUM,
             "exactly_one_converged": True,
             "exactly_one_ready": True,
-            "require_ack_retransmission": True,
+            "require_post_ready_ack_retransmission": True,
             "require_common_successor_commit": True,
             "forbid_epoch_above": SUCCESSOR_EPOCH,
             "throughput_claim": False,
@@ -1256,10 +1256,18 @@ def _validate_convergence(
             or payload["failure_reason"] is not None
         ):
             raise ValidationError(f"{label} event is not the exact terminal record")
-    if converged.timestamp_ns >= ready.timestamp_ns:
+    if converged.source_sequence >= ready.source_sequence:
         raise ValidationError("ready does not follow converged")
-    fifth_activation_ns = max(event.timestamp_ns for event, _ in accepted_activations)
-    if fifth_activation_ns >= converged.timestamp_ns:
+    accepted_activation_counts = [
+        payload["accepted_activation_count"]
+        for _, payload in accepted_activations
+    ]
+    if accepted_activation_counts != list(range(1, QUORUM + 1)):
+        raise ValidationError(
+            "accepted activation counts do not prove the exact Q progression"
+        )
+    q_completing_event, q_completing_payload = accepted_activations[QUORUM - 1]
+    if q_completing_event.source_sequence >= converged.source_sequence:
         raise ValidationError("terminal success precedes the fifth accepted activation")
 
     dropped = [item for item in activations if item[1]["disposition"] == "ack_injected_drop"]
@@ -1271,7 +1279,10 @@ def _validate_convergence(
         raise ValidationError("activation ACK injected drop has the wrong identity")
     if any(
         payload["disposition"] == "ack_sent"
-        and event.timestamp_ns <= drop_event.timestamp_ns
+        and payload["replica_id"] == target
+        and payload["canonical_payload_digest"]
+        == drop_payload["canonical_payload_digest"]
+        and event.source_sequence <= drop_event.source_sequence
         for event, payload in activations
     ):
         raise ValidationError("an activation ACK was sent before or at the injected drop")
@@ -1285,17 +1296,42 @@ def _validate_convergence(
     acked_target = [
         item for item in activations
         if item[1]["replica_id"] == target and item[1]["disposition"] == "ack_sent"
-        and item[0].timestamp_ns > ready.timestamp_ns
+        and item[0].source_sequence > ready.source_sequence
     ]
     accepted_event, accepted_payload = _single_event(
         accepted_target, "activation accepted before ACK loss"
     )
+    if (
+        accepted_event.source_sequence != q_completing_event.source_sequence
+        or accepted_payload["replica_id"] != q_completing_payload["replica_id"]
+        or accepted_payload["identity"] != q_completing_payload["identity"]
+        or accepted_payload["canonical_payload_digest"]
+        != q_completing_payload["canonical_payload_digest"]
+        or accepted_payload["accepted_activation_count"] != QUORUM
+        or drop_payload["accepted_activation_count"] != QUORUM
+        or drop_payload["replica_id"] != q_completing_payload["replica_id"]
+        or drop_payload["canonical_payload_digest"]
+        != q_completing_payload["canonical_payload_digest"]
+    ):
+        raise ValidationError(
+            "activation ACK loss does not target the Q-completing acceptance"
+        )
     duplicate_event, duplicate_payload = _single_event(
         duplicate_target, "activation retransmission"
     )
     acked_event, acked_payload = _single_event(
         acked_target, "activation ACK during drain"
     )
+    for label, payload in (
+        ("activation retransmission", duplicate_payload),
+        ("activation ACK during drain", acked_payload),
+    ):
+        if (
+            payload["identity"] != identity
+            or payload["accepted_activation_count"] != QUORUM
+            or payload["replica_id"] != target
+        ):
+            raise ValidationError(f"{label} does not carry the winning identity")
     digests = {
         accepted_payload["canonical_payload_digest"],
         drop_payload["canonical_payload_digest"],
@@ -1305,8 +1341,9 @@ def _validate_convergence(
     if len(digests) != 1:
         raise ValidationError("activation retransmission bytes differ")
     if not (
-        accepted_event.timestamp_ns < drop_event.timestamp_ns < ready.timestamp_ns
-        < duplicate_event.timestamp_ns < acked_event.timestamp_ns
+        accepted_event.source_sequence < drop_event.source_sequence
+        < converged.source_sequence < ready.source_sequence
+        < duplicate_event.source_sequence < acked_event.source_sequence
     ):
         raise ValidationError("activation ACK-loss recovery ordering is invalid")
 
@@ -1368,7 +1405,7 @@ def _validate_runner_state(
     ):
         raise ValidationError("runner state does not prove the exact bundle loss")
     if (
-        ack.get("positive_ack_ordinal") != 1
+        ack.get("accepted_activation_ordinal") != 5
         or ack.get("observed") is not True
         or ack.get("replica_id") != convergence["activation_ack_retry"]["replica_id"]
         or ack.get("canonical_payload_digest")
@@ -1463,7 +1500,7 @@ def _validate(
         "--experiment-drop-bundle-attempt",
         "2:1",
         "--experiment-drop-activation-ack",
-        "1",
+        "5",
     ]
     for option in expected_suffix[::2]:
         if manager_argv.count(option) != 1:

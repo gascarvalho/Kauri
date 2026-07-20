@@ -12,7 +12,7 @@ import synthetic_run
 
 RUN_ID = "synthetic-n7-epoch1-convergence"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
-PROFILE_ID = "n7-f2-q5-epoch1-convergence-v2"
+PROFILE_ID = "n7-f2-q5-epoch1-convergence-v3"
 BASE_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 BASE_PROFILE_SHA256 = (
     "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
@@ -51,13 +51,13 @@ def profile_document() -> dict[str, Any]:
         "activation_delay_blocks": 5,
         "fault_injection": {
             "bundle_delivery": {"recipient": 2, "attempt": 1},
-            "activation_ack": {"positive_ack_ordinal": 1},
+            "activation_ack": {"accepted_activation_ordinal": 5},
         },
         "requirements": {
             "matching_activation_sources": 5,
             "exactly_one_converged": True,
             "exactly_one_ready": True,
-            "require_ack_retransmission": True,
+            "require_post_ready_ack_retransmission": True,
             "require_common_successor_commit": True,
             "forbid_epoch_above": 1,
             "throughput_claim": False,
@@ -302,13 +302,13 @@ def manager_events() -> list[dict[str, Any]]:
                 ),
             )
         )
-        if replica == 2:
+        if replica == SURVIVORS[-1]:
             events.append(
                 _envelope(
                     source_kind=kind,
                     source_id=source,
                     source_instance=instance,
-                    timestamp_ns=3_110_000_000,
+                    timestamp_ns=3_510_000_000,
                     event_type="adaptive_v2_activation_observed",
                     payload=_convergence_payload(
                         replica_id=replica,
@@ -369,12 +369,14 @@ def manager_events() -> list[dict[str, Any]]:
                 timestamp_ns=4_100_000_000,
                 event_type="adaptive_v2_activation_observed",
                 payload=_convergence_payload(
-                    replica_id=2,
+                    replica_id=SURVIVORS[-1],
                     disposition="duplicate",
                     identity=winner,
                     commit_count=5,
                     activation_count=5,
-                    canonical_payload_digest=activation_payload_digest(2),
+                    canonical_payload_digest=activation_payload_digest(
+                        SURVIVORS[-1]
+                    ),
                 ),
             ),
             _envelope(
@@ -384,12 +386,14 @@ def manager_events() -> list[dict[str, Any]]:
                 timestamp_ns=ACK_RECOVERY_NS,
                 event_type="adaptive_v2_activation_observed",
                 payload=_convergence_payload(
-                    replica_id=2,
+                    replica_id=SURVIVORS[-1],
                     disposition="ack_sent",
                     identity=winner,
                     commit_count=5,
                     activation_count=5,
-                    canonical_payload_digest=activation_payload_digest(2),
+                    canonical_payload_digest=activation_payload_digest(
+                        SURVIVORS[-1]
+                    ),
                 ),
             ),
             _envelope(
@@ -599,10 +603,12 @@ def create_run(directory: Path) -> tuple[Path, Path]:
                     "canonical_payload_digest": BUNDLE_DIGEST,
                 },
                 "activation_ack": {
-                    "positive_ack_ordinal": 1,
+                    "accepted_activation_ordinal": 5,
                     "observed": True,
-                    "replica_id": 2,
-                    "canonical_payload_digest": activation_payload_digest(2),
+                    "replica_id": SURVIVORS[-1],
+                    "canonical_payload_digest": activation_payload_digest(
+                        SURVIVORS[-1]
+                    ),
                     "ack_source_monotonic_ns": ACK_RECOVERY_NS,
                 },
             },
@@ -660,7 +666,7 @@ def create_run(directory: Path) -> tuple[Path, Path]:
             "--experiment-drop-bundle-attempt",
             "2:1",
             "--experiment-drop-activation-ack",
-            "1",
+            "5",
         ],
     }
     manifest_path = directory / "manifest.json"

@@ -654,10 +654,15 @@ ManagerOptions parse_options(int argc, char **argv)
     }
     if (!opt_experiment_drop_activation_ack->get().empty())
     {
-        options.experiment_drop_activation_ack =
-            parse_unsigned<std::uint32_t>(
-                opt_experiment_drop_activation_ack->get(),
-                "experiment activation ACK ordinal", true);
+        const auto ordinal = parse_unsigned<std::uint32_t>(
+            opt_experiment_drop_activation_ack->get(),
+            "experiment activation ACK ordinal", true);
+        if (ordinal != kSmokeQuorum)
+        {
+            throw std::invalid_argument(
+                "experiment activation ACK ordinal must equal quorum");
+        }
+        options.experiment_drop_activation_ack = ordinal;
     }
 
     for (const auto &raw : opt_replicas->get())
@@ -1622,15 +1627,18 @@ private:
                         convergence_disposition_name(disposition),
                         "",
                         canonical_payload_digest);
-                    if (acknowledgement.disposition ==
-                        AdaptiveV2ConvergenceAckDisposition::positive)
+                    if (disposition ==
+                        AdaptiveV2ManagerConvergenceDisposition::accepted)
                     {
-                        ++positive_activation_ack_ordinal_;
+                        ++accepted_activation_ack_ordinal_;
                         acknowledgement_injected_drop =
                             options_.experiment_drop_activation_ack.has_value() &&
                             !experiment_activation_ack_drop_consumed_ &&
                             *options_.experiment_drop_activation_ack ==
-                                positive_activation_ack_ordinal_;
+                                accepted_activation_ack_ordinal_ &&
+                            convergence_->status() ==
+                                AdaptiveV2ManagerConvergenceStatus::
+                                    ready_for_optimization;
                         if (acknowledgement_injected_drop)
                         {
                             experiment_activation_ack_drop_consumed_ =
@@ -1724,7 +1732,7 @@ private:
     salticidae::TimerEvent convergence_ack_drain_timer;
     std::uint64_t convergence_tick_{0};
     std::size_t emitted_score_trajectory_{0};
-    std::uint32_t positive_activation_ack_ordinal_{0};
+    std::uint32_t accepted_activation_ack_ordinal_{0};
     bool network_stop_required_{false};
     bool network_stopped_{false};
     bool ingress_stopped_{false};
