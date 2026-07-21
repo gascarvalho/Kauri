@@ -631,6 +631,7 @@ struct AdaptiveV2ManagerIngress::State
         ready_members = prepared_readiness_sources.size();
         readiness_accepted = 0;
         readiness_rejected = 0;
+        readiness_height_floor = prepared_readiness_height;
         current_epoch = prepared_epoch;
         current_configuration = prepared_configuration;
         activation_generation = prepared_activation_generation;
@@ -657,6 +658,7 @@ struct AdaptiveV2ManagerIngress::State
     std::uint64_t prepared_activation_generation{0};
     std::vector<ReplicaID> prepared_readiness_sources;
     std::uint64_t prepared_readiness_height{0};
+    std::uint64_t readiness_height_floor{0};
     std::map<ReplicaID, ReadinessEntry> readiness;
     std::map<ReplicaID, LifecycleSourceEntry> lifecycle_sources;
     std::map<CorroboratedLifecycleFact, CorroboratingSources>
@@ -843,8 +845,9 @@ AdaptiveV2ManagerIngress::ingest_readiness(
             state.audit.state_rejections);
     }
 
-    if (entry.ready &&
-        notice.committed_height < entry.committed_height)
+    if (notice.committed_height < state.readiness_height_floor ||
+        (entry.ready &&
+         notice.committed_height < entry.committed_height))
     {
         return rejected(
             AdaptiveV2ManagerIngressStatus::rejected_height_regression,

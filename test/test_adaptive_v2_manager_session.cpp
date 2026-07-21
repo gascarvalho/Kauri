@@ -1570,6 +1570,8 @@ TEST_CASE(
 
     const auto seeded = fixture.session.ingress().readiness_stats();
     REQUIRE(seeded.ready_members == 5);
+    CHECK(seeded.accepted_notices == 0);
+    CHECK(seeded.rejected_notices == 0);
     CHECK_FALSE(seeded.all_members_ready);
     CHECK(fixture.session.ingress().operationally_ready());
     CHECK(fixture.session.ingress().membership() == kMembers);
@@ -1582,6 +1584,39 @@ TEST_CASE(
     const auto successor_generation =
         fixture.session.ingress().activation_generation();
     REQUIRE(identity.activation_height > 0);
+
+    const auto unseeded = [&](std::uint64_t sequence,
+                              std::uint64_t height) {
+        return route_readiness(
+            fixture.session,
+            AuthenticatedReporter{0},
+            hotstuff::encode_adaptive_v2_readiness_notice(
+                AdaptiveV2ReadinessNotice{
+                    hotstuff::
+                        kAdaptiveV2ReadinessNoticeSchemaVersionV1,
+                    0,
+                    sequence,
+                    successor_configuration,
+                    successor_generation,
+                    height},
+                session_config().ingress_limits.readiness_wire));
+    };
+    CHECK(unseeded(2, identity.activation_height - 1).status ==
+          AdaptiveV2ManagerIngressStatus::rejected_height_regression);
+    const auto below_floor =
+        fixture.session.ingress().readiness_stats();
+    CHECK(below_floor.ready_members == 5);
+    CHECK(below_floor.accepted_notices == 0);
+    CHECK(below_floor.rejected_notices == 1);
+    CHECK_FALSE(below_floor.all_members_ready);
+    CHECK(unseeded(2, identity.activation_height).status ==
+          AdaptiveV2ManagerIngressStatus::processed);
+    const auto accepted_at_floor =
+        fixture.session.ingress().readiness_stats();
+    CHECK(accepted_at_floor.ready_members == 6);
+    CHECK(accepted_at_floor.accepted_notices == 1);
+    CHECK(accepted_at_floor.rejected_notices == 1);
+
     for (const auto source : kSurvivors)
     {
         const auto deliver = [&](std::uint64_t sequence,
@@ -1608,24 +1643,24 @@ TEST_CASE(
         CHECK(deliver(2, identity.activation_height).status ==
               AdaptiveV2ManagerIngressStatus::processed);
     }
-    CHECK(fixture.session.ingress().readiness_stats().ready_members == 5);
+    CHECK(fixture.session.ingress().readiness_stats().ready_members == 6);
 
     const AdaptiveV2ReadinessNotice stale_predecessor{
         hotstuff::kAdaptiveV2ReadinessNoticeSchemaVersionV1,
-        0,
+        1,
         2,
         predecessor_configuration,
         predecessor_generation,
         identity.activation_height};
     CHECK(route_readiness(
               fixture.session,
-              AuthenticatedReporter{0},
+              AuthenticatedReporter{1},
               hotstuff::encode_adaptive_v2_readiness_notice(
                   stale_predecessor,
                   session_config().ingress_limits.readiness_wire))
               .status ==
           AdaptiveV2ManagerIngressStatus::rejected_configuration);
-    CHECK(fixture.session.ingress().readiness_stats().ready_members == 5);
+    CHECK(fixture.session.ingress().readiness_stats().ready_members == 6);
     CHECK(fixture.session.ingress().current_epoch().epoch_number() == 1);
 
     Fixture below_quorum;
