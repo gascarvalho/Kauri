@@ -75,9 +75,14 @@ bool exact_terminal_identity(
     const AdaptiveV2ManagerIngress &ingress,
     const AdaptiveV2EpochChangeBundle &bundle,
     const AdaptiveV2EpochChangeIdentity &identity,
-    std::uint64_t command_block_height,
     std::uint32_t active_tree_id) noexcept
 {
+    if (identity.command_block_height == 0 ||
+        identity.command_block_hash == uint256_t{})
+    {
+        return false;
+    }
+
     const auto successor = checked_successor_epoch(
         ingress.current_epoch().epoch_number());
     if (!successor.has_value())
@@ -87,7 +92,7 @@ bool exact_terminal_identity(
     const auto &payload = bundle.command().payload;
     std::uint64_t activation_height = 0;
     if (!checked_add(
-            command_block_height,
+            identity.command_block_height,
             payload.activation_delay_blocks,
             activation_height))
     {
@@ -117,10 +122,29 @@ bool exact_terminal_identity(
                payload.successor_epoch_digest &&
            identity.command_payload_digest ==
                epoch_change_payload_digest(payload) &&
-           identity.command_block_height == command_block_height &&
            identity.activation_delay_blocks ==
                payload.activation_delay_blocks &&
            identity.activation_height == activation_height;
+}
+
+AdaptiveV2ManagerConvergenceDisposition classify_observation_source(
+    const AdaptiveV2ManagerIngress &ingress,
+    ReplicaID authenticated_replica,
+    ReplicaID claimed_replica) noexcept
+{
+    const auto &members = ingress.membership();
+    if (!std::binary_search(
+            members.begin(), members.end(), authenticated_replica))
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_nonmember;
+    }
+    if (authenticated_replica != claimed_replica)
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_spoofed_source;
+    }
+    return AdaptiveV2ManagerConvergenceDisposition::accepted;
 }
 
 } // namespace
@@ -166,6 +190,7 @@ struct AdaptiveV2ManagerSession::State
             throw std::invalid_argument(
                 "invalid adaptive-v2 manager session configuration");
         }
+        commit_bindings.reserve(ingress.membership().size());
     }
 
     bool owns_cycle() const noexcept
@@ -223,13 +248,47 @@ struct AdaptiveV2ManagerSession::State
         }
     }
 
+    const AdaptiveV2EpochChangeIdentity *commit_binding(
+        ReplicaID source) const noexcept
+    {
+        const auto found = std::find_if(
+            commit_bindings.begin(),
+            commit_bindings.end(),
+            [source](const auto &binding) {
+                return binding.first == source;
+            });
+        return found == commit_bindings.end()
+                   ? nullptr
+                   : &found->second;
+    }
+
+    bool bind_commit(
+        ReplicaID source,
+        const AdaptiveV2EpochChangeIdentity &identity) noexcept
+    {
+        if (commit_binding(source) != nullptr ||
+            commit_bindings.size() >= commit_bindings.capacity())
+        {
+            return false;
+        }
+        try
+        {
+            commit_bindings.emplace_back(source, identity);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void release_cycle(Phase next_phase) noexcept
     {
         ++next_cycle_ordinal;
         convergence.reset();
         controller.reset();
         current_policy.reset();
-        command_block_height.reset();
+        commit_bindings.clear();
         phase = next_phase;
     }
 
@@ -238,7 +297,9 @@ struct AdaptiveV2ManagerSession::State
     std::unique_ptr<AdaptiveV2ManagerController> controller;
     std::unique_ptr<AdaptiveV2ManagerConvergence> convergence;
     std::optional<AdaptiveV2TransitionPolicy> current_policy;
-    std::optional<std::uint64_t> command_block_height;
+    std::vector<std::pair<
+        ReplicaID,
+        AdaptiveV2EpochChangeIdentity>> commit_bindings;
     std::vector<AdaptiveV2ManagerSessionTerminalRecord> records;
     std::uint64_t next_cycle_ordinal{0};
     Phase phase{Phase::evidence_window_open};
@@ -428,7 +489,7 @@ bool AdaptiveV2ManagerSession::begin_cycle(
     if (state.phase != State::Phase::evidence_window_open ||
         state.controller != nullptr || state.convergence != nullptr ||
         state.current_policy.has_value() ||
-        state.command_block_height.has_value() ||
+        !state.commit_bindings.empty() ||
         !state.ingress.healthy() ||
         !successor.has_value() ||
         !successor_generation.has_value() ||
@@ -502,7 +563,6 @@ AdaptiveV2ManagerSession::successor_bundle() const noexcept
 }
 
 bool AdaptiveV2ManagerSession::start_convergence(
-    std::uint64_t command_block_height,
     std::uint64_t logical_start_tick) noexcept
 {
     auto &state = *state_;
@@ -513,7 +573,7 @@ bool AdaptiveV2ManagerSession::start_convergence(
     {
         return false;
     }
-    if (bundle == nullptr || command_block_height == 0)
+    if (bundle == nullptr)
     {
         static_cast<void>(finalize_failed_cycle(
             AdaptiveV2ManagerCycleTerminalReason::
@@ -521,13 +581,8 @@ bool AdaptiveV2ManagerSession::start_convergence(
         return false;
     }
 
-    std::uint64_t activation_height = 0;
     std::uint64_t deadline = 0;
     if (!checked_add(
-            command_block_height,
-            bundle->command().payload.activation_delay_blocks,
-            activation_height) ||
-        !checked_add(
             logical_start_tick,
             state.config.convergence_window_ticks,
             deadline))
@@ -537,8 +592,6 @@ bool AdaptiveV2ManagerSession::start_convergence(
                 convergence_start_failed));
         return false;
     }
-    (void)activation_height;
-
     try
     {
         AdaptiveV2ManagerConvergenceConfig convergence_config;
@@ -555,7 +608,6 @@ bool AdaptiveV2ManagerSession::start_convergence(
                 logical_start_tick);
 
         state.convergence = std::move(convergence);
-        state.command_block_height = command_block_height;
         state.phase = State::Phase::observing_successor;
         return true;
     }
@@ -622,6 +674,15 @@ AdaptiveV2ManagerSession::observe_commit(
     }
     const auto result = state.convergence->observe_commit(
         authenticated_replica, observation);
+    if (result == AdaptiveV2ManagerConvergenceDisposition::accepted &&
+        !state.bind_commit(
+            authenticated_replica, observation.identity))
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                invalid_terminal_identity));
+        return AdaptiveV2ManagerConvergenceDisposition::terminal;
+    }
     static_cast<void>(finalize_convergence_failure_if_needed());
     return result;
 }
@@ -644,6 +705,24 @@ AdaptiveV2ManagerSession::observe_activation(
         return AdaptiveV2ManagerConvergenceDisposition::
             rejected_wrong_identity;
     }
+    if (state.convergence->status() ==
+        AdaptiveV2ManagerConvergenceStatus::awaiting_activations)
+    {
+        const auto source = classify_observation_source(
+            state.ingress,
+            authenticated_replica,
+            observation.claimed_source_replica_id);
+        if (source !=
+            AdaptiveV2ManagerConvergenceDisposition::accepted)
+        {
+            return source;
+        }
+        if (state.commit_binding(authenticated_replica) == nullptr)
+        {
+            return AdaptiveV2ManagerConvergenceDisposition::
+                rejected_wrong_identity;
+        }
+    }
     const auto result = state.convergence->observe_activation(
         authenticated_replica, observation);
     static_cast<void>(finalize_convergence_failure_if_needed());
@@ -665,7 +744,6 @@ bool AdaptiveV2ManagerSession::consume_ready_and_rotate() noexcept
     if (state.phase != State::Phase::observing_successor ||
         state.controller == nullptr || state.convergence == nullptr ||
         !state.current_policy.has_value() ||
-        !state.command_block_height.has_value() ||
         state.convergence->status() !=
             AdaptiveV2ManagerConvergenceStatus::
                 ready_for_optimization)
@@ -681,7 +759,6 @@ bool AdaptiveV2ManagerSession::consume_ready_and_rotate() noexcept
             state.ingress,
             *bundle,
             *identity,
-            *state.command_block_height,
             state.config.active_tree_id))
     {
         static_cast<void>(finalize_failed_cycle(

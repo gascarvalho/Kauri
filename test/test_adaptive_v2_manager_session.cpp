@@ -344,6 +344,18 @@ struct has_independent_convergence_clock<
             std::uint64_t{}, std::uint64_t{}))>> : std::true_type
 {};
 
+template<typename Session, typename = void>
+struct has_precommit_convergence_start : std::false_type
+{};
+
+template<typename Session>
+struct has_precommit_convergence_start<
+    Session,
+    std::void_t<decltype(
+        std::declval<Session &>().start_convergence(
+            std::uint64_t{}))>> : std::true_type
+{};
+
 template<typename Record, typename = void>
 struct has_complete_terminal_record : std::false_type
 {};
@@ -586,8 +598,7 @@ struct Fixture
             *session.successor_bundle(),
             command_height,
             "command-" + std::to_string(command_height));
-        REQUIRE(session.start_convergence(
-            command_height, logical_start_tick));
+        REQUIRE(session.start_convergence(logical_start_tick));
         return identity;
     }
 
@@ -600,6 +611,12 @@ struct Fixture
             policy, command_height, logical_start_tick);
         for (const auto source : kSurvivors)
         {
+            const AdaptiveV2EpochChangeCommittedObservation committed{
+                hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                source,
+                identity};
+            CHECK(session.observe_commit(source, committed) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
             const AdaptiveV2EpochActivatedObservation activated{
                 hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
                 source,
@@ -716,6 +733,12 @@ void verify_complete_convergence_contract()
             identity,
             identity.successor_epoch_number,
             identity.successor_epoch_digest};
+        const AdaptiveV2EpochChangeCommittedObservation commit_from_zero{
+            hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+            0,
+            identity};
+        CHECK(session.observe_commit(0, commit_from_zero) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
         CHECK(session.observe_activation(0, first_from_zero) ==
               AdaptiveV2ManagerConvergenceDisposition::accepted);
         auto conflicting_identity = identity;
@@ -767,14 +790,15 @@ void verify_complete_convergence_contract()
 template<typename Session>
 void verify_independent_convergence_clock_contract()
 {
-    if constexpr (!has_independent_convergence_clock<Session>::value)
+    if constexpr (!has_precommit_convergence_start<Session>::value)
     {
         FAIL(
-            "M12-R01 RED: start_convergence must accept independent "
-            "command block height and logical start tick");
+            "M12-R02 RED: start_convergence must depend only on the "
+            "logical retry clock");
     }
     else
     {
+        CHECK_FALSE(has_independent_convergence_clock<Session>::value);
         constexpr std::uint64_t command_block_height = 1'000;
         constexpr std::uint64_t logical_start_tick = 7;
 
@@ -797,8 +821,7 @@ void verify_independent_convergence_clock_contract()
             command_block_height,
             "independent-convergence-clock");
 
-        REQUIRE(session.start_convergence(
-            command_block_height, logical_start_tick));
+        REQUIRE(session.start_convergence(logical_start_tick));
         CHECK(session.due_deliveries(logical_start_tick - 1).empty());
         CHECK(session.terminal_records().empty());
 
@@ -844,6 +867,240 @@ void verify_independent_convergence_clock_contract()
               hotstuff::AdaptiveV2ManagerCycleTerminalReason::
                   convergence_retry_exhausted);
         CHECK(session.ingress().current_epoch().epoch_number() == 0);
+    }
+}
+
+template<typename Session>
+void verify_precommit_delivery_contract()
+{
+    if constexpr (!has_precommit_convergence_start<Session>::value)
+    {
+        FAIL(
+            "M12-R02 RED: start_convergence(logical_start_tick) is "
+            "absent; bundle delivery still requires a guessed pre-commit "
+            "command height");
+    }
+    else
+    {
+        const auto prepare = [](
+                                 Fixture &fixture,
+                                 Session &session,
+                                 std::uint64_t logical_start_tick) {
+            REQUIRE(session.begin_cycle(containment_policy()));
+            CHECK(session.evaluate() ==
+                  AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+            fixture.ready_all();
+            fixture.responsive_baseline();
+            REQUIRE(session.evaluate() ==
+                    AdaptiveV2ManagerControllerStatus::baseline_frozen);
+            fixture.persistent_timeouts();
+            REQUIRE(session.evaluate() ==
+                    AdaptiveV2ManagerControllerStatus::successor_ready);
+            REQUIRE(session.successor_bundle() != nullptr);
+            REQUIRE(session.start_convergence(logical_start_tick));
+        };
+
+        constexpr std::uint64_t logical_start_tick = 40;
+        constexpr std::uint64_t command_height = 1'200;
+        Fixture successful;
+        Session &session = successful.session;
+        prepare(successful, session, logical_start_tick);
+        const auto *bundle = session.successor_bundle();
+        REQUIRE(bundle != nullptr);
+        CHECK(bundle->definition().activation_height == 0);
+        CHECK(session.terminal_records().empty());
+        CHECK(session.due_deliveries(logical_start_tick - 1).empty());
+
+        const auto initial =
+            session.due_deliveries(logical_start_tick);
+        REQUIRE(initial.size() == kMembers.size());
+        const auto canonical_owner =
+            initial.front().canonical_bundle_owner;
+        REQUIRE(canonical_owner != nullptr);
+        for (const auto &request : initial)
+        {
+            CHECK(request.attempt == 1);
+            CHECK(request.canonical_bundle_owner == canonical_owner);
+            CHECK(request.canonical_bundle_bytes == canonical_owner.get());
+            REQUIRE(request.canonical_bundle_bytes != nullptr);
+            CHECK(*request.canonical_bundle_bytes ==
+                  bundle->canonical_bytes());
+        }
+
+        const auto observed = identity_for(
+            *bundle,
+            command_height,
+            "m12-r02-observed-command-block");
+        CHECK(observed.command_block_height != 0);
+        CHECK(observed.command_block_hash != uint256_t{});
+        for (const auto source : kSurvivors)
+        {
+            const AdaptiveV2EpochChangeCommittedObservation committed{
+                hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                source,
+                observed};
+            CHECK(session.observe_commit(source, committed) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+        }
+        for (const auto source : kSurvivors)
+        {
+            const AdaptiveV2EpochActivatedObservation activated{
+                hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                source,
+                observed,
+                observed.successor_epoch_number,
+                observed.successor_epoch_digest};
+            CHECK(session.observe_activation(source, activated) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+        }
+        REQUIRE(session.convergence_status().has_value());
+        CHECK(*session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::ready_for_optimization);
+        REQUIRE(session.consume_ready_and_rotate());
+        REQUIRE(session.terminal_records().size() == 1);
+        const auto &terminal = session.terminal_records().front();
+        REQUIRE(terminal.winning_activation.has_value());
+        CHECK(*terminal.winning_activation == observed);
+        CHECK(terminal.winning_activation->command_block_height ==
+              command_height);
+        CHECK(terminal.winning_activation->command_block_hash ==
+              observed.command_block_hash);
+
+        Fixture rejected;
+        Session &rejected_session = rejected.session;
+        constexpr std::uint64_t rejected_start_tick = 80;
+        prepare(rejected, rejected_session, rejected_start_tick);
+        const auto *rejected_bundle = rejected_session.successor_bundle();
+        REQUIRE(rejected_bundle != nullptr);
+        auto invalid = identity_for(
+            *rejected_bundle,
+            command_height,
+            "m12-r02-invalid-command-block");
+
+        auto zero_height = invalid;
+        zero_height.command_block_height = 0;
+        zero_height.activation_height =
+            zero_height.activation_delay_blocks;
+        CHECK(rejected_session.observe_commit(
+                  2,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      2,
+                      zero_height}) ==
+              AdaptiveV2ManagerConvergenceDisposition::
+                  rejected_wrong_identity);
+
+        auto wrong_bundle = invalid;
+        wrong_bundle.command_payload_digest =
+            digest("m12-r02-wrong-bundle");
+        CHECK(rejected_session.observe_commit(
+                  3,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      3,
+                      wrong_bundle}) ==
+              AdaptiveV2ManagerConvergenceDisposition::
+                  rejected_wrong_identity);
+
+        auto overflow = invalid;
+        overflow.command_block_height =
+            std::numeric_limits<std::uint64_t>::max() -
+            overflow.activation_delay_blocks + 1;
+        overflow.activation_height =
+            std::numeric_limits<std::uint64_t>::max();
+        CHECK(rejected_session.observe_commit(
+                  4,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      4,
+                      overflow}) ==
+              AdaptiveV2ManagerConvergenceDisposition::
+                  rejected_wrong_identity);
+        REQUIRE(rejected_session.convergence_status().has_value());
+        CHECK(*rejected_session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+        CHECK(rejected_session.terminal_records().empty());
+        CHECK(rejected_session.ingress().current_epoch().epoch_number() == 0);
+
+        Fixture conflicting;
+        Session &conflicting_session = conflicting.session;
+        constexpr std::uint64_t conflicting_start_tick = 120;
+        prepare(
+            conflicting,
+            conflicting_session,
+            conflicting_start_tick);
+        const auto *conflicting_bundle =
+            conflicting_session.successor_bundle();
+        REQUIRE(conflicting_bundle != nullptr);
+        const auto committed_identity = identity_for(
+            *conflicting_bundle,
+            command_height,
+            "m12-r02-conflicting-height");
+        CHECK(conflicting_session.observe_commit(
+                  2,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      2,
+                      committed_identity}) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+
+        auto conflicting_height = committed_identity;
+        ++conflicting_height.command_block_height;
+        ++conflicting_height.activation_height;
+        CHECK(conflicting_session.observe_commit(
+                  2,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      2,
+                      conflicting_height}) ==
+              AdaptiveV2ManagerConvergenceDisposition::
+                  conflicting_observation);
+
+        for (const auto source : kSurvivors)
+        {
+            if (source != 2)
+            {
+                const AdaptiveV2EpochChangeCommittedObservation committed{
+                    hotstuff::
+                        kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                    source,
+                    committed_identity};
+                CHECK(conflicting_session.observe_commit(
+                          source, committed) ==
+                      AdaptiveV2ManagerConvergenceDisposition::accepted);
+            }
+            const AdaptiveV2EpochActivatedObservation activated{
+                hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                source,
+                committed_identity,
+                committed_identity.successor_epoch_number,
+                committed_identity.successor_epoch_digest};
+            const auto disposition =
+                conflicting_session.observe_activation(source, activated);
+            CHECK(disposition ==
+                  (source == 2
+                       ? AdaptiveV2ManagerConvergenceDisposition::
+                             conflicting_observation
+                       : AdaptiveV2ManagerConvergenceDisposition::accepted));
+        }
+        REQUIRE(conflicting_session.convergence_status().has_value());
+        CHECK(*conflicting_session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+        CHECK_FALSE(conflicting_session.consume_ready_and_rotate());
+        CHECK(conflicting_session.due_deliveries(
+                  conflicting_start_tick +
+                  session_config().convergence_window_ticks)
+                  .empty());
+        REQUIRE(conflicting_session.terminal_records().size() == 1);
+        CHECK(conflicting_session.terminal_records().front().outcome ==
+              hotstuff::AdaptiveV2ManagerCycleOutcome::failed);
+        CHECK(conflicting_session.ingress().current_epoch().epoch_number() ==
+              0);
     }
 }
 
@@ -1145,6 +1402,14 @@ TEST_CASE(
 {
     verify_independent_convergence_clock_contract<
         AdaptiveV2ManagerSession>();
+}
+
+TEST_CASE(
+    "session delivers the immutable successor before commit identity exists",
+    "[adaptive-v2][manager-session][precommit-delivery][m12-r02]"
+    "[intentional-red]")
+{
+    verify_precommit_delivery_contract<AdaptiveV2ManagerSession>();
 }
 
 TEST_CASE(
