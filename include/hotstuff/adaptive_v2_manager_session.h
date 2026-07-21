@@ -6,13 +6,11 @@
 #define HOTSTUFF_ADAPTIVE_V2_MANAGER_SESSION_H_INCLUDED
 
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <vector>
 
 #include "hotstuff/adaptive_v2_manager_controller.h"
 #include "hotstuff/adaptive_v2_manager_convergence.h"
-#include "hotstuff/epoch_activation.h"
 
 namespace hotstuff
 {
@@ -21,10 +19,6 @@ struct AdaptiveV2ManagerSessionConfig
 {
     std::uint32_t active_tree_id{0};
     std::uint64_t activation_generation{0};
-    std::uint32_t maximum_epoch_number{
-        std::numeric_limits<std::uint32_t>::max()};
-    std::uint64_t maximum_activation_generation{
-        std::numeric_limits<std::uint64_t>::max()};
     AdaptiveV2ManagerIngressLimits ingress_limits;
     AdaptiveV2ManagerControllerConfig controller;
     std::uint64_t retry_interval_ticks{0};

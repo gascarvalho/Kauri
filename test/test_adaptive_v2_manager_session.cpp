@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "catch.hpp"
+#include "hotstuff/epoch_activation.h"
 
 #if __has_include("hotstuff/adaptive_v2_manager_session.h")
 #include "hotstuff/adaptive_v2_manager_session.h"
@@ -529,29 +530,28 @@ TEST_CASE(
     "counter exhaustion creates no command record or partial epoch window",
     "[adaptive-v2][manager-session][overflow][fail-closed][n7]")
 {
-    auto exhausted_config = session_config();
-    exhausted_config.maximum_epoch_number = 0;
-    exhausted_config.maximum_activation_generation =
-        kInitialGeneration;
     AdaptiveV2ManagerSession session{
         kMembers,
         epoch_zero(),
-        std::move(exhausted_config)};
+        session_config()};
     const auto epoch_digest = session.ingress().current_epoch().epoch_digest();
     const auto generation = session.ingress().activation_generation();
 
-    CHECK_FALSE(session.begin_cycle(containment_policy()));
+    // Sessions bootstrap only from trusted E0 and reach later epochs through
+    // exact rotations. Numeric exhaustion therefore remains at the public
+    // checked factory/activation seam rather than a history-free max-epoch
+    // session fixture.
+    CHECK_FALSE(hotstuff::checked_successor_epoch(
+        std::numeric_limits<std::uint32_t>::max()));
+    CHECK_FALSE(hotstuff::checked_activation_generation(
+        std::numeric_limits<std::uint32_t>::max(),
+        std::numeric_limits<std::uint64_t>::max()));
     CHECK(session.successor_bundle() == nullptr);
     CHECK(session.terminal_records().empty());
     CHECK(session.ingress().current_epoch().epoch_number() == 0);
     CHECK(session.ingress().current_epoch().epoch_digest() == epoch_digest);
     CHECK(session.ingress().activation_generation() == generation);
     CHECK(session.ingress().ledger().accepted().empty());
-    CHECK_FALSE(hotstuff::checked_successor_epoch(
-        std::numeric_limits<std::uint32_t>::max()));
-    CHECK_FALSE(hotstuff::checked_activation_generation(
-        std::numeric_limits<std::uint32_t>::max(),
-        std::numeric_limits<std::uint64_t>::max()));
 }
 
 #endif

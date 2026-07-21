@@ -154,10 +154,6 @@ struct AdaptiveV2ManagerSession::State
             placement_membership.begin(),
             placement_membership.end());
         if (placement_membership != ingress.membership() ||
-            ingress.current_epoch().epoch_number() >
-                config.maximum_epoch_number ||
-            ingress.activation_generation() >
-                config.maximum_activation_generation ||
             config.controller.placement.shape.tree_count !=
                 ingress.quorum_metadata().quorum ||
             config.active_tree_id >=
@@ -231,10 +227,9 @@ bool AdaptiveV2ManagerSession::begin_cycle(
         state.command_block_height.has_value() ||
         !state.ingress.healthy() ||
         !successor.has_value() ||
-        *successor > state.config.maximum_epoch_number ||
         !successor_generation.has_value() ||
-        *successor_generation >
-            state.config.maximum_activation_generation ||
+        state.ingress.activation_generation() ==
+            std::numeric_limits<std::uint64_t>::max() ||
         state.next_cycle_ordinal ==
             std::numeric_limits<std::uint64_t>::max() ||
         !valid_policy(
