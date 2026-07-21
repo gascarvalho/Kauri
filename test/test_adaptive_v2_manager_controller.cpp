@@ -811,3 +811,37 @@ TEST_CASE(
     verify_controller_transition_policy_contract<
         AdaptiveV2ManagerControllerConfig>();
 }
+
+TEST_CASE(
+    "legacy positional controller config keeps optimization default",
+    "[adaptive-v2][manager-controller][transition-policy][compatibility]")
+{
+    Fixture fixture;
+    fixture.controller.reset();
+    const auto configured = fixture.config;
+    AdaptiveV2ManagerControllerConfig legacy{
+        configured.selection,
+        configured.reputation_limits,
+        configured.placement,
+        configured.activation_delay_blocks,
+        configured.issuer_id,
+        configured.issuer_private_key,
+        configured.bundle_limits};
+
+    CHECK(legacy.transition_policy.intent ==
+          TreePolicyKind::performance_optimization);
+    CHECK(legacy.transition_policy.containment_baseline_roots.empty());
+
+    fixture.config = std::move(legacy);
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+    fixture.freeze_baseline();
+    fixture.persistent_timeouts(0);
+    fixture.persistent_timeouts(1);
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    CHECK(successor_roots(*fixture.controller) ==
+          std::vector<ReplicaID>{2, 3, 4, 5, 6});
+    check_controller_bundle_authority(fixture);
+}

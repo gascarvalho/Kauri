@@ -19,12 +19,13 @@ struct AdaptiveV2ManagerControllerConfig
 {
     AdaptiveV2SelectionConfig selection;
     EvidenceReputationLimits reputation_limits;
-    AdaptiveV2TransitionPolicy transition_policy;
     TreePlacementInput placement;
     std::uint64_t activation_delay_blocks{0};
     EpochChangeIssuerId issuer_id{0};
     PrivKeySecp256k1 issuer_private_key;
     EpochChangeBundleLimits bundle_limits;
+    // Keep new defaulted fields after the original positional aggregate shape.
+    AdaptiveV2TransitionPolicy transition_policy;
 };
 
 enum class AdaptiveV2ManagerControllerStatus : std::uint8_t
