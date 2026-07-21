@@ -24,6 +24,7 @@ using hotstuff::AdaptiveV2ManagerIngressStatus;
 using hotstuff::AdaptiveV2ReadinessNotice;
 using hotstuff::AdaptiveV2SelectionStatus;
 using hotstuff::AuthenticatedReporter;
+using hotstuff::BaselineRoot;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
 using hotstuff::EpochChangeBundleLimits;
@@ -43,6 +44,7 @@ using hotstuff::ResponseObservationBatch;
 using hotstuff::ResponseOutcome;
 using hotstuff::ResponsivenessClass;
 using hotstuff::TreePlacementInput;
+using hotstuff::TreePolicyKind;
 using hotstuff::TreeShape;
 using hotstuff::uint256_t;
 
@@ -403,6 +405,127 @@ struct Fixture
     }
 };
 
+template<typename Config, typename = void>
+struct has_controller_transition_policy : std::false_type
+{};
+
+template<typename Config>
+struct has_controller_transition_policy<
+    Config,
+    std::void_t<decltype(
+        std::declval<Config &>().transition_policy)>> : std::true_type
+{};
+
+std::vector<ReplicaID> successor_roots(
+    const AdaptiveV2ManagerController &controller)
+{
+    REQUIRE(controller.successor_bundle() != nullptr);
+    std::vector<ReplicaID> roots;
+    for (const auto &tree :
+         controller.successor_bundle()->definition().trees)
+    {
+        REQUIRE_FALSE(tree.members_breadth_first.empty());
+        roots.push_back(tree.members_breadth_first.front());
+    }
+    return roots;
+}
+
+void check_controller_bundle_authority(
+    const Fixture &fixture)
+{
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    const auto &definition =
+        fixture.controller->successor_bundle()->definition();
+    CHECK(definition.epoch_number == 1);
+    CHECK(definition.previous_epoch_digest ==
+          fixture.ingress.current_epoch().epoch_digest());
+    CHECK(definition.membership_digest ==
+          fixture.ingress.current_epoch().membership_digest());
+    CHECK(fixture.ingress.membership() == membership());
+    CHECK(fixture.ingress.quorum_metadata().replica_count == 7);
+    CHECK(fixture.ingress.quorum_metadata().fault_threshold == 2);
+    CHECK(fixture.ingress.quorum_metadata().quorum == 5);
+    for (const auto &tree : definition.trees)
+    {
+        CHECK(tree.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto selected : {ReplicaID{0}, ReplicaID{1}})
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                selected);
+            REQUIRE(position != tree.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      tree.members_breadth_first.begin(),
+                      position)) >= leaf_start);
+        }
+    }
+}
+
+template<typename Config>
+void verify_controller_transition_policy_contract()
+{
+    if constexpr (!has_controller_transition_policy<Config>::value)
+    {
+        FAIL(
+            "M12-R01 RED: AdaptiveV2ManagerControllerConfig has no "
+            "explicit transition_policy");
+    }
+    else
+    {
+        Fixture containment;
+        containment.controller.reset();
+        Config containment_config = containment.config;
+        containment_config.transition_policy.intent =
+            TreePolicyKind::fault_containment;
+        containment_config.transition_policy
+            .containment_baseline_roots = {
+                BaselineRoot{0, 0},
+                BaselineRoot{1, 1},
+                BaselineRoot{2, 2},
+                BaselineRoot{3, 3},
+                BaselineRoot{4, 4}};
+        containment.config = std::move(containment_config);
+        containment.controller =
+            std::make_unique<AdaptiveV2ManagerController>(
+                containment.ingress, containment.config);
+        containment.freeze_baseline();
+        containment.persistent_timeouts(0);
+        containment.persistent_timeouts(1);
+        REQUIRE(containment.controller->evaluate() ==
+                AdaptiveV2ManagerControllerStatus::successor_ready);
+        CHECK(successor_roots(*containment.controller) ==
+              std::vector<ReplicaID>{5, 6, 2, 3, 4});
+        check_controller_bundle_authority(containment);
+
+        Fixture optimization;
+        optimization.controller.reset();
+        Config optimization_config = optimization.config;
+        optimization_config.transition_policy.intent =
+            TreePolicyKind::performance_optimization;
+        optimization_config.transition_policy
+            .containment_baseline_roots.clear();
+        optimization.config = std::move(optimization_config);
+        optimization.controller =
+            std::make_unique<AdaptiveV2ManagerController>(
+                optimization.ingress, optimization.config);
+        optimization.freeze_baseline();
+        optimization.persistent_timeouts(0);
+        optimization.persistent_timeouts(1);
+        REQUIRE(optimization.controller->evaluate() ==
+                AdaptiveV2ManagerControllerStatus::successor_ready);
+        CHECK(successor_roots(*optimization.controller) ==
+              std::vector<ReplicaID>{2, 3, 4, 5, 6});
+        check_controller_bundle_authority(optimization);
+
+        CHECK(successor_roots(*containment.controller) !=
+              successor_roots(*optimization.controller));
+    }
+}
+
 } // namespace
 
 TEST_CASE(
@@ -679,4 +802,12 @@ TEST_CASE(
           AdaptiveV2SelectionStatus::selected);
     CHECK(fixture.controller->successor_bundle() == nullptr);
     CHECK_FALSE(fixture.controller->healthy());
+}
+
+TEST_CASE(
+    "controller routes explicit policy without consulting epoch ordinal",
+    "[adaptive-v2][manager-controller][transition-policy][n7][intentional-red]")
+{
+    verify_controller_transition_policy_contract<
+        AdaptiveV2ManagerControllerConfig>();
 }

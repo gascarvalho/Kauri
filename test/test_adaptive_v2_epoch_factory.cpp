@@ -10,6 +10,8 @@
 
 #include "catch.hpp"
 #include "hotstuff/adaptive_v2_epoch_factory.h"
+#include "hotstuff/adaptive_v2_manager_controller.h"
+#include "hotstuff/epoch_activation.h"
 
 namespace
 {
@@ -18,12 +20,14 @@ using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AcceptedEvidenceView;
 using hotstuff::AdaptationEpochId;
 using hotstuff::AdaptationPolicy;
+using hotstuff::AdaptiveV2ManagerControllerConfig;
 using hotstuff::AdaptiveV2CandidateAudit;
 using hotstuff::AdaptiveV2EpochFactoryResult;
 using hotstuff::AdaptiveV2EpochFactoryStatus;
 using hotstuff::AdaptiveV2SelectionResult;
 using hotstuff::AdaptiveV2SelectionStatus;
 using hotstuff::ConfigurationId;
+using hotstuff::BaselineRoot;
 using hotstuff::EpochChangeBundleLimits;
 using hotstuff::EpochChangeIssuer;
 using hotstuff::EpochDefinition;
@@ -39,6 +43,7 @@ using hotstuff::ResponseObservation;
 using hotstuff::ResponseOutcome;
 using hotstuff::ResponsivenessClass;
 using hotstuff::TreePlacementInput;
+using hotstuff::TreePolicyKind;
 using hotstuff::TreeShape;
 using hotstuff::uint256_t;
 
@@ -83,7 +88,12 @@ EpochDefinitionInput epoch_zero_input()
     input.epoch_number = 0;
     input.membership_digest =
         hotstuff::canonical_membership_digest(membership());
-    input.trees = {tree(0, membership())};
+    input.trees = {
+        tree(0, {0, 1, 2, 3, 4, 5, 6}),
+        tree(1, {1, 2, 3, 4, 5, 6, 0}),
+        tree(2, {2, 3, 4, 5, 6, 0, 1}),
+        tree(3, {3, 4, 5, 6, 0, 1, 2}),
+        tree(4, {4, 5, 6, 0, 1, 2, 3})};
     input.activation_height = 0;
     input.generation_seed = 11;
     input.policy_version = "adaptive-v2-baseline";
@@ -254,6 +264,162 @@ struct Fixture
             limits);
     }
 };
+
+template<typename Config, typename = void>
+struct has_transition_policy_config : std::false_type
+{};
+
+template<typename Config>
+struct has_transition_policy_config<
+    Config,
+    std::void_t<decltype(
+        std::declval<Config &>().transition_policy)>> : std::true_type
+{};
+
+template<typename Policy, typename = void>
+struct has_transition_policy_factory : std::false_type
+{};
+
+template<typename Policy>
+struct has_transition_policy_factory<
+    Policy,
+    std::void_t<decltype(hotstuff::build_adaptive_v2_successor_bundle(
+        std::declval<const EpochDefinition &>(),
+        std::declval<const AdaptiveV2SelectionResult &>(),
+        std::declval<const Policy &>(),
+        std::declval<const TreePlacementInput &>(),
+        std::uint64_t{},
+        std::uint32_t{},
+        std::declval<const PrivKeySecp256k1 &>(),
+        std::declval<const EpochChangeBundleLimits &>()))>>
+    : std::true_type
+{};
+
+std::vector<ReplicaID> bundle_roots(
+    const hotstuff::AdaptiveV2EpochChangeBundle &bundle)
+{
+    std::vector<ReplicaID> roots;
+    for (const auto &candidate : bundle.definition().trees)
+    {
+        REQUIRE_FALSE(candidate.members_breadth_first.empty());
+        roots.push_back(candidate.members_breadth_first.front());
+    }
+    return roots;
+}
+
+void check_bundle_authority_and_leaves(
+    const Fixture &fixture,
+    const hotstuff::AdaptiveV2EpochChangeBundle &bundle)
+{
+    CHECK(bundle.definition().membership_digest ==
+          fixture.current->membership_digest());
+    const auto quorum = hotstuff::derive_byzantine_quorum(
+        fixture.members.size());
+    REQUIRE(quorum.has_value());
+    CHECK(quorum->replica_count == 7);
+    CHECK(quorum->fault_threshold == 2);
+    CHECK(quorum->quorum == 5);
+    for (const auto &candidate : bundle.definition().trees)
+    {
+        CHECK(candidate.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+        const auto leaf_start = first_leaf_index(
+            candidate.members_breadth_first.size(),
+            candidate.fanout);
+        for (const auto selected : fixture.selection.selected_replicas)
+        {
+            const auto position = std::find(
+                candidate.members_breadth_first.begin(),
+                candidate.members_breadth_first.end(),
+                selected);
+            REQUIRE(position !=
+                    candidate.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      candidate.members_breadth_first.begin(),
+                      position)) >= leaf_start);
+        }
+    }
+}
+
+template<typename Config>
+void verify_explicit_factory_policy_contract()
+{
+    if constexpr (!has_transition_policy_config<Config>::value)
+    {
+        FAIL(
+            "M12-R01 RED: AdaptiveV2ManagerControllerConfig has no "
+            "explicit transition_policy");
+    }
+    else
+    {
+        using Policy = std::decay_t<decltype(
+            std::declval<Config &>().transition_policy)>;
+        if constexpr (!has_transition_policy_factory<Policy>::value)
+        {
+            FAIL(
+                "M12-R01 RED: the epoch factory has no overload accepting "
+                "the explicit transition policy");
+        }
+        else
+        {
+            Fixture containment;
+            Config containment_config;
+            containment_config.transition_policy.intent =
+                TreePolicyKind::fault_containment;
+            containment_config.transition_policy
+                .containment_baseline_roots = {
+                    BaselineRoot{0, 0},
+                    BaselineRoot{1, 1},
+                    BaselineRoot{2, 2},
+                    BaselineRoot{3, 3},
+                    BaselineRoot{4, 4}};
+            const auto contained =
+                hotstuff::build_adaptive_v2_successor_bundle(
+                    *containment.current,
+                    containment.selection,
+                    containment_config.transition_policy,
+                    containment.placement,
+                    5,
+                    kIssuerId,
+                    containment.key,
+                    containment.limits);
+            REQUIRE(contained);
+            REQUIRE(contained.bundle != nullptr);
+            CHECK(bundle_roots(*contained.bundle) ==
+                  std::vector<ReplicaID>{5, 6, 2, 3, 4});
+            check_bundle_authority_and_leaves(
+                containment, *contained.bundle);
+
+            Fixture optimization;
+            Config optimization_config;
+            optimization_config.transition_policy.intent =
+                TreePolicyKind::performance_optimization;
+            optimization_config.transition_policy
+                .containment_baseline_roots.clear();
+            const auto optimized =
+                hotstuff::build_adaptive_v2_successor_bundle(
+                    *optimization.current,
+                    optimization.selection,
+                    optimization_config.transition_policy,
+                    optimization.placement,
+                    5,
+                    kIssuerId,
+                    optimization.key,
+                    optimization.limits);
+            REQUIRE(optimized);
+            REQUIRE(optimized.bundle != nullptr);
+            CHECK(bundle_roots(*optimized.bundle) ==
+                  std::vector<ReplicaID>{2, 3, 4, 5, 6});
+            check_bundle_authority_and_leaves(
+                optimization, *optimized.bundle);
+
+            CHECK(contained.bundle->definition().epoch_number == 1);
+            CHECK(optimized.bundle->definition().epoch_number == 1);
+            CHECK(bundle_roots(*contained.bundle) !=
+                  bundle_roots(*optimized.bundle));
+        }
+    }
+}
 
 } // namespace
 
@@ -445,4 +611,24 @@ TEST_CASE(
               AdaptiveV2EpochFactoryStatus::capacity_exceeded);
         CHECK(result.bundle == nullptr);
     }
+}
+
+TEST_CASE(
+    "factory routes explicit containment and optimization independent of epoch",
+    "[adaptive-v2][epoch-factory][transition-policy][n7][intentional-red]")
+{
+    verify_explicit_factory_policy_contract<
+        AdaptiveV2ManagerControllerConfig>();
+}
+
+TEST_CASE(
+    "maximum epoch has no checked successor",
+    "[adaptive-v2][epoch-factory][overflow][fail-closed]")
+{
+    CHECK_FALSE(hotstuff::checked_successor_epoch(
+        std::numeric_limits<std::uint32_t>::max()));
+    hotstuff::AdaptiveV2EpochFactoryResult exhausted;
+    exhausted.status =
+        AdaptiveV2EpochFactoryStatus::epoch_number_exhausted;
+    CHECK(exhausted.bundle == nullptr);
 }

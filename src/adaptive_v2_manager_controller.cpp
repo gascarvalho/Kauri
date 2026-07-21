@@ -221,6 +221,7 @@ struct AdaptiveV2ManagerController::State
         auto built = build_adaptive_v2_successor_bundle(
             ingress.current_epoch(),
             *latest_selection,
+            config.transition_policy,
             config.placement,
             config.activation_delay_blocks,
             config.issuer_id,

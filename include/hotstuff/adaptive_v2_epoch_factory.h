@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "hotstuff/adaptive_v2_selection.h"
 #include "hotstuff/epoch_change_bundle.h"
@@ -14,6 +15,19 @@
 
 namespace hotstuff
 {
+
+/**
+ * Explicit policy input for one adaptive-v2 successor transition.
+ *
+ * Performance optimization is the compatibility default because the original
+ * factory exposed only that behavior. Fault containment additionally requires
+ * one baseline root for every requested tree.
+ */
+struct AdaptiveV2TransitionPolicy
+{
+    TreePolicyKind intent{TreePolicyKind::performance_optimization};
+    std::vector<BaselineRoot> containment_baseline_roots;
+};
 
 enum class AdaptiveV2EpochFactoryStatus : std::uint8_t
 {
@@ -54,6 +68,19 @@ struct AdaptiveV2EpochFactoryResult
  * The crash/containment set is accepted only through `selection`; there is no
  * independent fault-list input. The fixed membership and consensus quorum are
  * never changed by this operation.
+ */
+AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
+    const EpochDefinition &current_epoch,
+    const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
+    const TreePlacementInput &placement_input,
+    std::uint64_t activation_delay_blocks,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &issuer_private_key,
+    const EpochChangeBundleLimits &bundle_limits) noexcept;
+
+/**
+ * Compatibility overload preserving the original optimization-only API.
  */
 AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
     const EpochDefinition &current_epoch,

@@ -1,5 +1,7 @@
 #include "hotstuff/adaptive_v2_epoch_factory.h"
 
+#include "hotstuff/epoch_activation.h"
+
 #include <algorithm>
 #include <limits>
 #include <optional>
@@ -342,9 +344,154 @@ bool exact_optimized_placement(
     return true;
 }
 
+std::optional<std::vector<ReplicaID>> canonical_baseline_roots(
+    const AdaptiveV2TransitionPolicy &policy,
+    std::uint32_t tree_count)
+{
+    if (policy.containment_baseline_roots.size() != tree_count)
+        return std::nullopt;
+
+    std::vector<std::optional<ReplicaID>> by_tree(tree_count);
+    for (const auto &baseline : policy.containment_baseline_roots)
+    {
+        if (baseline.tree_id >= tree_count ||
+            by_tree[baseline.tree_id].has_value())
+        {
+            return std::nullopt;
+        }
+        by_tree[baseline.tree_id] = baseline.replica_id;
+    }
+
+    std::vector<ReplicaID> roots;
+    roots.reserve(tree_count);
+    for (const auto &baseline : by_tree)
+    {
+        if (!baseline.has_value())
+            return std::nullopt;
+        roots.push_back(*baseline);
+    }
+    return roots;
+}
+
+bool exact_containment_placement(
+    const TreePlacementResult &placement,
+    const AdaptiveV2TransitionPolicy &policy,
+    const TreePlacementInput &input,
+    const AdaptationSnapshot &snapshot,
+    const std::vector<ReplicaID> &membership,
+    const std::vector<ReplicaID> &roots,
+    const std::vector<ReplicaID> &selected)
+{
+    const auto baselines = canonical_baseline_roots(
+        policy, input.shape.tree_count);
+    if (!baselines.has_value())
+        return false;
+
+    const auto &explanation = placement.explanation();
+    if (explanation.policy_kind != TreePolicyKind::fault_containment ||
+        explanation.policy_version != input.policy_version ||
+        explanation.generation_seed != input.generation_seed ||
+        explanation.evidence_snapshot_id != snapshot.snapshot_id() ||
+        explanation.evidence_cutoff != snapshot.evidence_cutoff() ||
+        explanation.root_decisions.size() != baselines->size() ||
+        placement.trees().size() != baselines->size())
+    {
+        return false;
+    }
+
+    const std::set<ReplicaID> member_set(
+        membership.begin(), membership.end());
+    const std::set<ReplicaID> eligible(roots.begin(), roots.end());
+    std::vector<bool> preserve(baselines->size(), false);
+    std::set<ReplicaID> reserved;
+    for (std::size_t tree = 0; tree < baselines->size(); ++tree)
+    {
+        const auto requested = (*baselines)[tree];
+        if (eligible.count(requested) != 0 &&
+            reserved.insert(requested).second)
+        {
+            preserve[tree] = true;
+        }
+    }
+
+    std::set<ReplicaID> chosen = reserved;
+    for (std::size_t index = 0; index < baselines->size(); ++index)
+    {
+        const auto requested = (*baselines)[index];
+        auto expected = requested;
+        auto reason = RootSelectionReason::preserved_eligible_baseline;
+        if (!preserve[index])
+        {
+            if (member_set.count(requested) == 0)
+            {
+                reason = RootSelectionReason::fallback_missing_baseline;
+            }
+            else if (eligible.count(requested) == 0)
+            {
+                reason = RootSelectionReason::fallback_ineligible_baseline;
+            }
+            else
+            {
+                reason = RootSelectionReason::fallback_duplicate_baseline;
+            }
+
+            const auto replacement = std::find_if(
+                roots.begin(), roots.end(), [&chosen](ReplicaID candidate) {
+                    return chosen.count(candidate) == 0;
+                });
+            if (replacement == roots.end())
+                return false;
+            expected = *replacement;
+            chosen.insert(expected);
+        }
+
+        const auto &decision = explanation.root_decisions[index];
+        const auto &tree = placement.trees()[index];
+        const auto *score = snapshot_entry(snapshot, expected);
+        if (score == nullptr || !score->eligible ||
+            decision.tree_id != index ||
+            decision.requested_baseline_root != requested ||
+            decision.chosen_root != expected ||
+            decision.chosen_rank != score->rank ||
+            decision.reason != reason || tree.tree_id != index ||
+            tree.members_breadth_first.empty() ||
+            tree.members_breadth_first.front() != expected ||
+            !tree.wait_exempt_leaves.empty())
+        {
+            return false;
+        }
+
+        auto canonical_tree_members = tree.members_breadth_first;
+        if (!sort_unique(canonical_tree_members) ||
+            canonical_tree_members != membership)
+        {
+            return false;
+        }
+
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto selected_replica : selected)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                selected_replica);
+            if (position == tree.members_breadth_first.end() ||
+                static_cast<std::size_t>(std::distance(
+                    tree.members_breadth_first.begin(), position)) <
+                    leaf_start)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 AdaptiveV2EpochFactoryResult build_validated(
     const EpochDefinition &current,
     const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
     const TreePlacementInput &placement_input,
     std::uint64_t activation_delay_blocks,
     EpochChangeIssuerId issuer_id,
@@ -357,8 +504,9 @@ AdaptiveV2EpochFactoryResult build_validated(
         return rejected(
             AdaptiveV2EpochFactoryStatus::invalid_current_epoch);
     }
-    if (current.epoch_number() ==
-        std::numeric_limits<std::uint32_t>::max())
+    const auto successor_epoch = checked_successor_epoch(
+        current.epoch_number());
+    if (!successor_epoch.has_value())
     {
         return rejected(
             AdaptiveV2EpochFactoryStatus::epoch_number_exhausted);
@@ -440,10 +588,30 @@ AdaptiveV2EpochFactoryResult build_validated(
     std::optional<TreePlacementResult> placement;
     try
     {
-        placement.emplace(build_tree_placement(
-            placement_input,
-            *selection.snapshot,
-            PerformanceOptimizationPolicy{}));
+        switch (transition_policy.intent)
+        {
+        case TreePolicyKind::fault_containment:
+            placement.emplace(build_tree_placement(
+                placement_input,
+                *selection.snapshot,
+                FaultContainmentPolicy{
+                    transition_policy.containment_baseline_roots}));
+            break;
+        case TreePolicyKind::performance_optimization:
+            if (!transition_policy.containment_baseline_roots.empty())
+            {
+                return rejected(
+                    AdaptiveV2EpochFactoryStatus::placement_failed);
+            }
+            placement.emplace(build_tree_placement(
+                placement_input,
+                *selection.snapshot,
+                PerformanceOptimizationPolicy{}));
+            break;
+        default:
+            return rejected(
+                AdaptiveV2EpochFactoryStatus::placement_failed);
+        }
     }
     catch (const std::length_error &)
     {
@@ -461,13 +629,24 @@ AdaptiveV2EpochFactoryResult build_validated(
             AdaptiveV2EpochFactoryStatus::placement_failed);
     }
 
-    if (!exact_optimized_placement(
-            *placement,
-            placement_input,
-            *selection.snapshot,
-            *current_members,
-            roots,
-            selected))
+    const auto exact_placement =
+        transition_policy.intent == TreePolicyKind::fault_containment
+            ? exact_containment_placement(
+                  *placement,
+                  transition_policy,
+                  placement_input,
+                  *selection.snapshot,
+                  *current_members,
+                  roots,
+                  selected)
+            : exact_optimized_placement(
+                  *placement,
+                  placement_input,
+                  *selection.snapshot,
+                  *current_members,
+                  roots,
+                  selected);
+    if (!exact_placement)
     {
         return rejected(
             AdaptiveV2EpochFactoryStatus::placement_failed);
@@ -475,7 +654,7 @@ AdaptiveV2EpochFactoryResult build_validated(
 
     EpochDefinitionInput successor;
     successor.schema_version = kEpochDefinitionSchemaVersionV2;
-    successor.epoch_number = current.epoch_number() + 1U;
+    successor.epoch_number = *successor_epoch;
     successor.previous_epoch_digest = current.epoch_digest();
     successor.membership_digest = current.membership_digest();
     successor.trees = placement->trees();
@@ -544,6 +723,7 @@ AdaptiveV2EpochFactoryResult build_validated(
 AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
     const EpochDefinition &current_epoch,
     const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
     const TreePlacementInput &placement_input,
     std::uint64_t activation_delay_blocks,
     EpochChangeIssuerId issuer_id,
@@ -555,6 +735,7 @@ AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
         return build_validated(
             current_epoch,
             selection,
+            transition_policy,
             placement_input,
             activation_delay_blocks,
             issuer_id,
@@ -576,6 +757,26 @@ AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
         return rejected(
             AdaptiveV2EpochFactoryStatus::internal_failure);
     }
+}
+
+AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
+    const EpochDefinition &current_epoch,
+    const AdaptiveV2SelectionResult &selection,
+    const TreePlacementInput &placement_input,
+    std::uint64_t activation_delay_blocks,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &issuer_private_key,
+    const EpochChangeBundleLimits &bundle_limits) noexcept
+{
+    return build_adaptive_v2_successor_bundle(
+        current_epoch,
+        selection,
+        AdaptiveV2TransitionPolicy{},
+        placement_input,
+        activation_delay_blocks,
+        issuer_id,
+        issuer_private_key,
+        bundle_limits);
 }
 
 } // namespace hotstuff
