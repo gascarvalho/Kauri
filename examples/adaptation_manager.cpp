@@ -120,6 +120,8 @@ constexpr double kConvergenceAckDrainSeconds = 1.1;
 constexpr std::size_t kMaximumTransitionRequestBytes = 16 * 1024;
 constexpr std::size_t kMaximumTransitionArtifactIdBytes = 128;
 constexpr std::size_t kMaximumTransitionPathBytes = 4096;
+constexpr std::size_t kManagerStructuredEventMaximumLineBytes =
+    hotstuff::StructuredEventLimits{}.maximum_queued_bytes;
 constexpr std::uint32_t kMaximumPredecessorResidencyMs = 3'600'000;
 constexpr opcode_t kCommittedObservationOpcode =
     MsgAdaptiveV2EpochChangeCommittedObservation::opcode;
@@ -826,6 +828,9 @@ std::string transition_bundle_output_path(
 hotstuff::StructuredEventConfig manager_structured_event_config(
     const ManagerOptions &options)
 {
+    auto limits = hotstuff::StructuredEventLimits{};
+    limits.maximum_line_bytes =
+        kManagerStructuredEventMaximumLineBytes;
     return hotstuff::StructuredEventConfig{
         options.structured_event_run_id,
         hotstuff::StructuredEventSource{
@@ -833,7 +838,7 @@ hotstuff::StructuredEventConfig manager_structured_event_config(
             "adaptive-manager",
             options.structured_event_source_instance},
         std::nullopt,
-        hotstuff::StructuredEventLimits{}};
+        limits};
 }
 
 const char *controller_status_name(
@@ -1866,8 +1871,7 @@ private:
         auto canonical_payload =
             hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
                 event,
-                hotstuff::StructuredEventLimits{}
-                    .maximum_line_bytes);
+                kManagerStructuredEventMaximumLineBytes);
         canonical_payload.push_back('\n');
         structured_event_sink_.emit_audit(
             hotstuff::AuditStructuredEventPayload{event});

@@ -875,6 +875,40 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager gives exact evidence snapshots one shared bounded line capacity",
+    "[adaptive-v2][manager][snapshot][structured-event][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+
+    CHECK(manager.find(
+              "kManagerStructuredEventMaximumLineBytes") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "StructuredEventLimits{}.maximum_queued_bytes") !=
+          std::string::npos);
+
+    const auto config = function_body(
+        manager,
+        "hotstuff::StructuredEventConfig manager_structured_event_config(");
+    REQUIRE_FALSE(config.empty());
+    CHECK(without_whitespace(config).find(
+              "limits.maximum_line_bytes="
+              "kManagerStructuredEventMaximumLineBytes") !=
+          std::string::npos);
+
+    const auto snapshot = function_body(
+        manager, "void emit_evidence_snapshot(");
+    REQUIRE_FALSE(snapshot.empty());
+    const auto serialization = snapshot.find(
+        "serialize_adaptive_v2_evidence_snapshot_payload(");
+    REQUIRE(serialization != std::string::npos);
+    CHECK(snapshot.find(
+              "kManagerStructuredEventMaximumLineBytes",
+              serialization) != std::string::npos);
+}
+
+TEST_CASE(
     "recurring manager delays each rotated predecessor by its explicit residency",
     "[adaptive-v2][manager][session][residency][timer][wiring]")
 {

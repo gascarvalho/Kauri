@@ -545,6 +545,7 @@ using hotstuff::ProcessLifecycleState;
 using hotstuff::ProposalKey;
 using hotstuff::RequiredBranchSignerGap;
 using hotstuff::ReputationEvidenceAppliedStructuredEvent;
+using hotstuff::ReplicaID;
 using hotstuff::ResponseOutcome;
 using hotstuff::SimpleReputationOutcome;
 using hotstuff::StructuredEventClock;
@@ -749,6 +750,35 @@ AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event()
             ResponseOutcome::timeout,
             std::nullopt}};
     event.eligible_ranking = {2, 3, 4, 5, 6};
+    return event;
+}
+
+AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event(
+    std::size_t observation_count)
+{
+    REQUIRE(observation_count > 1);
+    auto event = evidence_snapshot_event();
+    event.baseline_cutoff = observation_count - 1;
+    event.current_cutoff = observation_count;
+    event.observations.clear();
+    event.observations.reserve(observation_count);
+    for (std::size_t index = 0; index < observation_count; ++index)
+    {
+        const auto sequence = index + 1;
+        const auto reporter = static_cast<ReplicaID>(sequence % 7);
+        event.observations.push_back(
+            AdaptiveV2EvidenceSnapshotObservation{
+                digest(
+                    "profile-snapshot-observation-" +
+                    std::to_string(sequence)),
+                sequence,
+                event.predecessor_epoch_number,
+                event.predecessor_epoch_digest,
+                reporter,
+                static_cast<ReplicaID>((reporter + 1) % 7),
+                ResponseOutcome::on_time,
+                1'000'000 + sequence});
+    }
     return event;
 }
 
@@ -1120,6 +1150,18 @@ private:
 std::string rendered(const MemoryOutput &output)
 {
     return std::string(output.bytes().begin(), output.bytes().end());
+}
+
+std::size_t count_occurrences(
+    const std::string &contents,
+    const std::string &needle)
+{
+    std::size_t count = 0;
+    for (std::size_t cursor = 0;
+         (cursor = contents.find(needle, cursor)) != std::string::npos;
+         cursor += needle.size())
+        ++count;
+    return count;
 }
 
 bytearray_t bytes_of(const std::string &text)
@@ -2012,6 +2054,78 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
         CHECK(sink.health().complete_records == 1);
         CHECK(rendered(output) == expected);
     }
+}
+
+TEST_CASE(
+    "manager capacity preserves the 4441-observation exact snapshot",
+    "[adaptive-v2][structured-event][audit][snapshot][capacity]")
+{
+    constexpr std::size_t kProfileObservationCount = 4'441;
+    const auto defaults = StructuredEventLimits{};
+    const auto manager_line_bytes = defaults.maximum_queued_bytes;
+    const auto event =
+        evidence_snapshot_event(kProfileObservationCount);
+
+    CHECK_THROWS_AS(
+        hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
+            event, defaults.maximum_line_bytes),
+        std::length_error);
+
+    const auto payload =
+        hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
+            event, manager_line_bytes);
+    CHECK(payload.size() > defaults.maximum_line_bytes);
+    REQUIRE(payload.size() < manager_line_bytes);
+    CHECK(count_occurrences(payload, "\"observation_id\":") ==
+          kProfileObservationCount);
+
+    auto config = manager_event_config();
+    config.limits.maximum_line_bytes = manager_line_bytes;
+    FakeClock clock({7004});
+    MemoryOutput output;
+    output.reserve(manager_line_bytes);
+    StructuredEventSink sink(config, clock, output);
+    sink.emit_audit(AuditStructuredEventPayload{event});
+    const auto queued = sink.health();
+    REQUIRE(queued.healthy);
+    CHECK(queued.queued_events == 1);
+    CHECK(queued.queued_bytes > payload.size());
+    CHECK(queued.queued_bytes <= manager_line_bytes);
+    sink.shutdown();
+
+    const auto record = rendered(output);
+    const auto payload_marker = record.find("\"payload\":");
+    REQUIRE(payload_marker != std::string::npos);
+    CHECK(record.compare(
+              payload_marker + std::string("\"payload\":").size(),
+              payload.size(),
+              payload) == 0);
+    CHECK(count_occurrences(record, "\"observation_id\":") ==
+          kProfileObservationCount);
+    CHECK(sink.health().healthy);
+    CHECK(sink.health().complete_records == 1);
+
+    const auto oversized = evidence_snapshot_event(20'000);
+    CHECK_THROWS_AS(
+        hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
+            oversized, manager_line_bytes),
+        std::length_error);
+
+    auto oversized_config = manager_event_config();
+    oversized_config.limits.maximum_line_bytes = manager_line_bytes;
+    FakeClock oversized_clock({7005});
+    MemoryOutput oversized_output;
+    StructuredEventSink oversized_sink(
+        oversized_config, oversized_clock, oversized_output);
+    oversized_sink.emit_audit(AuditStructuredEventPayload{oversized});
+    const auto rejected = oversized_sink.health();
+    CHECK_FALSE(rejected.healthy);
+    CHECK(rejected.stopped);
+    CHECK(rejected.last_assigned_sequence == 0);
+    CHECK(rejected.queued_events == 0);
+    CHECK(rejected.queued_bytes == 0);
+    CHECK(rejected.dropped_records == 1);
+    CHECK(oversized_output.bytes().empty());
 }
 
 TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
