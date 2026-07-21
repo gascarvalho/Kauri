@@ -125,7 +125,8 @@ public:
     const AdaptiveV2EpochChangeBundle *successor_bundle() const noexcept;
 
     bool start_convergence(
-        std::uint64_t command_block_height) noexcept;
+        std::uint64_t command_block_height,
+        std::uint64_t logical_start_tick) noexcept;
     std::vector<AdaptiveV2ManagerDeliveryRequest> due_deliveries(
         std::uint64_t logical_tick) noexcept;
     AdaptiveV2ManagerConvergenceDisposition record_enqueue_result(

@@ -502,7 +502,8 @@ AdaptiveV2ManagerSession::successor_bundle() const noexcept
 }
 
 bool AdaptiveV2ManagerSession::start_convergence(
-    std::uint64_t command_block_height) noexcept
+    std::uint64_t command_block_height,
+    std::uint64_t logical_start_tick) noexcept
 {
     auto &state = *state_;
     const auto *bundle = successor_bundle();
@@ -527,7 +528,7 @@ bool AdaptiveV2ManagerSession::start_convergence(
             bundle->command().payload.activation_delay_blocks,
             activation_height) ||
         !checked_add(
-            command_block_height,
+            logical_start_tick,
             state.config.convergence_window_ticks,
             deadline))
     {
@@ -551,7 +552,7 @@ bool AdaptiveV2ManagerSession::start_convergence(
             std::make_unique<AdaptiveV2ManagerConvergence>(
                 *bundle,
                 std::move(convergence_config),
-                command_block_height);
+                logical_start_tick);
 
         state.convergence = std::move(convergence);
         state.command_block_height = command_block_height;

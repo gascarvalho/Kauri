@@ -332,6 +332,18 @@ struct has_complete_convergence_forwarding<
     : std::true_type
 {};
 
+template<typename Session, typename = void>
+struct has_independent_convergence_clock : std::false_type
+{};
+
+template<typename Session>
+struct has_independent_convergence_clock<
+    Session,
+    std::void_t<decltype(
+        std::declval<Session &>().start_convergence(
+            std::uint64_t{}, std::uint64_t{}))>> : std::true_type
+{};
+
 template<typename Record, typename = void>
 struct has_complete_terminal_record : std::false_type
 {};
@@ -556,7 +568,8 @@ struct Fixture
 
     AdaptiveV2EpochChangeIdentity prepare_convergence(
         const AdaptiveV2TransitionPolicy &policy,
-        std::uint64_t command_height)
+        std::uint64_t command_height,
+        std::uint64_t logical_start_tick)
     {
         REQUIRE(session.begin_cycle(policy));
         CHECK(session.evaluate() ==
@@ -573,16 +586,18 @@ struct Fixture
             *session.successor_bundle(),
             command_height,
             "command-" + std::to_string(command_height));
-        REQUIRE(session.start_convergence(command_height));
+        REQUIRE(session.start_convergence(
+            command_height, logical_start_tick));
         return identity;
     }
 
     AdaptiveV2EpochChangeIdentity complete_cycle(
         const AdaptiveV2TransitionPolicy &policy,
-        std::uint64_t command_height)
+        std::uint64_t command_height,
+        std::uint64_t logical_start_tick)
     {
         const auto identity = prepare_convergence(
-            policy, command_height);
+            policy, command_height, logical_start_tick);
         for (const auto source : kSurvivors)
         {
             const AdaptiveV2EpochActivatedObservation activated{
@@ -666,7 +681,7 @@ void verify_complete_convergence_contract()
         Fixture fixture;
         Session &session = fixture.session;
         const auto identity = fixture.prepare_convergence(
-            containment_policy(), 100);
+            containment_policy(), 100, 100);
         const auto *bundle = session.successor_bundle();
         REQUIRE(bundle != nullptr);
 
@@ -749,6 +764,89 @@ void verify_complete_convergence_contract()
     }
 }
 
+template<typename Session>
+void verify_independent_convergence_clock_contract()
+{
+    if constexpr (!has_independent_convergence_clock<Session>::value)
+    {
+        FAIL(
+            "M12-R01 RED: start_convergence must accept independent "
+            "command block height and logical start tick");
+    }
+    else
+    {
+        constexpr std::uint64_t command_block_height = 1'000;
+        constexpr std::uint64_t logical_start_tick = 7;
+
+        Fixture fixture;
+        Session &session = fixture.session;
+        REQUIRE(session.begin_cycle(containment_policy()));
+        CHECK(session.evaluate() ==
+              AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+        fixture.ready_all();
+        fixture.responsive_baseline();
+        REQUIRE(session.evaluate() ==
+                AdaptiveV2ManagerControllerStatus::baseline_frozen);
+        fixture.persistent_timeouts();
+        REQUIRE(session.evaluate() ==
+                AdaptiveV2ManagerControllerStatus::successor_ready);
+        const auto *bundle = session.successor_bundle();
+        REQUIRE(bundle != nullptr);
+        const auto identity = identity_for(
+            *bundle,
+            command_block_height,
+            "independent-convergence-clock");
+
+        REQUIRE(session.start_convergence(
+            command_block_height, logical_start_tick));
+        CHECK(session.due_deliveries(logical_start_tick - 1).empty());
+        CHECK(session.terminal_records().empty());
+
+        const auto initial =
+            session.due_deliveries(logical_start_tick);
+        REQUIRE(initial.size() == kMembers.size());
+        for (const auto &request : initial)
+            CHECK(request.attempt == 1);
+
+        CHECK(session.due_deliveries(logical_start_tick + 1).empty());
+        const auto retry =
+            session.due_deliveries(logical_start_tick + 2);
+        REQUIRE(retry.size() == kMembers.size());
+        for (const auto &request : retry)
+            CHECK(request.attempt == 2);
+
+        const AdaptiveV2EpochChangeCommittedObservation committed{
+            hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+            2,
+            identity};
+        CHECK(session.observe_commit(2, committed) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+        const AdaptiveV2EpochActivatedObservation activated{
+            hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+            2,
+            identity,
+            identity.successor_epoch_number,
+            identity.successor_epoch_digest};
+        CHECK(session.observe_activation(2, activated) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+        REQUIRE(session.convergence_status().has_value());
+        CHECK(*session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+
+        const auto deadline = logical_start_tick +
+            session_config().convergence_window_ticks;
+        CHECK(session.due_deliveries(deadline).empty());
+        REQUIRE(session.terminal_records().size() == 1);
+        const auto &record = session.terminal_records().front();
+        CHECK(record.outcome ==
+              hotstuff::AdaptiveV2ManagerCycleOutcome::failed);
+        CHECK(record.reason ==
+              hotstuff::AdaptiveV2ManagerCycleTerminalReason::
+                  convergence_retry_exhausted);
+        CHECK(session.ingress().current_epoch().epoch_number() == 0);
+    }
+}
+
 template<typename Session, typename Record>
 void verify_terminal_outcome_contract()
 {
@@ -772,7 +870,7 @@ void verify_terminal_outcome_contract()
         const auto predecessor_digest =
             advanced_session.ingress().current_epoch().epoch_digest();
         const auto identity = advanced.complete_cycle(
-            containment_policy(), 100);
+            containment_policy(), 100, 100);
         REQUIRE(advanced_session.terminal_records().size() == 1);
         const Record advanced_record =
             advanced_session.terminal_records().front();
@@ -888,7 +986,7 @@ void verify_terminal_outcome_contract()
         Session &failed_session = failed.session;
         const auto failed_epoch =
             failed_session.ingress().current_epoch().epoch_digest();
-        failed.prepare_convergence(containment_policy(), 300);
+        failed.prepare_convergence(containment_policy(), 300, 300);
         const auto pending = failed_session.convergence_status();
         REQUIRE(pending.has_value());
         CHECK(*pending == AdaptiveV2ManagerConvergenceStatus::
@@ -939,7 +1037,9 @@ TEST_CASE(
         const auto predecessor_digest =
             fixture.session.ingress().current_epoch().epoch_digest();
         const auto identity = fixture.complete_cycle(
-            policies[cycle], 100 + cycle * 10);
+            policies[cycle],
+            100 + cycle * 10,
+            100 + cycle * 10);
 
         CHECK(identity.predecessor_epoch_number == predecessor_number);
         CHECK(identity.predecessor_epoch_digest == predecessor_digest);
@@ -1036,6 +1136,14 @@ TEST_CASE(
     "[adaptive-v2][manager-session][convergence][lifecycle][intentional-red]")
 {
     verify_complete_convergence_contract<
+        AdaptiveV2ManagerSession>();
+}
+
+TEST_CASE(
+    "convergence command height and logical clock are independent",
+    "[adaptive-v2][manager-session][convergence][clock][intentional-red]")
+{
+    verify_independent_convergence_clock_contract<
         AdaptiveV2ManagerSession>();
 }
 
