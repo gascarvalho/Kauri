@@ -2458,6 +2458,25 @@ def _enforce_observer_stall(
         raise RunnerError("live authoritative commit gap exceeds maximum_stall_s")
 
 
+def _transition_stall_window_start(
+    *,
+    predecessor_epoch: int,
+    crash_start_ns: int,
+    predecessor_phase_start_ns: int | None,
+) -> int:
+    if predecessor_epoch == 0:
+        return crash_start_ns
+    if (
+        predecessor_epoch < 0
+        or predecessor_phase_start_ns is None
+        or predecessor_phase_start_ns <= crash_start_ns
+    ):
+        raise RunnerError(
+            "recurring transition has no exact predecessor phase stall boundary"
+        )
+    return predecessor_phase_start_ns
+
+
 def _wait(
     description: str,
     timeout_s: float,
@@ -3280,6 +3299,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         decoded_bundles: list[DecodedBundle] = []
         command_payloads: list[dict[str, Any]] = []
         pending_phase: tuple[str, int, int, DecodedBundle] | None = None
+        recurring_stall_start_ns: int | None = None
 
         def phase_for_epoch(epoch_number: int) -> Mapping[str, Any] | None:
             candidates = [
@@ -3298,6 +3318,11 @@ def run(argv: Sequence[str] | None = None) -> int:
         for transition_index, request in enumerate(transition_requests):
             predecessor_epoch = int(request["predecessor_epoch_number"])
             successor_epoch = int(request["successor_epoch_number"])
+            transition_stall_start_ns = _transition_stall_window_start(
+                predecessor_epoch=predecessor_epoch,
+                crash_start_ns=crash_start_ns,
+                predecessor_phase_start_ns=recurring_stall_start_ns,
+            )
 
             def transition_ready(
                 request: Mapping[str, Any] = request,
@@ -3378,7 +3403,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 streams = _event_streams(run_directory)
                 _enforce_observer_stall(
                     streams[AUTHORITATIVE_SOURCE_ID],
-                    window_start_ns=crash_start_ns,
+                    window_start_ns=transition_stall_start_ns,
                     now_ns=monotonic_raw_ns(),
                     maximum_gap_ns=(
                         degraded_maximum_gap_ns
@@ -3493,11 +3518,12 @@ def run(argv: Sequence[str] | None = None) -> int:
                 allow_clean_exit=allow_completed_manager_exit,
             )
             phase_spec = phase_for_epoch(successor_epoch)
+            phase_start_ns = max(
+                activation_ns + minimum_post_activation_grace_ns,
+                common_successors[0].common_ns,
+            )
+            recurring_stall_start_ns = phase_start_ns
             if phase_spec is not None:
-                phase_start_ns = max(
-                    activation_ns + minimum_post_activation_grace_ns,
-                    common_successors[0].common_ns,
-                )
                 pending_phase = (
                     str(phase_spec["phase"]),
                     successor_epoch,

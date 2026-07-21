@@ -960,6 +960,59 @@ def test_manager_polling_surfaces_failed_terminal_before_ready() -> None:
         campaign.manager_convergence_ready_event([terminal], requests)
 
 
+def test_recurring_stall_window_excludes_the_degraded_epoch_history() -> None:
+    crash_start_ns = 100
+    containment_start_ns = 1_000
+    maximum_gap_ns = 10
+    observer_events = [
+        {
+            "event_type": "block.committed",
+            "source_monotonic_ns": 105,
+        },
+        {
+            "event_type": "block.committed",
+            "source_monotonic_ns": 1_005,
+        },
+    ]
+
+    assert (
+        campaign._transition_stall_window_start(
+            predecessor_epoch=0,
+            crash_start_ns=crash_start_ns,
+            predecessor_phase_start_ns=None,
+        )
+        == crash_start_ns
+    )
+
+    with pytest.raises(campaign.RunnerError, match="commit gap"):
+        campaign._enforce_observer_stall(
+            observer_events,
+            window_start_ns=crash_start_ns,
+            now_ns=1_008,
+            maximum_gap_ns=maximum_gap_ns,
+        )
+
+    recurring_start_ns = campaign._transition_stall_window_start(
+        predecessor_epoch=1,
+        crash_start_ns=crash_start_ns,
+        predecessor_phase_start_ns=containment_start_ns,
+    )
+    assert recurring_start_ns == containment_start_ns
+    campaign._enforce_observer_stall(
+        observer_events,
+        window_start_ns=recurring_start_ns,
+        now_ns=1_008,
+        maximum_gap_ns=maximum_gap_ns,
+    )
+
+    with pytest.raises(campaign.RunnerError, match="predecessor phase"):
+        campaign._transition_stall_window_start(
+            predecessor_epoch=1,
+            crash_start_ns=crash_start_ns,
+            predecessor_phase_start_ns=None,
+        )
+
+
 def _three_cycle_manager_contract(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     requests = synthetic_run.recurring_transition_requests()
