@@ -23,6 +23,7 @@ using hotstuff::AdaptiveV2ByzantineSelection;
 using hotstuff::AdaptiveV2CandidateAudit;
 using hotstuff::AdaptiveV2ReplicaScore;
 using hotstuff::AdaptiveV2SelectionConfig;
+using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::ConfigurationId;
@@ -278,6 +279,17 @@ struct Fixture
         ingest(observation(reporter, target, ResponseOutcome::on_time));
     }
 
+    void on_time(
+        ReplicaID reporter,
+        ReplicaID target,
+        std::uint64_t response_duration_us)
+    {
+        auto value = observation(
+            reporter, target, ResponseOutcome::on_time);
+        value.response_duration_us = response_duration_us;
+        ingest(value);
+    }
+
     void baseline_all()
     {
         for (const auto target : members)
@@ -285,6 +297,38 @@ struct Fixture
             on_time(
                 static_cast<ReplicaID>((target + 1U) % kReplicaCount),
                 target);
+        }
+    }
+
+    void baseline_live_survivors()
+    {
+        for (const auto target :
+             std::vector<ReplicaID>{2, 3, 4, 5, 6})
+        {
+            const auto reporter = target == 6
+                                      ? ReplicaID{2}
+                                      : static_cast<ReplicaID>(target + 1U);
+            for (std::size_t attempt = 0; attempt < 2; ++attempt)
+                on_time(reporter, target, 90);
+        }
+    }
+
+    void ranked_live_survivor_suffix()
+    {
+        const std::vector<std::uint64_t> latencies{50, 40, 30, 20, 10};
+        const std::vector<std::size_t> attempt_counts{2, 3, 4, 2, 4};
+        for (std::size_t index = 0; index < latencies.size(); ++index)
+        {
+            const auto target = static_cast<ReplicaID>(index + 2U);
+            const auto reporter = target == 6
+                                      ? ReplicaID{2}
+                                      : static_cast<ReplicaID>(target + 1U);
+            for (std::size_t attempt = 0;
+                 attempt < attempt_counts[index];
+                 ++attempt)
+            {
+                on_time(reporter, target, latencies[index]);
+            }
         }
     }
 
@@ -694,6 +738,199 @@ TEST_CASE(
     CHECK(selector.current_epoch() == fixture.epoch);
     CHECK(fixture.epochs.size() == 1);
     CHECK(fixture.ledger->healthy());
+}
+
+TEST_CASE(
+    "optimization inherits exact constraints and ranks only fresh live roots",
+    "[adaptive-v2][selection][inheritance][optimization][n7]")
+{
+    Fixture fixture;
+    fixture.baseline_live_survivors();
+    auto config = selection_config(1, 1);
+    config.responsiveness_policy.minimum_attempts = 2;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    CHECK(selector.rank_inheriting_constraints_through(
+              fixture.ledger->high_watermark(), {0, 1})
+              .status == AdaptiveV2SelectionStatus::invalid_state);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    const auto baseline_cutoff = selector.current_cutoff();
+    const auto baseline_trajectory_size =
+        selector.score_trajectory().size();
+
+    CHECK(selector.rank_inheriting_constraints_through(
+              baseline_cutoff, {0, 1})
+              .status == AdaptiveV2SelectionStatus::invalid_cutoff);
+    CHECK(selector.current_cutoff() == baseline_cutoff);
+    CHECK(selector.score_trajectory().size() ==
+          baseline_trajectory_size);
+
+    fixture.on_time(2, 6, 10);
+    const auto incomplete_cutoff = fixture.ledger->high_watermark();
+    REQUIRE(incomplete_cutoff > baseline_cutoff);
+    const auto incomplete =
+        selector.rank_inheriting_constraints_through(
+            incomplete_cutoff, {0, 1});
+    CHECK(incomplete.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    REQUIRE(incomplete.snapshot != nullptr);
+    CHECK(incomplete.snapshot->accepted_record_count() == 1);
+    CHECK(incomplete.selected_replicas.empty());
+    CHECK(incomplete.eligible_roots.empty());
+    CHECK(selector.current_cutoff() == baseline_cutoff);
+    CHECK(selector.score_trajectory().size() ==
+          baseline_trajectory_size);
+
+    fixture.ranked_live_survivor_suffix();
+    const auto suffix_cutoff = fixture.ledger->high_watermark();
+    const auto suffix_record_count = suffix_cutoff - baseline_cutoff;
+    REQUIRE(suffix_cutoff > incomplete_cutoff);
+    REQUIRE(suffix_record_count >
+            static_cast<std::uint64_t>(
+                selector.quorum_metadata().quorum *
+                config.responsiveness_policy.minimum_attempts));
+    for (const auto &invalid :
+         std::vector<std::vector<ReplicaID>>{
+             {}, {0}, {0, 0}, {0, 7}})
+    {
+        const auto rejected =
+            selector.rank_inheriting_constraints_through(
+                suffix_cutoff, invalid);
+        CHECK(rejected.status ==
+              AdaptiveV2SelectionStatus::invalid_state);
+        CHECK(selector.current_cutoff() == baseline_cutoff);
+        CHECK(selector.score_trajectory().size() ==
+              baseline_trajectory_size);
+    }
+
+    const auto result = selector.rank_inheriting_constraints_through(
+        suffix_cutoff, {1, 0});
+    REQUIRE(result.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(result.constraint_basis ==
+          AdaptiveV2SelectionConstraintBasis::
+              inherited_consensus_wait_exempt);
+    CHECK(result.selected_replicas ==
+          std::vector<ReplicaID>{0, 1});
+    CHECK(result.eligible_candidates.empty());
+    CHECK(result.eligible_roots ==
+          std::vector<ReplicaID>{6, 5, 4, 3, 2});
+    CHECK(result.metadata.replica_count == 7);
+    CHECK(result.metadata.fault_threshold == 2);
+    CHECK(result.metadata.quorum == 5);
+    CHECK(result.metadata.required_nonresponsive == 2);
+    CHECK(result.metadata.baseline_cutoff == baseline_cutoff);
+    CHECK(result.metadata.evidence_cutoff == suffix_cutoff);
+    REQUIRE(result.snapshot != nullptr);
+    CHECK(result.snapshot->accepted_record_count() ==
+          suffix_record_count);
+    for (const auto constrained :
+         std::vector<ReplicaID>{0, 1})
+    {
+        const auto found = std::find_if(
+            result.snapshot->ranking().begin(),
+            result.snapshot->ranking().end(),
+            [constrained](const auto &entry) {
+                return entry.replica_id == constrained;
+            });
+        REQUIRE(found != result.snapshot->ranking().end());
+        CHECK(found->classification ==
+              ResponsivenessClass::insufficient_evidence);
+        CHECK_FALSE(found->eligible);
+    }
+    for (const auto live :
+         std::vector<ReplicaID>{2, 3, 4, 5, 6})
+    {
+        const auto found = std::find_if(
+            result.snapshot->ranking().begin(),
+            result.snapshot->ranking().end(),
+            [live](const auto &entry) {
+                return entry.replica_id == live;
+            });
+        REQUIRE(found != result.snapshot->ranking().end());
+        CHECK(found->classification == ResponsivenessClass::responsive);
+        CHECK(found->eligible);
+        CHECK(found->attempt_count >=
+              config.responsiveness_policy.minimum_attempts);
+    }
+    CHECK(selector.current_cutoff() == suffix_cutoff);
+    CHECK(selector.score_trajectory().size() ==
+          baseline_trajectory_size + suffix_record_count);
+    CHECK(std::all_of(
+        fixture.ledger->accepted().begin(),
+        fixture.ledger->accepted().end(),
+        [](const auto &record) {
+            return record.observation.outcome ==
+                   ResponseOutcome::on_time;
+        }));
+    CHECK(selector.healthy());
+}
+
+TEST_CASE(
+    "inherited optimization excludes an exactly correlated cross-baseline late",
+    "[adaptive-v2][selection][inheritance][optimization][late][n7]")
+{
+    Fixture fixture;
+    const auto boundary_timeout = fixture.timeout(2, 0);
+    fixture.baseline_live_survivors();
+    auto config = selection_config(1, 1);
+    config.responsiveness_policy.minimum_attempts = 2;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    const auto baseline_cutoff = selector.current_cutoff();
+    const auto baseline_trajectory_size =
+        selector.score_trajectory().size();
+
+    fixture.late(boundary_timeout);
+    const auto incomplete_cutoff = fixture.ledger->high_watermark();
+    REQUIRE(incomplete_cutoff == baseline_cutoff + 1);
+    const auto incomplete =
+        selector.rank_inheriting_constraints_through(
+            incomplete_cutoff, {0, 1});
+    CHECK(incomplete.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    REQUIRE(incomplete.snapshot != nullptr);
+    CHECK(incomplete.snapshot->accepted_record_count() == 0);
+    CHECK(incomplete.selected_replicas.empty());
+    CHECK(incomplete.eligible_roots.empty());
+    CHECK(selector.current_cutoff() == baseline_cutoff);
+    CHECK(selector.score_trajectory().size() ==
+          baseline_trajectory_size);
+    CHECK(selector.healthy());
+
+    fixture.ranked_live_survivor_suffix();
+    const auto suffix_cutoff = fixture.ledger->high_watermark();
+    const auto fresh_attempt_count = suffix_cutoff - incomplete_cutoff;
+    REQUIRE(fresh_attempt_count >
+            static_cast<std::uint64_t>(
+                selector.quorum_metadata().quorum *
+                config.responsiveness_policy.minimum_attempts));
+
+    const auto result = selector.rank_inheriting_constraints_through(
+        suffix_cutoff, {0, 1});
+    REQUIRE(result.status == AdaptiveV2SelectionStatus::selected);
+    REQUIRE(result.snapshot != nullptr);
+    CHECK(result.snapshot->accepted_record_count() ==
+          fresh_attempt_count);
+    CHECK(suffix_cutoff - baseline_cutoff ==
+          fresh_attempt_count + 1);
+    CHECK(result.selected_replicas ==
+          std::vector<ReplicaID>{0, 1});
+    CHECK(result.eligible_roots ==
+          std::vector<ReplicaID>{6, 5, 4, 3, 2});
+    CHECK(selector.current_cutoff() == suffix_cutoff);
+    CHECK(selector.score_trajectory().size() ==
+          baseline_trajectory_size +
+              (suffix_cutoff - baseline_cutoff));
+    CHECK(selector.healthy());
 }
 
 TEST_CASE(

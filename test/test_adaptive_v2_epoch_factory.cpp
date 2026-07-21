@@ -25,6 +25,7 @@ using hotstuff::AdaptiveV2CandidateAudit;
 using hotstuff::AdaptiveV2EpochFactoryResult;
 using hotstuff::AdaptiveV2EpochFactoryStatus;
 using hotstuff::AdaptiveV2SelectionResult;
+using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
 using hotstuff::ConfigurationId;
 using hotstuff::BaselineRoot;
@@ -76,9 +77,15 @@ std::vector<ReplicaID> membership()
 
 EpochTreeDefinition tree(
     std::uint32_t tree_id,
-    std::vector<ReplicaID> members)
+    std::vector<ReplicaID> members,
+    std::vector<ReplicaID> wait_exempt = {})
 {
-    return {tree_id, 2, 2, std::move(members), {}};
+    return {
+        tree_id,
+        2,
+        2,
+        std::move(members),
+        std::move(wait_exempt)};
 }
 
 EpochDefinitionInput epoch_zero_input()
@@ -99,6 +106,21 @@ EpochDefinitionInput epoch_zero_input()
     input.policy_version = "adaptive-v2-baseline";
     input.evidence_snapshot_id = "baseline-snapshot";
     input.evidence_cutoff = 7;
+    return input;
+}
+
+EpochDefinitionInput inherited_epoch_input()
+{
+    auto input = epoch_zero_input();
+    input.trees = {
+        tree(0, {2, 3, 4, 5, 6, 0, 1}, {0, 1}),
+        tree(1, {3, 4, 5, 6, 2, 0, 1}, {0, 1}),
+        tree(2, {4, 5, 6, 2, 3, 0, 1}, {0, 1}),
+        tree(3, {5, 6, 2, 3, 4, 0, 1}, {0, 1}),
+        tree(4, {6, 2, 3, 4, 5, 0, 1}, {0, 1})};
+    input.policy_version = "adaptive-v2-contained-e1";
+    input.evidence_snapshot_id = "contained-e1-snapshot";
+    input.evidence_cutoff = 5;
     return input;
 }
 
@@ -234,6 +256,71 @@ AdaptiveV2SelectionResult successful_selection(
     return result;
 }
 
+AdaptiveV2SelectionResult inherited_selection(
+    const EpochDefinition &current,
+    bool selected_replicas_recovered = false)
+{
+    const AdaptationEpochId epoch{
+        current.epoch_number(), current.epoch_digest()};
+    std::vector<AcceptedEvidenceRecord> records;
+    const auto targets = selected_replicas_recovered
+                             ? membership()
+                             : std::vector<ReplicaID>{2, 3, 4, 5, 6};
+    std::uint64_t sequence = 5;
+    for (const auto target : targets)
+    {
+        ResponseObservation observation;
+        observation.reporter_id = target == 6 ? ReplicaID{2}
+                                               : ReplicaID{6};
+        observation.observed_replica_id = target;
+        observation.configuration = ConfigurationId{
+            epoch.epoch_number, 0, epoch.epoch_digest};
+        observation.block_hash = digest(
+            "inherited-factory-attempt-" + std::to_string(target));
+        observation.expected_message_type =
+            ExpectedMessageType::aggregate_relay;
+        observation.outcome = ResponseOutcome::on_time;
+        observation.response_duration_us =
+            target < 2 ? target + 1U : (7U - target) * 10U;
+        observation.deadline_duration_us = 100;
+        observation.reporter_sequence = sequence + 1U;
+        observation.reporter_monotonic_ns = (sequence + 1U) * 1'000;
+        observation.signer_set = {target};
+        observation.observation_id =
+            hotstuff::compute_response_observation_id(
+                observation.attempt_identity());
+        records.push_back({++sequence, std::move(observation)});
+    }
+
+    AdaptationPolicy policy;
+    policy.policy_version = "adaptive-v2-inherited-snapshot-v1";
+    policy.attempt_window = 8;
+    policy.minimum_attempts = 1;
+    policy.minimum_response_rate_ppm = 750'000;
+    policy.maximum_timeout_rate_ppm = 250'000;
+    policy.trailing_timeout_streak = 2;
+    policy.latency_percentile_basis_points = 5'000;
+    auto snapshot = hotstuff::build_adaptation_snapshot(
+        membership(),
+        epoch,
+        AcceptedEvidenceView{records.data(), records.size()},
+        sequence,
+        policy,
+        kPlacementSeed);
+
+    AdaptiveV2SelectionResult result;
+    result.status = AdaptiveV2SelectionStatus::selected;
+    result.constraint_basis = AdaptiveV2SelectionConstraintBasis::
+        inherited_consensus_wait_exempt;
+    result.metadata = {7, 2, 5, 2, 3, 1, 1, 5, sequence};
+    result.snapshot =
+        std::make_unique<hotstuff::AdaptationSnapshot>(
+            std::move(snapshot));
+    result.selected_replicas = {0, 1};
+    result.eligible_roots = {6, 5, 4, 3, 2};
+    return result;
+}
+
 struct Fixture
 {
     std::vector<ReplicaID> members{membership()};
@@ -259,6 +346,53 @@ struct Fixture
             selection,
             placement,
             delay,
+            kIssuerId,
+            key,
+            limits);
+    }
+};
+
+struct InheritedFixture
+{
+    std::vector<ReplicaID> members{membership()};
+    EpochStore store{members};
+    const EpochDefinition *current{nullptr};
+    AdaptiveV2SelectionResult selection;
+    TreePlacementInput placement{placement_input()};
+    PrivKeySecp256k1 key{private_key()};
+    EpochChangeBundleLimits limits{bundle_limits()};
+
+    explicit InheritedFixture(
+        EpochDefinitionInput input = inherited_epoch_input(),
+        bool selected_replicas_recovered = false)
+    {
+        current = &store.stage(
+            std::move(input), EpochValidationContext{});
+        selection = inherited_selection(
+            *current, selected_replicas_recovered);
+    }
+
+    AdaptiveV2EpochFactoryResult build(
+        TreePolicyKind intent =
+            TreePolicyKind::performance_optimization) const
+    {
+        hotstuff::AdaptiveV2TransitionPolicy policy;
+        policy.intent = intent;
+        if (intent == TreePolicyKind::fault_containment)
+        {
+            policy.containment_baseline_roots = {
+                BaselineRoot{0, 2},
+                BaselineRoot{1, 3},
+                BaselineRoot{2, 4},
+                BaselineRoot{3, 5},
+                BaselineRoot{4, 6}};
+        }
+        return hotstuff::build_adaptive_v2_successor_bundle(
+            *current,
+            selection,
+            policy,
+            placement,
+            5,
             kIssuerId,
             key,
             limits);
@@ -619,6 +753,221 @@ TEST_CASE(
 {
     verify_explicit_factory_policy_contract<
         AdaptiveV2ManagerControllerConfig>();
+}
+
+TEST_CASE(
+    "factory accepts consensus-inherited constraints only for optimization",
+    "[adaptive-v2][epoch-factory][inheritance][optimization][n7]")
+{
+    InheritedFixture fixture;
+    const auto result = fixture.build();
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    CHECK(fixture.selection.constraint_basis ==
+          AdaptiveV2SelectionConstraintBasis::
+              inherited_consensus_wait_exempt);
+    CHECK(fixture.selection.eligible_candidates.empty());
+    CHECK(bundle_roots(*result.bundle) ==
+          std::vector<ReplicaID>{6, 5, 4, 3, 2});
+    REQUIRE(result.bundle->definition().trees.size() == 5);
+    for (const auto &candidate : result.bundle->definition().trees)
+    {
+        CHECK(candidate.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+    }
+
+    const auto rejected_containment =
+        fixture.build(TreePolicyKind::fault_containment);
+    CHECK(rejected_containment.status ==
+          AdaptiveV2EpochFactoryStatus::invalid_selection);
+    CHECK(rejected_containment.bundle == nullptr);
+}
+
+TEST_CASE(
+    "factory allows guarded containment to refine an exact predecessor set",
+    "[adaptive-v2][epoch-factory][containment][recurring][n7]")
+{
+    InheritedFixture fixture;
+    fixture.selection = successful_selection(*fixture.current);
+    REQUIRE(fixture.selection.constraint_basis ==
+            AdaptiveV2SelectionConstraintBasis::guarded_evidence);
+
+    const auto result = fixture.build(TreePolicyKind::fault_containment);
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    CHECK(bundle_roots(*result.bundle) ==
+          std::vector<ReplicaID>{2, 3, 4, 5, 6});
+    REQUIRE(result.bundle->definition().trees.size() == 5);
+    for (const auto &candidate : result.bundle->definition().trees)
+    {
+        CHECK(candidate.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+    }
+}
+
+TEST_CASE(
+    "factory keeps freshly responsive inherited constraints as leaves",
+    "[adaptive-v2][epoch-factory][inheritance][recovered][n7]")
+{
+    InheritedFixture fixture(inherited_epoch_input(), true);
+    for (const auto selected : fixture.selection.selected_replicas)
+    {
+        const auto entry = std::find_if(
+            fixture.selection.snapshot->ranking().begin(),
+            fixture.selection.snapshot->ranking().end(),
+            [selected](const auto &candidate) {
+                return candidate.replica_id == selected;
+            });
+        REQUIRE(entry != fixture.selection.snapshot->ranking().end());
+        REQUIRE(entry->classification == ResponsivenessClass::responsive);
+        REQUIRE(entry->eligible);
+    }
+
+    const auto ranking_before = fixture.selection.snapshot->ranking();
+    const auto snapshot_id_before =
+        fixture.selection.snapshot->snapshot_id();
+    const auto result = fixture.build();
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    CHECK(bundle_roots(*result.bundle) ==
+          std::vector<ReplicaID>{6, 5, 4, 3, 2});
+    CHECK(fixture.selection.snapshot->ranking() == ranking_before);
+    CHECK(fixture.selection.snapshot->snapshot_id() == snapshot_id_before);
+    for (const auto &candidate : result.bundle->definition().trees)
+    {
+        const auto leaf_start = first_leaf_index(
+            candidate.members_breadth_first.size(), candidate.fanout);
+        CHECK(candidate.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+        for (const auto selected : fixture.selection.selected_replicas)
+        {
+            const auto position = std::find(
+                candidate.members_breadth_first.begin(),
+                candidate.members_breadth_first.end(),
+                selected);
+            REQUIRE(position != candidate.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      candidate.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
+    }
+}
+
+TEST_CASE(
+    "factory independently rejects forged inherited constraints",
+    "[adaptive-v2][epoch-factory][inheritance][negative][n7]")
+{
+    SECTION("an exact predecessor cannot be relabeled guarded evidence")
+    {
+        InheritedFixture fixture;
+        fixture.selection = successful_selection(*fixture.current);
+        REQUIRE(fixture.selection.constraint_basis ==
+                AdaptiveV2SelectionConstraintBasis::guarded_evidence);
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("a malformed predecessor fails even with guarded evidence")
+    {
+        auto input = inherited_epoch_input();
+        for (auto &candidate : input.trees)
+            candidate.wait_exempt_leaves = {0};
+        InheritedFixture fixture(std::move(input));
+        fixture.selection = successful_selection(*fixture.current);
+        REQUIRE(fixture.selection.constraint_basis ==
+                AdaptiveV2SelectionConstraintBasis::guarded_evidence);
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("inconsistent predecessor sets fail with guarded evidence")
+    {
+        auto input = inherited_epoch_input();
+        input.trees[1].wait_exempt_leaves = {0, 2};
+        InheritedFixture fixture(std::move(input));
+        fixture.selection = successful_selection(*fixture.current);
+        REQUIRE(fixture.selection.constraint_basis ==
+                AdaptiveV2SelectionConstraintBasis::guarded_evidence);
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("the predecessor cannot have empty inherited constraints")
+    {
+        auto input = inherited_epoch_input();
+        for (auto &candidate : input.trees)
+            candidate.wait_exempt_leaves.clear();
+        InheritedFixture fixture(std::move(input));
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("the predecessor constraints must have exact size f")
+    {
+        auto input = inherited_epoch_input();
+        for (auto &candidate : input.trees)
+            candidate.wait_exempt_leaves = {0};
+        InheritedFixture fixture(std::move(input));
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("every predecessor tree must carry the same canonical set")
+    {
+        auto input = inherited_epoch_input();
+        input.trees[1].wait_exempt_leaves = {0, 2};
+        InheritedFixture fixture(std::move(input));
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("the selection cannot replace the consensus inherited set")
+    {
+        InheritedFixture fixture;
+        fixture.selection.selected_replicas = {0, 2};
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("the selection cannot forge the fresh root ranking")
+    {
+        InheritedFixture fixture;
+        std::swap(
+            fixture.selection.eligible_roots[0],
+            fixture.selection.eligible_roots[1]);
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::root_mismatch);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("inherited constraints cannot carry guarded candidate audits")
+    {
+        InheritedFixture fixture;
+        fixture.selection.eligible_candidates.push_back(
+            AdaptiveV2CandidateAudit{});
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
 }
 
 TEST_CASE(

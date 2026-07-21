@@ -52,6 +52,7 @@ enum class ReplicaPlacementReason : std::uint8_t
     balanced_eligible_internal = 2,
     seeded_eligible_leaf = 3,
     constrained_ineligible_leaf = 4,
+    policy_constrained_leaf = 5,
 };
 
 struct TreeShape
@@ -73,7 +74,16 @@ struct FaultContainmentPolicy
 };
 
 struct PerformanceOptimizationPolicy
-{};
+{
+    /**
+     * Optional exact member set that may not influence the generated trees.
+     *
+     * These replicas remain classified by the immutable evidence snapshot,
+     * but are excluded from root and internal placement. An empty set retains
+     * the original highest-ranked-eligible optimization behavior.
+     */
+    std::vector<ReplicaID> constrained_leaves;
+};
 
 struct TreePlacementInput
 {

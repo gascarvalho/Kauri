@@ -22,6 +22,7 @@ using hotstuff::AdaptiveV2ManagerIngress;
 using hotstuff::AdaptiveV2ManagerIngressLimits;
 using hotstuff::AdaptiveV2ManagerIngressStatus;
 using hotstuff::AdaptiveV2ReadinessNotice;
+using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::BaselineRoot;
@@ -152,6 +153,14 @@ AdaptiveV2ManagerControllerConfig controller_config(
     config.issuer_id = kIssuerId;
     config.issuer_private_key = key;
     config.bundle_limits = bundle_limits();
+    config.transition_policy.intent =
+        TreePolicyKind::fault_containment;
+    config.transition_policy.containment_baseline_roots = {
+        BaselineRoot{0, 0},
+        BaselineRoot{1, 1},
+        BaselineRoot{2, 2},
+        BaselineRoot{3, 3},
+        BaselineRoot{4, 4}};
     return config;
 }
 
@@ -161,19 +170,6 @@ struct LeafEdge
     ReplicaID reporter{0};
 };
 
-LeafEdge leaf_edge(ReplicaID target, std::size_t reporter_index)
-{
-    static const std::array<std::uint32_t, 3> positions{{3, 4, 6}};
-    REQUIRE(reporter_index < positions.size());
-    const auto position = positions[reporter_index];
-    const auto root = static_cast<std::uint32_t>(
-        (target + 7U - position) % 7U);
-    const auto parent_position = (position - 1U) / 2U;
-    return {
-        root,
-        static_cast<ReplicaID>((root + parent_position) % 7U)};
-}
-
 std::size_t first_leaf_index(
     std::size_t member_count,
     std::uint32_t fanout)
@@ -182,6 +178,39 @@ std::size_t first_leaf_index(
     return member_count == 1
                ? 0
                : ((member_count - 2) / fanout) + 1;
+}
+
+LeafEdge leaf_edge(
+    const hotstuff::EpochDefinition &epoch,
+    ReplicaID target,
+    std::size_t reporter_index)
+{
+    std::vector<LeafEdge> edges;
+    std::set<ReplicaID> reporters;
+    for (const auto &tree : epoch.trees())
+    {
+        const auto found = std::find(
+            tree.members_breadth_first.begin(),
+            tree.members_breadth_first.end(),
+            target);
+        if (found == tree.members_breadth_first.end())
+            continue;
+        const auto position = static_cast<std::size_t>(std::distance(
+            tree.members_breadth_first.begin(), found));
+        if (position < first_leaf_index(
+                           tree.members_breadth_first.size(),
+                           tree.fanout))
+        {
+            continue;
+        }
+        const auto parent_position = (position - 1U) / tree.fanout;
+        const auto reporter =
+            tree.members_breadth_first[parent_position];
+        if (reporters.insert(reporter).second)
+            edges.push_back({tree.tree_id, reporter});
+    }
+    REQUIRE(reporter_index < edges.size());
+    return edges[reporter_index];
 }
 
 const ReplicaAdaptationResult *ranking_entry(
@@ -296,7 +325,8 @@ struct Fixture
         ResponseOutcome outcome,
         const std::string &label)
     {
-        const auto edge = leaf_edge(target, reporter_index);
+        const auto edge = leaf_edge(
+            ingress.current_epoch(), target, reporter_index);
         ResponseObservation value;
         value.reporter_id = edge.reporter;
         value.observed_replica_id = target;
@@ -366,6 +396,22 @@ struct Fixture
         }
     }
 
+    void responsive_attempt_with_latency(
+        ReplicaID target,
+        std::size_t reporter_index,
+        std::uint64_t latency,
+        const std::string &label)
+    {
+        auto value = observation(
+            target,
+            reporter_index,
+            ResponseOutcome::on_time,
+            label);
+        value.response_duration_us = latency;
+        admit(value);
+        ingest(value);
+    }
+
     void complete_responsive_baseline()
     {
         for (const auto member : members)
@@ -407,8 +453,16 @@ struct Fixture
     }
 };
 
+enum class InheritedEpochShape : std::uint8_t
+{
+    exact = 1,
+    undersized,
+    inconsistent,
+};
+
 EpochDefinitionInput exact_epoch_one(
-    const AdaptiveV2ManagerIngress &ingress)
+    const AdaptiveV2ManagerIngress &ingress,
+    InheritedEpochShape inherited_shape = InheritedEpochShape::exact)
 {
     auto input = epoch_zero();
     input.epoch_number = 1;
@@ -419,6 +473,34 @@ EpochDefinitionInput exact_epoch_one(
     input.policy_version = "adaptive-v2-live-survivor-baseline-v1";
     input.evidence_snapshot_id = "fresh-exact-e1";
     input.evidence_cutoff = 0;
+    input.trees.clear();
+    const std::vector<ReplicaID> live{2, 3, 4, 5, 6};
+    for (std::size_t root_index = 0;
+         root_index < live.size();
+         ++root_index)
+    {
+        std::vector<ReplicaID> ordered;
+        ordered.reserve(membership().size());
+        for (std::size_t offset = 0; offset < live.size(); ++offset)
+        {
+            ordered.push_back(
+                live[(root_index + offset) % live.size()]);
+        }
+        ordered.push_back(0);
+        ordered.push_back(1);
+        std::vector<ReplicaID> inherited{0, 1};
+        if (inherited_shape == InheritedEpochShape::undersized)
+            inherited = {0};
+        else if (inherited_shape == InheritedEpochShape::inconsistent &&
+                 root_index == 1)
+            inherited = {0, 2};
+        input.trees.push_back(EpochTreeDefinition{
+            static_cast<std::uint32_t>(root_index),
+            2,
+            2,
+            std::move(ordered),
+            std::move(inherited)});
+    }
     input.epoch_digest.reset();
     input.epoch_digest = hotstuff::compute_epoch_digest(input);
     return input;
@@ -426,10 +508,12 @@ EpochDefinitionInput exact_epoch_one(
 
 void rotate_to_exact_epoch_one(
     Fixture &fixture,
-    TreePolicyKind policy)
+    TreePolicyKind policy,
+    InheritedEpochShape inherited_shape = InheritedEpochShape::exact)
 {
     fixture.controller.reset();
-    const auto successor = exact_epoch_one(fixture.ingress);
+    const auto successor = exact_epoch_one(
+        fixture.ingress, inherited_shape);
     REQUIRE(fixture.ingress.rotate_to_successor(successor, 0) ==
             AdaptiveV2ManagerIngressStatus::processed);
     fixture.config.transition_policy.intent = policy;
@@ -470,7 +554,11 @@ void record_live_survivor_baseline(Fixture &fixture)
     {
         std::size_t reporter_index = 0;
         while (reporter_index < 3 &&
-               leaf_edge(target, reporter_index).reporter < 2)
+               leaf_edge(
+                   fixture.ingress.current_epoch(),
+                   target,
+                   reporter_index)
+                       .reporter < 2)
         {
             ++reporter_index;
         }
@@ -484,6 +572,58 @@ void record_live_survivor_baseline(Fixture &fixture)
                 "e1-live-baseline-" + std::to_string(target));
         }
     }
+}
+
+void record_ranked_live_survivor_suffix(Fixture &fixture)
+{
+    const std::vector<std::uint64_t> latencies{50, 40, 30, 20, 10};
+    const std::vector<std::size_t> attempt_counts{2, 3, 4, 2, 4};
+    for (std::size_t index = 0; index < latencies.size(); ++index)
+    {
+        const auto target = static_cast<ReplicaID>(index + 2U);
+        std::size_t reporter_index = 0;
+        while (reporter_index < 3 &&
+               leaf_edge(
+                   fixture.ingress.current_epoch(),
+                   target,
+                   reporter_index)
+                       .reporter < 2)
+        {
+            ++reporter_index;
+        }
+        REQUIRE(reporter_index < 3);
+        for (std::size_t attempt = 0;
+             attempt < attempt_counts[index];
+             ++attempt)
+        {
+            fixture.responsive_attempt_with_latency(
+                target,
+                reporter_index,
+                latencies[index],
+                "e1-live-suffix-" + std::to_string(target));
+        }
+    }
+}
+
+void record_one_live_survivor_suffix_observation(
+    Fixture &fixture,
+    ReplicaID target,
+    std::uint64_t latency)
+{
+    std::size_t reporter_index = 0;
+    while (reporter_index < 3 &&
+           leaf_edge(
+               fixture.ingress.current_epoch(), target, reporter_index)
+                   .reporter < 2)
+    {
+        ++reporter_index;
+    }
+    REQUIRE(reporter_index < 3);
+    fixture.responsive_attempt_with_latency(
+        target,
+        reporter_index,
+        latency,
+        "e1-live-incomplete-suffix-" + std::to_string(target));
 }
 
 template<typename Config, typename = void>
@@ -517,7 +657,8 @@ void check_controller_bundle_authority(
     REQUIRE(fixture.controller->successor_bundle() != nullptr);
     const auto &definition =
         fixture.controller->successor_bundle()->definition();
-    CHECK(definition.epoch_number == 1);
+    CHECK(definition.epoch_number ==
+          fixture.ingress.current_epoch().epoch_number() + 1U);
     CHECK(definition.previous_epoch_digest ==
           fixture.ingress.current_epoch().epoch_digest());
     CHECK(definition.membership_digest ==
@@ -598,6 +739,10 @@ void verify_controller_transition_policy_contract()
         optimization.persistent_timeouts(1);
         REQUIRE(optimization.controller->evaluate() ==
                 AdaptiveV2ManagerControllerStatus::successor_ready);
+        REQUIRE(optimization.controller->selection_audit() != nullptr);
+        CHECK(optimization.controller->selection_audit()
+                  ->constraint_basis ==
+              AdaptiveV2SelectionConstraintBasis::guarded_evidence);
         CHECK(successor_roots(*optimization.controller) ==
               std::vector<ReplicaID>{2, 3, 4, 5, 6});
         check_controller_bundle_authority(optimization);
@@ -725,7 +870,7 @@ TEST_CASE(
     }
 
     SECTION(
-        "performance optimization admits Q5 then needs fresh guarded evidence")
+        "performance optimization inherits containment and uses a fresh suffix")
     {
         Fixture optimization;
         rotate_to_exact_epoch_one(
@@ -773,11 +918,41 @@ TEST_CASE(
         CHECK(optimization.controller->successor_bundle() == nullptr);
         CHECK(optimization.controller->current_cutoff() ==
               baseline_cutoff);
+        const auto baseline_trajectory_size =
+            optimization.controller->score_trajectory().size();
 
-        optimization.persistent_timeouts(0);
-        optimization.persistent_timeouts(1);
-        REQUIRE(optimization.ingress.ledger().high_watermark() >
-                baseline_cutoff);
+        record_one_live_survivor_suffix_observation(
+            optimization, 6, 10);
+        const auto incomplete_cutoff =
+            optimization.ingress.ledger().high_watermark();
+        REQUIRE(incomplete_cutoff > baseline_cutoff);
+        REQUIRE(optimization.controller->evaluate() ==
+                AdaptiveV2ManagerControllerStatus::
+                    awaiting_guarded_selection);
+        REQUIRE(optimization.controller->selection_audit() != nullptr);
+        CHECK(optimization.controller->selection_audit()->status ==
+              AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+        REQUIRE(optimization.controller->selection_audit()->snapshot !=
+                nullptr);
+        CHECK(optimization.controller->selection_audit()
+                  ->snapshot->accepted_record_count() == 1);
+        CHECK(optimization.controller->current_cutoff() ==
+              baseline_cutoff);
+        CHECK(optimization.controller->score_trajectory().size() ==
+              baseline_trajectory_size);
+        CHECK(optimization.controller->successor_bundle() == nullptr);
+
+        record_ranked_live_survivor_suffix(optimization);
+        const auto suffix_cutoff =
+            optimization.ingress.ledger().high_watermark();
+        const auto suffix_record_count =
+            suffix_cutoff - baseline_cutoff;
+        REQUIRE(suffix_cutoff > incomplete_cutoff);
+        REQUIRE(suffix_record_count >
+                static_cast<std::uint64_t>(
+                    optimization.ingress.quorum_metadata().quorum *
+                    optimization.config.selection
+                        .responsiveness_policy.minimum_attempts));
         REQUIRE(optimization.controller->evaluate() ==
                 AdaptiveV2ManagerControllerStatus::successor_ready);
         REQUIRE(optimization.controller->selection_audit() != nullptr);
@@ -785,9 +960,63 @@ TEST_CASE(
                   ->metadata.baseline_cutoff == baseline_cutoff);
         CHECK(optimization.controller->selection_audit()
                   ->metadata.evidence_cutoff > baseline_cutoff);
+        REQUIRE(optimization.controller->selection_audit()->snapshot !=
+                nullptr);
+        CHECK(optimization.controller->selection_audit()
+                  ->snapshot->accepted_record_count() ==
+              suffix_record_count);
         CHECK(optimization.controller->selection_audit()
                   ->selected_replicas ==
               std::vector<ReplicaID>{0, 1});
+        CHECK(optimization.controller->selection_audit()
+                  ->constraint_basis ==
+              AdaptiveV2SelectionConstraintBasis::
+                  inherited_consensus_wait_exempt);
+        CHECK(optimization.controller->selection_audit()
+                  ->eligible_candidates.empty());
+        CHECK(optimization.controller->selection_audit()
+                  ->eligible_roots ==
+              std::vector<ReplicaID>{6, 5, 4, 3, 2});
+        CHECK(std::all_of(
+            optimization.ingress.ledger().accepted().begin(),
+            optimization.ingress.ledger().accepted().end(),
+            [](const auto &record) {
+                return record.observation.outcome ==
+                       ResponseOutcome::on_time;
+            }));
+        REQUIRE(optimization.controller->successor_bundle() != nullptr);
+        CHECK(successor_roots(*optimization.controller) ==
+              std::vector<ReplicaID>{6, 5, 4, 3, 2});
+        for (const auto &tree :
+             optimization.controller->successor_bundle()
+                 ->definition()
+                 .trees)
+        {
+            CHECK(tree.wait_exempt_leaves ==
+                  std::vector<ReplicaID>{0, 1});
+        }
+    }
+}
+
+TEST_CASE(
+    "optimization rejects malformed predecessor containment sets",
+    "[adaptive-v2][manager-controller][inheritance][fail-closed][n7]")
+{
+    for (const auto inherited_shape :
+         std::vector<InheritedEpochShape>{
+             InheritedEpochShape::undersized,
+             InheritedEpochShape::inconsistent})
+    {
+        Fixture fixture;
+        rotate_to_exact_epoch_one(
+            fixture,
+            TreePolicyKind::performance_optimization,
+            inherited_shape);
+        CHECK_FALSE(fixture.controller->healthy());
+        CHECK(fixture.controller->evaluate() ==
+              AdaptiveV2ManagerControllerStatus::unhealthy);
+        CHECK(fixture.controller->successor_bundle() == nullptr);
+        CHECK(fixture.controller->selection_audit() == nullptr);
     }
 }
 
@@ -819,6 +1048,8 @@ TEST_CASE(
     REQUIRE(fixture.controller->selection_audit() != nullptr);
     const auto *selection = fixture.controller->selection_audit();
     CHECK(selection->status == AdaptiveV2SelectionStatus::selected);
+    CHECK(selection->constraint_basis ==
+          AdaptiveV2SelectionConstraintBasis::guarded_evidence);
     CHECK(selection->metadata.replica_count == 7);
     CHECK(selection->metadata.fault_threshold == 2);
     CHECK(selection->metadata.quorum == 5);
@@ -859,6 +1090,7 @@ TEST_CASE(
     REQUIRE(definition.trees.size() == 5);
 
     std::set<ReplicaID> roots;
+    const std::vector<ReplicaID> expected_roots{5, 6, 2, 3, 4};
     for (std::size_t index = 0;
          index < definition.trees.size();
          ++index)
@@ -867,7 +1099,7 @@ TEST_CASE(
         REQUIRE_FALSE(tree.members_breadth_first.empty());
         CHECK(tree.tree_id == index);
         CHECK(tree.members_breadth_first.front() ==
-              selection->eligible_roots[index]);
+              expected_roots[index]);
         roots.insert(tree.members_breadth_first.front());
         CHECK(tree.wait_exempt_leaves ==
               std::vector<ReplicaID>{0, 1});
@@ -1047,6 +1279,9 @@ TEST_CASE(
     fixture.persistent_timeouts(1);
     REQUIRE(fixture.controller->evaluate() ==
             AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    CHECK(fixture.controller->selection_audit()->constraint_basis ==
+          AdaptiveV2SelectionConstraintBasis::guarded_evidence);
     CHECK(successor_roots(*fixture.controller) ==
           std::vector<ReplicaID>{2, 3, 4, 5, 6});
     check_controller_bundle_authority(fixture);

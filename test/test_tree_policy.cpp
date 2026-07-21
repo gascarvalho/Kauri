@@ -73,6 +73,7 @@ enum class ReplicaPlacementReason : std::uint8_t
     balanced_eligible_internal = 2,
     seeded_eligible_leaf = 3,
     constrained_ineligible_leaf = 4,
+    policy_constrained_leaf = 5,
 };
 
 struct TreeShape
@@ -94,7 +95,9 @@ struct FaultContainmentPolicy
 };
 
 struct PerformanceOptimizationPolicy
-{};
+{
+    std::vector<ReplicaID> constrained_leaves;
+};
 
 struct TreePlacementInput
 {
@@ -675,6 +678,103 @@ TEST_CASE("optimization chooses exactly the highest-ranked eligible roots",
         CHECK_FALSE(decision.requested_baseline_root.has_value());
         CHECK(decision.reason ==
               RootSelectionReason::highest_ranked_eligible);
+    }
+}
+
+TEST_CASE(
+    "optimization keeps responsive policy constraints out of influential roles",
+    "[t10][tree-policy][optimization][constraints][recovered][n7]")
+{
+    const auto members = sequential_members(7);
+    const auto snapshot = make_snapshot(members);
+    const auto ranking_before = snapshot.ranking();
+    const auto snapshot_id_before = snapshot.snapshot_id();
+    const auto input = placement_input(
+        members, 2, 5, 0xC057, "performance-constrained-v1");
+
+    const auto result = hotstuff::build_tree_placement(
+        input,
+        snapshot,
+        PerformanceOptimizationPolicy{{0, 1}});
+
+    CHECK(selected_roots(result) ==
+          std::vector<ReplicaID>{2, 3, 4, 5, 6});
+    REQUIRE(result.trees().size() == 5);
+    for (std::size_t tree_index = 0;
+         tree_index < result.trees().size();
+         ++tree_index)
+    {
+        const auto &candidate = result.trees()[tree_index];
+        const auto leaf_start = first_leaf_index(
+            candidate.members_breadth_first.size(), candidate.fanout);
+        for (const auto constrained : {ReplicaID{0}, ReplicaID{1}})
+        {
+            const auto position = std::find(
+                candidate.members_breadth_first.begin(),
+                candidate.members_breadth_first.end(),
+                constrained);
+            REQUIRE(position != candidate.members_breadth_first.end());
+            const auto position_index = static_cast<std::size_t>(
+                std::distance(
+                    candidate.members_breadth_first.begin(), position));
+            CHECK(position_index >= leaf_start);
+            const auto &role = result.explanation().replica_roles.at(
+                tree_index * members.size() + position_index);
+            CHECK(role.classification ==
+                  ResponsivenessClass::responsive);
+            CHECK(role.eligible);
+            CHECK(role.role == TreeReplicaRole::leaf);
+            CHECK(role.reason == ReplicaPlacementReason::
+                                     policy_constrained_leaf);
+        }
+    }
+    CHECK(snapshot.ranking() == ranking_before);
+    CHECK(snapshot.snapshot_id() == snapshot_id_before);
+
+    const auto reordered = hotstuff::build_tree_placement(
+        input,
+        snapshot,
+        PerformanceOptimizationPolicy{{1, 0}});
+    CHECK(output_fingerprint(reordered) == output_fingerprint(result));
+}
+
+TEST_CASE(
+    "optimization constrained leaves reject malformed policy input",
+    "[t10][tree-policy][optimization][constraints][negative][n7]")
+{
+    const auto members = sequential_members(7);
+    const auto snapshot = make_snapshot(members);
+    const auto input = placement_input(
+        members, 2, 5, 0xC057, "performance-constrained-v1");
+
+    SECTION("constraints must be unique")
+    {
+        CHECK_THROWS_AS(
+            hotstuff::build_tree_placement(
+                input,
+                snapshot,
+                PerformanceOptimizationPolicy{{0, 0}}),
+            std::invalid_argument);
+    }
+
+    SECTION("constraints must be exact members")
+    {
+        CHECK_THROWS_AS(
+            hotstuff::build_tree_placement(
+                input,
+                snapshot,
+                PerformanceOptimizationPolicy{{0, 7}}),
+            std::invalid_argument);
+    }
+
+    SECTION("constraints cannot consume required influential capacity")
+    {
+        CHECK_THROWS_AS(
+            hotstuff::build_tree_placement(
+                input,
+                snapshot,
+                PerformanceOptimizationPolicy{{0, 1, 2}}),
+            std::invalid_argument);
     }
 }
 

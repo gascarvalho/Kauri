@@ -62,8 +62,13 @@ struct AdaptiveV2EpochFactoryResult
 };
 
 /**
- * Validate one successful Byzantine-guarded selection and turn it into a
- * signed, immutable adaptive-v2 successor bundle.
+ * Validate one successful selection and turn it into a signed, immutable
+ * adaptive-v2 successor bundle. Guarded evidence remains valid for fault
+ * containment with either an empty or exact predecessor constraint set, and
+ * for performance optimization only while that set is uniformly empty.
+ * Consensus-inherited constraints are valid only for an explicit performance
+ * optimization from the same exact set. Malformed predecessor constraints
+ * reject every basis and are checked independently across all trees.
  *
  * The crash/containment set is accepted only through `selection`; there is no
  * independent fault-list input. The fixed membership and consensus quorum are

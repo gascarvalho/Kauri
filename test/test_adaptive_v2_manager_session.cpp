@@ -607,6 +607,21 @@ struct Fixture
         }
     }
 
+    void responsive_survivor_baseline()
+    {
+        for (const auto target : kSurvivors)
+        {
+            for (std::size_t attempt = 0; attempt < 2; ++attempt)
+            {
+                record(make_observation(
+                    target,
+                    attempt,
+                    ResponseOutcome::on_time,
+                    "survivor-baseline"));
+            }
+        }
+    }
+
     void persistent_timeouts()
     {
         for (const auto target : {ReplicaID{0}, ReplicaID{1}})
@@ -625,6 +640,25 @@ struct Fixture
         }
     }
 
+    void responsive_optimization_suffix()
+    {
+        const std::array<std::size_t, 5> attempt_counts{{2, 3, 4, 2, 5}};
+        for (std::size_t index = 0; index < kSurvivors.size(); ++index)
+        {
+            const auto target = kSurvivors[index];
+            for (std::size_t attempt = 0;
+                 attempt < attempt_counts[index];
+                 ++attempt)
+            {
+                record(make_observation(
+                    target,
+                    0,
+                    ResponseOutcome::on_time,
+                    "optimization-suffix"));
+            }
+        }
+    }
+
     AdaptiveV2EpochChangeIdentity prepare_convergence(
         const AdaptiveV2TransitionPolicy &policy,
         std::uint64_t command_height,
@@ -638,10 +672,16 @@ struct Fixture
                    : AdaptiveV2ManagerControllerStatus::
                          awaiting_readiness));
         ready_all();
-        responsive_baseline();
+        if (policy.intent == TreePolicyKind::fault_containment)
+            responsive_baseline();
+        else
+            responsive_survivor_baseline();
         REQUIRE(session.evaluate() ==
                 AdaptiveV2ManagerControllerStatus::baseline_frozen);
-        persistent_timeouts();
+        if (policy.intent == TreePolicyKind::fault_containment)
+            persistent_timeouts();
+        else
+            responsive_optimization_suffix();
         REQUIRE(session.evaluate() ==
                 AdaptiveV2ManagerControllerStatus::successor_ready);
         REQUIRE(session.successor_bundle() != nullptr);
@@ -1198,7 +1238,7 @@ void verify_terminal_outcome_contract()
         Session &noop_session = noop.session;
         const auto noop_epoch =
             noop_session.ingress().current_epoch().epoch_digest();
-        REQUIRE(noop_session.begin_cycle(containment_policy()));
+        REQUIRE(noop_session.begin_cycle(optimization_policy()));
         noop.ready_all();
         noop.responsive_baseline();
         REQUIRE(noop_session.evaluate() ==
@@ -1279,7 +1319,7 @@ void verify_terminal_outcome_contract()
         CHECK(replayed_evidence_result.rejected_observations == 1);
         CHECK(noop_session.ingress().ledger().accepted().empty());
 
-        REQUIRE(noop_session.begin_cycle(optimization_policy()));
+        REQUIRE(noop_session.begin_cycle(containment_policy()));
         CHECK(noop_session.evaluate() ==
               AdaptiveV2ManagerControllerStatus::awaiting_readiness);
         REQUIRE(noop_session.finalize_failed_cycle(

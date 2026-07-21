@@ -46,6 +46,13 @@ enum class AdaptiveV2SelectionStatus : std::uint8_t
     internal_failure,
 };
 
+/** Authority for the exact constrained replica set in a selection result. */
+enum class AdaptiveV2SelectionConstraintBasis : std::uint8_t
+{
+    guarded_evidence = 1,
+    inherited_consensus_wait_exempt,
+};
+
 struct AdaptiveV2SelectionMetadata
 {
     std::uint32_t replica_count{0};
@@ -95,6 +102,8 @@ struct AdaptiveV2SelectionResult
 {
     AdaptiveV2SelectionStatus status{
         AdaptiveV2SelectionStatus::invalid_state};
+    AdaptiveV2SelectionConstraintBasis constraint_basis{
+        AdaptiveV2SelectionConstraintBasis::guarded_evidence};
     AdaptiveV2SelectionMetadata metadata;
     std::unique_ptr<AdaptationSnapshot> snapshot;
     std::vector<AdaptiveV2CandidateAudit> eligible_candidates;
@@ -107,8 +116,11 @@ struct AdaptiveV2SelectionResult
  *
  * The ledger is borrowed and must outlive this object. This class owns the
  * target-only score table and its accepted-prefix projection. Baseline and
- * later cutoffs are monotonic, belong to one exact epoch, and consume the
- * same accepted prefix used by the returned AdaptationSnapshot.
+ * later cutoffs are monotonic and belong to one exact epoch. Guarded selection
+ * snapshots use the full accepted prefix, while inherited optimization ranks
+ * only fresh attempts after the frozen baseline. A legal late response whose
+ * exact timeout precedes the baseline is correlated against the full accepted
+ * prefix and excluded from that fresh-attempt snapshot.
  *
  * A reporter qualifies for a target only after at least the configured K
  * timeout-only attempts after baseline. At least f+1 independently
@@ -148,6 +160,23 @@ public:
 
     AdaptiveV2SelectionResult select_through(
         std::uint64_t evidence_cutoff) noexcept;
+
+    /**
+     * Rank fresh responsive roots while preserving an exact constraint set
+     * already authorized by the consensus-ordered predecessor epoch.
+     *
+     * The inherited input must contain exactly configured f unique members.
+     * All Q unconstrained replicas must be responsive in the accepted suffix
+     * `(baseline_cutoff, evidence_cutoff]` under the configured snapshot
+     * policy. An exact timeout-to-late transition crossing the baseline is
+     * validated against the full accepted prefix, then excluded: it is not a
+     * fresh responsiveness attempt. Invalid correlation fails closed. An
+     * incomplete suffix does not advance the cutoff or reputation projection.
+     * This path never creates guarded candidates.
+     */
+    AdaptiveV2SelectionResult rank_inheriting_constraints_through(
+        std::uint64_t evidence_cutoff,
+        const std::vector<ReplicaID> &inherited_wait_exempt) noexcept;
 
     const std::vector<AdaptiveV2ReplicaScore> &
     baseline_scores() const noexcept;

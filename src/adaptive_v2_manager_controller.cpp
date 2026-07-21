@@ -17,6 +17,96 @@ bool is_member(
         membership.begin(), membership.end(), replica_id);
 }
 
+std::size_t first_leaf_index(
+    std::size_t member_count,
+    std::uint32_t fanout) noexcept
+{
+    return member_count == 1
+               ? 0
+               : ((member_count - 2) / fanout) + 1;
+}
+
+enum class ConsensusConstraintStatus : std::uint8_t
+{
+    guarded_fallback = 1,
+    inherited,
+    invalid,
+};
+
+struct ConsensusConstraints
+{
+    ConsensusConstraintStatus status{
+        ConsensusConstraintStatus::invalid};
+    std::vector<ReplicaID> replicas;
+};
+
+ConsensusConstraints
+consensus_inherited_wait_exempt(
+    const EpochDefinition &current,
+    const std::vector<ReplicaID> &membership,
+    std::size_t required_count)
+{
+    if (current.trees().empty() || required_count == 0)
+        return {};
+
+    const auto canonical =
+        current.trees().front().wait_exempt_leaves;
+    if (canonical.empty())
+    {
+        const auto uniformly_empty = std::all_of(
+            current.trees().begin(),
+            current.trees().end(),
+            [](const auto &tree) {
+                return tree.wait_exempt_leaves.empty();
+            });
+        return {
+            uniformly_empty
+                ? ConsensusConstraintStatus::guarded_fallback
+                : ConsensusConstraintStatus::invalid,
+            {}};
+    }
+    if (canonical.size() != required_count ||
+        !std::is_sorted(canonical.begin(), canonical.end()) ||
+        std::adjacent_find(canonical.begin(), canonical.end()) !=
+            canonical.end())
+    {
+        return {};
+    }
+    for (const auto replica_id : canonical)
+    {
+        if (!is_member(membership, replica_id))
+            return {};
+    }
+
+    for (const auto &tree : current.trees())
+    {
+        if (tree.fanout == 0 ||
+            tree.wait_exempt_leaves != canonical)
+        {
+            return {};
+        }
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto replica_id : canonical)
+        {
+            const auto found = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                replica_id);
+            if (found == tree.members_breadth_first.end() ||
+                static_cast<std::size_t>(std::distance(
+                    tree.members_breadth_first.begin(), found)) <
+                    leaf_start)
+            {
+                return {};
+            }
+        }
+    }
+    return {
+        ConsensusConstraintStatus::inherited,
+        canonical};
+}
+
 AcceptedEvidenceView accepted_prefix(
     const EvidenceLedger &ledger,
     const std::vector<ReplicaID> &membership,
@@ -162,6 +252,33 @@ struct AdaptiveV2ManagerController::State
               config.reputation_limits)
     {
         locally_healthy = ingress.healthy() && selector.healthy();
+        switch (config.transition_policy.intent)
+        {
+        case TreePolicyKind::fault_containment:
+            break;
+        case TreePolicyKind::performance_optimization:
+        {
+            const auto inherited = consensus_inherited_wait_exempt(
+                ingress.current_epoch(),
+                ingress.membership(),
+                config.selection.required_nonresponsive);
+            if (inherited.status ==
+                ConsensusConstraintStatus::invalid)
+            {
+                locally_healthy = false;
+            }
+            else if (inherited.status ==
+                     ConsensusConstraintStatus::inherited)
+            {
+                inherit_consensus_wait_exempt = true;
+                inherited_wait_exempt = inherited.replicas;
+            }
+            break;
+        }
+        default:
+            locally_healthy = false;
+            break;
+        }
     }
 
     bool operational() const noexcept
@@ -263,7 +380,23 @@ struct AdaptiveV2ManagerController::State
                 awaiting_guarded_selection;
         }
 
-        auto selected = selector.select_through(cutoff);
+        AdaptiveV2SelectionResult selected;
+        switch (config.transition_policy.intent)
+        {
+        case TreePolicyKind::fault_containment:
+            selected = selector.select_through(cutoff);
+            break;
+        case TreePolicyKind::performance_optimization:
+            selected = inherit_consensus_wait_exempt
+                           ? selector
+                                 .rank_inheriting_constraints_through(
+                                     cutoff,
+                                     inherited_wait_exempt)
+                           : selector.select_through(cutoff);
+            break;
+        default:
+            return fail_closed();
+        }
         latest_selection =
             std::make_unique<AdaptiveV2SelectionResult>(
                 std::move(selected));
@@ -300,6 +433,8 @@ struct AdaptiveV2ManagerController::State
     std::unique_ptr<AdaptationSnapshot> baseline_snapshot;
     std::unique_ptr<AdaptiveV2SelectionResult> latest_selection;
     std::unique_ptr<const AdaptiveV2EpochChangeBundle> successor;
+    std::vector<ReplicaID> inherited_wait_exempt;
+    bool inherit_consensus_wait_exempt{false};
     std::uint64_t last_baseline_examined_cutoff{0};
     bool baseline_examined{false};
     bool factory_attempted{false};

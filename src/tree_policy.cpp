@@ -16,6 +16,7 @@ struct ValidatedInput
     std::vector<ReplicaID> members;
     std::map<ReplicaID, const ReplicaAdaptationResult *> scores;
     std::vector<const ReplicaAdaptationResult *> eligible;
+    std::set<ReplicaID> policy_constrained;
     std::size_t first_leaf{0};
 };
 
@@ -123,6 +124,45 @@ ValidatedInput validate_input(
     if (constrained_count > leaf_capacity)
         reject("tree policy has insufficient leaf capacity");
 
+    return validated;
+}
+
+ValidatedInput apply_performance_constraints(
+    ValidatedInput validated,
+    const TreePlacementInput &input,
+    const PerformanceOptimizationPolicy &policy)
+{
+    if (policy.constrained_leaves.empty())
+        return validated;
+    if (policy.constrained_leaves.size() > validated.members.size())
+        reject("tree policy constrained leaves exceed membership");
+
+    for (const auto replica : policy.constrained_leaves)
+    {
+        if (validated.scores.count(replica) == 0 ||
+            !validated.policy_constrained.insert(replica).second)
+        {
+            reject("tree policy constrained leaves must be unique members");
+        }
+    }
+
+    std::vector<const ReplicaAdaptationResult *> influential;
+    influential.reserve(validated.eligible.size());
+    for (const auto *score : validated.eligible)
+    {
+        if (validated.policy_constrained.count(score->replica_id) == 0)
+            influential.push_back(score);
+    }
+    validated.eligible = std::move(influential);
+
+    if (validated.eligible.size() < input.shape.tree_count)
+        reject("tree policy constraints leave insufficient eligible roots");
+    const auto leaf_capacity =
+        validated.members.size() - validated.first_leaf;
+    const auto constrained_count =
+        validated.members.size() - validated.eligible.size();
+    if (constrained_count > leaf_capacity)
+        reject("tree policy constraints exceed leaf capacity");
     return validated;
 }
 
@@ -498,11 +538,13 @@ PlacementWork build_work(
                 definition.members_breadth_first[position];
             const auto *score = validated.scores.at(replica);
             TreeReplicaRole role = TreeReplicaRole::leaf;
-            ReplicaPlacementReason reason = score->eligible
-                                                    ? ReplicaPlacementReason::
-                                                          seeded_eligible_leaf
-                                                    : ReplicaPlacementReason::
-                                                          constrained_ineligible_leaf;
+            ReplicaPlacementReason reason =
+                validated.policy_constrained.count(replica) != 0
+                    ? ReplicaPlacementReason::policy_constrained_leaf
+                    : score->eligible
+                          ? ReplicaPlacementReason::seeded_eligible_leaf
+                          : ReplicaPlacementReason::
+                                constrained_ineligible_leaf;
             if (position == 0)
             {
                 role = TreeReplicaRole::root;
@@ -552,9 +594,10 @@ TreePlacementResult build_tree_placement(
 TreePlacementResult build_tree_placement(
     const TreePlacementInput &input,
     const AdaptationSnapshot &snapshot,
-    const PerformanceOptimizationPolicy &)
+    const PerformanceOptimizationPolicy &policy)
 {
-    const auto validated = validate_input(input, snapshot);
+    const auto validated = apply_performance_constraints(
+        validate_input(input, snapshot), input, policy);
     auto work = build_work(
         input,
         snapshot,

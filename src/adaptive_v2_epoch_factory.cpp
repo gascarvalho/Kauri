@@ -151,9 +151,88 @@ bool valid_guarded_candidates(
     return true;
 }
 
+std::size_t first_leaf_index(
+    std::size_t member_count,
+    std::uint32_t fanout) noexcept;
+
+enum class ConsensusConstraintStatus : std::uint8_t
+{
+    empty = 1,
+    exact,
+    invalid,
+};
+
+struct ConsensusConstraints
+{
+    ConsensusConstraintStatus status{
+        ConsensusConstraintStatus::invalid};
+    std::vector<ReplicaID> replicas;
+};
+
+ConsensusConstraints current_consensus_constraints(
+    const EpochDefinition &current,
+    const std::set<ReplicaID> &membership,
+    const ByzantineQuorum &quorum)
+{
+    if (current.trees().empty())
+        return {};
+
+    const auto canonical =
+        current.trees().front().wait_exempt_leaves;
+    if (canonical.empty())
+    {
+        for (const auto &tree : current.trees())
+        {
+            if (!tree.wait_exempt_leaves.empty())
+                return {};
+        }
+        return {ConsensusConstraintStatus::empty, {}};
+    }
+
+    if (canonical.size() != quorum.fault_threshold ||
+        !std::is_sorted(canonical.begin(), canonical.end()) ||
+        std::adjacent_find(canonical.begin(), canonical.end()) !=
+            canonical.end())
+    {
+        return {};
+    }
+    for (const auto replica_id : canonical)
+    {
+        if (membership.count(replica_id) == 0)
+            return {};
+    }
+
+    for (const auto &tree : current.trees())
+    {
+        if (tree.fanout == 0 ||
+            tree.wait_exempt_leaves != canonical)
+        {
+            return {};
+        }
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto replica_id : canonical)
+        {
+            const auto found = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                replica_id);
+            if (found == tree.members_breadth_first.end() ||
+                static_cast<std::size_t>(std::distance(
+                    tree.members_breadth_first.begin(), found)) <
+                    leaf_start)
+            {
+                return {};
+            }
+        }
+    }
+    return {ConsensusConstraintStatus::exact, canonical};
+}
+
 AdaptiveV2EpochFactoryStatus validate_selection(
     const EpochDefinition &current,
     const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
     const std::vector<ReplicaID> &membership,
     const ByzantineQuorum &quorum,
     std::vector<ReplicaID> &canonical_wait_exempt,
@@ -183,8 +262,47 @@ AdaptiveV2EpochFactoryStatus validate_selection(
 
     const std::set<ReplicaID> member_set(
         membership.begin(), membership.end());
-    if (!valid_guarded_candidates(selection, member_set, quorum))
+    const auto current_constraints = current_consensus_constraints(
+        current, member_set, quorum);
+    if (current_constraints.status ==
+        ConsensusConstraintStatus::invalid)
+    {
         return AdaptiveV2EpochFactoryStatus::invalid_selection;
+    }
+
+    switch (selection.constraint_basis)
+    {
+    case AdaptiveV2SelectionConstraintBasis::guarded_evidence:
+        if (!valid_guarded_candidates(selection, member_set, quorum) ||
+            (transition_policy.intent ==
+                 TreePolicyKind::performance_optimization &&
+             current_constraints.status !=
+                 ConsensusConstraintStatus::empty))
+        {
+            return AdaptiveV2EpochFactoryStatus::invalid_selection;
+        }
+        break;
+    case AdaptiveV2SelectionConstraintBasis::
+        inherited_consensus_wait_exempt:
+    {
+        if (transition_policy.intent !=
+                TreePolicyKind::performance_optimization ||
+            !selection.eligible_candidates.empty() ||
+            current_constraints.status !=
+                ConsensusConstraintStatus::exact)
+        {
+            return AdaptiveV2EpochFactoryStatus::invalid_selection;
+        }
+        if (current_constraints.replicas != canonical_wait_exempt ||
+            selection.selected_replicas != canonical_wait_exempt)
+        {
+            return AdaptiveV2EpochFactoryStatus::invalid_selection;
+        }
+        break;
+    }
+    default:
+        return AdaptiveV2EpochFactoryStatus::invalid_selection;
+    }
 
     const std::set<ReplicaID> selected(
         canonical_wait_exempt.begin(), canonical_wait_exempt.end());
@@ -200,16 +318,27 @@ AdaptiveV2EpochFactoryStatus validate_selection(
         const auto &entry = ranking[index];
         if (entry.rank != static_cast<std::uint32_t>(index) ||
             member_set.count(entry.replica_id) == 0 ||
-            !ranked.insert(entry.replica_id).second)
+            !ranked.insert(entry.replica_id).second ||
+            (entry.classification != ResponsivenessClass::responsive &&
+             entry.classification !=
+                 ResponsivenessClass::insufficient_evidence &&
+             entry.classification !=
+                 ResponsivenessClass::nonresponsive) ||
+            entry.eligible !=
+                (entry.classification ==
+                 ResponsivenessClass::responsive))
         {
             return AdaptiveV2EpochFactoryStatus::invalid_selection;
         }
 
         if (selected.count(entry.replica_id) != 0)
         {
-            if (entry.classification !=
-                    ResponsivenessClass::nonresponsive ||
-                entry.eligible)
+            if (selection.constraint_basis ==
+                    AdaptiveV2SelectionConstraintBasis::
+                        guarded_evidence &&
+                (entry.classification !=
+                     ResponsivenessClass::nonresponsive ||
+                 entry.eligible))
             {
                 return AdaptiveV2EpochFactoryStatus::invalid_selection;
             }
@@ -224,15 +353,20 @@ AdaptiveV2EpochFactoryStatus validate_selection(
         snapshot_roots.push_back(entry.replica_id);
     }
 
-    for (const auto selected_replica : canonical_wait_exempt)
+    if (selection.constraint_basis ==
+        AdaptiveV2SelectionConstraintBasis::guarded_evidence)
     {
-        const auto *entry = snapshot_entry(snapshot, selected_replica);
-        if (entry == nullptr ||
-            entry->classification !=
-                ResponsivenessClass::nonresponsive ||
-            entry->eligible)
+        for (const auto selected_replica : canonical_wait_exempt)
         {
-            return AdaptiveV2EpochFactoryStatus::invalid_selection;
+            const auto *entry = snapshot_entry(
+                snapshot, selected_replica);
+            if (entry == nullptr ||
+                entry->classification !=
+                    ResponsivenessClass::nonresponsive ||
+                entry->eligible)
+            {
+                return AdaptiveV2EpochFactoryStatus::invalid_selection;
+            }
         }
     }
 
@@ -535,6 +669,7 @@ AdaptiveV2EpochFactoryResult build_validated(
     const auto selection_status = validate_selection(
         current,
         selection,
+        transition_policy,
         *current_members,
         *quorum,
         selected,
@@ -606,7 +741,7 @@ AdaptiveV2EpochFactoryResult build_validated(
             placement.emplace(build_tree_placement(
                 placement_input,
                 *selection.snapshot,
-                PerformanceOptimizationPolicy{}));
+                PerformanceOptimizationPolicy{selected}));
             break;
         default:
             return rejected(

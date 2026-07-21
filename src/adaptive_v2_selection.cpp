@@ -95,6 +95,7 @@ enum class PrefixStatus : std::uint8_t
 {
     valid = 1,
     invalid_order,
+    invalid_transition,
     mixed_epoch,
     nonmember,
 };
@@ -103,6 +104,18 @@ struct ValidatedPrefix
 {
     PrefixStatus status{PrefixStatus::valid};
     std::size_t size{0};
+};
+
+struct BaselineAttempt
+{
+    const AcceptedEvidenceRecord *first_record{nullptr};
+    bool timeout_open{false};
+};
+
+struct NormalizedSuffix
+{
+    PrefixStatus status{PrefixStatus::valid};
+    std::vector<AcceptedEvidenceRecord> records;
 };
 
 ValidatedPrefix validate_prefix(
@@ -148,6 +161,135 @@ ValidatedPrefix validate_prefix(
     return {PrefixStatus::valid, prefix_size};
 }
 
+bool exact_timeout_to_late_transition(
+    const AcceptedEvidenceRecord &timeout_record,
+    const AcceptedEvidenceRecord &late_record) noexcept
+{
+    constexpr std::size_t kMaximumSnapshotSigners = 4'096;
+    const auto &timeout = timeout_record.observation;
+    const auto &late = late_record.observation;
+    return timeout.outcome == ResponseOutcome::timeout &&
+           late.outcome == ResponseOutcome::late &&
+           timeout.observation_id == late.observation_id &&
+           timeout.attempt_identity() == late.attempt_identity() &&
+           timeout.deadline_duration_us == late.deadline_duration_us &&
+           late.schema_version == kResponseObservationSchemaVersion &&
+           late.deadline_duration_us != 0 &&
+           late.response_duration_us >= late.deadline_duration_us &&
+           !late.signer_set.empty() &&
+           late.signer_set.size() <= kMaximumSnapshotSigners &&
+           std::adjacent_find(
+               late.signer_set.begin(),
+               late.signer_set.end(),
+               [](ReplicaID left, ReplicaID right) {
+                   return left >= right;
+               }) == late.signer_set.end();
+}
+
+NormalizedSuffix normalize_suffix(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const std::vector<ReplicaID> &membership,
+    const AdaptationEpochId &epoch,
+    std::uint64_t lower_exclusive,
+    std::uint64_t upper_inclusive)
+{
+    NormalizedSuffix normalized;
+    std::map<uint256_t, BaselineAttempt> baseline_attempts;
+    std::uint64_t previous_sequence = 0;
+    for (const auto &record : accepted)
+    {
+        if (record.ingestion_sequence == 0 ||
+            record.ingestion_sequence <= previous_sequence)
+        {
+            normalized.status = PrefixStatus::invalid_order;
+            return normalized;
+        }
+        previous_sequence = record.ingestion_sequence;
+        if (record.ingestion_sequence > upper_inclusive)
+            continue;
+
+        const auto &observation = record.observation;
+        const bool in_suffix =
+            record.ingestion_sequence > lower_exclusive;
+        if (in_suffix &&
+            (observation.configuration.epoch_number !=
+                 epoch.epoch_number ||
+             observation.configuration.epoch_digest !=
+                 epoch.epoch_digest))
+        {
+            normalized.status = PrefixStatus::mixed_epoch;
+            return normalized;
+        }
+        if (in_suffix &&
+            (!is_member(membership, observation.reporter_id) ||
+             !is_member(
+                 membership, observation.observed_replica_id)))
+        {
+            normalized.status = PrefixStatus::nonmember;
+            return normalized;
+        }
+        if (in_suffix)
+        {
+            for (const auto signer : observation.signer_set)
+            {
+                if (!is_member(membership, signer))
+                {
+                    normalized.status = PrefixStatus::nonmember;
+                    return normalized;
+                }
+            }
+        }
+
+        const auto found = baseline_attempts.find(
+            observation.observation_id);
+        if (!in_suffix)
+        {
+            if (found == baseline_attempts.end())
+            {
+                if (observation.outcome == ResponseOutcome::late)
+                {
+                    normalized.status =
+                        PrefixStatus::invalid_transition;
+                    return normalized;
+                }
+                baseline_attempts.emplace(
+                    observation.observation_id,
+                    BaselineAttempt{
+                        &record,
+                        observation.outcome ==
+                            ResponseOutcome::timeout});
+                continue;
+            }
+            if (!found->second.timeout_open ||
+                !exact_timeout_to_late_transition(
+                    *found->second.first_record, record))
+            {
+                normalized.status =
+                    PrefixStatus::invalid_transition;
+                return normalized;
+            }
+            found->second.timeout_open = false;
+            continue;
+        }
+
+        if (found != baseline_attempts.end())
+        {
+            if (!found->second.timeout_open ||
+                !exact_timeout_to_late_transition(
+                    *found->second.first_record, record))
+            {
+                normalized.status =
+                    PrefixStatus::invalid_transition;
+                return normalized;
+            }
+            found->second.timeout_open = false;
+            continue;
+        }
+        normalized.records.push_back(record);
+    }
+    return normalized;
+}
+
 AdaptiveV2SelectionStatus selection_status(
     PrefixStatus status) noexcept
 {
@@ -160,6 +302,7 @@ AdaptiveV2SelectionStatus selection_status(
     case PrefixStatus::nonmember:
         return AdaptiveV2SelectionStatus::nonmember_evidence;
     case PrefixStatus::invalid_order:
+    case PrefixStatus::invalid_transition:
         return AdaptiveV2SelectionStatus::snapshot_failed;
     }
     return AdaptiveV2SelectionStatus::internal_failure;
@@ -446,10 +589,13 @@ struct AdaptiveV2ByzantineSelection::State
 
     AdaptiveV2SelectionResult result(
         AdaptiveV2SelectionStatus status,
-        std::uint64_t evidence_cutoff) const
+        std::uint64_t evidence_cutoff,
+        AdaptiveV2SelectionConstraintBasis constraint_basis =
+            AdaptiveV2SelectionConstraintBasis::guarded_evidence) const
     {
         AdaptiveV2SelectionResult output;
         output.status = status;
+        output.constraint_basis = constraint_basis;
         output.metadata = metadata(evidence_cutoff);
         return output;
     }
@@ -466,6 +612,32 @@ struct AdaptiveV2ByzantineSelection::State
                 AcceptedEvidenceView{
                     accepted.empty() ? nullptr : accepted.data(),
                     prefix_size},
+                evidence_cutoff,
+                config.responsiveness_policy,
+                config.snapshot_seed));
+    }
+
+    std::unique_ptr<AdaptationSnapshot> build_suffix_snapshot(
+        const std::vector<AcceptedEvidenceRecord> &accepted,
+        std::size_t suffix_offset,
+        std::size_t suffix_size,
+        std::uint64_t evidence_cutoff) const
+    {
+        if (suffix_offset > accepted.size() ||
+            suffix_size > accepted.size() - suffix_offset)
+        {
+            throw std::invalid_argument(
+                "adaptive-v2 suffix is outside accepted evidence");
+        }
+        return std::make_unique<AdaptationSnapshot>(
+            build_adaptation_snapshot(
+                membership,
+                current_epoch,
+                AcceptedEvidenceView{
+                    suffix_size == 0
+                        ? nullptr
+                        : accepted.data() + suffix_offset,
+                    suffix_size},
                 evidence_cutoff,
                 config.responsiveness_policy,
                 config.snapshot_seed));
@@ -611,6 +783,76 @@ struct AdaptiveV2ByzantineSelection::State
             healthy = false;
             output.status = AdaptiveV2SelectionStatus::internal_failure;
             output.eligible_candidates.clear();
+            output.selected_replicas.clear();
+            output.eligible_roots.clear();
+            return output;
+        }
+
+        output.status = AdaptiveV2SelectionStatus::selected;
+        return output;
+    }
+
+    AdaptiveV2SelectionResult rank_inherited_constraints(
+        std::unique_ptr<AdaptationSnapshot> snapshot,
+        std::vector<ReplicaID> inherited_wait_exempt,
+        std::uint64_t evidence_cutoff)
+    {
+        auto output = result(
+            AdaptiveV2SelectionStatus::insufficient_eligible_roots,
+            evidence_cutoff,
+            AdaptiveV2SelectionConstraintBasis::
+                inherited_consensus_wait_exempt);
+        output.snapshot = std::move(snapshot);
+        output.selected_replicas = std::move(inherited_wait_exempt);
+        try
+        {
+            const std::set<ReplicaID> constrained(
+                output.selected_replicas.begin(),
+                output.selected_replicas.end());
+            std::set<ReplicaID> ranked;
+            output.eligible_roots.reserve(quorum.quorum);
+            const auto &ranking = output.snapshot->ranking();
+            if (ranking.size() != membership.size())
+            {
+                healthy = false;
+                output.status =
+                    AdaptiveV2SelectionStatus::snapshot_failed;
+                output.selected_replicas.clear();
+                return output;
+            }
+            for (std::size_t index = 0; index < ranking.size(); ++index)
+            {
+                const auto &entry = ranking[index];
+                if (entry.rank != static_cast<std::uint32_t>(index) ||
+                    !is_member(membership, entry.replica_id) ||
+                    !ranked.insert(entry.replica_id).second)
+                {
+                    healthy = false;
+                    output.status =
+                        AdaptiveV2SelectionStatus::snapshot_failed;
+                    output.selected_replicas.clear();
+                    output.eligible_roots.clear();
+                    return output;
+                }
+                if (constrained.count(entry.replica_id) == 0 &&
+                    entry.classification ==
+                        ResponsivenessClass::responsive &&
+                    entry.eligible)
+                {
+                    output.eligible_roots.push_back(entry.replica_id);
+                }
+            }
+            if (output.eligible_roots.size() != quorum.quorum)
+            {
+                output.selected_replicas.clear();
+                output.eligible_roots.clear();
+                return output;
+            }
+        }
+        catch (...)
+        {
+            healthy = false;
+            output.status = AdaptiveV2SelectionStatus::internal_failure;
             output.selected_replicas.clear();
             output.eligible_roots.clear();
             return output;
@@ -836,6 +1078,125 @@ AdaptiveV2ByzantineSelection::select_through(
     state.current_cutoff = evidence_cutoff;
     return state.select_candidates(
         std::move(snapshot), timeout_counts, evidence_cutoff);
+}
+
+AdaptiveV2SelectionResult
+AdaptiveV2ByzantineSelection::rank_inheriting_constraints_through(
+    std::uint64_t evidence_cutoff,
+    const std::vector<ReplicaID> &inherited_wait_exempt) noexcept
+{
+    auto &state = *state_;
+    const auto inherited_result = [&](AdaptiveV2SelectionStatus status) {
+        return state.result(
+            status,
+            evidence_cutoff,
+            AdaptiveV2SelectionConstraintBasis::
+                inherited_consensus_wait_exempt);
+    };
+    if (!state.healthy || !state.baseline_frozen)
+        return inherited_result(AdaptiveV2SelectionStatus::invalid_state);
+    if (!state.ledger.healthy())
+    {
+        state.healthy = false;
+        return inherited_result(
+            AdaptiveV2SelectionStatus::ledger_unhealthy);
+    }
+    if (evidence_cutoff <= state.current_cutoff ||
+        evidence_cutoff > state.ledger.high_watermark())
+    {
+        return inherited_result(
+            AdaptiveV2SelectionStatus::invalid_cutoff);
+    }
+
+    std::vector<ReplicaID> canonical_inherited;
+    try
+    {
+        canonical_inherited = inherited_wait_exempt;
+        std::sort(
+            canonical_inherited.begin(), canonical_inherited.end());
+    }
+    catch (...)
+    {
+        state.healthy = false;
+        return inherited_result(
+            AdaptiveV2SelectionStatus::capacity_exceeded);
+    }
+    if (canonical_inherited.size() !=
+            state.config.required_nonresponsive ||
+        std::adjacent_find(
+            canonical_inherited.begin(), canonical_inherited.end()) !=
+            canonical_inherited.end() ||
+        std::any_of(
+            canonical_inherited.begin(),
+            canonical_inherited.end(),
+            [&state](ReplicaID replica_id) {
+                return !is_member(state.membership, replica_id);
+            }))
+    {
+        return inherited_result(AdaptiveV2SelectionStatus::invalid_state);
+    }
+
+    const auto &accepted = state.ledger.accepted();
+    NormalizedSuffix suffix;
+    try
+    {
+        suffix = normalize_suffix(
+            accepted,
+            state.membership,
+            state.current_epoch,
+            state.baseline_cutoff,
+            evidence_cutoff);
+    }
+    catch (...)
+    {
+        state.healthy = false;
+        return inherited_result(
+            AdaptiveV2SelectionStatus::capacity_exceeded);
+    }
+    if (suffix.status != PrefixStatus::valid)
+    {
+        if (suffix.status == PrefixStatus::invalid_transition)
+            state.healthy = false;
+        return inherited_result(selection_status(suffix.status));
+    }
+
+    std::unique_ptr<AdaptationSnapshot> snapshot;
+    try
+    {
+        snapshot = state.build_suffix_snapshot(
+            suffix.records,
+            0,
+            suffix.records.size(),
+            evidence_cutoff);
+    }
+    catch (...)
+    {
+        state.healthy = false;
+        return inherited_result(
+            AdaptiveV2SelectionStatus::snapshot_failed);
+    }
+
+    auto output = state.rank_inherited_constraints(
+        std::move(snapshot),
+        std::move(canonical_inherited),
+        evidence_cutoff);
+    if (!state.healthy)
+        return output;
+    if (output.status != AdaptiveV2SelectionStatus::selected)
+        return output;
+
+    const auto applied = state.projection.apply_through(evidence_cutoff);
+    if (!projection_applied(applied.status))
+    {
+        state.healthy = false;
+        return inherited_result(
+            applied.status ==
+                    EvidenceReputationApplyStatus::ledger_unhealthy
+                ? AdaptiveV2SelectionStatus::ledger_unhealthy
+                : AdaptiveV2SelectionStatus::projection_failed);
+    }
+    state.current_cutoff = evidence_cutoff;
+    return output;
 }
 
 const std::vector<AdaptiveV2ReplicaScore> &
