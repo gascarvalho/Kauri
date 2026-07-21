@@ -522,7 +522,12 @@ using hotstuff::AdaptiveAggregationTransition;
 using hotstuff::AdaptiveStructuredEventEmitter;
 using hotstuff::AdaptiveV2ConvergenceStructuredEvent;
 using hotstuff::AdaptiveV2ConvergenceTransition;
+using hotstuff::AdaptiveV2EvidenceSnapshotObservation;
+using hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent;
 using hotstuff::AdaptiveV2EpochChangeIdentity;
+using hotstuff::AdaptiveV2ManagerCycleOutcome;
+using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
+using hotstuff::AdaptiveV2ManagerSessionTerminalStructuredEvent;
 using hotstuff::AuditStructuredEventEmitter;
 using hotstuff::AuditStructuredEventPayload;
 using hotstuff::CommitObservedStructuredEvent;
@@ -559,6 +564,7 @@ using hotstuff::StructuredEventSourceKind;
 using hotstuff::StructuredEventType;
 using hotstuff::StructuredEventWriteResult;
 using hotstuff::StructuredEventWriteStatus;
+using hotstuff::TreePolicyKind;
 using hotstuff::bytearray_t;
 using hotstuff::uint256_t;
 
@@ -708,6 +714,67 @@ AdaptiveV2EpochChangeIdentity convergence_event_identity()
         digest("convergence-audit-command-block"),
         20,
         2365};
+}
+
+AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event()
+{
+    AdaptiveV2EvidenceSnapshotStructuredEvent event;
+    event.cycle_ordinal = 3;
+    event.policy_intent = TreePolicyKind::fault_containment;
+    event.transition_artifact_id = "e7-to-e8-containment";
+    event.predecessor_epoch_number = 7;
+    event.predecessor_epoch_digest =
+        digest("convergence-audit-predecessor");
+    event.activation_generation =
+        (std::uint64_t{7} << 32) | std::uint64_t{17};
+    event.baseline_cutoff = 44;
+    event.current_cutoff = 52;
+    event.observations = {
+        AdaptiveV2EvidenceSnapshotObservation{
+            digest("snapshot-observation-before-baseline"),
+            42,
+            7,
+            event.predecessor_epoch_digest,
+            2,
+            0,
+            ResponseOutcome::on_time,
+            1'250'000},
+        AdaptiveV2EvidenceSnapshotObservation{
+            digest("snapshot-observation-after-baseline"),
+            45,
+            7,
+            event.predecessor_epoch_digest,
+            3,
+            1,
+            ResponseOutcome::timeout,
+            std::nullopt}};
+    event.eligible_ranking = {2, 3, 4, 5, 6};
+    return event;
+}
+
+AdaptiveV2ManagerSessionTerminalStructuredEvent manager_terminal_event()
+{
+    const auto identity = convergence_event_identity();
+    AdaptiveV2ManagerSessionTerminalStructuredEvent event;
+    event.cycle_ordinal = 3;
+    event.policy_intent = TreePolicyKind::fault_containment;
+    event.outcome = AdaptiveV2ManagerCycleOutcome::advanced;
+    event.reason =
+        AdaptiveV2ManagerCycleTerminalReason::successor_converged;
+    event.transition_artifact_id = "e7-to-e8-containment";
+    event.predecessor_epoch_number =
+        identity.predecessor_epoch_number;
+    event.predecessor_epoch_digest =
+        identity.predecessor_epoch_digest;
+    event.successor_epoch_number = identity.successor_epoch_number;
+    event.successor_epoch_digest = identity.successor_epoch_digest;
+    event.command_payload_digest = identity.command_payload_digest;
+    event.winning_activation = identity;
+    event.evidence_window_activation_generation =
+        (std::uint64_t{7} << 32) | std::uint64_t{17};
+    event.baseline_evidence_cutoff = 44;
+    event.current_evidence_cutoff = 52;
+    return event;
 }
 
 template<typename Event, typename = void>
@@ -1680,13 +1747,23 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 3,
-        "the audit capability also admits convergence audit events");
+        std::variant_size<AuditStructuredEventPayload>::value == 5,
+        "the audit capability admits convergence, snapshots, and terminals");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
             AdaptiveV2ConvergenceStructuredEvent>::value,
         "the third audit payload is the adaptive-v2 convergence event");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<3, AuditStructuredEventPayload>,
+            AdaptiveV2EvidenceSnapshotStructuredEvent>::value,
+        "the fourth audit payload is the manager evidence snapshot");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<4, AuditStructuredEventPayload>,
+            AdaptiveV2ManagerSessionTerminalStructuredEvent>::value,
+        "the fifth audit payload is the manager-session terminal event");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -1706,6 +1783,22 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
     CHECK(std::string(
               hotstuff::structured_event_type_name(reputation_type)) ==
           "reputation.evidence_applied");
+
+    const auto snapshot_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{evidence_snapshot_event()});
+    CHECK(snapshot_type ==
+          StructuredEventType::adaptive_v2_evidence_snapshot);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(snapshot_type)) ==
+          "adaptive_v2_evidence_snapshot");
+
+    const auto terminal_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{manager_terminal_event()});
+    CHECK(terminal_type ==
+          StructuredEventType::adaptive_v2_session_terminal);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(terminal_type)) ==
+          "adaptive_v2_session_terminal");
 }
 
 TEST_CASE("AE01 serializes exact command and accepted reputation identities",
@@ -1747,6 +1840,7 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
         CHECK(sink.health().healthy);
         CHECK(sink.health().complete_records == 1);
         CHECK(rendered(output) == expected);
+
     }
 
     SECTION("applied reputation includes the accepted audit update and cutoff")
@@ -1779,6 +1873,139 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
         StructuredEventSink sink(manager_event_config(), clock, output);
         AuditStructuredEventEmitter &audit = sink;
         audit.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+    }
+
+    SECTION("evidence snapshot event and artifact share one canonical payload")
+    {
+        const auto event = evidence_snapshot_event();
+        const auto &before = event.observations[0];
+        const auto &after = event.observations[1];
+        const auto payload =
+            "{\"cycle_ordinal\":3,"
+            "\"policy_intent\":\"fault_containment\","
+            "\"transition_artifact_id\":\"e7-to-e8-containment\","
+            "\"predecessor_epoch_number\":7,"
+            "\"predecessor_epoch_digest\":\"" +
+            event.predecessor_epoch_digest.to_hex() + "\","
+            "\"activation_generation\":30064771089,"
+            "\"baseline_cutoff\":44,"
+            "\"current_cutoff\":52,"
+            "\"observations\":[{"
+            "\"observation_id\":\"" +
+            before.observation_id.to_hex() + "\","
+            "\"ingestion_sequence\":42,"
+            "\"epoch_number\":7,"
+            "\"epoch_digest\":\"" +
+            before.epoch_digest.to_hex() + "\","
+            "\"reporter_id\":2,"
+            "\"target_id\":0,"
+            "\"outcome\":\"on_time\","
+            "\"latency_ns\":1250000},{"
+            "\"observation_id\":\"" +
+            after.observation_id.to_hex() + "\","
+            "\"ingestion_sequence\":45,"
+            "\"epoch_number\":7,"
+            "\"epoch_digest\":\"" +
+            after.epoch_digest.to_hex() + "\","
+            "\"reporter_id\":3,"
+            "\"target_id\":1,"
+            "\"outcome\":\"timeout\"}],"
+            "\"eligible_ranking\":[2,3,4,5,6]}";
+
+        CHECK(hotstuff::
+                  serialize_adaptive_v2_evidence_snapshot_payload(
+                      event, 64 * 1024) == payload);
+
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7002,"
+            "\"event_type\":\"adaptive_v2_evidence_snapshot\","
+            "\"payload\":" + payload + "}\n";
+        FakeClock clock({7002});
+        MemoryOutput output;
+        StructuredEventSink sink(
+            manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+
+        auto tight_config = manager_event_config();
+        tight_config.limits.maximum_line_bytes = payload.size() + 1;
+        FakeClock tight_clock({7003});
+        MemoryOutput tight_output;
+        StructuredEventSink tight_sink(
+            tight_config, tight_clock, tight_output);
+        tight_sink.emit_audit(AuditStructuredEventPayload{event});
+        const auto tight_health = tight_sink.health();
+        CHECK_FALSE(tight_health.healthy);
+        CHECK(tight_health.first_failure ==
+              StructuredEventFailure::line_too_large);
+        CHECK(tight_health.last_assigned_sequence == 0);
+        CHECK(tight_health.queued_events == 0);
+        CHECK(tight_output.bytes().empty());
+    }
+
+    SECTION("session terminal binds intent artifact evidence and winner")
+    {
+        const auto event = manager_terminal_event();
+        const auto &identity = *event.winning_activation;
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7002,"
+            "\"event_type\":\"adaptive_v2_session_terminal\","
+            "\"payload\":{\"cycle_ordinal\":3,"
+            "\"policy_intent\":\"fault_containment\","
+            "\"outcome\":\"advanced\","
+            "\"reason\":\"successor_converged\","
+            "\"transition_artifact_id\":\"e7-to-e8-containment\","
+            "\"predecessor_epoch_number\":7,"
+            "\"predecessor_epoch_digest\":\"" +
+            event.predecessor_epoch_digest.to_hex() + "\","
+            "\"successor_epoch_number\":8,"
+            "\"successor_epoch_digest\":\"" +
+            event.successor_epoch_digest->to_hex() + "\","
+            "\"command_payload_digest\":\"" +
+            event.command_payload_digest->to_hex() + "\","
+            "\"winning_activation\":{"
+            "\"predecessor_epoch_number\":7,"
+            "\"predecessor_epoch_digest\":\"" +
+            identity.predecessor_epoch_digest.to_hex() + "\","
+            "\"successor_epoch_number\":8,"
+            "\"successor_epoch_digest\":\"" +
+            identity.successor_epoch_digest.to_hex() + "\","
+            "\"command_payload_digest\":\"" +
+            identity.command_payload_digest.to_hex() + "\","
+            "\"command_block_height\":2345,"
+            "\"command_block_hash\":\"" +
+            identity.command_block_hash.to_hex() + "\","
+            "\"activation_delay_blocks\":20,"
+            "\"activation_height\":2365},"
+            "\"evidence_window_activation_generation\":30064771089,"
+            "\"baseline_evidence_cutoff\":44,"
+            "\"current_evidence_cutoff\":52}}\n";
+
+        FakeClock clock({7002});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
         sink.shutdown();
 
         CHECK(sink.health().healthy);
@@ -1906,6 +2133,118 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         CHECK(rejects(manager_event_config(), invalid));
 
         CHECK(rejects(event_config(), reputation_event()));
+    }
+
+    SECTION("evidence snapshot is an exact bounded predecessor prefix")
+    {
+        auto invalid = evidence_snapshot_event();
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.activation_generation =
+            (std::uint64_t{8} << 32) | std::uint64_t{1};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations.clear();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations[1].epoch_number = 8;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations[1].epoch_digest =
+            digest("mixed-evidence-snapshot-epoch");
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations[1].ingestion_sequence = 53;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations[1].ingestion_sequence = 43;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations[1].ingestion_sequence = 42;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations[1].latency_ns = 1;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.observations[0].outcome = ResponseOutcome::late;
+        invalid.observations[0].latency_ns.reset();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.eligible_ranking[1] =
+            invalid.eligible_ranking[0];
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = evidence_snapshot_event();
+        invalid.eligible_ranking.clear();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        CHECK_THROWS_AS(
+            hotstuff::
+                serialize_adaptive_v2_evidence_snapshot_payload(
+                    evidence_snapshot_event(), 32),
+            std::length_error);
+    }
+
+    SECTION("session terminal is exact and manager-owned")
+    {
+        auto invalid = manager_terminal_event();
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.transition_artifact_id.clear();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.evidence_window_activation_generation = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.evidence_window_activation_generation = 17;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.baseline_evidence_cutoff =
+            invalid.current_evidence_cutoff + 1;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.current_evidence_cutoff =
+            invalid.baseline_evidence_cutoff;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.command_payload_digest.reset();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.winning_activation.reset();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.reason =
+            AdaptiveV2ManagerCycleTerminalReason::caller_failed;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.winning_activation->successor_epoch_digest =
+            digest("wrong-session-terminal-successor");
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.predecessor_epoch_number =
+            std::numeric_limits<std::uint32_t>::max();
+        invalid.successor_epoch_number = 0;
+        CHECK(rejects(manager_event_config(), invalid));
     }
 }
 

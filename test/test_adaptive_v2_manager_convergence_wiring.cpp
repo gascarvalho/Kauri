@@ -158,6 +158,16 @@ std::string without_whitespace(const std::string &contents)
     return result;
 }
 
+bool owns_manager_session(const std::string &manager)
+{
+    const auto compact = without_whitespace(manager);
+    return compact.find("AdaptiveV2ManagerSessionsession_") !=
+               std::string::npos &&
+           compact.find(
+               "AdaptiveV2ManagerRequestSequencerequest_sequence_") !=
+               std::string::npos;
+}
+
 double numeric_constant(
     const std::string &contents,
     const std::string &name)
@@ -181,22 +191,39 @@ TEST_CASE(
     const auto manager = code_without_comments_or_literals(raw_manager);
     const auto compact = without_whitespace(manager);
 
-    CHECK(raw_manager.find("adaptive_v2_manager_convergence.h") !=
-          std::string::npos);
-    CHECK(count_occurrences(
-              manager, "controller_.successor_bundle()") == 1);
-    CHECK(contains_in_order(
-        manager,
-        {"controller_.successor_bundle()",
-         "AdaptiveV2ManagerConvergenceConfig",
-         "membership",
-         "retry_interval_ticks",
-         "maximum_attempts_per_recipient",
-         "convergence_deadline_tick",
-         "AdaptiveV2ManagerConvergence"}));
-    CHECK(compact.find(
-              "AdaptiveV2ManagerConvergence>(*bundle,") !=
-          std::string::npos);
+    if (owns_manager_session(manager))
+    {
+        CHECK(raw_manager.find("adaptive_v2_manager_session.h") !=
+              std::string::npos);
+        CHECK(count_occurrences(
+                  manager, "session_.successor_bundle()") == 1);
+        CHECK(contains_in_order(
+            manager,
+            {"session_.successor_bundle()",
+             "write_exclusive_bundle(",
+             "session_.start_convergence(",
+             "session_.due_deliveries(",
+             "session_.record_enqueue_result("}));
+    }
+    else
+    {
+        CHECK(raw_manager.find("adaptive_v2_manager_convergence.h") !=
+              std::string::npos);
+        CHECK(count_occurrences(
+                  manager, "controller_.successor_bundle()") == 1);
+        CHECK(contains_in_order(
+            manager,
+            {"controller_.successor_bundle()",
+             "AdaptiveV2ManagerConvergenceConfig",
+             "membership",
+             "retry_interval_ticks",
+             "maximum_attempts_per_recipient",
+             "convergence_deadline_tick",
+             "AdaptiveV2ManagerConvergence"}));
+        CHECK(compact.find(
+                  "AdaptiveV2ManagerConvergence>(*bundle,") !=
+              std::string::npos);
+    }
 
     CHECK(count_occurrences(manager, "TimerEvent") >= 3);
     CHECK(manager.find("convergence_timer") != std::string::npos);
@@ -313,7 +340,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "manager remains advisory below Q and terminates only on convergence or failure",
+    "manager remains advisory below Q and advances only on convergence or failure",
     "[adaptive-v2][convergence][c6][manager][terminal][no-epoch2][wiring]")
 {
     const auto manager = code_without_comments_or_literals(
@@ -321,16 +348,45 @@ TEST_CASE(
     const auto run = function_body(manager, "int run()");
     REQUIRE_FALSE(run.empty());
 
-    CHECK(count_occurrences(
-              manager, "consume_ready_for_optimization(") == 1);
-    CHECK(contains_in_order(
-        manager,
-        {"AdaptiveV2ManagerConvergenceStatus::awaiting_activations",
-         "return",
-         "AdaptiveV2ManagerConvergenceStatus::ready_for_optimization",
-         "consume_ready_for_optimization(",
-         "convergence_succeeded_",
-         "event_context_.stop()"}));
+    if (owns_manager_session(manager))
+    {
+        CHECK(count_occurrences(
+                  manager, "session_.consume_ready_and_rotate(") == 1);
+        CHECK(contains_in_order(
+            manager,
+            {"AdaptiveV2ManagerConvergenceStatus::awaiting_activations",
+             "return",
+             "AdaptiveV2ManagerConvergenceStatus::ready_for_optimization",
+             "session_.consume_ready_and_rotate(",
+             "request_sequence_.observe_terminal_records(",
+             "request_sequence_.shutdown_eligible()"}));
+        CHECK(manager.find("session_.begin_cycle(") !=
+              std::string::npos);
+        CHECK(manager.find("request_sequence_.current_policy()") !=
+              std::string::npos);
+    }
+    else
+    {
+        CHECK(count_occurrences(
+                  manager, "consume_ready_for_optimization(") == 1);
+        CHECK(contains_in_order(
+            manager,
+            {"AdaptiveV2ManagerConvergenceStatus::awaiting_activations",
+             "return",
+             "AdaptiveV2ManagerConvergenceStatus::ready_for_optimization",
+             "consume_ready_for_optimization(",
+             "convergence_succeeded_",
+             "event_context_.stop()"}));
+        const auto ready =
+            manager.find("consume_ready_for_optimization(");
+        REQUIRE(ready != std::string::npos);
+        CHECK(manager.find("controller_.evaluate()", ready) ==
+              std::string::npos);
+        CHECK(count_occurrences(
+                  manager, "controller_.successor_bundle()") == 1);
+        CHECK(run.find("convergence_succeeded_") !=
+              std::string::npos);
+    }
     CHECK(manager.find(
               "AdaptiveV2ManagerConvergenceStatus::retry_exhausted") !=
           std::string::npos);
@@ -338,14 +394,6 @@ TEST_CASE(
               "AdaptiveV2ManagerConvergenceStatus::conflicting_observation") !=
           std::string::npos);
     CHECK(manager.find("fail(") != std::string::npos);
-    CHECK(run.find("convergence_succeeded_") != std::string::npos);
-
-    const auto ready = manager.find("consume_ready_for_optimization(");
-    REQUIRE(ready != std::string::npos);
-    CHECK(manager.find("controller_.evaluate()", ready) ==
-          std::string::npos);
-    CHECK(count_occurrences(
-              manager, "controller_.successor_bundle()") == 1);
     CHECK(manager.find("build_adaptive_v2_successor_bundle(") ==
           std::string::npos);
 }
@@ -431,10 +479,23 @@ TEST_CASE(
           std::string::npos);
     CHECK(manager.find("kConvergenceDefaultDeadlineTicks = 120") !=
           std::string::npos);
-    CHECK(compact.find(
-              "convergence_config.convergence_deadline_tick="
-              "convergence_tick_+options_.convergence_deadline_ticks") !=
-          std::string::npos);
+    if (owns_manager_session(code_without_comments_or_literals(manager)))
+    {
+        CHECK(compact.find(
+                  "config.convergence_window_ticks="
+                  "options.convergence_deadline_ticks") !=
+              std::string::npos);
+        CHECK(compact.find(
+                  "session_.start_convergence(convergence_tick_)") !=
+              std::string::npos);
+    }
+    else
+    {
+        CHECK(compact.find(
+                  "convergence_config.convergence_deadline_tick="
+                  "convergence_tick_+options_.convergence_deadline_ticks") !=
+              std::string::npos);
+    }
 }
 
 TEST_CASE(
@@ -457,11 +518,23 @@ TEST_CASE(
               "*options_.experiment_drop_activation_ack=="
               "accepted_activation_ack_ordinal_") !=
           std::string::npos);
-    CHECK(compact.find(
-              "convergence_->status()=="
-              "AdaptiveV2ManagerConvergenceStatus::"
-              "ready_for_optimization") !=
-          std::string::npos);
+    if (owns_manager_session(manager))
+    {
+        CHECK(compact.find(
+                  "session_.convergence_status()=="
+                  "std::optional<AdaptiveV2ManagerConvergenceStatus>{"
+                  "AdaptiveV2ManagerConvergenceStatus::"
+                  "ready_for_optimization}") !=
+              std::string::npos);
+    }
+    else
+    {
+        CHECK(compact.find(
+                  "convergence_->status()=="
+                  "AdaptiveV2ManagerConvergenceStatus::"
+                  "ready_for_optimization") !=
+              std::string::npos);
+    }
     CHECK(raw_manager.find(
               "experiment activation ACK ordinal must equal quorum") !=
           std::string::npos);
@@ -536,15 +609,35 @@ TEST_CASE(
         manager, "void handle_convergence_status()");
     REQUIRE_FALSE(status.empty());
 
-    CHECK(count_occurrences(status, "winning_identity()") >= 1);
-    CHECK(contains_in_order(
-        status,
-        {"winning_identity()",
-         "AdaptiveV2ConvergenceTransition::converged",
-         "winning_identity",
-         "consume_ready_for_optimization(",
-         "AdaptiveV2ConvergenceTransition::ready",
-         "winning_identity"}));
+    if (owns_manager_session(manager))
+    {
+        CHECK(status.find("session_.convergence_audit()") !=
+              std::string::npos);
+        CHECK(contains_in_order(
+            status,
+            {"convergence->winning_identity",
+             "AdaptiveV2ConvergenceTransition::converged",
+             "convergence->winning_identity",
+             "AdaptiveV2ConvergenceTransition::ready",
+             "convergence->winning_identity",
+             "begin_convergence_ack_drain()"}));
+        const auto drain = function_body(
+            manager, "void begin_convergence_ack_drain()");
+        CHECK(drain.find("session_.consume_ready_and_rotate(") !=
+              std::string::npos);
+    }
+    else
+    {
+        CHECK(count_occurrences(status, "winning_identity()") >= 1);
+        CHECK(contains_in_order(
+            status,
+            {"winning_identity()",
+             "AdaptiveV2ConvergenceTransition::converged",
+             "winning_identity",
+             "consume_ready_for_optimization(",
+             "AdaptiveV2ConvergenceTransition::ready",
+             "winning_identity"}));
+    }
 }
 
 TEST_CASE(
@@ -595,4 +688,360 @@ TEST_CASE(
     REQUIRE_FALSE(drive.empty());
     CHECK(drive.find("enqueued") != std::string::npos);
     CHECK(drive.find("enqueue_failed") != std::string::npos);
+}
+
+TEST_CASE(
+    "manager owns one recurring session and emits transition terminal proof",
+    "[adaptive-v2][manager][session][request-sequence][wiring]"
+    "[structured-event][intentional-red]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+    const auto compact = without_whitespace(manager);
+
+    const bool owns_session =
+        compact.find("AdaptiveV2ManagerSessionsession_") !=
+        std::string::npos;
+    const bool owns_request_sequence =
+        compact.find("AdaptiveV2ManagerRequestSequencerequest_sequence_") !=
+        std::string::npos;
+    if (!owns_session || !owns_request_sequence)
+    {
+        FAIL(
+            "M12-R02 RED: the manager example must own one "
+            "AdaptiveV2ManagerSession and one "
+            "AdaptiveV2ManagerRequestSequence");
+    }
+
+    CHECK(compact.find("AdaptiveV2ManagerIngressingress_") ==
+          std::string::npos);
+    CHECK(compact.find("AdaptiveV2ManagerControllercontroller_") ==
+          std::string::npos);
+    CHECK(compact.find(
+              "unique_ptr<AdaptiveV2ManagerConvergence>convergence_") ==
+          std::string::npos);
+
+    for (const auto *seam : {
+             "session_.ingest_readiness(",
+             "session_.ingest_lifecycle(",
+             "session_.ingest_evidence(",
+             "session_.evaluate(",
+             "session_.successor_bundle(",
+             "session_.start_convergence(",
+             "session_.due_deliveries(",
+             "session_.record_enqueue_result(",
+             "session_.observe_commit(",
+             "session_.observe_activation(",
+             "session_.convergence_status(",
+             "session_.consume_ready_and_rotate(",
+             "session_.shutdown("})
+    {
+        CAPTURE(seam);
+        CHECK(manager.find(seam) != std::string::npos);
+    }
+
+    CHECK(manager.find("request_sequence_.current_policy()") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "request_sequence_.observe_terminal_records(") !=
+          std::string::npos);
+    CHECK(manager.find("request_sequence_.shutdown_eligible()") !=
+          std::string::npos);
+
+    const auto drain = function_body(
+        manager, "void begin_convergence_ack_drain()");
+    REQUIRE_FALSE(drain.empty());
+    CHECK(contains_in_order(
+        drain,
+        {"session_.consume_ready_and_rotate(",
+         "request_sequence_.observe_terminal_records(",
+         "request_sequence_.shutdown_eligible()",
+         "event_context_.stop()"}));
+    CHECK(drain.find("schedule_current_predecessor_residency(") !=
+          std::string::npos);
+
+    const auto output_path = function_body(
+        manager, "std::string transition_bundle_output_path(");
+    REQUIRE_FALSE(output_path.empty());
+    CHECK(output_path.find("bundle_output") != std::string::npos);
+    CHECK(output_path.find("successor_epoch_number") !=
+          std::string::npos);
+    CHECK(output_path.find("successor_epoch_digest") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "write_exclusive_bundle(options_.bundle_output,") ==
+          std::string::npos);
+    CHECK(manager.find("write_exclusive_bundle(") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "request.evidence_snapshot_output =") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "request.evidence_snapshot_path") !=
+          std::string::npos);
+    CHECK(manager.find("exclusive_artifact_outputs") !=
+          std::string::npos);
+
+    const auto snapshot = function_body(
+        manager, "void emit_evidence_snapshot(");
+    REQUIRE_FALSE(snapshot.empty());
+    CHECK(contains_in_order(
+        snapshot,
+        {"session_.ingress()",
+         "ledger.accepted()",
+         "bundle.definition().trees",
+         "serialize_adaptive_v2_evidence_snapshot_payload(",
+         "structured_event_sink_.emit_audit(",
+         "structured_event_sink_.health()",
+         "write_exclusive_json("}));
+    CHECK(snapshot.find("record.ingestion_sequence >") !=
+          std::string::npos);
+    CHECK(snapshot.find("observation.configuration.epoch_number") !=
+          std::string::npos);
+    CHECK(snapshot.find("observation.configuration.epoch_digest") !=
+          std::string::npos);
+    CHECK(snapshot.find("tree.members_breadth_first.front()") !=
+          std::string::npos);
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(evaluate.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"session_.successor_bundle()",
+         "write_exclusive_bundle(",
+         "emit_evidence_snapshot(",
+         "session_.start_convergence("}));
+
+    const auto exclusive_json = function_body(
+        manager, "void write_exclusive_json(");
+    REQUIRE_FALSE(exclusive_json.empty());
+    CHECK(exclusive_json.find("O_EXCL") != std::string::npos);
+    CHECK(exclusive_json.find("O_NOFOLLOW") != std::string::npos);
+    CHECK(exclusive_json.find("fsync(") != std::string::npos);
+    CHECK(exclusive_json.find("unlink(") != std::string::npos);
+
+    const auto root_validation = function_body(
+        manager, "bool transition_policy_matches_current_roots(");
+    REQUIRE_FALSE(root_validation.empty());
+    CHECK(contains_in_order(
+        root_validation,
+        {"current_epoch().trees()",
+         "candidate.tree_id == root.tree_id",
+         "tree->members_breadth_first.front()",
+         "root.replica_id"}));
+    CHECK(root_validation.find(
+              "containment_baseline_roots.size()") ==
+          std::string::npos);
+    const auto cycle_context = function_body(
+        manager, "bool add_cycle_audit_context()");
+    REQUIRE_FALSE(cycle_context.empty());
+    CHECK(cycle_context.find(
+              "transition_policy_matches_current_roots(") !=
+          std::string::npos);
+
+    const auto header = code_without_comments_or_literals(
+        source("include/hotstuff/structured_event.h"));
+    const auto implementation =
+        source("src/structured_event.cpp");
+    CHECK(header.find(
+              "AdaptiveV2ManagerSessionTerminalStructuredEvent") !=
+          std::string::npos);
+    CHECK(implementation.find("adaptive_v2_session_terminal") !=
+          std::string::npos);
+    CHECK(header.find(
+              "AdaptiveV2EvidenceSnapshotStructuredEvent") !=
+          std::string::npos);
+    CHECK(header.find(
+              "serialize_adaptive_v2_evidence_snapshot_payload") !=
+          std::string::npos);
+    CHECK(implementation.find("adaptive_v2_evidence_snapshot") !=
+          std::string::npos);
+
+    const auto emit_terminals = function_body(
+        manager, "void emit_new_session_terminals()");
+    REQUIRE_FALSE(emit_terminals.empty());
+    CHECK(contains_in_order(
+        emit_terminals,
+        {"try",
+         "session_.terminal_records()",
+         "AdaptiveV2ManagerSessionTerminalStructuredEvent",
+         "emit_audit(",
+         "catch (...)"}));
+    CHECK(contains_in_order(
+        emit_terminals,
+        {"catch (...)", "failed_ = true", "event_context_.stop()"}));
+    CHECK(manager.find("AdaptiveV2ConvergenceTransition::ready") !=
+          std::string::npos);
+}
+
+TEST_CASE(
+    "recurring manager delays each rotated predecessor by its explicit residency",
+    "[adaptive-v2][manager][session][residency][timer][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    REQUIRE(owns_manager_session(manager));
+
+    CHECK(manager.find("minimum_predecessor_residency_ms") !=
+          std::string::npos);
+    CHECK(manager.find("kMaximumPredecessorResidencyMs") !=
+          std::string::npos);
+    CHECK(manager.find("predecessor_residency_timer") !=
+          std::string::npos);
+    CHECK(manager.find("predecessor_residency_pending_") !=
+          std::string::npos);
+
+    const auto drain = function_body(
+        manager, "void begin_convergence_ack_drain()");
+    REQUIRE_FALSE(drain.empty());
+    CHECK(contains_in_order(
+        drain,
+        {"session_.consume_ready_and_rotate(",
+         "request_sequence_.observe_terminal_records(",
+         "request_sequence_.shutdown_eligible()",
+         "schedule_current_predecessor_residency("}));
+
+    const auto schedule = function_body(
+        manager,
+        "bool schedule_current_predecessor_residency() noexcept");
+    REQUIRE_FALSE(schedule.empty());
+    CHECK(contains_in_order(
+        schedule,
+        {"current_transition_request()",
+         "minimum_predecessor_residency_ms",
+         "predecessor_residency_deadline_",
+         "predecessor_residency_pending_ = true",
+         "predecessor_residency_timer.add("}));
+
+    const auto fire = function_body(
+        manager,
+        "void handle_predecessor_residency_timer() noexcept");
+    REQUIRE_FALSE(fire.empty());
+    CHECK(contains_in_order(
+        fire,
+        {"steady_clock::now()",
+         "now < predecessor_residency_deadline_",
+         "predecessor_residency_timer.add(",
+         "return",
+         "predecessor_residency_pending_ = false",
+         "begin_current_cycle()",
+         "evaluate()"}));
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(evaluate.empty());
+    CHECK(evaluate.find("predecessor_residency_pending_") !=
+          std::string::npos);
+
+    const auto stop = function_body(manager, "void stop_runtime()");
+    REQUIRE_FALSE(stop.empty());
+    CHECK(stop.find("predecessor_residency_timer.del()") !=
+          std::string::npos);
+    CHECK(count_occurrences(
+              manager,
+              "schedule_current_predecessor_residency()") == 2);
+
+    const auto parse_options = function_body(
+        manager, "ManagerOptions parse_options(");
+    REQUIRE_FALSE(parse_options.empty());
+    const auto first_request = parse_options.find(
+        "options.transition_requests.empty()");
+    const auto first_residency = parse_options.find(
+        "request.minimum_predecessor_residency_ms", first_request);
+    const auto append_request = parse_options.find(
+        "options.transition_requests.push_back", first_request);
+    REQUIRE(first_request != std::string::npos);
+    REQUIRE(first_residency != std::string::npos);
+    REQUIRE(append_request != std::string::npos);
+    CHECK(first_request < first_residency);
+    CHECK(first_residency < append_request);
+}
+
+TEST_CASE(
+    "recurring session preserves terminal failure audit rollback and timer rearm",
+    "[adaptive-v2][manager][session][failure][timer][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    REQUIRE(owns_manager_session(manager));
+
+    const auto status = function_body(
+        manager, "void handle_convergence_status()");
+    const auto drain = function_body(
+        manager, "void begin_convergence_ack_drain()");
+    const auto drive = function_body(
+        manager, "void drive_convergence()");
+    const auto begin_cycle = function_body(
+        manager, "bool begin_current_cycle()");
+    const auto schedule_residency = function_body(
+        manager, "bool schedule_current_predecessor_residency()");
+    REQUIRE_FALSE(status.empty());
+    REQUIRE_FALSE(drain.empty());
+    REQUIRE_FALSE(drive.empty());
+    REQUIRE_FALSE(begin_cycle.empty());
+    REQUIRE_FALSE(schedule_residency.empty());
+
+    CHECK(contains_in_order(
+        status,
+        {"session_.terminal_records()",
+         "convergence_retry_exhausted",
+         "AdaptiveV2ConvergenceTransition::failure",
+         "emit_new_session_terminals()"}));
+    CHECK(contains_in_order(
+        begin_cycle,
+        {"add_cycle_audit_context()",
+         "session_.begin_cycle(",
+         "cycle_audits_.pop_back()"}));
+    CHECK(contains_in_order(
+        schedule_residency,
+        {"begin_current_cycle()", "evaluate()"}));
+    CHECK(contains_in_order(
+        manager,
+        {"session_.start_convergence(",
+         "drive_convergence()",
+         "session_.due_deliveries(",
+         "convergence_timer.add("}));
+}
+
+TEST_CASE(
+    "final recurring ACK drain ignores ordinary ingress without disabling duplicates",
+    "[adaptive-v2][manager][session][recurring][final-drain][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    REQUIRE(owns_manager_session(manager));
+
+    const auto ingest = function_body(manager, "void ingest(");
+    const auto evaluate = function_body(manager, "void evaluate()");
+    const auto drain = function_body(
+        manager, "void begin_convergence_ack_drain()");
+    REQUIRE_FALSE(ingest.empty());
+    REQUIRE_FALSE(evaluate.empty());
+    REQUIRE_FALSE(drain.empty());
+
+    const auto ingest_complete = ingest.find(
+        "request_sequence_.shutdown_eligible()");
+    const auto ingest_operation = ingest.find("operation(");
+    const auto ingest_evaluate = ingest.find("evaluate()");
+    REQUIRE(ingest_complete != std::string::npos);
+    REQUIRE(ingest_operation != std::string::npos);
+    REQUIRE(ingest_evaluate != std::string::npos);
+    CHECK(ingest_complete < ingest_operation);
+    CHECK(ingest_complete < ingest_evaluate);
+
+    const auto evaluate_complete = evaluate.find(
+        "request_sequence_.shutdown_eligible()");
+    const auto session_evaluate = evaluate.find("session_.evaluate()");
+    REQUIRE(evaluate_complete != std::string::npos);
+    REQUIRE(session_evaluate != std::string::npos);
+    CHECK(evaluate_complete < session_evaluate);
+
+    CHECK(contains_in_order(
+        drain,
+        {"request_sequence_.shutdown_eligible()",
+         "convergence_ack_drain_timer",
+         "event_context_.stop()"}));
+    CHECK(manager.find("session_.observe_commit(") !=
+          std::string::npos);
+    CHECK(manager.find("session_.observe_activation(") !=
+          std::string::npos);
 }

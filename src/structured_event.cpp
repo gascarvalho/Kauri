@@ -1,4 +1,5 @@
 #include "hotstuff/structured_event.h"
+#include "hotstuff/epoch_activation.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -133,6 +134,11 @@ public:
     std::string finish()
     {
         append('\n');
+        return std::move(value_);
+    }
+
+    std::string finish_value()
+    {
         return std::move(value_);
     }
 
@@ -372,9 +378,71 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
             return convergence_payload_type(
                 std::get<AdaptiveV2ConvergenceStructuredEvent>(payload),
                 type);
+        case 3:
+            type = StructuredEventType::adaptive_v2_evidence_snapshot;
+            return true;
+        case 4:
+            type = StructuredEventType::adaptive_v2_session_terminal;
+            return true;
         default:
             return false;
     }
+}
+
+const char *tree_policy_kind_name(TreePolicyKind policy) noexcept
+{
+    switch (policy)
+    {
+        case TreePolicyKind::fault_containment:
+            return "fault_containment";
+        case TreePolicyKind::performance_optimization:
+            return "performance_optimization";
+    }
+    return nullptr;
+}
+
+const char *manager_cycle_outcome_name(
+    AdaptiveV2ManagerCycleOutcome outcome) noexcept
+{
+    switch (outcome)
+    {
+        case AdaptiveV2ManagerCycleOutcome::advanced:
+            return "advanced";
+        case AdaptiveV2ManagerCycleOutcome::no_op:
+            return "no_op";
+        case AdaptiveV2ManagerCycleOutcome::failed:
+            return "failed";
+    }
+    return nullptr;
+}
+
+const char *manager_cycle_reason_name(
+    AdaptiveV2ManagerCycleTerminalReason reason) noexcept
+{
+    switch (reason)
+    {
+        case AdaptiveV2ManagerCycleTerminalReason::successor_converged:
+            return "successor_converged";
+        case AdaptiveV2ManagerCycleTerminalReason::explicit_no_op:
+            return "explicit_no_op";
+        case AdaptiveV2ManagerCycleTerminalReason::controller_unhealthy:
+            return "controller_unhealthy";
+        case AdaptiveV2ManagerCycleTerminalReason::convergence_start_failed:
+            return "convergence_start_failed";
+        case AdaptiveV2ManagerCycleTerminalReason::convergence_retry_exhausted:
+            return "convergence_retry_exhausted";
+        case AdaptiveV2ManagerCycleTerminalReason::convergence_conflicting_observation:
+            return "convergence_conflicting_observation";
+        case AdaptiveV2ManagerCycleTerminalReason::invalid_terminal_identity:
+            return "invalid_terminal_identity";
+        case AdaptiveV2ManagerCycleTerminalReason::successor_rotation_failed:
+            return "successor_rotation_failed";
+        case AdaptiveV2ManagerCycleTerminalReason::evidence_window_reset_failed:
+            return "evidence_window_reset_failed";
+        case AdaptiveV2ManagerCycleTerminalReason::caller_failed:
+            return "caller_failed";
+    }
+    return nullptr;
 }
 
 const char *response_outcome_name(ResponseOutcome outcome) noexcept
@@ -586,6 +654,181 @@ bool valid_convergence_payload(
     return false;
 }
 
+bool valid_evidence_snapshot_payload(
+    const AdaptiveV2EvidenceSnapshotStructuredEvent &event) noexcept
+{
+    if (event.activation_generation == 0)
+        return false;
+    const auto packed_generation = event.activation_generation - 1;
+    const auto rotation_ordinal = static_cast<std::uint32_t>(
+        packed_generation & std::numeric_limits<std::uint32_t>::max());
+    const auto expected_generation = checked_activation_generation(
+        event.predecessor_epoch_number, rotation_ordinal);
+    if (tree_policy_kind_name(event.policy_intent) == nullptr ||
+        event.transition_artifact_id.empty() ||
+        !valid_utf8(event.transition_artifact_id) ||
+        event.predecessor_epoch_digest == uint256_t{} ||
+        !expected_generation.has_value() ||
+        event.activation_generation != *expected_generation ||
+        event.baseline_cutoff == 0 ||
+        event.current_cutoff <= event.baseline_cutoff ||
+        event.observations.empty() ||
+        event.observations.size() >
+            kMaximumAdaptationEvidenceRecords ||
+        event.eligible_ranking.empty() ||
+        event.eligible_ranking.size() > kMaximumTreePolicyTrees)
+    {
+        return false;
+    }
+
+    bool has_post_baseline_observation = false;
+    std::uint64_t previous_ingestion_sequence = 0;
+    for (const auto &observation : event.observations)
+    {
+        if (observation.observation_id == uint256_t{} ||
+            observation.ingestion_sequence == 0 ||
+            observation.ingestion_sequence <=
+                previous_ingestion_sequence ||
+            observation.ingestion_sequence > event.current_cutoff ||
+            observation.epoch_number !=
+                event.predecessor_epoch_number ||
+            observation.epoch_digest !=
+                event.predecessor_epoch_digest ||
+            observation.reporter_id == observation.target_id ||
+            response_outcome_name(observation.outcome) == nullptr ||
+            (observation.latency_ns.has_value() &&
+             *observation.latency_ns == 0) ||
+            (observation.outcome == ResponseOutcome::timeout &&
+             observation.latency_ns.has_value()) ||
+            (observation.outcome == ResponseOutcome::late &&
+             !observation.latency_ns.has_value()))
+        {
+            return false;
+        }
+        previous_ingestion_sequence =
+            observation.ingestion_sequence;
+        has_post_baseline_observation =
+            has_post_baseline_observation ||
+            observation.ingestion_sequence > event.baseline_cutoff;
+    }
+    if (!has_post_baseline_observation)
+        return false;
+
+    for (std::size_t index = 0;
+         index < event.eligible_ranking.size();
+         ++index)
+    {
+        if (std::find(
+                event.eligible_ranking.begin(),
+                event.eligible_ranking.begin() + index,
+                event.eligible_ranking[index]) !=
+            event.eligible_ranking.begin() + index)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool valid_manager_session_terminal_payload(
+    const AdaptiveV2ManagerSessionTerminalStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    if (event.evidence_window_activation_generation == 0)
+        return false;
+    const auto packed_generation =
+        event.evidence_window_activation_generation - 1;
+    const auto rotation_ordinal = static_cast<std::uint32_t>(
+        packed_generation & std::numeric_limits<std::uint32_t>::max());
+    const auto expected_generation = checked_activation_generation(
+        event.predecessor_epoch_number, rotation_ordinal);
+    if (config.source.kind !=
+            StructuredEventSourceKind::adaptation_manager ||
+        tree_policy_kind_name(event.policy_intent) == nullptr ||
+        manager_cycle_outcome_name(event.outcome) == nullptr ||
+        manager_cycle_reason_name(event.reason) == nullptr ||
+        event.transition_artifact_id.empty() ||
+        !valid_utf8(event.transition_artifact_id) ||
+        event.transition_artifact_id.size() >
+            config.limits.maximum_identity_bytes ||
+        event.predecessor_epoch_digest == uint256_t{} ||
+        !expected_generation.has_value() ||
+        event.evidence_window_activation_generation !=
+            *expected_generation ||
+        event.baseline_evidence_cutoff > event.current_evidence_cutoff)
+    {
+        return false;
+    }
+
+    const bool has_successor =
+        event.successor_epoch_number.has_value() &&
+        event.successor_epoch_digest.has_value() &&
+        event.command_payload_digest.has_value();
+    const bool has_partial_successor =
+        event.successor_epoch_number.has_value() ||
+        event.successor_epoch_digest.has_value() ||
+        event.command_payload_digest.has_value();
+    if (has_partial_successor != has_successor ||
+        (event.successor_epoch_digest.has_value() &&
+         *event.successor_epoch_digest == uint256_t{}) ||
+        (event.command_payload_digest.has_value() &&
+         *event.command_payload_digest == uint256_t{}))
+    {
+        return false;
+    }
+
+    if (has_successor &&
+        (event.predecessor_epoch_number ==
+             std::numeric_limits<std::uint32_t>::max() ||
+         *event.successor_epoch_number !=
+             event.predecessor_epoch_number + 1 ||
+         *event.successor_epoch_digest ==
+             event.predecessor_epoch_digest))
+    {
+        return false;
+    }
+
+    if (event.winning_activation.has_value())
+    {
+        const auto &identity = *event.winning_activation;
+        if (!has_successor || !valid_convergence_identity(identity) ||
+            identity.predecessor_epoch_number !=
+                event.predecessor_epoch_number ||
+            identity.predecessor_epoch_digest !=
+                event.predecessor_epoch_digest ||
+            identity.successor_epoch_number !=
+                *event.successor_epoch_number ||
+            identity.successor_epoch_digest !=
+                *event.successor_epoch_digest ||
+            identity.command_payload_digest !=
+                *event.command_payload_digest)
+        {
+            return false;
+        }
+    }
+
+    switch (event.outcome)
+    {
+        case AdaptiveV2ManagerCycleOutcome::advanced:
+            return event.reason ==
+                    AdaptiveV2ManagerCycleTerminalReason::successor_converged &&
+                has_successor && event.winning_activation.has_value() &&
+                event.baseline_evidence_cutoff != 0 &&
+                event.current_evidence_cutoff >
+                    event.baseline_evidence_cutoff;
+        case AdaptiveV2ManagerCycleOutcome::no_op:
+            return event.reason ==
+                    AdaptiveV2ManagerCycleTerminalReason::explicit_no_op &&
+                !has_successor && !event.winning_activation.has_value();
+        case AdaptiveV2ManagerCycleOutcome::failed:
+            return event.reason !=
+                    AdaptiveV2ManagerCycleTerminalReason::successor_converged &&
+                event.reason !=
+                    AdaptiveV2ManagerCycleTerminalReason::explicit_no_op;
+    }
+    return false;
+}
+
 bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                          const StructuredEventConfig &config) noexcept
 {
@@ -602,6 +845,22 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
         case 2:
             return valid_convergence_payload(
                 std::get<AdaptiveV2ConvergenceStructuredEvent>(payload),
+                config);
+        case 3:
+            return config.source.kind ==
+                    StructuredEventSourceKind::adaptation_manager &&
+                std::get<AdaptiveV2EvidenceSnapshotStructuredEvent>(
+                    payload).transition_artifact_id.size() <=
+                    config.limits.maximum_identity_bytes &&
+                valid_evidence_snapshot_payload(
+                    std::get<
+                        AdaptiveV2EvidenceSnapshotStructuredEvent>(
+                            payload));
+        case 4:
+            return valid_manager_session_terminal_payload(
+                std::get<
+                    AdaptiveV2ManagerSessionTerminalStructuredEvent>(
+                        payload),
                 config);
         default:
             return false;
@@ -912,6 +1171,66 @@ void append_reputation_payload(
     builder.append('}');
 }
 
+void append_evidence_snapshot_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2EvidenceSnapshotStructuredEvent &event)
+{
+    builder.append("{\"cycle_ordinal\":");
+    builder.append_integer(event.cycle_ordinal);
+    builder.append(",\"policy_intent\":");
+    builder.append_escaped(tree_policy_kind_name(event.policy_intent));
+    builder.append(",\"transition_artifact_id\":");
+    builder.append_escaped(event.transition_artifact_id);
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(event.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(event.predecessor_epoch_digest.to_hex());
+    builder.append(",\"activation_generation\":");
+    builder.append_integer(event.activation_generation);
+    builder.append(",\"baseline_cutoff\":");
+    builder.append_integer(event.baseline_cutoff);
+    builder.append(",\"current_cutoff\":");
+    builder.append_integer(event.current_cutoff);
+    builder.append(",\"observations\":[");
+    bool first = true;
+    for (const auto &observation : event.observations)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append("{\"observation_id\":");
+        builder.append_escaped(observation.observation_id.to_hex());
+        builder.append(",\"ingestion_sequence\":");
+        builder.append_integer(observation.ingestion_sequence);
+        builder.append(",\"epoch_number\":");
+        builder.append_integer(observation.epoch_number);
+        builder.append(",\"epoch_digest\":");
+        builder.append_escaped(observation.epoch_digest.to_hex());
+        builder.append(",\"reporter_id\":");
+        builder.append_integer(observation.reporter_id);
+        builder.append(",\"target_id\":");
+        builder.append_integer(observation.target_id);
+        builder.append(",\"outcome\":");
+        builder.append_escaped(response_outcome_name(observation.outcome));
+        if (observation.latency_ns.has_value())
+        {
+            builder.append(",\"latency_ns\":");
+            builder.append_integer(*observation.latency_ns);
+        }
+        builder.append('}');
+        first = false;
+    }
+    builder.append("],\"eligible_ranking\":[");
+    first = true;
+    for (const auto replica : event.eligible_ranking)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append_integer(replica);
+        first = false;
+    }
+    builder.append("]}");
+}
+
 void append_convergence_identity(
     JsonLineBuilder &builder,
     const AdaptiveV2EpochChangeIdentity &identity)
@@ -978,6 +1297,53 @@ void append_convergence_payload(
         builder.append("null");
     else
         builder.append_escaped(event.failure_reason);
+    builder.append('}');
+}
+
+void append_manager_session_terminal_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2ManagerSessionTerminalStructuredEvent &event)
+{
+    builder.append("{\"cycle_ordinal\":");
+    builder.append_integer(event.cycle_ordinal);
+    builder.append(",\"policy_intent\":");
+    builder.append_escaped(tree_policy_kind_name(event.policy_intent));
+    builder.append(",\"outcome\":");
+    builder.append_escaped(manager_cycle_outcome_name(event.outcome));
+    builder.append(",\"reason\":");
+    builder.append_escaped(manager_cycle_reason_name(event.reason));
+    builder.append(",\"transition_artifact_id\":");
+    builder.append_escaped(event.transition_artifact_id);
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(event.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(event.predecessor_epoch_digest.to_hex());
+    builder.append(",\"successor_epoch_number\":");
+    if (event.successor_epoch_number.has_value())
+        builder.append_integer(*event.successor_epoch_number);
+    else
+        builder.append("null");
+    builder.append(",\"successor_epoch_digest\":");
+    if (event.successor_epoch_digest.has_value())
+        builder.append_escaped(event.successor_epoch_digest->to_hex());
+    else
+        builder.append("null");
+    builder.append(",\"command_payload_digest\":");
+    if (event.command_payload_digest.has_value())
+        builder.append_escaped(event.command_payload_digest->to_hex());
+    else
+        builder.append("null");
+    builder.append(",\"winning_activation\":");
+    if (event.winning_activation.has_value())
+        append_convergence_identity(builder, *event.winning_activation);
+    else
+        builder.append("null");
+    builder.append(",\"evidence_window_activation_generation\":");
+    builder.append_integer(event.evidence_window_activation_generation);
+    builder.append(",\"baseline_evidence_cutoff\":");
+    builder.append_integer(event.baseline_evidence_cutoff);
+    builder.append(",\"current_evidence_cutoff\":");
+    builder.append_integer(event.current_evidence_cutoff);
     builder.append('}');
 }
 
@@ -1166,6 +1532,21 @@ std::string serialize_audit_event(
             append_convergence_payload(
                 builder,
                 std::get<AdaptiveV2ConvergenceStructuredEvent>(event));
+            break;
+        case 3:
+            builder.append(
+                serialize_adaptive_v2_evidence_snapshot_payload(
+                    std::get<
+                        AdaptiveV2EvidenceSnapshotStructuredEvent>(
+                            event),
+                    config.limits.maximum_line_bytes));
+            break;
+        case 4:
+            append_manager_session_terminal_payload(
+                builder,
+                std::get<
+                    AdaptiveV2ManagerSessionTerminalStructuredEvent>(
+                        event));
             break;
         default:
             throw std::bad_variant_access{};
@@ -1535,6 +1916,29 @@ bool valid_json_record(const std::uint8_t *begin,
 
 } // namespace
 
+std::string serialize_adaptive_v2_evidence_snapshot_payload(
+    const AdaptiveV2EvidenceSnapshotStructuredEvent &event,
+    std::size_t maximum_bytes)
+{
+    if (maximum_bytes == 0 ||
+        !valid_evidence_snapshot_payload(event))
+    {
+        throw std::invalid_argument(
+            "invalid adaptive-v2 evidence snapshot payload");
+    }
+    try
+    {
+        JsonLineBuilder builder(maximum_bytes);
+        append_evidence_snapshot_payload(builder, event);
+        return builder.finish_value();
+    }
+    catch (const LineLimitExceeded &)
+    {
+        throw std::length_error(
+            "adaptive-v2 evidence snapshot payload exceeds its bound");
+    }
+}
+
 StructuredEventType structured_event_type(
     const StructuredEventPayload &payload) noexcept
 {
@@ -1605,6 +2009,10 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2_ready";
         case StructuredEventType::adaptive_v2_convergence_failure:
             return "adaptive_v2_convergence_failure";
+        case StructuredEventType::adaptive_v2_evidence_snapshot:
+            return "adaptive_v2_evidence_snapshot";
+        case StructuredEventType::adaptive_v2_session_terminal:
+            return "adaptive_v2_session_terminal";
         default:
             break;
     }

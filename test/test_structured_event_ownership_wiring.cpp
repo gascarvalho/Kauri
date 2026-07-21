@@ -536,13 +536,13 @@ TEST_CASE(
         const auto stop_context = stop_runtime.find(
             "event_context_.stop()");
         const auto network_stop = stop_runtime.find("network_.stop()");
-        const auto ingress_shutdown = stop_runtime.find(
-            "ingress_.shutdown()");
+        const auto session_shutdown = stop_runtime.find(
+            "session_.shutdown()");
         REQUIRE(stop_context != std::string::npos);
         REQUIRE(network_stop != std::string::npos);
-        REQUIRE(ingress_shutdown != std::string::npos);
+        REQUIRE(session_shutdown != std::string::npos);
         CHECK(stop_context < network_stop);
-        CHECK(network_stop < ingress_shutdown);
+        CHECK(network_stop < session_shutdown);
 
         const auto stop_required = run.find(
             "network_stop_required_ = true");
@@ -567,14 +567,22 @@ TEST_CASE(
 
     SECTION("score trajectory uses one monotonic emission cursor")
     {
+        const auto emit_trajectory = function_body(
+            manager, "void emit_new_score_trajectory() noexcept");
+        REQUIRE_FALSE(emit_trajectory.empty());
         CHECK(count_occurrences(
-                  manager, "controller_.score_trajectory()") == 1);
-        const auto trajectory = manager.find(
-            "controller_.score_trajectory()");
-        const auto reputation = manager.find(
+                  manager, "audit->score_trajectory") == 1);
+        CHECK(count_occurrences(
+                  emit_trajectory, "session_.controller_audit()") == 1);
+        CHECK(count_occurrences(
+                  emit_trajectory, "audit->score_trajectory") == 1);
+        const auto trajectory = emit_trajectory.find(
+            "audit->score_trajectory");
+        const auto reputation = emit_trajectory.find(
             "ReputationEvidenceAppliedStructuredEvent", trajectory);
-        const auto audit = manager.find("emit_audit(", trajectory);
-        const auto cursor = manager.find("emitted_score_trajectory_");
+        const auto audit = emit_trajectory.find("emit_audit(", trajectory);
+        const auto cursor = emit_trajectory.find(
+            "emitted_score_trajectory_");
         REQUIRE(trajectory != std::string::npos);
         REQUIRE(reputation != std::string::npos);
         REQUIRE(audit != std::string::npos);
@@ -582,17 +590,18 @@ TEST_CASE(
         CHECK(trajectory < reputation);
         CHECK(reputation < audit);
         CHECK(count_occurrences(
-                  manager, "emitted_score_trajectory_") >= 3);
+                  emit_trajectory, "emitted_score_trajectory_") >= 3);
 
-        const auto trajectory_window = manager.substr(
+        const auto trajectory_window = emit_trajectory.substr(
             trajectory,
-            std::min<std::size_t>(manager.size() - trajectory, 2400));
+            std::min<std::size_t>(
+                emit_trajectory.size() - trajectory, 2400));
         CHECK(trajectory_window.find("trajectory.size()") !=
               std::string::npos);
         CHECK(trajectory_window.find(
                   "trajectory[emitted_score_trajectory_]") !=
               std::string::npos);
-        CHECK(trajectory_window.find("controller_.current_cutoff()") !=
+        CHECK(trajectory_window.find("audit->current_cutoff") !=
               std::string::npos);
         const bool increments_cursor =
             trajectory_window.find("++emitted_score_trajectory_") !=
@@ -602,10 +611,12 @@ TEST_CASE(
         CHECK(increments_cursor);
 
         const auto controller_evaluate = evaluate.find(
-            "controller_.evaluate()");
+            "session_.evaluate()");
         const auto emit_new = evaluate.find("emit_new_score_trajectory(");
         const auto emit_short = evaluate.find("emit_score_trajectory(");
-        const auto direct = evaluate.find("controller_.score_trajectory()");
+        const auto direct = evaluate.find("audit->score_trajectory");
+        CHECK(count_occurrences(
+                  evaluate, "emit_new_score_trajectory();") == 1);
         const auto emission = std::min(
             direct,
             std::min(emit_new, emit_short));

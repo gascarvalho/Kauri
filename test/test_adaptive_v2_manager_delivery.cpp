@@ -90,20 +90,20 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "manager joins network workers before ingress shutdown",
+    "manager joins network workers before recurring session shutdown",
     "[adaptive-v2][manager-delivery][lifetime]")
 {
     const auto source = read_source("examples/adaptation_manager.cpp");
     const auto dispatch = source.find("event_context_.dispatch();");
     const auto network_stop = source.find("network_.stop();", dispatch);
-    const auto ingress_shutdown =
-        source.find("ingress_.shutdown();", dispatch);
+    const auto session_shutdown =
+        source.find("session_.shutdown();", dispatch);
 
     REQUIRE(dispatch != std::string::npos);
     REQUIRE(network_stop != std::string::npos);
-    REQUIRE(ingress_shutdown != std::string::npos);
+    REQUIRE(session_shutdown != std::string::npos);
     CHECK(dispatch < network_stop);
-    CHECK(network_stop < ingress_shutdown);
+    CHECK(network_stop < session_shutdown);
 }
 
 TEST_CASE(

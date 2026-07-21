@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "hotstuff/adaptive_v2_convergence_wire.h"
+#include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/configuration.h"
 #include "hotstuff/evidence_reputation.h"
 
@@ -151,6 +152,62 @@ struct AdaptiveV2ConvergenceStructuredEvent
     std::string failure_reason;
 };
 
+/** One accepted exact-predecessor observation in a manager evidence snapshot. */
+struct AdaptiveV2EvidenceSnapshotObservation
+{
+    uint256_t observation_id;
+    std::uint64_t ingestion_sequence{0};
+    std::uint32_t epoch_number{0};
+    uint256_t epoch_digest;
+    ReplicaID reporter_id{0};
+    ReplicaID target_id{0};
+    ResponseOutcome outcome{ResponseOutcome::on_time};
+    std::optional<std::uint64_t> latency_ns;
+};
+
+/** Immutable accepted-evidence prefix that caused one explicit transition. */
+struct AdaptiveV2EvidenceSnapshotStructuredEvent
+{
+    std::uint64_t cycle_ordinal{0};
+    TreePolicyKind policy_intent{
+        TreePolicyKind::performance_optimization};
+    std::string transition_artifact_id;
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::uint64_t activation_generation{0};
+    std::uint64_t baseline_cutoff{0};
+    std::uint64_t current_cutoff{0};
+    std::vector<AdaptiveV2EvidenceSnapshotObservation> observations;
+    std::vector<ReplicaID> eligible_ranking;
+};
+
+/** Canonical JSON object shared by the audit event and immutable artifact. */
+std::string serialize_adaptive_v2_evidence_snapshot_payload(
+    const AdaptiveV2EvidenceSnapshotStructuredEvent &event,
+    std::size_t maximum_bytes);
+
+/** Immutable manager-session terminal audit for one explicit transition. */
+struct AdaptiveV2ManagerSessionTerminalStructuredEvent
+{
+    std::uint64_t cycle_ordinal{0};
+    TreePolicyKind policy_intent{
+        TreePolicyKind::performance_optimization};
+    AdaptiveV2ManagerCycleOutcome outcome{
+        AdaptiveV2ManagerCycleOutcome::failed};
+    AdaptiveV2ManagerCycleTerminalReason reason{
+        AdaptiveV2ManagerCycleTerminalReason::caller_failed};
+    std::string transition_artifact_id;
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::optional<std::uint32_t> successor_epoch_number;
+    std::optional<uint256_t> successor_epoch_digest;
+    std::optional<uint256_t> command_payload_digest;
+    std::optional<AdaptiveV2EpochChangeIdentity> winning_activation;
+    std::uint64_t evidence_window_activation_generation{0};
+    std::uint64_t baseline_evidence_cutoff{0};
+    std::uint64_t current_evidence_cutoff{0};
+};
+
 using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
@@ -160,7 +217,9 @@ using StructuredEventPayload = std::variant<
 using AuditStructuredEventPayload = std::variant<
     EpochCommandCommittedStructuredEvent,
     ReputationEvidenceAppliedStructuredEvent,
-    AdaptiveV2ConvergenceStructuredEvent>;
+    AdaptiveV2ConvergenceStructuredEvent,
+    AdaptiveV2EvidenceSnapshotStructuredEvent,
+    AdaptiveV2ManagerSessionTerminalStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -255,6 +314,8 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_converged,
     adaptive_v2_ready,
     adaptive_v2_convergence_failure,
+    adaptive_v2_evidence_snapshot,
+    adaptive_v2_session_terminal,
 };
 
 StructuredEventType structured_event_type(

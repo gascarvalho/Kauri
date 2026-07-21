@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cctype>
 #include <csignal>
 #include <cstdint>
@@ -42,28 +43,30 @@
 #include "salticidae/network.h"
 #include "salticidae/util.h"
 
-#include "hotstuff/adaptive_v2_manager_controller.h"
-#include "hotstuff/adaptive_v2_manager_convergence.h"
+#include "hotstuff/adaptation_manager.h"
 #include "hotstuff/adaptive_v2_convergence_ack_wire.h"
+#include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/structured_event.h"
 #include "hotstuff/util.h"
 
 namespace
 {
 
-using hotstuff::AdaptiveV2ManagerController;
 using hotstuff::AdaptiveV2ManagerControllerConfig;
 using hotstuff::AdaptiveV2ManagerControllerStatus;
-using hotstuff::AdaptiveV2ManagerConvergence;
-using hotstuff::AdaptiveV2ManagerConvergenceConfig;
+using hotstuff::AdaptiveV2ManagerCycleOutcome;
+using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
 using hotstuff::AdaptiveV2ManagerConvergenceDisposition;
 using hotstuff::AdaptiveV2ManagerConvergenceStatus;
+using hotstuff::AdaptiveV2ManagerRequestSequence;
+using hotstuff::AdaptiveV2ManagerSession;
+using hotstuff::AdaptiveV2ManagerSessionConfig;
 using hotstuff::AdaptiveV2ConvergenceAckDisposition;
 using hotstuff::AdaptiveV2ConvergenceObservationAck;
 using hotstuff::AdaptiveV2ConvergenceObservationKind;
-using hotstuff::AdaptiveV2ManagerIngress;
 using hotstuff::AdaptiveV2ManagerIngressLimits;
 using hotstuff::AdaptiveV2ManagerIngressStatus;
+using hotstuff::AdaptiveV2TransitionPolicy;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::DataStream;
 using hotstuff::EpochChangeBundleLimits;
@@ -80,6 +83,7 @@ using hotstuff::MsgProposalLifecycleNotice;
 using hotstuff::PrivKeySecp256k1;
 using hotstuff::ReplicaID;
 using hotstuff::TreePlacementInput;
+using hotstuff::TreePolicyKind;
 using hotstuff::TreeShape;
 using hotstuff::bytearray_t;
 using hotstuff::opcode_t;
@@ -113,6 +117,10 @@ constexpr double kConvergenceTimerSeconds = 0.1;
 // Cover the replica outbox's one-second capped ACK retry backoff and leave
 // one convergence timer interval for scheduling and transport dispatch.
 constexpr double kConvergenceAckDrainSeconds = 1.1;
+constexpr std::size_t kMaximumTransitionRequestBytes = 16 * 1024;
+constexpr std::size_t kMaximumTransitionArtifactIdBytes = 128;
+constexpr std::size_t kMaximumTransitionPathBytes = 4096;
+constexpr std::uint32_t kMaximumPredecessorResidencyMs = 3'600'000;
 constexpr opcode_t kCommittedObservationOpcode =
     MsgAdaptiveV2EpochChangeCommittedObservation::opcode;
 constexpr opcode_t kActivatedObservationOpcode =
@@ -133,6 +141,29 @@ struct ExperimentBundleAttempt
     std::uint32_t attempt{0};
 };
 
+struct TransitionRequest
+{
+    AdaptiveV2TransitionPolicy policy;
+    std::string evidence_window_rule;
+    std::string transition_artifact_id;
+    std::string declared_bundle_path;
+    std::string evidence_snapshot_path;
+    std::uint32_t predecessor_epoch_number{0};
+    std::uint32_t successor_epoch_number{0};
+    std::uint32_t minimum_predecessor_residency_ms{0};
+    std::string bundle_output;
+    std::string evidence_snapshot_output;
+};
+
+struct CycleAuditContext
+{
+    std::string transition_artifact_id;
+    std::uint64_t activation_generation{0};
+    std::uint64_t baseline_evidence_cutoff{0};
+    std::uint64_t current_evidence_cutoff{0};
+    bool evidence_snapshot_emitted{false};
+};
+
 struct ManagerOptions
 {
     NetAddr listen_address;
@@ -145,7 +176,7 @@ struct ManagerOptions
     std::uint64_t activation_delay_blocks{5};
     std::uint64_t convergence_deadline_ticks{
         kConvergenceDefaultDeadlineTicks};
-    std::string bundle_output;
+    std::vector<TransitionRequest> transition_requests;
     std::string structured_event_run_id;
     std::string structured_event_source_instance;
     std::string structured_event_output;
@@ -179,6 +210,382 @@ Value parse_unsigned(
                  : " must be a canonical unsigned decimal"));
     }
     return value;
+}
+
+class TransitionJsonParser final
+{
+public:
+    explicit TransitionJsonParser(const std::string &text)
+        : text_(text)
+    {
+        if (text_.empty() ||
+            text_.size() > kMaximumTransitionRequestBytes)
+        {
+            throw std::invalid_argument(
+                "transition request JSON size is invalid");
+        }
+    }
+
+    TransitionRequest parse()
+    {
+        TransitionRequest request;
+        std::optional<std::string> policy_intent;
+        std::optional<std::string> evidence_window_rule;
+        std::optional<std::string> transition_artifact_id;
+        std::optional<std::string> bundle_path;
+        std::optional<std::string> evidence_snapshot_path;
+        std::optional<std::uint32_t> predecessor_epoch_number;
+        std::optional<std::uint32_t> successor_epoch_number;
+        std::optional<std::uint32_t> minimum_predecessor_residency_ms;
+        std::optional<std::vector<hotstuff::BaselineRoot>> baseline_roots;
+
+        expect('{');
+        bool first = true;
+        while (!consume('}'))
+        {
+            if (!first)
+                expect(',');
+            first = false;
+            const auto key = parse_string();
+            expect(':');
+            if (key == "policy_intent")
+                assign_once(policy_intent, parse_string(), key);
+            else if (key == "evidence_window_rule")
+                assign_once(evidence_window_rule, parse_string(), key);
+            else if (key == "transition_artifact_id")
+                assign_once(transition_artifact_id, parse_string(), key);
+            else if (key == "bundle_path")
+                assign_once(bundle_path, parse_string(), key);
+            else if (key == "evidence_snapshot_path")
+                assign_once(evidence_snapshot_path, parse_string(), key);
+            else if (key == "predecessor_epoch_number")
+            {
+                assign_once(
+                    predecessor_epoch_number, parse_u32(), key);
+            }
+            else if (key == "successor_epoch_number")
+            {
+                assign_once(successor_epoch_number, parse_u32(), key);
+            }
+            else if (key == "minimum_predecessor_residency_ms")
+            {
+                assign_once(
+                    minimum_predecessor_residency_ms,
+                    parse_u32(),
+                    key);
+            }
+            else if (key == "policy_parameters")
+            {
+                if (baseline_roots.has_value())
+                    duplicate(key);
+                baseline_roots = parse_policy_parameters();
+            }
+            else
+                unknown(key);
+        }
+        skip_whitespace();
+        if (position_ != text_.size())
+            fail("trailing bytes");
+
+        if (!policy_intent || !evidence_window_rule ||
+            !transition_artifact_id || !bundle_path ||
+            !evidence_snapshot_path || !predecessor_epoch_number ||
+            !successor_epoch_number ||
+            !minimum_predecessor_residency_ms || !baseline_roots)
+        {
+            fail("missing required field");
+        }
+        if (*evidence_window_rule !=
+            "fresh_exact_predecessor_after_common_commit")
+        {
+            fail("unsupported evidence_window_rule");
+        }
+        if (transition_artifact_id->empty() ||
+            *transition_artifact_id == "." ||
+            *transition_artifact_id == ".." ||
+            transition_artifact_id->size() >
+                kMaximumTransitionArtifactIdBytes ||
+            !std::all_of(
+                transition_artifact_id->begin(),
+                transition_artifact_id->end(),
+                [](unsigned char value) {
+                    return std::isalnum(value) != 0 ||
+                        value == '-' || value == '_' || value == '.';
+                }))
+        {
+            fail("invalid transition_artifact_id");
+        }
+        if (*predecessor_epoch_number ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            *successor_epoch_number !=
+                *predecessor_epoch_number + 1)
+        {
+            fail("transition must bind an exact successor");
+        }
+        if (*minimum_predecessor_residency_ms >
+            kMaximumPredecessorResidencyMs)
+        {
+            fail("minimum_predecessor_residency_ms exceeds bound");
+        }
+
+        const auto artifact_prefix =
+            std::string{"transitions/"} +
+            *transition_artifact_id + "/";
+        if (*bundle_path != artifact_prefix + "successor.bundle" ||
+            *evidence_snapshot_path !=
+                artifact_prefix + "evidence-snapshot.json")
+        {
+            fail("transition artifact paths are not canonical");
+        }
+
+        if (*policy_intent == "fault_containment")
+        {
+            validate_containment_roots(*baseline_roots);
+            request.policy.intent = TreePolicyKind::fault_containment;
+            request.policy.containment_baseline_roots =
+                std::move(*baseline_roots);
+        }
+        else if (*policy_intent == "performance_optimization")
+        {
+            if (!baseline_roots->empty())
+                fail("optimization policy parameters must be empty");
+            request.policy.intent =
+                TreePolicyKind::performance_optimization;
+        }
+        else
+            fail("unsupported policy_intent");
+
+        request.evidence_window_rule =
+            std::move(*evidence_window_rule);
+        request.transition_artifact_id =
+            std::move(*transition_artifact_id);
+        request.declared_bundle_path = std::move(*bundle_path);
+        request.evidence_snapshot_path =
+            std::move(*evidence_snapshot_path);
+        request.predecessor_epoch_number =
+            *predecessor_epoch_number;
+        request.successor_epoch_number = *successor_epoch_number;
+        request.minimum_predecessor_residency_ms =
+            *minimum_predecessor_residency_ms;
+        return request;
+    }
+
+private:
+    template<typename Value>
+    void assign_once(
+        std::optional<Value> &destination,
+        Value value,
+        const std::string &key)
+    {
+        if (destination.has_value())
+            duplicate(key);
+        destination = std::move(value);
+    }
+
+    [[noreturn]] void fail(const std::string &reason) const
+    {
+        throw std::invalid_argument(
+            "invalid transition request JSON: " + reason);
+    }
+
+    [[noreturn]] void duplicate(const std::string &key) const
+    {
+        fail("duplicate field " + key);
+    }
+
+    [[noreturn]] void unknown(const std::string &key) const
+    {
+        fail("unknown field " + key);
+    }
+
+    void skip_whitespace()
+    {
+        while (position_ < text_.size() &&
+               std::isspace(
+                   static_cast<unsigned char>(text_[position_])) != 0)
+        {
+            ++position_;
+        }
+    }
+
+    bool consume(char expected)
+    {
+        skip_whitespace();
+        if (position_ >= text_.size() ||
+            text_[position_] != expected)
+        {
+            return false;
+        }
+        ++position_;
+        return true;
+    }
+
+    void expect(char expected)
+    {
+        if (!consume(expected))
+            fail(std::string{"expected "} + expected);
+    }
+
+    std::string parse_string()
+    {
+        skip_whitespace();
+        if (position_ >= text_.size() || text_[position_] != '"')
+            fail("expected string");
+        ++position_;
+        std::string result;
+        while (position_ < text_.size())
+        {
+            const auto value = static_cast<unsigned char>(
+                text_[position_++]);
+            if (value == '"')
+                return result;
+            if (value < 0x20)
+                fail("control byte in string");
+            if (value != '\\')
+            {
+                result.push_back(static_cast<char>(value));
+                if (result.size() > kMaximumTransitionPathBytes)
+                    fail("string is too long");
+                continue;
+            }
+            if (position_ >= text_.size())
+                fail("truncated string escape");
+            const auto escaped = text_[position_++];
+            switch (escaped)
+            {
+                case '"':
+                case '\\':
+                case '/':
+                    result.push_back(escaped);
+                    break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                default:
+                    fail("unsupported string escape");
+            }
+            if (result.size() > kMaximumTransitionPathBytes)
+                fail("string is too long");
+        }
+        fail("unterminated string");
+    }
+
+    std::uint32_t parse_u32()
+    {
+        skip_whitespace();
+        const auto begin = position_;
+        while (position_ < text_.size() &&
+               std::isdigit(
+                   static_cast<unsigned char>(text_[position_])) != 0)
+        {
+            ++position_;
+        }
+        if (begin == position_ ||
+            (position_ - begin > 1 && text_[begin] == '0'))
+        {
+            fail("expected canonical unsigned integer");
+        }
+        return parse_unsigned<std::uint32_t>(
+            text_.substr(begin, position_ - begin),
+            "transition request integer", false);
+    }
+
+    std::vector<hotstuff::BaselineRoot> parse_policy_parameters()
+    {
+        std::vector<hotstuff::BaselineRoot> roots;
+        expect('{');
+        if (consume('}'))
+            return roots;
+        const auto key = parse_string();
+        if (key != "containment_baseline_roots")
+            unknown(key);
+        expect(':');
+        roots = parse_baseline_roots();
+        if (consume(','))
+            fail("unknown policy parameter");
+        expect('}');
+        return roots;
+    }
+
+    std::vector<hotstuff::BaselineRoot> parse_baseline_roots()
+    {
+        std::vector<hotstuff::BaselineRoot> roots;
+        expect('[');
+        bool first = true;
+        while (!consume(']'))
+        {
+            if (!first)
+                expect(',');
+            first = false;
+            roots.push_back(parse_baseline_root());
+            if (roots.size() > kSmokeQuorum)
+                fail("too many containment baseline roots");
+        }
+        return roots;
+    }
+
+    hotstuff::BaselineRoot parse_baseline_root()
+    {
+        std::optional<std::uint32_t> tree_id;
+        std::optional<std::uint32_t> replica_id;
+        expect('{');
+        bool first = true;
+        while (!consume('}'))
+        {
+            if (!first)
+                expect(',');
+            first = false;
+            const auto key = parse_string();
+            expect(':');
+            if (key == "tree_id")
+                assign_once(tree_id, parse_u32(), key);
+            else if (key == "replica_id")
+                assign_once(replica_id, parse_u32(), key);
+            else
+                unknown(key);
+        }
+        if (!tree_id || !replica_id ||
+            *replica_id >= kSmokeReplicaCount)
+        {
+            fail("invalid containment baseline root");
+        }
+        return {*tree_id, static_cast<ReplicaID>(*replica_id)};
+    }
+
+    void validate_containment_roots(
+        const std::vector<hotstuff::BaselineRoot> &roots)
+    {
+        if (roots.size() != kSmokeQuorum)
+            fail("containment requires one baseline root per tree");
+        std::set<std::uint32_t> tree_ids;
+        std::set<ReplicaID> replica_ids;
+        for (const auto &root : roots)
+        {
+            if (root.tree_id >= kSmokeQuorum ||
+                !tree_ids.insert(root.tree_id).second ||
+                !replica_ids.insert(root.replica_id).second)
+            {
+                fail("containment baseline roots are not unique");
+            }
+        }
+        for (std::uint32_t tree_id = 0;
+             tree_id < kSmokeQuorum;
+             ++tree_id)
+        {
+            if (tree_ids.count(tree_id) == 0)
+                fail("containment baseline roots omit a tree");
+        }
+    }
+
+    const std::string &text_;
+    std::size_t position_{0};
+};
+
+TransitionRequest parse_transition_request(const std::string &text)
+{
+    return TransitionJsonParser(text).parse();
 }
 
 ExperimentBundleAttempt parse_experiment_bundle_attempt(
@@ -357,6 +764,65 @@ AdaptiveV2ManagerControllerConfig smoke_controller_config(
     return config;
 }
 
+AdaptiveV2ManagerSessionConfig smoke_session_config(
+    const ManagerOptions &options)
+{
+    AdaptiveV2ManagerSessionConfig config;
+    config.active_tree_id = kInitialTreeId;
+    config.activation_generation = kInitialActivationGeneration;
+    config.ingress_limits = smoke_ingress_limits();
+    config.controller = smoke_controller_config(options);
+    config.retry_interval_ticks = kConvergenceRetryIntervalTicks;
+    config.maximum_attempts_per_recipient =
+        kConvergenceMaximumAttempts;
+    config.convergence_window_ticks =
+        options.convergence_deadline_ticks;
+    return config;
+}
+
+std::vector<AdaptiveV2TransitionPolicy> transition_policies(
+    const ManagerOptions &options)
+{
+    std::vector<AdaptiveV2TransitionPolicy> policies;
+    policies.reserve(options.transition_requests.size());
+    for (const auto &request : options.transition_requests)
+        policies.push_back(request.policy);
+    return policies;
+}
+
+std::string transition_bundle_output_path(
+    const TransitionRequest &request,
+    const hotstuff::AdaptiveV2EpochChangeBundle &bundle,
+    const AdaptiveV2ManagerSession &session)
+{
+    const auto &definition = bundle.definition();
+    const auto &payload = bundle.command().payload;
+    const auto predecessor_epoch_number =
+        session.ingress().current_epoch().epoch_number();
+    const auto successor_epoch_number =
+        definition.epoch_number;
+    const auto successor_epoch_digest =
+        payload.successor_epoch_digest;
+    if (request.bundle_output.empty() ||
+        request.predecessor_epoch_number != predecessor_epoch_number ||
+        request.successor_epoch_number != successor_epoch_number ||
+        predecessor_epoch_number ==
+            std::numeric_limits<std::uint32_t>::max() ||
+        successor_epoch_number != predecessor_epoch_number + 1 ||
+        payload.successor_epoch_number != successor_epoch_number ||
+        definition.previous_epoch_digest !=
+            session.ingress().current_epoch().epoch_digest() ||
+        payload.predecessor_epoch_digest !=
+            definition.previous_epoch_digest ||
+        successor_epoch_digest !=
+            hotstuff::compute_epoch_digest(definition))
+    {
+        throw std::logic_error(
+            "successor bundle does not match the explicit transition request");
+    }
+    return request.bundle_output;
+}
+
 hotstuff::StructuredEventConfig manager_structured_event_config(
     const ManagerOptions &options)
 {
@@ -521,6 +987,69 @@ void write_exclusive_bundle(
     }
 }
 
+void write_exclusive_json(
+    const std::string &path,
+    const std::string &json)
+{
+    if (path.empty() || json.empty() || json.back() != '\n')
+        throw std::invalid_argument(
+            "JSON output path or canonical record is invalid");
+
+    int fd = ::open(
+        path.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+    if (fd < 0)
+    {
+        throw std::system_error(
+            errno, std::generic_category(),
+            "cannot exclusively create JSON output");
+    }
+
+    try
+    {
+        std::size_t offset = 0;
+        while (offset < json.size())
+        {
+            const auto written = ::write(
+                fd,
+                json.data() + offset,
+                json.size() - offset);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+            {
+                throw std::system_error(
+                    written < 0 ? errno : EIO,
+                    std::generic_category(),
+                    "cannot write canonical JSON output");
+            }
+            offset += static_cast<std::size_t>(written);
+        }
+        if (::fsync(fd) != 0)
+        {
+            throw std::system_error(
+                errno, std::generic_category(),
+                "cannot sync canonical JSON output");
+        }
+        const auto close_result = ::close(fd);
+        fd = -1;
+        if (close_result != 0)
+        {
+            throw std::system_error(
+                errno, std::generic_category(),
+                "cannot close canonical JSON output");
+        }
+    }
+    catch (...)
+    {
+        if (fd >= 0)
+            ::close(fd);
+        ::unlink(path.c_str());
+        throw;
+    }
+}
+
 ManagerOptions parse_options(int argc, char **argv)
 {
     Config config("hotstuff.gen.conf");
@@ -534,7 +1063,8 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_activation_delay = Config::OptValStr::create("5");
     auto opt_convergence_deadline_seconds =
         Config::OptValStr::create("12");
-    auto opt_bundle_output = Config::OptValStr::create();
+    auto opt_transition_requests = Config::OptValStrVec::create();
+    auto opt_bundle_outputs = Config::OptValStrVec::create();
     auto opt_structured_event_run_id = Config::OptValStr::create();
     auto opt_structured_event_source_instance =
         Config::OptValStr::create();
@@ -559,7 +1089,10 @@ ManagerOptions parse_options(int argc, char **argv)
         "convergence-deadline-seconds",
         opt_convergence_deadline_seconds,
         Config::SET_VAL);
-    config.add_opt("bundle-output", opt_bundle_output, Config::SET_VAL);
+    config.add_opt(
+        "transition-request", opt_transition_requests, Config::APPEND);
+    config.add_opt(
+        "bundle-output", opt_bundle_outputs, Config::APPEND);
     config.add_opt(
         "structured-event-run-id",
         opt_structured_event_run_id,
@@ -626,9 +1159,102 @@ ManagerOptions parse_options(int argc, char **argv)
     }
     options.convergence_deadline_ticks =
         convergence_deadline_seconds * kConvergenceTicksPerSecond;
-    options.bundle_output = opt_bundle_output->get();
-    if (options.bundle_output.empty())
-        throw std::invalid_argument("bundle output path is required");
+    const auto &raw_transition_requests =
+        opt_transition_requests->get();
+    const auto &bundle_outputs = opt_bundle_outputs->get();
+    if (raw_transition_requests.empty() ||
+        raw_transition_requests.size() != bundle_outputs.size())
+    {
+        throw std::invalid_argument(
+            "transition requests and bundle outputs must be nonempty and paired");
+    }
+
+    std::set<std::string> artifact_ids;
+    std::set<std::string> declared_bundle_paths;
+    std::set<std::string> evidence_snapshot_paths;
+    std::set<std::string> exclusive_artifact_outputs;
+    for (std::size_t index = 0;
+         index < raw_transition_requests.size();
+         ++index)
+    {
+        auto request = parse_transition_request(
+            raw_transition_requests[index]);
+        request.bundle_output = bundle_outputs[index];
+        if (request.bundle_output.size() >=
+            request.declared_bundle_path.size())
+        {
+            const auto artifact_root_bytes =
+                request.bundle_output.size() -
+                request.declared_bundle_path.size();
+            request.evidence_snapshot_output =
+                request.bundle_output.substr(0, artifact_root_bytes) +
+                request.evidence_snapshot_path;
+        }
+        if (request.bundle_output.empty() ||
+            request.bundle_output.front() != '/' ||
+            request.bundle_output.size() >
+                kMaximumTransitionPathBytes ||
+            request.bundle_output.find("//") != std::string::npos ||
+            request.bundle_output.find("/./") != std::string::npos ||
+            request.bundle_output.find("/../") != std::string::npos ||
+            request.bundle_output.size() <
+                request.declared_bundle_path.size() ||
+            request.bundle_output.compare(
+                request.bundle_output.size() -
+                    request.declared_bundle_path.size(),
+                request.declared_bundle_path.size(),
+                request.declared_bundle_path) != 0 ||
+            (request.bundle_output.size() >
+                 request.declared_bundle_path.size() &&
+             request.bundle_output[
+                 request.bundle_output.size() -
+                 request.declared_bundle_path.size() - 1] != '/') ||
+            !artifact_ids.insert(
+                request.transition_artifact_id).second ||
+            !declared_bundle_paths.insert(
+                request.declared_bundle_path).second ||
+            !evidence_snapshot_paths.insert(
+                request.evidence_snapshot_path).second ||
+            request.evidence_snapshot_output.empty() ||
+            request.evidence_snapshot_output.front() != '/' ||
+            request.evidence_snapshot_output.size() >
+                kMaximumTransitionPathBytes ||
+            request.evidence_snapshot_output.find("//") !=
+                std::string::npos ||
+            request.evidence_snapshot_output.find("/./") !=
+                std::string::npos ||
+            request.evidence_snapshot_output.find("/../") !=
+                std::string::npos ||
+            !exclusive_artifact_outputs.insert(
+                request.bundle_output).second ||
+            !exclusive_artifact_outputs.insert(
+                request.evidence_snapshot_output).second)
+        {
+            throw std::invalid_argument(
+                "transition artifact identities and paths must be exact and unique");
+        }
+        if (options.transition_requests.empty() &&
+            request.predecessor_epoch_number != 0)
+        {
+            throw std::invalid_argument(
+                "the first transition must name epoch zero as predecessor");
+        }
+        if (options.transition_requests.empty() &&
+            request.minimum_predecessor_residency_ms != 0)
+        {
+            throw std::invalid_argument(
+                "the first transition residency must be zero");
+        }
+        if (!options.transition_requests.empty() &&
+            (options.transition_requests.back()
+                     .successor_epoch_number !=
+                 request.predecessor_epoch_number))
+        {
+            throw std::invalid_argument(
+                "transition requests must form one exact successor chain");
+        }
+        options.transition_requests.push_back(std::move(request));
+    }
     options.structured_event_run_id =
         opt_structured_event_run_id->get();
     if (options.structured_event_run_id.empty())
@@ -643,9 +1269,12 @@ ManagerOptions parse_options(int argc, char **argv)
     if (options.structured_event_output.empty())
         throw std::invalid_argument(
             "structured-event output path is required");
-    if (options.structured_event_output == options.bundle_output)
+    if (exclusive_artifact_outputs.count(
+            options.structured_event_output) != 0)
+    {
         throw std::invalid_argument(
-            "structured-event and bundle outputs must be distinct");
+            "structured-event and artifact outputs must be distinct");
+    }
     if (!opt_experiment_drop_bundle_attempt->get().empty())
     {
         options.experiment_drop_bundle_attempt =
@@ -738,13 +1367,11 @@ public:
         : event_context_(event_context),
           options_(std::move(options)),
           network_(event_context_, net_config),
-          ingress_(
+          session_(
               smoke_membership(),
               smoke_epoch_zero(),
-              kInitialTreeId,
-              kInitialActivationGeneration,
-              smoke_ingress_limits()),
-          controller_(ingress_, smoke_controller_config(options_)),
+              smoke_session_config(options_)),
+          request_sequence_(transition_policies(options_)),
           structured_event_sink_(structured_event_sink)
     {
         for (const auto &replica : options_.replicas)
@@ -763,6 +1390,11 @@ public:
                 }
                 ++convergence_tick_;
                 drive_convergence();
+            });
+        predecessor_residency_timer = salticidae::TimerEvent(
+            event_context_,
+            [this](salticidae::TimerEvent &) {
+                handle_predecessor_residency_timer();
             });
         register_handlers();
     }
@@ -822,6 +1454,9 @@ public:
             for (const auto &replica : options_.replicas)
                 network_.conn_peer(replica.peer_id);
 
+            if (!begin_current_cycle())
+                fail("manager_cycle_start_failed");
+
             HOTSTUFF_LOG_INFO(
                 "KAURI_ADAPTIVE_MANAGER listening=%s n=7 f=2 quorum=5",
                 std::string(options_.listen_address).c_str());
@@ -843,7 +1478,9 @@ public:
             structured_event_sink_.drain();
             if (!structured_event_sink_.health().healthy)
                 failed_ = true;
-            return failed_ || !convergence_succeeded_ ? 1 : 0;
+            return failed_ || !request_sequence_.shutdown_eligible()
+                ? 1
+                : 0;
         }
         catch (...)
         {
@@ -909,18 +1546,19 @@ private:
         event.delivery_attempt = delivery_attempt;
         event.disposition = disposition;
         event.identity = std::move(identity);
-        if (convergence_ != nullptr)
+        const auto convergence = session_.convergence_audit();
+        if (convergence.has_value())
         {
             event.accepted_commit_count =
-                convergence_->accepted_commit_count();
+                convergence->accepted_commit_count;
             event.accepted_activation_count =
                 transition ==
                             hotstuff::AdaptiveV2ConvergenceTransition::
                                 converged ||
                         transition ==
                             hotstuff::AdaptiveV2ConvergenceTransition::ready
-                    ? convergence_->winning_activation_count()
-                    : convergence_->accepted_activation_count();
+                    ? convergence->winning_activation_count
+                    : convergence->accepted_activation_count;
         }
         event.required_activation_count = kSmokeQuorum;
         event.canonical_payload_digest =
@@ -935,9 +1573,378 @@ private:
         }
     }
 
+    const TransitionRequest *current_transition_request() const noexcept
+    {
+        const auto cursor = request_sequence_.cursor();
+        return cursor < options_.transition_requests.size()
+            ? &options_.transition_requests[cursor]
+            : nullptr;
+    }
+
+    bool transition_policy_matches_current_roots(
+        const TransitionRequest &request) const noexcept
+    {
+        if (request.policy.intent !=
+            TreePolicyKind::fault_containment)
+        {
+            return request.policy.containment_baseline_roots.empty();
+        }
+
+        const auto &trees =
+            session_.ingress().current_epoch().trees();
+        for (const auto &root :
+             request.policy.containment_baseline_roots)
+        {
+            const auto tree = std::find_if(
+                trees.begin(), trees.end(),
+                [&root](const EpochTreeDefinition &candidate) {
+                    return candidate.tree_id == root.tree_id;
+                });
+            if (tree == trees.end() ||
+                tree->members_breadth_first.empty() ||
+                tree->members_breadth_first.front() !=
+                    root.replica_id)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool add_cycle_audit_context() noexcept
+    {
+        const auto *request = current_transition_request();
+        if (request == nullptr ||
+            request->predecessor_epoch_number !=
+                session_.ingress().current_epoch().epoch_number() ||
+            !transition_policy_matches_current_roots(*request))
+        {
+            return false;
+        }
+        try
+        {
+            const auto activation_generation =
+                session_.ingress().activation_generation();
+            if (activation_generation == 0)
+                return false;
+            cycle_audits_.push_back(CycleAuditContext{
+                request->transition_artifact_id,
+                activation_generation,
+                0,
+                0});
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool begin_current_cycle() noexcept
+    {
+        const auto *policy = request_sequence_.current_policy();
+        if (policy == nullptr || !add_cycle_audit_context())
+            return false;
+        if (!session_.begin_cycle(*policy))
+        {
+            cycle_audits_.pop_back();
+            return false;
+        }
+        emitted_score_trajectory_ = 0;
+        accepted_activation_ack_ordinal_ = 0;
+        convergence_failure_emitted_ = false;
+        refresh_cycle_audit();
+        return true;
+    }
+
+    bool schedule_current_predecessor_residency() noexcept
+    {
+        const auto *request = current_transition_request();
+        if (request == nullptr || predecessor_residency_pending_)
+            return false;
+
+        try
+        {
+            if (request->minimum_predecessor_residency_ms == 0)
+            {
+                if (!begin_current_cycle())
+                    return false;
+                evaluate();
+                return !failed_;
+            }
+
+            predecessor_residency_deadline_ =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(
+                    request->minimum_predecessor_residency_ms);
+            predecessor_residency_pending_ = true;
+            predecessor_residency_timer.add(
+                static_cast<double>(
+                    request->minimum_predecessor_residency_ms) /
+                1000.0);
+            return true;
+        }
+        catch (...)
+        {
+            predecessor_residency_pending_ = false;
+            predecessor_residency_timer.del();
+            return false;
+        }
+    }
+
+    void handle_predecessor_residency_timer() noexcept
+    {
+        if (!predecessor_residency_pending_ || failed_)
+            return;
+
+        try
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < predecessor_residency_deadline_)
+            {
+                predecessor_residency_timer.add(
+                    std::chrono::duration<double>(
+                        predecessor_residency_deadline_ - now)
+                        .count());
+                return;
+            }
+
+            predecessor_residency_pending_ = false;
+            if (!begin_current_cycle())
+            {
+                fail("manager_cycle_start_failed_after_residency");
+                return;
+            }
+            evaluate();
+        }
+        catch (...)
+        {
+            predecessor_residency_pending_ = false;
+            fail("predecessor_residency_timer_failed");
+        }
+    }
+
+    void refresh_cycle_audit() noexcept
+    {
+        if (cycle_audits_.empty())
+            return;
+        const auto audit = session_.controller_audit();
+        if (!audit.has_value())
+            return;
+        cycle_audits_.back().baseline_evidence_cutoff =
+            audit->baseline_cutoff;
+        cycle_audits_.back().current_evidence_cutoff =
+            audit->current_cutoff;
+    }
+
+    void emit_evidence_snapshot(
+        const TransitionRequest &request,
+        const hotstuff::AdaptiveV2EpochChangeBundle &bundle)
+    {
+        if (cycle_audits_.empty() ||
+            request_sequence_.cursor() != cycle_audits_.size() - 1)
+        {
+            throw std::logic_error(
+                "evidence snapshot has no exact cycle audit context");
+        }
+
+        auto &audit = cycle_audits_.back();
+        if (audit.evidence_snapshot_emitted ||
+            audit.transition_artifact_id !=
+                request.transition_artifact_id)
+        {
+            throw std::logic_error(
+                "evidence snapshot was duplicated or rebound");
+        }
+
+        const auto &ingress = session_.ingress();
+        const auto &predecessor = ingress.current_epoch();
+        const auto &ledger = ingress.ledger();
+        if (request.predecessor_epoch_number !=
+                predecessor.epoch_number() ||
+            audit.activation_generation !=
+                ingress.activation_generation() ||
+            audit.baseline_evidence_cutoff == 0 ||
+            audit.current_evidence_cutoff <=
+                audit.baseline_evidence_cutoff ||
+            ledger.high_watermark() !=
+                audit.current_evidence_cutoff)
+        {
+            throw std::logic_error(
+                "evidence snapshot window is not the selected exact prefix");
+        }
+
+        hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent event;
+        event.cycle_ordinal = request_sequence_.cursor();
+        event.policy_intent = request.policy.intent;
+        event.transition_artifact_id =
+            request.transition_artifact_id;
+        event.predecessor_epoch_number =
+            predecessor.epoch_number();
+        event.predecessor_epoch_digest =
+            predecessor.epoch_digest();
+        event.activation_generation = audit.activation_generation;
+        event.baseline_cutoff = audit.baseline_evidence_cutoff;
+        event.current_cutoff = audit.current_evidence_cutoff;
+
+        std::uint64_t previous_ingestion_sequence = 0;
+        for (const auto &record : ledger.accepted())
+        {
+            if (record.ingestion_sequence <=
+                previous_ingestion_sequence)
+            {
+                throw std::logic_error(
+                    "accepted evidence is not canonically ordered");
+            }
+            previous_ingestion_sequence = record.ingestion_sequence;
+            if (record.ingestion_sequence > event.current_cutoff)
+                continue;
+
+            const auto &observation = record.observation;
+            if (observation.configuration.epoch_number !=
+                    event.predecessor_epoch_number ||
+                observation.configuration.epoch_digest !=
+                    event.predecessor_epoch_digest)
+            {
+                throw std::logic_error(
+                    "evidence snapshot contains a mixed epoch");
+            }
+
+            hotstuff::AdaptiveV2EvidenceSnapshotObservation snapshot;
+            snapshot.observation_id = observation.observation_id;
+            snapshot.ingestion_sequence = record.ingestion_sequence;
+            snapshot.epoch_number =
+                observation.configuration.epoch_number;
+            snapshot.epoch_digest =
+                observation.configuration.epoch_digest;
+            snapshot.reporter_id = observation.reporter_id;
+            snapshot.target_id =
+                observation.observed_replica_id;
+            snapshot.outcome = observation.outcome;
+            if (observation.outcome == hotstuff::ResponseOutcome::timeout)
+            {
+                if (observation.response_duration_us != 0)
+                {
+                    throw std::logic_error(
+                        "timeout evidence has a response duration");
+                }
+            }
+            else if (observation.response_duration_us != 0)
+            {
+                if (observation.response_duration_us >
+                    std::numeric_limits<std::uint64_t>::max() / 1000)
+                {
+                    throw std::overflow_error(
+                        "evidence latency nanoseconds overflow");
+                }
+                snapshot.latency_ns =
+                    observation.response_duration_us * 1000;
+            }
+            else if (observation.outcome ==
+                     hotstuff::ResponseOutcome::late)
+            {
+                throw std::logic_error(
+                    "late evidence has no response duration");
+            }
+            event.observations.push_back(std::move(snapshot));
+        }
+
+        std::set<ReplicaID> eligible_leaders;
+        for (const auto &tree : bundle.definition().trees)
+        {
+            if (tree.members_breadth_first.empty() ||
+                !eligible_leaders.insert(
+                    tree.members_breadth_first.front()).second)
+            {
+                throw std::logic_error(
+                    "successor tree leaders are not an exact ranking");
+            }
+            event.eligible_ranking.push_back(
+                tree.members_breadth_first.front());
+        }
+
+        auto canonical_payload =
+            hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
+                event,
+                hotstuff::StructuredEventLimits{}
+                    .maximum_line_bytes);
+        canonical_payload.push_back('\n');
+        structured_event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{event});
+        if (!structured_event_sink_.health().healthy)
+        {
+            throw std::runtime_error(
+                "evidence snapshot audit emission failed");
+        }
+        write_exclusive_json(
+            request.evidence_snapshot_output, canonical_payload);
+        audit.evidence_snapshot_emitted = true;
+    }
+
+    void emit_new_session_terminals() noexcept
+    {
+        try
+        {
+            const auto &records = session_.terminal_records();
+            while (emitted_session_terminals_ < records.size())
+            {
+                const auto &record = records[emitted_session_terminals_];
+                if (record.cycle_ordinal >= cycle_audits_.size())
+                {
+                    failed_ = true;
+                    event_context_.stop();
+                    return;
+                }
+                const auto &audit = cycle_audits_[
+                    static_cast<std::size_t>(record.cycle_ordinal)];
+                hotstuff::AdaptiveV2ManagerSessionTerminalStructuredEvent
+                    event;
+                event.cycle_ordinal = record.cycle_ordinal;
+                event.policy_intent = record.policy_intent;
+                event.outcome = record.outcome;
+                event.reason = record.reason;
+                event.transition_artifact_id =
+                    audit.transition_artifact_id;
+                event.predecessor_epoch_number =
+                    record.predecessor_epoch_number;
+                event.predecessor_epoch_digest =
+                    record.predecessor_epoch_digest;
+                event.successor_epoch_number =
+                    record.successor_epoch_number;
+                event.successor_epoch_digest =
+                    record.successor_epoch_digest;
+                event.command_payload_digest =
+                    record.command_payload_digest;
+                event.winning_activation = record.winning_activation;
+                event.evidence_window_activation_generation =
+                    audit.activation_generation;
+                event.baseline_evidence_cutoff =
+                    audit.baseline_evidence_cutoff;
+                event.current_evidence_cutoff =
+                    audit.current_evidence_cutoff;
+                structured_event_sink_.emit_audit(
+                    hotstuff::AuditStructuredEventPayload{
+                        std::move(event)});
+                if (!structured_event_sink_.health().healthy)
+                {
+                    failed_ = true;
+                    event_context_.stop();
+                    return;
+                }
+                ++emitted_session_terminals_;
+            }
+        }
+        catch (...)
+        {
+            failed_ = true;
+            event_context_.stop();
+        }
+    }
+
     void fail(const char *reason) noexcept
     {
-        if (convergence_ != nullptr && !convergence_failure_emitted_)
+        const auto convergence = session_.convergence_status();
+        if (convergence.has_value() && !convergence_failure_emitted_)
         {
             convergence_failure_emitted_ = true;
             emit_convergence_event(
@@ -948,6 +1955,10 @@ private:
                 "",
                 reason);
         }
+        refresh_cycle_audit();
+        static_cast<void>(session_.finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::caller_failed));
+        emit_new_session_terminals();
         failed_ = true;
         HOTSTUFF_LOG_WARN(
             "KAURI_ADAPTIVE_MANAGER fatal reason=%s", reason);
@@ -959,6 +1970,8 @@ private:
         event_context_.stop();
         convergence_timer.del();
         convergence_ack_drain_timer.del();
+        predecessor_residency_timer.del();
+        predecessor_residency_pending_ = false;
         if (network_stop_required_ && !network_stopped_)
         {
             network_stopped_ = true;
@@ -973,10 +1986,11 @@ private:
                     "KAURI_ADAPTIVE_MANAGER fatal reason=network_stop_failed");
             }
         }
-        if (!ingress_stopped_)
+        if (!session_stopped_)
         {
-            ingress_stopped_ = true;
-            ingress_.shutdown();
+            session_stopped_ = true;
+            session_.shutdown();
+            emit_new_session_terminals();
         }
     }
 
@@ -991,8 +2005,11 @@ private:
 
     void emit_new_score_trajectory() noexcept
     {
-        const auto &trajectory = controller_.score_trajectory();
-        const auto evidence_cutoff = controller_.current_cutoff();
+        const auto audit = session_.controller_audit();
+        if (!audit.has_value())
+            return;
+        const auto &trajectory = audit->score_trajectory;
+        const auto evidence_cutoff = audit->current_cutoff;
         while (emitted_score_trajectory_ < trajectory.size())
         {
             const hotstuff::AuditStructuredEventPayload event{
@@ -1011,9 +2028,13 @@ private:
 
     void evaluate()
     {
-        if (failed_ || convergence_ != nullptr)
+        if (failed_ || request_sequence_.shutdown_eligible() ||
+            predecessor_residency_pending_ ||
+            session_.convergence_status().has_value())
             return;
-        const auto status = controller_.evaluate();
+        refresh_cycle_audit();
+        const auto status = session_.evaluate();
+        refresh_cycle_audit();
         emit_new_score_trajectory();
         if (failed_)
             return;
@@ -1021,45 +2042,36 @@ private:
             "KAURI_ADAPTIVE_MANAGER state=%s cutoff=%llu",
             controller_status_name(status),
             static_cast<unsigned long long>(
-                controller_.current_cutoff()));
+                cycle_audits_.empty()
+                    ? 0
+                    : cycle_audits_.back().current_evidence_cutoff));
         if (status == AdaptiveV2ManagerControllerStatus::unhealthy)
         {
+            emit_new_session_terminals();
             fail("controller_unhealthy");
             return;
         }
-        if (status != AdaptiveV2ManagerControllerStatus::successor_ready)
+        if (status != AdaptiveV2ManagerControllerStatus::successor_ready &&
+            status != AdaptiveV2ManagerControllerStatus::already_ready)
             return;
 
-        const auto *bundle = controller_.successor_bundle();
-        if (bundle == nullptr)
+        const auto *request = current_transition_request();
+        const auto *bundle = session_.successor_bundle();
+        if (request == nullptr || bundle == nullptr)
         {
             fail("missing_successor_bundle");
             return;
         }
         try
         {
+            const auto output_path = transition_bundle_output_path(
+                *request, *bundle, session_);
             write_exclusive_bundle(
-                options_.bundle_output, bundle->canonical_bytes());
-            AdaptiveV2ManagerConvergenceConfig convergence_config;
-            convergence_config.membership = smoke_membership();
-            convergence_config.retry_interval_ticks =
-                kConvergenceRetryIntervalTicks;
-            convergence_config.maximum_attempts_per_recipient =
-                kConvergenceMaximumAttempts;
-            if (options_.convergence_deadline_ticks >
-                std::numeric_limits<std::uint64_t>::max() -
-                    convergence_tick_)
-            {
-                throw std::overflow_error(
-                    "convergence deadline tick overflow");
-            }
-            convergence_config.convergence_deadline_tick =
-                convergence_tick_ + options_.convergence_deadline_ticks;
-            convergence_ =
-                std::make_unique<AdaptiveV2ManagerConvergence>(
-                    *bundle,
-                    std::move(convergence_config),
-                    convergence_tick_);
+                output_path, bundle->canonical_bytes());
+            emit_evidence_snapshot(*request, *bundle);
+            if (!session_.start_convergence(convergence_tick_))
+                throw std::runtime_error(
+                    "manager session rejected convergence start");
             const auto &payload = bundle->command().payload;
             HOTSTUFF_LOG_INFO(
                 "KAURI_ADAPTIVE_MANAGER convergence_started "
@@ -1075,18 +2087,56 @@ private:
             HOTSTUFF_LOG_WARN(
                 "KAURI_ADAPTIVE_MANAGER distribution_error=%s",
                 error.what());
+            emit_new_session_terminals();
             fail("successor_distribution_failed");
         }
     }
 
     void handle_convergence_status() noexcept
     {
-        if (convergence_ == nullptr || failed_)
+        if (failed_)
             return;
-        if (convergence_succeeded_)
+        const auto status_value = session_.convergence_status();
+        if (!status_value.has_value())
+        {
+            const auto &records = session_.terminal_records();
+            if (records.size() > emitted_session_terminals_)
+            {
+                const auto &terminal =
+                    records[emitted_session_terminals_];
+                const char *failure_reason = nullptr;
+                if (terminal.reason ==
+                    AdaptiveV2ManagerCycleTerminalReason::
+                        convergence_retry_exhausted)
+                {
+                    failure_reason = "convergence_retry_exhausted";
+                }
+                else if (terminal.reason ==
+                    AdaptiveV2ManagerCycleTerminalReason::
+                        convergence_conflicting_observation)
+                {
+                    failure_reason =
+                        "convergence_conflicting_observation";
+                }
+                if (failure_reason != nullptr &&
+                    !convergence_failure_emitted_)
+                {
+                    convergence_failure_emitted_ = true;
+                    emit_convergence_event(
+                        hotstuff::AdaptiveV2ConvergenceTransition::failure,
+                        std::nullopt,
+                        0,
+                        std::nullopt,
+                        "",
+                        failure_reason);
+                }
+                emit_new_session_terminals();
+                fail("convergence_terminal_failure");
+            }
             return;
+        }
 
-        const auto status = convergence_->status();
+        const auto status = *status_value;
         if (status ==
             AdaptiveV2ManagerConvergenceStatus::awaiting_activations)
         {
@@ -1095,9 +2145,9 @@ private:
         if (status ==
             AdaptiveV2ManagerConvergenceStatus::ready_for_optimization)
         {
-            const auto *winning_identity =
-                convergence_->winning_identity();
-            if (winning_identity == nullptr)
+            const auto convergence = session_.convergence_audit();
+            if (!convergence.has_value() ||
+                !convergence->winning_identity.has_value())
             {
                 fail("convergence_winning_identity_missing");
                 return;
@@ -1114,32 +2164,34 @@ private:
                 hotstuff::AdaptiveV2ConvergenceTransition::converged,
                 std::nullopt,
                 0,
-                *winning_identity);
+                *convergence->winning_identity);
             if (failed_)
                 return;
-            if (!convergence_->consume_ready_for_optimization())
-            {
-                fail("convergence_ready_consumption_failed");
-                return;
-            }
-            convergence_succeeded_ = true;
             emit_convergence_event(
                 hotstuff::AdaptiveV2ConvergenceTransition::ready,
                 std::nullopt,
                 0,
-                *winning_identity);
+                *convergence->winning_identity);
             begin_convergence_ack_drain();
             return;
         }
         if (status ==
             AdaptiveV2ManagerConvergenceStatus::retry_exhausted)
         {
+            static_cast<void>(session_.finalize_failed_cycle(
+                AdaptiveV2ManagerCycleTerminalReason::
+                    convergence_retry_exhausted));
+            emit_new_session_terminals();
             fail("convergence_retry_exhausted");
             return;
         }
         if (status ==
             AdaptiveV2ManagerConvergenceStatus::conflicting_observation)
         {
+            static_cast<void>(session_.finalize_failed_cycle(
+                AdaptiveV2ManagerCycleTerminalReason::
+                    convergence_conflicting_observation));
+            emit_new_session_terminals();
             fail("convergence_conflicting_observation");
         }
     }
@@ -1148,26 +2200,52 @@ private:
     {
         convergence_timer.del();
         convergence_ack_drain_timer.del();
-        try
+        refresh_cycle_audit();
+        if (!session_.consume_ready_and_rotate())
         {
-            convergence_ack_drain_timer = salticidae::TimerEvent(
-                event_context_,
-                [this](salticidae::TimerEvent &) {
-                    event_context_.stop();
-                });
-            convergence_ack_drain_timer.add(
-                kConvergenceAckDrainSeconds);
+            emit_new_session_terminals();
+            fail("convergence_ready_consumption_failed");
+            return;
         }
-        catch (...)
+        emit_new_session_terminals();
+        const auto previous_cursor = request_sequence_.cursor();
+        if (!request_sequence_.observe_terminal_records(
+                session_.terminal_records()) ||
+            request_sequence_.cursor() == previous_cursor)
         {
-            fail("convergence_ack_drain_timer_failed");
+            fail("transition_request_did_not_advance");
+            return;
+        }
+        if (request_sequence_.shutdown_eligible())
+        {
+            try
+            {
+                convergence_ack_drain_timer = salticidae::TimerEvent(
+                    event_context_,
+                    [this](salticidae::TimerEvent &) {
+                        event_context_.stop();
+                    });
+                convergence_ack_drain_timer.add(
+                    kConvergenceAckDrainSeconds);
+            }
+            catch (...)
+            {
+                fail("convergence_ack_drain_timer_failed");
+            }
+            return;
+        }
+
+        if (!schedule_current_predecessor_residency())
+        {
+            if (!failed_)
+                fail("predecessor_residency_schedule_failed");
+            return;
         }
     }
 
     void drive_convergence() noexcept
     {
-        if (convergence_ == nullptr || failed_ ||
-            convergence_succeeded_)
+        if (failed_ || !session_.convergence_status().has_value())
         {
             return;
         }
@@ -1175,7 +2253,7 @@ private:
         try
         {
             const auto requests =
-                convergence_->due_deliveries(convergence_tick_);
+                session_.due_deliveries(convergence_tick_);
             for (const auto &request : requests)
             {
                 if (request.canonical_bundle_bytes == nullptr ||
@@ -1235,7 +2313,7 @@ private:
                     }
                 }
 
-                const auto recorded = convergence_->record_enqueue_result(
+                const auto recorded = session_.record_enqueue_result(
                     request.recipient,
                     request.attempt,
                     enqueued);
@@ -1259,8 +2337,9 @@ private:
             }
 
             handle_convergence_status();
-            if (!failed_ && !convergence_succeeded_ &&
-                convergence_->status() ==
+            const auto status = session_.convergence_status();
+            if (!failed_ && status.has_value() &&
+                *status ==
                     AdaptiveV2ManagerConvergenceStatus::
                         awaiting_activations)
             {
@@ -1278,9 +2357,10 @@ private:
         AdaptiveV2ManagerIngressStatus status,
         ReplicaID source) const noexcept
     {
-        const auto audit = ingress_.audit_stats();
-        const auto lifecycle = ingress_.lifecycle_stats();
-        const auto &ledger = ingress_.ledger();
+        const auto &ingress = session_.ingress();
+        const auto audit = ingress.audit_stats();
+        const auto lifecycle = ingress.lifecycle_stats();
+        const auto &ledger = ingress.ledger();
         HOTSTUFF_LOG_WARN(
             "KAURI_ADAPTIVE_MANAGER ingress_failure "
             "kind=%s status=%s status_code=%u source=%u "
@@ -1367,6 +2447,8 @@ private:
         const ManagerNetwork::conn_t &connection,
         Ingest &&operation)
     {
+        if (request_sequence_.shutdown_eligible())
+            return;
         const auto source = authenticated_source(connection);
         if (!source.has_value())
             return;
@@ -1381,7 +2463,8 @@ private:
             fail("manager_ingress_unhealthy");
             return;
         }
-        evaluate();
+        if (!predecessor_residency_pending_)
+            evaluate();
     }
 
     void register_handlers()
@@ -1404,7 +2487,7 @@ private:
                     std::move(message), connection,
                     [this](const AuthenticatedReporter &source,
                            const MsgAdaptiveV2ReadinessNotice &value) {
-                        return ingress_.ingest_readiness(source, value);
+                        return session_.ingest_readiness(source, value);
                     });
             });
         network_.reg_handler(
@@ -1414,7 +2497,7 @@ private:
                     std::move(message), connection,
                     [this](const AuthenticatedReporter &source,
                            const MsgProposalLifecycleNotice &value) {
-                        return ingress_.ingest_lifecycle(source, value);
+                        return session_.ingest_lifecycle(source, value);
                     });
             });
         network_.reg_handler(
@@ -1424,14 +2507,14 @@ private:
                     std::move(message), connection,
                     [this](const AuthenticatedReporter &source,
                            const MsgEvidenceReport &value) {
-                        return ingress_.ingest_evidence(source, value);
+                        return session_.ingest_evidence(source, value);
                     });
             });
         network_.reg_handler(
             [this](
                 MsgAdaptiveV2EpochChangeCommittedObservation &&message,
                 const ManagerNetwork::conn_t &connection) {
-                if (convergence_ == nullptr || failed_)
+                if (failed_)
                     return;
                 const auto source = authenticated_source(connection);
                 if (!source.has_value())
@@ -1472,7 +2555,7 @@ private:
                         "rejected_wire_decode");
                     return;
                 }
-                const auto disposition = convergence_->observe_commit(
+                const auto disposition = session_.observe_commit(
                     *source, *decoded.observation);
 
                 bool acknowledgement_sent = false;
@@ -1549,7 +2632,7 @@ private:
         network_.reg_handler(
             [this](MsgAdaptiveV2EpochActivatedObservation &&message,
                    const ManagerNetwork::conn_t &connection) {
-                if (convergence_ == nullptr || failed_)
+                if (failed_)
                     return;
                 const auto source = authenticated_source(connection);
                 if (!source.has_value())
@@ -1590,7 +2673,7 @@ private:
                         "rejected_wire_decode");
                     return;
                 }
-                const auto disposition = convergence_->observe_activation(
+                const auto disposition = session_.observe_activation(
                     *source, *decoded.observation);
 
                 bool acknowledgement_sent = false;
@@ -1636,9 +2719,11 @@ private:
                             !experiment_activation_ack_drop_consumed_ &&
                             *options_.experiment_drop_activation_ack ==
                                 accepted_activation_ack_ordinal_ &&
-                            convergence_->status() ==
-                                AdaptiveV2ManagerConvergenceStatus::
-                                    ready_for_optimization;
+                            session_.convergence_status() ==
+                                std::optional<
+                                    AdaptiveV2ManagerConvergenceStatus>{
+                                    AdaptiveV2ManagerConvergenceStatus::
+                                        ready_for_optimization};
                         if (acknowledgement_injected_drop)
                         {
                             experiment_activation_ack_drop_consumed_ =
@@ -1722,22 +2807,26 @@ private:
     ManagerOptions options_;
     ManagerNetwork network_;
     std::unordered_map<PeerId, ReplicaID> peer_to_replica_;
-    AdaptiveV2ManagerIngress ingress_;
-    AdaptiveV2ManagerController controller_;
+    AdaptiveV2ManagerSession session_;
+    AdaptiveV2ManagerRequestSequence request_sequence_;
     hotstuff::StructuredEventSink &structured_event_sink_;
-    std::unique_ptr<AdaptiveV2ManagerConvergence> convergence_;
     hotstuff::AdaptiveV2ConvergenceWireLimits
         convergence_wire_limits_;
     salticidae::TimerEvent convergence_timer;
     salticidae::TimerEvent convergence_ack_drain_timer;
+    salticidae::TimerEvent predecessor_residency_timer;
+    std::chrono::steady_clock::time_point
+        predecessor_residency_deadline_{};
     std::uint64_t convergence_tick_{0};
     std::size_t emitted_score_trajectory_{0};
+    std::size_t emitted_session_terminals_{0};
+    std::vector<CycleAuditContext> cycle_audits_;
     std::uint32_t accepted_activation_ack_ordinal_{0};
     bool network_stop_required_{false};
     bool network_stopped_{false};
-    bool ingress_stopped_{false};
-    bool convergence_succeeded_{false};
+    bool session_stopped_{false};
     bool convergence_failure_emitted_{false};
+    bool predecessor_residency_pending_{false};
     bool experiment_bundle_drop_consumed_{false};
     bool experiment_activation_ack_drop_consumed_{false};
     bool failed_{false};
