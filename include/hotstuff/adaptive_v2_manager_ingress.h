@@ -114,7 +114,7 @@ struct AdaptiveV2ManagerEvidenceResult
 };
 
 /**
- * Single-writer manager ingress core for one fixed initial epoch.
+ * Single-writer manager ingress core for sequential exact epochs.
  *
  * Authentication is supplied by the transport owner as an already mapped
  * configured ReplicaID. This class owns no TLS, sockets, clocks, crash
@@ -127,7 +127,7 @@ class AdaptiveV2ManagerIngress final
 public:
     AdaptiveV2ManagerIngress(
         std::vector<ReplicaID> membership,
-        EpochDefinitionInput epoch_zero,
+        EpochDefinitionInput initial_epoch,
         std::uint32_t active_tree_id,
         std::uint64_t activation_generation,
         AdaptiveV2ManagerIngressLimits limits = {});
@@ -165,6 +165,18 @@ public:
     AdaptiveV2ManagerEvidenceResult ingest_evidence(
         const AuthenticatedReporter &authenticated_reporter,
         const bytearray_t &canonical_payload) noexcept;
+
+    /**
+     * Replace the mutable ingress window with one for the exact successor.
+     *
+     * The successor must retain the fixed membership, name the current epoch
+     * by number and digest as its exact predecessor, and contain the selected
+     * active tree. Session-wide authenticated source sequences survive the
+     * rotation while readiness, lifecycle, and evidence state starts empty.
+     */
+    AdaptiveV2ManagerIngressStatus rotate_to_successor(
+        const EpochDefinitionInput &successor,
+        std::uint32_t active_tree_id) noexcept;
 
     const std::vector<ReplicaID> &membership() const noexcept;
     const ByzantineQuorum &quorum_metadata() const noexcept;

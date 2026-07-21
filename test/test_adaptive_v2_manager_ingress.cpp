@@ -164,6 +164,284 @@ AdaptiveV2ManagerLifecycleResult ingest_lifecycle(
             notice, configured.lifecycle_wire));
 }
 
+EpochDefinitionInput strict_successor(
+    const AdaptiveV2ManagerIngress &manager)
+{
+    EpochDefinitionInput input;
+    input.schema_version = hotstuff::kEpochDefinitionSchemaVersionV2;
+    input.epoch_number = manager.current_epoch().epoch_number() + 1;
+    input.previous_epoch_digest = manager.current_epoch().epoch_digest();
+    input.membership_digest = manager.current_epoch().membership_digest();
+    input.trees = {EpochTreeDefinition{
+        0, 2, 2, {2, 3, 4, 5, 6, 0, 1}, {0, 1}}};
+    input.activation_height = 0;
+    input.generation_seed = manager.activation_generation() + 1;
+    input.policy_version = "adaptive-v2-ingress-rotation-v1";
+    input.evidence_snapshot_id = "exact-retired-window";
+    input.evidence_cutoff = manager.ledger().high_watermark();
+    input.epoch_digest = hotstuff::compute_epoch_digest(input);
+    return input;
+}
+
+template<typename Manager, typename = void>
+struct has_strict_successor_rotation : std::false_type
+{};
+
+template<typename Manager>
+struct has_strict_successor_rotation<
+    Manager,
+    std::void_t<decltype(std::declval<Manager &>().rotate_to_successor(
+        std::declval<const EpochDefinitionInput &>(),
+        std::uint32_t{}))>> : std::true_type
+{};
+
+template<typename Manager>
+void verify_recurring_ingress_contract()
+{
+    if constexpr (!has_strict_successor_rotation<Manager>::value)
+    {
+        FAIL(
+            "M12-R01 RED: AdaptiveV2ManagerIngress has no "
+            "rotate_to_successor(definition, active_tree_id) entry point");
+    }
+    else
+    {
+        const auto configured = limits();
+        Manager manager(
+            membership(), epoch_zero(), 0, 3, configured);
+        const auto fixed_membership = manager.membership();
+        const auto fixed_membership_digest =
+            manager.current_epoch().membership_digest();
+        const auto old_configuration = manager.current_configuration();
+        const auto old_generation = manager.activation_generation();
+
+        const auto refresh_digest = [](EpochDefinitionInput &input) {
+            input.epoch_digest.reset();
+            input.epoch_digest = hotstuff::compute_epoch_digest(input);
+        };
+        auto skipped_epoch = strict_successor(manager);
+        ++skipped_epoch.epoch_number;
+        refresh_digest(skipped_epoch);
+        CHECK(manager.rotate_to_successor(skipped_epoch, 0) ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+
+        auto wrong_predecessor = strict_successor(manager);
+        wrong_predecessor.previous_epoch_digest =
+            digest("wrong-predecessor");
+        refresh_digest(wrong_predecessor);
+        CHECK(manager.rotate_to_successor(wrong_predecessor, 0) ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+
+        auto changed_membership = strict_successor(manager);
+        changed_membership.membership_digest =
+            digest("changed-membership");
+        refresh_digest(changed_membership);
+        CHECK(manager.rotate_to_successor(changed_membership, 0) ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+
+        auto incomplete_tree = strict_successor(manager);
+        incomplete_tree.trees.front().members_breadth_first.pop_back();
+        refresh_digest(incomplete_tree);
+        CHECK(manager.rotate_to_successor(incomplete_tree, 0) ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+
+        const auto missing_active_tree = strict_successor(manager);
+        CHECK(manager.rotate_to_successor(missing_active_tree, 9) ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+        CHECK(manager.current_epoch().epoch_number() == 0);
+        CHECK(manager.current_epoch().epoch_digest() ==
+              old_configuration.epoch_digest);
+        CHECK(manager.activation_generation() == old_generation);
+
+        REQUIRE(manager.ingest_readiness(
+                    AuthenticatedReporter{0},
+                    hotstuff::encode_adaptive_v2_readiness_notice(
+                        readiness(manager, 0, 1, old_generation),
+                        configured.readiness_wire))
+                    .status ==
+                AdaptiveV2ManagerIngressStatus::processed);
+
+        const auto accepted_old = observation(
+            manager, "before-rotation", 2, 5, 1);
+        for (ReplicaID source = 0; source < 3; ++source)
+        {
+            const auto admitted = ingest_lifecycle(
+                manager,
+                configured,
+                admission(accepted_old.proposal_key(), source, 1));
+            CHECK(admitted.status ==
+                  (source < 2
+                       ? AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration
+                       : AdaptiveV2ManagerIngressStatus::processed));
+        }
+        REQUIRE(manager.ingest_evidence(
+                    AuthenticatedReporter{2},
+                    hotstuff::encode_evidence_batch(
+                        ResponseObservationBatch{
+                            hotstuff::kEvidenceBatchSchemaVersion,
+                            {accepted_old}},
+                        configured.evidence_wire))
+                    .accepted_observations == 1);
+        REQUIRE(manager.ledger().high_watermark() == 1);
+
+        auto stale_readiness = readiness(
+            manager, 0, 2, old_generation);
+        auto stale_evidence = observation(
+            manager, "stale-after-rotation", 2, 5, 2);
+        const auto stale_lifecycle = admission(
+            stale_evidence.proposal_key(), 0, 2);
+
+        const auto successor = strict_successor(manager);
+        const auto expected_digest = *successor.epoch_digest;
+        REQUIRE(manager.rotate_to_successor(successor, 0) ==
+                AdaptiveV2ManagerIngressStatus::processed);
+        CHECK(manager.current_epoch().epoch_number() == 1);
+        CHECK(manager.current_epoch().previous_epoch_digest() ==
+              old_configuration.epoch_digest);
+        CHECK(manager.current_epoch().epoch_digest() == expected_digest);
+        CHECK(manager.current_configuration().epoch_number == 1);
+        CHECK(manager.current_configuration().epoch_digest ==
+              expected_digest);
+        CHECK(manager.activation_generation() == old_generation + 1);
+        CHECK(manager.membership() == fixed_membership);
+        CHECK(manager.current_epoch().membership_digest() ==
+              fixed_membership_digest);
+        CHECK(manager.quorum_metadata().replica_count == 7);
+        CHECK(manager.quorum_metadata().fault_threshold == 2);
+        CHECK(manager.quorum_metadata().quorum == 5);
+        CHECK(manager.ledger().accepted().empty());
+        CHECK(manager.ledger().high_watermark() == 0);
+        CHECK_FALSE(manager.all_members_ready());
+        CHECK(manager.lifecycle_stats().quarantined_records == 0);
+
+        const auto empty_ledger_size = manager.ledger().accepted().size();
+        CHECK(manager.ingest_readiness(
+                  AuthenticatedReporter{0},
+                  hotstuff::encode_adaptive_v2_readiness_notice(
+                      stale_readiness, configured.readiness_wire))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+        CHECK(manager.ingest_readiness(
+                  AuthenticatedReporter{0},
+                  hotstuff::encode_adaptive_v2_readiness_notice(
+                      readiness(
+                          manager,
+                          0,
+                          2,
+                          manager.activation_generation()),
+                      configured.readiness_wire))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::rejected_sequence);
+        CHECK(manager.ingest_readiness(
+                  AuthenticatedReporter{0},
+                  hotstuff::encode_adaptive_v2_readiness_notice(
+                      readiness(
+                          manager,
+                          0,
+                          3,
+                          manager.activation_generation()),
+                      configured.readiness_wire))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+
+        CHECK(ingest_lifecycle(
+                  manager, configured, stale_lifecycle)
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+        auto current_evidence = observation(
+            manager, "fresh-after-rotation", 2, 3, 2);
+        current_evidence.expected_message_type =
+            ExpectedMessageType::aggregate_relay;
+        current_evidence.observation_id =
+            hotstuff::compute_response_observation_id(
+                current_evidence.attempt_identity());
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  admission(current_evidence.proposal_key(), 0, 2))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::rejected_sequence);
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  admission(current_evidence.proposal_key(), 0, 3))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::awaiting_corroboration);
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  admission(current_evidence.proposal_key(), 1, 2))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::awaiting_corroboration);
+        CHECK(ingest_lifecycle(
+                  manager,
+                  configured,
+                  admission(current_evidence.proposal_key(), 2, 2))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+
+        CHECK(manager.ingest_evidence(
+                  AuthenticatedReporter{2},
+                  hotstuff::encode_evidence_batch(
+                      ResponseObservationBatch{
+                          hotstuff::kEvidenceBatchSchemaVersion,
+                          {stale_evidence}},
+                      configured.evidence_wire))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+        CHECK(manager.ledger().accepted().size() == empty_ledger_size);
+        const auto replayed_current = manager.ingest_evidence(
+            AuthenticatedReporter{2},
+            hotstuff::encode_evidence_batch(
+                ResponseObservationBatch{
+                    hotstuff::kEvidenceBatchSchemaVersion,
+                    {current_evidence}},
+                configured.evidence_wire));
+        CHECK(replayed_current.status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+        CHECK(replayed_current.accepted_observations == 0);
+        CHECK(replayed_current.rejected_observations == 1);
+        CHECK(manager.ledger().high_watermark() == 0);
+        auto accepted_current = current_evidence;
+        accepted_current.reporter_sequence = 3;
+        accepted_current.reporter_monotonic_ns = 3'000;
+        accepted_current.observation_id =
+            hotstuff::compute_response_observation_id(
+                accepted_current.attempt_identity());
+        const auto fresh = manager.ingest_evidence(
+            AuthenticatedReporter{2},
+            hotstuff::encode_evidence_batch(
+                ResponseObservationBatch{
+                    hotstuff::kEvidenceBatchSchemaVersion,
+                    {accepted_current}},
+                configured.evidence_wire));
+        CHECK(fresh.status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+        CHECK(fresh.accepted_observations == 1);
+
+        Manager exhausted(
+            membership(),
+            epoch_zero(),
+            0,
+            std::numeric_limits<std::uint64_t>::max(),
+            configured);
+        const auto exhausted_digest =
+            exhausted.current_epoch().epoch_digest();
+        const auto exhausted_generation =
+            exhausted.activation_generation();
+        const auto rejected_successor = strict_successor(exhausted);
+        CHECK(exhausted.rotate_to_successor(rejected_successor, 0) ==
+              AdaptiveV2ManagerIngressStatus::rejected_generation);
+        CHECK(exhausted.current_epoch().epoch_number() == 0);
+        CHECK(exhausted.current_epoch().epoch_digest() ==
+              exhausted_digest);
+        CHECK(exhausted.activation_generation() ==
+              exhausted_generation);
+        CHECK(exhausted.ledger().accepted().empty());
+    }
+}
+
 } // namespace
 
 TEST_CASE(
@@ -1483,4 +1761,11 @@ TEST_CASE(
     CHECK(manager.ingest_readiness(
               AuthenticatedReporter{0}, message)
               .status == AdaptiveV2ManagerIngressStatus::stopped);
+}
+
+TEST_CASE(
+    "recurring ingress rotates exact windows and retains replay fences",
+    "[adaptive-v2][manager-ingress][recurring][rotation][n7][contract]")
+{
+    verify_recurring_ingress_contract<AdaptiveV2ManagerIngress>();
 }

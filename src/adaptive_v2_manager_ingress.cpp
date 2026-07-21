@@ -126,6 +126,39 @@ private:
     const ReporterCommitFrontiers &frontiers_;
 };
 
+/**
+ * Mutable evidence state for exactly one active configuration.
+ *
+ * Declaration order is significant: borrowed dependencies are constructed
+ * before their consumers and destroyed after them. Replacing this owner opens
+ * a fresh exact-epoch window without replacing session-global source fences.
+ */
+struct ExactEpochIngressWindow final
+{
+    ExactEpochIngressWindow(
+        const EpochStore &epochs,
+        const std::vector<ReplicaID> &membership,
+        const AdaptiveV2ManagerIngressLimits &limits)
+        : proposal_index(limits.proposal_index),
+          reporter_causal_window(
+              proposal_index, membership, reporter_commit_frontiers),
+          ledger(epochs, reporter_causal_window, limits.evidence_store),
+          coordinator(
+              proposal_index,
+              reporter_causal_window,
+              ledger,
+              EvidenceLifecycleAccounting{
+                  limits.lifecycle_accounting},
+              limits.lifecycle)
+    {}
+
+    ProposalEvidenceIndex proposal_index;
+    ReporterCommitFrontiers reporter_commit_frontiers;
+    ReporterCausalProposalEvidenceWindow reporter_causal_window;
+    EvidenceLedger ledger;
+    ProposalLifecycleEvidenceCoordinator coordinator;
+};
+
 bool valid_limits(
     const AdaptiveV2ManagerIngressLimits &limits,
     std::size_t member_count) noexcept
@@ -167,7 +200,7 @@ bool valid_limits(
 
 ValidatedBootstrap validate_bootstrap(
     std::vector<ReplicaID> membership,
-    const EpochDefinitionInput &epoch_zero,
+    const EpochDefinitionInput &initial_epoch,
     std::uint64_t activation_generation,
     AdaptiveV2ManagerIngressLimits limits)
 {
@@ -185,13 +218,13 @@ ValidatedBootstrap validate_bootstrap(
         throw std::invalid_argument(
             "adaptive-v2 manager requires exact N=3f+1 with f>0");
     }
-    if (epoch_zero.schema_version !=
+    if (initial_epoch.schema_version !=
             kEpochDefinitionSchemaVersionV2 ||
-        epoch_zero.epoch_number != 0 ||
         activation_generation == 0)
     {
         throw std::invalid_argument(
-            "adaptive-v2 manager requires schema-v2 epoch zero and generation");
+            "adaptive-v2 manager requires a schema-v2 initial epoch "
+            "and generation");
     }
     if (!valid_limits(limits, membership.size()))
     {
@@ -228,42 +261,37 @@ struct AdaptiveV2ManagerIngress::State
     };
 
     State(ValidatedBootstrap bootstrap,
-          EpochDefinitionInput epoch_zero,
+          EpochDefinitionInput initial_epoch,
           std::uint32_t active_tree_id,
           std::uint64_t activation_generation_)
         : membership(std::move(bootstrap.membership)),
           quorum(bootstrap.quorum),
           limits(std::move(bootstrap.limits)),
           epochs(membership),
-          proposal_index(limits.proposal_index),
-          reporter_causal_window(
-              proposal_index, membership, reporter_commit_frontiers),
-          ledger(epochs, reporter_causal_window, limits.evidence_store),
-          coordinator(
-              proposal_index,
-              reporter_causal_window,
-              ledger,
-              EvidenceLifecycleAccounting{
-                  limits.lifecycle_accounting},
-              limits.lifecycle),
           activation_generation(activation_generation_)
     {
         current_epoch = &epochs.stage(
-            epoch_zero, EpochValidationContext{});
-        if (epochs.find_tree(0, active_tree_id) == nullptr)
+            initial_epoch, EpochValidationContext{});
+        if (epochs.find_tree(
+                current_epoch->epoch_number(), active_tree_id) == nullptr)
         {
             throw std::invalid_argument(
-                "adaptive-v2 manager active tree is not in epoch zero");
+                "adaptive-v2 manager active tree is not in initial epoch");
         }
         current_configuration = ConfigurationId{
-            0, active_tree_id, current_epoch->epoch_digest()};
+            current_epoch->epoch_number(),
+            active_tree_id,
+            current_epoch->epoch_digest()};
+        window = std::make_unique<ExactEpochIngressWindow>(
+            epochs, membership, limits);
         for (const auto member : membership)
         {
             readiness.emplace(member, ReadinessEntry{});
             lifecycle_sources.emplace(member, LifecycleSourceEntry{});
         }
-        if (!proposal_index.healthy() || !ledger.healthy() ||
-            !coordinator.healthy())
+        if (!window->proposal_index.healthy() ||
+            !window->ledger.healthy() ||
+            !window->coordinator.healthy())
         {
             throw std::invalid_argument(
                 "adaptive-v2 manager owned evidence state is unhealthy");
@@ -276,18 +304,36 @@ struct AdaptiveV2ManagerIngress::State
             membership.begin(), membership.end(), replica_id);
     }
 
+    bool is_current_epoch_configuration(
+        const ConfigurationId &configuration) const noexcept
+    {
+        return current_epoch != nullptr &&
+               configuration.epoch_number ==
+                   current_epoch->epoch_number() &&
+               configuration.epoch_digest ==
+                   current_epoch->epoch_digest() &&
+               epochs.find_tree(
+                   configuration.epoch_number,
+                   configuration.tree_id) != nullptr;
+    }
+
     bool operational() const noexcept
     {
         return locally_healthy && !stopped &&
-               proposal_index.healthy() && ledger.healthy() &&
-               coordinator.healthy();
+               window != nullptr &&
+               window->proposal_index.healthy() &&
+               window->ledger.healthy() &&
+               window->coordinator.healthy();
     }
 
     void fail_closed() noexcept
     {
         locally_healthy = false;
-        coordinator.shutdown();
-        proposal_index.shutdown();
+        if (window != nullptr)
+        {
+            window->coordinator.shutdown();
+            window->proposal_index.shutdown();
+        }
     }
 
     std::optional<std::size_t> member_index(
@@ -304,8 +350,8 @@ struct AdaptiveV2ManagerIngress::State
         const ProposalKey &proposal,
         const CorroboratingSources &corroborating_sources) noexcept
     {
-        if (reporter_commit_frontiers.count(proposal) != 0 ||
-            reporter_commit_frontiers.size() >=
+        if (window->reporter_commit_frontiers.count(proposal) != 0 ||
+            window->reporter_commit_frontiers.size() >=
                 limits.proposal_index.maximum_exact_proposals)
         {
             record(audit.capacity_failures);
@@ -328,8 +374,9 @@ struct AdaptiveV2ManagerIngress::State
                 boundary.evidence_sequence_fence = source.second;
                 boundary.terminal_seen = true;
             }
-            const auto inserted = reporter_commit_frontiers.emplace(
-                proposal, std::move(frontier));
+            const auto inserted =
+                window->reporter_commit_frontiers.emplace(
+                    proposal, std::move(frontier));
             if (!inserted.second)
             {
                 fail_closed();
@@ -347,7 +394,7 @@ struct AdaptiveV2ManagerIngress::State
     void cancel_reporter_commit_frontier(
         const ProposalKey &proposal) noexcept
     {
-        reporter_commit_frontiers.erase(proposal);
+        window->reporter_commit_frontiers.erase(proposal);
     }
 
     bool close_reporter_commit_frontier(
@@ -355,8 +402,9 @@ struct AdaptiveV2ManagerIngress::State
         ReplicaID source,
         std::uint64_t evidence_sequence_fence) noexcept
     {
-        const auto frontier = reporter_commit_frontiers.find(proposal);
-        if (frontier == reporter_commit_frontiers.end())
+        const auto frontier =
+            window->reporter_commit_frontiers.find(proposal);
+        if (frontier == window->reporter_commit_frontiers.end())
         {
             fail_closed();
             return false;
@@ -389,8 +437,9 @@ struct AdaptiveV2ManagerIngress::State
         const ProposalKey &proposal,
         ReplicaID source) noexcept
     {
-        const auto frontier = reporter_commit_frontiers.find(proposal);
-        if (frontier == reporter_commit_frontiers.end())
+        const auto frontier =
+            window->reporter_commit_frontiers.find(proposal);
+        if (frontier == window->reporter_commit_frontiers.end())
             return ReporterCommitBoundaryState::no_frontier;
         const auto index = member_index(source);
         if (!index.has_value() ||
@@ -408,9 +457,10 @@ struct AdaptiveV2ManagerIngress::State
         const ProposalKey &proposal,
         ReplicaID source) const noexcept
     {
-        const auto frontier = reporter_commit_frontiers.find(proposal);
+        const auto frontier =
+            window->reporter_commit_frontiers.find(proposal);
         const auto index = member_index(source);
-        if (frontier == reporter_commit_frontiers.end() ||
+        if (frontier == window->reporter_commit_frontiers.end() ||
             !index.has_value() ||
             frontier->second.reporters.size() != membership.size())
         {
@@ -452,7 +502,7 @@ struct AdaptiveV2ManagerIngress::State
     std::size_t open_reporter_commit_reporters() const noexcept
     {
         std::size_t open = 0;
-        for (const auto &proposal : reporter_commit_frontiers)
+        for (const auto &proposal : window->reporter_commit_frontiers)
         {
             open += static_cast<std::size_t>(std::count_if(
                 proposal.second.reporters.begin(),
@@ -508,7 +558,7 @@ struct AdaptiveV2ManagerIngress::State
         snapshot.pending_lifecycle_associations =
             pending_lifecycle_associations;
         snapshot.reporter_causal_retained_proposals =
-            reporter_commit_frontiers.size();
+            window->reporter_commit_frontiers.size();
         snapshot.reporter_causal_open_reporters =
             open_reporter_commit_reporters();
         return snapshot;
@@ -542,11 +592,7 @@ struct AdaptiveV2ManagerIngress::State
     ByzantineQuorum quorum;
     AdaptiveV2ManagerIngressLimits limits;
     EpochStore epochs;
-    ProposalEvidenceIndex proposal_index;
-    ReporterCommitFrontiers reporter_commit_frontiers;
-    ReporterCausalProposalEvidenceWindow reporter_causal_window;
-    EvidenceLedger ledger;
-    ProposalLifecycleEvidenceCoordinator coordinator;
+    std::unique_ptr<ExactEpochIngressWindow> window;
     const EpochDefinition *current_epoch{nullptr};
     ConfigurationId current_configuration;
     std::uint64_t activation_generation{0};
@@ -565,17 +611,17 @@ struct AdaptiveV2ManagerIngress::State
 
 AdaptiveV2ManagerIngress::AdaptiveV2ManagerIngress(
     std::vector<ReplicaID> membership,
-    EpochDefinitionInput epoch_zero,
+    EpochDefinitionInput initial_epoch,
     std::uint32_t active_tree_id,
     std::uint64_t activation_generation,
     AdaptiveV2ManagerIngressLimits limits)
     : state_(std::make_unique<State>(
           validate_bootstrap(
               std::move(membership),
-              epoch_zero,
+              initial_epoch,
               activation_generation,
               std::move(limits)),
-          std::move(epoch_zero),
+          std::move(initial_epoch),
           active_tree_id,
           activation_generation))
 {}
@@ -714,19 +760,6 @@ AdaptiveV2ManagerIngress::ingest_readiness(
             AdaptiveV2ManagerIngressStatus::rejected_spoofed_source,
             state.audit.spoofed_source_rejections);
     }
-    if (notice.active_configuration != state.current_configuration)
-    {
-        return rejected(
-            AdaptiveV2ManagerIngressStatus::rejected_configuration,
-            state.audit.state_rejections);
-    }
-    if (notice.activation_generation != state.activation_generation)
-    {
-        return rejected(
-            AdaptiveV2ManagerIngressStatus::rejected_generation,
-            state.audit.state_rejections);
-    }
-
     auto &entry = state.readiness.at(notice.claimed_source_replica_id);
     if (notice.source_sequence <= entry.source_sequence)
     {
@@ -734,6 +767,21 @@ AdaptiveV2ManagerIngress::ingest_readiness(
             AdaptiveV2ManagerIngressStatus::rejected_sequence,
             state.audit.state_rejections);
     }
+    if (notice.active_configuration != state.current_configuration)
+    {
+        entry.source_sequence = notice.source_sequence;
+        return rejected(
+            AdaptiveV2ManagerIngressStatus::rejected_configuration,
+            state.audit.state_rejections);
+    }
+    if (notice.activation_generation != state.activation_generation)
+    {
+        entry.source_sequence = notice.source_sequence;
+        return rejected(
+            AdaptiveV2ManagerIngressStatus::rejected_generation,
+            state.audit.state_rejections);
+    }
+
     if (entry.ready &&
         notice.committed_height < entry.committed_height)
     {
@@ -960,7 +1008,23 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
                 {}};
     }
 
-    const auto classification = state.proposal_index.classify(fact.proposal);
+    if (!state.is_current_epoch_configuration(
+            fact.proposal.configuration))
+    {
+        if (!state.record(state.audit.state_rejections))
+        {
+            return {
+                AdaptiveV2ManagerIngressStatus::evidence_unhealthy,
+                {},
+                {}};
+        }
+        return {AdaptiveV2ManagerIngressStatus::rejected_configuration,
+                {},
+                {}};
+    }
+
+    const auto classification =
+        state.window->proposal_index.classify(fact.proposal);
     if (fact.kind ==
         CorroboratedLifecycleFactKind::normal_runtime_initialized)
     {
@@ -1070,7 +1134,7 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
                     {},
                     {}};
         }
-        const auto retried = state.coordinator.retry_reporter(
+        const auto retried = state.window->coordinator.retry_reporter(
             authenticated_source);
         if (retried.status == ProposalLifecycleApplyStatus::stopped)
         {
@@ -1215,7 +1279,7 @@ AdaptiveV2ManagerIngress::ingest_lifecycle(
                 {}};
     }
 
-    const auto applied = state.coordinator.apply_notice(
+    const auto applied = state.window->coordinator.apply_notice(
         authenticated_source, notice);
     if (applied.status == ProposalLifecycleApplyStatus::applied)
     {
@@ -1321,7 +1385,8 @@ AdaptiveV2ManagerIngress::ingest_evidence(
         result.status = state.record(state.audit.nonmember_rejections)
             ? AdaptiveV2ManagerIngressStatus::rejected_nonmember
             : AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
-        result.ledger_high_watermark = state.ledger.high_watermark();
+        result.ledger_high_watermark =
+            state.window->ledger.high_watermark();
         return result;
     }
     if (message.serialized.size() >
@@ -1329,7 +1394,7 @@ AdaptiveV2ManagerIngress::ingest_evidence(
     {
         try
         {
-            state.ledger.reject_wire(
+            state.window->ledger.reject_wire(
                 authenticated_reporter,
                 EvidenceWireError::payload_too_large);
         }
@@ -1342,10 +1407,11 @@ AdaptiveV2ManagerIngress::ingest_evidence(
         result.wire_error = EvidenceWireError::payload_too_large;
         result.status =
             state.record(state.audit.evidence_wire_rejections) &&
-                    state.ledger.healthy()
+                    state.window->ledger.healthy()
                 ? AdaptiveV2ManagerIngressStatus::rejected_wire
                 : AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
-        result.ledger_high_watermark = state.ledger.high_watermark();
+        result.ledger_high_watermark =
+            state.window->ledger.high_watermark();
         if (result.status ==
             AdaptiveV2ManagerIngressStatus::evidence_unhealthy)
         {
@@ -1374,8 +1440,9 @@ AdaptiveV2ManagerIngress::ingest_evidence(
     auto &state = *state_;
     AdaptiveV2ManagerEvidenceResult result;
     result.remaining_quarantined_observations =
-        state.coordinator.stats().quarantined_records;
-    result.ledger_high_watermark = state.ledger.high_watermark();
+        state.window->coordinator.stats().quarantined_records;
+    result.ledger_high_watermark =
+        state.window->ledger.high_watermark();
 
     if (state.stopped)
     {
@@ -1409,7 +1476,7 @@ AdaptiveV2ManagerIngress::ingest_evidence(
         }
         try
         {
-            state.ledger.reject_wire(
+            state.window->ledger.reject_wire(
                 authenticated_reporter, decoded.error);
         }
         catch (...)
@@ -1419,10 +1486,11 @@ AdaptiveV2ManagerIngress::ingest_evidence(
         }
         result.status =
             state.record(state.audit.evidence_wire_rejections) &&
-                    state.ledger.healthy()
+                    state.window->ledger.healthy()
                 ? AdaptiveV2ManagerIngressStatus::rejected_wire
                 : AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
-        result.ledger_high_watermark = state.ledger.high_watermark();
+        result.ledger_high_watermark =
+            state.window->ledger.high_watermark();
         if (result.status ==
             AdaptiveV2ManagerIngressStatus::evidence_unhealthy)
         {
@@ -1454,6 +1522,22 @@ AdaptiveV2ManagerIngress::ingest_evidence(
             continue;
         }
 
+        if (!state.is_current_epoch_configuration(
+                observation.configuration))
+        {
+            ++result.processed_observations;
+            ++result.rejected_observations;
+            if (!state.record(state.audit.state_rejections))
+            {
+                result.status =
+                    AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
+                return result;
+            }
+            result.status =
+                AdaptiveV2ManagerIngressStatus::rejected_configuration;
+            continue;
+        }
+
         if (observation.reporter_id !=
             authenticated_reporter.replica_id)
         {
@@ -1481,7 +1565,7 @@ AdaptiveV2ManagerIngress::ingest_evidence(
                     AdaptiveV2ManagerIngressStatus::rejected_nonmember;
             }
         }
-        const auto observed = state.coordinator.ingest_observation(
+        const auto observed = state.window->coordinator.ingest_observation(
             authenticated_reporter, observation);
         ++result.processed_observations;
         result.accepted_observations +=
@@ -1515,9 +1599,116 @@ AdaptiveV2ManagerIngress::ingest_evidence(
         }
     }
     result.remaining_quarantined_observations =
-        state.coordinator.stats().quarantined_records;
-    result.ledger_high_watermark = state.ledger.high_watermark();
+        state.window->coordinator.stats().quarantined_records;
+    result.ledger_high_watermark =
+        state.window->ledger.high_watermark();
     return result;
+}
+
+AdaptiveV2ManagerIngressStatus
+AdaptiveV2ManagerIngress::rotate_to_successor(
+    const EpochDefinitionInput &successor,
+    std::uint32_t active_tree_id) noexcept
+{
+    auto &state = *state_;
+    if (state.stopped)
+        return AdaptiveV2ManagerIngressStatus::stopped;
+    if (!state.operational())
+    {
+        state.fail_closed();
+        return AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
+    }
+
+    if (state.activation_generation ==
+        std::numeric_limits<std::uint64_t>::max())
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_generation;
+    }
+    if (state.current_epoch->epoch_number() ==
+            std::numeric_limits<std::uint32_t>::max() ||
+        successor.schema_version != kEpochDefinitionSchemaVersionV2 ||
+        successor.epoch_number !=
+            state.current_epoch->epoch_number() + 1 ||
+        successor.previous_epoch_digest !=
+            state.current_epoch->epoch_digest() ||
+        successor.membership_digest !=
+            state.current_epoch->membership_digest())
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_configuration;
+    }
+
+    const auto selected_tree = std::find_if(
+        successor.trees.begin(),
+        successor.trees.end(),
+        [active_tree_id](const EpochTreeDefinition &tree) {
+            return tree.tree_id == active_tree_id;
+        });
+    if (selected_tree == successor.trees.end())
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_configuration;
+    }
+
+    std::unique_ptr<ExactEpochIngressWindow> next_window;
+    try
+    {
+        next_window = std::make_unique<ExactEpochIngressWindow>(
+            state.epochs, state.membership, state.limits);
+    }
+    catch (...)
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_capacity;
+    }
+    if (!next_window->proposal_index.healthy() ||
+        !next_window->ledger.healthy() ||
+        !next_window->coordinator.healthy())
+    {
+        return AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
+    }
+
+    DefinitionAvailabilityResult availability;
+    try
+    {
+        availability = state.epochs.stage_available_v2(
+            successor, *state.current_epoch);
+    }
+    catch (...)
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_capacity;
+    }
+    if (availability.disposition !=
+            DefinitionAvailabilityDisposition::staged ||
+        availability.definition == nullptr)
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_configuration;
+    }
+
+    const auto *const staged_epoch = availability.definition;
+    const auto next_generation = state.activation_generation + 1;
+
+    // From this point onward publication is no-throw. Authenticated stream
+    // watermarks remain in their session-owned map entries while all mutable
+    // exact-epoch facts are cleared or replaced.
+    for (auto &source : state.readiness)
+    {
+        source.second.committed_height = 0;
+        source.second.ready = false;
+    }
+    for (auto &source : state.lifecycle_sources)
+        source.second.pending_associations = 0;
+    state.pending_lifecycle_votes.clear();
+    state.pending_lifecycle_associations = 0;
+    state.ready_members = 0;
+    state.readiness_accepted = 0;
+    state.readiness_rejected = 0;
+    state.current_epoch = staged_epoch;
+    state.current_configuration = ConfigurationId{
+        staged_epoch->epoch_number(),
+        active_tree_id,
+        staged_epoch->epoch_digest()};
+    state.activation_generation = next_generation;
+    state.window.swap(next_window);
+
+    return AdaptiveV2ManagerIngressStatus::processed;
 }
 
 const std::vector<ReplicaID> &
@@ -1553,7 +1744,7 @@ AdaptiveV2ManagerIngress::current_epoch() const noexcept
 const EvidenceLedger &
 AdaptiveV2ManagerIngress::ledger() const noexcept
 {
-    return state_->ledger;
+    return state_->window->ledger;
 }
 
 AdaptiveV2ManagerReadinessStats
@@ -1565,7 +1756,7 @@ AdaptiveV2ManagerIngress::readiness_stats() const noexcept
 EvidenceLifecycleStats
 AdaptiveV2ManagerIngress::lifecycle_stats() const noexcept
 {
-    return state_->coordinator.stats();
+    return state_->window->coordinator.stats();
 }
 
 AdaptiveV2ManagerIngressAuditStats
@@ -1587,9 +1778,9 @@ bool AdaptiveV2ManagerIngress::healthy() const noexcept
 void AdaptiveV2ManagerIngress::shutdown() noexcept
 {
     state_->stopped = true;
-    state_->coordinator.shutdown();
-    state_->proposal_index.shutdown();
-    state_->reporter_commit_frontiers.clear();
+    state_->window->coordinator.shutdown();
+    state_->window->proposal_index.shutdown();
+    state_->window->reporter_commit_frontiers.clear();
 }
 
 } // namespace hotstuff
