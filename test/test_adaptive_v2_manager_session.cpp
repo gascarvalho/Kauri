@@ -3,8 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -35,12 +37,16 @@ namespace
 {
 
 using hotstuff::AdaptiveV2EpochActivatedObservation;
+using hotstuff::AdaptiveV2EpochChangeCommittedObservation;
 using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ManagerControllerStatus;
 using hotstuff::AdaptiveV2ManagerConvergenceDisposition;
+using hotstuff::AdaptiveV2ManagerConvergenceStatus;
+using hotstuff::AdaptiveV2ManagerDeliveryRequest;
 using hotstuff::AdaptiveV2ManagerIngressStatus;
 using hotstuff::AdaptiveV2ManagerSession;
 using hotstuff::AdaptiveV2ManagerSessionConfig;
+using hotstuff::AdaptiveV2ManagerSessionTerminalRecord;
 using hotstuff::AdaptiveV2ReadinessNotice;
 using hotstuff::AdaptiveV2TransitionPolicy;
 using hotstuff::AuthenticatedReporter;
@@ -64,6 +70,7 @@ using hotstuff::TreePlacementInput;
 using hotstuff::TreePolicyKind;
 using hotstuff::TreeShape;
 using hotstuff::uint256_t;
+using hotstuff::bytearray_t;
 
 constexpr std::uint32_t kIssuerId = 17;
 constexpr std::uint64_t kInitialGeneration = 3;
@@ -250,6 +257,168 @@ AdaptiveV2EpochChangeIdentity identity_for(
         command_height + payload.activation_delay_blocks};
 }
 
+template<typename Session, typename = void>
+struct has_session_ingestion : std::false_type
+{};
+
+template<typename Session>
+struct has_session_ingestion<
+    Session,
+    std::void_t<
+        decltype(std::declval<Session &>().ingest_readiness(
+            std::declval<const AuthenticatedReporter &>(),
+            std::declval<const bytearray_t &>())),
+        decltype(std::declval<Session &>().ingest_lifecycle(
+            std::declval<const AuthenticatedReporter &>(),
+            std::declval<const bytearray_t &>())),
+        decltype(std::declval<Session &>().ingest_evidence(
+            std::declval<const AuthenticatedReporter &>(),
+            std::declval<const bytearray_t &>()))>> : std::true_type
+{};
+
+template<typename Session>
+auto route_readiness(
+    Session &session,
+    const AuthenticatedReporter &source,
+    const bytearray_t &payload)
+{
+    if constexpr (has_session_ingestion<Session>::value)
+        return session.ingest_readiness(source, payload);
+    else
+        return session.ingress().ingest_readiness(source, payload);
+}
+
+template<typename Session>
+auto route_lifecycle(
+    Session &session,
+    const AuthenticatedReporter &source,
+    const bytearray_t &payload)
+{
+    if constexpr (has_session_ingestion<Session>::value)
+        return session.ingest_lifecycle(source, payload);
+    else
+        return session.ingress().ingest_lifecycle(source, payload);
+}
+
+template<typename Session>
+auto route_evidence(
+    Session &session,
+    const AuthenticatedReporter &source,
+    const bytearray_t &payload)
+{
+    if constexpr (has_session_ingestion<Session>::value)
+        return session.ingest_evidence(source, payload);
+    else
+        return session.ingress().ingest_evidence(source, payload);
+}
+
+template<typename Session, typename = void>
+struct has_complete_convergence_forwarding : std::false_type
+{};
+
+template<typename Session>
+struct has_complete_convergence_forwarding<
+    Session,
+    std::void_t<
+        decltype(std::declval<Session &>().due_deliveries(
+            std::uint64_t{})),
+        decltype(std::declval<Session &>().record_enqueue_result(
+            ReplicaID{}, std::uint32_t{}, bool{})),
+        decltype(std::declval<Session &>().observe_commit(
+            ReplicaID{},
+            std::declval<
+                const AdaptiveV2EpochChangeCommittedObservation &>())),
+        decltype(std::declval<const Session &>().convergence_status())>>
+    : std::true_type
+{};
+
+template<typename Record, typename = void>
+struct has_complete_terminal_record : std::false_type
+{};
+
+template<typename Record>
+struct has_complete_terminal_record<
+    Record,
+    std::void_t<
+        decltype(std::declval<const Record &>().outcome),
+        decltype(std::declval<const Record &>().reason),
+        decltype(std::declval<const Record &>()
+                     .successor_epoch_number.has_value()),
+        decltype(std::declval<const Record &>()
+                     .successor_epoch_digest.has_value()),
+        decltype(std::declval<const Record &>()
+                     .command_payload_digest.has_value()),
+        decltype(std::declval<const Record &>()
+                     .winning_activation.has_value())>> : std::true_type
+{};
+
+template<typename Session, typename Record, typename = void>
+struct has_cycle_finalizers : std::false_type
+{};
+
+template<typename Session, typename Record>
+struct has_cycle_finalizers<
+    Session,
+    Record,
+    std::void_t<
+        decltype(std::declval<Session &>().finalize_noop_cycle(
+            std::declval<decltype(
+                std::declval<const Record &>().reason)>())),
+        decltype(std::declval<Session &>().finalize_failed_cycle(
+            std::declval<decltype(
+                std::declval<const Record &>().reason)>()))>>
+    : std::true_type
+{};
+
+template<typename Session, typename = void>
+struct has_session_rotation : std::false_type
+{};
+
+template<typename Session>
+struct has_session_rotation<
+    Session,
+    std::void_t<decltype(std::declval<Session &>().rotate_to_successor(
+        std::declval<const EpochDefinitionInput &>(),
+        std::uint32_t{}))>> : std::true_type
+{};
+
+template<typename Session, typename = void>
+struct has_convergence_accessor : std::false_type
+{};
+
+template<typename Session>
+struct has_convergence_accessor<
+    Session,
+    std::void_t<decltype(
+        std::declval<Session &>().convergence())>> : std::true_type
+{};
+
+template<typename Value, typename = void>
+struct is_optional_like : std::false_type
+{};
+
+template<typename Value>
+struct is_optional_like<
+    Value,
+    std::void_t<
+        decltype(std::declval<const Value &>().has_value()),
+        decltype(*std::declval<const Value &>())>> : std::true_type
+{};
+
+template<typename Value>
+const auto &terminal_value(const Value &value)
+{
+    if constexpr (is_optional_like<Value>::value)
+    {
+        REQUIRE(value.has_value());
+        return *value;
+    }
+    else
+    {
+        return value;
+    }
+}
+
 struct Fixture
 {
     AdaptiveV2ManagerSession session{
@@ -270,13 +439,13 @@ struct Fixture
                 session.ingress().current_configuration(),
                 session.ingress().activation_generation(),
                 static_cast<std::uint64_t>(100 + source)};
-            CHECK(session.ingress()
-                      .ingest_readiness(
-                          AuthenticatedReporter{source},
-                          hotstuff::encode_adaptive_v2_readiness_notice(
-                              notice,
-                              session_config().ingress_limits
-                                  .readiness_wire))
+            CHECK(route_readiness(
+                      session,
+                      AuthenticatedReporter{source},
+                      hotstuff::encode_adaptive_v2_readiness_notice(
+                          notice,
+                          session_config().ingress_limits
+                              .readiness_wire))
                       .status ==
                   AdaptiveV2ManagerIngressStatus::processed);
         }
@@ -327,7 +496,8 @@ struct Fixture
                 ++lifecycle_sequences[source],
                 ProposalLifecycleFact{NormalProposalRuntimeInitialized{
                     observation.proposal_key()}}};
-            const auto result = session.ingress().ingest_lifecycle(
+            const auto result = route_lifecycle(
+                session,
                 AuthenticatedReporter{source},
                 hotstuff::encode_proposal_lifecycle_notice(
                     notice,
@@ -338,7 +508,8 @@ struct Fixture
                              awaiting_corroboration
                        : AdaptiveV2ManagerIngressStatus::processed));
         }
-        const auto result = session.ingress().ingest_evidence(
+        const auto result = route_evidence(
+            session,
             AuthenticatedReporter{observation.reporter_id},
             hotstuff::encode_evidence_batch(
                 ResponseObservationBatch{
@@ -383,7 +554,7 @@ struct Fixture
         }
     }
 
-    AdaptiveV2EpochChangeIdentity complete_cycle(
+    AdaptiveV2EpochChangeIdentity prepare_convergence(
         const AdaptiveV2TransitionPolicy &policy,
         std::uint64_t command_height)
     {
@@ -403,6 +574,15 @@ struct Fixture
             command_height,
             "command-" + std::to_string(command_height));
         REQUIRE(session.start_convergence(command_height));
+        return identity;
+    }
+
+    AdaptiveV2EpochChangeIdentity complete_cycle(
+        const AdaptiveV2TransitionPolicy &policy,
+        std::uint64_t command_height)
+    {
+        const auto identity = prepare_convergence(
+            policy, command_height);
         for (const auto source : kSurvivors)
         {
             const AdaptiveV2EpochActivatedObservation activated{
@@ -439,6 +619,296 @@ void check_fixed_authority(const AdaptiveV2ManagerSession &session)
     CHECK(session.ingress().quorum_metadata().quorum == 5);
     CHECK(session.ingress().current_epoch().membership_digest() ==
           hotstuff::canonical_membership_digest(kMembers));
+}
+
+template<typename Session>
+void verify_read_only_ingress_contract()
+{
+    using IngressResult =
+        decltype(std::declval<Session &>().ingress());
+    if constexpr (!std::is_same<
+                      IngressResult,
+                      const hotstuff::AdaptiveV2ManagerIngress &>::value)
+    {
+        FAIL(
+            "M12-R01 RED: session ingress() is mutable and exposes "
+            "rotate_to_successor outside terminal finalization");
+    }
+    else if constexpr (!has_session_ingestion<Session>::value)
+    {
+        FAIL(
+            "M12-R01 RED: const-only ingress requires session-owned "
+            "readiness/lifecycle/evidence forwarding");
+    }
+    else
+    {
+        CHECK_FALSE(has_session_rotation<Session>::value);
+        CHECK_FALSE(has_convergence_accessor<Session>::value);
+        CHECK((std::is_same<
+               decltype(std::declval<const Session &>()
+                            .terminal_records()),
+               const std::vector<
+                   AdaptiveV2ManagerSessionTerminalRecord> &>::value));
+    }
+}
+
+template<typename Session>
+void verify_complete_convergence_contract()
+{
+    if constexpr (!has_complete_convergence_forwarding<Session>::value)
+    {
+        FAIL(
+            "M12-R01 RED: session cannot drive delivery retry, enqueue, "
+            "commit, and convergence status through owned forwarding");
+    }
+    else
+    {
+        Fixture fixture;
+        Session &session = fixture.session;
+        const auto identity = fixture.prepare_convergence(
+            containment_policy(), 100);
+        const auto *bundle = session.successor_bundle();
+        REQUIRE(bundle != nullptr);
+
+        const auto first = session.due_deliveries(100);
+        REQUIRE(first.size() == kMembers.size());
+        for (const auto &request : first)
+        {
+            CHECK(request.attempt == 1);
+            REQUIRE(request.canonical_bundle_bytes != nullptr);
+            CHECK(*request.canonical_bundle_bytes ==
+                  bundle->canonical_bytes());
+            CHECK(session.record_enqueue_result(
+                      request.recipient,
+                      request.attempt,
+                      true) ==
+                  AdaptiveV2ManagerConvergenceDisposition::
+                      advisory_enqueue_recorded);
+        }
+
+        const auto retry = session.due_deliveries(102);
+        REQUIRE(retry.size() == kMembers.size());
+        for (const auto &request : retry)
+        {
+            CHECK(request.attempt == 2);
+            CHECK(request.canonical_bundle_bytes ==
+                  first.front().canonical_bundle_bytes);
+        }
+
+        const AdaptiveV2EpochActivatedObservation first_from_zero{
+            hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+            0,
+            identity,
+            identity.successor_epoch_number,
+            identity.successor_epoch_digest};
+        CHECK(session.observe_activation(0, first_from_zero) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+        auto conflicting_identity = identity;
+        conflicting_identity.command_block_hash =
+            digest("quarantined-source-conflict");
+        const AdaptiveV2EpochActivatedObservation conflict_from_zero{
+            hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+            0,
+            conflicting_identity,
+            conflicting_identity.successor_epoch_number,
+            conflicting_identity.successor_epoch_digest};
+        CHECK(session.observe_activation(0, conflict_from_zero) ==
+              AdaptiveV2ManagerConvergenceDisposition::
+                  conflicting_observation);
+        REQUIRE(session.convergence_status().has_value());
+        CHECK(*session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+        CHECK(session.terminal_records().empty());
+
+        for (const auto source : kSurvivors)
+        {
+            const AdaptiveV2EpochChangeCommittedObservation committed{
+                hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                source,
+                identity};
+            CHECK(session.observe_commit(source, committed) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+            const AdaptiveV2EpochActivatedObservation activated{
+                hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                source,
+                identity,
+                identity.successor_epoch_number,
+                identity.successor_epoch_digest};
+            CHECK(session.observe_activation(source, activated) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+        }
+
+        const auto status = session.convergence_status();
+        REQUIRE(status.has_value());
+        CHECK(*status == AdaptiveV2ManagerConvergenceStatus::
+                             ready_for_optimization);
+        REQUIRE(session.consume_ready_and_rotate());
+        CHECK_FALSE(session.consume_ready_and_rotate());
+        CHECK(session.terminal_records().size() == 1);
+        CHECK_FALSE(has_convergence_accessor<Session>::value);
+    }
+}
+
+template<typename Session, typename Record>
+void verify_terminal_outcome_contract()
+{
+    if constexpr (!has_complete_terminal_record<Record>::value ||
+                  !has_cycle_finalizers<Session, Record>::value ||
+                  !has_complete_convergence_forwarding<Session>::value)
+    {
+        FAIL(
+            "M12-R01 RED: session terminal records cannot represent and "
+            "finalize advanced, failed, and explicit no-op cycles");
+    }
+    else
+    {
+        using Outcome = std::decay_t<decltype(
+            std::declval<const Record &>().outcome)>;
+        using Reason = std::decay_t<decltype(
+            std::declval<const Record &>().reason)>;
+
+        Fixture advanced;
+        Session &advanced_session = advanced.session;
+        const auto predecessor_digest =
+            advanced_session.ingress().current_epoch().epoch_digest();
+        const auto identity = advanced.complete_cycle(
+            containment_policy(), 100);
+        REQUIRE(advanced_session.terminal_records().size() == 1);
+        const Record advanced_record =
+            advanced_session.terminal_records().front();
+        CHECK(advanced_record.outcome == Outcome::advanced);
+        CHECK(advanced_record.reason == Reason::successor_converged);
+        CHECK(advanced_record.predecessor_epoch_number == 0);
+        CHECK(advanced_record.predecessor_epoch_digest ==
+              predecessor_digest);
+        CHECK(terminal_value(advanced_record.successor_epoch_number) == 1);
+        CHECK(terminal_value(advanced_record.winning_activation) ==
+              identity);
+        CHECK(advanced_session.ingress().current_epoch().epoch_number() == 1);
+        CHECK_FALSE(advanced_session.consume_ready_and_rotate());
+        CHECK(advanced_session.terminal_records().size() == 1);
+
+        Fixture noop;
+        Session &noop_session = noop.session;
+        const auto noop_epoch =
+            noop_session.ingress().current_epoch().epoch_digest();
+        REQUIRE(noop_session.begin_cycle(containment_policy()));
+        noop.ready_all();
+        noop.responsive_baseline();
+        REQUIRE(noop_session.evaluate() ==
+                AdaptiveV2ManagerControllerStatus::baseline_frozen);
+        REQUIRE(noop_session.ingress().ledger().high_watermark() > 0);
+        REQUIRE(noop_session.finalize_noop_cycle(
+            Reason::explicit_no_op));
+        REQUIRE(noop_session.terminal_records().size() == 1);
+        const Record noop_record = noop_session.terminal_records().front();
+        CHECK(noop_record.outcome == Outcome::no_op);
+        CHECK(noop_record.reason == Reason::explicit_no_op);
+        CHECK(noop_record.predecessor_epoch_digest == noop_epoch);
+        CHECK_FALSE(noop_record.successor_epoch_number.has_value());
+        CHECK_FALSE(noop_record.command_payload_digest.has_value());
+        CHECK_FALSE(noop_record.winning_activation.has_value());
+        CHECK(noop_session.ingress().current_epoch().epoch_number() == 0);
+        CHECK(noop_session.ingress().current_epoch().epoch_digest() ==
+              noop_epoch);
+        CHECK(noop_session.ingress().ledger().accepted().empty());
+        CHECK_FALSE(noop_session.ingress().all_members_ready());
+        CHECK_FALSE(noop_session.finalize_noop_cycle(
+            Reason::explicit_no_op));
+        CHECK(noop_session.terminal_records().size() == 1);
+
+        const AdaptiveV2ReadinessNotice replayed_readiness{
+            hotstuff::kAdaptiveV2ReadinessNoticeSchemaVersionV1,
+            0,
+            noop.readiness_sequences[0],
+            noop_session.ingress().current_configuration(),
+            noop_session.ingress().activation_generation(),
+            999};
+        CHECK(route_readiness(
+                  noop_session,
+                  AuthenticatedReporter{0},
+                  hotstuff::encode_adaptive_v2_readiness_notice(
+                      replayed_readiness,
+                      session_config().ingress_limits.readiness_wire))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::rejected_sequence);
+
+        auto replayed_evidence = noop.make_observation(
+            0, 0, ResponseOutcome::on_time, "noop-replay");
+        const auto replayed_reporter = replayed_evidence.reporter_id;
+        const ProposalLifecycleNotice replayed_lifecycle{
+            hotstuff::kProposalLifecycleNoticeSchemaVersion,
+            0,
+            noop.lifecycle_sequences[0],
+            ProposalLifecycleFact{NormalProposalRuntimeInitialized{
+                replayed_evidence.proposal_key()}}};
+        CHECK(route_lifecycle(
+                  noop_session,
+                  AuthenticatedReporter{0},
+                  hotstuff::encode_proposal_lifecycle_notice(
+                      replayed_lifecycle,
+                      session_config().ingress_limits.lifecycle_wire))
+                  .status ==
+              AdaptiveV2ManagerIngressStatus::rejected_sequence);
+
+        REQUIRE(noop.evidence_sequences[replayed_reporter] > 1);
+        replayed_evidence.reporter_sequence =
+            noop.evidence_sequences[replayed_reporter] - 1;
+        replayed_evidence.reporter_monotonic_ns =
+            replayed_evidence.reporter_sequence * 1'000;
+        replayed_evidence.observation_id =
+            hotstuff::compute_response_observation_id(
+                replayed_evidence.attempt_identity());
+        const auto replayed_evidence_result = route_evidence(
+            noop_session,
+            AuthenticatedReporter{replayed_reporter},
+            hotstuff::encode_evidence_batch(
+                ResponseObservationBatch{
+                    hotstuff::kEvidenceBatchSchemaVersion,
+                    {replayed_evidence}},
+                session_config().ingress_limits.evidence_wire));
+        CHECK(replayed_evidence_result.status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+        CHECK(replayed_evidence_result.accepted_observations == 0);
+        CHECK(replayed_evidence_result.rejected_observations == 1);
+        CHECK(noop_session.ingress().ledger().accepted().empty());
+
+        REQUIRE(noop_session.begin_cycle(optimization_policy()));
+        CHECK(noop_session.evaluate() ==
+              AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+        REQUIRE(noop_session.finalize_failed_cycle(
+            Reason::caller_failed));
+        REQUIRE(noop_session.terminal_records().size() == 2);
+        CHECK(noop_session.terminal_records().back().outcome ==
+              Outcome::failed);
+        CHECK(noop_session.terminal_records().back().reason ==
+              Reason::caller_failed);
+
+        Fixture failed;
+        Session &failed_session = failed.session;
+        const auto failed_epoch =
+            failed_session.ingress().current_epoch().epoch_digest();
+        failed.prepare_convergence(containment_policy(), 300);
+        const auto pending = failed_session.convergence_status();
+        REQUIRE(pending.has_value());
+        CHECK(*pending == AdaptiveV2ManagerConvergenceStatus::
+                              awaiting_activations);
+        CHECK(failed_session.due_deliveries(400).empty());
+        REQUIRE(failed_session.terminal_records().size() == 1);
+        const Record failed_record =
+            failed_session.terminal_records().front();
+        CHECK(failed_record.outcome == Outcome::failed);
+        CHECK(failed_record.reason ==
+              Reason::convergence_retry_exhausted);
+        CHECK(failed_record.predecessor_epoch_digest == failed_epoch);
+        CHECK(failed_session.ingress().current_epoch().epoch_number() == 0);
+        CHECK(failed_session.ingress().current_epoch().epoch_digest() ==
+              failed_epoch);
+        CHECK_FALSE(failed_session.finalize_failed_cycle(
+            Reason::convergence_retry_exhausted));
+        CHECK(failed_session.terminal_records().size() == 1);
+        CHECK_FALSE(failed_session.begin_cycle(optimization_policy()));
+    }
 }
 
 } // namespace
@@ -493,12 +963,12 @@ TEST_CASE(
         CHECK(record.policy_intent == expected_intents[cycle]);
         CHECK(record.predecessor_epoch_number == predecessor_number);
         CHECK(record.predecessor_epoch_digest == predecessor_digest);
-        CHECK(record.successor_epoch_number == cycle + 1);
-        CHECK(record.successor_epoch_digest ==
+        CHECK(terminal_value(record.successor_epoch_number) == cycle + 1);
+        CHECK(terminal_value(record.successor_epoch_digest) ==
               identity.successor_epoch_digest);
-        CHECK(record.command_payload_digest ==
+        CHECK(terminal_value(record.command_payload_digest) ==
               identity.command_payload_digest);
-        CHECK(record.winning_activation == identity);
+        CHECK(terminal_value(record.winning_activation) == identity);
 
         const auto record_count =
             fixture.session.terminal_records().size();
@@ -511,7 +981,7 @@ TEST_CASE(
             identity.successor_epoch_number,
             identity.successor_epoch_digest};
         CHECK(fixture.session.observe_activation(2, duplicate) ==
-              AdaptiveV2ManagerConvergenceDisposition::terminal);
+              AdaptiveV2ManagerConvergenceDisposition::duplicate);
         CHECK(fixture.session.terminal_records().size() == record_count);
     }
 
@@ -552,6 +1022,30 @@ TEST_CASE(
     CHECK(session.ingress().current_epoch().epoch_digest() == epoch_digest);
     CHECK(session.ingress().activation_generation() == generation);
     CHECK(session.ingress().ledger().accepted().empty());
+}
+
+TEST_CASE(
+    "session exposes ingress read-only and owns every mutating route",
+    "[adaptive-v2][manager-session][ownership][ingress][intentional-red]")
+{
+    verify_read_only_ingress_contract<AdaptiveV2ManagerSession>();
+}
+
+TEST_CASE(
+    "session forwards the complete one-shot convergence lifecycle",
+    "[adaptive-v2][manager-session][convergence][lifecycle][intentional-red]")
+{
+    verify_complete_convergence_contract<
+        AdaptiveV2ManagerSession>();
+}
+
+TEST_CASE(
+    "every begun cycle appends exactly one immutable terminal outcome",
+    "[adaptive-v2][manager-session][terminal][outcome][intentional-red]")
+{
+    verify_terminal_outcome_contract<
+        AdaptiveV2ManagerSession,
+        AdaptiveV2ManagerSessionTerminalRecord>();
 }
 
 #endif

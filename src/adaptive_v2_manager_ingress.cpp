@@ -611,14 +611,42 @@ struct AdaptiveV2ManagerIngress::State
         return true;
     }
 
+    void publish_window_state() noexcept
+    {
+        for (auto &source : readiness)
+        {
+            source.second.committed_height = 0;
+            source.second.ready = false;
+        }
+        for (auto &source : lifecycle_sources)
+            source.second.pending_associations = 0;
+        pending_lifecycle_votes.clear();
+        pending_lifecycle_associations = 0;
+        ready_members = 0;
+        readiness_accepted = 0;
+        readiness_rejected = 0;
+        current_epoch = prepared_epoch;
+        current_configuration = prepared_configuration;
+        activation_generation = prepared_activation_generation;
+        window.swap(prepared_window);
+        prepared_window.reset();
+        prepared_epoch = nullptr;
+        prepared_configuration = ConfigurationId{};
+        prepared_activation_generation = 0;
+    }
+
     std::vector<ReplicaID> membership;
     ByzantineQuorum quorum;
     AdaptiveV2ManagerIngressLimits limits;
     EpochStore epochs;
     std::unique_ptr<ExactEpochIngressWindow> window;
+    std::unique_ptr<ExactEpochIngressWindow> prepared_window;
     const EpochDefinition *current_epoch{nullptr};
+    const EpochDefinition *prepared_epoch{nullptr};
     ConfigurationId current_configuration;
+    ConfigurationId prepared_configuration;
     std::uint64_t activation_generation{0};
+    std::uint64_t prepared_activation_generation{0};
     std::map<ReplicaID, ReadinessEntry> readiness;
     std::map<ReplicaID, LifecycleSourceEntry> lifecycle_sources;
     std::map<CorroboratedLifecycleFact, CorroboratingSources>
@@ -1629,7 +1657,45 @@ AdaptiveV2ManagerIngress::ingest_evidence(
 }
 
 AdaptiveV2ManagerIngressStatus
-AdaptiveV2ManagerIngress::rotate_to_successor(
+AdaptiveV2ManagerIngress::prepare_same_epoch_window_reset() noexcept
+{
+    auto &state = *state_;
+    if (state.stopped)
+        return AdaptiveV2ManagerIngressStatus::stopped;
+    if (!state.operational())
+    {
+        state.fail_closed();
+        return AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
+    }
+    if (state.prepared_window != nullptr)
+        return AdaptiveV2ManagerIngressStatus::rejected_configuration;
+
+    std::unique_ptr<ExactEpochIngressWindow> next_window;
+    try
+    {
+        next_window = std::make_unique<ExactEpochIngressWindow>(
+            state.epochs, state.membership, state.limits);
+    }
+    catch (...)
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_capacity;
+    }
+    if (!next_window->proposal_index.healthy() ||
+        !next_window->ledger.healthy() ||
+        !next_window->coordinator.healthy())
+    {
+        return AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
+    }
+
+    state.prepared_epoch = state.current_epoch;
+    state.prepared_configuration = state.current_configuration;
+    state.prepared_activation_generation = state.activation_generation;
+    state.prepared_window = std::move(next_window);
+    return AdaptiveV2ManagerIngressStatus::processed;
+}
+
+AdaptiveV2ManagerIngressStatus
+AdaptiveV2ManagerIngress::prepare_successor_rotation(
     const EpochDefinitionInput &successor,
     std::uint32_t active_tree_id) noexcept
 {
@@ -1641,6 +1707,8 @@ AdaptiveV2ManagerIngress::rotate_to_successor(
         state.fail_closed();
         return AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
     }
+    if (state.prepared_window != nullptr)
+        return AdaptiveV2ManagerIngressStatus::rejected_configuration;
 
     const auto successor_epoch = checked_successor_epoch(
         state.current_epoch->epoch_number());
@@ -1700,36 +1768,57 @@ AdaptiveV2ManagerIngress::rotate_to_successor(
     {
         return AdaptiveV2ManagerIngressStatus::rejected_capacity;
     }
-    if (availability.disposition !=
-            DefinitionAvailabilityDisposition::staged ||
+    if ((availability.disposition !=
+             DefinitionAvailabilityDisposition::staged &&
+         availability.disposition !=
+             DefinitionAvailabilityDisposition::duplicate) ||
         availability.definition == nullptr)
     {
         return AdaptiveV2ManagerIngressStatus::rejected_configuration;
     }
 
-    const auto *const staged_epoch = availability.definition;
-    // From this point onward publication is no-throw. Authenticated stream
-    // watermarks remain in their session-owned map entries while all mutable
-    // exact-epoch facts are cleared or replaced.
-    for (auto &source : state.readiness)
-    {
-        source.second.committed_height = 0;
-        source.second.ready = false;
-    }
-    for (auto &source : state.lifecycle_sources)
-        source.second.pending_associations = 0;
-    state.pending_lifecycle_votes.clear();
-    state.pending_lifecycle_associations = 0;
-    state.ready_members = 0;
-    state.readiness_accepted = 0;
-    state.readiness_rejected = 0;
-    state.current_epoch = staged_epoch;
-    state.current_configuration = ConfigurationId{
-        staged_epoch->epoch_number(),
+    state.prepared_epoch = availability.definition;
+    state.prepared_configuration = ConfigurationId{
+        availability.definition->epoch_number(),
         active_tree_id,
-        staged_epoch->epoch_digest()};
-    state.activation_generation = *next_generation;
-    state.window.swap(next_window);
+        availability.definition->epoch_digest()};
+    state.prepared_activation_generation = *next_generation;
+    state.prepared_window = std::move(next_window);
+
+    return AdaptiveV2ManagerIngressStatus::processed;
+}
+
+void AdaptiveV2ManagerIngress::publish_prepared_window() noexcept
+{
+    auto &state = *state_;
+    if (state.prepared_window == nullptr ||
+        state.prepared_epoch == nullptr)
+    {
+        state.fail_closed();
+        return;
+    }
+    state.publish_window_state();
+}
+
+void AdaptiveV2ManagerIngress::discard_prepared_window() noexcept
+{
+    auto &state = *state_;
+    state.prepared_window.reset();
+    state.prepared_epoch = nullptr;
+    state.prepared_configuration = ConfigurationId{};
+    state.prepared_activation_generation = 0;
+}
+
+AdaptiveV2ManagerIngressStatus
+AdaptiveV2ManagerIngress::rotate_to_successor(
+    const EpochDefinitionInput &successor,
+    std::uint32_t active_tree_id) noexcept
+{
+    const auto prepared = prepare_successor_rotation(
+        successor, active_tree_id);
+    if (prepared != AdaptiveV2ManagerIngressStatus::processed)
+        return prepared;
+    publish_prepared_window();
 
     return AdaptiveV2ManagerIngressStatus::processed;
 }
@@ -1801,6 +1890,7 @@ bool AdaptiveV2ManagerIngress::healthy() const noexcept
 void AdaptiveV2ManagerIngress::shutdown() noexcept
 {
     state_->stopped = true;
+    discard_prepared_window();
     state_->window->coordinator.shutdown();
     state_->window->proposal_index.shutdown();
     state_->window->reporter_commit_frontiers.clear();

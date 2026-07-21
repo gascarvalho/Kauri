@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "hotstuff/adaptive_v2_manager_controller.h"
@@ -26,6 +27,27 @@ struct AdaptiveV2ManagerSessionConfig
     std::uint64_t convergence_window_ticks{0};
 };
 
+enum class AdaptiveV2ManagerCycleOutcome : std::uint8_t
+{
+    advanced = 1,
+    no_op,
+    failed,
+};
+
+enum class AdaptiveV2ManagerCycleTerminalReason : std::uint8_t
+{
+    successor_converged = 1,
+    explicit_no_op,
+    controller_unhealthy,
+    convergence_start_failed,
+    convergence_retry_exhausted,
+    convergence_conflicting_observation,
+    invalid_terminal_identity,
+    successor_rotation_failed,
+    evidence_window_reset_failed,
+    caller_failed,
+};
+
 /**
  * Immutable audit result for one converged exact-successor cycle.
  *
@@ -38,12 +60,16 @@ struct AdaptiveV2ManagerSessionTerminalRecord
     std::uint64_t cycle_ordinal{0};
     TreePolicyKind policy_intent{
         TreePolicyKind::performance_optimization};
+    AdaptiveV2ManagerCycleOutcome outcome{
+        AdaptiveV2ManagerCycleOutcome::failed};
+    AdaptiveV2ManagerCycleTerminalReason reason{
+        AdaptiveV2ManagerCycleTerminalReason::caller_failed};
     std::uint32_t predecessor_epoch_number{0};
     uint256_t predecessor_epoch_digest;
-    std::uint32_t successor_epoch_number{0};
-    uint256_t successor_epoch_digest;
-    uint256_t command_payload_digest;
-    AdaptiveV2EpochChangeIdentity winning_activation;
+    std::optional<std::uint32_t> successor_epoch_number;
+    std::optional<uint256_t> successor_epoch_digest;
+    std::optional<uint256_t> command_payload_digest;
+    std::optional<AdaptiveV2EpochChangeIdentity> winning_activation;
 };
 
 /**
@@ -72,8 +98,26 @@ public:
     AdaptiveV2ManagerSession &operator=(
         AdaptiveV2ManagerSession &&) = delete;
 
-    AdaptiveV2ManagerIngress &ingress() noexcept;
     const AdaptiveV2ManagerIngress &ingress() const noexcept;
+
+    AdaptiveV2ManagerReadinessResult ingest_readiness(
+        const AuthenticatedReporter &authenticated_source,
+        const MsgAdaptiveV2ReadinessNotice &message) noexcept;
+    AdaptiveV2ManagerReadinessResult ingest_readiness(
+        const AuthenticatedReporter &authenticated_source,
+        const bytearray_t &canonical_payload) noexcept;
+    AdaptiveV2ManagerLifecycleResult ingest_lifecycle(
+        const AuthenticatedReporter &authenticated_source,
+        const MsgProposalLifecycleNotice &message) noexcept;
+    AdaptiveV2ManagerLifecycleResult ingest_lifecycle(
+        const AuthenticatedReporter &authenticated_source,
+        const bytearray_t &canonical_payload) noexcept;
+    AdaptiveV2ManagerEvidenceResult ingest_evidence(
+        const AuthenticatedReporter &authenticated_reporter,
+        const MsgEvidenceReport &message) noexcept;
+    AdaptiveV2ManagerEvidenceResult ingest_evidence(
+        const AuthenticatedReporter &authenticated_reporter,
+        const bytearray_t &canonical_payload) noexcept;
 
     bool begin_cycle(
         const AdaptiveV2TransitionPolicy &policy) noexcept;
@@ -82,15 +126,44 @@ public:
 
     bool start_convergence(
         std::uint64_t command_block_height) noexcept;
+    std::vector<AdaptiveV2ManagerDeliveryRequest> due_deliveries(
+        std::uint64_t logical_tick) noexcept;
+    AdaptiveV2ManagerConvergenceDisposition record_enqueue_result(
+        ReplicaID recipient,
+        std::uint32_t attempt,
+        bool enqueued) noexcept;
+    AdaptiveV2ManagerConvergenceDisposition observe_commit(
+        ReplicaID authenticated_replica,
+        const AdaptiveV2EpochChangeCommittedObservation &observation)
+        noexcept;
     AdaptiveV2ManagerConvergenceDisposition observe_activation(
         ReplicaID authenticated_replica,
         const AdaptiveV2EpochActivatedObservation &observation) noexcept;
+    std::optional<AdaptiveV2ManagerConvergenceStatus>
+    convergence_status() const noexcept;
     bool consume_ready_and_rotate() noexcept;
+
+    bool finalize_noop_cycle(
+        AdaptiveV2ManagerCycleTerminalReason reason) noexcept;
+    bool finalize_failed_cycle(
+        AdaptiveV2ManagerCycleTerminalReason reason) noexcept;
 
     const std::vector<AdaptiveV2ManagerSessionTerminalRecord> &
     terminal_records() const noexcept;
 
 private:
+    bool finalize_convergence_failure_if_needed() noexcept;
+    AdaptiveV2ManagerConvergenceDisposition
+    classify_terminal_commit(
+        ReplicaID authenticated_replica,
+        const AdaptiveV2EpochChangeCommittedObservation &observation,
+        bool &matched) const noexcept;
+    AdaptiveV2ManagerConvergenceDisposition
+    classify_terminal_activation(
+        ReplicaID authenticated_replica,
+        const AdaptiveV2EpochActivatedObservation &observation,
+        bool &matched) const noexcept;
+
     struct State;
     std::unique_ptr<State> state_;
 };

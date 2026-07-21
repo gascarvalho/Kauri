@@ -17,6 +17,8 @@
 namespace hotstuff
 {
 
+class AdaptiveV2ManagerSession;
+
 constexpr std::size_t kMaximumAdaptiveV2ManagerMembers = 4096;
 constexpr std::size_t
     kMaximumAdaptiveV2PendingLifecycleFactsPerSource = 64;
@@ -198,6 +200,16 @@ public:
     void shutdown() noexcept;
 
 private:
+    friend class AdaptiveV2ManagerSession;
+
+    AdaptiveV2ManagerIngressStatus prepare_same_epoch_window_reset()
+        noexcept;
+    AdaptiveV2ManagerIngressStatus prepare_successor_rotation(
+        const EpochDefinitionInput &successor,
+        std::uint32_t active_tree_id) noexcept;
+    void publish_prepared_window() noexcept;
+    void discard_prepared_window() noexcept;
+
     struct State;
     std::unique_ptr<State> state_;
 };

@@ -168,13 +168,69 @@ struct AdaptiveV2ManagerSession::State
         }
     }
 
-    void make_unavailable() noexcept
+    bool owns_cycle() const noexcept
     {
+        return (phase == Phase::collecting_cycle ||
+                phase == Phase::successor_available ||
+                phase == Phase::observing_successor) &&
+               controller != nullptr && current_policy.has_value();
+    }
+
+    bool append_terminal(
+        AdaptiveV2ManagerCycleOutcome outcome,
+        AdaptiveV2ManagerCycleTerminalReason reason,
+        const AdaptiveV2EpochChangeIdentity *winning) noexcept
+    {
+        if (!owns_cycle() || records.capacity() <= records.size())
+            return false;
+
+        AdaptiveV2ManagerSessionTerminalRecord record;
+        record.cycle_ordinal = next_cycle_ordinal;
+        record.policy_intent = current_policy->intent;
+        record.outcome = outcome;
+        record.reason = reason;
+        record.predecessor_epoch_number =
+            ingress.current_epoch().epoch_number();
+        record.predecessor_epoch_digest =
+            ingress.current_epoch().epoch_digest();
+
+        if (outcome != AdaptiveV2ManagerCycleOutcome::no_op &&
+            controller != nullptr)
+        {
+            const auto *bundle = controller->successor_bundle();
+            if (bundle != nullptr)
+            {
+                record.successor_epoch_number =
+                    bundle->definition().epoch_number;
+                record.successor_epoch_digest =
+                    bundle->command().payload.successor_epoch_digest;
+                record.command_payload_digest =
+                    epoch_change_payload_digest(
+                        bundle->command().payload);
+            }
+        }
+        if (winning != nullptr)
+            record.winning_activation = *winning;
+
+        try
+        {
+            records.push_back(std::move(record));
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void release_cycle(Phase next_phase) noexcept
+    {
+        ++next_cycle_ordinal;
         convergence.reset();
         controller.reset();
         current_policy.reset();
         command_block_height.reset();
-        phase = Phase::unavailable;
+        phase = next_phase;
     }
 
     AdaptiveV2ManagerSessionConfig config;
@@ -200,16 +256,164 @@ AdaptiveV2ManagerSession::AdaptiveV2ManagerSession(
 
 AdaptiveV2ManagerSession::~AdaptiveV2ManagerSession() = default;
 
-AdaptiveV2ManagerIngress &
-AdaptiveV2ManagerSession::ingress() noexcept
-{
-    return state_->ingress;
-}
-
 const AdaptiveV2ManagerIngress &
 AdaptiveV2ManagerSession::ingress() const noexcept
 {
     return state_->ingress;
+}
+
+AdaptiveV2ManagerReadinessResult
+AdaptiveV2ManagerSession::ingest_readiness(
+    const AuthenticatedReporter &authenticated_source,
+    const MsgAdaptiveV2ReadinessNotice &message) noexcept
+{
+    auto &state = *state_;
+    if (state.phase == State::Phase::unavailable)
+    {
+        return {AdaptiveV2ManagerIngressStatus::stopped,
+                std::nullopt,
+                state.ingress.readiness_stats()};
+    }
+    auto result = state.ingress.ingest_readiness(
+        authenticated_source, message);
+    if (result.status ==
+            AdaptiveV2ManagerIngressStatus::evidence_unhealthy &&
+        state.owns_cycle())
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                controller_unhealthy));
+    }
+    return result;
+}
+
+AdaptiveV2ManagerReadinessResult
+AdaptiveV2ManagerSession::ingest_readiness(
+    const AuthenticatedReporter &authenticated_source,
+    const bytearray_t &canonical_payload) noexcept
+{
+    auto &state = *state_;
+    if (state.phase == State::Phase::unavailable)
+    {
+        return {AdaptiveV2ManagerIngressStatus::stopped,
+                std::nullopt,
+                state.ingress.readiness_stats()};
+    }
+    auto result = state.ingress.ingest_readiness(
+        authenticated_source, canonical_payload);
+    if (result.status ==
+            AdaptiveV2ManagerIngressStatus::evidence_unhealthy &&
+        state.owns_cycle())
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                controller_unhealthy));
+    }
+    return result;
+}
+
+AdaptiveV2ManagerLifecycleResult
+AdaptiveV2ManagerSession::ingest_lifecycle(
+    const AuthenticatedReporter &authenticated_source,
+    const MsgProposalLifecycleNotice &message) noexcept
+{
+    auto &state = *state_;
+    if (state.phase == State::Phase::unavailable)
+    {
+        AdaptiveV2ManagerLifecycleResult stopped;
+        stopped.status = AdaptiveV2ManagerIngressStatus::stopped;
+        return stopped;
+    }
+    auto result = state.ingress.ingest_lifecycle(
+        authenticated_source, message);
+    if (result.status ==
+            AdaptiveV2ManagerIngressStatus::evidence_unhealthy &&
+        state.owns_cycle())
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                controller_unhealthy));
+    }
+    return result;
+}
+
+AdaptiveV2ManagerLifecycleResult
+AdaptiveV2ManagerSession::ingest_lifecycle(
+    const AuthenticatedReporter &authenticated_source,
+    const bytearray_t &canonical_payload) noexcept
+{
+    auto &state = *state_;
+    if (state.phase == State::Phase::unavailable)
+    {
+        AdaptiveV2ManagerLifecycleResult stopped;
+        stopped.status = AdaptiveV2ManagerIngressStatus::stopped;
+        return stopped;
+    }
+    auto result = state.ingress.ingest_lifecycle(
+        authenticated_source, canonical_payload);
+    if (result.status ==
+            AdaptiveV2ManagerIngressStatus::evidence_unhealthy &&
+        state.owns_cycle())
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                controller_unhealthy));
+    }
+    return result;
+}
+
+AdaptiveV2ManagerEvidenceResult
+AdaptiveV2ManagerSession::ingest_evidence(
+    const AuthenticatedReporter &authenticated_reporter,
+    const MsgEvidenceReport &message) noexcept
+{
+    auto &state = *state_;
+    if (state.phase == State::Phase::unavailable)
+    {
+        AdaptiveV2ManagerEvidenceResult stopped;
+        stopped.status = AdaptiveV2ManagerIngressStatus::stopped;
+        stopped.ledger_high_watermark =
+            state.ingress.ledger().high_watermark();
+        return stopped;
+    }
+    auto result = state.ingress.ingest_evidence(
+        authenticated_reporter, message);
+    if (result.status ==
+            AdaptiveV2ManagerIngressStatus::evidence_unhealthy &&
+        state.owns_cycle())
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                controller_unhealthy));
+    }
+    return result;
+}
+
+AdaptiveV2ManagerEvidenceResult
+AdaptiveV2ManagerSession::ingest_evidence(
+    const AuthenticatedReporter &authenticated_reporter,
+    const bytearray_t &canonical_payload) noexcept
+{
+    auto &state = *state_;
+    if (state.phase == State::Phase::unavailable)
+    {
+        AdaptiveV2ManagerEvidenceResult stopped;
+        stopped.status = AdaptiveV2ManagerIngressStatus::stopped;
+        stopped.ledger_high_watermark =
+            state.ingress.ledger().high_watermark();
+        return stopped;
+    }
+    auto result = state.ingress.ingest_evidence(
+        authenticated_reporter, canonical_payload);
+    if (result.status ==
+            AdaptiveV2ManagerIngressStatus::evidence_unhealthy &&
+        state.owns_cycle())
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                controller_unhealthy));
+    }
+    return result;
 }
 
 bool AdaptiveV2ManagerSession::begin_cycle(
@@ -232,6 +436,7 @@ bool AdaptiveV2ManagerSession::begin_cycle(
             std::numeric_limits<std::uint64_t>::max() ||
         state.next_cycle_ordinal ==
             std::numeric_limits<std::uint64_t>::max() ||
+        state.records.size() == state.records.max_size() ||
         !valid_policy(
             policy,
             state.config.controller.placement.shape.tree_count))
@@ -275,7 +480,9 @@ AdaptiveV2ManagerSession::evaluate() noexcept
     const auto result = state.controller->evaluate();
     if (result == AdaptiveV2ManagerControllerStatus::unhealthy)
     {
-        state.make_unavailable();
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                controller_unhealthy));
         return result;
     }
     if (result == AdaptiveV2ManagerControllerStatus::successor_ready ||
@@ -301,9 +508,15 @@ bool AdaptiveV2ManagerSession::start_convergence(
     const auto *bundle = successor_bundle();
     if (state.phase != State::Phase::successor_available ||
         state.controller == nullptr || state.convergence != nullptr ||
-        !state.current_policy.has_value() || bundle == nullptr ||
-        command_block_height == 0)
+        !state.current_policy.has_value())
     {
+        return false;
+    }
+    if (bundle == nullptr || command_block_height == 0)
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                convergence_start_failed));
         return false;
     }
 
@@ -318,6 +531,9 @@ bool AdaptiveV2ManagerSession::start_convergence(
             state.config.convergence_window_ticks,
             deadline))
     {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                convergence_start_failed));
         return false;
     }
     (void)activation_height;
@@ -344,14 +560,33 @@ bool AdaptiveV2ManagerSession::start_convergence(
     }
     catch (...)
     {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                convergence_start_failed));
         return false;
     }
 }
 
+std::vector<AdaptiveV2ManagerDeliveryRequest>
+AdaptiveV2ManagerSession::due_deliveries(
+    std::uint64_t logical_tick) noexcept
+{
+    auto &state = *state_;
+    if (state.phase != State::Phase::observing_successor ||
+        state.convergence == nullptr)
+    {
+        return {};
+    }
+    auto deliveries = state.convergence->due_deliveries(logical_tick);
+    static_cast<void>(finalize_convergence_failure_if_needed());
+    return deliveries;
+}
+
 AdaptiveV2ManagerConvergenceDisposition
-AdaptiveV2ManagerSession::observe_activation(
-    ReplicaID authenticated_replica,
-    const AdaptiveV2EpochActivatedObservation &observation) noexcept
+AdaptiveV2ManagerSession::record_enqueue_result(
+    ReplicaID recipient,
+    std::uint32_t attempt,
+    bool enqueued) noexcept
 {
     auto &state = *state_;
     if (state.phase != State::Phase::observing_successor ||
@@ -359,8 +594,68 @@ AdaptiveV2ManagerSession::observe_activation(
     {
         return AdaptiveV2ManagerConvergenceDisposition::terminal;
     }
-    return state.convergence->observe_activation(
+    const auto result = state.convergence->record_enqueue_result(
+        recipient, attempt, enqueued);
+    static_cast<void>(finalize_convergence_failure_if_needed());
+    return result;
+}
+
+AdaptiveV2ManagerConvergenceDisposition
+AdaptiveV2ManagerSession::observe_commit(
+    ReplicaID authenticated_replica,
+    const AdaptiveV2EpochChangeCommittedObservation &observation)
+    noexcept
+{
+    bool terminal_match = false;
+    const auto terminal = classify_terminal_commit(
+        authenticated_replica, observation, terminal_match);
+    if (terminal_match)
+        return terminal;
+
+    auto &state = *state_;
+    if (state.phase != State::Phase::observing_successor ||
+        state.convergence == nullptr)
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_wrong_identity;
+    }
+    const auto result = state.convergence->observe_commit(
         authenticated_replica, observation);
+    static_cast<void>(finalize_convergence_failure_if_needed());
+    return result;
+}
+
+AdaptiveV2ManagerConvergenceDisposition
+AdaptiveV2ManagerSession::observe_activation(
+    ReplicaID authenticated_replica,
+    const AdaptiveV2EpochActivatedObservation &observation) noexcept
+{
+    bool terminal_match = false;
+    const auto terminal = classify_terminal_activation(
+        authenticated_replica, observation, terminal_match);
+    if (terminal_match)
+        return terminal;
+
+    auto &state = *state_;
+    if (state.phase != State::Phase::observing_successor ||
+        state.convergence == nullptr)
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_wrong_identity;
+    }
+    const auto result = state.convergence->observe_activation(
+        authenticated_replica, observation);
+    static_cast<void>(finalize_convergence_failure_if_needed());
+    return result;
+}
+
+std::optional<AdaptiveV2ManagerConvergenceStatus>
+AdaptiveV2ManagerSession::convergence_status() const noexcept
+{
+    return state_->convergence == nullptr
+               ? std::nullopt
+               : std::optional<AdaptiveV2ManagerConvergenceStatus>{
+                     state_->convergence->status()};
 }
 
 bool AdaptiveV2ManagerSession::consume_ready_and_rotate() noexcept
@@ -388,52 +683,223 @@ bool AdaptiveV2ManagerSession::consume_ready_and_rotate() noexcept
             *state.command_block_height,
             state.config.active_tree_id))
     {
-        state.make_unavailable();
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                invalid_terminal_identity));
         return false;
     }
 
-    AdaptiveV2ManagerSessionTerminalRecord record{
-        state.next_cycle_ordinal,
-        state.current_policy->intent,
-        identity->predecessor_epoch_number,
-        identity->predecessor_epoch_digest,
-        identity->successor_epoch_number,
-        identity->successor_epoch_digest,
-        identity->command_payload_digest,
-        *identity};
+    const auto prepared = state.ingress.prepare_successor_rotation(
+        bundle->definition(), state.config.active_tree_id);
+    if (prepared != AdaptiveV2ManagerIngressStatus::processed)
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                successor_rotation_failed));
+        return false;
+    }
 
     if (!state.convergence->consume_ready_for_optimization())
     {
-        state.make_unavailable();
+        state.ingress.discard_prepared_window();
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                invalid_terminal_identity));
         return false;
     }
 
-    try
+    if (!state.append_terminal(
+            AdaptiveV2ManagerCycleOutcome::advanced,
+            AdaptiveV2ManagerCycleTerminalReason::successor_converged,
+            identity))
     {
-        state.records.push_back(std::move(record));
-    }
-    catch (...)
-    {
-        state.make_unavailable();
+        state.ingress.discard_prepared_window();
         return false;
     }
 
-    const auto rotated = state.ingress.rotate_to_successor(
-        bundle->definition(), state.config.active_tree_id);
-    if (rotated != AdaptiveV2ManagerIngressStatus::processed)
-    {
-        state.records.pop_back();
-        state.make_unavailable();
-        return false;
-    }
-
-    ++state.next_cycle_ordinal;
-    state.convergence.reset();
-    state.controller.reset();
-    state.current_policy.reset();
-    state.command_block_height.reset();
-    state.phase = State::Phase::evidence_window_open;
+    state.ingress.publish_prepared_window();
+    state.release_cycle(State::Phase::evidence_window_open);
     return true;
+}
+
+bool AdaptiveV2ManagerSession::finalize_noop_cycle(
+    AdaptiveV2ManagerCycleTerminalReason reason) noexcept
+{
+    const auto valid_reason =
+        reason == AdaptiveV2ManagerCycleTerminalReason::explicit_no_op;
+    auto &state = *state_;
+    if (!valid_reason ||
+        state.phase != State::Phase::collecting_cycle ||
+        state.convergence != nullptr || !state.owns_cycle())
+    {
+        return false;
+    }
+
+    const auto prepared =
+        state.ingress.prepare_same_epoch_window_reset();
+    if (prepared != AdaptiveV2ManagerIngressStatus::processed)
+    {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                evidence_window_reset_failed));
+        return false;
+    }
+    if (!state.append_terminal(
+            AdaptiveV2ManagerCycleOutcome::no_op, reason, nullptr))
+    {
+        state.ingress.discard_prepared_window();
+        return false;
+    }
+
+    state.ingress.publish_prepared_window();
+    state.release_cycle(State::Phase::evidence_window_open);
+    return true;
+}
+
+bool AdaptiveV2ManagerSession::finalize_failed_cycle(
+    AdaptiveV2ManagerCycleTerminalReason reason) noexcept
+{
+    switch (reason)
+    {
+    case AdaptiveV2ManagerCycleTerminalReason::controller_unhealthy:
+    case AdaptiveV2ManagerCycleTerminalReason::convergence_start_failed:
+    case AdaptiveV2ManagerCycleTerminalReason::
+        convergence_retry_exhausted:
+    case AdaptiveV2ManagerCycleTerminalReason::
+        convergence_conflicting_observation:
+    case AdaptiveV2ManagerCycleTerminalReason::invalid_terminal_identity:
+    case AdaptiveV2ManagerCycleTerminalReason::successor_rotation_failed:
+    case AdaptiveV2ManagerCycleTerminalReason::
+        evidence_window_reset_failed:
+    case AdaptiveV2ManagerCycleTerminalReason::caller_failed:
+        break;
+    case AdaptiveV2ManagerCycleTerminalReason::successor_converged:
+    case AdaptiveV2ManagerCycleTerminalReason::explicit_no_op:
+        return false;
+    }
+
+    auto &state = *state_;
+    if (!state.owns_cycle())
+        return false;
+    const auto *winning = state.convergence == nullptr
+        ? nullptr
+        : state.convergence->winning_identity();
+    if (!state.append_terminal(
+            AdaptiveV2ManagerCycleOutcome::failed,
+            reason,
+            winning))
+    {
+        return false;
+    }
+
+    state.ingress.discard_prepared_window();
+    state.release_cycle(State::Phase::unavailable);
+    return true;
+}
+
+bool AdaptiveV2ManagerSession::finalize_convergence_failure_if_needed()
+    noexcept
+{
+    const auto status = convergence_status();
+    if (!status.has_value())
+        return false;
+    switch (*status)
+    {
+    case AdaptiveV2ManagerConvergenceStatus::retry_exhausted:
+        return finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                convergence_retry_exhausted);
+    case AdaptiveV2ManagerConvergenceStatus::conflicting_observation:
+        return finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                convergence_conflicting_observation);
+    case AdaptiveV2ManagerConvergenceStatus::awaiting_activations:
+    case AdaptiveV2ManagerConvergenceStatus::ready_for_optimization:
+        return false;
+    }
+    return false;
+}
+
+AdaptiveV2ManagerConvergenceDisposition
+AdaptiveV2ManagerSession::classify_terminal_commit(
+    ReplicaID authenticated_replica,
+    const AdaptiveV2EpochChangeCommittedObservation &observation,
+    bool &matched) const noexcept
+{
+    matched = true;
+    const auto &members = state_->ingress.membership();
+    if (!std::binary_search(
+            members.begin(), members.end(), authenticated_replica))
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_nonmember;
+    }
+    if (authenticated_replica != observation.claimed_source_replica_id)
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_spoofed_source;
+    }
+    if (observation.schema_version ==
+        kAdaptiveV2ConvergenceObservationSchemaVersionV1)
+    {
+        for (auto record = state_->records.rbegin();
+             record != state_->records.rend();
+             ++record)
+        {
+            if (record->winning_activation.has_value() &&
+                *record->winning_activation == observation.identity)
+            {
+                return AdaptiveV2ManagerConvergenceDisposition::duplicate;
+            }
+        }
+    }
+    matched = false;
+    return AdaptiveV2ManagerConvergenceDisposition::
+        rejected_wrong_identity;
+}
+
+AdaptiveV2ManagerConvergenceDisposition
+AdaptiveV2ManagerSession::classify_terminal_activation(
+    ReplicaID authenticated_replica,
+    const AdaptiveV2EpochActivatedObservation &observation,
+    bool &matched) const noexcept
+{
+    matched = true;
+    const auto &members = state_->ingress.membership();
+    if (!std::binary_search(
+            members.begin(), members.end(), authenticated_replica))
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_nonmember;
+    }
+    if (authenticated_replica != observation.claimed_source_replica_id)
+    {
+        return AdaptiveV2ManagerConvergenceDisposition::
+            rejected_spoofed_source;
+    }
+    if (observation.schema_version ==
+        kAdaptiveV2ConvergenceObservationSchemaVersionV1)
+    {
+        for (auto record = state_->records.rbegin();
+             record != state_->records.rend();
+             ++record)
+        {
+            if (record->winning_activation.has_value() &&
+                *record->winning_activation == observation.identity)
+            {
+                return observation.activated_epoch_number ==
+                               observation.identity.successor_epoch_number &&
+                               observation.activated_epoch_digest ==
+                                   observation.identity.successor_epoch_digest
+                    ? AdaptiveV2ManagerConvergenceDisposition::duplicate
+                    : AdaptiveV2ManagerConvergenceDisposition::
+                          rejected_wrong_identity;
+            }
+        }
+    }
+    matched = false;
+    return AdaptiveV2ManagerConvergenceDisposition::
+        rejected_wrong_identity;
 }
 
 const std::vector<AdaptiveV2ManagerSessionTerminalRecord> &
