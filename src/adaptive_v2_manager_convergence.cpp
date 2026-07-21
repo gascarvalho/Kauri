@@ -464,6 +464,7 @@ struct AdaptiveV2ManagerConvergence::State
     std::map<ReplicaID, RecipientState> recipients;
     std::vector<CandidateActivationGroup> activation_groups;
     std::optional<AdaptiveV2EpochChangeIdentity> ready_identity;
+    std::vector<ReplicaID> ready_activation_sources;
     std::size_t ready_activation_count{0};
     AdaptiveV2ManagerConvergenceStatus convergence_status{
         AdaptiveV2ManagerConvergenceStatus::awaiting_activations};
@@ -750,7 +751,35 @@ AdaptiveV2ManagerConvergence::observe_activation(
         recipient.activated = observation;
         if (group_count >= state.required_activations)
         {
+            const auto *winning_group =
+                state.find_activation_group(observation.identity);
+            if (winning_group == nullptr ||
+                winning_group->sources.size() != group_count)
+            {
+                state.remove_activation_contribution(
+                    authenticated_replica, observation.identity);
+                recipient.activated.reset();
+                state.fail_conflicting();
+                return AdaptiveV2ManagerConvergenceDisposition::
+                    terminal;
+            }
+            auto winning_sources = winning_group->sources;
+            std::sort(
+                winning_sources.begin(), winning_sources.end());
+            if (std::adjacent_find(
+                    winning_sources.begin(),
+                    winning_sources.end()) != winning_sources.end())
+            {
+                state.remove_activation_contribution(
+                    authenticated_replica, observation.identity);
+                recipient.activated.reset();
+                state.fail_conflicting();
+                return AdaptiveV2ManagerConvergenceDisposition::
+                    terminal;
+            }
             state.ready_identity = observation.identity;
+            state.ready_activation_sources =
+                std::move(winning_sources);
             state.ready_activation_count = group_count;
             state.convergence_status =
                 AdaptiveV2ManagerConvergenceStatus::
@@ -802,6 +831,12 @@ std::size_t
 AdaptiveV2ManagerConvergence::winning_activation_count() const noexcept
 {
     return state_->ready_activation_count;
+}
+
+const std::vector<ReplicaID> &
+AdaptiveV2ManagerConvergence::winning_activation_sources() const noexcept
+{
+    return state_->ready_activation_sources;
 }
 
 bool AdaptiveV2ManagerConvergence::consume_ready_for_optimization()

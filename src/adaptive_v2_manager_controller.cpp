@@ -84,7 +84,9 @@ BaselineSnapshotStatus validate_baseline_snapshot(
     std::uint64_t cutoff,
     std::size_t accepted_record_count,
     const AdaptationPolicy &policy,
-    std::uint64_t seed)
+    std::uint64_t seed,
+    TreePolicyKind transition_intent,
+    std::size_t required_responsive)
 {
     if (snapshot.schema_version() != kAdaptationSchemaVersion ||
         snapshot.epoch() != epoch ||
@@ -98,7 +100,7 @@ BaselineSnapshotStatus validate_baseline_snapshot(
 
     std::vector<ReplicaID> ranked_members;
     ranked_members.reserve(snapshot.ranking().size());
-    bool all_responsive = true;
+    std::size_t responsive = 0;
     for (std::size_t index = 0;
          index < snapshot.ranking().size();
          ++index)
@@ -115,16 +117,30 @@ BaselineSnapshotStatus validate_baseline_snapshot(
         {
             return BaselineSnapshotStatus::invalid;
         }
-        if (!entry.eligible)
-            all_responsive = false;
+        if (entry.eligible)
+            ++responsive;
         ranked_members.push_back(entry.replica_id);
     }
     std::sort(ranked_members.begin(), ranked_members.end());
     if (ranked_members != membership)
         return BaselineSnapshotStatus::invalid;
-    return all_responsive
-               ? BaselineSnapshotStatus::responsive
-               : BaselineSnapshotStatus::incomplete;
+    switch (transition_intent)
+    {
+    case TreePolicyKind::fault_containment:
+        return responsive == membership.size()
+                   ? BaselineSnapshotStatus::responsive
+                   : BaselineSnapshotStatus::incomplete;
+    case TreePolicyKind::performance_optimization:
+        if (required_responsive == 0 ||
+            required_responsive > membership.size())
+        {
+            return BaselineSnapshotStatus::invalid;
+        }
+        return responsive >= required_responsive
+                   ? BaselineSnapshotStatus::responsive
+                   : BaselineSnapshotStatus::incomplete;
+    }
+    return BaselineSnapshotStatus::invalid;
 }
 
 } // namespace
@@ -192,7 +208,10 @@ struct AdaptiveV2ManagerController::State
             cutoff,
             prefix.size,
             config.selection.responsiveness_policy,
-            config.selection.snapshot_seed);
+            config.selection.snapshot_seed,
+            config.transition_policy.intent,
+            static_cast<std::size_t>(
+                ingress.quorum_metadata().quorum));
         if (baseline == BaselineSnapshotStatus::invalid)
             return fail_closed();
         if (baseline == BaselineSnapshotStatus::incomplete)
@@ -305,7 +324,7 @@ AdaptiveV2ManagerController::evaluate() noexcept
             return state.fail_closed();
         if (state.successor != nullptr)
             return AdaptiveV2ManagerControllerStatus::already_ready;
-        if (!state.ingress.all_members_ready())
+        if (!state.ingress.operationally_ready())
             return AdaptiveV2ManagerControllerStatus::awaiting_readiness;
 
         const auto cutoff = state.ingress.ledger().high_watermark();

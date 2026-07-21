@@ -113,6 +113,8 @@ public:
     const AdaptiveV2EpochChangeIdentity *winning_identity() const
         noexcept;
     std::size_t winning_activation_count() const noexcept;
+    const std::vector<ReplicaID> &winning_activation_sources() const
+        noexcept;
     bool consume_ready_for_optimization() noexcept;
 
 private:

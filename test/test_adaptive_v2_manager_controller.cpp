@@ -229,7 +229,7 @@ struct Fixture
             source,
             ++readiness_sequences[source],
             ingress.current_configuration(),
-            kActivationGeneration,
+            ingress.activation_generation(),
             static_cast<std::uint64_t>(100 + source)};
         const auto result = ingress.ingest_readiness(
             AuthenticatedReporter{source},
@@ -248,7 +248,7 @@ struct Fixture
 
     void admit(const ResponseObservation &observation)
     {
-        for (ReplicaID source = 0; source < 3; ++source)
+        for (ReplicaID source = 2; source < 5; ++source)
         {
             const ProposalLifecycleNotice notice{
                 hotstuff::kProposalLifecycleNoticeSchemaVersion,
@@ -261,7 +261,7 @@ struct Fixture
                 AuthenticatedReporter{source},
                 hotstuff::encode_proposal_lifecycle_notice(
                     notice, limits.lifecycle_wire));
-            if (source < 2)
+            if (source < 4)
             {
                 REQUIRE(result.status ==
                         AdaptiveV2ManagerIngressStatus::
@@ -301,7 +301,9 @@ struct Fixture
         value.reporter_id = edge.reporter;
         value.observed_replica_id = target;
         value.configuration = ConfigurationId{
-            0, edge.tree_id, ingress.current_epoch().epoch_digest()};
+            ingress.current_epoch().epoch_number(),
+            edge.tree_id,
+            ingress.current_epoch().epoch_digest()};
         value.block_hash = digest(
             label + "-" + std::to_string(++proposal_counter));
         value.expected_message_type = ExpectedMessageType::direct_vote;
@@ -404,6 +406,85 @@ struct Fixture
         return recorded;
     }
 };
+
+EpochDefinitionInput exact_epoch_one(
+    const AdaptiveV2ManagerIngress &ingress)
+{
+    auto input = epoch_zero();
+    input.epoch_number = 1;
+    input.previous_epoch_digest =
+        ingress.current_epoch().epoch_digest();
+    input.membership_digest =
+        ingress.current_epoch().membership_digest();
+    input.policy_version = "adaptive-v2-live-survivor-baseline-v1";
+    input.evidence_snapshot_id = "fresh-exact-e1";
+    input.evidence_cutoff = 0;
+    input.epoch_digest.reset();
+    input.epoch_digest = hotstuff::compute_epoch_digest(input);
+    return input;
+}
+
+void rotate_to_exact_epoch_one(
+    Fixture &fixture,
+    TreePolicyKind policy)
+{
+    fixture.controller.reset();
+    const auto successor = exact_epoch_one(fixture.ingress);
+    REQUIRE(fixture.ingress.rotate_to_successor(successor, 0) ==
+            AdaptiveV2ManagerIngressStatus::processed);
+    fixture.config.transition_policy.intent = policy;
+    if (policy == TreePolicyKind::fault_containment)
+    {
+        fixture.config.transition_policy.containment_baseline_roots = {
+            BaselineRoot{0, 0},
+            BaselineRoot{1, 1},
+            BaselineRoot{2, 2},
+            BaselineRoot{3, 3},
+            BaselineRoot{4, 4}};
+    }
+    else
+    {
+        fixture.config.transition_policy
+            .containment_baseline_roots.clear();
+    }
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+}
+
+void ready_live_survivors(Fixture &fixture)
+{
+    for (const auto source :
+         std::vector<ReplicaID>{2, 3, 4, 5, 6})
+    {
+        fixture.ready(source);
+    }
+    REQUIRE(fixture.ingress.operationally_ready());
+    REQUIRE_FALSE(fixture.ingress.all_members_ready());
+}
+
+void record_live_survivor_baseline(Fixture &fixture)
+{
+    for (const auto target :
+         std::vector<ReplicaID>{2, 3, 4, 5, 6})
+    {
+        std::size_t reporter_index = 0;
+        while (reporter_index < 3 &&
+               leaf_edge(target, reporter_index).reporter < 2)
+        {
+            ++reporter_index;
+        }
+        REQUIRE(reporter_index < 3);
+        for (std::uint32_t attempt = 0; attempt < 2; ++attempt)
+        {
+            fixture.record(
+                target,
+                reporter_index,
+                ResponseOutcome::on_time,
+                "e1-live-baseline-" + std::to_string(target));
+        }
+    }
+}
 
 template<typename Config, typename = void>
 struct has_controller_transition_policy : std::false_type
@@ -533,6 +614,18 @@ TEST_CASE(
     "[adaptive-v2][manager-controller][baseline][n7]")
 {
     Fixture fixture;
+    fixture.controller.reset();
+    fixture.config.transition_policy.intent =
+        TreePolicyKind::fault_containment;
+    fixture.config.transition_policy.containment_baseline_roots = {
+        BaselineRoot{0, 0},
+        BaselineRoot{1, 1},
+        BaselineRoot{2, 2},
+        BaselineRoot{3, 3},
+        BaselineRoot{4, 4}};
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
     CHECK(fixture.controller->evaluate() ==
           AdaptiveV2ManagerControllerStatus::awaiting_readiness);
     CHECK_FALSE(fixture.controller->baseline_frozen());
@@ -583,6 +676,119 @@ TEST_CASE(
     CHECK(fixture.controller->baseline_audit_snapshot() == baseline);
     CHECK(fixture.controller->selection_audit() == nullptr);
     CHECK(fixture.controller->healthy());
+}
+
+TEST_CASE(
+    "controller progresses at operational Q5 and waits below quorum",
+    "[adaptive-v2][manager-controller][readiness][operational][quorum]"
+    "[n7][intentional-red]")
+{
+    Fixture fixture;
+    for (const auto source :
+         std::vector<ReplicaID>{2, 3, 4, 5})
+    {
+        fixture.ready(source);
+    }
+    CHECK_FALSE(fixture.ingress.operationally_ready());
+    CHECK(fixture.controller->evaluate() ==
+          AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+
+    fixture.ready(6);
+    REQUIRE(fixture.ingress.operationally_ready());
+    REQUIRE_FALSE(fixture.ingress.all_members_ready());
+    CHECK(fixture.ingress.quorum_metadata().replica_count == 7);
+    CHECK(fixture.ingress.quorum_metadata().fault_threshold == 2);
+    CHECK(fixture.ingress.quorum_metadata().quorum == 5);
+    CHECK(fixture.controller->evaluate() ==
+          AdaptiveV2ManagerControllerStatus::
+              awaiting_responsive_baseline);
+}
+
+TEST_CASE(
+    "explicit optimization policy freezes a fresh E1 Q5 survivor baseline",
+    "[adaptive-v2][manager-controller][baseline][transition-policy][n7]"
+    "[live-feasibility][intentional-red]")
+{
+    SECTION("fault containment still requires a pre-fault baseline")
+    {
+        Fixture containment;
+        rotate_to_exact_epoch_one(
+            containment, TreePolicyKind::fault_containment);
+        ready_live_survivors(containment);
+        record_live_survivor_baseline(containment);
+
+        CHECK(containment.controller->evaluate() ==
+              AdaptiveV2ManagerControllerStatus::
+                  awaiting_responsive_baseline);
+        CHECK_FALSE(containment.controller->baseline_frozen());
+        CHECK(containment.controller->successor_bundle() == nullptr);
+    }
+
+    SECTION(
+        "performance optimization admits Q5 then needs fresh guarded evidence")
+    {
+        Fixture optimization;
+        rotate_to_exact_epoch_one(
+            optimization, TreePolicyKind::performance_optimization);
+        ready_live_survivors(optimization);
+        record_live_survivor_baseline(optimization);
+
+        const auto baseline_cutoff =
+            optimization.ingress.ledger().high_watermark();
+        REQUIRE(baseline_cutoff == 10);
+        REQUIRE(optimization.controller->evaluate() ==
+                AdaptiveV2ManagerControllerStatus::baseline_frozen);
+        REQUIRE(optimization.controller->baseline_audit_snapshot() !=
+                nullptr);
+        CHECK(optimization.controller->baseline_cutoff() ==
+              baseline_cutoff);
+        for (const auto live :
+             std::vector<ReplicaID>{2, 3, 4, 5, 6})
+        {
+            const auto *entry = ranking_entry(
+                *optimization.controller->baseline_audit_snapshot(),
+                live);
+            REQUIRE(entry != nullptr);
+            CHECK(entry->classification ==
+                  ResponsivenessClass::responsive);
+            CHECK(entry->eligible);
+        }
+        for (const auto crashed :
+             std::vector<ReplicaID>{0, 1})
+        {
+            const auto *entry = ranking_entry(
+                *optimization.controller->baseline_audit_snapshot(),
+                crashed);
+            REQUIRE(entry != nullptr);
+            CHECK((entry->classification ==
+                       ResponsivenessClass::insufficient_evidence ||
+                   entry->classification ==
+                       ResponsivenessClass::nonresponsive));
+            CHECK_FALSE(entry->eligible);
+        }
+
+        CHECK(optimization.controller->evaluate() ==
+              AdaptiveV2ManagerControllerStatus::
+                  awaiting_guarded_selection);
+        CHECK(optimization.controller->successor_bundle() == nullptr);
+        CHECK(optimization.controller->current_cutoff() ==
+              baseline_cutoff);
+
+        optimization.persistent_timeouts(0);
+        optimization.persistent_timeouts(1);
+        REQUIRE(optimization.ingress.ledger().high_watermark() >
+                baseline_cutoff);
+        REQUIRE(optimization.controller->evaluate() ==
+                AdaptiveV2ManagerControllerStatus::successor_ready);
+        REQUIRE(optimization.controller->selection_audit() != nullptr);
+        CHECK(optimization.controller->selection_audit()
+                  ->metadata.baseline_cutoff == baseline_cutoff);
+        CHECK(optimization.controller->selection_audit()
+                  ->metadata.evidence_cutoff > baseline_cutoff);
+        CHECK(optimization.controller->selection_audit()
+                  ->selected_replicas ==
+              std::vector<ReplicaID>{0, 1});
+    }
 }
 
 TEST_CASE(

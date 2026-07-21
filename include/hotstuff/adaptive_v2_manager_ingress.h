@@ -214,6 +214,9 @@ private:
     AdaptiveV2ManagerIngressStatus prepare_successor_rotation(
         const EpochDefinitionInput &successor,
         std::uint32_t active_tree_id) noexcept;
+    AdaptiveV2ManagerIngressStatus seed_prepared_successor_readiness(
+        const std::vector<ReplicaID> &sources,
+        std::uint64_t committed_height) noexcept;
     void publish_prepared_window() noexcept;
     void discard_prepared_window() noexcept;
 

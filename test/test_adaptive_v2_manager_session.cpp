@@ -417,6 +417,51 @@ struct has_convergence_accessor<
         std::declval<Session &>().convergence())>> : std::true_type
 {};
 
+template<typename Session, typename = void>
+struct has_bounded_execution_audit : std::false_type
+{};
+
+template<typename Session>
+struct has_bounded_execution_audit<
+    Session,
+    std::void_t<
+        decltype(std::declval<const Session &>()
+                     .controller_audit()
+                     .has_value()),
+        decltype(std::declval<const Session &>()
+                     .controller_audit()
+                     ->baseline_cutoff),
+        decltype(std::declval<const Session &>()
+                     .controller_audit()
+                     ->current_cutoff),
+        decltype(std::declval<const Session &>()
+                     .controller_audit()
+                     ->score_trajectory.size()),
+        decltype(std::declval<const Session &>()
+                     .convergence_audit()
+                     .has_value()),
+        decltype(std::declval<const Session &>()
+                     .convergence_audit()
+                     ->status),
+        decltype(std::declval<const Session &>()
+                     .convergence_audit()
+                     ->accepted_commit_count),
+        decltype(std::declval<const Session &>()
+                     .convergence_audit()
+                     ->accepted_activation_count),
+        decltype(std::declval<const Session &>()
+                     .convergence_audit()
+                     ->winning_activation_count),
+        decltype(std::declval<const Session &>()
+                     .convergence_audit()
+                     ->winning_identity.has_value()),
+        decltype(std::declval<const Session &>()
+                     .convergence_audit()
+                     ->winning_activation_sources.size()),
+        decltype(std::declval<Session &>().shutdown())>>
+    : std::true_type
+{};
+
 template<typename Value, typename = void>
 struct is_optional_like : std::false_type
 {};
@@ -462,7 +507,9 @@ struct Fixture
                 ++readiness_sequences[source],
                 session.ingress().current_configuration(),
                 session.ingress().activation_generation(),
-                static_cast<std::uint64_t>(100 + source)};
+                static_cast<std::uint64_t>(
+                    1'000'000 + readiness_sequences[source] * 100 +
+                    source)};
             CHECK(route_readiness(
                       session,
                       AuthenticatedReporter{source},
@@ -585,7 +632,11 @@ struct Fixture
     {
         REQUIRE(session.begin_cycle(policy));
         CHECK(session.evaluate() ==
-              AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+              (session.ingress().operationally_ready()
+                   ? AdaptiveV2ManagerControllerStatus::
+                         awaiting_responsive_baseline
+                   : AdaptiveV2ManagerControllerStatus::
+                         awaiting_readiness));
         ready_all();
         responsive_baseline();
         REQUIRE(session.evaluate() ==
@@ -1266,6 +1317,98 @@ void verify_terminal_outcome_contract()
     }
 }
 
+template<typename Session>
+void verify_bounded_execution_audit_contract()
+{
+    if constexpr (!has_bounded_execution_audit<Session>::value)
+    {
+        FAIL(
+            "M12-R02 RED: the session lacks bounded read-only controller "
+            "and convergence audit snapshots plus an owned shutdown seam");
+    }
+    else
+    {
+        Fixture fixture;
+        Session &session = fixture.session;
+        const auto identity = fixture.prepare_convergence(
+            containment_policy(), 1'400, 140);
+        const Session &read_only = session;
+
+        const auto controller = read_only.controller_audit();
+        REQUIRE(controller.has_value());
+        CHECK(controller->baseline_cutoff > 0);
+        CHECK(controller->current_cutoff >= controller->baseline_cutoff);
+        CHECK_FALSE(controller->score_trajectory.empty());
+        CHECK(controller->score_trajectory.size() <=
+              session_config().controller.reputation_limits
+                  .maximum_audit_updates);
+
+        auto convergence = read_only.convergence_audit();
+        REQUIRE(convergence.has_value());
+        CHECK(convergence->status ==
+              AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+        CHECK(convergence->accepted_commit_count == 0);
+        CHECK(convergence->accepted_activation_count == 0);
+        CHECK(convergence->winning_activation_count == 0);
+        CHECK_FALSE(convergence->winning_identity.has_value());
+        CHECK(convergence->winning_activation_sources.empty());
+
+        for (const auto source : kSurvivors)
+        {
+            CHECK(session.observe_commit(
+                      source,
+                      AdaptiveV2EpochChangeCommittedObservation{
+                          hotstuff::
+                              kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                          source,
+                          identity}) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+            CHECK(session.observe_activation(
+                      source,
+                      AdaptiveV2EpochActivatedObservation{
+                          hotstuff::
+                              kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                          source,
+                          identity,
+                          identity.successor_epoch_number,
+                          identity.successor_epoch_digest}) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+        }
+
+        convergence = read_only.convergence_audit();
+        REQUIRE(convergence.has_value());
+        CHECK(convergence->status ==
+              AdaptiveV2ManagerConvergenceStatus::ready_for_optimization);
+        CHECK(convergence->accepted_commit_count == 5);
+        CHECK(convergence->accepted_activation_count == 5);
+        CHECK(convergence->winning_activation_count == 5);
+        REQUIRE(convergence->winning_identity.has_value());
+        CHECK(*convergence->winning_identity == identity);
+        CHECK(convergence->winning_activation_sources == kSurvivors);
+
+        Fixture stopping;
+        Session &stopped = stopping.session;
+        stopped.shutdown();
+        CHECK_FALSE(stopped.ingress().healthy());
+        CHECK_FALSE(stopped.begin_cycle(containment_policy()));
+
+        Fixture active_stopping;
+        Session &active = active_stopping.session;
+        REQUIRE(active.begin_cycle(containment_policy()));
+        active.shutdown();
+        REQUIRE(active.terminal_records().size() == 1);
+        CHECK(active.terminal_records().front().outcome ==
+              hotstuff::AdaptiveV2ManagerCycleOutcome::failed);
+        CHECK(active.terminal_records().front().reason ==
+              hotstuff::AdaptiveV2ManagerCycleTerminalReason::
+                  caller_failed);
+        CHECK(active.ingress().current_epoch().epoch_number() == 0);
+        CHECK_FALSE(active.ingress().healthy());
+        active.shutdown();
+        CHECK(active.terminal_records().size() == 1);
+    }
+}
+
 } // namespace
 
 TEST_CASE(
@@ -1410,6 +1553,120 @@ TEST_CASE(
     "[intentional-red]")
 {
     verify_precommit_delivery_contract<AdaptiveV2ManagerSession>();
+}
+
+TEST_CASE(
+    "Q-winning activations seed the exact fresh successor readiness window",
+    "[adaptive-v2][manager-session][successor-readiness][quorum][n7]"
+    "[m12-r02][intentional-red]")
+{
+    Fixture fixture;
+    const auto predecessor_configuration =
+        fixture.session.ingress().current_configuration();
+    const auto predecessor_generation =
+        fixture.session.ingress().activation_generation();
+    const auto identity = fixture.complete_cycle(
+        containment_policy(), 1'300, 130);
+
+    const auto seeded = fixture.session.ingress().readiness_stats();
+    REQUIRE(seeded.ready_members == 5);
+    CHECK_FALSE(seeded.all_members_ready);
+    CHECK(fixture.session.ingress().operationally_ready());
+    CHECK(fixture.session.ingress().membership() == kMembers);
+    CHECK(fixture.session.ingress().quorum_metadata().replica_count == 7);
+    CHECK(fixture.session.ingress().quorum_metadata().fault_threshold == 2);
+    CHECK(fixture.session.ingress().quorum_metadata().quorum == 5);
+
+    const auto successor_configuration =
+        fixture.session.ingress().current_configuration();
+    const auto successor_generation =
+        fixture.session.ingress().activation_generation();
+    REQUIRE(identity.activation_height > 0);
+    for (const auto source : kSurvivors)
+    {
+        const auto deliver = [&](std::uint64_t sequence,
+                                 std::uint64_t height) {
+            return route_readiness(
+                fixture.session,
+                AuthenticatedReporter{source},
+                hotstuff::encode_adaptive_v2_readiness_notice(
+                    AdaptiveV2ReadinessNotice{
+                        hotstuff::
+                            kAdaptiveV2ReadinessNoticeSchemaVersionV1,
+                        source,
+                        sequence,
+                        successor_configuration,
+                        successor_generation,
+                        height},
+                    session_config().ingress_limits.readiness_wire));
+        };
+        CHECK(deliver(1, identity.activation_height).status ==
+              AdaptiveV2ManagerIngressStatus::rejected_sequence);
+        CHECK(deliver(2, identity.activation_height - 1).status ==
+              AdaptiveV2ManagerIngressStatus::
+                  rejected_height_regression);
+        CHECK(deliver(2, identity.activation_height).status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+    }
+    CHECK(fixture.session.ingress().readiness_stats().ready_members == 5);
+
+    const AdaptiveV2ReadinessNotice stale_predecessor{
+        hotstuff::kAdaptiveV2ReadinessNoticeSchemaVersionV1,
+        0,
+        2,
+        predecessor_configuration,
+        predecessor_generation,
+        identity.activation_height};
+    CHECK(route_readiness(
+              fixture.session,
+              AuthenticatedReporter{0},
+              hotstuff::encode_adaptive_v2_readiness_notice(
+                  stale_predecessor,
+                  session_config().ingress_limits.readiness_wire))
+              .status ==
+          AdaptiveV2ManagerIngressStatus::rejected_configuration);
+    CHECK(fixture.session.ingress().readiness_stats().ready_members == 5);
+    CHECK(fixture.session.ingress().current_epoch().epoch_number() == 1);
+
+    Fixture below_quorum;
+    const auto below_identity = below_quorum.prepare_convergence(
+        containment_policy(), 1'500, 150);
+    for (const auto source :
+         std::vector<ReplicaID>{2, 3, 4, 5})
+    {
+        CHECK(below_quorum.session.observe_commit(
+                  source,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      source,
+                      below_identity}) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+        CHECK(below_quorum.session.observe_activation(
+                  source,
+                  AdaptiveV2EpochActivatedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      source,
+                      below_identity,
+                      below_identity.successor_epoch_number,
+                      below_identity.successor_epoch_digest}) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+    }
+    REQUIRE(below_quorum.session.convergence_status().has_value());
+    CHECK(*below_quorum.session.convergence_status() ==
+          AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+    CHECK_FALSE(below_quorum.session.consume_ready_and_rotate());
+    CHECK(below_quorum.session.ingress().current_epoch().epoch_number() == 0);
+    CHECK(below_quorum.session.terminal_records().empty());
+}
+
+TEST_CASE(
+    "session exposes bounded audit snapshots and owned shutdown",
+    "[adaptive-v2][manager-session][audit][shutdown][m12-r02]"
+    "[intentional-red]")
+{
+    verify_bounded_execution_audit_contract<AdaptiveV2ManagerSession>();
 }
 
 TEST_CASE(

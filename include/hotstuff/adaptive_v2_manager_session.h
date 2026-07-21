@@ -5,6 +5,7 @@
 #ifndef HOTSTUFF_ADAPTIVE_V2_MANAGER_SESSION_H_INCLUDED
 #define HOTSTUFF_ADAPTIVE_V2_MANAGER_SESSION_H_INCLUDED
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -70,6 +71,24 @@ struct AdaptiveV2ManagerSessionTerminalRecord
     std::optional<uint256_t> successor_epoch_digest;
     std::optional<uint256_t> command_payload_digest;
     std::optional<AdaptiveV2EpochChangeIdentity> winning_activation;
+};
+
+struct AdaptiveV2ManagerControllerAuditSnapshot
+{
+    std::uint64_t baseline_cutoff{0};
+    std::uint64_t current_cutoff{0};
+    std::vector<EvidenceReputationAuditUpdate> score_trajectory;
+};
+
+struct AdaptiveV2ManagerConvergenceAuditSnapshot
+{
+    AdaptiveV2ManagerConvergenceStatus status{
+        AdaptiveV2ManagerConvergenceStatus::awaiting_activations};
+    std::size_t accepted_commit_count{0};
+    std::size_t accepted_activation_count{0};
+    std::size_t winning_activation_count{0};
+    std::optional<AdaptiveV2EpochChangeIdentity> winning_identity;
+    std::vector<ReplicaID> winning_activation_sources;
 };
 
 /**
@@ -140,6 +159,10 @@ public:
         const AdaptiveV2EpochActivatedObservation &observation) noexcept;
     std::optional<AdaptiveV2ManagerConvergenceStatus>
     convergence_status() const noexcept;
+    std::optional<AdaptiveV2ManagerControllerAuditSnapshot>
+    controller_audit() const noexcept;
+    std::optional<AdaptiveV2ManagerConvergenceAuditSnapshot>
+    convergence_audit() const noexcept;
     bool consume_ready_and_rotate() noexcept;
 
     bool finalize_noop_cycle(
@@ -149,6 +172,7 @@ public:
 
     const std::vector<AdaptiveV2ManagerSessionTerminalRecord> &
     terminal_records() const noexcept;
+    void shutdown() noexcept;
 
 private:
     bool finalize_convergence_failure_if_needed() noexcept;

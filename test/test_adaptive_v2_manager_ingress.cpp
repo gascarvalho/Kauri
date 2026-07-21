@@ -623,6 +623,38 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "operational readiness is fixed Q5 without requiring all N7",
+    "[adaptive-v2][manager-ingress][readiness][operational][quorum][n7]")
+{
+    const auto configured = limits();
+    AdaptiveV2ManagerIngress manager(
+        membership(), epoch_zero(), 0, 3, configured);
+    const std::vector<ReplicaID> survivors{2, 3, 4, 5, 6};
+
+    for (std::size_t index = 0; index < survivors.size(); ++index)
+    {
+        const auto source = survivors[index];
+        REQUIRE(manager.ingest_readiness(
+                    AuthenticatedReporter{source},
+                    hotstuff::encode_adaptive_v2_readiness_notice(
+                        readiness(manager, source),
+                        configured.readiness_wire))
+                    .status ==
+                AdaptiveV2ManagerIngressStatus::processed);
+        CHECK(manager.operationally_ready() == (index + 1 == 5));
+    }
+
+    const auto stats = manager.readiness_stats();
+    CHECK(stats.total_members == 7);
+    CHECK(stats.ready_members == 5);
+    CHECK_FALSE(stats.all_members_ready);
+    CHECK_FALSE(manager.all_members_ready());
+    CHECK(manager.quorum_metadata().replica_count == 7);
+    CHECK(manager.quorum_metadata().fault_threshold == 2);
+    CHECK(manager.quorum_metadata().quorum == 5);
+}
+
+TEST_CASE(
     "readiness rejects spoof replay configuration and generation drift",
     "[adaptive-v2][manager-ingress][readiness][negative]")
 {

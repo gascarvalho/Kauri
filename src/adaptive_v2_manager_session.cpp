@@ -738,6 +738,59 @@ AdaptiveV2ManagerSession::convergence_status() const noexcept
                      state_->convergence->status()};
 }
 
+std::optional<AdaptiveV2ManagerControllerAuditSnapshot>
+AdaptiveV2ManagerSession::controller_audit() const noexcept
+{
+    const auto &state = *state_;
+    if (state.controller == nullptr)
+        return std::nullopt;
+    try
+    {
+        AdaptiveV2ManagerControllerAuditSnapshot snapshot;
+        snapshot.baseline_cutoff =
+            state.controller->baseline_cutoff();
+        snapshot.current_cutoff =
+            state.controller->current_cutoff();
+        snapshot.score_trajectory =
+            state.controller->score_trajectory();
+        return snapshot;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+std::optional<AdaptiveV2ManagerConvergenceAuditSnapshot>
+AdaptiveV2ManagerSession::convergence_audit() const noexcept
+{
+    const auto &state = *state_;
+    if (state.convergence == nullptr)
+        return std::nullopt;
+    try
+    {
+        AdaptiveV2ManagerConvergenceAuditSnapshot snapshot;
+        snapshot.status = state.convergence->status();
+        snapshot.accepted_commit_count =
+            state.convergence->accepted_commit_count();
+        snapshot.accepted_activation_count =
+            state.convergence->accepted_activation_count();
+        snapshot.winning_activation_count =
+            state.convergence->winning_activation_count();
+        const auto *identity =
+            state.convergence->winning_identity();
+        if (identity != nullptr)
+            snapshot.winning_identity = *identity;
+        snapshot.winning_activation_sources =
+            state.convergence->winning_activation_sources();
+        return snapshot;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
 bool AdaptiveV2ManagerSession::consume_ready_and_rotate() noexcept
 {
     auto &state = *state_;
@@ -753,7 +806,13 @@ bool AdaptiveV2ManagerSession::consume_ready_and_rotate() noexcept
 
     const auto *bundle = state.controller->successor_bundle();
     const auto *identity = state.convergence->winning_identity();
+    const auto &winning_sources =
+        state.convergence->winning_activation_sources();
     if (bundle == nullptr || identity == nullptr ||
+        winning_sources.size() !=
+            state.convergence->winning_activation_count() ||
+        winning_sources.size() != static_cast<std::size_t>(
+            state.ingress.quorum_metadata().quorum) ||
         state.records.capacity() <= state.records.size() ||
         !exact_terminal_identity(
             state.ingress,
@@ -771,6 +830,18 @@ bool AdaptiveV2ManagerSession::consume_ready_and_rotate() noexcept
         bundle->definition(), state.config.active_tree_id);
     if (prepared != AdaptiveV2ManagerIngressStatus::processed)
     {
+        static_cast<void>(finalize_failed_cycle(
+            AdaptiveV2ManagerCycleTerminalReason::
+                successor_rotation_failed));
+        return false;
+    }
+
+    const auto seeded =
+        state.ingress.seed_prepared_successor_readiness(
+            winning_sources, identity->activation_height);
+    if (seeded != AdaptiveV2ManagerIngressStatus::processed)
+    {
+        state.ingress.discard_prepared_window();
         static_cast<void>(finalize_failed_cycle(
             AdaptiveV2ManagerCycleTerminalReason::
                 successor_rotation_failed));
@@ -984,6 +1055,29 @@ const std::vector<AdaptiveV2ManagerSessionTerminalRecord> &
 AdaptiveV2ManagerSession::terminal_records() const noexcept
 {
     return state_->records;
+}
+
+void AdaptiveV2ManagerSession::shutdown() noexcept
+{
+    auto &state = *state_;
+    if (state.owns_cycle())
+    {
+        if (!finalize_failed_cycle(
+                AdaptiveV2ManagerCycleTerminalReason::caller_failed))
+        {
+            return;
+        }
+    }
+    else if (state.phase != State::Phase::unavailable)
+    {
+        state.convergence.reset();
+        state.controller.reset();
+        state.current_policy.reset();
+        state.commit_bindings.clear();
+        state.phase = State::Phase::unavailable;
+    }
+    state.ingress.discard_prepared_window();
+    state.ingress.shutdown();
 }
 
 } // namespace hotstuff

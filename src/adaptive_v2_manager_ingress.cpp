@@ -312,6 +312,7 @@ struct AdaptiveV2ManagerIngress::State
             readiness.emplace(member, ReadinessEntry{});
             lifecycle_sources.emplace(member, LifecycleSourceEntry{});
         }
+        prepared_readiness_sources.reserve(membership.size());
         if (!window->proposal_index.healthy() ||
             !window->ledger.healthy() ||
             !window->coordinator.healthy())
@@ -615,14 +616,19 @@ struct AdaptiveV2ManagerIngress::State
     {
         for (auto &source : readiness)
         {
-            source.second.committed_height = 0;
-            source.second.ready = false;
+            source.second.ready = std::binary_search(
+                prepared_readiness_sources.begin(),
+                prepared_readiness_sources.end(),
+                source.first);
+            source.second.committed_height = source.second.ready
+                ? prepared_readiness_height
+                : 0;
         }
         for (auto &source : lifecycle_sources)
             source.second.pending_associations = 0;
         pending_lifecycle_votes.clear();
         pending_lifecycle_associations = 0;
-        ready_members = 0;
+        ready_members = prepared_readiness_sources.size();
         readiness_accepted = 0;
         readiness_rejected = 0;
         current_epoch = prepared_epoch;
@@ -633,6 +639,8 @@ struct AdaptiveV2ManagerIngress::State
         prepared_epoch = nullptr;
         prepared_configuration = ConfigurationId{};
         prepared_activation_generation = 0;
+        prepared_readiness_sources.clear();
+        prepared_readiness_height = 0;
     }
 
     std::vector<ReplicaID> membership;
@@ -647,6 +655,8 @@ struct AdaptiveV2ManagerIngress::State
     ConfigurationId prepared_configuration;
     std::uint64_t activation_generation{0};
     std::uint64_t prepared_activation_generation{0};
+    std::vector<ReplicaID> prepared_readiness_sources;
+    std::uint64_t prepared_readiness_height{0};
     std::map<ReplicaID, ReadinessEntry> readiness;
     std::map<ReplicaID, LifecycleSourceEntry> lifecycle_sources;
     std::map<CorroboratedLifecycleFact, CorroboratingSources>
@@ -1788,6 +1798,59 @@ AdaptiveV2ManagerIngress::prepare_successor_rotation(
     return AdaptiveV2ManagerIngressStatus::processed;
 }
 
+AdaptiveV2ManagerIngressStatus
+AdaptiveV2ManagerIngress::seed_prepared_successor_readiness(
+    const std::vector<ReplicaID> &sources,
+    std::uint64_t committed_height) noexcept
+{
+    auto &state = *state_;
+    if (state.stopped)
+        return AdaptiveV2ManagerIngressStatus::stopped;
+    if (!state.operational())
+    {
+        state.fail_closed();
+        return AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
+    }
+    if (state.prepared_window == nullptr ||
+        state.prepared_epoch == nullptr ||
+        state.prepared_epoch == state.current_epoch ||
+        !state.prepared_readiness_sources.empty() ||
+        state.prepared_readiness_height != 0 ||
+        committed_height == 0 ||
+        sources.size() !=
+            static_cast<std::size_t>(state.quorum.quorum))
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_configuration;
+    }
+
+    try
+    {
+        auto canonical_sources = sources;
+        std::sort(canonical_sources.begin(), canonical_sources.end());
+        if (std::adjacent_find(
+                canonical_sources.begin(),
+                canonical_sources.end()) != canonical_sources.end() ||
+            !std::all_of(
+                canonical_sources.begin(),
+                canonical_sources.end(),
+                [&state](ReplicaID source) {
+                    return state.is_member(source);
+                }))
+        {
+            return AdaptiveV2ManagerIngressStatus::
+                rejected_configuration;
+        }
+        state.prepared_readiness_sources =
+            std::move(canonical_sources);
+        state.prepared_readiness_height = committed_height;
+        return AdaptiveV2ManagerIngressStatus::processed;
+    }
+    catch (...)
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_capacity;
+    }
+}
+
 void AdaptiveV2ManagerIngress::publish_prepared_window() noexcept
 {
     auto &state = *state_;
@@ -1807,6 +1870,8 @@ void AdaptiveV2ManagerIngress::discard_prepared_window() noexcept
     state.prepared_epoch = nullptr;
     state.prepared_configuration = ConfigurationId{};
     state.prepared_activation_generation = 0;
+    state.prepared_readiness_sources.clear();
+    state.prepared_readiness_height = 0;
 }
 
 AdaptiveV2ManagerIngressStatus
