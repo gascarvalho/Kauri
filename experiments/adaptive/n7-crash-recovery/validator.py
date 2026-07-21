@@ -22,6 +22,7 @@ import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 import analysis
+import run as campaign_runner
 
 
 SCHEMA_VERSION = 1
@@ -33,10 +34,25 @@ MANAGER_CONVERGENCE_DEADLINE_S = 120
 CRASHED_REPLICAS = (0, 1)
 SURVIVING_REPLICAS = (2, 3, 4, 5, 6)
 SUCCESSOR_ROOTS = SURVIVING_REPLICAS
-FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
+FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-recurring-v3"
 FROZEN_PROFILE_SHA256 = (
+    "ddfb037c707ebc699138e446f365aa51f19624ee997635784249cc464c5eccef"
+)
+LEGACY_FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
+LEGACY_FROZEN_PROFILE_SHA256 = (
     "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
 )
+MAXIMUM_PREDECESSOR_RESIDENCY_MS = 3_600_000
+EPOCH_CHANGE_PAYLOAD_DOMAIN = b"kauri-epoch-change-payload-v1"
+MEMBERSHIP_DOMAIN = b"kauri-membership-v1"
+PLACEMENT_POLICY_VERSION = "adaptive-v2-performance-optimization-v1"
+RESPONSIVENESS_ATTEMPT_WINDOW = 32
+RESPONSIVENESS_MINIMUM_ATTEMPTS = 2
+RESPONSIVENESS_RATE_PPM_SCALE = 1_000_000
+MINIMUM_RESPONSE_RATE_PPM = 750_000
+MAXIMUM_TIMEOUT_RATE_PPM = 250_000
+TRAILING_TIMEOUT_STREAK = 2
+LATENCY_PERCENTILE_BASIS_POINTS = 5_000
 MANAGER_LIMITS = {
     "maximum_members": 7,
     "readiness_wire_maximum_payload_bytes": 256,
@@ -102,6 +118,9 @@ _MANIFEST_FIELDS = frozenset(
         "runtime_artifacts",
     }
 )
+_RECURRING_MANIFEST_FIELDS = frozenset(
+    {*_MANIFEST_FIELDS, "transition_requests", "throughput_windows"}
+)
 _PROFILE_FIELDS = frozenset({"identity", "path", "sha256"})
 _FROZEN_PROFILE_FIELDS = frozenset(
     {
@@ -142,6 +161,21 @@ _FROZEN_PROFILE_FIELDS = frozenset(
         "snapshot_seed",
     }
 )
+_RECURRING_FROZEN_PROFILE_FIELDS = frozenset(
+    {
+        *(_FROZEN_PROFILE_FIELDS - {
+            "successor_epoch",
+            "successor_roots",
+            "successor_wait_exempt",
+            "baseline_bucket_count",
+            "post_bucket_count",
+        }),
+        "transition_requests",
+        "throughput_windows",
+        "minimum_containment_to_degraded_ratio",
+        "minimum_optimized_to_containment_ratio",
+    }
+)
 _RUN_COMPLETION_FIELDS = frozenset(
     {"complete", "interrupted", "runtime_error", "unexpected_survivor_exits"}
 )
@@ -150,6 +184,9 @@ _SOURCE_FIELDS = frozenset(
 )
 _MANAGER_FIELDS = frozenset(
     {"source_id", "receives_crash_ground_truth"}
+)
+_RECURRING_MANAGER_FIELDS = frozenset(
+    {*_MANAGER_FIELDS, "transition_artifact_ids"}
 )
 _CRASH_MARKER_FIELDS = frozenset(
     {
@@ -320,6 +357,13 @@ _RUNTIME_FIELDS = frozenset(
         "executables",
     }
 )
+_RECURRING_RUNTIME_FIELDS = frozenset(
+    {
+        *(_RUNTIME_FIELDS - {"successor_roots", "successor_wait_exempt"}),
+        "transition_requests",
+        "throughput_windows",
+    }
+)
 _RUNTIME_EXECUTABLE_FIELDS = frozenset(
     {"hotstuff_app", "adaptation_manager"}
 )
@@ -370,6 +414,23 @@ _LAUNCH_ARGUMENT_FIELDS = frozenset({"schema_version", "processes"})
 _LAUNCH_PROCESS_FIELDS = frozenset(
     {"source_kind", "source_id", "argv", "effective_options"}
 )
+_MANAGER_LAUNCH_FLAGS = frozenset(
+    {
+        "--listen",
+        "--tls-privkey",
+        "--tls-cert",
+        "--issuer-id",
+        "--issuer-private-key",
+        "--activation-delay-blocks",
+        "--structured-event-run-id",
+        "--structured-event-source-instance",
+        "--structured-event-output",
+        "--transition-request",
+        "--bundle-output",
+        "--replica",
+        "--convergence-deadline-seconds",
+    }
+)
 _REPLICA_RUNTIME_OPTION_FIELDS = frozenset(
     {
         "block_size",
@@ -403,6 +464,55 @@ _MANAGER_EFFECTIVE_OPTION_FIELDS = frozenset(
         "issuer_public_key_sha256",
         "replica_tls_certificate_sha256",
     }
+)
+_RECURRING_MANAGER_EFFECTIVE_OPTION_FIELDS = frozenset(
+    {*_MANAGER_EFFECTIVE_OPTION_FIELDS, "transition_requests"}
+)
+_MANAGER_SESSION_TERMINAL_FIELDS = frozenset(
+    {
+        "cycle_ordinal",
+        "policy_intent",
+        "outcome",
+        "reason",
+        "transition_artifact_id",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "winning_activation",
+        "evidence_window_activation_generation",
+        "baseline_evidence_cutoff",
+        "current_evidence_cutoff",
+    }
+)
+_EVIDENCE_SNAPSHOT_FIELDS = frozenset(
+    {
+        "cycle_ordinal",
+        "policy_intent",
+        "transition_artifact_id",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "activation_generation",
+        "baseline_cutoff",
+        "current_cutoff",
+        "observations",
+        "eligible_ranking",
+    }
+)
+_EVIDENCE_SNAPSHOT_OBSERVATION_FIELDS = frozenset(
+    {
+        "observation_id",
+        "ingestion_sequence",
+        "epoch_number",
+        "epoch_digest",
+        "reporter_id",
+        "target_id",
+        "outcome",
+    }
+)
+_EVIDENCE_SNAPSHOT_LATENCY_OBSERVATION_FIELDS = frozenset(
+    {*_EVIDENCE_SNAPSHOT_OBSERVATION_FIELDS, "latency_ns"}
 )
 
 
@@ -482,6 +592,11 @@ class Manifest:
     maximum_activation_to_successor_ns: int
     baseline_bucket_count: int
     post_bucket_count: int
+    transition_requests: tuple[Mapping[str, Any], ...]
+    throughput_windows: tuple[analysis.PhaseWindow, ...]
+    required_bucket_counts: Mapping[str, int]
+    minimum_containment_to_degraded_ratio: float | None
+    minimum_optimized_to_containment_ratio: float | None
     maximum_stall_ns: int
     degraded_maximum_stall_ns: int
     runtime: Mapping[str, Any]
@@ -521,9 +636,14 @@ class EpochDefinition:
 class EpochDocument:
     raw: Mapping[str, Any]
     path: Path
+    epochs: tuple[EpochDefinition, ...]
     initial: EpochDefinition
     successor: EpochDefinition
     leader_by_configuration: Mapping[analysis.ConfigurationKey, int]
+
+    @property
+    def final(self) -> EpochDefinition:
+        return self.epochs[-1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,10 +846,20 @@ def _decode_frozen_profile(payload: bytes, label: str) -> Mapping[str, Any]:
         raise ValidationError(f"{label} is not strict UTF-8 JSON") from exc
     if not isinstance(value, dict):
         raise ValidationError(f"{label} must be a JSON object")
+    identity = value.get("profile_id")
+    if identity == FROZEN_PROFILE_ID:
+        _exact_fields(value, _RECURRING_FROZEN_PROFILE_FIELDS, label)
+        if hashlib.sha256(payload).hexdigest() != FROZEN_PROFILE_SHA256:
+            raise ValidationError(
+                f"{label} differs from the exact frozen recurring v3 settings"
+            )
+        return value
+    if identity != LEGACY_FROZEN_PROFILE_ID:
+        raise ValidationError(f"{label} has an unknown frozen profile identity")
     _exact_fields(value, _FROZEN_PROFILE_FIELDS, label)
     expected: Mapping[str, Any] = {
         "schema_version": 1,
-        "profile_id": FROZEN_PROFILE_ID,
+        "profile_id": LEGACY_FROZEN_PROFILE_ID,
         "frozen": True,
         "replica_ids": list(MEMBERSHIP),
         "fault_threshold": 2,
@@ -766,6 +896,8 @@ def _decode_frozen_profile(payload: bytes, label: str) -> Mapping[str, Any]:
     }
     if not _json_values_equal(value, expected) or value.get("frozen") is not True:
         raise ValidationError(f"{label} differs from the exact frozen v2 settings")
+    if hashlib.sha256(payload).hexdigest() != LEGACY_FROZEN_PROFILE_SHA256:
+        raise ValidationError(f"{label} is not byte-exact frozen v2")
     return value
 
 
@@ -781,8 +913,212 @@ def _repository_frozen_profile() -> bytes:
     return payload
 
 
+def _transition_requests(
+    value: Any, label: str
+) -> tuple[Mapping[str, Any], ...]:
+    requests = _list(value, label)
+    if not requests:
+        raise ValidationError(f"{label} must not be empty")
+    fields = frozenset(
+        {
+            "policy_intent",
+            "evidence_window_rule",
+            "transition_artifact_id",
+            "bundle_path",
+            "evidence_snapshot_path",
+            "predecessor_epoch_number",
+            "successor_epoch_number",
+            "minimum_predecessor_residency_ms",
+            "policy_parameters",
+        }
+    )
+    result: list[Mapping[str, Any]] = []
+    paths: set[str] = set()
+    artifact_ids: set[str] = set()
+    expected_predecessor = 0
+    for index, item in enumerate(requests):
+        request = _object(item, f"{label}[{index}]")
+        _exact_fields(request, fields, f"{label}[{index}]")
+        predecessor = _integer(
+            request["predecessor_epoch_number"],
+            f"{label}[{index}].predecessor_epoch_number",
+            maximum=analysis.UINT32_MAX,
+        )
+        successor = _integer(
+            request["successor_epoch_number"],
+            f"{label}[{index}].successor_epoch_number",
+            maximum=analysis.UINT32_MAX,
+        )
+        if predecessor != expected_predecessor or successor != predecessor + 1:
+            raise ValidationError("transition requests must form one contiguous chain")
+        expected_predecessor = successor
+        residency_ms = _integer(
+            request["minimum_predecessor_residency_ms"],
+            f"{label}[{index}].minimum_predecessor_residency_ms",
+            maximum=MAXIMUM_PREDECESSOR_RESIDENCY_MS,
+        )
+        if index == 0 and residency_ms != 0:
+            raise ValidationError(
+                "the initial containment transition residency must be zero"
+            )
+        intent = _string(
+            request["policy_intent"], f"{label}[{index}].policy_intent"
+        )
+        if intent not in ("fault_containment", "performance_optimization"):
+            raise ValidationError("transition request policy intent is unsupported")
+        if request["evidence_window_rule"] != (
+            "fresh_exact_predecessor_after_common_commit"
+        ):
+            raise ValidationError("transition request evidence rule is not frozen")
+        artifact_id = _string(
+            request["transition_artifact_id"],
+            f"{label}[{index}].transition_artifact_id",
+        )
+        if artifact_id in artifact_ids:
+            raise ValidationError("transition artifact IDs must be distinct")
+        artifact_ids.add(artifact_id)
+        for field in ("bundle_path", "evidence_snapshot_path"):
+            relative = _string(request[field], f"{label}[{index}].{field}")
+            relative_path = Path(relative)
+            if (
+                relative_path.is_absolute()
+                or ".." in relative_path.parts
+                or artifact_id not in relative_path.parts
+                or relative in paths
+            ):
+                raise ValidationError("transition artifact paths must be distinct")
+            paths.add(relative)
+        parameters = _object(
+            request["policy_parameters"],
+            f"{label}[{index}].policy_parameters",
+        )
+        if intent == "performance_optimization" and parameters:
+            raise ValidationError("optimization policy parameters must be empty")
+        if intent == "fault_containment":
+            _exact_fields(
+                parameters,
+                frozenset({"containment_baseline_roots"}),
+                f"{label}[{index}].policy_parameters",
+            )
+            roots = _list(
+                parameters["containment_baseline_roots"],
+                f"{label}[{index}].containment_baseline_roots",
+            )
+            if not roots:
+                raise ValidationError("containment baseline roots must not be empty")
+            pairs: list[tuple[int, int]] = []
+            for root_index, root_value in enumerate(roots):
+                root = _object(root_value, "containment baseline root")
+                _exact_fields(
+                    root,
+                    frozenset({"tree_id", "replica_id"}),
+                    "containment baseline root",
+                )
+                pairs.append(
+                    (
+                        _integer(root["tree_id"], "containment tree_id"),
+                        _integer(root["replica_id"], "containment replica_id"),
+                    )
+                )
+            if len({tree_id for tree_id, _ in pairs}) != len(pairs) or len(
+                {replica_id for _, replica_id in pairs}
+            ) != len(pairs):
+                raise ValidationError("containment baseline roots must be unique")
+        result.append(request)
+    return tuple(result)
+
+
+def _throughput_window_specs(
+    value: Any, label: str
+) -> tuple[Mapping[str, Any], ...]:
+    windows = _list(value, label)
+    phases = ("baseline", "degraded", "containment", "optimized")
+    if len(windows) != len(phases):
+        raise ValidationError(f"{label} must contain four ordered phases")
+    result: list[Mapping[str, Any]] = []
+    for index, (item, phase) in enumerate(zip(windows, phases)):
+        window = _object(item, f"{label}[{index}]")
+        _exact_fields(
+            window,
+            frozenset({"phase", "epoch_number", "bucket_count"}),
+            f"{label}[{index}]",
+        )
+        if window["phase"] != phase:
+            raise ValidationError(f"{label} phases are not canonical")
+        _integer(window["epoch_number"], f"{label}[{index}].epoch_number")
+        _integer(
+            window["bucket_count"],
+            f"{label}[{index}].bucket_count",
+            minimum=1,
+        )
+        result.append(window)
+    return tuple(result)
+
+
+def _validate_transition_residencies(
+    requests: Sequence[Mapping[str, Any]],
+    windows: Sequence[Mapping[str, Any]],
+    *,
+    bucket_width_ns: int,
+    post_activation_grace_ns: int,
+) -> None:
+    for previous, request in zip(requests, requests[1:]):
+        predecessor_epoch = int(request["predecessor_epoch_number"])
+        if predecessor_epoch != int(previous["successor_epoch_number"]):
+            raise ValidationError("transition residency does not bind its predecessor")
+        matching = [
+            window
+            for window in windows
+            if int(window["epoch_number"]) == predecessor_epoch
+        ]
+        if len(matching) != 1:
+            raise ValidationError(
+                f"successor epoch {predecessor_epoch} requires one throughput phase"
+            )
+        required_ns = (
+            int(matching[0]["bucket_count"]) * bucket_width_ns
+            + post_activation_grace_ns
+        )
+        declared_ns = int(request["minimum_predecessor_residency_ms"]) * 1_000_000
+        if declared_ns < required_ns:
+            raise ValidationError(
+                f"transition into epoch {request['successor_epoch_number']} does not "
+                "preserve its predecessor's complete throughput window and grace"
+            )
+
+
+def _measurement_windows(
+    value: Any, specs: Sequence[Mapping[str, Any]]
+) -> tuple[analysis.PhaseWindow, ...]:
+    windows = _list(value, "manifest.throughput_windows")
+    if len(windows) != len(specs):
+        raise ValidationError("manifest throughput windows do not match the profile")
+    result: list[analysis.PhaseWindow] = []
+    previous_end = 0
+    for index, (item, spec) in enumerate(zip(windows, specs)):
+        window = _object(item, f"manifest.throughput_windows[{index}]")
+        _exact_fields(
+            window,
+            frozenset({"phase", "epoch_number", "start_ns", "end_ns"}),
+            f"manifest.throughput_windows[{index}]",
+        )
+        phase = _string(window["phase"], f"throughput_windows[{index}].phase")
+        epoch = _integer(
+            window["epoch_number"], f"throughput_windows[{index}].epoch_number"
+        )
+        start = _integer(window["start_ns"], f"throughput_windows[{index}].start_ns")
+        end = _integer(window["end_ns"], f"throughput_windows[{index}].end_ns")
+        if phase != spec["phase"] or epoch != spec["epoch_number"]:
+            raise ValidationError("manifest throughput window identity differs from profile")
+        if start < previous_end or end <= start:
+            raise ValidationError("manifest throughput windows overlap or are empty")
+        previous_end = end
+        result.append(analysis.PhaseWindow(phase, epoch, start, end))
+    return tuple(result)
+
+
 def _expected_runtime(profile: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    expected = {
         "block_size": profile["block_size"],
         "pipeline_depth": profile["pipeline_depth"],
         "aggregation_timeout_ms": int(profile["aggregation_timeout_s"] * 1000),
@@ -795,19 +1131,31 @@ def _expected_runtime(profile: Mapping[str, Any]) -> dict[str, Any]:
         "activation_delay_blocks": profile["activation_delay_blocks"],
         "fanout": profile["fanout"],
         "epoch0_roots": list(profile["epoch0_roots"]),
-        "successor_roots": list(profile["successor_roots"]),
-        "successor_wait_exempt": list(profile["successor_wait_exempt"]),
         "tree_switch_period_blocks": profile["tree_switch_period_blocks"],
         "snapshot_seed": profile["snapshot_seed"],
         "manager_limits": dict(MANAGER_LIMITS),
     }
+    if profile["profile_id"] == FROZEN_PROFILE_ID:
+        expected["transition_requests"] = profile["transition_requests"]
+        expected["throughput_windows"] = profile["throughput_windows"]
+    else:
+        expected["successor_roots"] = list(profile["successor_roots"])
+        expected["successor_wait_exempt"] = list(
+            profile["successor_wait_exempt"]
+        )
+    return expected
 
 
 def _validate_runtime(
     value: Any, profile: Mapping[str, Any]
 ) -> Mapping[str, Any]:
     runtime = _object(value, "manifest.runtime")
-    _exact_fields(runtime, _RUNTIME_FIELDS, "manifest.runtime")
+    expected_fields = (
+        _RECURRING_RUNTIME_FIELDS
+        if profile["profile_id"] == FROZEN_PROFILE_ID
+        else _RUNTIME_FIELDS
+    )
+    _exact_fields(runtime, expected_fields, "manifest.runtime")
     manager_limits = _object(
         runtime["manager_limits"], "manifest.runtime.manager_limits"
     )
@@ -818,7 +1166,7 @@ def _validate_runtime(
     )
     expected = _expected_runtime(profile)
     static_runtime = {
-        field: runtime[field] for field in _RUNTIME_FIELDS if field != "executables"
+        field: runtime[field] for field in expected_fields if field != "executables"
     }
     if not _json_values_equal(static_runtime, expected):
         raise ValidationError(
@@ -988,6 +1336,27 @@ def _single_argv_value(argv: Sequence[str], flag: str) -> str:
     return argv[index + 1]
 
 
+def _validate_manager_argv_flags(
+    argv: Sequence[str], *, recurring: bool
+) -> None:
+    if len(argv) < 3 or (len(argv) - 1) % 2 != 0:
+        raise ValidationError("manager launch argv is not an exact flag/value sequence")
+    for position in range(1, len(argv), 2):
+        flag = argv[position]
+        if flag not in _MANAGER_LAUNCH_FLAGS:
+            raise ValidationError(
+                f"manager launch argv contains unsupported flag: {flag}"
+            )
+    repeated_flags = {"--transition-request", "--bundle-output", "--replica"}
+    singleton_flags = _MANAGER_LAUNCH_FLAGS - repeated_flags
+    if any(argv.count(flag) > 1 for flag in singleton_flags):
+        raise ValidationError("manager launch argv repeats a singleton flag")
+    if recurring and any(argv.count(flag) != 1 for flag in singleton_flags):
+        raise ValidationError(
+            "recurring manager launch argv omits a canonical singleton flag"
+        )
+
+
 def _validate_launch_arguments(
     value: Mapping[str, Any], runtime: Mapping[str, Any]
 ) -> None:
@@ -1109,9 +1478,14 @@ def _validate_launch_arguments(
                 digests["manager_tls_certificate_sha256"]
             )
         else:
+            manager_option_fields = (
+                _RECURRING_MANAGER_EFFECTIVE_OPTION_FIELDS
+                if "transition_requests" in runtime
+                else _MANAGER_EFFECTIVE_OPTION_FIELDS
+            )
             _exact_fields(
                 options,
-                _MANAGER_EFFECTIVE_OPTION_FIELDS,
+                manager_option_fields,
                 "manager launch effective_options",
             )
             if options["activation_delay_blocks"] != runtime[
@@ -1123,6 +1497,12 @@ def _validate_launch_arguments(
             ):
                 raise ValidationError(
                     "manager launch effective_options differ from manifest.runtime"
+                )
+            if "transition_requests" in runtime and not _json_values_equal(
+                options["transition_requests"], runtime["transition_requests"]
+            ):
+                raise ValidationError(
+                    "manager launch transition requests differ from manifest.runtime"
                 )
             if _hash(options["binary_sha256"], "manager binary_sha256") != (
                 manager_executable["sha256"]
@@ -1144,6 +1524,23 @@ def _validate_launch_arguments(
                 _hash(digest, f"manager replica-{replica_index} TLS certificate hash")
             if argv[0] != manager_executable["path"]:
                 raise ValidationError("manager launch argv names the wrong binary")
+            recurring_launch = "transition_requests" in runtime
+            _validate_manager_argv_flags(argv, recurring=recurring_launch)
+            if recurring_launch:
+                if _single_argv_value(argv, "--issuer-id") != str(
+                    campaign_runner.ISSUER_ID
+                ):
+                    raise ValidationError("manager launch binds the wrong issuer ID")
+                for structured_flag in (
+                    "--listen",
+                    "--structured-event-run-id",
+                    "--structured-event-source-instance",
+                    "--structured-event-output",
+                ):
+                    _string(
+                        _single_argv_value(argv, structured_flag),
+                        f"manager launch {structured_flag}",
+                    )
             if _single_argv_value(argv, "--activation-delay-blocks") != str(
                 runtime["activation_delay_blocks"]
             ):
@@ -1183,6 +1580,47 @@ def _validate_launch_arguments(
                     raise ValidationError(
                         "manager replica launch arguments are not canonically fingerprinted"
                     )
+            if "transition_requests" in runtime:
+                request_positions = [
+                    position
+                    for position, argument in enumerate(argv[:-1])
+                    if argument == "--transition-request"
+                ]
+                bundle_positions = [
+                    position
+                    for position, argument in enumerate(argv[:-1])
+                    if argument == "--bundle-output"
+                ]
+                expected_requests = runtime["transition_requests"]
+                if (
+                    len(request_positions) != len(expected_requests)
+                    or len(bundle_positions) != len(expected_requests)
+                ):
+                    raise ValidationError(
+                        "manager launch requires one repeated request and bundle output per transition"
+                    )
+                decoded_requests: list[Any] = []
+                for position in request_positions:
+                    try:
+                        decoded_requests.append(json.loads(argv[position + 1]))
+                    except json.JSONDecodeError as exc:
+                        raise ValidationError(
+                            "manager launch transition request is not JSON"
+                        ) from exc
+                if not _json_values_equal(decoded_requests, expected_requests):
+                    raise ValidationError(
+                        "manager launch repeated requests differ from frozen order"
+                    )
+                bundle_paths = [Path(argv[position + 1]) for position in bundle_positions]
+                if len({path.resolve() for path in bundle_paths}) != len(bundle_paths):
+                    raise ValidationError("transition artifact paths must be distinct")
+                for path, request in zip(bundle_paths, expected_requests):
+                    if not path.is_absolute() or not str(path).endswith(
+                        request["bundle_path"]
+                    ):
+                        raise ValidationError(
+                            "manager bundle output does not bind its transition request"
+                        )
             manager_options = options
 
     if len(main_config_hashes) != 1:
@@ -1206,21 +1644,41 @@ def _load_runtime_artifacts(
     value: Any, *, manifest_path: Path, runtime: Mapping[str, Any]
 ) -> tuple[RuntimeArtifactSpec, ...]:
     entries = _list(value, "manifest.runtime_artifacts")
-    expected = [
+    base_expected = [
         ("replica_config", replica, f"runtime/replica-{replica}.effective.json")
         for replica in MEMBERSHIP
     ] + [
         ("epoch_input", None, "runtime/epoch-input.json"),
         ("launch_arguments", None, "runtime/launch-arguments.json"),
     ]
+    recurring = "transition_requests" in runtime
+    if recurring:
+        transition_expected = [
+            ("transition_requests", None, "runtime/transition-requests.json")
+        ]
+        for request in runtime["transition_requests"]:
+            transition_expected.extend(
+                (
+                    ("transition_bundle", None, request["bundle_path"]),
+                    (
+                        "evidence_snapshot",
+                        None,
+                        request["evidence_snapshot_path"],
+                    ),
+                )
+            )
+        expected = [*base_expected, *transition_expected]
+    else:
+        expected = base_expected
     if len(entries) != len(expected):
         raise IncompleteRun(
-            "runtime_artifacts must contain seven replica configs, epoch input, "
-            "and launch arguments"
+            "runtime_artifacts do not contain the complete frozen artifact set"
         )
     base = manifest_path.resolve().parent
     artifacts: list[RuntimeArtifactSpec] = []
-    for index, (item, expected_identity) in enumerate(zip(entries, expected)):
+    identities: set[tuple[str, int | None, str]] = set()
+    relative_paths: set[str] = set()
+    for index, item in enumerate(entries):
         entry = _object(item, f"runtime_artifacts[{index}]")
         _exact_fields(
             entry, _RUNTIME_ARTIFACT_FIELDS, f"runtime_artifacts[{index}]"
@@ -1234,8 +1692,15 @@ def _load_runtime_artifacts(
                 maximum=analysis.UINT32_MAX,
             )
         relative = _string(entry["path"], f"runtime_artifacts[{index}].path")
-        if (kind, replica_id, relative) != expected_identity:
+        identity = (kind, replica_id, relative)
+        if identity not in set(expected):
+            raise ValidationError("runtime artifact identity is not canonical")
+        if identity in identities or relative in relative_paths:
+            if recurring:
+                raise ValidationError("transition artifact paths must be distinct")
             raise ValidationError("runtime artifact identities or ordering are not canonical")
+        identities.add(identity)
+        relative_paths.add(relative)
         relative_path = Path(relative)
         if relative_path.is_absolute() or ".." in relative_path.parts:
             raise ValidationError("runtime artifact path must be manifest-relative")
@@ -1257,7 +1722,20 @@ def _load_runtime_artifacts(
             RuntimeArtifactSpec(kind, replica_id, relative, path, digest, payload)
         )
 
-    for artifact in artifacts[: len(MEMBERSHIP)]:
+    if identities != set(expected):
+        raise IncompleteRun("runtime_artifacts omit a frozen artifact identity")
+    if not recurring and [
+        (artifact.kind, artifact.replica_id, artifact.relative_path)
+        for artifact in artifacts
+    ] != expected:
+        raise ValidationError("runtime artifact identities or ordering are not canonical")
+
+    artifacts_by_path = {
+        artifact.relative_path: artifact for artifact in artifacts
+    }
+
+    for replica in MEMBERSHIP:
+        artifact = artifacts_by_path[f"runtime/replica-{replica}.effective.json"]
         assert artifact.replica_id is not None
         decoded = _load_json_bytes(artifact.payload, artifact.relative_path)
         _exact_fields(
@@ -1274,7 +1752,8 @@ def _load_runtime_artifacts(
                 "the frozen runtime"
             )
 
-    epoch_input = _load_json_bytes(artifacts[-2].payload, "initial epoch input")
+    epoch_input_artifact = artifacts_by_path["runtime/epoch-input.json"]
+    epoch_input = _load_json_bytes(epoch_input_artifact.payload, "initial epoch input")
     _exact_fields(epoch_input, _INITIAL_EPOCH_INPUT_FIELDS, "initial epoch input")
     for index, tree_value in enumerate(
         _list(epoch_input["epoch0_trees"], "initial epoch trees")
@@ -1287,14 +1766,49 @@ def _load_runtime_artifacts(
     if not _json_values_equal(epoch_input, _expected_initial_epoch_input(runtime)):
         raise ValidationError("initial epoch input differs from the frozen runtime")
 
-    launch = _load_json_bytes(artifacts[-1].payload, "launch arguments")
+    launch_artifact = artifacts_by_path["runtime/launch-arguments.json"]
+    launch = _load_json_bytes(launch_artifact.payload, "launch arguments")
     _validate_launch_arguments(launch, runtime)
+    if recurring:
+        requests_artifact = artifacts_by_path["runtime/transition-requests.json"]
+        requests_document = _load_json_bytes(
+            requests_artifact.payload, "transition requests"
+        )
+        _exact_fields(
+            requests_document,
+            frozenset({"schema_version", "requests"}),
+            "transition requests",
+        )
+        if (
+            _integer(
+                requests_document["schema_version"],
+                "transition requests schema_version",
+            )
+            != SCHEMA_VERSION
+            or not _json_values_equal(
+                requests_document["requests"], runtime["transition_requests"]
+            )
+        ):
+            raise ValidationError(
+                "transition request artifact differs from manifest.runtime"
+            )
     return tuple(artifacts)
 
 
 def load_manifest(path: Path) -> Manifest:
     raw = _load_json(path, "manifest")
-    _exact_fields(raw, _MANIFEST_FIELDS, "manifest")
+    profile_header = _object(raw.get("profile"), "manifest.profile")
+    profile_identity = _string(
+        profile_header.get("identity"), "manifest.profile.identity"
+    )
+    recurring = profile_identity == FROZEN_PROFILE_ID
+    if profile_identity not in (FROZEN_PROFILE_ID, LEGACY_FROZEN_PROFILE_ID):
+        raise ValidationError("profile identity is not a frozen N7 campaign profile")
+    _exact_fields(
+        raw,
+        _RECURRING_MANIFEST_FIELDS if recurring else _MANIFEST_FIELDS,
+        "manifest",
+    )
     if _integer(raw["schema_version"], "manifest.schema_version") != SCHEMA_VERSION:
         raise ValidationError("unsupported manifest schema_version")
     if raw["scenario"] != SCENARIO:
@@ -1320,8 +1834,6 @@ def load_manifest(path: Path) -> Manifest:
     profile = _object(raw["profile"], "manifest.profile")
     _exact_fields(profile, _PROFILE_FIELDS, "manifest.profile")
     profile_identity = _string(profile["identity"], "manifest.profile.identity")
-    if profile_identity != FROZEN_PROFILE_ID:
-        raise ValidationError("profile identity is not the frozen N7 campaign profile")
     profile_relative = Path(_string(profile["path"], "manifest.profile.path"))
     if profile_relative.is_absolute() or ".." in profile_relative.parts:
         raise ValidationError("profile path must be manifest-relative")
@@ -1339,13 +1851,19 @@ def load_manifest(path: Path) -> Manifest:
     except OSError as exc:
         raise IncompleteRun(f"cannot read frozen profile: {exc}") from exc
     profile_sha = _hash(profile["sha256"], "manifest.profile.sha256")
-    if profile_sha != FROZEN_PROFILE_SHA256:
+    expected_profile_sha = (
+        FROZEN_PROFILE_SHA256 if recurring else LEGACY_FROZEN_PROFILE_SHA256
+    )
+    if profile_sha != expected_profile_sha:
         raise ValidationError("manifest does not pin the canonical frozen profile SHA-256")
     if hashlib.sha256(profile_bytes).hexdigest() != profile_sha:
         raise ValidationError("profile sha256 does not match the preserved profile")
-    canonical_profile = _repository_frozen_profile()
-    if profile_bytes != canonical_profile:
-        raise ValidationError("run profile is not byte-exact canonical frozen v2")
+    if recurring:
+        canonical_profile = _repository_frozen_profile()
+        if profile_bytes != canonical_profile:
+            raise ValidationError(
+                "run profile is not byte-exact canonical frozen recurring v3"
+            )
     profile_json = _decode_frozen_profile(profile_bytes, "run frozen profile")
     runtime = _validate_runtime(raw["runtime"], profile_json)
     runtime_artifacts = _load_runtime_artifacts(
@@ -1358,7 +1876,11 @@ def load_manifest(path: Path) -> Manifest:
         raise ValidationError("authoritative observer must be replica-2")
 
     manager = _object(raw["manager"], "manifest.manager")
-    _exact_fields(manager, _MANAGER_FIELDS, "manifest.manager")
+    _exact_fields(
+        manager,
+        _RECURRING_MANAGER_FIELDS if recurring else _MANAGER_FIELDS,
+        "manifest.manager",
+    )
     manager_id = _string(manager["source_id"], "manifest.manager.source_id")
     if manager["receives_crash_ground_truth"] is not False:
         raise ValidationError(
@@ -1366,6 +1888,63 @@ def load_manifest(path: Path) -> Manifest:
         )
     if manager_id != "adaptive-manager":
         raise ValidationError("manager source_id must be adaptive-manager")
+    transition_requests: tuple[Mapping[str, Any], ...] = ()
+    throughput_windows: tuple[analysis.PhaseWindow, ...] = ()
+    required_bucket_counts: dict[str, int]
+    containment_ratio: float | None = None
+    optimized_ratio: float | None = None
+    if recurring:
+        transition_requests = _transition_requests(
+            raw["transition_requests"], "manifest.transition_requests"
+        )
+        profile_requests = _transition_requests(
+            profile_json["transition_requests"], "profile.transition_requests"
+        )
+        if not _json_values_equal(transition_requests, profile_requests):
+            raise ValidationError(
+                "manifest transition requests differ from the frozen profile"
+            )
+        if not _json_values_equal(
+            runtime["transition_requests"], transition_requests
+        ):
+            raise ValidationError(
+                "runtime transition requests differ from the manifest"
+            )
+        artifact_ids = _list(
+            manager["transition_artifact_ids"],
+            "manifest.manager.transition_artifact_ids",
+        )
+        if artifact_ids != [
+            request["transition_artifact_id"] for request in transition_requests
+        ]:
+            raise ValidationError(
+                "manager transition artifact IDs differ from the requests"
+            )
+        window_specs = _throughput_window_specs(
+            profile_json["throughput_windows"], "profile.throughput_windows"
+        )
+        if not _json_values_equal(runtime["throughput_windows"], window_specs):
+            raise ValidationError(
+                "runtime throughput windows differ from the frozen profile"
+            )
+        throughput_windows = _measurement_windows(
+            raw["throughput_windows"], window_specs
+        )
+        required_bucket_counts = {
+            str(spec["phase"]): int(spec["bucket_count"])
+            for spec in window_specs
+        }
+        containment_ratio = float(
+            profile_json["minimum_containment_to_degraded_ratio"]
+        )
+        optimized_ratio = float(
+            profile_json["minimum_optimized_to_containment_ratio"]
+        )
+    else:
+        required_bucket_counts = {
+            "baseline": int(profile_json["baseline_bucket_count"]),
+            "post": int(profile_json["post_bucket_count"]),
+        }
 
     width = _integer(raw["bucket_width_ns"], "manifest.bucket_width_ns", minimum=1)
     frozen_bucket_width_ns = int(profile_json["bucket_width_s"]) * 1_000_000_000
@@ -1390,21 +1969,20 @@ def load_manifest(path: Path) -> Manifest:
         raise ValidationError(
             "minimum post-activation grace differs from the frozen profile"
         )
+    if recurring:
+        _validate_transition_residencies(
+            transition_requests,
+            window_specs,
+            bucket_width_ns=width,
+            post_activation_grace_ns=minimum_post_activation_grace_ns,
+        )
     maximum_activation_to_successor_ns = _integer(
         profile_json["maximum_activation_to_successor_s"],
         "profile.maximum_activation_to_successor_s",
         minimum=1,
     ) * 1_000_000_000
-    baseline_bucket_count = _integer(
-        profile_json["baseline_bucket_count"],
-        "profile.baseline_bucket_count",
-        minimum=1,
-    )
-    post_bucket_count = _integer(
-        profile_json["post_bucket_count"],
-        "profile.post_bucket_count",
-        minimum=1,
-    )
+    baseline_bucket_count = required_bucket_counts["baseline"]
+    post_bucket_count = required_bucket_counts.get("post", 0)
     maximum_stall_ns = _integer(
         profile_json["maximum_stall_s"],
         "profile.maximum_stall_s",
@@ -1636,6 +2214,11 @@ def load_manifest(path: Path) -> Manifest:
         maximum_activation_to_successor_ns=maximum_activation_to_successor_ns,
         baseline_bucket_count=baseline_bucket_count,
         post_bucket_count=post_bucket_count,
+        transition_requests=transition_requests,
+        throughput_windows=throughput_windows,
+        required_bucket_counts=required_bucket_counts,
+        minimum_containment_to_degraded_ratio=containment_ratio,
+        minimum_optimized_to_containment_ratio=optimized_ratio,
         maximum_stall_ns=maximum_stall_ns,
         degraded_maximum_stall_ns=degraded_maximum_stall_ns,
         runtime=runtime,
@@ -1687,8 +2270,8 @@ def load_epochs(path: Path) -> EpochDocument:
         raise ValidationError("unsupported epoch schema_version")
     _require_frozen_header(raw, "epochs")
     epoch_values = _list(raw["epochs"], "epochs.epochs")
-    if len(epoch_values) != 2:
-        raise ValidationError("epoch definition must contain exactly epochs 0 and 1")
+    if len(epoch_values) < 2:
+        raise IncompleteRun("epoch definition requires at least one transition")
 
     epochs: list[EpochDefinition] = []
     for index, item in enumerate(epoch_values):
@@ -1700,7 +2283,7 @@ def load_epochs(path: Path) -> EpochDocument:
             maximum=analysis.UINT32_MAX,
         )
         if number != index:
-            raise ValidationError("epoch numbers must be exactly 0 then 1")
+            raise ValidationError("epoch numbers must be contiguous from 0")
         digest = _hash(epoch["epoch_digest"], f"epochs[{index}].epoch_digest")
         trees = tuple(
             _load_tree(
@@ -1717,13 +2300,12 @@ def load_epochs(path: Path) -> EpochDocument:
             _exact_fields(command, _COMMAND_FIELDS, f"epochs[{index}].command")
         epochs.append(EpochDefinition(number, digest, trees, command))
 
-    initial, successor = epochs
-    if initial.epoch_digest == successor.epoch_digest:
-        raise ValidationError("successor epoch digest must differ from epoch 0")
+    initial = epochs[0]
+    successor = epochs[1]
+    if len({epoch.epoch_digest for epoch in epochs}) != len(epochs):
+        raise ValidationError("epoch digests must be distinct across transitions")
     if initial.command is not None:
         raise ValidationError("epoch 0 command must be null")
-    if successor.command is None:
-        raise ValidationError("successor epoch must contain its committed command")
 
     if len(initial.trees) != 7:
         raise ValidationError("epoch 0 must contain seven cyclic trees")
@@ -1738,63 +2320,107 @@ def load_epochs(path: Path) -> EpochDocument:
         if tree.wait_exempt:
             raise ValidationError("epoch 0 must not have wait-exempt replicas")
 
-    if len(successor.trees) != 5:
-        raise ValidationError("successor epoch must contain exactly five trees")
-    for tree_id, tree in enumerate(successor.trees):
-        if tree.tree_id != tree_id or tree.fanout != 2:
-            raise ValidationError("successor trees require ids 0..4 and fanout 2")
-        if len(tree.members) != len(MEMBERSHIP):
-            raise ValidationError("successor tree must contain all seven replicas")
-        if set(tree.members) != set(MEMBERSHIP):
-            raise ValidationError("successor tree membership must remain unchanged")
-        if tree.wait_exempt != CRASHED_REPLICAS:
-            raise ValidationError("only replicas 0 and 1 may be wait-exempt")
-        leaf_start = (len(tree.members) - 2) // tree.fanout + 1
-        for failed in CRASHED_REPLICAS:
-            if tree.members.index(failed) < leaf_start:
+    payload_digests: set[str] = set()
+    previous_command_height = 0
+    previous_activation_height = 0
+    for epoch_index, current in enumerate(epochs[1:], start=1):
+        if len(current.trees) != 5:
+            raise ValidationError("successor epoch must contain exactly five trees")
+        predecessor = epochs[epoch_index - 1]
+        if epoch_index == 1:
+            inherited_wait_exempt = CRASHED_REPLICAS
+        else:
+            predecessor_wait_exempt = {
+                tree.wait_exempt for tree in predecessor.trees
+            }
+            if len(predecessor_wait_exempt) != 1:
                 raise ValidationError(
-                    f"replica {failed} is not a physical leaf in successor tree {tree_id}"
+                    "predecessor epoch has no canonical wait-exempt set to inherit"
                 )
-    successor_roots = tuple(tree.leader for tree in successor.trees)
-    if (
-        len(set(successor_roots)) != QUORUM
-        or set(successor_roots) != set(SUCCESSOR_ROOTS)
-    ):
-        raise ValidationError("successor roots must be exactly the five surviving replicas")
+            inherited_wait_exempt = next(iter(predecessor_wait_exempt))
+            if inherited_wait_exempt != CRASHED_REPLICAS:
+                raise ValidationError(
+                    "optimization predecessor must preserve wait-exempt replicas 0 and 1"
+                )
+        for tree_id, tree in enumerate(current.trees):
+            if tree.tree_id != tree_id or tree.fanout != 2:
+                raise ValidationError("successor trees require ids 0..4 and fanout 2")
+            if len(tree.members) != len(MEMBERSHIP):
+                raise ValidationError("successor tree must contain all seven replicas")
+            if set(tree.members) != set(MEMBERSHIP):
+                raise ValidationError("successor tree membership must remain unchanged")
+            if tree.wait_exempt != inherited_wait_exempt:
+                if epoch_index == 1:
+                    raise ValidationError("only replicas 0 and 1 may be wait-exempt")
+                raise ValidationError(
+                    f"epoch {current.epoch_number} wait-exempt set does not inherit "
+                    f"epoch {predecessor.epoch_number}'s canonical set"
+                )
+            leaf_start = (len(tree.members) - 2) // tree.fanout + 1
+            for failed in CRASHED_REPLICAS:
+                if tree.members.index(failed) < leaf_start:
+                    raise ValidationError(
+                        f"replica {failed} is not a physical leaf in successor tree {tree_id}"
+                    )
+        roots = tuple(tree.leader for tree in current.trees)
+        if len(set(roots)) != QUORUM or set(roots) != set(SUCCESSOR_ROOTS):
+            raise ValidationError(
+                "successor roots must be exactly the five surviving replicas"
+            )
 
-    command = successor.command
-    assert command is not None
-    for field in (
-        "command_block_height",
-        "activation_delay_blocks",
-        "activation_height",
-    ):
-        _integer(command[field], f"successor.command.{field}", minimum=1)
-    for field in ("predecessor_epoch_number", "successor_epoch_number"):
-        _integer(
-            command[field],
-            f"successor.command.{field}",
-            maximum=analysis.UINT32_MAX,
-        )
-    for field in (
-        "command_block_hash",
-        "payload_digest",
-        "predecessor_epoch_digest",
-        "successor_epoch_digest",
-    ):
-        _hash(command[field], f"successor.command.{field}")
-    if command["predecessor_epoch_number"] != 0:
-        raise ValidationError("command predecessor epoch must be 0")
-    if command["successor_epoch_number"] != 1:
-        raise ValidationError("command successor epoch must be 1")
-    if command["predecessor_epoch_digest"] != initial.epoch_digest:
-        raise ValidationError("command predecessor digest does not match epoch 0")
-    if command["successor_epoch_digest"] != successor.epoch_digest:
-        raise ValidationError("command successor digest does not match epoch 1")
-    if command["activation_height"] != (
-        command["command_block_height"] + command["activation_delay_blocks"]
-    ):
-        raise ValidationError("command activation height must equal h_c + delta")
+        command = current.command
+        if command is None:
+            raise IncompleteRun(
+                f"successor epoch {current.epoch_number} lacks its committed command"
+            )
+        for field in (
+            "command_block_height",
+            "activation_delay_blocks",
+            "activation_height",
+        ):
+            _integer(command[field], f"epochs[{epoch_index}].command.{field}", minimum=1)
+        for field in ("predecessor_epoch_number", "successor_epoch_number"):
+            _integer(
+                command[field],
+                f"epochs[{epoch_index}].command.{field}",
+                maximum=analysis.UINT32_MAX,
+            )
+        for field in (
+            "command_block_hash",
+            "payload_digest",
+            "predecessor_epoch_digest",
+            "successor_epoch_digest",
+        ):
+            _hash(command[field], f"epochs[{epoch_index}].command.{field}")
+        if (
+            command["predecessor_epoch_number"] != predecessor.epoch_number
+            or command["predecessor_epoch_digest"] != predecessor.epoch_digest
+        ):
+            raise ValidationError(
+                f"epoch {current.epoch_number} command does not continue the exact predecessor"
+            )
+        if (
+            command["successor_epoch_number"] != current.epoch_number
+            or command["successor_epoch_digest"] != current.epoch_digest
+        ):
+            raise ValidationError(
+                f"epoch {current.epoch_number} command does not bind its successor"
+            )
+        if command["activation_height"] != (
+            command["command_block_height"] + command["activation_delay_blocks"]
+        ):
+            raise ValidationError("command activation height must equal h_c + delta")
+        payload_digest = str(command["payload_digest"])
+        if payload_digest in payload_digests:
+            raise ValidationError("command payload digest is reused across transitions")
+        payload_digests.add(payload_digest)
+        if (
+            int(command["command_block_height"]) <= previous_command_height
+            or int(command["activation_height"]) <= previous_activation_height
+        ):
+            raise ValidationError("transition command heights must increase")
+        previous_command_height = int(command["command_block_height"])
+        previous_activation_height = int(command["activation_height"])
 
     leader_map: dict[analysis.ConfigurationKey, int] = {}
     for epoch in epochs:
@@ -1802,7 +2428,14 @@ def load_epochs(path: Path) -> EpochDocument:
             if tree.configuration_key in leader_map:
                 raise ValidationError("duplicate configuration identity")
             leader_map[tree.configuration_key] = tree.leader
-    return EpochDocument(raw, path.resolve(), initial, successor, leader_map)
+    return EpochDocument(
+        raw,
+        path.resolve(),
+        tuple(epochs),
+        initial,
+        successor,
+        leader_map,
+    )
 
 
 def _read_source_events(
@@ -1862,12 +2495,872 @@ def _event_at_sequence(
     raise IncompleteRun(f"referenced source_sequence {sequence} is absent")
 
 
+def _canonical_membership_digest(membership: Sequence[int]) -> str:
+    payload = b"".join(
+        (
+            MEMBERSHIP_DOMAIN,
+            len(membership).to_bytes(4, "big"),
+            b"".join(replica.to_bytes(2, "big") for replica in sorted(membership)),
+        )
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_recurring_transition_bundles(
+    manifest: Manifest,
+    epochs: EpochDocument,
+    manager_events: Sequence[analysis.StructuredEvent],
+) -> None:
+    artifacts = {
+        artifact.relative_path: artifact for artifact in manifest.runtime_artifacts
+    }
+    snapshots = {
+        int(event.payload["cycle_ordinal"]): event
+        for event in manager_events
+        if event.event_type == "adaptive_v2_evidence_snapshot"
+    }
+    terminals = {
+        int(event.payload["cycle_ordinal"]): event
+        for event in manager_events
+        if event.event_type == "adaptive_v2_session_terminal"
+    }
+    expected_membership_digest = _canonical_membership_digest(MEMBERSHIP)
+    snapshot_ids: set[str] = set()
+
+    for ordinal, request in enumerate(manifest.transition_requests):
+        relative_path = str(request["bundle_path"])
+        try:
+            decoded = campaign_runner.decode_epoch_change_bundle(
+                artifacts[relative_path].payload
+            )
+        except campaign_runner.RunnerError as exc:
+            raise ValidationError(
+                f"transition bundle {relative_path} is not canonical: {exc}"
+            ) from exc
+
+        predecessor = epochs.epochs[ordinal]
+        successor = epochs.epochs[ordinal + 1]
+        command = _object(successor.command, "recurring successor command")
+        decoded_command = decoded.command
+        if (
+            decoded_command.issuer_id != campaign_runner.ISSUER_ID
+            or decoded_command.successor_epoch_number
+            != command["successor_epoch_number"]
+            or decoded_command.predecessor_epoch_digest
+            != command["predecessor_epoch_digest"]
+            or decoded_command.successor_epoch_digest
+            != command["successor_epoch_digest"]
+            or decoded_command.activation_delay_blocks
+            != command["activation_delay_blocks"]
+            or campaign_runner.epoch_change_payload_digest(decoded_command)
+            != command["payload_digest"]
+        ):
+            raise ValidationError(
+                f"transition bundle {relative_path} command identity differs from epochs.json"
+            )
+
+        expected_trees = tuple(
+            (
+                tree.tree_id,
+                tree.fanout,
+                int(manifest.runtime["pipeline_depth"]),
+                tree.members,
+                tree.wait_exempt,
+            )
+            for tree in successor.trees
+        )
+        decoded_trees = tuple(
+            (
+                tree.tree_id,
+                tree.fanout,
+                tree.pipeline_stretch,
+                tree.members,
+                tree.wait_exempt,
+            )
+            for tree in decoded.trees
+        )
+        if (
+            decoded.epoch_number != successor.epoch_number
+            or decoded.epoch_digest != successor.epoch_digest
+            or decoded.previous_epoch_digest != predecessor.epoch_digest
+            or decoded.membership_digest != expected_membership_digest
+            or decoded.generation_seed != manifest.runtime["snapshot_seed"]
+            or decoded.policy_version != PLACEMENT_POLICY_VERSION
+            or decoded_trees != expected_trees
+        ):
+            raise ValidationError(
+                f"transition bundle {relative_path} definition differs from epochs.json"
+            )
+
+        snapshot_id = _string(
+            decoded.evidence_snapshot_id,
+            f"transition bundle {relative_path} evidence snapshot ID",
+        )
+        if snapshot_id in snapshot_ids:
+            raise ValidationError(
+                "transition bundles reuse one evidence snapshot identity"
+            )
+        snapshot_ids.add(snapshot_id)
+        snapshot_cutoff = snapshots[ordinal].payload["current_cutoff"]
+        terminal_cutoff = terminals[ordinal].payload["current_evidence_cutoff"]
+        if (
+            decoded.evidence_cutoff != snapshot_cutoff
+            or decoded.evidence_cutoff != terminal_cutoff
+        ):
+            raise ValidationError(
+                f"transition bundle {relative_path} evidence cutoff differs from manager events"
+            )
+
+
+def _command_identity(command: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "predecessor_epoch_number": command["predecessor_epoch_number"],
+        "predecessor_epoch_digest": command["predecessor_epoch_digest"],
+        "successor_epoch_number": command["successor_epoch_number"],
+        "successor_epoch_digest": command["successor_epoch_digest"],
+        "command_payload_digest": command["payload_digest"],
+        "command_block_height": command["command_block_height"],
+        "command_block_hash": command["command_block_hash"],
+        "activation_delay_blocks": command["activation_delay_blocks"],
+        "activation_height": command["activation_height"],
+    }
+
+
+def _missing_transition_label(index: int) -> str:
+    if index == 0:
+        return "first transition"
+    if index == 1:
+        return "second transition"
+    return f"transition {index + 1}"
+
+
+def _checked_activation_generation(epoch_number: int) -> int:
+    epoch = _integer(
+        epoch_number,
+        "activation-generation epoch",
+        maximum=analysis.UINT32_MAX,
+    )
+    generation = (epoch << 32) | 1
+    if generation <= 0 or generation > analysis.UINT64_MAX:
+        raise ValidationError("activation generation is outside uint64 range")
+    return generation
+
+
+@dataclass
+class _SnapshotAttempt:
+    observation_id: str
+    first_ingestion_sequence: int
+    reporter_id: int
+    target_id: int
+    state: str
+    latency_ns: int | None
+
+
+@dataclass(frozen=True)
+class _SnapshotReplicaScore:
+    replica_id: int
+    attempt_count: int
+    response_rate_ppm: int
+    timeout_rate_ppm: int
+    trailing_timeout_count: int
+    latency_percentile_ns: int | None
+    eligible: bool
+    reasons: tuple[str, ...]
+
+
+def _replay_snapshot_attempts(
+    observations: Sequence[Mapping[str, Any]],
+) -> dict[str, _SnapshotAttempt]:
+    attempts: dict[str, _SnapshotAttempt] = {}
+    previous_sequence = 0
+    for observation in observations:
+        sequence = _integer(
+            observation.get("ingestion_sequence"),
+            "snapshot observation ingestion_sequence",
+            minimum=1,
+        )
+        if sequence <= previous_sequence:
+            raise ValidationError(
+                "snapshot observations are not ordered by ingestion sequence"
+            )
+        previous_sequence = sequence
+        observation_id = _hash(
+            observation.get("observation_id"), "snapshot observation_id"
+        )
+        reporter = _integer(
+            observation.get("reporter_id"),
+            "snapshot observation reporter_id",
+            maximum=max(MEMBERSHIP),
+        )
+        target = _integer(
+            observation.get("target_id"),
+            "snapshot observation target_id",
+            maximum=max(MEMBERSHIP),
+        )
+        if reporter not in MEMBERSHIP or target not in MEMBERSHIP:
+            raise ValidationError("snapshot attempt contains a non-member")
+        if reporter == target:
+            raise ValidationError(
+                "snapshot observation reporter and target must differ"
+            )
+        outcome = _string(
+            observation.get("outcome"), "snapshot observation outcome"
+        )
+        if outcome not in ("on_time", "late", "timeout"):
+            raise ValidationError("snapshot observation outcome is invalid")
+        latency_value = observation.get("latency_ns")
+        if outcome == "timeout":
+            if latency_value is not None:
+                raise ValidationError("snapshot timeout attempt contains latency")
+            latency: int | None = None
+        elif outcome == "late":
+            latency = _integer(
+                latency_value,
+                "snapshot late attempt latency_ns",
+                minimum=1,
+            )
+        else:
+            # The manager omits latency_ns when the underlying C++ response
+            # duration is zero; AdaptationSnapshot still ranks that value as 0.
+            latency = (
+                0
+                if latency_value is None
+                else _integer(
+                    latency_value,
+                    "snapshot on-time attempt latency_ns",
+                    minimum=1,
+                )
+            )
+
+        prior = attempts.get(observation_id)
+        if prior is None:
+            if outcome == "late":
+                raise ValidationError(
+                    "snapshot adaptation attempt starts with a late response"
+                )
+            attempts[observation_id] = _SnapshotAttempt(
+                observation_id=observation_id,
+                first_ingestion_sequence=sequence,
+                reporter_id=reporter,
+                target_id=target,
+                state="timeout_only" if outcome == "timeout" else "on_time",
+                latency_ns=latency,
+            )
+            continue
+
+        if prior.reporter_id != reporter or prior.target_id != target:
+            raise ValidationError(
+                "snapshot timeout-to-late correlation differs in reporter or target"
+            )
+        if prior.state != "timeout_only" or outcome != "late":
+            raise ValidationError("snapshot adaptation attempt transition is invalid")
+        prior.state = "late"
+        prior.latency_ns = latency
+    return attempts
+
+
+def _score_snapshot_replicas(
+    attempts: Iterable[_SnapshotAttempt],
+) -> dict[int, _SnapshotReplicaScore]:
+    by_target: dict[int, list[_SnapshotAttempt]] = {
+        target: [] for target in MEMBERSHIP
+    }
+    for attempt in attempts:
+        by_target[attempt.target_id].append(attempt)
+
+    scores: dict[int, _SnapshotReplicaScore] = {}
+    for target, target_attempts in by_target.items():
+        target_attempts.sort(
+            key=lambda attempt: attempt.first_ingestion_sequence
+        )
+        target_attempts = target_attempts[-RESPONSIVENESS_ATTEMPT_WINDOW:]
+        response_count = 0
+        timeout_count = 0
+        latencies: list[int] = []
+        for attempt in target_attempts:
+            if attempt.state == "on_time":
+                response_count += 1
+                assert attempt.latency_ns is not None
+                latencies.append(attempt.latency_ns)
+            elif attempt.state == "timeout_only":
+                timeout_count += 1
+            elif attempt.state == "late":
+                response_count += 1
+                timeout_count += 1
+                assert attempt.latency_ns is not None
+                latencies.append(attempt.latency_ns)
+            else:  # pragma: no cover - replay constructs a closed state set.
+                raise AssertionError("unexpected snapshot attempt state")
+
+        attempt_count = len(target_attempts)
+        response_rate = (
+            response_count * RESPONSIVENESS_RATE_PPM_SCALE // attempt_count
+            if attempt_count
+            else 0
+        )
+        timeout_rate = (
+            timeout_count * RESPONSIVENESS_RATE_PPM_SCALE // attempt_count
+            if attempt_count
+            else 0
+        )
+        trailing_timeouts = 0
+        for attempt in reversed(target_attempts):
+            if attempt.state != "timeout_only":
+                break
+            trailing_timeouts += 1
+        latency_percentile: int | None = None
+        if latencies:
+            latencies.sort()
+            numerator = LATENCY_PERCENTILE_BASIS_POINTS * len(latencies)
+            rank = (numerator + 10_000 - 1) // 10_000
+            latency_percentile = latencies[rank - 1]
+
+        reasons: list[str] = []
+        if attempt_count < RESPONSIVENESS_MINIMUM_ATTEMPTS:
+            reasons.append("insufficient attempts")
+        else:
+            if response_rate < MINIMUM_RESPONSE_RATE_PPM:
+                reasons.append("response rate below minimum")
+            if timeout_rate > MAXIMUM_TIMEOUT_RATE_PPM:
+                reasons.append("timeout rate above maximum")
+            if trailing_timeouts >= TRAILING_TIMEOUT_STREAK:
+                reasons.append("trailing timeout streak")
+        scores[target] = _SnapshotReplicaScore(
+            replica_id=target,
+            attempt_count=attempt_count,
+            response_rate_ppm=response_rate,
+            timeout_rate_ppm=timeout_rate,
+            trailing_timeout_count=trailing_timeouts,
+            latency_percentile_ns=latency_percentile,
+            eligible=not reasons,
+            reasons=tuple(reasons),
+        )
+    return scores
+
+
+def _cpp_snapshot_ranking(
+    scores: Mapping[int, _SnapshotReplicaScore],
+) -> list[int]:
+    return sorted(
+        MEMBERSHIP,
+        key=lambda target: (
+            0 if scores[target].eligible else 1,
+            -scores[target].response_rate_ppm,
+            scores[target].timeout_rate_ppm,
+            0 if scores[target].latency_percentile_ns is not None else 1,
+            (
+                scores[target].latency_percentile_ns
+                if scores[target].latency_percentile_ns is not None
+                else 0
+            ),
+            -scores[target].attempt_count,
+            target,
+        ),
+    )
+
+
+def _validate_recurring_evidence_window(
+    request: Mapping[str, Any],
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    baseline_cutoff: int,
+    minimum_attempts: int,
+    minimum_reporters: int,
+) -> list[int] | None:
+    baseline_cutoff = _integer(
+        baseline_cutoff, "snapshot baseline cutoff", minimum=1
+    )
+    # Replay the full prefix first so malformed sequence types/order cannot be
+    # hidden by boundary partitioning.
+    full_attempts = _replay_snapshot_attempts(observations)
+    baseline_observations = [
+        observation
+        for observation in observations
+        if _integer(
+            observation.get("ingestion_sequence"),
+            "snapshot observation ingestion_sequence",
+            minimum=1,
+        )
+        <= baseline_cutoff
+    ]
+    intent = request["policy_intent"]
+    if intent not in ("fault_containment", "performance_optimization"):
+        raise ValidationError("snapshot has an unsupported transition policy intent")
+
+    # Replay the baseline independently because a late response after the
+    # boundary must not retroactively change baseline state.
+    baseline_attempts = _replay_snapshot_attempts(baseline_observations)
+    baseline_scores = _score_snapshot_replicas(baseline_attempts.values())
+    responsive_baseline = sum(
+        score.eligible for score in baseline_scores.values()
+    )
+    required_baseline = (
+        len(MEMBERSHIP) if intent == "fault_containment" else QUORUM
+    )
+    if responsive_baseline < required_baseline:
+        raise ValidationError(
+            "snapshot baseline lacks the configured responsive replica count"
+        )
+
+    # Attempts belong to the window containing their first ingestion.  A late
+    # response to a pre-baseline timeout is therefore legal but excluded from
+    # fresh classification, ranking, and guarded timeout counts.
+    fresh_attempts = {
+        observation_id: attempt
+        for observation_id, attempt in full_attempts.items()
+        if attempt.first_ingestion_sequence > baseline_cutoff
+    }
+
+    if intent == "fault_containment":
+        timeout_reporters: dict[int, dict[int, int]] = {
+            target: {} for target in CRASHED_REPLICAS
+        }
+        for attempt in fresh_attempts.values():
+            if (
+                attempt.state != "timeout_only"
+                or attempt.target_id not in CRASHED_REPLICAS
+            ):
+                continue
+            counts = timeout_reporters[attempt.target_id]
+            counts[attempt.reporter_id] = (
+                counts.get(attempt.reporter_id, 0) + 1
+            )
+        for target, reporters in timeout_reporters.items():
+            qualifying = sum(
+                count >= minimum_attempts for count in reporters.values()
+            )
+            if qualifying < minimum_reporters:
+                raise ValidationError(
+                    f"snapshot target {target} lacks configured guarded timeout attempts"
+                )
+
+        full_scores = _score_snapshot_replicas(full_attempts.values())
+        if any(full_scores[target].eligible for target in CRASHED_REPLICAS):
+            raise ValidationError(
+                "containment crash target is not snapshot-nonresponsive"
+            )
+        if any(not full_scores[target].eligible for target in SURVIVING_REPLICAS):
+            raise ValidationError(
+                "containment does not retain exactly Q responsive survivors"
+            )
+        return None
+
+    fresh_scores = _score_snapshot_replicas(fresh_attempts.values())
+    for target in SURVIVING_REPLICAS:
+        score = fresh_scores[target]
+        if score.eligible:
+            continue
+        reasons = ", ".join(score.reasons)
+        if "insufficient attempts" in score.reasons:
+            raise ValidationError(
+                f"optimization suffix lacks configured fresh on-time attempts for target {target}"
+            )
+        raise ValidationError(
+            f"optimization target {target} is nonresponsive: {reasons}"
+        )
+    ranking = [
+        target
+        for target in _cpp_snapshot_ranking(fresh_scores)
+        if target not in CRASHED_REPLICAS and fresh_scores[target].eligible
+    ]
+    if len(ranking) != QUORUM or set(ranking) != set(SURVIVING_REPLICAS):
+        raise ValidationError(
+            "optimization does not have exactly Q unconstrained eligible survivors"
+        )
+    return ranking
+
+
+def _validate_recurring_manager_sessions(
+    manifest: Manifest,
+    epochs: EpochDocument,
+    events: Sequence[analysis.StructuredEvent],
+) -> analysis.StructuredEvent:
+    if any(
+        event.event_type == "adaptive_v2_convergence_failure"
+        for event in events
+    ):
+        raise ValidationError("manager emitted adaptive_v2_convergence_failure")
+    ready_events = [event for event in events if event.event_type == "adaptive_v2_ready"]
+    terminal_events = [
+        event
+        for event in events
+        if event.event_type == "adaptive_v2_session_terminal"
+    ]
+    snapshot_events = [
+        event
+        for event in events
+        if event.event_type == "adaptive_v2_evidence_snapshot"
+    ]
+    artifacts = {
+        artifact.relative_path: artifact for artifact in manifest.runtime_artifacts
+    }
+    ready_by_key: dict[tuple[int, int], analysis.StructuredEvent] = {}
+    for ready in ready_events:
+        payload = _object(ready.payload, "adaptive_v2_ready payload")
+        _exact_fields(
+            payload,
+            _MANAGER_CONVERGENCE_PAYLOAD_FIELDS,
+            "adaptive_v2_ready payload",
+        )
+        identity = _object(payload["identity"], "adaptive_v2_ready identity")
+        _exact_fields(
+            identity,
+            _MANAGER_CONVERGENCE_IDENTITY_FIELDS,
+            "adaptive_v2_ready identity",
+        )
+        key = (
+            _integer(identity["predecessor_epoch_number"], "ready predecessor"),
+            _integer(identity["successor_epoch_number"], "ready successor"),
+        )
+        if key in ready_by_key:
+            raise ValidationError("duplicate adaptive_v2_ready for one transition")
+        if any(
+            payload[field] is not None
+            for field in (
+                "replica_id",
+                "delivery_attempt",
+                "disposition",
+                "canonical_payload_digest",
+                "failure_reason",
+            )
+        ):
+            raise ValidationError("adaptive_v2_ready is not the exact terminal record")
+        if (
+            _integer(payload["accepted_activation_count"], "accepted activations")
+            != QUORUM
+            or _integer(payload["required_activation_count"], "required activations")
+            != QUORUM
+        ):
+            raise ValidationError("adaptive_v2_ready does not prove the fixed quorum")
+        _integer(payload["accepted_commit_count"], "accepted commits")
+        ready_by_key[key] = ready
+
+    terminal_by_ordinal: dict[int, analysis.StructuredEvent] = {}
+    for terminal in terminal_events:
+        payload = _object(
+            terminal.payload, "adaptive_v2_session_terminal payload"
+        )
+        _exact_fields(
+            payload,
+            _MANAGER_SESSION_TERMINAL_FIELDS,
+            "adaptive_v2_session_terminal payload",
+        )
+        ordinal = _integer(payload["cycle_ordinal"], "terminal cycle_ordinal")
+        if ordinal in terminal_by_ordinal:
+            raise ValidationError("duplicate adaptive_v2_session_terminal record")
+        terminal_by_ordinal[ordinal] = terminal
+
+    snapshot_by_ordinal: dict[int, analysis.StructuredEvent] = {}
+    for snapshot in snapshot_events:
+        payload = _object(snapshot.payload, "adaptive_v2_evidence_snapshot payload")
+        _exact_fields(
+            payload,
+            _EVIDENCE_SNAPSHOT_FIELDS,
+            "adaptive_v2_evidence_snapshot payload",
+        )
+        ordinal = _integer(payload["cycle_ordinal"], "snapshot cycle_ordinal")
+        if ordinal in snapshot_by_ordinal:
+            raise ValidationError("duplicate adaptive_v2_evidence_snapshot record")
+        snapshot_by_ordinal[ordinal] = snapshot
+
+    reputation_cycles: list[list[analysis.StructuredEvent]] = []
+    current_cycle: list[analysis.StructuredEvent] = []
+    previous_ingestion = 0
+    for event in events:
+        if event.event_type != "reputation.evidence_applied":
+            continue
+        payload = _object(event.payload, "reputation evidence payload")
+        _exact_fields(payload, _REPUTATION_FIELDS, "reputation evidence payload")
+        ingestion = _integer(
+            payload["ingestion_sequence"], "reputation ingestion_sequence", minimum=1
+        )
+        if ingestion <= previous_ingestion:
+            if ingestion != 1 or not current_cycle:
+                raise ValidationError(
+                    "reputation ingestion sequence reset is not canonical"
+                )
+            reputation_cycles.append(current_cycle)
+            current_cycle = []
+        current_cycle.append(event)
+        previous_ingestion = ingestion
+    if current_cycle:
+        reputation_cycles.append(current_cycle)
+
+    previous_terminal_sequence = 0
+    final_ready: analysis.StructuredEvent | None = None
+    # One cycle may contain the two records of a timeout-to-late attempt; the
+    # replay below validates that exact transition.  Reuse across ledgers is
+    # still forbidden even when ingestion sequences restart.
+    observation_cycles: dict[str, int] = {}
+    profile = _decode_frozen_profile(
+        manifest.profile_bytes, "recurring manager profile"
+    )
+    minimum_attempts = _integer(
+        profile["minimum_timeout_observations_per_reporter"],
+        "profile minimum attempts",
+        minimum=1,
+    )
+    minimum_reporters = _integer(
+        profile["minimum_qualifying_reporters"],
+        "profile minimum qualifying reporters",
+        minimum=1,
+    )
+    for index, request in enumerate(manifest.transition_requests):
+        if index + 1 >= len(epochs.epochs):
+            raise IncompleteRun(
+                f"{_missing_transition_label(index)} has no successor epoch"
+            )
+        successor = epochs.epochs[index + 1]
+        command = _object(successor.command, "recurring successor command")
+        expected_identity = _command_identity(command)
+        key = (
+            int(request["predecessor_epoch_number"]),
+            int(request["successor_epoch_number"]),
+        )
+        ready = ready_by_key.get(key)
+        terminal = terminal_by_ordinal.get(index)
+        snapshot = snapshot_by_ordinal.get(index)
+        if ready is None or terminal is None or snapshot is None:
+            raise IncompleteRun(
+                f"{_missing_transition_label(index)} lacks its ready, terminal, or evidence snapshot record"
+            )
+        ready_identity = _object(ready.payload["identity"], "ready identity")
+        if not _json_values_equal(ready_identity, expected_identity):
+            raise ValidationError(
+                "adaptive_v2_ready identity differs from the canonical epoch command"
+            )
+        terminal_payload = _object(terminal.payload, "session terminal payload")
+        if (
+            terminal_payload["cycle_ordinal"] != index
+            or terminal_payload["policy_intent"] != request["policy_intent"]
+            or terminal_payload["outcome"] != "advanced"
+            or terminal_payload["reason"] != "successor_converged"
+            or terminal_payload["transition_artifact_id"]
+            != request["transition_artifact_id"]
+            or terminal_payload["predecessor_epoch_number"] != key[0]
+            or terminal_payload["predecessor_epoch_digest"]
+            != command["predecessor_epoch_digest"]
+            or terminal_payload["successor_epoch_number"] != key[1]
+            or terminal_payload["successor_epoch_digest"]
+            != command["successor_epoch_digest"]
+            or terminal_payload["command_payload_digest"]
+            != command["payload_digest"]
+            or not _json_values_equal(
+                terminal_payload["winning_activation"], expected_identity
+            )
+        ):
+            raise ValidationError(
+                "adaptive_v2_session_terminal does not bind its requested transition"
+            )
+        snapshot_payload = _object(snapshot.payload, "evidence snapshot payload")
+        artifact = artifacts[request["evidence_snapshot_path"]]
+        artifact_payload = _load_json_bytes(
+            artifact.payload, request["evidence_snapshot_path"]
+        )
+        if not _json_values_equal(snapshot_payload, artifact_payload):
+            raise ValidationError(
+                "manager evidence snapshot event differs from its immutable artifact"
+            )
+        predecessor = epochs.epochs[index]
+        observations = _list(
+            snapshot_payload.get("observations"), "evidence snapshot observations"
+        )
+        if not observations or any(
+            not isinstance(observation, dict)
+            or observation.get("epoch_number") != predecessor.epoch_number
+            or observation.get("epoch_digest") != predecessor.epoch_digest
+            for observation in observations
+        ):
+            raise ValidationError(
+                f"{_missing_transition_label(index)} requires fresh Epoch {predecessor.epoch_number} evidence only"
+            )
+        if index >= len(reputation_cycles):
+            raise IncompleteRun(
+                f"{_missing_transition_label(index)} lacks its emitted reputation evidence prefix"
+            )
+        cycle_events = reputation_cycles[index]
+        if index > 0:
+            previous_terminal = terminal_by_ordinal[index - 1]
+            if not (
+                cycle_events[0].source_sequence > previous_terminal.source_sequence
+                and cycle_events[0].timestamp_ns >= previous_terminal.timestamp_ns
+            ):
+                raise ValidationError(
+                    "reputation ingestion sequence reset precedes the authenticated successor-window boundary"
+                )
+        baseline_cutoff = _integer(
+            snapshot_payload.get("baseline_cutoff"),
+            "snapshot baseline_cutoff",
+        )
+        current_cutoff = _integer(
+            snapshot_payload.get("current_cutoff"),
+            "snapshot current_cutoff",
+            minimum=1,
+        )
+        if baseline_cutoff >= current_cutoff:
+            raise ValidationError("snapshot evidence cutoffs are not ordered")
+        expected_events = [
+            event
+            for event in cycle_events
+            if event.source_sequence < snapshot.source_sequence
+        ]
+        expected_ingestion = list(range(1, current_cutoff + 1))
+        if [
+            int(event.payload["ingestion_sequence"])
+            for event in expected_events
+        ] != expected_ingestion:
+            raise ValidationError(
+                "snapshot does not cover the full emitted evidence prefix"
+            )
+        if len(observations) != len(expected_events):
+            raise ValidationError(
+                "snapshot omits or adds emitted reputation observations"
+            )
+        for observation, evidence_event in zip(observations, expected_events):
+            assert isinstance(observation, dict)
+            _exact_fields(
+                observation,
+                (
+                    _EVIDENCE_SNAPSHOT_LATENCY_OBSERVATION_FIELDS
+                    if "latency_ns" in observation
+                    else _EVIDENCE_SNAPSHOT_OBSERVATION_FIELDS
+                ),
+                "evidence snapshot observation",
+            )
+            _integer(
+                observation["ingestion_sequence"],
+                "snapshot observation ingestion_sequence",
+                minimum=1,
+            )
+            _integer(
+                observation["epoch_number"],
+                "snapshot observation epoch_number",
+                maximum=analysis.UINT32_MAX,
+            )
+            _hash(
+                observation["epoch_digest"],
+                "snapshot observation epoch_digest",
+            )
+            reporter = _integer(
+                observation["reporter_id"],
+                "snapshot observation reporter_id",
+                maximum=max(MEMBERSHIP),
+            )
+            target = _integer(
+                observation["target_id"],
+                "snapshot observation target_id",
+                maximum=max(MEMBERSHIP),
+            )
+            if reporter == target:
+                raise ValidationError(
+                    "snapshot observation reporter and target must differ"
+                )
+            outcome = _string(
+                observation["outcome"], "snapshot observation outcome"
+            )
+            if outcome not in ("on_time", "late", "timeout"):
+                raise ValidationError("snapshot observation outcome is invalid")
+            has_latency = "latency_ns" in observation
+            if (outcome == "timeout" and has_latency) or (
+                outcome == "late" and not has_latency
+            ):
+                raise ValidationError(
+                    "snapshot observation latency does not match its outcome"
+                )
+            if has_latency:
+                _integer(
+                    observation["latency_ns"],
+                    "snapshot observation latency_ns",
+                    minimum=1,
+                )
+            evidence = evidence_event.payload
+            observation_id = _hash(
+                observation.get("observation_id"),
+                "snapshot observation_id",
+            )
+            previous_cycle = observation_cycles.setdefault(
+                observation_id, index
+            )
+            if previous_cycle != index:
+                raise ValidationError(
+                    "snapshot observation is reused across transition cycles"
+                )
+            expected_observation = {
+                "observation_id": evidence["observation_id"],
+                "ingestion_sequence": evidence["ingestion_sequence"],
+                "reporter_id": evidence["reporter_id"],
+                "target_id": evidence["target_id"],
+                "outcome": evidence["evidence_outcome"],
+            }
+            actual_observation = {
+                field: observation.get(field) for field in expected_observation
+            }
+            if not _json_values_equal(actual_observation, expected_observation):
+                raise ValidationError(
+                    "snapshot observation prefix differs from emitted reputation evidence"
+                )
+        calculated_ranking = _validate_recurring_evidence_window(
+            request,
+            observations,
+            baseline_cutoff=baseline_cutoff,
+            minimum_attempts=minimum_attempts,
+            minimum_reporters=minimum_reporters,
+        )
+        if calculated_ranking is not None:
+            if snapshot_payload.get("eligible_ranking") != calculated_ranking:
+                raise ValidationError(
+                    "optimization ranking does not follow fresh successor-window latency evidence"
+                )
+        roots = [tree.leader for tree in successor.trees]
+        if snapshot_payload.get("eligible_ranking") != roots:
+            raise ValidationError(
+                "successor roots do not match the fresh eligible ranking"
+            )
+        if (
+            snapshot_payload.get("cycle_ordinal") != index
+            or snapshot_payload.get("policy_intent") != request["policy_intent"]
+            or snapshot_payload.get("transition_artifact_id")
+            != request["transition_artifact_id"]
+            or snapshot_payload.get("predecessor_epoch_number") != key[0]
+            or snapshot_payload.get("predecessor_epoch_digest")
+            != predecessor.epoch_digest
+            or snapshot_payload.get("activation_generation")
+            != _checked_activation_generation(predecessor.epoch_number)
+            or terminal_payload["evidence_window_activation_generation"]
+            != snapshot_payload.get("activation_generation")
+            or terminal_payload["baseline_evidence_cutoff"]
+            != snapshot_payload.get("baseline_cutoff")
+            or terminal_payload["current_evidence_cutoff"]
+            != snapshot_payload.get("current_cutoff")
+        ):
+            raise ValidationError("terminal evidence window differs from its snapshot")
+        if not (
+            snapshot.source_sequence < ready.source_sequence < terminal.source_sequence
+            and snapshot.timestamp_ns <= ready.timestamp_ns <= terminal.timestamp_ns
+            and ready.source_sequence > previous_terminal_sequence
+        ):
+            raise ValidationError("manager transition records are not ordered")
+        previous_terminal_sequence = terminal.source_sequence
+        final_ready = ready
+
+    if (
+        len(ready_by_key) != len(manifest.transition_requests)
+        or set(terminal_by_ordinal) != set(range(len(manifest.transition_requests)))
+        or set(snapshot_by_ordinal) != set(range(len(manifest.transition_requests)))
+    ):
+        raise ValidationError("manager emitted an unrequested transition session")
+    assert final_ready is not None
+    return final_ready
+
+
 def _validate_manager_convergence_ready(
     manifest: Manifest,
     epochs: EpochDocument,
     streams: Mapping[tuple[str, str], Sequence[analysis.StructuredEvent]],
 ) -> analysis.StructuredEvent:
     events = streams[("adaptation_manager", manifest.manager_source_id)]
+    if manifest.transition_requests:
+        return _validate_recurring_manager_sessions(manifest, epochs, events)
     if any(
         event.event_type == "adaptive_v2_convergence_failure"
         for event in events
@@ -2344,6 +3837,15 @@ def _compressed(values: Iterable[int]) -> list[int]:
 def _contains_contiguous(values: Sequence[int], expected: Sequence[int]) -> bool:
     width = len(expected)
     return any(list(values[index : index + width]) == list(expected) for index in range(len(values) - width + 1))
+
+
+def _contains_cyclic_cycle(
+    values: Sequence[int], expected: Sequence[int]
+) -> bool:
+    return any(
+        _contains_contiguous(values, (*expected[offset:], *expected[:offset]))
+        for offset in range(len(expected))
+    )
 
 
 def _rich_commit_observations(
@@ -2907,6 +4409,7 @@ def _validate_reputation(
     observations: dict[str, tuple[str, int, int]] = {}
     previous_ingestion = 0
     previous_cutoff = 0
+    evidence_window_resets = 0
     baseline_snapshot_taken = False
     command_snapshot_taken = False
     score_at_command = [0] * 7
@@ -2946,7 +4449,18 @@ def _validate_reputation(
             payload["ingestion_sequence"], "ingestion_sequence", minimum=1
         )
         if ingestion <= previous_ingestion:
-            raise ValidationError("reputation ingestion_sequence must increase")
+            if (
+                not manifest.transition_requests
+                or ingestion != 1
+                or event.timestamp_ns < post_start_ns
+                or evidence_window_resets
+                >= len(manifest.transition_requests) - 1
+            ):
+                raise ValidationError("reputation ingestion_sequence must increase")
+            evidence_window_resets += 1
+            previous_ingestion = 0
+            previous_cutoff = 0
+            scores = [0] * 7
         if cutoff < previous_cutoff or ingestion > cutoff:
             raise ValidationError("reputation evidence cutoff is invalid")
         previous_ingestion = ingestion
@@ -3053,6 +4567,12 @@ def _validate_reputation(
             "manager reputation trajectory is missing replicas: "
             + ", ".join(map(str, missing))
         )
+    if manifest.transition_requests and evidence_window_resets != (
+        len(manifest.transition_requests) - 1
+    ):
+        raise IncompleteRun(
+            "reputation evidence did not open every authenticated successor window"
+        )
     if baseline_on_time_targets != set(MEMBERSHIP):
         missing = sorted(set(MEMBERSHIP) - baseline_on_time_targets)
         raise IncompleteRun(
@@ -3096,9 +4616,531 @@ def _validate_reputation(
     return tuple(points), tuple(scores)  # type: ignore[return-value]
 
 
+def _validate_recurring_command_and_activation(
+    manifest: Manifest,
+    epochs: EpochDocument,
+    streams: Mapping[tuple[str, str], Sequence[analysis.StructuredEvent]],
+    crash_complete_ns: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    transitions = epochs.epochs[1:]
+    expected_commands = [dict(epoch.command or {}) for epoch in transitions]
+    command_times_by_transition: list[dict[int, int]] = [
+        {} for _ in transitions
+    ]
+    activation_times_by_transition: list[dict[int, int]] = [
+        {} for _ in transitions
+    ]
+    for replica in CRASHED_REPLICAS:
+        events = streams[("replica", f"replica-{replica}")]
+        if any(
+            event.event_type in ("epoch.command_committed", "epoch.activated")
+            for event in events
+        ):
+            raise ValidationError(
+                f"crashed replica-{replica} emitted transition evidence after exit"
+            )
+    for replica in SURVIVING_REPLICAS:
+        events = streams[("replica", f"replica-{replica}")]
+        command_events = [
+            event for event in events if event.event_type == "epoch.command_committed"
+        ]
+        if len(command_events) < len(transitions):
+            raise IncompleteRun(
+                f"replica-{replica} is missing a recurring epoch command"
+            )
+        if len(command_events) > len(transitions):
+            raise ValidationError(
+                f"replica-{replica} emitted an unrequested epoch command"
+            )
+        activation_events = [
+            event for event in events if event.event_type == "epoch.activated"
+        ]
+        for index, (epoch, expected_command, command_event) in enumerate(
+            zip(transitions, expected_commands, command_events)
+        ):
+            command = _parse_command_payload(command_event.payload)
+            if command != expected_command:
+                raise ValidationError(
+                    f"replica-{replica} transition command differs from the epoch chain"
+                )
+            if index == 0 and command_event.timestamp_ns <= crash_complete_ns:
+                raise ValidationError("first epoch command must follow both crash exits")
+            command_times_by_transition[index][replica] = command_event.timestamp_ns
+            candidates = [
+                event
+                for event in activation_events
+                if event.payload.get("epoch_number") == epoch.epoch_number
+            ]
+            if not candidates:
+                raise IncompleteRun(
+                    f"replica-{replica} has no activation for epoch {epoch.epoch_number}"
+                )
+            if len(candidates) != 1:
+                raise ValidationError(
+                    f"replica-{replica} emitted duplicate epoch {epoch.epoch_number} activation"
+                )
+            activation = candidates[0]
+            _exact_fields(
+                activation.payload, _EPOCH_EVENT_FIELDS, "epoch.activated payload"
+            )
+            if (
+                activation.payload["epoch_number"] != epoch.epoch_number
+                or activation.payload["epoch_digest"] != epoch.epoch_digest
+                or activation.payload["activation_height"]
+                != expected_command["activation_height"]
+                or activation.payload["tree_id"]
+                not in {tree.tree_id for tree in epoch.trees}
+            ):
+                raise ValidationError(
+                    f"replica-{replica} activation does not identify epoch {epoch.epoch_number}"
+                )
+            if activation.timestamp_ns < command_event.timestamp_ns:
+                raise ValidationError("epoch activation precedes its committed command")
+            activation_times_by_transition[index][replica] = activation.timestamp_ns
+
+    grace_ns = _integer(
+        manifest.runtime["leader_activation_grace_ms"],
+        "runtime.leader_activation_grace_ms",
+        minimum=1,
+    ) * 1_000_000
+    observer_commands: list[int] = []
+    observer_activations: list[int] = []
+    latest_activations: list[int] = []
+    for command_times, activation_times in zip(
+        command_times_by_transition, activation_times_by_transition
+    ):
+        if max(activation_times.values()) - min(activation_times.values()) > grace_ns:
+            raise ValidationError(
+                "survivor activation spread exceeds frozen leader activation grace"
+            )
+        observer_commands.append(command_times[analysis.AUTHORITATIVE_OBSERVER])
+        observer_activations.append(
+            activation_times[analysis.AUTHORITATIVE_OBSERVER]
+        )
+        latest_activations.append(max(activation_times.values()))
+    if any(
+        right <= left
+        for left, right in zip(observer_commands, observer_commands[1:])
+    ):
+        raise ValidationError("recurring epoch commands are not ordered")
+    return (
+        tuple(observer_commands),
+        tuple(observer_activations),
+        tuple(latest_activations),
+    )
+
+
+def _validate_recurring_commits(
+    manifest: Manifest,
+    epochs: EpochDocument,
+    streams: Mapping[tuple[str, str], Sequence[analysis.StructuredEvent]],
+    texts: Mapping[tuple[str, str], str],
+    crash_ns: int,
+    command_times: Sequence[int],
+    activation_times: Sequence[int],
+) -> tuple[
+    analysis.ThroughputAnalysis,
+    int,
+    Mapping[str, int],
+    Mapping[str, int],
+    tuple[int, ...],
+]:
+    observer_key = ("replica", manifest.authoritative_observer)
+    try:
+        commits = analysis.parse_commit_events(
+            texts[observer_key],
+            expected_run_id=manifest.run_id,
+            leader_by_configuration=epochs.leader_by_configuration,
+            expected_source_instance=next(
+                source.source_instance
+                for source in manifest.sources
+                if source.key == observer_key
+            ),
+            allow_legacy_prefix=False,
+        )
+    except analysis.AnalysisError as exc:
+        raise ValidationError(f"authoritative commit stream is invalid: {exc}") from exc
+    if not commits:
+        raise IncompleteRun("authoritative observer has no commit events")
+    epoch_positions = {epoch.epoch_number: index for index, epoch in enumerate(epochs.epochs)}
+    previous_position = -1
+    first_timestamp_by_epoch: dict[int, int] = {}
+    for commit in commits:
+        position = epoch_positions.get(commit.epoch_number)
+        if position is None:
+            raise ValidationError(
+                f"commit height {commit.height} uses an unknown epoch"
+            )
+        if position < previous_position:
+            raise ValidationError("authoritative commits regress to a retired epoch")
+        if position > previous_position + 1:
+            raise ValidationError("authoritative commits skip an epoch")
+        if position > 0 and commit.timestamp_ns < activation_times[position - 1]:
+            raise ValidationError(
+                f"epoch {commit.epoch_number} commit precedes common activation"
+            )
+        previous_position = position
+        first_timestamp_by_epoch.setdefault(commit.epoch_number, commit.timestamp_ns)
+
+    survivor_observations = {
+        replica: _commit_observations(
+            streams[("replica", f"replica-{replica}")], replica
+        )
+        for replica in SURVIVING_REPLICAS
+    }
+    common_first_ns: list[int] = []
+    for transition_index, epoch in enumerate(epochs.epochs[1:]):
+        successor_commits = [
+            commit for commit in commits if commit.epoch_number == epoch.epoch_number
+        ]
+        if len(successor_commits) < 2:
+            raise IncompleteRun(
+                f"epoch {epoch.epoch_number} lacks two post-activation authoritative commits"
+            )
+        first_two = successor_commits[:2]
+        first_common_times = [first_two[0].timestamp_ns]
+        for commit in first_two:
+            for replica, observations in survivor_observations.items():
+                observed_hash = observations.get(commit.height)
+                if observed_hash is None:
+                    raise IncompleteRun(
+                        f"replica-{replica} is missing post-activation height {commit.height}"
+                    )
+                if observed_hash != commit.block_hash:
+                    raise ValidationError(
+                        f"survivor commit disagreement at height {commit.height}"
+                    )
+                if commit is first_two[0]:
+                    witness = _commit_witness_observations(
+                        streams[("replica", f"replica-{replica}")], replica
+                    )[commit.height]
+                    first_common_times.append(witness.timestamp_ns)
+        first_common = max(first_common_times)
+        common_first_ns.append(first_common)
+        if first_common - activation_times[transition_index] > (
+            manifest.maximum_activation_to_successor_ns
+        ):
+            raise ValidationError(
+                f"epoch {epoch.epoch_number} first common commit exceeds the activation deadline"
+            )
+        if transition_index + 1 < len(command_times) and not (
+            first_common < command_times[transition_index + 1]
+        ):
+            raise ValidationError(
+                "next transition command precedes a common predecessor commit"
+            )
+
+    windows = manifest.throughput_windows
+    if (
+        windows[0].start_ns != manifest.baseline_start_ns
+        or windows[0].end_ns != crash_ns
+        or windows[-1].end_ns != manifest.end_ns
+        or windows[2].start_ns < common_first_ns[0]
+        or windows[2].end_ns > command_times[1]
+        or windows[3].start_ns < common_first_ns[1]
+    ):
+        raise ValidationError(
+            "four throughput windows do not bind the causal transition boundaries"
+        )
+    try:
+        throughput = analysis.analyze_throughput(commits, windows)
+    except analysis.AnalysisError as exc:
+        raise ValidationError(f"throughput analysis failed: {exc}") from exc
+    counts = {phase: 0 for phase in manifest.required_bucket_counts}
+    for bucket in throughput.buckets:
+        if bucket.phase not in counts:
+            raise ValidationError(f"unknown throughput phase: {bucket.phase}")
+        if bucket.end_ns - bucket.start_ns == analysis.BUCKET_WIDTH_NS:
+            counts[bucket.phase] += 1
+    for phase, required in manifest.required_bucket_counts.items():
+        if counts[phase] < required:
+            raise IncompleteRun(
+                f"{phase} phase has {counts[phase]} complete raw buckets; requires {required}"
+            )
+    maximum_stalls = _maximum_commit_stalls(
+        commits,
+        tuple((window.phase, window.start_ns, window.end_ns) for window in windows),
+    )
+    for phase, stall_ns in maximum_stalls.items():
+        limit = (
+            manifest.degraded_maximum_stall_ns
+            if phase == "degraded"
+            else manifest.maximum_stall_ns
+        )
+        if stall_ns > limit:
+            raise ValidationError(
+                f"{phase} authoritative commit stall exceeds the frozen maximum"
+            )
+    for transition_index, epoch in enumerate(epochs.epochs[1:]):
+        command = _object(epoch.command, "successor command")
+        by_height = {commit.height: commit for commit in commits}
+        command_commit = by_height.get(int(command["command_block_height"]))
+        if command_commit is None:
+            raise IncompleteRun(
+                f"authoritative observer lacks command height {command['command_block_height']}"
+            )
+        if command_commit.block_hash != command["command_block_hash"]:
+            raise ValidationError("committed command hash differs from its consensus block")
+        if command_commit.timestamp_ns > command_times[transition_index]:
+            raise ValidationError("epoch command event precedes its committed block")
+
+    pre_crash = [
+        commit
+        for commit in commits
+        if manifest.baseline_start_ns <= commit.timestamp_ns < crash_ns
+    ]
+    all_replica_observations = {
+        replica: _commit_observations(
+            streams[("replica", f"replica-{replica}")], replica
+        )
+        for replica in MEMBERSHIP
+    }
+    if not _contains_contiguous(
+        _compressed(commit.leader_replica for commit in pre_crash), MEMBERSHIP
+    ):
+        raise ValidationError("crash must follow a complete common epoch-0 root cycle 0..6")
+    for commit in pre_crash:
+        for replica in MEMBERSHIP:
+            if all_replica_observations[replica].get(commit.height) != commit.block_hash:
+                raise IncompleteRun(
+                    f"replica-{replica} is missing common baseline height {commit.height}"
+                )
+    for window in windows[2:]:
+        phase_commits = [
+            commit
+            for commit in commits
+            if window.start_ns <= commit.timestamp_ns < window.end_ns
+        ]
+        epoch = epochs.epochs[window.epoch_number]
+        expected_roots = tuple(tree.leader for tree in epoch.trees)
+        if not _contains_cyclic_cycle(
+            _compressed(commit.leader_replica for commit in phase_commits),
+            expected_roots,
+        ):
+            raise IncompleteRun(
+                f"{window.phase} phase lacks one complete ranked root cycle"
+            )
+    authoritative_window = {
+        commit.height: commit.block_hash
+        for commit in commits
+        if any(
+            window.start_ns <= commit.timestamp_ns < window.end_ns
+            for window in windows
+        )
+    }
+    for height, block_hash in authoritative_window.items():
+        for replica, observations in survivor_observations.items():
+            if observations.get(height) != block_hash:
+                raise IncompleteRun(
+                    f"replica-{replica} is missing authoritative height {height}"
+                )
+    common = set.intersection(
+        *(set(observations) for observations in survivor_observations.values())
+    )
+    medians = throughput.medians
+    assert medians.containment_tps is not None
+    assert medians.optimized_tps is not None
+    if medians.degraded_tps <= 0 or medians.containment_tps <= 0:
+        raise ValidationError("recurring throughput ratios require positive medians")
+    containment_ratio = medians.containment_tps / medians.degraded_tps
+    optimized_ratio = medians.optimized_tps / medians.containment_tps
+    if containment_ratio < float(manifest.minimum_containment_to_degraded_ratio):
+        raise ValidationError("containment throughput ratio is below the frozen minimum")
+    if optimized_ratio < float(manifest.minimum_optimized_to_containment_ratio):
+        raise ValidationError("optimized throughput ratio is below the frozen minimum")
+    for bucket in throughput.buckets:
+        if sum(bucket.leader_transactions) != bucket.transaction_count:
+            raise ValidationError("leader transaction columns do not conserve aggregate")
+        if sum(bucket.leader_tps) != bucket.aggregate_tps:
+            raise ValidationError("leader TPS columns do not conserve aggregate")
+    return throughput, len(common), counts, maximum_stalls, tuple(common_first_ns)
+
+
 def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
     manifest = load_manifest(manifest_path)
     epochs = load_epochs(epochs_path)
+    if manifest.transition_requests:
+        if len(epochs.epochs) != len(manifest.transition_requests) + 1:
+            raise IncompleteRun(
+                "epoch chain does not contain one successor per transition request"
+            )
+        if [tree.leader for tree in epochs.initial.trees] != manifest.runtime[
+            "epoch0_roots"
+        ]:
+            raise ValidationError("epoch-0 roots differ from manifest.runtime")
+        for request, epoch in zip(
+            manifest.transition_requests, epochs.epochs[1:]
+        ):
+            command = _object(epoch.command, "recurring successor command")
+            if command["activation_delay_blocks"] != manifest.runtime[
+                "activation_delay_blocks"
+            ]:
+                raise ValidationError(
+                    "committed activation delay differs from manifest.runtime"
+                )
+            if request["policy_intent"] == "fault_containment":
+                parameters = _object(
+                    request["policy_parameters"], "containment policy parameters"
+                )
+                predecessor = epochs.epochs[
+                    int(request["predecessor_epoch_number"])
+                ]
+                expected_baseline_roots = [
+                    {
+                        "tree_id": tree.tree_id,
+                        "replica_id": tree.leader,
+                    }
+                    for tree in predecessor.trees[:QUORUM]
+                ]
+                actual_baseline_roots = [
+                    dict(item)
+                    for item in _list(
+                        parameters.get("containment_baseline_roots"),
+                        "containment baseline roots",
+                    )
+                ]
+                if not _json_values_equal(
+                    actual_baseline_roots, expected_baseline_roots
+                ):
+                    raise ValidationError(
+                        "containment baseline roots do not describe the predecessor layout"
+                    )
+        streams, texts = _read_source_events(manifest)
+        manager_ready = _validate_manager_convergence_ready(
+            manifest, epochs, streams
+        )
+        _validate_recurring_transition_bundles(
+            manifest,
+            epochs,
+            streams[("adaptation_manager", manifest.manager_source_id)],
+        )
+        _validate_process_lifecycle(
+            manifest,
+            streams,
+            manager_ready=manager_ready,
+        )
+        crash_markers = _validate_crash_markers(manifest, streams)
+        crash_ns = min(crash_markers)
+        crash_complete_ns = max(
+            marker.confirmed_ns for marker in manifest.crash_markers
+        )
+        _validate_crash_configuration_boundary(
+            manifest,
+            epochs,
+            streams,
+            max(crash_markers),
+        )
+        command_times, activation_times, latest_activations = (
+            _validate_recurring_command_and_activation(
+                manifest, epochs, streams, crash_complete_ns
+            )
+        )
+        ready_events = [
+            event
+            for event in streams[
+                ("adaptation_manager", manifest.manager_source_id)
+            ]
+            if event.event_type == "adaptive_v2_ready"
+        ]
+        ready_by_successor = {
+            int(event.payload["identity"]["successor_epoch_number"]): event
+            for event in ready_events
+        }
+        manager_events = streams[
+            ("adaptation_manager", manifest.manager_source_id)
+        ]
+        snapshots_by_ordinal = {
+            int(event.payload["cycle_ordinal"]): event
+            for event in manager_events
+            if event.event_type == "adaptive_v2_evidence_snapshot"
+        }
+        terminals_by_ordinal = {
+            int(event.payload["cycle_ordinal"]): event
+            for event in manager_events
+            if event.event_type == "adaptive_v2_session_terminal"
+        }
+        for index, (command_ns, activation_ns, latest_ns) in enumerate(
+            zip(command_times, activation_times, latest_activations)
+        ):
+            successor_number = epochs.epochs[index + 1].epoch_number
+            ready = ready_by_successor[successor_number]
+            if not (
+                (crash_ns if index == 0 else latest_activations[index - 1])
+                < command_ns
+                <= activation_ns
+                <= latest_ns
+                <= ready.timestamp_ns
+                < manifest.end_ns
+            ):
+                raise ValidationError(
+                    f"transition to epoch {successor_number} has invalid causal boundaries"
+                )
+            if index > 0:
+                residency_ns = int(
+                    manifest.transition_requests[index][
+                        "minimum_predecessor_residency_ms"
+                    ]
+                ) * 1_000_000
+                predecessor_terminal_ns = terminals_by_ordinal[
+                    index - 1
+                ].timestamp_ns
+                if predecessor_terminal_ns > analysis.UINT64_MAX - residency_ns:
+                    raise ValidationError(
+                        "minimum predecessor residency overflows monotonic time"
+                    )
+                earliest_transition_ns = predecessor_terminal_ns + residency_ns
+                snapshot = snapshots_by_ordinal[index]
+                if (
+                    snapshot.timestamp_ns < earliest_transition_ns
+                    or command_ns < earliest_transition_ns
+                ):
+                    raise ValidationError(
+                        f"transition to epoch {successor_number} violates its "
+                        "minimum predecessor residency"
+                    )
+        (
+            throughput,
+            common_heights,
+            complete_bucket_counts,
+            maximum_stalls,
+            first_common_successors,
+        ) = _validate_recurring_commits(
+            manifest,
+            epochs,
+            streams,
+            texts,
+            crash_ns,
+            command_times,
+            activation_times,
+        )
+        containment_start_ns = manifest.throughput_windows[2].start_ns
+        reputation, final_scores = _validate_reputation(
+            manifest,
+            streams,
+            crash_ns,
+            command_times[0],
+            containment_start_ns,
+        )
+        return Evaluation(
+            manifest=manifest,
+            epochs=epochs,
+            crash_markers_ns=crash_markers,
+            crash_ns=crash_ns,
+            command_ns=command_times[0],
+            activation_ns=activation_times[0],
+            minimum_post_start_ns=(
+                activation_times[0]
+                + manifest.minimum_post_activation_grace_ns
+            ),
+            first_common_successor_ns=first_common_successors[0],
+            post_start_ns=containment_start_ns,
+            throughput=throughput,
+            reputation=reputation,
+            final_scores=final_scores,
+            common_commit_heights=common_heights,
+            complete_bucket_counts=complete_bucket_counts,
+            maximum_stall_ns_by_phase=maximum_stalls,
+        )
     command = epochs.successor.command
     assert command is not None
     if command["activation_delay_blocks"] != manifest.runtime[
@@ -3216,7 +5258,43 @@ def _pass_record(
     evaluation: Evaluation, artifacts: Mapping[str, Mapping[str, str]]
 ) -> dict[str, Any]:
     medians = evaluation.throughput.medians
-    ratio = medians.post_tps / medians.baseline_tps
+    recurring = bool(evaluation.manifest.transition_requests)
+    if recurring:
+        assert medians.containment_tps is not None
+        assert medians.optimized_tps is not None
+        metrics: dict[str, Any] = {
+            "phase_median_tps": {
+                "baseline": medians.baseline_tps,
+                "degraded": medians.degraded_tps,
+                "containment": medians.containment_tps,
+                "optimized": medians.optimized_tps,
+            },
+            "containment_to_degraded_ratio": (
+                medians.containment_tps / medians.degraded_tps
+            ),
+            "optimized_to_containment_ratio": (
+                medians.optimized_tps / medians.containment_tps
+            ),
+        }
+    else:
+        assert medians.post_tps is not None
+        metrics = {
+            "baseline_median_tps": medians.baseline_tps,
+            "degraded_median_tps": medians.degraded_tps,
+            "post_median_tps": medians.post_tps,
+            "recovery_ratio": medians.post_tps / medians.baseline_tps,
+        }
+    metrics.update(
+        {
+            "common_survivor_commit_heights": evaluation.common_commit_heights,
+            "complete_bucket_counts": dict(evaluation.complete_bucket_counts),
+            "maximum_commit_stall_seconds": {
+                phase: stall_ns / 1_000_000_000
+                for phase, stall_ns in evaluation.maximum_stall_ns_by_phase.items()
+            },
+            "final_reputation_scores": list(evaluation.final_scores),
+        }
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "scenario": SCENARIO,
@@ -3246,19 +5324,7 @@ def _pass_record(
                 marker.confirmed_ns for marker in evaluation.manifest.crash_markers
             ],
         },
-        "metrics": {
-            "baseline_median_tps": medians.baseline_tps,
-            "degraded_median_tps": medians.degraded_tps,
-            "post_median_tps": medians.post_tps,
-            "recovery_ratio": ratio,
-            "common_survivor_commit_heights": evaluation.common_commit_heights,
-            "complete_bucket_counts": dict(evaluation.complete_bucket_counts),
-            "maximum_commit_stall_seconds": {
-                phase: stall_ns / 1_000_000_000
-                for phase, stall_ns in evaluation.maximum_stall_ns_by_phase.items()
-            },
-            "final_reputation_scores": list(evaluation.final_scores),
-        },
+        "metrics": metrics,
         "artifacts": dict(artifacts),
     }
 

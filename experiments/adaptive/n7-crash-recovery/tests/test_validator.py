@@ -105,6 +105,1007 @@ def test_complete_synthetic_run_passes_and_writes_only_canonical_inputs(
     assert "post" in throughput
 
 
+def test_complete_recurring_run_requires_exact_two_cycle_causality(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    epoch_values = synthetic_run.load(epochs)["epochs"]
+    assert [epoch["epoch_number"] for epoch in epoch_values] == [0, 1, 2]
+    assert [
+        (
+            epoch["command"]["predecessor_epoch_number"],
+            epoch["command"]["successor_epoch_number"],
+        )
+        for epoch in epoch_values[1:]
+    ] == [(0, 1), (1, 2)]
+    for epoch in epoch_values[1:]:
+        for tree in epoch["trees"]:
+            assert tree["wait_exempt"] == [0, 1]
+            assert tree["members_breadth_first"].index(0) >= 3
+            assert tree["members_breadth_first"].index(1) >= 3
+    assert tuple(
+        tree["members_breadth_first"][0]
+        for tree in epoch_values[2]["trees"]
+    ) == synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING
+
+    second_snapshot = synthetic_run.load(
+        tmp_path / "run" / synthetic_run.TRANSITION_SNAPSHOT_PATHS[1]
+    )
+    assert second_snapshot["eligible_ranking"] == list(
+        synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING
+    )
+    assert (second_snapshot["baseline_cutoff"], second_snapshot["current_cutoff"]) == (
+        synthetic_run.OPTIMIZATION_BASELINE_CUTOFF,
+        synthetic_run.OPTIMIZATION_CURRENT_CUTOFF,
+    )
+    assert len(second_snapshot["observations"]) == (
+        synthetic_run.OPTIMIZATION_CURRENT_CUTOFF
+    )
+    assert {
+        observation["target_id"]
+        for observation in second_snapshot["observations"][
+            synthetic_run.OPTIMIZATION_BASELINE_CUTOFF:
+        ]
+    } == set(synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING)
+    assert all(
+        observation["outcome"] == "on_time" and observation["latency_ns"] > 0
+        for observation in second_snapshot["observations"][
+            synthetic_run.OPTIMIZATION_BASELINE_CUTOFF:
+        ]
+    )
+    assert all(
+        sum(
+            observation["target_id"] == target
+            for observation in second_snapshot["observations"][
+                synthetic_run.OPTIMIZATION_BASELINE_CUTOFF:
+            ]
+        )
+        >= 2
+        for target in synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING
+    )
+    assert {
+        (item["epoch_number"], item["epoch_digest"])
+        for item in second_snapshot["observations"]
+    } == {(1, synthetic_run.EPOCH_1_DIGEST)}
+
+    manager_events = [
+        json.loads(line)
+        for line in (tmp_path / "run/raw/adaptive-manager.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [
+        event["payload"]["identity"]["successor_epoch_number"]
+        for event in manager_events
+        if event["event_type"] == "adaptive_v2_ready"
+    ] == [1, 2]
+    terminals = [
+        event
+        for event in manager_events
+        if event["event_type"] == "adaptive_v2_session_terminal"
+    ]
+    expected_terminal_fields = {
+        "cycle_ordinal",
+        "policy_intent",
+        "outcome",
+        "reason",
+        "transition_artifact_id",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "winning_activation",
+        "evidence_window_activation_generation",
+        "baseline_evidence_cutoff",
+        "current_evidence_cutoff",
+    }
+    assert all(set(event["payload"]) == expected_terminal_fields for event in terminals)
+    assert [event["payload"]["cycle_ordinal"] for event in terminals] == [0, 1]
+    assert [
+        (
+            event["payload"]["baseline_evidence_cutoff"],
+            event["payload"]["current_evidence_cutoff"],
+        )
+        for event in terminals
+    ] == [
+        (
+            synthetic_run.CONTAINMENT_BASELINE_CUTOFF,
+            synthetic_run.CONTAINMENT_CURRENT_CUTOFF,
+        ),
+        (
+            synthetic_run.OPTIMIZATION_BASELINE_CUTOFF,
+            synthetic_run.OPTIMIZATION_CURRENT_CUTOFF,
+        ),
+    ]
+    assert [
+        event["payload"]["evidence_window_activation_generation"]
+        for event in terminals
+    ] == [
+        synthetic_run.checked_activation_generation(0),
+        synthetic_run.checked_activation_generation(1),
+    ]
+    assert len(
+        {
+            (
+                event["payload"]["baseline_evidence_cutoff"],
+                event["payload"]["current_evidence_cutoff"],
+            )
+            for event in terminals
+        }
+    ) == 2
+    assert len(
+        {
+            event["payload"]["transition_artifact_id"]
+            for event in terminals
+        }
+    ) == 2
+
+    artifact_paths = [
+        artifact["path"]
+        for artifact in synthetic_run.load(manifest)["runtime_artifacts"]
+        if artifact["kind"] in ("transition_bundle", "evidence_snapshot")
+    ]
+    assert artifact_paths == [
+        synthetic_run.TRANSITION_BUNDLE_PATHS[0],
+        synthetic_run.TRANSITION_SNAPSHOT_PATHS[0],
+        synthetic_run.TRANSITION_BUNDLE_PATHS[1],
+        synthetic_run.TRANSITION_SNAPSHOT_PATHS[1],
+    ]
+    assert len(set(artifact_paths)) == 4
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "PASS"
+    assert verdict["profile_identity"] == (
+        "n7-f2-q5-crash-recovery-recurring-v3"
+    )
+    assert verdict["metrics"]["complete_bucket_counts"] == {
+        "baseline": 7,
+        "degraded": 7,
+        "containment": 8,
+        "optimized": 7,
+    }
+    assert set(verdict["metrics"]["phase_median_tps"]) == {
+        "baseline",
+        "degraded",
+        "containment",
+        "optimized",
+    }
+
+
+def test_recurring_manager_exit_after_only_first_cycle_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    synthetic_run._write_stream(  # type: ignore[attr-defined]
+        tmp_path / "run/raw/adaptive-manager.jsonl",
+        synthetic_run.recurring_manager_events(completed_cycles=1),
+    )
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "INCOMPLETE"
+    assert "second transition" in verdict["reason"]
+    assert synthetic_run.load(tmp_path / "validated/validation.json") == verdict
+
+
+@pytest.mark.parametrize("early_record", ("snapshot", "command"))
+def test_second_transition_cannot_precede_minimum_predecessor_residency(
+    tmp_path: Path,
+    early_record: str,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    earliest_transition_ns = (
+        synthetic_run.MANAGER_READY_NS
+        + 1_000_000
+        + 40_000_000_000
+    )
+    early_ns = earliest_transition_ns - 1
+
+    if early_record == "snapshot":
+        def move_second_snapshot(values: list[dict[str, object]]) -> None:
+            snapshot = next(
+                value
+                for value in values
+                if value["event_type"] == "adaptive_v2_evidence_snapshot"
+                and value["payload"]["cycle_ordinal"] == 1  # type: ignore[index]
+            )
+            snapshot["source_monotonic_ns"] = early_ns
+            values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+        _rewrite_jsonl(
+            tmp_path / "run/raw/adaptive-manager.jsonl",
+            move_second_snapshot,
+        )
+    else:
+        for replica in synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING:
+            def move_second_command(
+                values: list[dict[str, object]],
+            ) -> None:
+                command = next(
+                    value
+                    for value in values
+                    if value["event_type"] == "epoch.command_committed"
+                    and value["payload"]["successor_epoch_number"] == 2  # type: ignore[index]
+                )
+                command["source_monotonic_ns"] = early_ns
+                values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+            _rewrite_jsonl(
+                tmp_path / f"run/raw/replica-{replica}.jsonl",
+                move_second_command,
+            )
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "minimum predecessor residency" in verdict["reason"]
+
+
+def test_second_transition_residency_starts_at_previous_manager_terminal(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+
+    def move_first_terminal(values: list[dict[str, object]]) -> None:
+        terminal = next(
+            value
+            for value in values
+            if value["event_type"] == "adaptive_v2_session_terminal"
+            and value["payload"]["cycle_ordinal"] == 0  # type: ignore[index]
+        )
+        terminal["source_monotonic_ns"] = 79_500_000_000
+        values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+    _rewrite_jsonl(
+        tmp_path / "run/raw/adaptive-manager.jsonl",
+        move_first_terminal,
+    )
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "minimum predecessor residency" in verdict["reason"]
+
+
+def test_rehashed_noncanonical_transition_bundle_is_rejected(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    relative_path = synthetic_run.TRANSITION_BUNDLE_PATHS[1]
+    (tmp_path / "run" / relative_path).write_bytes(b"not a canonical bundle")
+    _rehash_runtime_artifact(manifest, relative_path)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "transition bundle" in verdict["reason"]
+
+
+def test_rehashed_canonical_bundle_cannot_bind_the_wrong_transition(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    first_path = tmp_path / "run" / synthetic_run.TRANSITION_BUNDLE_PATHS[0]
+    second_relative = synthetic_run.TRANSITION_BUNDLE_PATHS[1]
+    (tmp_path / "run" / second_relative).write_bytes(first_path.read_bytes())
+    _rehash_runtime_artifact(manifest, second_relative)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "command identity differs from epochs.json" in verdict["reason"]
+
+
+@pytest.mark.parametrize("nested", (False, True), ids=("snapshot", "observation"))
+@pytest.mark.parametrize("mutation", ("extra", "missing"))
+def test_evidence_snapshot_payloads_require_exact_fields(
+    tmp_path: Path,
+    nested: bool,
+    mutation: str,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    relative_path = synthetic_run.TRANSITION_SNAPSHOT_PATHS[1]
+    snapshot_path = tmp_path / "run" / relative_path
+    snapshot = synthetic_run.load(snapshot_path)
+    target = snapshot["observations"][0] if nested else snapshot
+    field = "reporter_id" if nested else "eligible_ranking"
+    if mutation == "extra":
+        target["unexpected_behavior_switch"] = True
+    else:
+        target.pop(field)
+    synthetic_run.save(snapshot_path, snapshot)
+    _rehash_runtime_artifact(manifest, relative_path)
+
+    def mutate_event(values: list[dict[str, object]]) -> None:
+        event = next(
+            value
+            for value in values
+            if value["event_type"] == "adaptive_v2_evidence_snapshot"
+            and value["payload"]["cycle_ordinal"] == 1  # type: ignore[index]
+        )
+        payload = event["payload"]  # type: ignore[assignment]
+        event_target = payload["observations"][0] if nested else payload  # type: ignore[index]
+        if mutation == "extra":
+            event_target["unexpected_behavior_switch"] = True
+        else:
+            event_target.pop(field)
+
+    _rewrite_jsonl(
+        tmp_path / "run/raw/adaptive-manager.jsonl",
+        mutate_event,
+    )
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "fields are invalid" in verdict["reason"]
+
+
+def _window_observation(
+    observations: list[dict[str, object]],
+    *,
+    target: int,
+    reporter: int,
+    outcome: str = "on_time",
+    latency_ns: int | None = None,
+    observation_id: str | None = None,
+) -> None:
+    sequence = len(observations) + 1
+    observation: dict[str, object] = {
+        "observation_id": observation_id or f"{50_000 + sequence:064x}",
+        "ingestion_sequence": sequence,
+        "epoch_number": 1,
+        "epoch_digest": synthetic_run.EPOCH_1_DIGEST,
+        "reporter_id": reporter,
+        "target_id": target,
+        "outcome": outcome,
+    }
+    if latency_ns is not None:
+        observation["latency_ns"] = latency_ns
+    observations.append(observation)
+
+
+def _variable_containment_window(
+) -> tuple[list[dict[str, object]], int]:
+    observations: list[dict[str, object]] = []
+    for target in range(7):
+        for attempt in range(2):
+            _window_observation(
+                observations,
+                target=target,
+                reporter=(target + attempt + 1) % 7,
+            )
+    _window_observation(observations, target=2, reporter=3)
+    baseline_cutoff = len(observations)
+    _window_observation(observations, target=6, reporter=2, latency_ns=90)
+    for target in (0, 1):
+        for reporter in (2, 3, 4):
+            for _attempt in range(2):
+                _window_observation(
+                    observations,
+                    target=target,
+                    reporter=reporter,
+                    outcome="timeout",
+                )
+    _window_observation(
+        observations,
+        target=0,
+        reporter=5,
+        outcome="timeout",
+    )
+    return observations, baseline_cutoff
+
+
+def _variable_optimization_window(
+) -> tuple[list[dict[str, object]], int]:
+    observations: list[dict[str, object]] = []
+    for target in range(2, 7):
+        for attempt in range(2):
+            _window_observation(
+                observations,
+                target=target,
+                reporter=2 + ((target - 2 + attempt + 1) % 5),
+            )
+    _window_observation(observations, target=2, reporter=3)
+    _window_observation(observations, target=6, reporter=2)
+    baseline_cutoff = len(observations)
+    latencies = {
+        2: (500, 520),
+        3: (400, 420),
+        4: (300, 320),
+        5: (200, 220),
+        6: (100, 120, 140),
+    }
+    for target, values in latencies.items():
+        for attempt, latency_ns in enumerate(values):
+            _window_observation(
+                observations,
+                target=target,
+                reporter=2 + ((target - 2 + attempt + 1) % 5),
+                latency_ns=latency_ns,
+            )
+    return observations, baseline_cutoff
+
+
+def test_containment_evidence_window_accepts_variable_extra_records() -> None:
+    observations, baseline_cutoff = _variable_containment_window()
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[0],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    assert ranking is None
+
+
+def test_containment_evidence_window_rejects_missing_reporter_threshold() -> None:
+    observations, baseline_cutoff = _variable_containment_window()
+    observations = [
+        observation
+        for observation in observations
+        if not (
+            observation["ingestion_sequence"] > baseline_cutoff
+            and observation["target_id"] == 0
+            and observation["reporter_id"] == 4
+        )
+    ]
+
+    with pytest.raises(validator.ValidationError, match="guarded timeout"):
+        validator._validate_recurring_evidence_window(
+            synthetic_run.recurring_transition_requests()[0],
+            observations,
+            baseline_cutoff=baseline_cutoff,
+            minimum_attempts=2,
+            minimum_reporters=3,
+        )
+
+
+def test_optimization_evidence_window_ranks_a_variable_fresh_suffix() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[1],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    assert ranking == list(synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING)
+
+
+def test_optimization_evidence_window_rejects_missing_fresh_attempt() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    removed = False
+    retained: list[dict[str, object]] = []
+    for observation in observations:
+        if (
+            not removed
+            and observation["ingestion_sequence"] > baseline_cutoff
+            and observation["target_id"] == 2
+        ):
+            removed = True
+            continue
+        retained.append(observation)
+
+    with pytest.raises(validator.ValidationError, match="fresh on-time attempts"):
+        validator._validate_recurring_evidence_window(
+            synthetic_run.recurring_transition_requests()[1],
+            retained,
+            baseline_cutoff=baseline_cutoff,
+            minimum_attempts=2,
+            minimum_reporters=3,
+        )
+
+
+def test_optimization_excludes_a_correlated_cross_baseline_late() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    boundary_id = f"{60_001:064x}"
+    boundary_timeout = {
+        **observations[0],
+        "observation_id": boundary_id,
+        "reporter_id": 3,
+        "target_id": 2,
+        "outcome": "timeout",
+    }
+    boundary_timeout.pop("latency_ns", None)
+    observations.insert(baseline_cutoff, boundary_timeout)
+    baseline_cutoff += 1
+    boundary_late = {
+        **boundary_timeout,
+        "outcome": "late",
+        "latency_ns": 1,
+    }
+    observations.insert(baseline_cutoff, boundary_late)
+    for sequence, observation in enumerate(observations, start=1):
+        observation["ingestion_sequence"] = sequence
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[1],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    assert ranking == list(synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING)
+    attempts = validator._replay_snapshot_attempts(observations)
+    fresh_scores = validator._score_snapshot_replicas(
+        attempt
+        for attempt in attempts.values()
+        if attempt.first_ingestion_sequence > baseline_cutoff
+    )
+    assert fresh_scores[2].attempt_count == 2
+
+
+def test_optimization_scores_tolerated_late_and_timeout_attempts() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    late_attempt = f"{60_002:064x}"
+    _window_observation(
+        observations,
+        target=6,
+        reporter=2,
+        outcome="timeout",
+        observation_id=late_attempt,
+    )
+    _window_observation(
+        observations,
+        target=6,
+        reporter=2,
+        outcome="late",
+        latency_ns=50,
+        observation_id=late_attempt,
+    )
+    _window_observation(
+        observations,
+        target=5,
+        reporter=6,
+        latency_ns=210,
+    )
+    _window_observation(
+        observations,
+        target=5,
+        reporter=6,
+        outcome="timeout",
+    )
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[1],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    # C++ ranks response rate before timeout rate and latency.  The late attempt
+    # is one response plus one timeout; the timeout-only attempt is no response.
+    assert ranking == [4, 3, 2, 6, 5]
+    attempts = validator._replay_snapshot_attempts(observations)
+    fresh_scores = validator._score_snapshot_replicas(
+        attempt
+        for attempt in attempts.values()
+        if attempt.first_ingestion_sequence > baseline_cutoff
+    )
+    assert (
+        fresh_scores[6].attempt_count,
+        fresh_scores[6].response_rate_ppm,
+        fresh_scores[6].timeout_rate_ppm,
+    ) == (4, 1_000_000, 250_000)
+    assert (
+        fresh_scores[5].attempt_count,
+        fresh_scores[5].response_rate_ppm,
+        fresh_scores[5].timeout_rate_ppm,
+    ) == (4, 750_000, 250_000)
+
+
+def test_optimization_matches_cpp_percentile_count_and_id_ties() -> None:
+    observations: list[dict[str, object]] = []
+    for target in range(2, 7):
+        for attempt in range(2):
+            _window_observation(
+                observations,
+                target=target,
+                reporter=2 + ((target - 2 + attempt + 1) % 5),
+            )
+    baseline_cutoff = len(observations)
+    fresh_latencies = {
+        2: (100, 200),
+        3: (100, 100, 300),
+        4: (100, 100, 300),
+        5: (50, 50),
+        6: (10, 10),
+    }
+    for target, latencies in fresh_latencies.items():
+        for attempt, latency_ns in enumerate(latencies):
+            _window_observation(
+                observations,
+                target=target,
+                reporter=2 + ((target - 2 + attempt + 1) % 5),
+                latency_ns=latency_ns,
+            )
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[1],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    # Targets 2/3/4 all have nearest-rank p50=100.  The 3-attempt targets
+    # precede target 2, then replica id breaks the remaining exact tie.
+    assert ranking == [6, 5, 3, 4, 2]
+
+
+def test_optimization_excludes_responsive_inherited_constraints() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    for target in (0, 1):
+        for attempt in range(2):
+            _window_observation(
+                observations,
+                target=target,
+                reporter=2 + attempt,
+                latency_ns=1,
+            )
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[1],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    assert ranking == list(synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("standalone_late", "starts with a late"),
+        ("mismatched_late", "timeout-to-late correlation"),
+        ("duplicate_on_time", "transition is invalid"),
+        ("second_timeout", "transition is invalid"),
+    ),
+)
+def test_optimization_rejects_malformed_attempt_transitions(
+    mutation: str,
+    reason: str,
+) -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    attempt_id = f"{60_003:064x}"
+    if mutation == "standalone_late":
+        _window_observation(
+            observations,
+            target=6,
+            reporter=2,
+            outcome="late",
+            latency_ns=50,
+            observation_id=attempt_id,
+        )
+    elif mutation == "mismatched_late":
+        _window_observation(
+            observations,
+            target=6,
+            reporter=2,
+            outcome="timeout",
+            observation_id=attempt_id,
+        )
+        _window_observation(
+            observations,
+            target=6,
+            reporter=3,
+            outcome="late",
+            latency_ns=50,
+            observation_id=attempt_id,
+        )
+    elif mutation == "duplicate_on_time":
+        _window_observation(
+            observations,
+            target=6,
+            reporter=2,
+            latency_ns=50,
+            observation_id=attempt_id,
+        )
+        _window_observation(
+            observations,
+            target=6,
+            reporter=2,
+            latency_ns=50,
+            observation_id=attempt_id,
+        )
+    else:
+        _window_observation(
+            observations,
+            target=6,
+            reporter=2,
+            outcome="timeout",
+            observation_id=attempt_id,
+        )
+        _window_observation(
+            observations,
+            target=6,
+            reporter=2,
+            outcome="timeout",
+            observation_id=attempt_id,
+        )
+
+    with pytest.raises(validator.ValidationError, match=reason):
+        validator._validate_recurring_evidence_window(
+            synthetic_run.recurring_transition_requests()[1],
+            observations,
+            baseline_cutoff=baseline_cutoff,
+            minimum_attempts=2,
+            minimum_reporters=3,
+        )
+
+
+def test_optimization_rejects_timeout_rate_above_cpp_threshold() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    late_attempt = f"{60_004:064x}"
+    _window_observation(
+        observations,
+        target=5,
+        reporter=6,
+        outcome="timeout",
+        observation_id=late_attempt,
+    )
+    _window_observation(
+        observations,
+        target=5,
+        reporter=6,
+        outcome="late",
+        latency_ns=50,
+        observation_id=late_attempt,
+    )
+
+    with pytest.raises(validator.ValidationError, match="timeout rate"):
+        validator._validate_recurring_evidence_window(
+            synthetic_run.recurring_transition_requests()[1],
+            observations,
+            baseline_cutoff=baseline_cutoff,
+            minimum_attempts=2,
+            minimum_reporters=3,
+        )
+
+
+def test_optimization_rejects_cpp_trailing_timeout_streak() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    for _ in range(4):
+        _window_observation(
+            observations,
+            target=5,
+            reporter=6,
+            latency_ns=210,
+        )
+    for reporter in (6, 2):
+        _window_observation(
+            observations,
+            target=5,
+            reporter=reporter,
+            outcome="timeout",
+        )
+
+    with pytest.raises(validator.ValidationError, match="trailing timeout"):
+        validator._validate_recurring_evidence_window(
+            synthetic_run.recurring_transition_requests()[1],
+            observations,
+            baseline_cutoff=baseline_cutoff,
+            minimum_attempts=2,
+            minimum_reporters=3,
+        )
+
+
+def test_optimization_applies_cpp_attempt_window_before_ranking() -> None:
+    observations, baseline_cutoff = _variable_optimization_window()
+    first_fresh = next(
+        index
+        for index, observation in enumerate(observations)
+        if observation["ingestion_sequence"] > baseline_cutoff
+    )
+    old_timeout = {
+        **observations[first_fresh],
+        "observation_id": f"{60_005:064x}",
+        "reporter_id": 3,
+        "target_id": 2,
+        "outcome": "timeout",
+    }
+    old_timeout.pop("latency_ns", None)
+    observations.insert(first_fresh, old_timeout)
+    for _ in range(30):
+        _window_observation(
+            observations,
+            target=2,
+            reporter=3,
+            latency_ns=500,
+        )
+    for sequence, observation in enumerate(observations, start=1):
+        observation["ingestion_sequence"] = sequence
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[1],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    assert ranking == list(synthetic_run.ELIGIBLE_OPTIMIZATION_RANKING)
+
+
+def test_containment_accepts_tolerated_late_and_timeout_evidence() -> None:
+    observations, baseline_cutoff = _variable_containment_window()
+    late_attempt = f"{60_006:064x}"
+    _window_observation(observations, target=3, reporter=4)
+    _window_observation(
+        observations,
+        target=3,
+        reporter=4,
+        outcome="timeout",
+    )
+    _window_observation(
+        observations,
+        target=2,
+        reporter=3,
+        outcome="timeout",
+        observation_id=late_attempt,
+    )
+    _window_observation(
+        observations,
+        target=2,
+        reporter=3,
+        outcome="late",
+        latency_ns=90,
+        observation_id=late_attempt,
+    )
+
+    ranking = validator._validate_recurring_evidence_window(
+        synthetic_run.recurring_transition_requests()[0],
+        observations,
+        baseline_cutoff=baseline_cutoff,
+        minimum_attempts=2,
+        minimum_reporters=3,
+    )
+
+    assert ranking is None
+
+
+def test_containment_guard_counts_only_unresolved_timeout_attempts() -> None:
+    observations, baseline_cutoff = _variable_containment_window()
+    timeout = next(
+        observation
+        for observation in observations
+        if observation["ingestion_sequence"] > baseline_cutoff
+        and observation["target_id"] == 0
+        and observation["reporter_id"] == 4
+    )
+    _window_observation(
+        observations,
+        target=0,
+        reporter=4,
+        outcome="late",
+        latency_ns=90,
+        observation_id=str(timeout["observation_id"]),
+    )
+
+    with pytest.raises(validator.ValidationError, match="guarded timeout"):
+        validator._validate_recurring_evidence_window(
+            synthetic_run.recurring_transition_requests()[0],
+            observations,
+            baseline_cutoff=baseline_cutoff,
+            minimum_attempts=2,
+            minimum_reporters=3,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("skipped_epoch", "epoch numbers must be contiguous"),
+        ("forked_predecessor", "does not continue the exact predecessor"),
+        ("reused_command", "command payload digest is reused"),
+        ("reused_artifact_path", "transition artifact paths must be distinct"),
+        ("overwritten_bundle", "runtime artifact SHA-256 mismatch"),
+        ("duplicate_ready", "duplicate adaptive_v2_ready"),
+        ("duplicate_terminal", "duplicate adaptive_v2_session_terminal"),
+        ("retired_epoch_evidence", "fresh Epoch 1 evidence"),
+    ),
+)
+def test_recurring_validator_rejects_noncausal_or_reused_evidence(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    if mutation in ("skipped_epoch", "forked_predecessor", "reused_command"):
+        value = synthetic_run.load(epochs)
+        second_command = value["epochs"][2]["command"]
+        if mutation == "skipped_epoch":
+            value["epochs"][2]["epoch_number"] = 3
+            second_command["successor_epoch_number"] = 3
+        elif mutation == "forked_predecessor":
+            second_command["predecessor_epoch_number"] = 0
+            second_command["predecessor_epoch_digest"] = (
+                synthetic_run.EPOCH_0_DIGEST
+            )
+        else:
+            second_command["payload_digest"] = synthetic_run.PAYLOAD_DIGEST
+        synthetic_run.save(epochs, value)
+    elif mutation == "reused_artifact_path":
+        value = synthetic_run.load(manifest)
+        bundles = [
+            artifact
+            for artifact in value["runtime_artifacts"]
+            if artifact["kind"] == "transition_bundle"
+        ]
+        bundles[1]["path"] = bundles[0]["path"]
+        synthetic_run.save(manifest, value)
+    elif mutation == "overwritten_bundle":
+        path = tmp_path / "run" / synthetic_run.TRANSITION_BUNDLE_PATHS[0]
+        path.write_bytes(path.read_bytes() + b"overwritten")
+    elif mutation in ("duplicate_ready", "duplicate_terminal"):
+        manager = tmp_path / "run/raw/adaptive-manager.jsonl"
+        event_type = (
+            "adaptive_v2_ready"
+            if mutation == "duplicate_ready"
+            else "adaptive_v2_session_terminal"
+        )
+
+        def duplicate(values: list[dict[str, object]]) -> None:
+            event = next(
+                value
+                for value in reversed(values)
+                if value["event_type"] == event_type
+            )
+            copied = json.loads(json.dumps(event))
+            copied["source_monotonic_ns"] = int(
+                copied["source_monotonic_ns"]
+            ) + 1
+            values.append(copied)
+            values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+        _rewrite_jsonl(manager, duplicate)
+    else:
+        snapshot_path = (
+            tmp_path / "run" / synthetic_run.TRANSITION_SNAPSHOT_PATHS[1]
+        )
+        snapshot = synthetic_run.load(snapshot_path)
+        retired = dict(
+            synthetic_run.recurring_evidence_snapshots()[0]["observations"][0]
+        )
+        snapshot["observations"].append(retired)
+        synthetic_run.save(snapshot_path, snapshot)
+        _rehash_runtime_artifact(
+            manifest, synthetic_run.TRANSITION_SNAPSHOT_PATHS[1]
+        )
+
+        def replay_into_second_snapshot(
+            values: list[dict[str, object]],
+        ) -> None:
+            event = next(
+                value
+                for value in values
+                if value["event_type"] == "adaptive_v2_evidence_snapshot"
+                and value["payload"]["cycle_ordinal"] == 1
+            )
+            event["payload"]["observations"].append(retired)
+
+        _rewrite_jsonl(
+            tmp_path / "run/raw/adaptive-manager.jsonl",
+            replay_into_second_snapshot,
+        )
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert reason in verdict["reason"]
+
+
 def test_ranked_successor_root_cycle_is_accepted(tmp_path: Path) -> None:
     manifest, epochs = synthetic_run.create_run(tmp_path / "run")
     value = synthetic_run.load(epochs)
@@ -266,12 +1267,42 @@ def test_first_successor_commit_must_be_common_to_survivors(
     assert "replica-4 is missing first successor height 18" in verdict["reason"]
 
 
-def test_repository_profile_has_exact_v2_recovery_fields() -> None:
+def test_repository_profile_freezes_the_recurring_n7_contract() -> None:
     profile_path = Path(validator.__file__).resolve().with_name("profile.json")
     profile_bytes = profile_path.read_bytes()
     profile = json.loads(profile_bytes)
 
-    assert profile["profile_id"] == "n7-f2-q5-crash-recovery-v2"
+    assert profile["profile_id"] == "n7-f2-q5-crash-recovery-recurring-v3"
+    assert profile["replica_ids"] == list(range(7))
+    assert (profile["fault_threshold"], profile["quorum"]) == (2, 5)
+    assert profile["crash_targets"] == [0, 1]
+    assert profile["transition_requests"] == (
+        synthetic_run.recurring_transition_requests()
+    )
+    assert [
+        request["minimum_predecessor_residency_ms"]
+        for request in profile["transition_requests"]
+    ] == [0, 40_000]
+    assert profile["throughput_windows"] == [
+        {
+            "phase": phase,
+            "epoch_number": epoch_number,
+            "bucket_count": 7,
+        }
+        for phase, epoch_number in (
+            ("baseline", 0),
+            ("degraded", 0),
+            ("containment", 1),
+            ("optimized", 2),
+        )
+    ]
+    assert not {
+        "successor_epoch",
+        "successor_roots",
+        "successor_wait_exempt",
+        "baseline_bucket_count",
+        "post_bucket_count",
+    }.intersection(profile)
     assert profile["minimum_post_activation_grace_s"] == 1
     assert profile["maximum_activation_to_successor_s"] == 10
     assert "activation_grace_s" not in profile
@@ -280,12 +1311,59 @@ def test_repository_profile_has_exact_v2_recovery_fields() -> None:
     )
 
 
+def test_recurring_profile_residency_covers_the_complete_predecessor_phase(
+) -> None:
+    profile = synthetic_run.recurring_profile()
+    requests = validator._transition_requests(
+        profile["transition_requests"],
+        "transition_requests",
+    )
+    windows = validator._throughput_window_specs(
+        profile["throughput_windows"],
+        "throughput_windows",
+    )
+
+    validator._validate_transition_residencies(
+        requests,
+        windows,
+        bucket_width_ns=5_000_000_000,
+        post_activation_grace_ns=1_000_000_000,
+    )
+
+    mutated = synthetic_run.recurring_transition_requests()
+    mutated[1]["minimum_predecessor_residency_ms"] = 35_999
+    with pytest.raises(validator.ValidationError, match="complete throughput window"):
+        validator._validate_transition_residencies(
+            validator._transition_requests(mutated, "transition_requests"),
+            windows,
+            bucket_width_ns=5_000_000_000,
+            post_activation_grace_ns=1_000_000_000,
+        )
+
+
+@pytest.mark.parametrize(
+    "residency_ms",
+    (True, -1, validator.MAXIMUM_PREDECESSOR_RESIDENCY_MS + 1),
+)
+def test_validator_transition_residency_has_strict_integer_bounds(
+    residency_ms: object,
+) -> None:
+    requests = synthetic_run.recurring_transition_requests()
+    requests[1]["minimum_predecessor_residency_ms"] = residency_ms
+
+    with pytest.raises(
+        validator.ValidationError,
+        match="minimum_predecessor_residency_ms",
+    ):
+        validator._transition_requests(requests, "transition_requests")
+
+
 def test_frozen_profile_rejects_boolean_numeric_alias() -> None:
     profile_path = Path(validator.__file__).resolve().with_name("profile.json")
     profile = json.loads(profile_path.read_bytes())
     profile["maximum_activation_to_successor_s"] = True
 
-    with pytest.raises(validator.ValidationError, match="exact frozen v2"):
+    with pytest.raises(validator.ValidationError, match="exact frozen"):
         validator._decode_frozen_profile(
             json.dumps(profile).encode(),
             "mutated frozen profile",
@@ -943,7 +2021,7 @@ def test_pass_artifact_retains_pinned_repository_profile_sha(tmp_path: Path) -> 
 
     assert verdict["verdict"] == "PASS"
     assert verdict["artifacts"]["profile"]["sha256"] == (
-        validator.FROZEN_PROFILE_SHA256
+        validator.LEGACY_FROZEN_PROFILE_SHA256
     )
 
 
@@ -1059,6 +2137,24 @@ def test_launch_artifact_pins_manager_convergence_deadline(
 
     assert verdict["verdict"] == "FAIL"
     assert "--convergence-deadline-seconds" in verdict["reason"]
+
+
+def test_launch_artifact_rejects_unapproved_manager_flags(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    launch_path = tmp_path / "run/runtime/launch-arguments.json"
+    launch = synthetic_run.load(launch_path)
+    launch["processes"][-1]["argv"].extend(
+        ("--experiment-drop-bundle-attempt", "2:1")
+    )
+    synthetic_run.save(launch_path, launch)
+    _rehash_runtime_artifact(manifest, "runtime/launch-arguments.json")
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "unsupported flag" in verdict["reason"]
 
 
 def test_launched_executable_bytes_are_sha_bound(tmp_path: Path) -> None:

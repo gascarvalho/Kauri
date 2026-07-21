@@ -19,15 +19,18 @@ SYNTHETIC_RUN_ID = "synthetic-non-evidence"
 SOURCE_INSTANCE = "synthetic-replica-2-instance"
 DIGEST_0 = "a" * 64
 DIGEST_1 = "b" * 64
+DIGEST_2 = "c" * 64
 HASH_1 = "1" * 64
 HASH_2 = "2" * 64
 HASH_3 = "3" * 64
+HASH_4 = "4" * 64
 UINT32_MAX = (1 << 32) - 1
 UINT64_MAX = (1 << 64) - 1
 LEADERS = {
     (0, DIGEST_0, 0): 0,
     (0, DIGEST_0, 1): 1,
     (1, DIGEST_1, 0): 2,
+    (2, DIGEST_2, 0): 6,
 }
 
 
@@ -613,3 +616,94 @@ class TestRawThroughput:
         invalid = analysis().PhaseBoundaries(0, 10, 10, 20)
         with pytest.raises(analysis().AnalysisError, match="baseline < crash"):
             analysis().build_throughput_buckets((), invalid)
+
+
+def test_builds_four_explicit_unique_commit_windows_with_zeroes_and_medians() -> None:
+    windows = (
+        analysis().PhaseWindow("baseline", 0, 0, 10_000_000_000),
+        analysis().PhaseWindow(
+            "degraded", 0, 10_000_000_000, 20_000_000_000
+        ),
+        analysis().PhaseWindow(
+            "containment", 1, 30_000_000_000, 40_000_000_000
+        ),
+        analysis().PhaseWindow(
+            "optimized", 2, 50_000_000_000, 60_000_000_000
+        ),
+    )
+    commits = parse(
+        "\n".join(
+            (
+                event_line(
+                    sequence=1,
+                    timestamp_ns=1_000_000_000,
+                    height=1,
+                    block_hash=HASH_1,
+                    transaction_count=50,
+                ),
+                event_line(
+                    sequence=2,
+                    timestamp_ns=11_000_000_000,
+                    height=2,
+                    block_hash=HASH_2,
+                    transaction_count=20,
+                    tree_id=1,
+                ),
+                event_line(
+                    sequence=3,
+                    timestamp_ns=31_000_000_000,
+                    height=3,
+                    block_hash=HASH_3,
+                    transaction_count=100,
+                    epoch_number=1,
+                    epoch_digest=DIGEST_1,
+                ),
+                event_line(
+                    sequence=4,
+                    timestamp_ns=31_000_000_001,
+                    height=3,
+                    block_hash=HASH_3,
+                    transaction_count=100,
+                    epoch_number=1,
+                    epoch_digest=DIGEST_1,
+                ),
+                event_line(
+                    sequence=5,
+                    timestamp_ns=51_000_000_000,
+                    height=4,
+                    block_hash=HASH_4,
+                    transaction_count=140,
+                    epoch_number=2,
+                    epoch_digest=DIGEST_2,
+                ),
+            )
+        )
+    )
+
+    result = analysis().analyze_throughput(commits, windows)
+
+    assert [bucket.phase for bucket in result.buckets] == [
+        "baseline",
+        "baseline",
+        "degraded",
+        "degraded",
+        "containment",
+        "containment",
+        "optimized",
+        "optimized",
+    ]
+    assert [bucket.transaction_count for bucket in result.buckets] == [
+        50,
+        0,
+        20,
+        0,
+        100,
+        0,
+        140,
+        0,
+    ]
+    assert sum(bucket.commit_count for bucket in result.buckets) == 4
+    assert result.medians.baseline_tps == pytest.approx(5.0)
+    assert result.medians.degraded_tps == pytest.approx(2.0)
+    assert result.medians.containment_tps == pytest.approx(10.0)
+    assert result.medians.optimized_tps == pytest.approx(14.0)

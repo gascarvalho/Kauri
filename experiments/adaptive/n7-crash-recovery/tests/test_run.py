@@ -10,12 +10,67 @@ import hashlib
 import json
 from pathlib import Path
 import signal
+import subprocess
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import run as campaign
+import synthetic_run
+
+
+def test_plotting_is_explicit_and_does_not_change_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def completed(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0 if command[1].endswith("validator.py") else 1,
+        )
+
+    monkeypatch.setattr(campaign.subprocess, "run", completed)
+    run_directory = tmp_path / "run"
+
+    assert campaign._arguments([]).plot is False  # type: ignore[attr-defined]
+    assert campaign._arguments(["--plot"]).plot is True  # type: ignore[attr-defined]
+    assert campaign.validate_preserved_attempt(
+        repository=tmp_path,
+        run_directory=run_directory,
+        manifest_path=run_directory / "manifest.json",
+        plot=True,
+    ) == 0
+    assert [Path(command[1]).name for command in calls] == [
+        "validator.py",
+        "plot.py",
+    ]
+
+
+def test_incomplete_attempt_is_still_sent_to_the_validator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def incomplete(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1)
+
+    monkeypatch.setattr(campaign.subprocess, "run", incomplete)
+    run_directory = tmp_path / "incomplete"
+
+    assert campaign.validate_preserved_attempt(
+        repository=tmp_path,
+        run_directory=run_directory,
+        manifest_path=run_directory / "missing-manifest.json",
+        plot=True,
+    ) == 1
+    assert len(calls) == 1
+    assert Path(calls[0][1]).name == "validator.py"
 
 
 def _u8(value: int) -> bytes:
@@ -49,20 +104,6 @@ def _synthetic_bundle(
     root_order: tuple[int, ...] = campaign.SURVIVORS,
 ) -> bytes:
     predecessor = bytes.fromhex("aa" * 32)
-    successor = bytes.fromhex("bb" * 32)
-    command = b"".join(
-        (
-            campaign.AUTHORIZED_COMMAND_DOMAIN,
-            _u32(1),
-            _u8(2),
-            _u32(7),
-            _u32(1),
-            predecessor,
-            successor,
-            _u64(5),
-            bytes.fromhex("11" * 64),
-        )
-    )
     trees = []
     for tree_id, root in enumerate(root_order):
         members = [root, *[member for member in range(2, 7) if member != root], 0, 1]
@@ -80,12 +121,8 @@ def _synthetic_bundle(
                 )
             )
         )
-    definition = b"".join(
+    definition_fields = b"".join(
         (
-            _u32(2),
-            _u8(2),
-            _u8(6),
-            successor,
             _u32(2),
             _u32(1),
             predecessor,
@@ -96,6 +133,31 @@ def _synthetic_bundle(
             _u64(19),
             _u32(5),
             b"".join(trees),
+        )
+    )
+    successor = hashlib.sha256(
+        campaign.EPOCH_DEFINITION_DOMAIN_V2 + definition_fields
+    ).digest()
+    command = b"".join(
+        (
+            campaign.AUTHORIZED_COMMAND_DOMAIN,
+            _u32(1),
+            _u8(2),
+            _u32(7),
+            _u32(1),
+            predecessor,
+            successor,
+            _u64(5),
+            bytes.fromhex("11" * 64),
+        )
+    )
+    definition = b"".join(
+        (
+            _u32(2),
+            _u8(2),
+            _u8(6),
+            successor,
+            definition_fields,
         )
     )
     return b"".join(
@@ -238,10 +300,10 @@ def test_decodes_exact_manager_bundle_without_inventing_topology() -> None:
     assert decoded.command.issuer_id == 7
     assert decoded.command.successor_epoch_number == 1
     assert decoded.command.predecessor_epoch_digest == "aa" * 32
-    assert decoded.command.successor_epoch_digest == "bb" * 32
+    assert decoded.command.successor_epoch_digest == decoded.epoch_digest
     assert decoded.command.activation_delay_blocks == 5
     assert decoded.epoch_number == 1
-    assert decoded.epoch_digest == "bb" * 32
+    assert decoded.epoch_digest != "0" * 64
     assert decoded.generation_seed == 0xA2F7
     assert [tree.members[0] for tree in decoded.trees] == [2, 3, 4, 5, 6]
     assert all(tree.wait_exempt == (0, 1) for tree in decoded.trees)
@@ -504,6 +566,49 @@ def test_frozen_profile_timing_fields_are_positive_seconds(field: str) -> None:
         campaign._profile_duration_ns({}, field)
 
 
+def test_recurring_profile_residency_preserves_the_complete_predecessor_phase(
+) -> None:
+    profile = synthetic_run.recurring_profile()
+    requests = campaign._profile_transition_requests(profile)
+    windows = campaign._profile_throughput_windows(profile)
+
+    assert [
+        request["minimum_predecessor_residency_ms"] for request in requests
+    ] == [0, 40_000]
+    campaign._validate_profile_transition_residencies(
+        profile,
+        requests,
+        windows,
+    )
+
+    too_short = json.loads(json.dumps(profile))
+    too_short["transition_requests"][1][
+        "minimum_predecessor_residency_ms"
+    ] = 35_999
+    with pytest.raises(campaign.RunnerError, match="complete throughput window"):
+        campaign._validate_profile_transition_residencies(
+            too_short,
+            campaign._profile_transition_requests(too_short),
+            campaign._profile_throughput_windows(too_short),
+        )
+
+
+@pytest.mark.parametrize(
+    "residency_ms",
+    (True, -1, campaign.MAXIMUM_PREDECESSOR_RESIDENCY_MS + 1),
+)
+def test_transition_request_residency_has_strict_integer_bounds(
+    residency_ms: object,
+) -> None:
+    profile = synthetic_run.recurring_profile()
+    profile["transition_requests"][1][
+        "minimum_predecessor_residency_ms"
+    ] = residency_ms
+
+    with pytest.raises(campaign.RunnerError, match="minimum_predecessor_residency_ms"):
+        campaign._profile_transition_requests(profile)
+
+
 def test_fresh_common_root_six_boundary_binds_all_sources() -> None:
     watermarks = {f"replica-{replica}": 10 for replica in range(7)}
     streams = {
@@ -721,51 +826,309 @@ def test_process_check_accepts_only_guarded_clean_manager_exit(
         )
 
 
-def test_manager_clean_exit_gate_requires_one_canonical_ready_event() -> None:
-    identity = {
-        "predecessor_epoch_number": 0,
-        "predecessor_epoch_digest": "a" * 64,
-        "successor_epoch_number": 1,
-        "successor_epoch_digest": "b" * 64,
-        "command_payload_digest": "c" * 64,
-        "command_block_height": 12,
-        "command_block_hash": "d" * 64,
-        "activation_delay_blocks": 5,
-        "activation_height": 17,
-    }
-    ready = {
-        "source_sequence": 10,
-        "source_monotonic_ns": 20,
-        "event_type": "adaptive_v2_ready",
-        "payload": {
-            "replica_id": None,
-            "delivery_attempt": None,
-            "disposition": None,
-            "identity": identity,
-            "accepted_commit_count": 3,
-            "accepted_activation_count": 5,
-            "required_activation_count": 5,
-            "canonical_payload_digest": None,
-            "failure_reason": None,
+def test_final_process_audit_failure_cannot_skip_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _record(2)
+    calls: list[str] = []
+
+    def fail_audit(*_args: object, **_kwargs: object) -> None:
+        calls.append("audit")
+        raise campaign.RunnerError("post-wait process audit raced")
+
+    def fail_shutdown(_records: object) -> list[str]:
+        calls.append("shutdown")
+        raise campaign.RunnerError("cleanup group failed")
+
+    monkeypatch.setattr(campaign, "_check_processes", fail_audit)
+    monkeypatch.setattr(campaign, "_shutdown_processes", fail_shutdown)
+
+    unexpected, errors = campaign._audit_and_shutdown_processes(
+        [record],
+        audit_required=True,
+        allow_clean_exit=lambda _: False,
+    )
+
+    assert calls == ["audit", "shutdown"]
+    assert unexpected == []
+    assert errors == [
+        "final process audit failed: post-wait process audit raced",
+        "process shutdown failed: cleanup group failed",
+    ]
+    combined = campaign._merge_runtime_errors("original runtime failure", errors)
+    assert combined.startswith("original runtime failure")
+    assert "post-wait process audit raced" in combined
+    assert "cleanup group failed" in combined
+
+
+def test_manager_clean_exit_requires_both_ready_and_terminal_cycles() -> None:
+    def cycle_events(completed_cycles: int) -> list[dict[str, Any]]:
+        events = [
+            json.loads(json.dumps(event))
+            for event in synthetic_run.recurring_manager_events(
+                completed_cycles=completed_cycles
+            )
+            if event["event_type"]
+            in ("adaptive_v2_ready", "adaptive_v2_session_terminal")
+        ]
+        for sequence, event in enumerate(events, start=1):
+            event["source_sequence"] = sequence
+        return events
+
+    first_cycle = cycle_events(1)
+    both_cycles = cycle_events(2)
+
+    requests = synthetic_run.recurring_transition_requests()
+    assert campaign.manager_convergence_ready_event([], requests) is None
+    assert campaign.manager_convergence_ready_event(first_cycle, requests) is None
+    final_ready = campaign.manager_convergence_ready_event(both_cycles, requests)
+    assert final_ready is not None
+    assert final_ready["payload"]["identity"]["successor_epoch_number"] == 2
+
+    missing_final_terminal = [
+        event
+        for event in both_cycles
+        if not (
+            event["event_type"] == "adaptive_v2_session_terminal"
+            and event["payload"]["cycle_ordinal"] == 1
+        )
+    ]
+    assert campaign.manager_convergence_ready_event(
+        missing_final_terminal, requests
+    ) is None
+
+    duplicate_final_terminal = [
+        *both_cycles,
+        json.loads(json.dumps(both_cycles[-1])),
+    ]
+    duplicate_final_terminal[-1]["source_sequence"] = len(
+        duplicate_final_terminal
+    )
+    with pytest.raises(campaign.RunnerError, match="duplicate.*terminal"):
+        campaign.manager_convergence_ready_event(
+            duplicate_final_terminal, requests
+        )
+
+    invalid = json.loads(
+        json.dumps(
+            next(
+                event
+                for event in both_cycles
+                if event["event_type"] == "adaptive_v2_ready"
+                and event["payload"]["identity"]["successor_epoch_number"] == 2
+            )
+        )
+    )
+    invalid["payload"]["accepted_activation_count"] = 4
+    invalid_events = [
+        invalid
+        if event["event_type"] == "adaptive_v2_ready"
+        and event["payload"]["identity"]["successor_epoch_number"] == 2
+        else event
+        for event in both_cycles
+    ]
+    with pytest.raises(campaign.RunnerError, match="fixed quorum"):
+        campaign.manager_convergence_ready_event(invalid_events, requests)
+
+
+def _three_cycle_manager_contract(
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    requests = synthetic_run.recurring_transition_requests()
+    third_request = json.loads(json.dumps(requests[-1]))
+    third_request.update(
+        {
+            "transition_artifact_id": "e2-to-e3-optimization",
+            "bundle_path": (
+                "transitions/e2-to-e3-optimization/successor.bundle"
+            ),
+            "evidence_snapshot_path": (
+                "transitions/e2-to-e3-optimization/evidence-snapshot.json"
+            ),
+            "predecessor_epoch_number": 2,
+            "successor_epoch_number": 3,
+        }
+    )
+    requests.append(third_request)
+
+    events = [
+        json.loads(json.dumps(event))
+        for event in synthetic_run.recurring_manager_events()
+        if event["event_type"]
+        in ("adaptive_v2_ready", "adaptive_v2_session_terminal")
+    ]
+    ready = json.loads(
+        json.dumps(
+            next(
+                event
+                for event in events
+                if event["event_type"] == "adaptive_v2_ready"
+                and event["payload"]["identity"]["successor_epoch_number"] == 2
+            )
+        )
+    )
+    identity = ready["payload"]["identity"]
+    identity.update(
+        {
+            "predecessor_epoch_number": 2,
+            "predecessor_epoch_digest": synthetic_run.EPOCH_2_DIGEST,
+            "successor_epoch_number": 3,
+            "successor_epoch_digest": "f" * 64,
+            "command_payload_digest": "9" * 64,
+            "command_block_height": 44,
+            "command_block_hash": "8" * 64,
+            "activation_height": 49,
+        }
+    )
+    ready["source_monotonic_ns"] = 150_000_000_000
+
+    terminal = json.loads(
+        json.dumps(
+            next(
+                event
+                for event in events
+                if event["event_type"] == "adaptive_v2_session_terminal"
+                and event["payload"]["cycle_ordinal"] == 1
+            )
+        )
+    )
+    terminal["source_monotonic_ns"] = 150_001_000_000
+    terminal["payload"].update(
+        {
+            "cycle_ordinal": 2,
+            "transition_artifact_id": third_request["transition_artifact_id"],
+            "predecessor_epoch_number": 2,
+            "predecessor_epoch_digest": synthetic_run.EPOCH_2_DIGEST,
+            "successor_epoch_number": 3,
+            "successor_epoch_digest": "f" * 64,
+            "command_payload_digest": "9" * 64,
+            "winning_activation": identity,
+            "evidence_window_activation_generation": (
+                synthetic_run.checked_activation_generation(2)
+            ),
+            "baseline_evidence_cutoff": 15,
+            "current_evidence_cutoff": 20,
+        }
+    )
+    events.extend((ready, terminal))
+    events.sort(key=lambda event: int(event["source_monotonic_ns"]))
+    for sequence, event in enumerate(events, start=1):
+        event["source_sequence"] = sequence
+    return requests, events
+
+
+def test_manager_polling_accepts_known_future_cycles_in_a_longer_sequence(
+) -> None:
+    requests, events = _three_cycle_manager_contract()
+
+    ready = campaign.manager_convergence_ready_event(
+        events,
+        requests,
+        required_completed=1,
+    )
+
+    assert ready is not None
+    assert ready["payload"]["identity"]["successor_epoch_number"] == 1
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "unknown"))
+def test_manager_polling_rejects_invalid_future_terminal_records(
+    mutation: str,
+) -> None:
+    requests, events = _three_cycle_manager_contract()
+    future_terminal = json.loads(json.dumps(events[-1]))
+    if mutation == "unknown":
+        future_terminal["payload"]["cycle_ordinal"] = 3
+    future_terminal["source_sequence"] = len(events) + 1
+    future_terminal["source_monotonic_ns"] += 1
+    events.append(future_terminal)
+
+    expected = "duplicate.*terminal" if mutation == "duplicate" else "cycle ordinal"
+    with pytest.raises(campaign.RunnerError, match=expected):
+        campaign.manager_convergence_ready_event(
+            events,
+            requests,
+            required_completed=1,
+        )
+
+
+def test_runtime_inputs_bind_two_explicit_transition_artifacts(
+    tmp_path: Path,
+) -> None:
+    for directory in ("config", "raw", "logs"):
+        (tmp_path / directory).mkdir()
+    profile = synthetic_run.recurring_profile()
+    bls = [
+        {
+            "pub": f"{replica + 1:02x}" * 48,
+            "sec": f"{replica + 17:02x}" * 32,
+        }
+        for replica in range(7)
+    ]
+    tls = [
+        {
+            "crt": f"{replica + 33:02x}" * 64,
+            "sec": f"{replica + 49:02x}" * 64,
+            "cid": f"cid-{replica}",
+        }
+        for replica in range(8)
+    ]
+    app_binary = tmp_path / "hotstuff-app"
+    manager_binary = tmp_path / "adaptation-manager"
+    app_binary.write_bytes(b"synthetic hotstuff app executable")
+    manager_binary.write_bytes(b"synthetic adaptation manager executable")
+    instances = {
+        **{
+            f"replica-{replica}": f"instance-{replica}"
+            for replica in range(7)
         },
+        "adaptive-manager": "manager-instance",
     }
 
-    assert campaign.manager_convergence_ready_event([]) is None
-    assert campaign.manager_convergence_ready_event([ready]) == ready
-    with pytest.raises(campaign.RunnerError, match="duplicate"):
-        campaign.manager_convergence_ready_event([ready, ready])
-    with pytest.raises(campaign.RunnerError, match="convergence_failure"):
-        campaign.manager_convergence_ready_event(
-            [{**ready, "event_type": "adaptive_v2_convergence_failure"}]
-        )
-    invalid = json.loads(json.dumps(ready))
-    invalid["payload"]["accepted_activation_count"] = 4
-    with pytest.raises(campaign.RunnerError, match="fixed quorum"):
-        campaign.manager_convergence_ready_event([invalid])
-    invalid = json.loads(json.dumps(ready))
-    invalid["payload"]["required_activation_count"] = 5.0
-    with pytest.raises(campaign.RunnerError, match="fixed quorum"):
-        campaign.manager_convergence_ready_event([invalid])
+    _, _, manager_command, _, artifacts = campaign.write_runtime_inputs(
+        tmp_path,
+        profile,
+        bls,
+        tls,
+        {"pub": "61" * 33, "sec": "62" * 32},
+        peer_port=25_000,
+        client_port=26_000,
+        manager_port=27_000,
+        run_id="synthetic-non-evidence",
+        source_instances=instances,
+        app_binary=app_binary,
+        manager_binary=manager_binary,
+    )
+
+    request_arguments = [
+        json.loads(manager_command[index + 1])
+        for index, argument in enumerate(manager_command)
+        if argument == "--transition-request"
+    ]
+    bundle_paths = [
+        Path(manager_command[index + 1])
+        for index, argument in enumerate(manager_command)
+        if argument == "--bundle-output"
+    ]
+    assert request_arguments == synthetic_run.recurring_transition_requests()
+    assert bundle_paths == [
+        tmp_path / relative
+        for relative in synthetic_run.TRANSITION_BUNDLE_PATHS
+    ]
+    assert len(set(bundle_paths)) == 2
+    assert [path.parent.name for path in bundle_paths] == list(
+        synthetic_run.TRANSITION_ARTIFACT_IDS
+    )
+    assert "runtime/transition-requests.json" in {
+        artifact["path"] for artifact in artifacts
+    }
+
+    launch = json.loads(
+        (tmp_path / "runtime" / "launch-arguments.json").read_text()
+    )
+    manager_launch = launch["processes"][-1]
+    assert manager_launch["effective_options"]["transition_requests"] == (
+        synthetic_run.recurring_transition_requests()
+    )
 
 
 def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(

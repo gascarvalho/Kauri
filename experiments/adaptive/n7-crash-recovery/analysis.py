@@ -54,7 +54,13 @@ _COMMIT_FIELDS = frozenset(
 _DECISION_PROOF_FIELDS = frozenset(
     {"epoch_number", "tree_id", "epoch_digest", "block_hash"}
 )
-_PHASE_NAMES = ("baseline", "degraded", "post")
+_LEGACY_PHASE_NAMES = ("baseline", "degraded", "post")
+_RECURRING_PHASE_NAMES = (
+    "baseline",
+    "degraded",
+    "containment",
+    "optimized",
+)
 
 ConfigurationKey = tuple[int, str, int]
 
@@ -131,6 +137,16 @@ class PhaseBoundaries:
 
 
 @dataclass(frozen=True, slots=True)
+class PhaseWindow:
+    """One explicit half-open, epoch-qualified measurement window."""
+
+    phase: str
+    epoch_number: int
+    start_ns: int
+    end_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class ThroughputBucket:
     """One raw bucket; per-leader throughput conserves the aggregate exactly."""
 
@@ -169,7 +185,9 @@ class ThroughputBucket:
 class PhaseMedians:
     baseline_tps: float
     degraded_tps: float
-    post_tps: float
+    post_tps: float | None = None
+    containment_tps: float | None = None
+    optimized_tps: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,7 +574,7 @@ def parse_commit_events(
     return tuple(events)
 
 
-def _validate_boundaries(boundaries: PhaseBoundaries) -> None:
+def _validate_legacy_boundaries(boundaries: PhaseBoundaries) -> None:
     values = (
         boundaries.baseline_start_ns,
         boundaries.crash_ns,
@@ -581,17 +599,59 @@ def _validate_boundaries(boundaries: PhaseBoundaries) -> None:
         )
 
 
+def _validate_phase_windows(windows: Sequence[PhaseWindow]) -> None:
+    if tuple(window.phase for window in windows) != _RECURRING_PHASE_NAMES:
+        raise AnalysisError(
+            "recurring phase windows must be exactly baseline, degraded, "
+            "containment, optimized"
+        )
+    previous_end_ns: int | None = None
+    for window in windows:
+        if (
+            type(window.epoch_number) is not int
+            or not 0 <= window.epoch_number <= UINT32_MAX
+            or type(window.start_ns) is not int
+            or type(window.end_ns) is not int
+            or not 0 <= window.start_ns <= UINT64_MAX
+            or not 0 <= window.end_ns <= UINT64_MAX
+        ):
+            raise AnalysisError(
+                "phase windows require unsigned epoch and timestamp integers"
+            )
+        if window.start_ns >= window.end_ns:
+            raise AnalysisError("phase window start must precede its end")
+        if previous_end_ns is not None and window.start_ns < previous_end_ns:
+            raise AnalysisError("phase windows overlap or regress")
+        previous_end_ns = window.end_ns
+
+
 def _phase_intervals(
-    boundaries: PhaseBoundaries,
-) -> tuple[tuple[str, int, int], ...]:
+    boundaries: PhaseBoundaries | Sequence[PhaseWindow],
+) -> tuple[tuple[str, int, int, int | None], ...]:
+    if isinstance(boundaries, PhaseBoundaries):
+        _validate_legacy_boundaries(boundaries)
+        return (
+            (
+                "baseline",
+                boundaries.baseline_start_ns,
+                boundaries.crash_ns,
+                None,
+            ),
+            (
+                "degraded",
+                boundaries.crash_ns,
+                boundaries.activation_ns,
+                None,
+            ),
+            ("post", boundaries.activation_ns, boundaries.end_ns, None),
+        )
+    windows = tuple(boundaries)
+    _validate_phase_windows(windows)
     return (
-        (
-            "baseline",
-            boundaries.baseline_start_ns,
-            boundaries.crash_ns,
+        *(
+            (window.phase, window.start_ns, window.end_ns, window.epoch_number)
+            for window in windows
         ),
-        ("degraded", boundaries.crash_ns, boundaries.activation_ns),
-        ("post", boundaries.activation_ns, boundaries.end_ns),
     )
 
 
@@ -692,19 +752,20 @@ def _validated_unique_commits(
 
 def _build_phase_buckets(
     unique_events: Sequence[CommitEvent],
-    boundaries: PhaseBoundaries,
+    boundaries: PhaseBoundaries | Sequence[PhaseWindow],
 ) -> tuple[ThroughputBucket, ...]:
+    intervals = _phase_intervals(boundaries)
+    measurement_start_ns = intervals[0][1]
+    measurement_end_ns = intervals[-1][2]
     in_window = [
         event
         for event in unique_events
-        if boundaries.baseline_start_ns
-        <= event.timestamp_ns
-        < boundaries.end_ns
+        if measurement_start_ns <= event.timestamp_ns < measurement_end_ns
     ]
     event_index = 0
     buckets: list[ThroughputBucket] = []
 
-    for phase, phase_start_ns, phase_end_ns in _phase_intervals(boundaries):
+    for phase, phase_start_ns, phase_end_ns, expected_epoch in intervals:
         bucket_start_ns = phase_start_ns
         while bucket_start_ns < phase_end_ns:
             bucket_end_ns = min(
@@ -718,6 +779,14 @@ def _build_phase_buckets(
             ):
                 event = in_window[event_index]
                 if event.timestamp_ns >= bucket_start_ns:
+                    if (
+                        expected_epoch is not None
+                        and event.epoch_number != expected_epoch
+                    ):
+                        raise AnalysisError(
+                            f"{phase} phase contains epoch {event.epoch_number}; "
+                            f"expected epoch {expected_epoch}"
+                        )
                     leader_transactions[event.leader_replica] += (
                         event.transaction_count
                     )
@@ -758,7 +827,7 @@ def _build_phase_buckets(
 
 def build_throughput_buckets(
     events: Sequence[CommitEvent],
-    boundaries: PhaseBoundaries,
+    boundaries: PhaseBoundaries | Sequence[PhaseWindow],
 ) -> tuple[ThroughputBucket, ...]:
     """Build max-five-second phase-local buckets with explicit zero rows.
 
@@ -768,7 +837,7 @@ def build_throughput_buckets(
     five seconds and uses its actual elapsed duration. Exact hash replays are
     defensively deduplicated again before attribution.
     """
-    _validate_boundaries(boundaries)
+    _phase_intervals(boundaries)
     unique_events = _validated_unique_commits(events)
     return _build_phase_buckets(unique_events, boundaries)
 
@@ -777,26 +846,48 @@ def compute_phase_medians(
     buckets: Iterable[ThroughputBucket],
 ) -> PhaseMedians:
     """Compute medians from the raw buckets, including explicit zeroes."""
-    values: dict[str, list[float]] = {phase: [] for phase in _PHASE_NAMES}
-    for bucket in buckets:
+    bucket_values = tuple(buckets)
+    phases = tuple(dict.fromkeys(bucket.phase for bucket in bucket_values))
+    if phases == _LEGACY_PHASE_NAMES:
+        expected_phases = _LEGACY_PHASE_NAMES
+    elif phases == _RECURRING_PHASE_NAMES:
+        expected_phases = _RECURRING_PHASE_NAMES
+    else:
+        raise AnalysisError(
+            "throughput buckets must contain one complete legacy or recurring "
+            "phase sequence"
+        )
+    values: dict[str, list[float]] = {
+        phase: [] for phase in expected_phases
+    }
+    for bucket in bucket_values:
         if bucket.phase not in values:
             raise AnalysisError(f"unknown throughput phase: {bucket.phase}")
         values[bucket.phase].append(bucket.aggregate_tps)
-    missing = [phase for phase in _PHASE_NAMES if not values[phase]]
+    missing = [phase for phase in expected_phases if not values[phase]]
     if missing:
         raise AnalysisError(
             "cannot compute medians without buckets for: " + ", ".join(missing)
         )
+    baseline_tps = float(statistics.median(values["baseline"]))
+    degraded_tps = float(statistics.median(values["degraded"]))
+    if expected_phases == _LEGACY_PHASE_NAMES:
+        return PhaseMedians(
+            baseline_tps=baseline_tps,
+            degraded_tps=degraded_tps,
+            post_tps=float(statistics.median(values["post"])),
+        )
     return PhaseMedians(
-        baseline_tps=float(statistics.median(values["baseline"])),
-        degraded_tps=float(statistics.median(values["degraded"])),
-        post_tps=float(statistics.median(values["post"])),
+        baseline_tps=baseline_tps,
+        degraded_tps=degraded_tps,
+        containment_tps=float(statistics.median(values["containment"])),
+        optimized_tps=float(statistics.median(values["optimized"])),
     )
 
 
 def analyze_throughput(
     events: Sequence[CommitEvent],
-    boundaries: PhaseBoundaries,
+    boundaries: PhaseBoundaries | Sequence[PhaseWindow],
 ) -> ThroughputAnalysis:
     buckets = build_throughput_buckets(events, boundaries)
     return ThroughputAnalysis(

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "n7-f2-q5-crash-recovery-v2",
+  "profile_id": "n7-f2-q5-crash-recovery-recurring-v3",
   "frozen": true,
   "replica_ids": [0, 1, 2, 3, 4, 5, 6],
   "fault_threshold": 2,
@@ -10,17 +10,52 @@
   "crash_targets": [0, 1],
   "crash_epoch": 0,
   "crash_root": 6,
-  "successor_epoch": 1,
-  "successor_roots": [2, 3, 4, 5, 6],
-  "successor_wait_exempt": [0, 1],
+  "transition_requests": [
+    {
+      "policy_intent": "fault_containment",
+      "evidence_window_rule": "fresh_exact_predecessor_after_common_commit",
+      "transition_artifact_id": "e0-to-e1-containment",
+      "bundle_path": "transitions/e0-to-e1-containment/successor.bundle",
+      "evidence_snapshot_path": "transitions/e0-to-e1-containment/evidence-snapshot.json",
+      "predecessor_epoch_number": 0,
+      "successor_epoch_number": 1,
+      "minimum_predecessor_residency_ms": 0,
+      "policy_parameters": {
+        "containment_baseline_roots": [
+          {"tree_id": 0, "replica_id": 0},
+          {"tree_id": 1, "replica_id": 1},
+          {"tree_id": 2, "replica_id": 2},
+          {"tree_id": 3, "replica_id": 3},
+          {"tree_id": 4, "replica_id": 4}
+        ]
+      }
+    },
+    {
+      "policy_intent": "performance_optimization",
+      "evidence_window_rule": "fresh_exact_predecessor_after_common_commit",
+      "transition_artifact_id": "e1-to-e2-optimization",
+      "bundle_path": "transitions/e1-to-e2-optimization/successor.bundle",
+      "evidence_snapshot_path": "transitions/e1-to-e2-optimization/evidence-snapshot.json",
+      "predecessor_epoch_number": 1,
+      "successor_epoch_number": 2,
+      "minimum_predecessor_residency_ms": 40000,
+      "policy_parameters": {}
+    }
+  ],
   "fanout": 2,
   "pipeline_depth": 2,
   "tree_switch_period_blocks": 1,
   "bucket_width_s": 5,
-  "baseline_bucket_count": 7,
+  "throughput_windows": [
+    {"phase": "baseline", "epoch_number": 0, "bucket_count": 7},
+    {"phase": "degraded", "epoch_number": 0, "bucket_count": 7},
+    {"phase": "containment", "epoch_number": 1, "bucket_count": 7},
+    {"phase": "optimized", "epoch_number": 2, "bucket_count": 7}
+  ],
   "minimum_post_activation_grace_s": 1,
   "maximum_activation_to_successor_s": 10,
-  "post_bucket_count": 7,
+  "minimum_containment_to_degraded_ratio": 1.0,
+  "minimum_optimized_to_containment_ratio": 1.0,
   "minimum_qualifying_reporters": 3,
   "minimum_timeout_observations_per_reporter": 2,
   "minimum_net_reputation_drop": 6,

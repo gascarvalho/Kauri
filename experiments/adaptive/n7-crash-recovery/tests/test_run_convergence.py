@@ -69,7 +69,8 @@ def test_runner_reuses_existing_n7_helpers_without_mutating_base_profile() -> No
         SCENARIO_DIRECTORY / "convergence-profile.json"
     )
     assert hashlib.sha256(base_path.read_bytes()).hexdigest() == before
-    assert before == convergence_run.BASE_PROFILE_SHA256
+    assert before == base_runner.RECURRING_PROFILE_SHA256
+    assert convergence_run.BASE_PROFILE_SHA256 == base_runner.PROFILE_SHA256
 
 
 def test_base_runner_threads_optional_manager_extra_args_over_full_run_default(

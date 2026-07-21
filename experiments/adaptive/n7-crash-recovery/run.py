@@ -44,6 +44,10 @@ FULL_RUN_MANAGER_EXTRA_ARGS = (
 REQUIRED_BRANCH = "feature/adaptive-epoch-throughput"
 PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 PROFILE_SHA256 = "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
+RECURRING_PROFILE_ID = "n7-f2-q5-crash-recovery-recurring-v3"
+RECURRING_PROFILE_SHA256 = (
+    "ddfb037c707ebc699138e446f365aa51f19624ee997635784249cc464c5eccef"
+)
 SCENARIO = "n7-crash-recovery"
 BUCKET_WIDTH_NS = 5_000_000_000
 MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD = "minimum_post_activation_grace_s"
@@ -51,6 +55,7 @@ MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD = "maximum_activation_to_successor
 ACTIVATION_DELAY_BLOCKS = 5
 TREE_SWITCH_PERIOD_BLOCKS = 1
 SNAPSHOT_SEED = 0xA2F7
+MAXIMUM_PREDECESSOR_RESIDENCY_MS = 3_600_000
 ISSUER_ID = 1
 MAX_REPLICA_MESSAGE_BYTES = 4 << 20
 MAX_COMMAND_BYTES = 4096
@@ -83,6 +88,11 @@ MANAGER_LIMITS = {
 }
 BUNDLE_DOMAIN = b"kauri-adaptive-v2-epoch-change-bundle-v1"
 AUTHORIZED_COMMAND_DOMAIN = b"kauri-authorized-epoch-change-v1"
+EPOCH_CHANGE_PAYLOAD_DOMAIN = b"kauri-epoch-change-payload-v1"
+EPOCH_DEFINITION_DOMAIN_V2 = b"kauri-epoch-definition-v2"
+SECP256K1_HALF_ORDER = bytes.fromhex(
+    "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0"
+)
 FORBIDDEN_COMMAND_TOKENS = frozenset({"killall", "pkill", "sudo", "ssh"})
 
 MANIFEST_FIELDS = frozenset(
@@ -110,6 +120,9 @@ MANIFEST_FIELDS = frozenset(
         "runtime",
         "runtime_artifacts",
     }
+)
+RECURRING_MANIFEST_FIELDS = frozenset(
+    {*MANIFEST_FIELDS, "transition_requests", "throughput_windows"}
 )
 
 CONFIGURATION_ACTIVE_PAYLOAD_FIELDS = frozenset(
@@ -154,6 +167,24 @@ MANAGER_CONVERGENCE_IDENTITY_FIELDS = frozenset(
         "command_block_hash",
         "activation_delay_blocks",
         "activation_height",
+    }
+)
+MANAGER_SESSION_TERMINAL_FIELDS = frozenset(
+    {
+        "cycle_ordinal",
+        "policy_intent",
+        "outcome",
+        "reason",
+        "transition_artifact_id",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "winning_activation",
+        "evidence_window_activation_generation",
+        "baseline_evidence_cutoff",
+        "current_evidence_cutoff",
     }
 )
 
@@ -216,6 +247,79 @@ class DecodedBundle:
     evidence_snapshot_id: str
     evidence_cutoff: int
     trees: tuple[DecodedTree, ...]
+
+
+def _canonical_unsigned(value: int, size: int) -> bytes:
+    return value.to_bytes(size, "big")
+
+
+def _canonical_string(value: str) -> bytes:
+    payload = value.encode("utf-8")
+    return _canonical_unsigned(len(payload), 4) + payload
+
+
+def epoch_change_payload_digest(command: DecodedCommand) -> str:
+    """Return the protocol digest for a decoded authorized command payload."""
+    payload = b"".join(
+        (
+            EPOCH_CHANGE_PAYLOAD_DOMAIN,
+            _canonical_unsigned(command.successor_epoch_number, 4),
+            bytes.fromhex(command.predecessor_epoch_digest),
+            bytes.fromhex(command.successor_epoch_digest),
+            _canonical_unsigned(command.activation_delay_blocks, 8),
+        )
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _decoded_epoch_definition_digest(
+    *,
+    epoch_number: int,
+    previous_epoch_digest: str,
+    membership_digest: str,
+    generation_seed: int,
+    policy_version: str,
+    evidence_snapshot_id: str,
+    evidence_cutoff: int,
+    trees: Sequence[DecodedTree],
+) -> str:
+    tree_payloads = []
+    for tree in trees:
+        tree_payloads.append(
+            b"".join(
+                (
+                    _canonical_unsigned(tree.tree_id, 4),
+                    _canonical_unsigned(tree.fanout, 4),
+                    _canonical_unsigned(tree.pipeline_stretch, 4),
+                    _canonical_unsigned(len(tree.members), 4),
+                    b"".join(
+                        _canonical_unsigned(member, REPLICA_ID_BYTES)
+                        for member in tree.members
+                    ),
+                    _canonical_unsigned(len(tree.wait_exempt), 4),
+                    b"".join(
+                        _canonical_unsigned(member, REPLICA_ID_BYTES)
+                        for member in sorted(tree.wait_exempt)
+                    ),
+                )
+            )
+        )
+    payload = b"".join(
+        (
+            EPOCH_DEFINITION_DOMAIN_V2,
+            _canonical_unsigned(2, 4),
+            _canonical_unsigned(epoch_number, 4),
+            bytes.fromhex(previous_epoch_digest),
+            bytes.fromhex(membership_digest),
+            _canonical_unsigned(generation_seed, 8),
+            _canonical_string(policy_version),
+            _canonical_string(evidence_snapshot_id),
+            _canonical_unsigned(evidence_cutoff, 8),
+            _canonical_unsigned(len(trees), 4),
+            b"".join(tree_payloads),
+        )
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 class _ByteReader:
@@ -282,8 +386,10 @@ def decode_epoch_change_bundle(payload: bytes) -> DecodedBundle:
     predecessor_digest = command_reader.digest()
     successor_digest = command_reader.digest()
     activation_delay = command_reader.unsigned(8)
-    command_reader._take(64)
+    signature = command_reader._take(64)
     command_reader.finish()
+    if signature[32:] > SECP256K1_HALF_ORDER:
+        raise RunnerError("authorized epoch command signature is not canonical low-S")
 
     definition = _ByteReader(definition_bytes, "successor epoch definition")
     if definition.unsigned(4) != 2 or definition.unsigned(1) != 2 or definition.unsigned(1) != 6:
@@ -325,6 +431,20 @@ def decode_epoch_change_bundle(payload: bytes) -> DecodedBundle:
         trees.append(DecodedTree(tree_id, fanout, pipeline, members, wait_exempt))
     definition.finish()
 
+    computed_definition_digest = _decoded_epoch_definition_digest(
+        epoch_number=epoch_number,
+        previous_epoch_digest=previous_epoch_digest,
+        membership_digest=membership_digest,
+        generation_seed=generation_seed,
+        policy_version=policy_version,
+        evidence_snapshot_id=snapshot_id,
+        evidence_cutoff=evidence_cutoff,
+        trees=trees,
+    )
+    if computed_definition_digest != definition_digest:
+        raise RunnerError(
+            "successor definition digest differs from its canonical bytes"
+        )
     if (
         epoch_number != successor_epoch_number
         or definition_digest != successor_digest
@@ -445,15 +565,182 @@ def verify_repository_state(
     return RepositorySnapshot(revision, True)
 
 
+def _profile_transition_requests(
+    profile: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    raw = profile.get("transition_requests")
+    if not isinstance(raw, list) or not raw:
+        raise RunnerError("frozen profile requires ordered transition_requests")
+    expected_fields = {
+        "policy_intent",
+        "evidence_window_rule",
+        "transition_artifact_id",
+        "bundle_path",
+        "evidence_snapshot_path",
+        "predecessor_epoch_number",
+        "successor_epoch_number",
+        "minimum_predecessor_residency_ms",
+        "policy_parameters",
+    }
+    requests: list[dict[str, Any]] = []
+    artifact_ids: set[str] = set()
+    artifact_paths: set[str] = set()
+    previous_successor: int | None = None
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict) or set(item) != expected_fields:
+            raise RunnerError(
+                f"transition_requests[{index}] has an invalid field set"
+            )
+        predecessor = item["predecessor_epoch_number"]
+        successor = item["successor_epoch_number"]
+        if (
+            type(predecessor) is not int
+            or type(successor) is not int
+            or predecessor < 0
+            or successor != predecessor + 1
+            or (previous_successor is None and predecessor != 0)
+            or (
+                previous_successor is not None
+                and predecessor != previous_successor
+            )
+        ):
+            raise RunnerError("transition requests must form one contiguous chain")
+        previous_successor = successor
+        residency_ms = item["minimum_predecessor_residency_ms"]
+        if (
+            type(residency_ms) is not int
+            or residency_ms < 0
+            or residency_ms > MAXIMUM_PREDECESSOR_RESIDENCY_MS
+        ):
+            raise RunnerError(
+                f"transition_requests[{index}].minimum_predecessor_residency_ms "
+                f"must be an integer from 0 through {MAXIMUM_PREDECESSOR_RESIDENCY_MS}"
+            )
+        intent = item["policy_intent"]
+        if intent not in ("fault_containment", "performance_optimization"):
+            raise RunnerError(
+                f"transition_requests[{index}] has an unknown policy intent"
+            )
+        if item["evidence_window_rule"] != (
+            "fresh_exact_predecessor_after_common_commit"
+        ):
+            raise RunnerError(
+                f"transition_requests[{index}] has an invalid evidence rule"
+            )
+        artifact_id = item["transition_artifact_id"]
+        if (
+            not isinstance(artifact_id, str)
+            or not artifact_id
+            or artifact_id in artifact_ids
+        ):
+            raise RunnerError("transition artifact IDs must be non-empty and unique")
+        artifact_ids.add(artifact_id)
+        for field in ("bundle_path", "evidence_snapshot_path"):
+            relative = item[field]
+            if not isinstance(relative, str) or not relative:
+                raise RunnerError(f"transition_requests[{index}].{field} is invalid")
+            relative_path = Path(relative)
+            if (
+                relative_path.is_absolute()
+                or ".." in relative_path.parts
+                or relative in artifact_paths
+                or artifact_id not in relative_path.parts
+            ):
+                raise RunnerError(
+                    "transition artifact paths must be distinct, relative, and qualified"
+                )
+            artifact_paths.add(relative)
+        parameters = item["policy_parameters"]
+        if not isinstance(parameters, dict):
+            raise RunnerError(
+                f"transition_requests[{index}].policy_parameters is invalid"
+            )
+        if intent == "performance_optimization" and parameters:
+            raise RunnerError("optimization policy parameters must be empty")
+        if intent == "fault_containment":
+            roots = parameters.get("containment_baseline_roots")
+            if (
+                set(parameters) != {"containment_baseline_roots"}
+                or not isinstance(roots, list)
+                or not roots
+                or any(
+                    not isinstance(root, dict)
+                    or set(root) != {"tree_id", "replica_id"}
+                    or type(root["tree_id"]) is not int
+                    or type(root["replica_id"]) is not int
+                    for root in roots
+                )
+            ):
+                raise RunnerError("containment policy parameters are invalid")
+        requests.append(json.loads(json.dumps(item)))
+    return tuple(requests)
+
+
+def _profile_throughput_windows(
+    profile: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    raw = profile.get("throughput_windows")
+    phases = ("baseline", "degraded", "containment", "optimized")
+    if not isinstance(raw, list) or len(raw) != len(phases):
+        raise RunnerError("frozen profile requires four throughput windows")
+    windows: list[dict[str, Any]] = []
+    for index, (item, phase) in enumerate(zip(raw, phases)):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"phase", "epoch_number", "bucket_count"}
+            or item["phase"] != phase
+            or type(item["epoch_number"]) is not int
+            or item["epoch_number"] != (0, 0, 1, 2)[index]
+            or type(item["bucket_count"]) is not int
+            or item["bucket_count"] <= 0
+        ):
+            raise RunnerError(f"throughput_windows[{index}] is invalid")
+        windows.append(dict(item))
+    return tuple(windows)
+
+
+def _validate_profile_transition_residencies(
+    profile: Mapping[str, Any],
+    requests: Sequence[Mapping[str, Any]],
+    windows: Sequence[Mapping[str, Any]],
+) -> None:
+    if requests[0]["minimum_predecessor_residency_ms"] != 0:
+        raise RunnerError("the initial containment transition residency must be zero")
+    bucket_width_ns = _profile_duration_ns(profile, "bucket_width_s")
+    grace_ns = _profile_duration_ns(
+        profile, MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD
+    )
+    for previous, request in zip(requests, requests[1:]):
+        predecessor_epoch = request["predecessor_epoch_number"]
+        if predecessor_epoch != previous["successor_epoch_number"]:
+            raise RunnerError("transition residency does not bind its predecessor")
+        matching = [
+            window
+            for window in windows
+            if window["epoch_number"] == predecessor_epoch
+        ]
+        if len(matching) != 1:
+            raise RunnerError(
+                f"successor epoch {predecessor_epoch} requires one throughput phase"
+            )
+        required_ns = matching[0]["bucket_count"] * bucket_width_ns + grace_ns
+        declared_ns = request["minimum_predecessor_residency_ms"] * 1_000_000
+        if declared_ns < required_ns:
+            raise RunnerError(
+                f"transition into epoch {request['successor_epoch_number']} does not "
+                "preserve its predecessor's complete throughput window and grace"
+            )
+
+
 def load_frozen_profile(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
         payload = path.read_bytes()
         value = json.loads(payload.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunnerError(f"cannot load frozen profile {path}: {exc}") from exc
-    if sha256_bytes(payload) != PROFILE_SHA256:
+    if sha256_bytes(payload) != RECURRING_PROFILE_SHA256:
         raise RunnerError("frozen profile SHA-256 differs from the canonical profile")
-    if not isinstance(value, dict) or value.get("profile_id") != PROFILE_ID or value.get("frozen") is not True:
+    if not isinstance(value, dict) or value.get("profile_id") != RECURRING_PROFILE_ID or value.get("frozen") is not True:
         raise RunnerError("profile is not the frozen N=7 crash-recovery profile")
     expected = {
         "replica_ids": list(REPLICA_IDS),
@@ -462,8 +749,6 @@ def load_frozen_profile(path: Path) -> tuple[dict[str, Any], bytes]:
         "authoritative_observer": AUTHORITATIVE_OBSERVER,
         "crash_targets": list(CRASH_TARGETS),
         "epoch0_roots": list(REPLICA_IDS),
-        "successor_roots": list(SURVIVORS),
-        "successor_wait_exempt": list(CRASH_TARGETS),
         "fanout": 2,
         "pipeline_depth": 2,
         "block_size": 1,
@@ -479,6 +764,9 @@ def load_frozen_profile(path: Path) -> tuple[dict[str, Any], bytes]:
         MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD,
     ):
         _profile_duration_ns(value, field)
+    requests = _profile_transition_requests(value)
+    windows = _profile_throughput_windows(value)
+    _validate_profile_transition_residencies(value, requests, windows)
     return value, payload
 
 
@@ -656,12 +944,20 @@ def runtime_parameters(
         "activation_delay_blocks": int(profile["activation_delay_blocks"]),
         "fanout": int(profile["fanout"]),
         "epoch0_roots": list(REPLICA_IDS),
-        "successor_roots": list(SURVIVORS),
-        "successor_wait_exempt": list(CRASH_TARGETS),
         "tree_switch_period_blocks": int(profile["tree_switch_period_blocks"]),
         "snapshot_seed": int(profile["snapshot_seed"]),
         "manager_limits": dict(MANAGER_LIMITS),
     }
+    if "transition_requests" in profile:
+        runtime["transition_requests"] = [
+            dict(request) for request in _profile_transition_requests(profile)
+        ]
+        runtime["throughput_windows"] = [
+            dict(window) for window in _profile_throughput_windows(profile)
+        ]
+    else:
+        runtime["successor_roots"] = list(SURVIVORS)
+        runtime["successor_wait_exempt"] = list(CRASH_TARGETS)
     if (app_binary is None) != (manager_binary is None):
         raise RunnerError("runtime executable provenance requires both launched binaries")
     if app_binary is not None and manager_binary is not None:
@@ -726,7 +1022,9 @@ def build_manager_command(
     run_id: str,
     source_instance: str,
     structured_event_path: Path,
-    bundle_path: Path,
+    bundle_path: Path | None = None,
+    transition_requests: Sequence[Mapping[str, Any]] = (),
+    bundle_paths: Sequence[Path] = (),
     manager_extra_args: Sequence[str] = (),
 ) -> tuple[str, ...]:
     if len(replicas_tls) != 7:
@@ -745,8 +1043,6 @@ def build_manager_command(
         str(issuer["sec"]),
         "--activation-delay-blocks",
         str(activation_delay_blocks),
-        "--bundle-output",
-        str(bundle_path),
         "--structured-event-run-id",
         run_id,
         "--structured-event-source-instance",
@@ -754,6 +1050,26 @@ def build_manager_command(
         "--structured-event-output",
         str(structured_event_path),
     ]
+    if transition_requests:
+        if bundle_path is not None or len(bundle_paths) != len(transition_requests):
+            raise RunnerError(
+                "recurring manager command requires one bundle path per request"
+            )
+        if len({path.resolve() for path in bundle_paths}) != len(bundle_paths):
+            raise RunnerError("manager bundle output paths must be distinct")
+        for request, path in zip(transition_requests, bundle_paths):
+            command.extend(
+                (
+                    "--transition-request",
+                    json.dumps(request, sort_keys=True, separators=(",", ":")),
+                    "--bundle-output",
+                    str(path),
+                )
+            )
+    elif bundle_path is not None:
+        command.extend(("--bundle-output", str(bundle_path)))
+    else:
+        raise RunnerError("manager command requires at least one transition request")
     for replica_id, tls in enumerate(replicas_tls):
         command.extend(
             (
@@ -979,6 +1295,15 @@ def _launch_arguments(
                     ],
                     "snapshot_seed": runtime["snapshot_seed"],
                     "manager_limits": runtime["manager_limits"],
+                    **(
+                        {
+                            "transition_requests": runtime[
+                                "transition_requests"
+                            ]
+                        }
+                        if "transition_requests" in runtime
+                        else {}
+                    ),
                     "binary_sha256": manager_sha256,
                     "tls_certificate_sha256": manager_tls_certificate_sha256,
                     "issuer_public_key_sha256": issuer_public_key_sha256,
@@ -1066,6 +1391,51 @@ def write_runtime_inputs(
             )
         )
 
+    manager_options: dict[str, Any]
+    if "transition_requests" in runtime:
+        transition_requests = tuple(runtime["transition_requests"])
+        bundle_paths = tuple(
+            run_directory / request["bundle_path"]
+            for request in transition_requests
+        )
+        snapshot_paths = tuple(
+            run_directory / request["evidence_snapshot_path"]
+            for request in transition_requests
+        )
+        all_paths = (*bundle_paths, *snapshot_paths)
+        if len({path.resolve() for path in all_paths}) != len(all_paths):
+            raise RunnerError("transition artifact paths must be distinct")
+        for request, bundle, snapshot in zip(
+            transition_requests, bundle_paths, snapshot_paths
+        ):
+            expected_parent = run_directory / "transitions" / request[
+                "transition_artifact_id"
+            ]
+            if bundle.parent != expected_parent or snapshot.parent != expected_parent:
+                raise RunnerError(
+                    "transition artifacts must use their qualified directory"
+                )
+            expected_parent.mkdir(parents=True, mode=0o700, exist_ok=False)
+        request_path = runtime_directory / "transition-requests.json"
+        _write_json_exclusive(
+            request_path,
+            {"schema_version": 1, "requests": list(transition_requests)},
+        )
+        runtime_artifacts.append(
+            _runtime_artifact(
+                run_directory,
+                request_path,
+                kind="transition_requests",
+                replica_id=None,
+            )
+        )
+        manager_options = {
+            "transition_requests": transition_requests,
+            "bundle_paths": bundle_paths,
+        }
+    else:
+        manager_options = {"bundle_path": run_directory / "successor.bundle"}
+
     manager_command = build_manager_command(
         manager_binary,
         replicas_tls=tls[:7],
@@ -1077,8 +1447,8 @@ def write_runtime_inputs(
         run_id=run_id,
         source_instance=source_instances[MANAGER_SOURCE_ID],
         structured_event_path=raw_directory / "adaptive-manager.jsonl",
-        bundle_path=run_directory / "successor.bundle",
         manager_extra_args=manager_extra_args,
+        **manager_options,
     )
     epoch_input_path = runtime_directory / "epoch-input.json"
     _write_json_exclusive(epoch_input_path, _initial_epoch_input())
@@ -1230,83 +1600,219 @@ def _event_timestamp(event: Mapping[str, Any]) -> int:
     return value
 
 
+def checked_activation_generation(epoch_number: int) -> int:
+    if type(epoch_number) is not int or not 0 <= epoch_number <= (1 << 32) - 1:
+        raise RunnerError("activation-generation epoch is outside uint32 range")
+    generation = (epoch_number << 32) | 1
+    if generation <= 0 or generation > (1 << 64) - 1:
+        raise RunnerError("activation generation is outside uint64 range")
+    return generation
+
+
 def manager_convergence_ready_event(
     events: Sequence[Mapping[str, Any]],
+    transition_requests: Sequence[Mapping[str, Any]],
+    *,
+    required_completed: int | None = None,
 ) -> dict[str, Any] | None:
-    """Return the unique canonical terminal-ready event, if not yet emitted."""
+    """Return the requested prefix's ready record after exact terminal cycles."""
+    requests = _profile_transition_requests(
+        {"transition_requests": list(transition_requests)}
+    )
+    if required_completed is None:
+        required_completed = len(requests)
+    if (
+        type(required_completed) is not int
+        or required_completed < 1
+        or required_completed > len(requests)
+    ):
+        raise RunnerError(
+            "required_completed must identify a non-empty transition prefix"
+        )
     if any(
         event.get("event_type") == "adaptive_v2_convergence_failure"
         for event in events
     ):
         raise RunnerError("manager emitted adaptive_v2_convergence_failure")
-    ready = [
+    ready_events = [
         event for event in events if event.get("event_type") == "adaptive_v2_ready"
     ]
-    if len(ready) > 1:
-        raise RunnerError("manager emitted duplicate adaptive_v2_ready events")
-    if not ready:
-        return None
-    event = ready[0]
-    _source_sequence(event)
-    _event_timestamp(event)
-    payload = event.get("payload")
-    if not isinstance(payload, dict) or set(payload) != set(
-        MANAGER_CONVERGENCE_PAYLOAD_FIELDS
-    ):
-        raise RunnerError("adaptive_v2_ready has an invalid payload field set")
-    identity = payload.get("identity")
-    if not isinstance(identity, dict) or set(identity) != set(
-        MANAGER_CONVERGENCE_IDENTITY_FIELDS
-    ):
-        raise RunnerError("adaptive_v2_ready has an invalid identity")
-    if any(
-        payload.get(field) is not None
-        for field in (
-            "replica_id",
-            "delivery_attempt",
-            "disposition",
-            "canonical_payload_digest",
-            "failure_reason",
-        )
-    ):
-        raise RunnerError("adaptive_v2_ready is not an exact terminal record")
-    accepted_commits = payload.get("accepted_commit_count")
-    accepted_activations = payload.get("accepted_activation_count")
-    required_activations = payload.get("required_activation_count")
-    if (
-        type(accepted_commits) is not int
-        or accepted_commits < 0
-        or accepted_commits > len(REPLICA_IDS)
-        or type(accepted_activations) is not int
-        or accepted_activations != QUORUM
-        or type(required_activations) is not int
-        or required_activations != QUORUM
-    ):
-        raise RunnerError("adaptive_v2_ready does not prove the fixed quorum")
-    for field in (
-        "predecessor_epoch_number",
-        "successor_epoch_number",
-        "command_block_height",
-        "activation_delay_blocks",
-        "activation_height",
-    ):
-        if type(identity.get(field)) is not int or int(identity[field]) < 0:
-            raise RunnerError("adaptive_v2_ready identity has an invalid integer")
-    for field in (
-        "predecessor_epoch_digest",
-        "successor_epoch_digest",
-        "command_payload_digest",
-        "command_block_hash",
-    ):
-        digest = identity.get(field)
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or digest == "0" * 64
-            or any(character not in "0123456789abcdef" for character in digest)
+    terminal_events = [
+        event
+        for event in events
+        if event.get("event_type") == "adaptive_v2_session_terminal"
+    ]
+    ready_by_transition: dict[tuple[int, int], Mapping[str, Any]] = {}
+    for event in ready_events:
+        _source_sequence(event)
+        _event_timestamp(event)
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or set(payload) != set(
+            MANAGER_CONVERGENCE_PAYLOAD_FIELDS
         ):
-            raise RunnerError("adaptive_v2_ready identity has an invalid digest")
-    return dict(event)
+            raise RunnerError("adaptive_v2_ready has an invalid payload field set")
+        identity = payload.get("identity")
+        if not isinstance(identity, dict) or set(identity) != set(
+            MANAGER_CONVERGENCE_IDENTITY_FIELDS
+        ):
+            raise RunnerError("adaptive_v2_ready has an invalid identity")
+        if any(
+            payload.get(field) is not None
+            for field in (
+                "replica_id",
+                "delivery_attempt",
+                "disposition",
+                "canonical_payload_digest",
+                "failure_reason",
+            )
+        ):
+            raise RunnerError("adaptive_v2_ready is not an exact terminal record")
+        accepted_commits = payload.get("accepted_commit_count")
+        accepted_activations = payload.get("accepted_activation_count")
+        required_activations = payload.get("required_activation_count")
+        if (
+            type(accepted_commits) is not int
+            or accepted_commits < 0
+            or accepted_commits > len(REPLICA_IDS)
+            or type(accepted_activations) is not int
+            or accepted_activations != QUORUM
+            or type(required_activations) is not int
+            or required_activations != QUORUM
+        ):
+            raise RunnerError("adaptive_v2_ready does not prove the fixed quorum")
+        for field in (
+            "predecessor_epoch_number",
+            "successor_epoch_number",
+            "command_block_height",
+            "activation_delay_blocks",
+            "activation_height",
+        ):
+            if type(identity.get(field)) is not int or int(identity[field]) < 0:
+                raise RunnerError("adaptive_v2_ready identity has an invalid integer")
+        for field in (
+            "predecessor_epoch_digest",
+            "successor_epoch_digest",
+            "command_payload_digest",
+            "command_block_hash",
+        ):
+            digest = identity.get(field)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or digest == "0" * 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise RunnerError("adaptive_v2_ready identity has an invalid digest")
+        key = (
+            identity["predecessor_epoch_number"],
+            identity["successor_epoch_number"],
+        )
+        if key in ready_by_transition:
+            raise RunnerError("duplicate adaptive_v2_ready for one transition")
+        ready_by_transition[key] = event
+
+    expected_keys = {
+        (request["predecessor_epoch_number"], request["successor_epoch_number"])
+        for request in requests
+    }
+    if not set(ready_by_transition).issubset(expected_keys):
+        raise RunnerError("manager emitted an unrequested transition ready record")
+
+    terminal_by_ordinal: dict[int, Mapping[str, Any]] = {}
+    for event in terminal_events:
+        _source_sequence(event)
+        _event_timestamp(event)
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or set(payload) != set(
+            MANAGER_SESSION_TERMINAL_FIELDS
+        ):
+            raise RunnerError(
+                "adaptive_v2_session_terminal has an invalid payload field set"
+            )
+        ordinal = payload.get("cycle_ordinal")
+        if type(ordinal) is not int or not 0 <= ordinal < len(requests):
+            raise RunnerError("adaptive_v2_session_terminal has an invalid cycle ordinal")
+        if ordinal in terminal_by_ordinal:
+            raise RunnerError("duplicate adaptive_v2_session_terminal record")
+        terminal_by_ordinal[ordinal] = event
+
+    required_ready: Mapping[str, Any] | None = None
+    previous_terminal_sequence = 0
+    for ordinal, request in enumerate(requests):
+        key = (
+            request["predecessor_epoch_number"],
+            request["successor_epoch_number"],
+        )
+        ready = ready_by_transition.get(key)
+        terminal = terminal_by_ordinal.get(ordinal)
+        if ready is None and terminal is not None:
+            raise RunnerError(
+                "adaptive_v2_session_terminal has no matching ready record"
+            )
+        if ready is None:
+            if ordinal < required_completed:
+                return None
+            continue
+        ready_sequence = _source_sequence(ready)
+        if ready_sequence <= previous_terminal_sequence:
+            raise RunnerError("manager transition terminal records are out of order")
+        if terminal is None:
+            if ordinal < required_completed:
+                return None
+            continue
+        ready_payload = ready["payload"]
+        identity = ready_payload["identity"]
+        terminal_payload = terminal["payload"]
+        if (
+            terminal_payload["policy_intent"] != request["policy_intent"]
+            or terminal_payload["transition_artifact_id"]
+            != request["transition_artifact_id"]
+            or terminal_payload["outcome"] != "advanced"
+            or terminal_payload["reason"] != "successor_converged"
+            or terminal_payload["predecessor_epoch_number"] != key[0]
+            or terminal_payload["successor_epoch_number"] != key[1]
+            or terminal_payload["predecessor_epoch_digest"]
+            != identity["predecessor_epoch_digest"]
+            or terminal_payload["successor_epoch_digest"]
+            != identity["successor_epoch_digest"]
+            or terminal_payload["command_payload_digest"]
+            != identity["command_payload_digest"]
+            or terminal_payload["winning_activation"] != identity
+        ):
+            raise RunnerError(
+                "adaptive_v2_session_terminal does not bind its requested transition"
+            )
+        activation_generation = terminal_payload[
+            "evidence_window_activation_generation"
+        ]
+        baseline_cutoff = terminal_payload["baseline_evidence_cutoff"]
+        current_cutoff = terminal_payload["current_evidence_cutoff"]
+        if (
+            type(activation_generation) is not int
+            or activation_generation
+            != checked_activation_generation(
+                request["predecessor_epoch_number"]
+            )
+            or type(baseline_cutoff) is not int
+            or baseline_cutoff < 0
+            or type(current_cutoff) is not int
+            or current_cutoff <= baseline_cutoff
+        ):
+            raise RunnerError(
+                "adaptive_v2_session_terminal has an invalid evidence window"
+            )
+        terminal_sequence = _source_sequence(terminal)
+        if (
+            terminal_sequence <= ready_sequence
+            or _event_timestamp(terminal) < _event_timestamp(ready)
+        ):
+            raise RunnerError("manager transition terminal records are out of order")
+        previous_terminal_sequence = terminal_sequence
+        if ordinal + 1 == required_completed:
+            required_ready = ready
+
+    assert required_ready is not None
+    return dict(required_ready)
 
 
 def _manager_identity_from_command(
@@ -1700,6 +2206,45 @@ def find_first_common_epoch_commit(
     return None
 
 
+def find_common_epoch_commits(
+    observer_events: Sequence[Mapping[str, Any]],
+    witnesses: Mapping[int, Mapping[tuple[int, str], int]],
+    *,
+    participants: Sequence[int],
+    epoch_number: int,
+    minimum_count: int,
+    strictly_after_ns: int | None = None,
+) -> tuple[CommonEpochCommit, ...] | None:
+    if type(minimum_count) is not int or minimum_count <= 0:
+        raise RunnerError("common epoch commit count must be positive")
+    results: list[CommonEpochCommit] = []
+    for event in _commits(observer_events):
+        payload = event.get("payload")
+        proof = payload.get("decision_proof") if isinstance(payload, dict) else None
+        if not isinstance(proof, dict) or proof.get("epoch_number") != epoch_number:
+            continue
+        observer_timestamp = _event_timestamp(event)
+        if strictly_after_ns is not None and observer_timestamp <= strictly_after_ns:
+            continue
+        key = _commit_key(event)
+        timestamps = [witnesses.get(replica, {}).get(key) for replica in participants]
+        if not all(timestamp is not None for timestamp in timestamps):
+            continue
+        if strictly_after_ns is not None and not all(
+            int(timestamp) > strictly_after_ns for timestamp in timestamps
+        ):
+            continue
+        results.append(
+            CommonEpochCommit(
+                observer_event=dict(event),
+                common_ns=max(observer_timestamp, *(int(value) for value in timestamps)),
+            )
+        )
+        if len(results) == minimum_count:
+            return tuple(results)
+    return None
+
+
 def enforce_common_epoch_commit_deadline(
     result: CommonEpochCommit | None,
     *,
@@ -2005,6 +2550,79 @@ def _common_single_payload(
     return values[0]
 
 
+def _common_transition_payload(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    event_type: str,
+    *,
+    predecessor_epoch_number: int,
+    successor_epoch_number: int,
+) -> dict[str, Any] | None:
+    values: list[dict[str, Any]] = []
+    for replica in SURVIVORS:
+        matches: list[dict[str, Any]] = []
+        for event in streams[f"replica-{replica}"]:
+            if event.get("event_type") != event_type:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                raise RunnerError(f"replica-{replica} emitted invalid {event_type}")
+            if event_type == "epoch.command_committed":
+                selected = (
+                    payload.get("predecessor_epoch_number")
+                    == predecessor_epoch_number
+                    and payload.get("successor_epoch_number")
+                    == successor_epoch_number
+                )
+            else:
+                selected = payload.get("epoch_number") == successor_epoch_number
+            if selected:
+                matches.append(dict(payload))
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise RunnerError(
+                f"replica-{replica} emitted duplicate {event_type} for one transition"
+            )
+        values.append(matches[0])
+    if any(value != values[0] for value in values[1:]):
+        raise RunnerError(f"survivors disagree on {event_type} payload")
+    return values[0]
+
+
+def _observer_transition_event(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    event_type: str,
+    *,
+    predecessor_epoch_number: int,
+    successor_epoch_number: int,
+) -> dict[str, Any] | None:
+    matches: list[dict[str, Any]] = []
+    for event in streams[AUTHORITATIVE_SOURCE_ID]:
+        if event.get("event_type") != event_type:
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            raise RunnerError(f"authoritative observer emitted invalid {event_type}")
+        if event_type == "epoch.command_committed":
+            selected = (
+                payload.get("predecessor_epoch_number")
+                == predecessor_epoch_number
+                and payload.get("successor_epoch_number")
+                == successor_epoch_number
+            )
+        else:
+            selected = payload.get("epoch_number") == successor_epoch_number
+        if selected:
+            matches.append(dict(event))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RunnerError(
+            f"authoritative observer emitted duplicate {event_type} for one transition"
+        )
+    return matches[0]
+
+
 def _observer_event(streams: Mapping[str, Sequence[Mapping[str, Any]]], event_type: str) -> dict[str, Any] | None:
     events = [dict(event) for event in streams[AUTHORITATIVE_SOURCE_ID] if event.get("event_type") == event_type]
     if not events:
@@ -2014,7 +2632,10 @@ def _observer_event(streams: Mapping[str, Sequence[Mapping[str, Any]]], event_ty
     return events[0]
 
 
-def build_epochs_document(decoded: DecodedBundle, command_payload: Mapping[str, Any]) -> dict[str, Any]:
+def build_epochs_document(
+    decoded: DecodedBundle | Sequence[DecodedBundle],
+    command_payload: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
     expected_command_fields = {
         "command_block_height",
         "command_block_hash",
@@ -2026,16 +2647,60 @@ def build_epochs_document(decoded: DecodedBundle, command_payload: Mapping[str, 
         "activation_delay_blocks",
         "activation_height",
     }
-    if set(command_payload) != expected_command_fields:
-        raise RunnerError("epoch command event does not have the canonical field set")
-    if (
-        command_payload["predecessor_epoch_number"] != 0
-        or command_payload["successor_epoch_number"] != decoded.epoch_number
-        or command_payload["predecessor_epoch_digest"] != decoded.previous_epoch_digest
-        or command_payload["successor_epoch_digest"] != decoded.epoch_digest
-        or command_payload["activation_delay_blocks"] != ACTIVATION_DELAY_BLOCKS
-    ):
-        raise RunnerError("committed command does not match the manager bundle")
+    bundles = (decoded,) if isinstance(decoded, DecodedBundle) else tuple(decoded)
+    commands = (
+        (command_payload,)
+        if isinstance(command_payload, Mapping)
+        else tuple(command_payload)
+    )
+    if not bundles or len(bundles) != len(commands):
+        raise RunnerError("epoch document requires one command per successor bundle")
+    predecessor_number = 0
+    initial_epoch_digest = bundles[0].previous_epoch_digest
+    predecessor_digest = initial_epoch_digest
+    epoch_digests = {predecessor_digest}
+    payload_digests: set[str] = set()
+    successors: list[dict[str, Any]] = []
+    for bundle, command in zip(bundles, commands):
+        if set(command) != expected_command_fields:
+            raise RunnerError("epoch command event does not have the canonical field set")
+        if (
+            bundle.epoch_number != predecessor_number + 1
+            or bundle.previous_epoch_digest != predecessor_digest
+            or command["predecessor_epoch_number"] != predecessor_number
+            or command["successor_epoch_number"] != bundle.epoch_number
+            or command["predecessor_epoch_digest"] != predecessor_digest
+            or command["successor_epoch_digest"] != bundle.epoch_digest
+            or command["activation_delay_blocks"] != ACTIVATION_DELAY_BLOCKS
+        ):
+            raise RunnerError(
+                "committed command does not continue the exact manager bundle chain"
+            )
+        payload_digest = command["payload_digest"]
+        if bundle.epoch_digest in epoch_digests:
+            raise RunnerError("successor epoch digest is reused")
+        if payload_digest in payload_digests:
+            raise RunnerError("command payload digest is reused")
+        epoch_digests.add(bundle.epoch_digest)
+        payload_digests.add(payload_digest)
+        successors.append(
+            {
+                "epoch_number": bundle.epoch_number,
+                "epoch_digest": bundle.epoch_digest,
+                "trees": [
+                    {
+                        "tree_id": tree.tree_id,
+                        "fanout": tree.fanout,
+                        "members_breadth_first": list(tree.members),
+                        "wait_exempt": list(tree.wait_exempt),
+                    }
+                    for tree in bundle.trees
+                ],
+                "command": dict(command),
+            }
+        )
+        predecessor_number = bundle.epoch_number
+        predecessor_digest = bundle.epoch_digest
     return {
         "schema_version": 1,
         "replica_count": 7,
@@ -2045,7 +2710,7 @@ def build_epochs_document(decoded: DecodedBundle, command_payload: Mapping[str, 
         "epochs": [
             {
                 "epoch_number": 0,
-                "epoch_digest": decoded.previous_epoch_digest,
+                "epoch_digest": initial_epoch_digest,
                 "trees": [
                     {
                         "tree_id": root,
@@ -2057,20 +2722,7 @@ def build_epochs_document(decoded: DecodedBundle, command_payload: Mapping[str, 
                 ],
                 "command": None,
             },
-            {
-                "epoch_number": decoded.epoch_number,
-                "epoch_digest": decoded.epoch_digest,
-                "trees": [
-                    {
-                        "tree_id": tree.tree_id,
-                        "fanout": tree.fanout,
-                        "members_breadth_first": list(tree.members),
-                        "wait_exempt": list(tree.wait_exempt),
-                    }
-                    for tree in decoded.trees
-                ],
-                "command": dict(command_payload),
-            },
+            *successors,
         ],
     }
 
@@ -2093,6 +2745,8 @@ def build_manifest(
     crash_configuration_boundary: Mapping[str, Any] | None = None,
     runtime: Mapping[str, Any] | None = None,
     runtime_artifacts: Sequence[Mapping[str, Any]] = (),
+    transition_requests: Sequence[Mapping[str, Any]] = (),
+    throughput_windows: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     if (
         type(minimum_post_activation_grace_ns) is not int
@@ -2124,6 +2778,17 @@ def build_manifest(
             "path": "raw/adaptive-manager.jsonl",
         }
     )
+    runtime_value = dict(runtime or {})
+    recurring = "transition_requests" in runtime_value
+    manager_metadata: dict[str, Any] = {
+        "source_id": MANAGER_SOURCE_ID,
+        "receives_crash_ground_truth": False,
+    }
+    if recurring:
+        manager_metadata["transition_artifact_ids"] = [
+            request["transition_artifact_id"]
+            for request in runtime_value["transition_requests"]
+        ]
     manifest = {
         "schema_version": 1,
         "scenario": SCENARIO,
@@ -2131,7 +2796,7 @@ def build_manifest(
         "kauri_revision": revision,
         "kauri_worktree_clean": True,
         "profile": {
-            "identity": PROFILE_ID,
+                "identity": RECURRING_PROFILE_ID if recurring else PROFILE_ID,
             "path": "profile.json",
             "sha256": sha256_bytes(profile_bytes),
         },
@@ -2146,10 +2811,7 @@ def build_manifest(
         "quorum": 5,
         "membership": list(REPLICA_IDS),
         "authoritative_observer": AUTHORITATIVE_SOURCE_ID,
-        "manager": {
-            "source_id": MANAGER_SOURCE_ID,
-            "receives_crash_ground_truth": False,
-        },
+        "manager": manager_metadata,
         "bucket_width_ns": BUCKET_WIDTH_NS,
         "minimum_post_activation_grace_ns": minimum_post_activation_grace_ns,
         "baseline_start_ns": baseline_start_ns,
@@ -2161,10 +2823,25 @@ def build_manifest(
             if crash_configuration_boundary is not None
             else None
         ),
-        "runtime": dict(runtime or {}),
+        "runtime": runtime_value,
         "runtime_artifacts": [dict(artifact) for artifact in runtime_artifacts],
     }
-    if set(manifest) != MANIFEST_FIELDS:
+    if recurring:
+        manifest["transition_requests"] = [
+            dict(request)
+            for request in (
+                transition_requests or runtime_value["transition_requests"]
+            )
+        ]
+        manifest["throughput_windows"] = [
+            dict(window) for window in throughput_windows
+        ]
+    expected_manifest_fields = (
+        RECURRING_MANIFEST_FIELDS
+        if recurring
+        else MANIFEST_FIELDS
+    )
+    if set(manifest) != expected_manifest_fields:
         raise RunnerError("internal manifest schema drift")
     return manifest
 
@@ -2200,6 +2877,41 @@ def _shutdown_processes(records: Sequence[ProcessRecord]) -> list[str]:
     return unexpected
 
 
+def _audit_and_shutdown_processes(
+    records: Sequence[ProcessRecord],
+    *,
+    audit_required: bool,
+    allow_clean_exit: Callable[[ProcessRecord], bool],
+) -> tuple[list[str], list[str]]:
+    """Audit independently, then always attempt process-group shutdown."""
+    errors: list[str] = []
+    if audit_required:
+        try:
+            _check_processes(
+                records,
+                set(CRASH_TARGETS),
+                allow_clean_exit=allow_clean_exit,
+            )
+        except RunnerError as exc:
+            errors.append(f"final process audit failed: {exc}")
+    unexpected: list[str] = []
+    try:
+        unexpected = _shutdown_processes(records)
+    except (RunnerError, OSError, subprocess.SubprocessError) as exc:
+        errors.append(f"process shutdown failed: {exc}")
+    return unexpected, errors
+
+
+def _merge_runtime_errors(
+    original: str | None,
+    additional: Sequence[str],
+) -> str | None:
+    if not additional:
+        return original
+    suffix = "; ".join(additional)
+    return suffix if original is None else f"{original}; {suffix}"
+
+
 def _wait_listeners_stopped(ports: Sequence[int], timeout_s: float) -> list[int]:
     deadline = time.monotonic() + timeout_s
     remaining = listening_ports(ports)
@@ -2226,7 +2938,60 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--startup-timeout", type=float, default=90.0)
     parser.add_argument("--phase-timeout", type=float, default=240.0)
     parser.add_argument("--crash-confirm-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="generate PASS-only figures; plotting never changes the validator verdict",
+    )
     return parser.parse_args(argv)
+
+
+def validate_preserved_attempt(
+    *,
+    repository: Path,
+    run_directory: Path,
+    manifest_path: Path,
+    plot: bool,
+) -> int:
+    """Write the immutable verdict and optionally render a PASS result.
+
+    The validator is deliberately invoked even when the manifest or epoch
+    document is absent.  Its missing-input path is the canonical INCOMPLETE
+    verdict for an attempt that stopped before those artifacts were finished.
+    """
+
+    validated_directory = run_directory / "validated"
+    validator = Path(__file__).resolve().with_name("validator.py")
+    validation = subprocess.run(
+        [
+            sys.executable,
+            str(validator),
+            "--manifest",
+            str(manifest_path),
+            "--epochs",
+            str(run_directory / "epochs.json"),
+            "--output-dir",
+            str(validated_directory),
+        ],
+        cwd=repository,
+        check=False,
+    )
+    if validation.returncode != 0 or not plot:
+        return validation.returncode
+
+    plotter = Path(__file__).resolve().with_name("plot.py")
+    plotted = subprocess.run(
+        [sys.executable, str(plotter), str(validated_directory)],
+        cwd=repository,
+        check=False,
+    )
+    if plotted.returncode != 0:
+        print(
+            "WARNING: immutable PASS evidence was preserved but optional "
+            "figure generation failed",
+            file=sys.stderr,
+        )
+    return 0
 
 
 def run(argv: Sequence[str] | None = None) -> int:
@@ -2285,6 +3050,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     crash_markers: list[dict[str, Any]] = []
     crash_configuration_boundary: dict[str, Any] | None = None
     runtime_artifacts: list[dict[str, Any]] = []
+    throughput_measurement_windows: list[dict[str, Any]] = []
     runtime = runtime_parameters(
         profile,
         app_binary=binaries["app"],
@@ -2319,6 +3085,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             unexpected_survivor_exits=unexpected_exits,
             runtime=runtime,
             runtime_artifacts=runtime_artifacts,
+            transition_requests=runtime.get("transition_requests", ()),
+            throughput_windows=throughput_measurement_windows,
         )
         if manifest_written:
             _replace_json(manifest_path, value)
@@ -2330,7 +3098,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         if record.name != MANAGER_SOURCE_ID:
             return False
         return manager_convergence_ready_event(
-            _read_jsonl(run_directory / "raw" / "adaptive-manager.jsonl")
+            _read_jsonl(run_directory / "raw" / "adaptive-manager.jsonl"),
+            runtime["transition_requests"],
         ) is not None
 
     interrupted_signal: int | None = None
@@ -2410,7 +3179,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         state["phase"] = "baseline"
         state["baseline_start_ns"] = baseline_start_ns
         _replace_json(state_path, state)
-        baseline_duration_ns = int(profile["baseline_bucket_count"]) * BUCKET_WIDTH_NS
+        window_specs = {
+            window["phase"]: window
+            for window in _profile_throughput_windows(profile)
+        }
+        baseline_duration_ns = (
+            int(window_specs["baseline"]["bucket_count"]) * BUCKET_WIDTH_NS
+        )
         maximum_gap_ns = int(float(profile["maximum_stall_s"]) * 1_000_000_000)
         degraded_maximum_gap_ns = int(
             float(profile["degraded_maximum_stall_s"]) * 1_000_000_000
@@ -2479,182 +3254,322 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         update_manifest()
 
-        def transition_ready() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
-            streams = _event_streams(run_directory)
-            command = _common_single_payload(streams, "epoch.command_committed")
-            activation = _common_single_payload(streams, "epoch.activated")
-            observer_command = _observer_event(streams, "epoch.command_committed")
-            observer_activation = _observer_event(streams, "epoch.activated")
-            manager_ready = manager_convergence_ready_event(
-                streams[MANAGER_SOURCE_ID]
-            )
-            if (
-                command is None
-                or activation is None
-                or observer_command is None
-                or observer_activation is None
-                or manager_ready is None
-            ):
+        transition_requests = tuple(runtime["transition_requests"])
+        crash_start_ns = min(
+            marker["requested_monotonic_raw_ns"] for marker in crash_markers
+        )
+        throughput_measurement_windows.append(
+            {
+                "phase": "baseline",
+                "epoch_number": 0,
+                "start_ns": baseline_start_ns,
+                "end_ns": crash_start_ns,
+            }
+        )
+        decoded_bundles: list[DecodedBundle] = []
+        command_payloads: list[dict[str, Any]] = []
+        pending_phase: tuple[str, int, int, DecodedBundle] | None = None
+
+        def phase_for_epoch(epoch_number: int) -> Mapping[str, Any] | None:
+            candidates = [
+                window
+                for window in window_specs.values()
+                if window["epoch_number"] == epoch_number
+            ]
+            if not candidates:
                 return None
-            ready_payload = manager_ready["payload"]
-            if ready_payload["identity"] != _manager_identity_from_command(command):
+            if len(candidates) != 1:
                 raise RunnerError(
-                    "adaptive_v2_ready identity differs from the common epoch command"
+                    f"successor epoch {epoch_number} has ambiguous throughput phases"
                 )
-            latest_activation_ns = max(
-                _event_timestamp(
-                    next(
+            return candidates[0]
+
+        for transition_index, request in enumerate(transition_requests):
+            predecessor_epoch = int(request["predecessor_epoch_number"])
+            successor_epoch = int(request["successor_epoch_number"])
+
+            def transition_ready(
+                request: Mapping[str, Any] = request,
+                transition_index: int = transition_index,
+            ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+                streams = _event_streams(run_directory)
+                command = _common_transition_payload(
+                    streams,
+                    "epoch.command_committed",
+                    predecessor_epoch_number=int(
+                        request["predecessor_epoch_number"]
+                    ),
+                    successor_epoch_number=int(request["successor_epoch_number"]),
+                )
+                activation = _common_transition_payload(
+                    streams,
+                    "epoch.activated",
+                    predecessor_epoch_number=int(
+                        request["predecessor_epoch_number"]
+                    ),
+                    successor_epoch_number=int(request["successor_epoch_number"]),
+                )
+                observer_command = _observer_transition_event(
+                    streams,
+                    "epoch.command_committed",
+                    predecessor_epoch_number=int(
+                        request["predecessor_epoch_number"]
+                    ),
+                    successor_epoch_number=int(request["successor_epoch_number"]),
+                )
+                observer_activation = _observer_transition_event(
+                    streams,
+                    "epoch.activated",
+                    predecessor_epoch_number=int(
+                        request["predecessor_epoch_number"]
+                    ),
+                    successor_epoch_number=int(request["successor_epoch_number"]),
+                )
+                manager_ready = manager_convergence_ready_event(
+                    streams[MANAGER_SOURCE_ID],
+                    transition_requests,
+                    required_completed=transition_index + 1,
+                )
+                if (
+                    command is None
+                    or activation is None
+                    or observer_command is None
+                    or observer_activation is None
+                    or manager_ready is None
+                ):
+                    return None
+                if manager_ready["payload"]["identity"] != (
+                    _manager_identity_from_command(command)
+                ):
+                    raise RunnerError(
+                        "adaptive_v2_ready identity differs from the common epoch command"
+                    )
+                activation_times = []
+                for replica in SURVIVORS:
+                    matches = [
                         event
                         for event in streams[f"replica-{replica}"]
                         if event.get("event_type") == "epoch.activated"
+                        and isinstance(event.get("payload"), dict)
+                        and event["payload"].get("epoch_number")
+                        == int(request["successor_epoch_number"])
+                    ]
+                    if len(matches) != 1:
+                        return None
+                    activation_times.append(_event_timestamp(matches[0]))
+                if _event_timestamp(manager_ready) < max(activation_times):
+                    raise RunnerError(
+                        "adaptive_v2_ready precedes a survivor activation"
                     )
+                return command, observer_command, observer_activation
+
+            def transition_health() -> None:
+                streams = _event_streams(run_directory)
+                _enforce_observer_stall(
+                    streams[AUTHORITATIVE_SOURCE_ID],
+                    window_start_ns=crash_start_ns,
+                    now_ns=monotonic_raw_ns(),
+                    maximum_gap_ns=(
+                        degraded_maximum_gap_ns
+                        if predecessor_epoch == 0
+                        else maximum_gap_ns
+                    ),
                 )
-                for replica in SURVIVORS
+
+            state["phase"] = (
+                f"awaiting_transition_{request['transition_artifact_id']}"
             )
-            if _event_timestamp(manager_ready) < latest_activation_ns:
+            _replace_json(state_path, state)
+            command_payload, observer_command, observer_activation = _wait(
+                f"transition {request['transition_artifact_id']} terminal evidence",
+                args.phase_timeout,
+                records,
+                transition_ready,
+                expected_crashed=set(CRASH_TARGETS),
+                health=transition_health,
+                allow_clean_exit=allow_completed_manager_exit,
+            )
+            command_ns = _event_timestamp(observer_command)
+            activation_ns = _event_timestamp(observer_activation)
+            if transition_index == 0:
+                throughput_measurement_windows.append(
+                    {
+                        "phase": "degraded",
+                        "epoch_number": predecessor_epoch,
+                        "start_ns": crash_start_ns,
+                        "end_ns": command_ns,
+                    }
+                )
+            if pending_phase is not None:
+                phase, phase_epoch, phase_start_ns, phase_bundle = pending_phase
+                required_end_ns = phase_start_ns + (
+                    int(window_specs[phase]["bucket_count"]) * BUCKET_WIDTH_NS
+                )
+                if command_ns < required_end_ns:
+                    raise RunnerError(
+                        f"{phase} phase ended before its frozen complete buckets"
+                    )
+                throughput_measurement_windows.append(
+                    {
+                        "phase": phase,
+                        "epoch_number": phase_epoch,
+                        "start_ns": phase_start_ns,
+                        "end_ns": command_ns,
+                    }
+                )
+
+            bundle_path = run_directory / request["bundle_path"]
+            snapshot_path = run_directory / request["evidence_snapshot_path"]
+            decoded = decode_epoch_change_bundle(bundle_path.read_bytes())
+            if (
+                decoded.generation_seed != runtime["snapshot_seed"]
+                or decoded.previous_epoch_digest
+                != command_payload["predecessor_epoch_digest"]
+            ):
                 raise RunnerError(
-                    "adaptive_v2_ready precedes a survivor activation"
+                    "manager bundle differs from the frozen transition identity"
                 )
-            return command, observer_command, observer_activation
-
-        def degraded_health() -> None:
-            streams = _event_streams(run_directory)
-            _enforce_observer_stall(
-                streams[AUTHORITATIVE_SOURCE_ID],
-                window_start_ns=min(marker["requested_monotonic_raw_ns"] for marker in crash_markers),
-                now_ns=monotonic_raw_ns(),
-                maximum_gap_ns=degraded_maximum_gap_ns,
+            runtime_artifacts.extend(
+                (
+                    _runtime_artifact(
+                        run_directory,
+                        bundle_path,
+                        kind="transition_bundle",
+                        replica_id=None,
+                    ),
+                    _runtime_artifact(
+                        run_directory,
+                        snapshot_path,
+                        kind="evidence_snapshot",
+                        replica_id=None,
+                    ),
+                )
             )
+            decoded_bundles.append(decoded)
+            command_payloads.append(command_payload)
 
-        state["phase"] = "awaiting_committed_successor"
-        _replace_json(state_path, state)
-        command_payload, observer_command, observer_activation = _wait(
-            "one common signed command, exact successor activation, and manager readiness",
-            args.phase_timeout,
-            records,
-            transition_ready,
-            expected_crashed=set(CRASH_TARGETS),
-            health=degraded_health,
-            allow_clean_exit=allow_completed_manager_exit,
-        )
-        decoded = decode_epoch_change_bundle((run_directory / "successor.bundle").read_bytes())
-        if decoded.generation_seed != runtime["snapshot_seed"]:
-            raise RunnerError("manager bundle generation seed differs from frozen runtime")
-        epochs_document = build_epochs_document(decoded, command_payload)
-        _write_json_exclusive(run_directory / "epochs.json", epochs_document)
-        observer_activation_ns = _event_timestamp(observer_activation)
-        minimum_post_start_ns = (
-            observer_activation_ns + minimum_post_activation_grace_ns
-        )
-        maximum_successor_deadline_ns = (
-            observer_activation_ns + maximum_activation_to_successor_ns
-        )
-        state["phase"] = "awaiting_first_common_successor_commit"
-        state["command_ns"] = _event_timestamp(observer_command)
-        state["activation_ns"] = observer_activation_ns
-        state["minimum_post_start_ns"] = minimum_post_start_ns
-        _replace_json(state_path, state)
+            deadline_ns = activation_ns + maximum_activation_to_successor_ns
 
-        def first_common_successor_commit() -> CommonEpochCommit | None:
-            streams = _event_streams(run_directory)
-            result = find_first_common_epoch_commit(
-                streams[AUTHORITATIVE_SOURCE_ID],
-                commit_witness_timestamps(streams, SURVIVORS),
-                participants=SURVIVORS,
-                epoch_number=1,
-            )
-            return enforce_common_epoch_commit_deadline(
-                result,
-                now_ns=monotonic_raw_ns(),
-                deadline_ns=maximum_successor_deadline_ns,
-            )
-
-        def successor_commit_health() -> None:
-            now_ns = monotonic_raw_ns()
-            streams = _event_streams(run_directory)
-            enforce_common_epoch_commit_deadline(
-                find_first_common_epoch_commit(
+            def two_common_successor_commits() -> (
+                tuple[CommonEpochCommit, ...] | None
+            ):
+                streams = _event_streams(run_directory)
+                result = find_common_epoch_commits(
                     streams[AUTHORITATIVE_SOURCE_ID],
                     commit_witness_timestamps(streams, SURVIVORS),
                     participants=SURVIVORS,
-                    epoch_number=1,
-                ),
-                now_ns=now_ns,
-                deadline_ns=maximum_successor_deadline_ns,
-            )
-            _enforce_observer_stall(
-                streams[AUTHORITATIVE_SOURCE_ID],
-                window_start_ns=min(
-                    marker["requested_monotonic_raw_ns"]
-                    for marker in crash_markers
-                ),
-                now_ns=now_ns,
-                maximum_gap_ns=degraded_maximum_gap_ns,
-            )
+                    epoch_number=successor_epoch,
+                    minimum_count=2,
+                )
+                if result is not None and result[0].common_ns > deadline_ns:
+                    raise RunnerError(
+                        "first common successor commit exceeded maximum_activation_to_successor_s"
+                    )
+                if result is None and monotonic_raw_ns() > deadline_ns:
+                    raise RunnerError(
+                        "first common successor commit exceeded maximum_activation_to_successor_s"
+                    )
+                return result
 
-        first_common_successor = _wait(
-            "first common epoch-1 commit from every survivor",
-            float(profile[MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD]) + 1.0,
-            records,
-            first_common_successor_commit,
-            expected_crashed=set(CRASH_TARGETS),
-            health=successor_commit_health,
-            allow_clean_exit=allow_completed_manager_exit,
-        )
-        first_common_successor_ns = first_common_successor.common_ns
-        minimum_post_start_ns, post_start_ns = post_measurement_boundaries(
-            activation_ns=observer_activation_ns,
-            first_common_successor_ns=first_common_successor_ns,
-            minimum_post_activation_grace_ns=minimum_post_activation_grace_ns,
-        )
-        post_duration_ns = int(profile["post_bucket_count"]) * BUCKET_WIDTH_NS
-        tree_roots = {tree.tree_id: tree.members[0] for tree in decoded.trees}
-        successor_root_cycle = tuple(tree.members[0] for tree in decoded.trees)
+            common_successors = _wait(
+                f"two common epoch-{successor_epoch} survivor commits",
+                float(profile[MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD])
+                + 1.0,
+                records,
+                two_common_successor_commits,
+                expected_crashed=set(CRASH_TARGETS),
+                health=transition_health,
+                allow_clean_exit=allow_completed_manager_exit,
+            )
+            phase_spec = phase_for_epoch(successor_epoch)
+            if phase_spec is not None:
+                phase_start_ns = max(
+                    activation_ns + minimum_post_activation_grace_ns,
+                    common_successors[0].common_ns,
+                )
+                pending_phase = (
+                    str(phase_spec["phase"]),
+                    successor_epoch,
+                    phase_start_ns,
+                    decoded,
+                )
+            update_manifest()
 
-        def post_cycle() -> dict[str, Any] | None:
-            if monotonic_raw_ns() < post_start_ns + post_duration_ns:
+        if pending_phase is None:
+            raise RunnerError("final transition has no throughput phase")
+        final_phase, final_epoch, final_start_ns, final_bundle = pending_phase
+        final_duration_ns = (
+            int(window_specs[final_phase]["bucket_count"]) * BUCKET_WIDTH_NS
+        )
+        final_end_ns = final_start_ns + final_duration_ns
+        final_tree_roots = {
+            tree.tree_id: tree.members[0] for tree in final_bundle.trees
+        }
+        final_root_cycle = tuple(
+            tree.members[0] for tree in final_bundle.trees
+        )
+
+        def final_phase_complete() -> dict[str, Any] | None:
+            if monotonic_raw_ns() < final_end_ns:
                 return None
             streams = _event_streams(run_directory)
-            post_observer_events = [
+            observer_events = [
                 event
                 for event in streams[AUTHORITATIVE_SOURCE_ID]
                 if event.get("event_type") == "block.committed"
-                and _event_timestamp(event) >= post_start_ns
+                and final_start_ns <= _event_timestamp(event) < final_end_ns
             ]
-            return find_common_root_cycle(
-                post_observer_events,
-                commit_witness_timestamps(streams, SURVIVORS),
-                participants=SURVIVORS,
-                epoch_number=1,
-                tree_roots=tree_roots,
-                expected_roots=successor_root_cycle,
-                require_terminal=False,
-            )
+            for offset in range(len(final_root_cycle)):
+                rotated = (
+                    *final_root_cycle[offset:],
+                    *final_root_cycle[:offset],
+                )
+                found = find_common_root_cycle(
+                    observer_events,
+                    commit_witness_timestamps(streams, SURVIVORS),
+                    participants=SURVIVORS,
+                    epoch_number=final_epoch,
+                    tree_roots=final_tree_roots,
+                    expected_roots=rotated,
+                    require_terminal=False,
+                )
+                if found is not None:
+                    return found
+            return None
 
-        def post_health() -> None:
+        def final_phase_health() -> None:
             streams = _event_streams(run_directory)
             _enforce_observer_stall(
                 streams[AUTHORITATIVE_SOURCE_ID],
-                window_start_ns=post_start_ns,
-                now_ns=max(post_start_ns, monotonic_raw_ns()),
+                window_start_ns=final_start_ns,
+                now_ns=max(final_start_ns, monotonic_raw_ns()),
                 maximum_gap_ns=maximum_gap_ns,
             )
 
-        state["phase"] = "post_successor"
-        state["first_common_successor_ns"] = first_common_successor_ns
-        state["minimum_post_start_ns"] = minimum_post_start_ns
-        state["post_start_ns"] = post_start_ns
+        state["phase"] = f"measuring_{final_phase}"
         _replace_json(state_path, state)
         _wait(
-            "seven complete post buckets and the ranked successor root cycle",
+            f"complete {final_phase} buckets and ranked root cycle",
             args.phase_timeout,
             records,
-            post_cycle,
+            final_phase_complete,
             expected_crashed=set(CRASH_TARGETS),
-            health=post_health,
+            health=final_phase_health,
             allow_clean_exit=allow_completed_manager_exit,
         )
-        end_ns = monotonic_raw_ns()
+        throughput_measurement_windows.append(
+            {
+                "phase": final_phase,
+                "epoch_number": final_epoch,
+                "start_ns": final_start_ns,
+                "end_ns": final_end_ns,
+            }
+        )
+        end_ns = final_end_ns
+        _write_json_exclusive(
+            run_directory / "epochs.json",
+            build_epochs_document(decoded_bundles, command_payloads),
+        )
         update_manifest()
     except KeyboardInterrupt:
         name = signal.Signals(interrupted_signal).name if interrupted_signal is not None else "interrupt"
@@ -2666,19 +3581,19 @@ def run(argv: Sequence[str] | None = None) -> int:
         state["runtime_error"] = runtime_error
         _replace_json(state_path, state)
         if records:
-            try:
-                if runtime_error is None and not interrupted:
-                    _check_processes(
-                        records,
-                        set(CRASH_TARGETS),
-                        allow_clean_exit=allow_completed_manager_exit,
-                    )
-                unexpected_exits.extend(_shutdown_processes(records))
-            except RunnerError as exc:
-                runtime_error = runtime_error or str(exc)
+            shutdown_exits, process_errors = _audit_and_shutdown_processes(
+                records,
+                audit_required=runtime_error is None and not interrupted,
+                allow_clean_exit=allow_completed_manager_exit,
+            )
+            unexpected_exits.extend(shutdown_exits)
+            runtime_error = _merge_runtime_errors(runtime_error, process_errors)
         remaining = _wait_listeners_stopped(ports, 5.0)
         if remaining:
-            runtime_error = runtime_error or f"listeners remained active after cleanup: {remaining}"
+            runtime_error = _merge_runtime_errors(
+                runtime_error,
+                [f"listeners remained active after cleanup: {remaining}"],
+            )
         if end_ns <= baseline_start_ns:
             end_ns = baseline_start_ns + 1
         if manifest_written:
@@ -2692,42 +3607,26 @@ def run(argv: Sequence[str] | None = None) -> int:
             signal.signal(signum, handler)
 
     print(f"results: {run_directory}")
+    validation_status = validate_preserved_attempt(
+        repository=repository,
+        run_directory=run_directory,
+        manifest_path=manifest_path,
+        plot=args.plot,
+    )
     if runtime_error is not None or interrupted or unexpected_exits:
         print(f"INCOMPLETE: {runtime_error or unexpected_exits}")
+        if validation_status == 2:
+            print("FAIL: canonical validator could not preserve the attempt verdict")
         return 1
     if not (run_directory / "epochs.json").is_file() or not manifest_written:
         print("INCOMPLETE: canonical manifest or epoch input is absent")
+        if validation_status == 2:
+            print("FAIL: canonical validator could not preserve the attempt verdict")
         return 1
-
-    validated_directory = run_directory / "validated"
-    validator = Path(__file__).resolve().with_name("validator.py")
-    plotter = Path(__file__).resolve().with_name("plot.py")
-    validation = subprocess.run(
-        [
-            sys.executable,
-            str(validator),
-            "--manifest",
-            str(manifest_path),
-            "--epochs",
-            str(run_directory / "epochs.json"),
-            "--output-dir",
-            str(validated_directory),
-        ],
-        cwd=repository,
-        check=False,
-    )
-    if validation.returncode != 0:
+    if validation_status != 0:
         print("FAIL: canonical validator rejected the preserved run")
         return 1
-    plotted = subprocess.run(
-        [sys.executable, str(plotter), str(validated_directory)],
-        cwd=repository,
-        check=False,
-    )
-    if plotted.returncode != 0:
-        print("FAIL: PASS evidence was preserved but figure generation failed")
-        return 1
-    print(f"PASS: {validated_directory}")
+    print(f"PASS: {run_directory / 'validated'}")
     return 0
 
 
