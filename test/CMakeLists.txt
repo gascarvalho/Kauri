@@ -246,6 +246,13 @@ set_tests_properties(
     LABELS "adaptive-v2;manager-controller;n7;evidence;selection;epoch-factory;unit"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_adaptive_v2_manager_session
+    test_adaptive_v2_manager_session.cpp)
+set_tests_properties(
+    test_adaptive_v2_manager_session PROPERTIES
+    LABELS "adaptive-v2;manager-session;recurring;n7;integration;contract"
+    TIMEOUT 15)
+add_kauri_catch_test(
     test_adaptive_v2_manager_delivery
     test_adaptive_v2_manager_delivery.cpp)
 target_compile_definitions(

@@ -178,6 +178,7 @@ add_library(hotstuff
     src/adaptive_v2_manager_convergence.cpp
     src/adaptive_v2_manager_delivery.cpp
     src/adaptive_v2_manager_ingress.cpp
+    src/adaptive_v2_manager_session.cpp
     src/adaptive_v2_reporting_outbox.cpp
     src/adaptive_v2_response_evidence.cpp
     src/adaptive_v2_readiness_wire.cpp
