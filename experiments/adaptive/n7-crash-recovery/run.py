@@ -36,6 +36,11 @@ QUORUM = 5
 AUTHORITATIVE_OBSERVER = 2
 AUTHORITATIVE_SOURCE_ID = "replica-2"
 MANAGER_SOURCE_ID = "adaptive-manager"
+MANAGER_CONVERGENCE_DEADLINE_S = 120
+FULL_RUN_MANAGER_EXTRA_ARGS = (
+    "--convergence-deadline-seconds",
+    str(MANAGER_CONVERGENCE_DEADLINE_S),
+)
 REQUIRED_BRANCH = "feature/adaptive-epoch-throughput"
 PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 PROFILE_SHA256 = "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
@@ -123,6 +128,32 @@ CONFIGURATION_ACTIVE_PAYLOAD_FIELDS = frozenset(
         "root_signer_count",
         "global_quorum",
         "rejection_reason",
+    }
+)
+MANAGER_CONVERGENCE_PAYLOAD_FIELDS = frozenset(
+    {
+        "replica_id",
+        "delivery_attempt",
+        "disposition",
+        "identity",
+        "accepted_commit_count",
+        "accepted_activation_count",
+        "required_activation_count",
+        "canonical_payload_digest",
+        "failure_reason",
+    }
+)
+MANAGER_CONVERGENCE_IDENTITY_FIELDS = frozenset(
+    {
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "command_block_height",
+        "command_block_hash",
+        "activation_delay_blocks",
+        "activation_height",
     }
 )
 
@@ -974,7 +1005,7 @@ def write_runtime_inputs(
     source_instances: Mapping[str, str],
     app_binary: Path,
     manager_binary: Path,
-    manager_extra_args: Sequence[str] = (),
+    manager_extra_args: Sequence[str] = FULL_RUN_MANAGER_EXTRA_ARGS,
 ) -> tuple[Path, list[Path], tuple[str, ...], list[tuple[str, ...]], list[dict[str, Any]]]:
     config_directory = run_directory / "config"
     runtime_directory = run_directory / "runtime"
@@ -1197,6 +1228,114 @@ def _event_timestamp(event: Mapping[str, Any]) -> int:
     if type(value) is not int or value <= 0:
         raise RunnerError("structured event has an invalid monotonic timestamp")
     return value
+
+
+def manager_convergence_ready_event(
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Return the unique canonical terminal-ready event, if not yet emitted."""
+    if any(
+        event.get("event_type") == "adaptive_v2_convergence_failure"
+        for event in events
+    ):
+        raise RunnerError("manager emitted adaptive_v2_convergence_failure")
+    ready = [
+        event for event in events if event.get("event_type") == "adaptive_v2_ready"
+    ]
+    if len(ready) > 1:
+        raise RunnerError("manager emitted duplicate adaptive_v2_ready events")
+    if not ready:
+        return None
+    event = ready[0]
+    _source_sequence(event)
+    _event_timestamp(event)
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or set(payload) != set(
+        MANAGER_CONVERGENCE_PAYLOAD_FIELDS
+    ):
+        raise RunnerError("adaptive_v2_ready has an invalid payload field set")
+    identity = payload.get("identity")
+    if not isinstance(identity, dict) or set(identity) != set(
+        MANAGER_CONVERGENCE_IDENTITY_FIELDS
+    ):
+        raise RunnerError("adaptive_v2_ready has an invalid identity")
+    if any(
+        payload.get(field) is not None
+        for field in (
+            "replica_id",
+            "delivery_attempt",
+            "disposition",
+            "canonical_payload_digest",
+            "failure_reason",
+        )
+    ):
+        raise RunnerError("adaptive_v2_ready is not an exact terminal record")
+    accepted_commits = payload.get("accepted_commit_count")
+    accepted_activations = payload.get("accepted_activation_count")
+    required_activations = payload.get("required_activation_count")
+    if (
+        type(accepted_commits) is not int
+        or accepted_commits < 0
+        or accepted_commits > len(REPLICA_IDS)
+        or type(accepted_activations) is not int
+        or accepted_activations != QUORUM
+        or type(required_activations) is not int
+        or required_activations != QUORUM
+    ):
+        raise RunnerError("adaptive_v2_ready does not prove the fixed quorum")
+    for field in (
+        "predecessor_epoch_number",
+        "successor_epoch_number",
+        "command_block_height",
+        "activation_delay_blocks",
+        "activation_height",
+    ):
+        if type(identity.get(field)) is not int or int(identity[field]) < 0:
+            raise RunnerError("adaptive_v2_ready identity has an invalid integer")
+    for field in (
+        "predecessor_epoch_digest",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "command_block_hash",
+    ):
+        digest = identity.get(field)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or digest == "0" * 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RunnerError("adaptive_v2_ready identity has an invalid digest")
+    return dict(event)
+
+
+def _manager_identity_from_command(
+    command: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_fields = {
+        "command_block_height",
+        "command_block_hash",
+        "payload_digest",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "activation_delay_blocks",
+        "activation_height",
+    }
+    if set(command) != expected_fields:
+        raise RunnerError("epoch command event does not have the canonical field set")
+    return {
+        "predecessor_epoch_number": command["predecessor_epoch_number"],
+        "predecessor_epoch_digest": command["predecessor_epoch_digest"],
+        "successor_epoch_number": command["successor_epoch_number"],
+        "successor_epoch_digest": command["successor_epoch_digest"],
+        "command_payload_digest": command["payload_digest"],
+        "command_block_height": command["command_block_height"],
+        "command_block_hash": command["command_block_hash"],
+        "activation_delay_blocks": command["activation_delay_blocks"],
+        "activation_height": command["activation_height"],
+    }
 
 
 def _validate_crash_tree_roles(
@@ -1717,12 +1856,23 @@ def assert_crash_boundary_held(
             )
 
 
-def _check_processes(records: Sequence[ProcessRecord], expected_crashed: set[int]) -> None:
+def _check_processes(
+    records: Sequence[ProcessRecord],
+    expected_crashed: set[int],
+    *,
+    allow_clean_exit: Callable[[ProcessRecord], bool] | None = None,
+) -> None:
     for record in records:
         return_code = record.process.poll()
         if return_code is None:
             continue
         if record.replica_id in expected_crashed and return_code == -signal.SIGKILL:
+            continue
+        if (
+            return_code == 0
+            and allow_clean_exit is not None
+            and allow_clean_exit(record)
+        ):
             continue
         raise RunnerError(f"{record.name} exited unexpectedly with status {return_code}")
 
@@ -1760,10 +1910,15 @@ def _wait(
     *,
     expected_crashed: set[int] | None = None,
     health: Callable[[], None] | None = None,
+    allow_clean_exit: Callable[[ProcessRecord], bool] | None = None,
 ) -> Any:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        _check_processes(records, expected_crashed or set())
+        _check_processes(
+            records,
+            expected_crashed or set(),
+            allow_clean_exit=allow_clean_exit,
+        )
         if health is not None:
             health()
         result = predicate()
@@ -2171,6 +2326,13 @@ def run(argv: Sequence[str] | None = None) -> int:
             _write_json_exclusive(manifest_path, value)
             manifest_written = True
 
+    def allow_completed_manager_exit(record: ProcessRecord) -> bool:
+        if record.name != MANAGER_SOURCE_ID:
+            return False
+        return manager_convergence_ready_event(
+            _read_jsonl(run_directory / "raw" / "adaptive-manager.jsonl")
+        ) is not None
+
     interrupted_signal: int | None = None
 
     def request_shutdown(signum: int, _frame: Any) -> None:
@@ -2323,8 +2485,36 @@ def run(argv: Sequence[str] | None = None) -> int:
             activation = _common_single_payload(streams, "epoch.activated")
             observer_command = _observer_event(streams, "epoch.command_committed")
             observer_activation = _observer_event(streams, "epoch.activated")
-            if command is None or activation is None or observer_command is None or observer_activation is None:
+            manager_ready = manager_convergence_ready_event(
+                streams[MANAGER_SOURCE_ID]
+            )
+            if (
+                command is None
+                or activation is None
+                or observer_command is None
+                or observer_activation is None
+                or manager_ready is None
+            ):
                 return None
+            ready_payload = manager_ready["payload"]
+            if ready_payload["identity"] != _manager_identity_from_command(command):
+                raise RunnerError(
+                    "adaptive_v2_ready identity differs from the common epoch command"
+                )
+            latest_activation_ns = max(
+                _event_timestamp(
+                    next(
+                        event
+                        for event in streams[f"replica-{replica}"]
+                        if event.get("event_type") == "epoch.activated"
+                    )
+                )
+                for replica in SURVIVORS
+            )
+            if _event_timestamp(manager_ready) < latest_activation_ns:
+                raise RunnerError(
+                    "adaptive_v2_ready precedes a survivor activation"
+                )
             return command, observer_command, observer_activation
 
         def degraded_health() -> None:
@@ -2339,12 +2529,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         state["phase"] = "awaiting_committed_successor"
         _replace_json(state_path, state)
         command_payload, observer_command, observer_activation = _wait(
-            "one common signed command and exact successor activation",
+            "one common signed command, exact successor activation, and manager readiness",
             args.phase_timeout,
             records,
             transition_ready,
             expected_crashed=set(CRASH_TARGETS),
             health=degraded_health,
+            allow_clean_exit=allow_completed_manager_exit,
         )
         decoded = decode_epoch_change_bundle((run_directory / "successor.bundle").read_bytes())
         if decoded.generation_seed != runtime["snapshot_seed"]:
@@ -2408,6 +2599,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             first_common_successor_commit,
             expected_crashed=set(CRASH_TARGETS),
             health=successor_commit_health,
+            allow_clean_exit=allow_completed_manager_exit,
         )
         first_common_successor_ns = first_common_successor.common_ns
         minimum_post_start_ns, post_start_ns = post_measurement_boundaries(
@@ -2460,6 +2652,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             post_cycle,
             expected_crashed=set(CRASH_TARGETS),
             health=post_health,
+            allow_clean_exit=allow_completed_manager_exit,
         )
         end_ns = monotonic_raw_ns()
         update_manifest()
@@ -2475,7 +2668,11 @@ def run(argv: Sequence[str] | None = None) -> int:
         if records:
             try:
                 if runtime_error is None and not interrupted:
-                    _check_processes(records, set(CRASH_TARGETS))
+                    _check_processes(
+                        records,
+                        set(CRASH_TARGETS),
+                        allow_clean_exit=allow_completed_manager_exit,
+                    )
                 unexpected_exits.extend(_shutdown_processes(records))
             except RunnerError as exc:
                 runtime_error = runtime_error or str(exc)

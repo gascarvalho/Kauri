@@ -315,6 +315,182 @@ def test_missing_manager_reputation_is_incomplete_and_writes_no_plot_inputs(
     assert {path.name for path in output.iterdir()} == {"validation.json"}
 
 
+def test_manager_convergence_ready_is_required(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    manager = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+    def remove_ready(values: list[dict[str, object]]) -> None:
+        values[:] = [
+            value
+            for value in values
+            if value["event_type"] != "adaptive_v2_ready"
+        ]
+
+    _rewrite_jsonl(manager, remove_ready)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "INCOMPLETE"
+    assert "exactly one adaptive_v2_ready" in verdict["reason"]
+
+
+def test_duplicate_manager_convergence_ready_fails(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    manager = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+    def duplicate_ready(values: list[dict[str, object]]) -> None:
+        ready = next(
+            value for value in values if value["event_type"] == "adaptive_v2_ready"
+        )
+        duplicate = json.loads(json.dumps(ready))
+        duplicate["source_monotonic_ns"] = int(ready["source_monotonic_ns"]) + 1
+        values.append(duplicate)
+        values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+    _rewrite_jsonl(manager, duplicate_ready)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "duplicate adaptive_v2_ready" in verdict["reason"]
+
+
+def test_manager_convergence_failure_cannot_pass(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    manager = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+    def append_failure(values: list[dict[str, object]]) -> None:
+        ready = next(
+            value for value in values if value["event_type"] == "adaptive_v2_ready"
+        )
+        failure = json.loads(json.dumps(ready))
+        failure["event_type"] = "adaptive_v2_convergence_failure"
+        failure["source_monotonic_ns"] = int(ready["source_monotonic_ns"]) - 1
+        failure["payload"]["failure_reason"] = "synthetic_failure"
+        values.append(failure)
+        values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+    _rewrite_jsonl(manager, append_failure)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "adaptive_v2_convergence_failure" in verdict["reason"]
+
+
+def test_manager_ready_must_bind_exact_command_and_quorum(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    manager = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+    def change_ready(values: list[dict[str, object]]) -> None:
+        ready = next(
+            value for value in values if value["event_type"] == "adaptive_v2_ready"
+        )
+        ready["payload"]["accepted_activation_count"] = 4
+        ready["payload"]["identity"]["command_block_hash"] = "f" * 64
+
+    _rewrite_jsonl(manager, change_ready)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "adaptive_v2_ready" in verdict["reason"]
+
+
+def test_manager_may_stop_only_after_convergence_ready(tmp_path: Path) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    manager = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+    def move_ready_after_stop(values: list[dict[str, object]]) -> None:
+        ready = next(
+            value for value in values if value["event_type"] == "adaptive_v2_ready"
+        )
+        ready["source_monotonic_ns"] = synthetic_run.MANAGER_READY_NS + 3_000_000
+        values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+    _rewrite_jsonl(manager, move_ready_after_stop)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "manager lifecycle is not ordered after convergence readiness" in (
+        verdict["reason"]
+    )
+
+
+def test_manager_stopping_must_follow_ready_by_source_sequence(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    manager = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+    def reorder_equal_timestamp_lifecycle(
+        values: list[dict[str, object]],
+    ) -> None:
+        ready_index = next(
+            index
+            for index, value in enumerate(values)
+            if value["event_type"] == "adaptive_v2_ready"
+        )
+        stopping_index = next(
+            index
+            for index, value in enumerate(values)
+            if value["event_type"] == "process.stopping"
+        )
+        stopping = values.pop(stopping_index)
+        stopping["source_monotonic_ns"] = values[ready_index][
+            "source_monotonic_ns"
+        ]
+        values.insert(ready_index, stopping)
+
+    _rewrite_jsonl(manager, reorder_equal_timestamp_lifecycle)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "manager lifecycle is not ordered after convergence readiness" in (
+        verdict["reason"]
+    )
+
+
+def test_manager_ready_must_follow_every_survivor_activation(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-6.jsonl"
+
+    def move_activation_after_ready(values: list[dict[str, object]]) -> None:
+        activation = next(
+            value for value in values if value["event_type"] == "epoch.activated"
+        )
+        activation["source_monotonic_ns"] = synthetic_run.MANAGER_READY_NS + 1
+        values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+    _rewrite_jsonl(survivor, move_activation_after_ready)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "latest survivor activation <= manager readiness" in verdict["reason"]
+
+
+def test_surviving_replica_still_cannot_stop_before_measurement_end(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    survivor = tmp_path / "run/raw/replica-2.jsonl"
+
+    def stop_early(values: list[dict[str, object]]) -> None:
+        stopping = next(
+            value for value in values if value["event_type"] == "process.stopping"
+        )
+        stopped = next(
+            value for value in values if value["event_type"] == "process.stopped"
+        )
+        stopping["source_monotonic_ns"] = synthetic_run.END_NS - 2
+        stopped["source_monotonic_ns"] = synthetic_run.END_NS - 1
+        values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+    _rewrite_jsonl(survivor, stop_early)
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "replica-2 stopped before measurement end" in verdict["reason"]
+
+
 def test_legacy_prefixed_events_are_diagnostic_only_and_fail_full_validation(
     tmp_path: Path,
 ) -> None:
@@ -860,6 +1036,29 @@ def test_launch_artifact_must_not_persist_private_manager_values(
 
     assert verdict["verdict"] == "FAIL"
     assert "--issuer-private-key must be redacted" in verdict["reason"]
+
+
+@pytest.mark.parametrize("mutation", ("missing", "wrong"))
+def test_launch_artifact_pins_manager_convergence_deadline(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    manifest, epochs = synthetic_run.create_run(tmp_path / "run")
+    launch_path = tmp_path / "run/runtime/launch-arguments.json"
+    launch = synthetic_run.load(launch_path)
+    argv = launch["processes"][-1]["argv"]
+    index = argv.index("--convergence-deadline-seconds")
+    if mutation == "missing":
+        del argv[index : index + 2]
+    else:
+        argv[index + 1] = "12"
+    synthetic_run.save(launch_path, launch)
+    _rehash_runtime_artifact(manifest, "runtime/launch-arguments.json")
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "--convergence-deadline-seconds" in verdict["reason"]
 
 
 def test_launched_executable_bytes_are_sha_bound(tmp_path: Path) -> None:

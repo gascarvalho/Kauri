@@ -21,6 +21,7 @@ COMMAND_NS = 54_100_000_000
 ACTIVATION_NS = 74_100_000_000
 MINIMUM_POST_ACTIVATION_GRACE_NS = 1_000_000_000
 END_NS = 111_006_000_000
+MANAGER_READY_NS = ACTIVATION_NS + 10_000_000
 MANAGER_LIMITS = {
     "maximum_members": 7,
     "readiness_wire_maximum_payload_bytes": 256,
@@ -404,13 +405,48 @@ def _manager_events() -> list[dict[str, Any]]:
             target,
             "on_time",
         )
+    command = command_payload()
+    events.append(
+        _envelope(
+            source_kind=source_kind,
+            source_id=source_id,
+            source_instance=instance,
+            timestamp_ns=MANAGER_READY_NS,
+            event_type="adaptive_v2_ready",
+            payload={
+                "replica_id": None,
+                "delivery_attempt": None,
+                "disposition": None,
+                "identity": {
+                    "predecessor_epoch_number": command[
+                        "predecessor_epoch_number"
+                    ],
+                    "predecessor_epoch_digest": command[
+                        "predecessor_epoch_digest"
+                    ],
+                    "successor_epoch_number": command["successor_epoch_number"],
+                    "successor_epoch_digest": command["successor_epoch_digest"],
+                    "command_payload_digest": command["payload_digest"],
+                    "command_block_height": command["command_block_height"],
+                    "command_block_hash": command["command_block_hash"],
+                    "activation_delay_blocks": command["activation_delay_blocks"],
+                    "activation_height": command["activation_height"],
+                },
+                "accepted_commit_count": 3,
+                "accepted_activation_count": 5,
+                "required_activation_count": 5,
+                "canonical_payload_digest": None,
+                "failure_reason": None,
+            },
+        )
+    )
     events.extend(
         (
             _envelope(
                 source_kind=source_kind,
                 source_id=source_id,
                 source_instance=instance,
-                timestamp_ns=112_500_000_000,
+                timestamp_ns=MANAGER_READY_NS + 1_000_000,
                 event_type="process.stopping",
                 payload={"exit_status": None},
             ),
@@ -418,7 +454,7 @@ def _manager_events() -> list[dict[str, Any]]:
                 source_kind=source_kind,
                 source_id=source_id,
                 source_instance=instance,
-                timestamp_ns=113_500_000_000,
+                timestamp_ns=MANAGER_READY_NS + 2_000_000,
                 event_type="process.stopped",
                 payload={"exit_status": None},
             ),
@@ -593,6 +629,8 @@ def _write_runtime_artifacts(
         "<redacted>",
         "--activation-delay-blocks",
         str(runtime["activation_delay_blocks"]),
+        "--convergence-deadline-seconds",
+        "120",
     ]
     for replica in range(7):
         manager_argv.extend(

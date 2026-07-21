@@ -13,14 +13,14 @@ SCENARIO_DIRECTORY = Path(__file__).resolve().parents[1]
 REPOSITORY = SCENARIO_DIRECTORY.parents[2]
 
 
-def test_base_runner_has_one_default_off_manager_extra_args_seam() -> None:
+def test_base_runner_pins_full_run_deadline_but_keeps_builder_seam_neutral() -> None:
     build = inspect.signature(base.build_manager_command).parameters
     runtime = inspect.signature(base.write_runtime_inputs).parameters
 
     assert "manager_extra_args" in build
     assert build["manager_extra_args"].default == ()
     assert "manager_extra_args" in runtime
-    assert runtime["manager_extra_args"].default == ()
+    assert runtime["manager_extra_args"].default == base.FULL_RUN_MANAGER_EXTRA_ARGS
 
     source = (SCENARIO_DIRECTORY / "run.py").read_text(encoding="utf-8")
     assert "command.extend(manager_extra_args)" in source

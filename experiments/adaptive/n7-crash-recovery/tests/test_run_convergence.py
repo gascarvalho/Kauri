@@ -72,7 +72,7 @@ def test_runner_reuses_existing_n7_helpers_without_mutating_base_profile() -> No
     assert before == convergence_run.BASE_PROFILE_SHA256
 
 
-def test_base_runner_threads_optional_manager_extra_args_without_changing_default(
+def test_base_runner_threads_optional_manager_extra_args_over_full_run_default(
     tmp_path: Path,
 ) -> None:
     runner = _runner()
@@ -115,7 +115,7 @@ def test_base_runner_threads_optional_manager_extra_args_without_changing_defaul
     parameter = inspect.signature(
         base_runner.write_runtime_inputs
     ).parameters["manager_extra_args"]
-    assert parameter.default == ()
+    assert parameter.default == base_runner.FULL_RUN_MANAGER_EXTRA_ARGS
 
 
 @pytest.mark.parametrize(

@@ -65,7 +65,11 @@ binaries exist, and the default loopback ports are free. It generates fresh
 run-local identities, launches seven replicas plus the authenticated adaptation
 manager in separate process groups, waits for seven complete baseline buckets
 and a terminal `0..6` leader cycle, sends `SIGKILL` only to replicas 0 and 1,
-then waits for the committed successor and seven complete post-start buckets.
+then waits for the committed successor, one exact `adaptive_v2_ready` record,
+and seven complete post-start buckets. The manager launch pins an operational
+120-second convergence deadline in the hash-bound launch arguments. A clean
+manager exit is accepted only after that terminal record; surviving replicas
+must remain live through the measurement end.
 Alternative binary, results-root, port, and timeout paths are available through
 `python3 experiments/adaptive/n7-crash-recovery/run.py --help`.
 
@@ -99,6 +103,9 @@ requires all of the following:
   truth supplied to the manager;
 - an identical committed epoch command and one matching successor activation
   at every surviving replica;
+- exactly one manager `adaptive_v2_ready` terminal record for the same complete
+  command identity and fixed activation quorum, with no convergence-failure
+  record; the manager may stop cleanly after this boundary;
 - predecessor work admitted before activation may drain contiguously under its
   exact Epoch 0 identity until the first common Epoch 1 commit; any predecessor
   commit after that successor commit is rejected;

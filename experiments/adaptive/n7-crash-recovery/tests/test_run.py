@@ -689,6 +689,85 @@ def test_manager_command_has_no_crash_ground_truth(tmp_path: Path) -> None:
     assert "--structured-event-output" in command
 
 
+def test_process_check_accepts_only_guarded_clean_manager_exit(
+    tmp_path: Path,
+) -> None:
+    manager = campaign.ProcessRecord(
+        name=campaign.MANAGER_SOURCE_ID,
+        pid=11_000,
+        pgid=21_000,
+        command=("adaptation-manager",),
+        log_path=tmp_path / "manager.log",
+        process=_ProcessDouble(0),  # type: ignore[arg-type]
+        log_handle=SimpleNamespace(close=lambda: None),
+        replica_id=None,
+    )
+
+    with pytest.raises(campaign.RunnerError, match="exited unexpectedly"):
+        campaign._check_processes([manager], set())
+
+    campaign._check_processes(
+        [manager],
+        set(),
+        allow_clean_exit=lambda record: record.name == campaign.MANAGER_SOURCE_ID,
+    )
+
+    manager.process.return_code = 1  # type: ignore[attr-defined]
+    with pytest.raises(campaign.RunnerError, match="status 1"):
+        campaign._check_processes(
+            [manager],
+            set(),
+            allow_clean_exit=lambda _: True,
+        )
+
+
+def test_manager_clean_exit_gate_requires_one_canonical_ready_event() -> None:
+    identity = {
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": "a" * 64,
+        "successor_epoch_number": 1,
+        "successor_epoch_digest": "b" * 64,
+        "command_payload_digest": "c" * 64,
+        "command_block_height": 12,
+        "command_block_hash": "d" * 64,
+        "activation_delay_blocks": 5,
+        "activation_height": 17,
+    }
+    ready = {
+        "source_sequence": 10,
+        "source_monotonic_ns": 20,
+        "event_type": "adaptive_v2_ready",
+        "payload": {
+            "replica_id": None,
+            "delivery_attempt": None,
+            "disposition": None,
+            "identity": identity,
+            "accepted_commit_count": 3,
+            "accepted_activation_count": 5,
+            "required_activation_count": 5,
+            "canonical_payload_digest": None,
+            "failure_reason": None,
+        },
+    }
+
+    assert campaign.manager_convergence_ready_event([]) is None
+    assert campaign.manager_convergence_ready_event([ready]) == ready
+    with pytest.raises(campaign.RunnerError, match="duplicate"):
+        campaign.manager_convergence_ready_event([ready, ready])
+    with pytest.raises(campaign.RunnerError, match="convergence_failure"):
+        campaign.manager_convergence_ready_event(
+            [{**ready, "event_type": "adaptive_v2_convergence_failure"}]
+        )
+    invalid = json.loads(json.dumps(ready))
+    invalid["payload"]["accepted_activation_count"] = 4
+    with pytest.raises(campaign.RunnerError, match="fixed quorum"):
+        campaign.manager_convergence_ready_event([invalid])
+    invalid = json.loads(json.dumps(ready))
+    invalid["payload"]["required_activation_count"] = 5.0
+    with pytest.raises(campaign.RunnerError, match="fixed quorum"):
+        campaign.manager_convergence_ready_event([invalid])
+
+
 def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
     tmp_path: Path,
 ) -> None:
@@ -764,6 +843,10 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
         "a6e9412cd67b07d70062c20b56f8dc916828e06c57dcbccf6a7d86d9df510be3"
     )
     assert manager_command[manager_command.index("--activation-delay-blocks") + 1] == "5"
+    assert manager_command.count("--convergence-deadline-seconds") == 1
+    assert manager_command[
+        manager_command.index("--convergence-deadline-seconds") + 1
+    ] == str(campaign.MANAGER_CONVERGENCE_DEADLINE_S)
     assert len(replica_commands) == 7
     assert [artifact["path"] for artifact in artifacts] == [
         *[f"runtime/replica-{replica}.effective.json" for replica in range(7)],
@@ -788,6 +871,10 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
         (tmp_path / "runtime" / "launch-arguments.json").read_text()
     )
     manager_launch = launch["processes"][-1]
+    assert manager_launch["argv"].count("--convergence-deadline-seconds") == 1
+    assert manager_launch["argv"][
+        manager_launch["argv"].index("--convergence-deadline-seconds") + 1
+    ] == str(campaign.MANAGER_CONVERGENCE_DEADLINE_S)
     assert manager_launch["effective_options"]["activation_delay_blocks"] == 5
     assert manager_launch["effective_options"]["snapshot_seed"] == 0xA2F7
     assert manager_launch["effective_options"]["manager_limits"] == (

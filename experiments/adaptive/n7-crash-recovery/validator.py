@@ -29,6 +29,7 @@ SCENARIO = "n7-crash-recovery"
 MEMBERSHIP = tuple(range(7))
 FAULT_THRESHOLD = 2
 QUORUM = 5
+MANAGER_CONVERGENCE_DEADLINE_S = 120
 CRASHED_REPLICAS = (0, 1)
 SURVIVING_REPLICAS = (2, 3, 4, 5, 6)
 SUCCESSOR_ROOTS = SURVIVING_REPLICAS
@@ -238,6 +239,32 @@ _EPOCH_EVENT_FIELDS = frozenset(
     {"epoch_number", "tree_id", "epoch_digest", "activation_height"}
 )
 _PROCESS_FIELDS = frozenset({"exit_status"})
+_MANAGER_CONVERGENCE_PAYLOAD_FIELDS = frozenset(
+    {
+        "replica_id",
+        "delivery_attempt",
+        "disposition",
+        "identity",
+        "accepted_commit_count",
+        "accepted_activation_count",
+        "required_activation_count",
+        "canonical_payload_digest",
+        "failure_reason",
+    }
+)
+_MANAGER_CONVERGENCE_IDENTITY_FIELDS = frozenset(
+    {
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "command_block_height",
+        "command_block_hash",
+        "activation_delay_blocks",
+        "activation_height",
+    }
+)
 _REPUTATION_FIELDS = frozenset(
     {
         "evidence_cutoff",
@@ -1123,6 +1150,12 @@ def _validate_launch_arguments(
                 raise ValidationError(
                     "manager launch activation delay differs from manifest.runtime"
                 )
+            if _single_argv_value(
+                argv, "--convergence-deadline-seconds"
+            ) != str(MANAGER_CONVERGENCE_DEADLINE_S):
+                raise ValidationError(
+                    "manager launch --convergence-deadline-seconds differs from 120"
+                )
             for private_flag in ("--tls-privkey", "--issuer-private-key"):
                 if _single_argv_value(argv, private_flag) != "<redacted>":
                     raise ValidationError(
@@ -1829,9 +1862,107 @@ def _event_at_sequence(
     raise IncompleteRun(f"referenced source_sequence {sequence} is absent")
 
 
+def _validate_manager_convergence_ready(
+    manifest: Manifest,
+    epochs: EpochDocument,
+    streams: Mapping[tuple[str, str], Sequence[analysis.StructuredEvent]],
+) -> analysis.StructuredEvent:
+    events = streams[("adaptation_manager", manifest.manager_source_id)]
+    if any(
+        event.event_type == "adaptive_v2_convergence_failure"
+        for event in events
+    ):
+        raise ValidationError("manager emitted adaptive_v2_convergence_failure")
+    ready = [event for event in events if event.event_type == "adaptive_v2_ready"]
+    if not ready:
+        raise IncompleteRun("manager requires exactly one adaptive_v2_ready event")
+    if len(ready) > 1:
+        raise ValidationError("manager emitted duplicate adaptive_v2_ready events")
+    event = ready[0]
+    payload = _object(event.payload, "adaptive_v2_ready payload")
+    _exact_fields(
+        payload,
+        _MANAGER_CONVERGENCE_PAYLOAD_FIELDS,
+        "adaptive_v2_ready payload",
+    )
+    if any(
+        payload[field] is not None
+        for field in (
+            "replica_id",
+            "delivery_attempt",
+            "disposition",
+            "canonical_payload_digest",
+            "failure_reason",
+        )
+    ):
+        raise ValidationError("adaptive_v2_ready is not the exact terminal record")
+    _integer(
+        payload["accepted_commit_count"],
+        "adaptive_v2_ready.accepted_commit_count",
+        maximum=len(MEMBERSHIP),
+    )
+    accepted_activations = _integer(
+        payload["accepted_activation_count"],
+        "adaptive_v2_ready.accepted_activation_count",
+        maximum=len(MEMBERSHIP),
+    )
+    required_activations = _integer(
+        payload["required_activation_count"],
+        "adaptive_v2_ready.required_activation_count",
+        minimum=1,
+        maximum=len(MEMBERSHIP),
+    )
+    if accepted_activations != QUORUM or required_activations != QUORUM:
+        raise ValidationError("adaptive_v2_ready does not prove the fixed quorum")
+
+    identity = _object(payload["identity"], "adaptive_v2_ready identity")
+    _exact_fields(
+        identity,
+        _MANAGER_CONVERGENCE_IDENTITY_FIELDS,
+        "adaptive_v2_ready identity",
+    )
+    for field in (
+        "predecessor_epoch_number",
+        "successor_epoch_number",
+        "command_block_height",
+        "activation_delay_blocks",
+        "activation_height",
+    ):
+        _integer(identity[field], f"adaptive_v2_ready.identity.{field}")
+    for field in (
+        "predecessor_epoch_digest",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "command_block_hash",
+    ):
+        _hash(identity[field], f"adaptive_v2_ready.identity.{field}")
+    command = _object(
+        epochs.successor.command,
+        "successor command for adaptive_v2_ready",
+    )
+    expected_identity = {
+        "predecessor_epoch_number": command["predecessor_epoch_number"],
+        "predecessor_epoch_digest": command["predecessor_epoch_digest"],
+        "successor_epoch_number": command["successor_epoch_number"],
+        "successor_epoch_digest": command["successor_epoch_digest"],
+        "command_payload_digest": command["payload_digest"],
+        "command_block_height": command["command_block_height"],
+        "command_block_hash": command["command_block_hash"],
+        "activation_delay_blocks": command["activation_delay_blocks"],
+        "activation_height": command["activation_height"],
+    }
+    if not _json_values_equal(identity, expected_identity):
+        raise ValidationError(
+            "adaptive_v2_ready identity differs from the canonical epoch command"
+        )
+    return event
+
+
 def _validate_process_lifecycle(
     manifest: Manifest,
     streams: Mapping[tuple[str, str], Sequence[analysis.StructuredEvent]],
+    *,
+    manager_ready: analysis.StructuredEvent,
 ) -> None:
     required_keys = [
         ("replica", f"replica-{replica}") for replica in MEMBERSHIP
@@ -1887,7 +2018,19 @@ def _validate_process_lifecycle(
             raise IncompleteRun(
                 f"completed run lacks one stopping/stopped pair for {key[1]}"
             )
-        if not (
+        if key[0] == "adaptation_manager":
+            if not (
+                manager_ready.source_sequence
+                < stopping[0].source_sequence
+                < stopped[0].source_sequence
+                and manager_ready.timestamp_ns
+                <= stopping[0].timestamp_ns
+                <= stopped[0].timestamp_ns
+            ):
+                raise ValidationError(
+                    "manager lifecycle is not ordered after convergence readiness"
+                )
+        elif not (
             manifest.end_ns
             <= stopping[0].timestamp_ns
             <= stopped[0].timestamp_ns
@@ -2100,7 +2243,7 @@ def _validate_command_and_activation(
     epochs: EpochDocument,
     streams: Mapping[tuple[str, str], Sequence[analysis.StructuredEvent]],
     crash_complete_ns: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     expected_command = dict(epochs.successor.command or {})
     command_times: dict[int, int] = {}
     activation_times: dict[int, int] = {}
@@ -2183,7 +2326,11 @@ def _validate_command_and_activation(
         raise ValidationError(
             "survivor activation spread exceeds frozen leader activation grace"
         )
-    return observer_command_ns, observer_activation_ns
+    return (
+        observer_command_ns,
+        observer_activation_ns,
+        max(activation_times.values()),
+    )
 
 
 def _compressed(values: Iterable[int]) -> list[int]:
@@ -2969,7 +3116,15 @@ def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
     ):
         raise ValidationError("successor root set differs from manifest.runtime")
     streams, texts = _read_source_events(manifest)
-    _validate_process_lifecycle(manifest, streams)
+    manager_ready = _validate_manager_convergence_ready(
+        manifest, epochs, streams
+    )
+    _validate_process_lifecycle(
+        manifest,
+        streams,
+        manager_ready=manager_ready,
+    )
+    manager_ready_ns = manager_ready.timestamp_ns
     crash_markers = _validate_crash_markers(manifest, streams)
     crash_ns = min(crash_markers)
     crash_complete_ns = max(marker.confirmed_ns for marker in manifest.crash_markers)
@@ -2979,12 +3134,20 @@ def evaluate(manifest_path: Path, epochs_path: Path) -> Evaluation:
         streams,
         max(crash_markers),
     )
-    command_ns, activation_ns = _validate_command_and_activation(
+    command_ns, activation_ns, latest_activation_ns = _validate_command_and_activation(
         manifest, epochs, streams, crash_complete_ns
     )
-    if not crash_ns < command_ns <= activation_ns < manifest.end_ns:
+    if not (
+        crash_ns
+        < command_ns
+        <= activation_ns
+        <= latest_activation_ns
+        <= manager_ready_ns
+        < manifest.end_ns
+    ):
         raise ValidationError(
-            "boundaries must satisfy crash < command <= activation < end"
+            "boundaries must satisfy crash < command <= observer activation "
+            "<= latest survivor activation <= manager readiness < end"
         )
     (
         throughput,
