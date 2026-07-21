@@ -9,6 +9,7 @@
 
 #include "catch.hpp"
 #include "hotstuff/adaptive_v2_manager_ingress.h"
+#include "hotstuff/epoch_activation.h"
 
 namespace
 {
@@ -72,6 +73,18 @@ EpochDefinitionInput epoch_zero(
     return hotstuff::adaptive_v2_epoch_zero_input(
         members,
         {EpochTreeDefinition{0, 2, 2, members, {}}});
+}
+
+EpochDefinitionInput detached_epoch_one()
+{
+    auto input = epoch_zero();
+    input.epoch_number = 1;
+    input.previous_epoch_digest = digest("detached-epoch-zero");
+    input.policy_version = "adaptive-v2-detached-epoch-one";
+    input.evidence_snapshot_id = "detached-epoch-one";
+    input.epoch_digest.reset();
+    input.epoch_digest = hotstuff::compute_epoch_digest(input);
+    return input;
 }
 
 AdaptiveV2ManagerIngressLimits limits()
@@ -303,7 +316,11 @@ void verify_recurring_ingress_contract()
         CHECK(manager.current_configuration().epoch_number == 1);
         CHECK(manager.current_configuration().epoch_digest ==
               expected_digest);
-        CHECK(manager.activation_generation() == old_generation + 1);
+        const auto expected_generation =
+            hotstuff::checked_activation_generation(1, 0);
+        REQUIRE(expected_generation.has_value());
+        CHECK(*expected_generation == 4'294'967'297ULL);
+        CHECK(manager.activation_generation() == *expected_generation);
         CHECK(manager.membership() == fixed_membership);
         CHECK(manager.current_epoch().membership_digest() ==
               fixed_membership_digest);
@@ -420,25 +437,6 @@ void verify_recurring_ingress_contract()
               AdaptiveV2ManagerIngressStatus::processed);
         CHECK(fresh.accepted_observations == 1);
 
-        Manager exhausted(
-            membership(),
-            epoch_zero(),
-            0,
-            std::numeric_limits<std::uint64_t>::max(),
-            configured);
-        const auto exhausted_digest =
-            exhausted.current_epoch().epoch_digest();
-        const auto exhausted_generation =
-            exhausted.activation_generation();
-        const auto rejected_successor = strict_successor(exhausted);
-        CHECK(exhausted.rotate_to_successor(rejected_successor, 0) ==
-              AdaptiveV2ManagerIngressStatus::rejected_generation);
-        CHECK(exhausted.current_epoch().epoch_number() == 0);
-        CHECK(exhausted.current_epoch().epoch_digest() ==
-              exhausted_digest);
-        CHECK(exhausted.activation_generation() ==
-              exhausted_generation);
-        CHECK(exhausted.ledger().accepted().empty());
     }
 }
 
@@ -498,6 +496,44 @@ TEST_CASE(
         AdaptiveV2ManagerIngress(
             membership(), epoch_zero(), 0, 0, limits()),
         std::invalid_argument);
+
+    const auto epoch_one_generation =
+        hotstuff::checked_activation_generation(1, 0);
+    REQUIRE(epoch_one_generation.has_value());
+
+    bool rejected_detached_epoch = false;
+    try
+    {
+        AdaptiveV2ManagerIngress invalid(
+            membership(), detached_epoch_one(), 0,
+            *epoch_one_generation, limits());
+        static_cast<void>(invalid);
+    }
+    catch (const std::invalid_argument &error)
+    {
+        rejected_detached_epoch = true;
+        CHECK(std::string(error.what()) ==
+              "adaptive-v2 manager requires an epoch-zero initial "
+              "definition");
+    }
+    CHECK(rejected_detached_epoch);
+
+    bool rejected_wrong_epoch_generation = false;
+    try
+    {
+        AdaptiveV2ManagerIngress invalid(
+            membership(), epoch_zero(), 0,
+            *epoch_one_generation, limits());
+        static_cast<void>(invalid);
+    }
+    catch (const std::invalid_argument &error)
+    {
+        rejected_wrong_epoch_generation = true;
+        CHECK(std::string(error.what()) ==
+              "adaptive-v2 manager activation generation does not belong "
+              "to the initial epoch");
+    }
+    CHECK(rejected_wrong_epoch_generation);
 
     auto zero_pending_quota = limits();
     zero_pending_quota.maximum_pending_lifecycle_facts_per_source = 0;

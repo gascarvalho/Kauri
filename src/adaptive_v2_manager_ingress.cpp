@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "hotstuff/epoch_activation.h"
+
 namespace hotstuff
 {
 namespace
@@ -219,12 +221,33 @@ ValidatedBootstrap validate_bootstrap(
             "adaptive-v2 manager requires exact N=3f+1 with f>0");
     }
     if (initial_epoch.schema_version !=
-            kEpochDefinitionSchemaVersionV2 ||
-        activation_generation == 0)
+        kEpochDefinitionSchemaVersionV2)
     {
         throw std::invalid_argument(
-            "adaptive-v2 manager requires a schema-v2 initial epoch "
-            "and generation");
+            "adaptive-v2 manager requires a schema-v2 initial epoch");
+    }
+    if (initial_epoch.epoch_number != 0)
+    {
+        throw std::invalid_argument(
+            "adaptive-v2 manager requires an epoch-zero initial "
+            "definition");
+    }
+    if (activation_generation == 0)
+    {
+        throw std::invalid_argument(
+            "adaptive-v2 manager activation generation is zero");
+    }
+    const auto packed_generation = activation_generation - 1;
+    const auto rotation_ordinal = static_cast<std::uint32_t>(
+        packed_generation);
+    const auto canonical_generation = checked_activation_generation(
+        initial_epoch.epoch_number, rotation_ordinal);
+    if (!canonical_generation.has_value() ||
+        *canonical_generation != activation_generation)
+    {
+        throw std::invalid_argument(
+            "adaptive-v2 manager activation generation does not belong "
+            "to the initial epoch");
     }
     if (!valid_limits(limits, membership.size()))
     {
@@ -1619,22 +1642,24 @@ AdaptiveV2ManagerIngress::rotate_to_successor(
         return AdaptiveV2ManagerIngressStatus::evidence_unhealthy;
     }
 
-    if (state.activation_generation ==
-        std::numeric_limits<std::uint64_t>::max())
-    {
-        return AdaptiveV2ManagerIngressStatus::rejected_generation;
-    }
-    if (state.current_epoch->epoch_number() ==
-            std::numeric_limits<std::uint32_t>::max() ||
+    const auto successor_epoch = checked_successor_epoch(
+        state.current_epoch->epoch_number());
+    if (!successor_epoch.has_value() ||
         successor.schema_version != kEpochDefinitionSchemaVersionV2 ||
-        successor.epoch_number !=
-            state.current_epoch->epoch_number() + 1 ||
+        successor.epoch_number != *successor_epoch ||
         successor.previous_epoch_digest !=
             state.current_epoch->epoch_digest() ||
         successor.membership_digest !=
             state.current_epoch->membership_digest())
     {
         return AdaptiveV2ManagerIngressStatus::rejected_configuration;
+    }
+
+    const auto next_generation = checked_activation_generation(
+        successor.epoch_number, 0);
+    if (!next_generation.has_value())
+    {
+        return AdaptiveV2ManagerIngressStatus::rejected_generation;
     }
 
     const auto selected_tree = std::find_if(
@@ -1683,8 +1708,6 @@ AdaptiveV2ManagerIngress::rotate_to_successor(
     }
 
     const auto *const staged_epoch = availability.definition;
-    const auto next_generation = state.activation_generation + 1;
-
     // From this point onward publication is no-throw. Authenticated stream
     // watermarks remain in their session-owned map entries while all mutable
     // exact-epoch facts are cleared or replaced.
@@ -1705,7 +1728,7 @@ AdaptiveV2ManagerIngress::rotate_to_successor(
         staged_epoch->epoch_number(),
         active_tree_id,
         staged_epoch->epoch_digest()};
-    state.activation_generation = next_generation;
+    state.activation_generation = *next_generation;
     state.window.swap(next_window);
 
     return AdaptiveV2ManagerIngressStatus::processed;

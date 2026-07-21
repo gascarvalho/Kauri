@@ -116,6 +116,10 @@ struct AdaptiveV2ManagerEvidenceResult
 /**
  * Single-writer manager ingress core for sequential exact epochs.
  *
+ * Construction accepts only the trusted epoch-zero bootstrap. Later exact
+ * epochs are reached through rotate_to_successor(), which preserves the
+ * predecessor chain and assigns the canonical epoch-packed generation.
+ *
  * Authentication is supplied by the transport owner as an already mapped
  * configured ReplicaID. This class owns no TLS, sockets, clocks, crash
  * identities, scoring, selection, signing, topology generation, activation,
