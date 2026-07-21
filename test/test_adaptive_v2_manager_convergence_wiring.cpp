@@ -909,6 +909,28 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager drains reputation audit backpressure before every exact record",
+    "[adaptive-v2][manager][reputation][structured-event][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    const auto trajectory = function_body(
+        manager, "void emit_new_score_trajectory() noexcept");
+    REQUIRE_FALSE(trajectory.empty());
+
+    CHECK(contains_in_order(
+        trajectory,
+        {"while (emitted_score_trajectory_ < trajectory.size())",
+         "structured_event_sink_.drain()",
+         "structured_event_sink_.health()",
+         "return",
+         "ReputationEvidenceAppliedStructuredEvent",
+         "structured_event_sink_.emit_audit(",
+         "structured_event_sink_.health()",
+         "++emitted_score_trajectory_"}));
+}
+
+TEST_CASE(
     "recurring manager delays each rotated predecessor by its explicit residency",
     "[adaptive-v2][manager][session][residency][timer][wiring]")
 {

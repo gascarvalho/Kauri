@@ -2016,6 +2016,12 @@ private:
         const auto evidence_cutoff = audit->current_cutoff;
         while (emitted_score_trajectory_ < trajectory.size())
         {
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("structured_event_reputation_drain_failed");
+                return;
+            }
             const hotstuff::AuditStructuredEventPayload event{
                 hotstuff::ReputationEvidenceAppliedStructuredEvent{
                     evidence_cutoff,
