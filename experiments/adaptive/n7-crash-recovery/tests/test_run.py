@@ -931,6 +931,35 @@ def test_manager_clean_exit_requires_both_ready_and_terminal_cycles() -> None:
         campaign.manager_convergence_ready_event(invalid_events, requests)
 
 
+def test_manager_polling_surfaces_failed_terminal_before_ready() -> None:
+    requests = synthetic_run.recurring_transition_requests()
+    terminal = json.loads(
+        json.dumps(
+            next(
+                event
+                for event in synthetic_run.recurring_manager_events(
+                    completed_cycles=1
+                )
+                if event["event_type"] == "adaptive_v2_session_terminal"
+            )
+        )
+    )
+    terminal["source_sequence"] = 1
+    terminal["payload"].update(
+        {
+            "outcome": "failed",
+            "reason": "caller_failed",
+            "winning_activation": None,
+        }
+    )
+
+    with pytest.raises(
+        campaign.RunnerError,
+        match="manager cycle 0 failed before ready: caller_failed",
+    ):
+        campaign.manager_convergence_ready_event([terminal], requests)
+
+
 def _three_cycle_manager_contract(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     requests = synthetic_run.recurring_transition_requests()

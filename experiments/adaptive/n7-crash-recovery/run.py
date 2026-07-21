@@ -1746,6 +1746,17 @@ def manager_convergence_ready_event(
         ready = ready_by_transition.get(key)
         terminal = terminal_by_ordinal.get(ordinal)
         if ready is None and terminal is not None:
+            terminal_payload = terminal["payload"]
+            outcome = terminal_payload.get("outcome")
+            reason = terminal_payload.get("reason")
+            if (
+                outcome in ("failed", "no_op")
+                and isinstance(reason, str)
+                and reason
+            ):
+                raise RunnerError(
+                    f"manager cycle {ordinal} {outcome} before ready: {reason}"
+                )
             raise RunnerError(
                 "adaptive_v2_session_terminal has no matching ready record"
             )
