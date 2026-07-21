@@ -11,6 +11,8 @@
 
 #include "catch.hpp"
 #include "hotstuff/adaptation.h"
+#include "hotstuff/adaptive_v2_manager_ingress.h"
+#include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/epoch_activation.h"
 #include "hotstuff/epoch_store.h"
 #include "hotstuff/tree_policy.h"
@@ -153,6 +155,11 @@ public:
 } // namespace hotstuff
 #endif
 
+namespace hotstuff
+{
+class AdaptiveV2ManagerRequestSequence;
+}
+
 namespace
 {
 
@@ -167,6 +174,11 @@ using hotstuff::AdaptationManagerCoordinator;
 using hotstuff::AdaptationManagerRecordDisposition;
 using hotstuff::AdaptationManagerState;
 using hotstuff::AdaptationPolicy;
+using hotstuff::AdaptiveV2ManagerIngress;
+using hotstuff::AdaptiveV2ManagerIngressLimits;
+using hotstuff::AdaptiveV2ManagerRequestSequence;
+using hotstuff::AdaptiveV2ManagerSessionTerminalRecord;
+using hotstuff::AdaptiveV2TransitionPolicy;
 using hotstuff::ConfigurationId;
 using hotstuff::EpochDefinition;
 using hotstuff::EpochDefinitionInput;
@@ -186,6 +198,7 @@ using hotstuff::ResponsivenessClass;
 using hotstuff::ReplicaStageDisposition;
 using hotstuff::StageAck;
 using hotstuff::TreePlacementInput;
+using hotstuff::TreePolicyKind;
 using hotstuff::TreeReplicaRole;
 using hotstuff::TreeShape;
 
@@ -219,6 +232,28 @@ template <typename Value>
 struct has_profile_labels<
     Value,
     std::void_t<decltype(std::declval<Value>().profile_labels)>>
+    : std::true_type
+{};
+
+template <typename Sequence, typename Ingress, typename = void>
+struct has_m12_r02_continuation_seam : std::false_type
+{};
+
+template <typename Sequence, typename Ingress>
+struct has_m12_r02_continuation_seam<
+    Sequence,
+    Ingress,
+    std::void_t<
+        decltype(sizeof(Sequence)),
+        decltype(Sequence(std::declval<
+            std::vector<AdaptiveV2TransitionPolicy>>())),
+        decltype(std::declval<const Sequence &>().cursor()),
+        decltype(std::declval<const Sequence &>().current_policy()),
+        decltype(std::declval<Sequence &>().observe_terminal_records(
+            std::declval<const std::vector<
+                AdaptiveV2ManagerSessionTerminalRecord> &>())),
+        decltype(std::declval<const Sequence &>().shutdown_eligible()),
+        decltype(std::declval<const Ingress &>().operationally_ready())>>
     : std::true_type
 {};
 
@@ -288,6 +323,64 @@ AdaptationPolicy adaptation_policy()
     return policy;
 }
 
+AdaptiveV2ManagerIngressLimits recurring_ingress_limits()
+{
+    AdaptiveV2ManagerIngressLimits limits;
+    limits.maximum_members = 7;
+    limits.readiness_wire.maximum_payload_bytes = 256;
+    limits.lifecycle_wire.maximum_payload_bytes = 512;
+    limits.evidence_wire = {4096, 8, 7};
+    limits.proposal_index = {512, 32};
+    limits.evidence_store = {1024, 256};
+    limits.lifecycle = {
+        128, 64 * 1024, 7, 1024, 512, 7, 16};
+    limits.lifecycle_accounting = {128, 64 * 1024, 1024};
+    limits.maximum_pending_lifecycle_facts_per_source = 64;
+    return limits;
+}
+
+AdaptiveV2TransitionPolicy containment_request()
+{
+    AdaptiveV2TransitionPolicy policy;
+    policy.intent = TreePolicyKind::fault_containment;
+    policy.containment_baseline_roots = {{0, 2}, {1, 3}};
+    return policy;
+}
+
+AdaptiveV2TransitionPolicy optimization_request()
+{
+    AdaptiveV2TransitionPolicy policy;
+    policy.intent = TreePolicyKind::performance_optimization;
+    return policy;
+}
+
+AdaptiveV2ManagerSessionTerminalRecord terminal_record(
+    TreePolicyKind intent,
+    hotstuff::AdaptiveV2ManagerCycleOutcome outcome,
+    std::uint64_t deliberately_unrelated_ordinal)
+{
+    AdaptiveV2ManagerSessionTerminalRecord record;
+    record.cycle_ordinal = deliberately_unrelated_ordinal;
+    record.policy_intent = intent;
+    record.outcome = outcome;
+    switch (outcome)
+    {
+    case hotstuff::AdaptiveV2ManagerCycleOutcome::advanced:
+        record.reason = hotstuff::AdaptiveV2ManagerCycleTerminalReason::
+            successor_converged;
+        break;
+    case hotstuff::AdaptiveV2ManagerCycleOutcome::no_op:
+        record.reason = hotstuff::AdaptiveV2ManagerCycleTerminalReason::
+            explicit_no_op;
+        break;
+    case hotstuff::AdaptiveV2ManagerCycleOutcome::failed:
+        record.reason = hotstuff::AdaptiveV2ManagerCycleTerminalReason::
+            caller_failed;
+        break;
+    }
+    return record;
+}
+
 std::vector<AcceptedEvidenceRecord> baseline_evidence(
     const EpochDefinition &epoch,
     const std::vector<ReplicaID> &nonresponsive_replicas = {6})
@@ -354,6 +447,119 @@ bool is_leaf(
         ? 0
         : ((tree.members_breadth_first.size() - 2) / tree.fanout) + 1;
     return position >= first_leaf;
+}
+
+template <typename Sequence, typename Ingress>
+void verify_m12_r02_continuation_contract()
+{
+    if constexpr (!has_m12_r02_continuation_seam<
+                      Sequence,
+                      Ingress>::value)
+    {
+        FAIL(
+            "M12-R02 RED: AdaptiveV2ManagerRequestSequence with Q=5 "
+            "operational readiness is absent; the executable cannot "
+            "continue from containment to explicit optimization");
+    }
+    else
+    {
+        std::vector<AdaptiveV2TransitionPolicy> requests{
+            containment_request(), optimization_request()};
+        Sequence sequence{requests};
+        requests.clear();
+
+        REQUIRE(sequence.current_policy() != nullptr);
+        CHECK(sequence.current_policy()->intent ==
+              TreePolicyKind::fault_containment);
+        CHECK(sequence.cursor() == 0);
+        CHECK_FALSE(sequence.shutdown_eligible());
+
+        std::vector<AdaptiveV2ManagerSessionTerminalRecord> records;
+        records.push_back(terminal_record(
+            TreePolicyKind::fault_containment,
+            hotstuff::AdaptiveV2ManagerCycleOutcome::no_op,
+            91));
+        REQUIRE(sequence.observe_terminal_records(records));
+        CHECK(sequence.cursor() == 0);
+        CHECK_FALSE(sequence.shutdown_eligible());
+
+        records.push_back(terminal_record(
+            TreePolicyKind::fault_containment,
+            hotstuff::AdaptiveV2ManagerCycleOutcome::failed,
+            4));
+        REQUIRE(sequence.observe_terminal_records(records));
+        CHECK(sequence.cursor() == 0);
+        CHECK_FALSE(sequence.shutdown_eligible());
+
+        records.push_back(terminal_record(
+            TreePolicyKind::fault_containment,
+            hotstuff::AdaptiveV2ManagerCycleOutcome::advanced,
+            73));
+        REQUIRE(sequence.observe_terminal_records(records));
+        CHECK(sequence.cursor() == 1);
+        REQUIRE(sequence.current_policy() != nullptr);
+        CHECK(sequence.current_policy()->intent ==
+              TreePolicyKind::performance_optimization);
+        CHECK_FALSE(sequence.shutdown_eligible());
+        CHECK_FALSE(sequence.observe_terminal_records(records));
+        CHECK(sequence.cursor() == 1);
+
+        records.push_back(terminal_record(
+            TreePolicyKind::performance_optimization,
+            hotstuff::AdaptiveV2ManagerCycleOutcome::advanced,
+            0));
+        REQUIRE(sequence.observe_terminal_records(records));
+        CHECK(sequence.cursor() == 2);
+        CHECK(sequence.current_policy() == nullptr);
+        CHECK(sequence.shutdown_eligible());
+
+        Sequence wrong_policy{{
+            containment_request(), optimization_request()}};
+        const std::vector<AdaptiveV2ManagerSessionTerminalRecord>
+            wrong_records{terminal_record(
+                TreePolicyKind::performance_optimization,
+                hotstuff::AdaptiveV2ManagerCycleOutcome::advanced,
+                0)};
+        CHECK_FALSE(wrong_policy.observe_terminal_records(wrong_records));
+        CHECK(wrong_policy.cursor() == 0);
+        CHECK_FALSE(wrong_policy.shutdown_eligible());
+
+        const auto generation =
+            hotstuff::checked_activation_generation(0, 0);
+        REQUIRE(generation.has_value());
+        const auto phase_one_epoch = baseline_input();
+        Ingress ingress{
+            membership(),
+            hotstuff::adaptive_v2_epoch_zero_input(
+                membership(), phase_one_epoch.trees),
+            0,
+            *generation,
+            recurring_ingress_limits()};
+        for (const auto source :
+             std::vector<ReplicaID>{2, 3, 4, 5, 6})
+        {
+            const hotstuff::AdaptiveV2ReadinessNotice notice{
+                hotstuff::kAdaptiveV2ReadinessNoticeSchemaVersionV1,
+                source,
+                1,
+                ingress.current_configuration(),
+                ingress.activation_generation(),
+                100 + static_cast<std::uint64_t>(source)};
+            CHECK(ingress.ingest_readiness(
+                      hotstuff::AuthenticatedReporter{source},
+                      hotstuff::encode_adaptive_v2_readiness_notice(
+                          notice,
+                          recurring_ingress_limits().readiness_wire))
+                      .status ==
+                  hotstuff::AdaptiveV2ManagerIngressStatus::processed);
+        }
+        CHECK(ingress.readiness_stats().ready_members == 5);
+        CHECK_FALSE(ingress.all_members_ready());
+        CHECK(ingress.operationally_ready());
+        CHECK(ingress.quorum_metadata().replica_count == 7);
+        CHECK(ingress.quorum_metadata().fault_threshold == 2);
+        CHECK(ingress.quorum_metadata().quorum == 5);
+    }
 }
 
 } // namespace
@@ -732,4 +938,14 @@ TEST_CASE("M12 accepts readiness for the explicit rotated generation",
     }
     CHECK(manager.state() ==
           AdaptationManagerState::collecting_baseline_evidence);
+}
+
+TEST_CASE(
+    "M12-R02 continues explicit requests until every transition advances",
+    "[m12][adaptation-manager][continuation][request-sequence]"
+    "[operational-readiness][intentional-red]")
+{
+    verify_m12_r02_continuation_contract<
+        AdaptiveV2ManagerRequestSequence,
+        AdaptiveV2ManagerIngress>();
 }

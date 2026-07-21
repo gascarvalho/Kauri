@@ -1877,6 +1877,13 @@ AdaptiveV2ManagerIngress::audit_stats() const noexcept
     return state_->audit_snapshot();
 }
 
+bool AdaptiveV2ManagerIngress::operationally_ready() const noexcept
+{
+    return state_->operational() &&
+           state_->ready_members >=
+               static_cast<std::size_t>(state_->quorum.quorum);
+}
+
 bool AdaptiveV2ManagerIngress::all_members_ready() const noexcept
 {
     return state_->ready_members == state_->membership.size();

@@ -652,4 +652,72 @@ bool AdaptationManagerCoordinator::converged() const noexcept
            AdaptationManagerState::containment_converged;
 }
 
+struct AdaptiveV2ManagerRequestSequence::State
+{
+    explicit State(std::vector<AdaptiveV2TransitionPolicy> requests_)
+        : requests(std::move(requests_))
+    {}
+
+    const std::vector<AdaptiveV2TransitionPolicy> requests;
+    std::size_t cursor{0};
+    std::size_t observed_terminal_records{0};
+};
+
+AdaptiveV2ManagerRequestSequence::AdaptiveV2ManagerRequestSequence(
+    std::vector<AdaptiveV2TransitionPolicy> requests)
+    : state_(std::make_unique<State>(std::move(requests)))
+{}
+
+AdaptiveV2ManagerRequestSequence::~AdaptiveV2ManagerRequestSequence() =
+    default;
+
+std::size_t AdaptiveV2ManagerRequestSequence::cursor() const noexcept
+{
+    return state_->cursor;
+}
+
+const AdaptiveV2TransitionPolicy *
+AdaptiveV2ManagerRequestSequence::current_policy() const noexcept
+{
+    return state_->cursor < state_->requests.size()
+        ? &state_->requests[state_->cursor]
+        : nullptr;
+}
+
+bool AdaptiveV2ManagerRequestSequence::observe_terminal_records(
+    const std::vector<AdaptiveV2ManagerSessionTerminalRecord> &records)
+    noexcept
+{
+    if (state_->observed_terminal_records >= records.size())
+        return false;
+
+    const auto *policy = current_policy();
+    if (policy == nullptr)
+        return false;
+
+    const auto &record = records[state_->observed_terminal_records];
+    if (record.policy_intent != policy->intent)
+        return false;
+
+    switch (record.outcome)
+    {
+    case AdaptiveV2ManagerCycleOutcome::advanced:
+        ++state_->cursor;
+        break;
+    case AdaptiveV2ManagerCycleOutcome::no_op:
+    case AdaptiveV2ManagerCycleOutcome::failed:
+        break;
+    default:
+        return false;
+    }
+
+    ++state_->observed_terminal_records;
+    return true;
+}
+
+bool AdaptiveV2ManagerRequestSequence::shutdown_eligible() const noexcept
+{
+    return state_->cursor == state_->requests.size();
+}
+
 } // namespace hotstuff

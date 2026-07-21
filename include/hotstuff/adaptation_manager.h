@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "hotstuff/adaptation.h"
+#include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/epoch_activation.h"
 #include "hotstuff/tree_policy.h"
 
@@ -138,6 +139,52 @@ public:
 
     AdaptationManagerState state() const noexcept;
     bool converged() const noexcept;
+
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
+
+/**
+ * Ordered, transport-independent transition-request cursor.
+ *
+ * Requests are copied into immutable owned storage. The cursor consumes only
+ * newly appended session terminal records whose explicit policy intent
+ * matches the current request. Epoch numbers and cycle ordinals are not part
+ * of this sequencing decision, and the sequencer has no consensus or
+ * activation authority.
+ */
+class AdaptiveV2ManagerRequestSequence final
+{
+public:
+    explicit AdaptiveV2ManagerRequestSequence(
+        std::vector<AdaptiveV2TransitionPolicy> requests);
+    ~AdaptiveV2ManagerRequestSequence();
+
+    AdaptiveV2ManagerRequestSequence(
+        const AdaptiveV2ManagerRequestSequence &) = delete;
+    AdaptiveV2ManagerRequestSequence &operator=(
+        const AdaptiveV2ManagerRequestSequence &) = delete;
+    AdaptiveV2ManagerRequestSequence(
+        AdaptiveV2ManagerRequestSequence &&) = delete;
+    AdaptiveV2ManagerRequestSequence &operator=(
+        AdaptiveV2ManagerRequestSequence &&) = delete;
+
+    std::size_t cursor() const noexcept;
+    const AdaptiveV2TransitionPolicy *current_policy() const noexcept;
+
+    /**
+     * Consume at most one previously unseen append-only terminal record.
+     *
+     * A matching `advanced` record advances the request cursor. Matching
+     * `no_op` and `failed` records are observed without advancing it. A
+     * replay, malformed outcome, or policy-intent mismatch is inert.
+     */
+    bool observe_terminal_records(
+        const std::vector<AdaptiveV2ManagerSessionTerminalRecord> &records)
+        noexcept;
+
+    bool shutdown_eligible() const noexcept;
 
 private:
     struct State;

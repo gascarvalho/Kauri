@@ -195,6 +195,13 @@ public:
     EvidenceLifecycleStats lifecycle_stats() const noexcept;
     AdaptiveV2ManagerIngressAuditStats audit_stats() const noexcept;
 
+    /**
+     * Whether a derived Byzantine quorum of distinct members is ready.
+     *
+     * This is operational observation only. It neither changes the fixed
+     * quorum metadata nor grants consensus or activation authority.
+     */
+    bool operationally_ready() const noexcept;
     bool all_members_ready() const noexcept;
     bool healthy() const noexcept;
     void shutdown() noexcept;
