@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import datetime as dt
 import hashlib
 import json
@@ -16,6 +17,15 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 import run as base
+from experiments.adaptive.kauri_experiment import (
+    ActivationAckDrop,
+    FaultEvidence,
+    FaultJournal,
+    FaultLifecycle,
+    FaultPlan,
+    ReplicaGroupSigkill,
+    SuccessorBundleAttemptDrop,
+)
 
 
 PROFILE_ID = "n7-f2-q5-epoch1-convergence-v3"
@@ -138,30 +148,48 @@ def convergence_runtime_profile(
     return runtime_profile
 
 
-def loss_control_arguments(profile: Mapping[str, Any]) -> tuple[str, ...]:
-    """Translate only the two frozen, explicit one-shot loss controls."""
+def convergence_fault_plan(profile: Mapping[str, Any]) -> FaultPlan:
+    """Return the one exact FI-Core plan permitted by this scenario."""
+
     if dict(profile) != _expected_profile():
-        raise RunnerError("loss controls require the exact convergence profile")
+        raise RunnerError("fault plan requires the exact convergence profile")
     bundle = profile["fault_injection"]["bundle_delivery"]
-    acknowledgement = profile["fault_injection"]["activation_ack"]
-    bundle_attempt = f"{bundle['recipient']}:{bundle['attempt']}"
-    acknowledgement_ordinal = str(
-        acknowledgement["accepted_activation_ordinal"]
-    )
-    if bundle_attempt != "2:1" or acknowledgement_ordinal != "5":
-        raise RunnerError("frozen loss-control arguments are not exact")
-    return (
-        "--experiment-drop-bundle-attempt",
-        bundle_attempt,
-        "--experiment-drop-activation-ack",
-        acknowledgement_ordinal,
+    if (
+        bundle != {"recipient": 2, "attempt": 1}
+        or profile["fault_injection"]["activation_ack"]
+        != {"accepted_activation_ordinal": base.QUORUM}
+    ):
+        raise RunnerError("frozen fault actions are not exact")
+    return FaultPlan(
+        context=base.n7_fault_context(),
+        seed=base.SNAPSHOT_SEED,
+        actions=(
+            ReplicaGroupSigkill(
+                fault_id="crash-replica-0",
+                replica_id=0,
+            ),
+            ReplicaGroupSigkill(
+                fault_id="crash-replica-1",
+                replica_id=1,
+            ),
+            SuccessorBundleAttemptDrop(
+                fault_id="drop-successor-bundle-2-attempt-1",
+                replica_id=bundle["recipient"],
+                attempt=bundle["attempt"],
+            ),
+            ActivationAckDrop(
+                fault_id="drop-activation-ack-quorum",
+                accepted_activation_ordinal=base.QUORUM,
+            ),
+        ),
     )
 
 
 def manager_convergence_arguments(
     profile: Mapping[str, Any],
 ) -> tuple[str, ...]:
-    """Translate the exact v2 manager deadline and one-shot loss controls."""
+    """Translate only the non-fault convergence manager controls."""
+
     if dict(profile) != _expected_profile():
         raise RunnerError("manager controls require the exact convergence profile")
     deadline_seconds = profile["timeouts"][
@@ -170,12 +198,278 @@ def manager_convergence_arguments(
     return (
         "--convergence-deadline-seconds",
         str(deadline_seconds),
-        *loss_control_arguments(profile),
     )
 
 
+def _assert_convergence_manager_arguments(
+    profile: Mapping[str, Any],
+    fault_plan: FaultPlan,
+    manager_command: Sequence[str],
+) -> None:
+    """Prove the composed manager arguments retain the frozen wire contract."""
+
+    expected_plan = {
+        "actions": [
+            {
+                "fault_id": "crash-replica-0",
+                "kind": "replica_group_sigkill",
+                "replica_id": 0,
+            },
+            {
+                "fault_id": "crash-replica-1",
+                "kind": "replica_group_sigkill",
+                "replica_id": 1,
+            },
+            {
+                "attempt": 1,
+                "fault_id": "drop-successor-bundle-2-attempt-1",
+                "kind": "successor_bundle_attempt_drop",
+                "replica_id": 2,
+            },
+            {
+                "accepted_activation_ordinal": base.QUORUM,
+                "fault_id": "drop-activation-ack-quorum",
+                "kind": "activation_ack_drop",
+            },
+        ],
+        "scenario": {
+            "crash_budget": base.FAULT_THRESHOLD,
+            "quorum": base.QUORUM,
+            "replica_ids": list(base.REPLICA_IDS),
+            "successor_bundle_retry_limit": 5,
+        },
+        "schema_version": 1,
+        "seed": base.SNAPSHOT_SEED,
+    }
+    if (
+        dict(profile) != _expected_profile()
+        or json.loads(fault_plan.canonical_json()) != expected_plan
+    ):
+        raise RunnerError("manager command received a non-exact fault plan")
+    expected = (
+        *manager_convergence_arguments(profile),
+        *fault_plan.manager_cli_args(),
+    )
+    if tuple(manager_command[-len(expected) :]) != expected:
+        raise RunnerError(
+            "manager command does not end with the exact convergence controls"
+        )
+    for option in (
+        "--convergence-deadline-seconds",
+        "--experiment-drop-bundle-attempt",
+        "--experiment-drop-activation-ack",
+    ):
+        if manager_command.count(option) != 1:
+            raise RunnerError(
+                f"manager command has invalid {option} cardinality"
+            )
+
+
+def _manager_fault_actions(
+    fault_plan: FaultPlan,
+) -> tuple[SuccessorBundleAttemptDrop, ActivationAckDrop]:
+    bundle_actions = fault_plan.actions_of_type(SuccessorBundleAttemptDrop)
+    acknowledgement_actions = fault_plan.actions_of_type(ActivationAckDrop)
+    if len(bundle_actions) != 1 or len(acknowledgement_actions) != 1:
+        raise RunnerError(
+            "convergence plan requires one bundle and one ACK loss"
+        )
+    return bundle_actions[0], acknowledgement_actions[0]
+
+
+def _canonical_digest(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value == "0" * 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RunnerError(f"{label} loss lacks a canonical payload digest")
+    return value
+
+
+def _append_terminal_once(
+    journal: FaultLifecycle | FaultJournal,
+    terminal_fault_ids: set[str],
+    *,
+    fault_id: str,
+    outcome: Mapping[str, object],
+) -> None:
+    if fault_id in terminal_fault_ids:
+        raise RunnerError(f"duplicate terminal outcome for fault {fault_id}")
+    status = outcome.get("status")
+    if not isinstance(status, str) or not status:
+        raise RunnerError(f"fault {fault_id} terminal lacks a status")
+    if isinstance(journal, FaultLifecycle):
+        journal.terminal(
+            fault_id=fault_id,
+            status=status,
+            outcome=outcome,
+        )
+    else:
+        journal.append(
+            fault_id=fault_id,
+            lifecycle="terminal",
+            outcome=outcome,
+        )
+    terminal_fault_ids.add(fault_id)
+
+
+def _append_manager_fault_outcomes(
+    fault_plan: FaultPlan,
+    loss_controls: Mapping[str, Any],
+    journal: FaultLifecycle | FaultJournal,
+    terminal_fault_ids: set[str],
+    *,
+    manager_exit_code: int | None,
+    manager_output_closed: bool,
+) -> None:
+    """Journal manager-side success only after exact runtime evidence."""
+
+    if type(manager_exit_code) is not int or manager_exit_code != 0:
+        raise RunnerError(
+            "manager fault success requires an exact zero exit code"
+        )
+    if manager_output_closed is not True:
+        raise RunnerError(
+            "manager fault success requires closed and drained output"
+        )
+
+    bundle_action, acknowledgement_action = _manager_fault_actions(fault_plan)
+    bundle = loss_controls.get("bundle_delivery")
+    acknowledgement = loss_controls.get("activation_ack")
+    if not isinstance(bundle, Mapping) or not isinstance(
+        acknowledgement, Mapping
+    ):
+        raise RunnerError("loss-control state is incomplete")
+    if (
+        bundle.get("observed") is not True
+        or bundle.get("recipient") != bundle_action.replica_id
+        or bundle.get("attempt") != bundle_action.attempt
+    ):
+        raise RunnerError("bundle loss was not proven for the fault plan")
+    if (
+        acknowledgement.get("observed") is not True
+        or acknowledgement.get("accepted_activation_ordinal")
+        != acknowledgement_action.accepted_activation_ordinal
+    ):
+        raise RunnerError("activation ACK loss was not proven for the fault plan")
+
+    bundle_digest = _canonical_digest(
+        bundle.get("canonical_payload_digest"),
+        "bundle",
+    )
+    acknowledgement_digest = _canonical_digest(
+        acknowledgement.get("canonical_payload_digest"),
+        "activation acknowledgement",
+    )
+    ack_source_monotonic_ns = acknowledgement.get(
+        "ack_source_monotonic_ns"
+    )
+    if (
+        isinstance(ack_source_monotonic_ns, bool)
+        or not isinstance(ack_source_monotonic_ns, int)
+        or ack_source_monotonic_ns < 0
+    ):
+        raise RunnerError("ACK recovery lacks a monotonic timestamp")
+
+    acknowledgement_outcome: dict[str, object] = {
+        "accepted_activation_ordinal": (
+            acknowledgement_action.accepted_activation_ordinal
+        ),
+        "ack_source_monotonic_ns": ack_source_monotonic_ns,
+        "canonical_payload_digest": acknowledgement_digest,
+        "kind": "activation_ack_drop",
+        "observed": True,
+        "status": "succeeded",
+    }
+    acknowledgement_replica = acknowledgement.get("replica_id")
+    if acknowledgement_replica is not None:
+        if (
+            isinstance(acknowledgement_replica, bool)
+            or not isinstance(acknowledgement_replica, int)
+            or acknowledgement_replica not in fault_plan.context.replica_ids
+        ):
+            raise RunnerError(
+                "activation ACK audit has an invalid replica identity"
+            )
+        acknowledgement_outcome["replica_id"] = acknowledgement_replica
+
+    terminal_events = (
+        (
+            bundle_action.fault_id,
+            {
+                "attempt": bundle_action.attempt,
+                "canonical_payload_digest": bundle_digest,
+                "kind": "successor_bundle_attempt_drop",
+                "observed": True,
+                "replica_id": bundle_action.replica_id,
+                "status": "succeeded",
+            },
+        ),
+        (
+            acknowledgement_action.fault_id,
+            acknowledgement_outcome,
+        ),
+    )
+    if any(
+        fault_id in terminal_fault_ids
+        for fault_id, _outcome in terminal_events
+    ):
+        raise RunnerError("manager fault already has a terminal outcome")
+    for fault_id, outcome in terminal_events:
+        _append_terminal_once(
+            journal,
+            terminal_fault_ids,
+            fault_id=fault_id,
+            outcome=outcome,
+        )
+
+
+def _append_pending_manager_fault_outcomes(
+    fault_plan: FaultPlan,
+    journal: FaultLifecycle | FaultJournal,
+    terminal_fault_ids: set[str],
+    *,
+    manager_launched: bool,
+) -> None:
+    """Close every unproven manager action without claiming success."""
+
+    bundle_action, acknowledgement_action = _manager_fault_actions(fault_plan)
+    pending = (
+        (
+            bundle_action.fault_id,
+            {
+                "attempt": bundle_action.attempt,
+                "kind": "successor_bundle_attempt_drop",
+                "replica_id": bundle_action.replica_id,
+                "status": "unobserved" if manager_launched else "not_reached",
+            },
+        ),
+        (
+            acknowledgement_action.fault_id,
+            {
+                "accepted_activation_ordinal": (
+                    acknowledgement_action.accepted_activation_ordinal
+                ),
+                "kind": "activation_ack_drop",
+                "status": "unobserved" if manager_launched else "not_reached",
+            },
+        ),
+    )
+    for fault_id, outcome in pending:
+        if fault_id in terminal_fault_ids:
+            continue
+        _append_terminal_once(
+            journal,
+            terminal_fault_ids,
+            fault_id=fault_id,
+            outcome=outcome,
+        )
+
+
 def validate_manager_exit(exit_code: int, ready_count: int) -> None:
-    if exit_code != 0 or ready_count != 1:
+    if type(exit_code) is not int or exit_code != 0 or ready_count != 1:
         raise RunnerError(
             "manager exit zero requires exactly one adaptive_v2_ready event"
         )
@@ -462,6 +756,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     args = _arguments(argv)
     repository = args.repository.resolve()
     profile, profile_bytes = load_frozen_profile(args.profile.resolve())
+    fault_plan = convergence_fault_plan(profile)
     base_profile, _ = base.load_frozen_profile(args.base_profile.resolve())
     runtime_profile = convergence_runtime_profile(base_profile)
     transition_request = convergence_transition_request(runtime_profile)
@@ -498,9 +793,18 @@ def run(argv: Sequence[str] | None = None) -> int:
     base._write_json_exclusive(state_path, state)
 
     records: list[base.ProcessRecord] = []
-    records_by_replica: dict[int, base.ProcessRecord] = {}
+    fault_registry = base.ProcessRegistry(
+        monotonic_ns=base.monotonic_raw_ns
+    )
+    fault_resources = ExitStack()
+    fault_lifecycle: FaultLifecycle | None = None
+    fault_journal_path = run_directory / "raw" / "fault-orchestrator.jsonl"
+    manager_fault_terminal_ids: set[str] = set()
+    manager_launched = False
+    processes_shutdown = False
+    manager_output_closed = False
     runtime_error: str | None = None
-    manager_exit_code = -1
+    manager_exit_code: int | None = None
     manager_command: tuple[str, ...] = ()
     crash_markers: list[dict[str, Any]] = []
     boundary: dict[str, Any] = {}
@@ -512,6 +816,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         f"{run_id}-manager-{uuid.uuid4().hex}"
     )
     try:
+        fault_lifecycle = fault_resources.enter_context(
+            FaultEvidence(
+                run_directory,
+                fault_plan,
+                monotonic_ns=base.monotonic_raw_ns,
+            )
+        )
         bls, tls, issuer = base.generate_identities(
             binaries["keygen"],
             binaries["tls_keygen"],
@@ -531,6 +842,12 @@ def run(argv: Sequence[str] | None = None) -> int:
             app_binary=binaries["app"],
             manager_binary=binaries["manager"],
             manager_extra_args=manager_convergence_arguments(profile),
+            fault_plan=fault_plan,
+        )
+        _assert_convergence_manager_arguments(
+            profile,
+            fault_plan,
+            manager_command,
         )
         state["phase"] = "launch"
         base._replace_json(state_path, state)
@@ -542,6 +859,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             replica_id=None,
         )
         records.append(manager)
+        manager_launched = True
         for replica in base.REPLICA_IDS:
             record = base.spawn_process(
                 f"replica-{replica}",
@@ -551,7 +869,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 replica_id=replica,
             )
             records.append(record)
-            records_by_replica[replica] = record
+            base.register_fault_replica(fault_registry, record)
 
         def all_ready() -> bool:
             streams = base._event_streams(run_directory)
@@ -618,9 +936,12 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         state["phase"] = "crash"
         base._replace_json(state_path, state)
-        crash_markers = base.inject_sigkill_crashes(
-            records_by_replica,
-            base.CRASH_TARGETS,
+        if fault_lifecycle is None:
+            raise RunnerError("fault lifecycle was not opened before launch")
+        crash_markers = base.inject_fault_plan_crashes(
+            fault_registry,
+            fault_plan,
+            fault_lifecycle,
             timeout_s=float(profile["timeouts"]["crash_confirm_s"]),
         )
         base.assert_crash_boundary_held(
@@ -712,6 +1033,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             "authoritative_observer": base.AUTHORITATIVE_SOURCE_ID,
         }
         base._replace_json(state_path, state)
+    except KeyboardInterrupt:
+        runtime_error = "campaign interrupted by interrupt"
     except (
         RunnerError,
         base.RunnerError,
@@ -723,16 +1046,128 @@ def run(argv: Sequence[str] | None = None) -> int:
         state["phase"] = "cleanup"
         state["runtime_error"] = runtime_error
         base._replace_json(state_path, state)
-        if records:
+        if records and not processes_shutdown:
+            processes_shutdown = True
             try:
                 unexpected = base._shutdown_processes(records)
+                manager_record = next(
+                    (
+                        record
+                        for record in records
+                        if record.name == MANAGER_SOURCE_ID
+                    ),
+                    None,
+                )
+                manager_log_handle = (
+                    getattr(manager_record, "log_handle", None)
+                    if manager_record is not None
+                    else None
+                )
+                manager_output_closed = (
+                    manager_launched
+                    and manager_record is not None
+                    and manager_log_handle is not None
+                    and getattr(manager_log_handle, "closed", False) is True
+                )
                 if unexpected:
                     runtime_error = runtime_error or str(unexpected)
-            except base.RunnerError as exc:
+                if manager_launched and manager_exit_code is None:
+                    if manager_record is not None:
+                        poll = getattr(manager_record.process, "poll", None)
+                        observed_exit_code = (
+                            poll() if callable(poll) else None
+                        )
+                        if type(observed_exit_code) is int:
+                            manager_exit_code = observed_exit_code
+            except (
+                base.RunnerError,
+                OSError,
+                subprocess.SubprocessError,
+            ) as exc:
+                manager_output_closed = False
                 runtime_error = runtime_error or str(exc)
+        if manager_launched and not manager_output_closed:
+            runtime_error = runtime_error or (
+                "manager output was not proven closed and drained"
+            )
         remaining = base._wait_listeners_stopped(ports, 5.0)
         if remaining:
+            manager_output_closed = False
             runtime_error = runtime_error or f"listeners remained active: {remaining}"
+
+        if fault_lifecycle is not None:
+            manager_audit_error: str | None = None
+            if (
+                manager_launched
+                and type(manager_exit_code) is int
+                and manager_exit_code == 0
+                and manager_output_closed
+            ):
+                try:
+                    final_manager_events = base._event_streams(run_directory)[
+                        MANAGER_SOURCE_ID
+                    ]
+                    final_loss_controls = _loss_control_state(
+                        final_manager_events
+                    )
+                    state["loss_controls"] = final_loss_controls
+                    _append_manager_fault_outcomes(
+                        fault_plan,
+                        final_loss_controls,
+                        fault_lifecycle,
+                        manager_fault_terminal_ids,
+                        manager_exit_code=manager_exit_code,
+                        manager_output_closed=manager_output_closed,
+                    )
+                except (
+                    KeyError,
+                    OSError,
+                    RunnerError,
+                    base.RunnerError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    manager_audit_error = str(exc)
+            if manager_launched and (
+                manager_audit_error is not None
+                or type(manager_exit_code) is not int
+                or manager_exit_code != 0
+                or not manager_output_closed
+            ):
+                try:
+                    _append_pending_manager_fault_outcomes(
+                        fault_plan,
+                        fault_lifecycle,
+                        manager_fault_terminal_ids,
+                        manager_launched=manager_launched,
+                    )
+                except (
+                    OSError,
+                    RunnerError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    runtime_error = runtime_error or (
+                        f"cannot finalize manager fault evidence: {exc}"
+                    )
+            if manager_audit_error is not None:
+                runtime_error = runtime_error or (
+                    "cannot prove manager fault evidence after shutdown: "
+                    f"{manager_audit_error}"
+                )
+        try:
+            fault_resources.close()
+        except (OSError, RuntimeError, ValueError) as exc:
+            runtime_error = runtime_error or (
+                f"cannot close fault evidence: {exc}"
+            )
+        if fault_lifecycle is not None and not fault_journal_path.is_file():
+            runtime_error = runtime_error or (
+                f"fault journal is missing after evidence close: "
+                f"{fault_journal_path}"
+            )
         state["phase"] = "finished"
         state["runtime_error"] = runtime_error
         state["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -741,6 +1176,9 @@ def run(argv: Sequence[str] | None = None) -> int:
     print(f"results: {run_directory}")
     if runtime_error is not None:
         print(f"INCOMPLETE: {runtime_error}")
+        return 1
+    if type(manager_exit_code) is not int or manager_exit_code != 0:
+        print("INCOMPLETE: manager exit was not exactly zero")
         return 1
     manifest = _manifest(
         run_directory=run_directory,

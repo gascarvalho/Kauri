@@ -24,7 +24,8 @@ def test_base_runner_pins_full_run_deadline_but_keeps_builder_seam_neutral() -> 
 
     source = (SCENARIO_DIRECTORY / "run.py").read_text(encoding="utf-8")
     assert "command.extend(manager_extra_args)" in source
-    assert "manager_extra_args=manager_extra_args" in source
+    assert "fault_plan.manager_cli_args()" in source
+    assert "manager_extra_args=(" in source
 
 
 def test_manager_exposes_only_explicit_cli_loss_controls_and_audits_drops() -> None:
@@ -62,11 +63,14 @@ def test_convergence_runner_requests_exact_loss_controls_without_environment_fla
     source = path.read_text(encoding="utf-8")
 
     assert "import run as base" in source
-    assert '"--experiment-drop-bundle-attempt"' in source
-    assert '"2:1"' in source
-    assert '"--experiment-drop-activation-ack"' in source
-    assert '"5"' in source
-    assert "manager_extra_args=" in source
+    assert "def convergence_fault_plan(" in source
+    assert "SuccessorBundleAttemptDrop(" in source
+    assert "ActivationAckDrop(" in source
+    assert "accepted_activation_ordinal=base.QUORUM" in source
+    assert "manager_extra_args=manager_convergence_arguments(profile)" in source
+    assert "fault_plan=fault_plan" in source
+    assert "fault_plan.manager_cli_args()" in source
+    assert "def loss_control_arguments(" not in source
     assert "os.environ" not in source
 
 

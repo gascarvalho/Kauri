@@ -281,6 +281,18 @@ class _ProcessDouble:
         return self.return_code
 
 
+class _ManagedProcessDouble(_ProcessDouble):
+    def __init__(self, pid: int) -> None:
+        super().__init__()
+        self.pid = pid
+        self.wait_timeouts: list[float] = []
+
+    def wait(self, timeout: float) -> int:
+        self.wait_timeouts.append(timeout)
+        self.return_code = -int(signal.SIGKILL)
+        return self.return_code
+
+
 def _record(replica: int, return_code: int | None = None) -> campaign.ProcessRecord:
     return campaign.ProcessRecord(
         name=f"replica-{replica}",
@@ -766,6 +778,234 @@ def test_crash_injection_targets_only_registered_replica_groups() -> None:
     assert [marker["replica_id"] for marker in markers] == [0, 1]
     assert [marker["requested_monotonic_raw_ns"] for marker in markers] == [101, 102]
     assert [marker["confirmed_exit"]["observed_monotonic_raw_ns"] for marker in markers] == [201, 202]
+
+
+def test_n7_fault_plan_preserves_the_frozen_crash_order() -> None:
+    context = campaign.n7_fault_context()
+    plan = campaign.n7_crash_fault_plan()
+
+    assert context.replica_ids == campaign.REPLICA_IDS
+    assert context.quorum == campaign.QUORUM
+    assert context.crash_budget == campaign.FAULT_THRESHOLD
+    assert context.successor_bundle_retry_limit == 5
+    assert plan.context == context
+    assert plan.seed == campaign.SNAPSHOT_SEED
+    assert [
+        (action.fault_id, action.replica_id)
+        for action in plan.actions_of_type(campaign.ReplicaGroupSigkill)
+    ] == [
+        ("crash-replica-0", 0),
+        ("crash-replica-1", 1),
+    ]
+    assert plan.manager_cli_args() == ()
+
+
+def test_register_fault_replica_maps_the_legacy_process_identity() -> None:
+    process = _ManagedProcessDouble(pid=10_000)
+    legacy = campaign.ProcessRecord(
+        name="replica-3",
+        pid=process.pid,
+        pgid=process.pid,
+        command=("hotstuff-app",),
+        log_path=Path("replica-3.log"),
+        process=process,  # type: ignore[arg-type]
+        log_handle=SimpleNamespace(close=lambda: None),
+        replica_id=3,
+    )
+    registry = campaign.ProcessRegistry(
+        getpgid=lambda pid: pid,
+        get_launcher_pgid=lambda: 99_999,
+    )
+
+    assert campaign.register_fault_replica(registry, legacy) is None
+    registered = registry.record_for_replica(3)
+
+    assert registered.name == legacy.name
+    assert registered.replica_id == legacy.replica_id
+    assert registered.pid == legacy.pid
+    assert registered.pgid == legacy.pgid
+    assert registered.process is legacy.process
+
+
+def test_fault_plan_crashes_project_exact_legacy_markers_and_journal(
+    tmp_path: Path,
+) -> None:
+    processes = {
+        replica: _ManagedProcessDouble(pid=10_000 + replica)
+        for replica in campaign.CRASH_TARGETS
+    }
+    killed: list[tuple[int, int]] = []
+    operations: list[tuple[str, int]] = []
+    registry_timestamps = iter((101, 102, 201, 202))
+
+    def killpg(pgid: int, signal_number: int) -> None:
+        operations.append(("kill", pgid))
+        killed.append((pgid, signal_number))
+
+    def wait_for_exit(
+        process: _ManagedProcessDouble,
+        timeout: float,
+    ) -> int:
+        operations.append(("wait", process.pid))
+        return process.wait(timeout)
+
+    registry = campaign.ProcessRegistry(
+        getpgid=lambda pid: pid,
+        killpg=killpg,
+        get_launcher_pgid=lambda: 99_999,
+        monotonic_ns=lambda: next(registry_timestamps),
+        wait_for_exit=wait_for_exit,
+    )
+    for replica, process in processes.items():
+        registry.register(
+            name=f"replica-{replica}",
+            replica_id=replica,
+            process=process,
+        )
+    plan = campaign.n7_crash_fault_plan()
+    journal_path = tmp_path / "raw" / "fault-orchestrator.jsonl"
+    journal_timestamps = iter((1, 2, 3, 4))
+
+    with campaign.FaultJournal(
+        journal_path,
+        plan.sha256,
+        monotonic_ns=lambda: next(journal_timestamps),
+    ) as journal:
+        markers = campaign.inject_fault_plan_crashes(
+            registry,
+            plan,
+            journal,
+            timeout_s=0.25,
+        )
+
+    assert killed == [
+        (10_000, int(signal.SIGKILL)),
+        (10_001, int(signal.SIGKILL)),
+    ]
+    assert operations == [
+        ("kill", 10_000),
+        ("kill", 10_001),
+        ("wait", 10_000),
+        ("wait", 10_001),
+    ]
+    assert markers == [
+        {
+            "replica_id": 0,
+            "pid": 10_000,
+            "pgid": 10_000,
+            "signal": "SIGKILL",
+            "signal_number": int(signal.SIGKILL),
+            "requested_monotonic_raw_ns": 101,
+            "confirmed_exit": {
+                "pid": 10_000,
+                "pgid": 10_000,
+                "signal": "SIGKILL",
+                "signal_number": int(signal.SIGKILL),
+                "observed_monotonic_raw_ns": 201,
+            },
+        },
+        {
+            "replica_id": 1,
+            "pid": 10_001,
+            "pgid": 10_001,
+            "signal": "SIGKILL",
+            "signal_number": int(signal.SIGKILL),
+            "requested_monotonic_raw_ns": 102,
+            "confirmed_exit": {
+                "pid": 10_001,
+                "pgid": 10_001,
+                "signal": "SIGKILL",
+                "signal_number": int(signal.SIGKILL),
+                "observed_monotonic_raw_ns": 202,
+            },
+        },
+    ]
+    journal_events = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["fault_id"] for event in journal_events] == [
+        "crash-replica-0",
+        "crash-replica-1",
+        "crash-replica-0",
+        "crash-replica-1",
+    ]
+    assert [event["lifecycle"] for event in journal_events] == [
+        "started",
+        "started",
+        "terminal",
+        "terminal",
+    ]
+    assert [event.get("outcome", {}).get("status") for event in journal_events] == [
+        None,
+        None,
+        "succeeded",
+        "succeeded",
+    ]
+
+
+def test_partial_fault_plan_crash_failure_journals_each_action_truth(
+    tmp_path: Path,
+) -> None:
+    processes = {
+        0: _ManagedProcessDouble(pid=10_000),
+        1: _ManagedProcessDouble(pid=10_001),
+    }
+    processes[1].wait = lambda _timeout: 0  # type: ignore[method-assign]
+    registry = campaign.ProcessRegistry(
+        getpgid=lambda pid: pid,
+        killpg=lambda _pgid, _signal_number: None,
+        get_launcher_pgid=lambda: 99_999,
+        monotonic_ns=iter((101, 102, 201)).__next__,
+        wait_for_exit=lambda process, timeout: process.wait(timeout),
+    )
+    for replica, process in processes.items():
+        registry.register(
+            name=f"replica-{replica}",
+            replica_id=replica,
+            process=process,
+        )
+    plan = campaign.n7_crash_fault_plan()
+    journal_path = tmp_path / "raw" / "fault-orchestrator.jsonl"
+
+    with campaign.FaultJournal(
+        journal_path,
+        plan.sha256,
+        monotonic_ns=iter(range(1, 10)).__next__,
+    ) as journal:
+        lifecycle = campaign.FaultLifecycle(plan, journal)
+        with pytest.raises(campaign.RunnerError, match="SIGKILL"):
+            campaign.inject_fault_plan_crashes(
+                registry,
+                plan,
+                lifecycle,
+                timeout_s=0.25,
+            )
+        lifecycle.finalize()
+
+    terminals = [
+        event
+        for event in (
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        )
+        if event["lifecycle"] == "terminal"
+    ]
+    assert [
+        (event["fault_id"], event["outcome"]["status"])
+        for event in terminals
+    ] == [
+        ("crash-replica-0", "succeeded"),
+        ("crash-replica-1", "failed"),
+    ]
+    succeeded, failed = (event["outcome"] for event in terminals)
+    assert succeeded["replica_id"] == 0
+    assert succeeded["returncode"] == -int(signal.SIGKILL)
+    assert succeeded["confirmed_monotonic_raw_ns"] == 201
+    assert failed["replica_id"] == 1
+    assert failed["requested_monotonic_raw_ns"] == 102
+    assert "confirmed_monotonic_raw_ns" not in failed
+    assert "did not exit from SIGKILL" in failed["error"]
 
 
 def test_manager_command_has_no_crash_ground_truth(tmp_path: Path) -> None:
@@ -1268,6 +1508,7 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
             source_instances=instances,
             app_binary=app_binary,
             manager_binary=manager_binary,
+            fault_plan=campaign.n7_crash_fault_plan(),
         )
     )
 
@@ -1292,12 +1533,15 @@ def test_runtime_inputs_bind_five_block_delay_and_one_block_rotation(
     assert manager_command[
         manager_command.index("--convergence-deadline-seconds") + 1
     ] == str(campaign.MANAGER_CONVERGENCE_DEADLINE_S)
+    assert "--experiment-drop-bundle-attempt" not in manager_command
+    assert "--experiment-drop-activation-ack" not in manager_command
     assert len(replica_commands) == 7
     assert [artifact["path"] for artifact in artifacts] == [
         *[f"runtime/replica-{replica}.effective.json" for replica in range(7)],
         "runtime/epoch-input.json",
         "runtime/launch-arguments.json",
     ]
+    assert not (tmp_path / "fault-plan.json").exists()
     effective = json.loads(
         (tmp_path / "runtime" / "replica-0.effective.json").read_text()
     )

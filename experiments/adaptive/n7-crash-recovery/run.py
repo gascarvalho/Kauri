@@ -12,6 +12,7 @@ that a run passed on its own.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass
 import datetime as dt
 import hashlib
@@ -26,6 +27,24 @@ import sys
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import uuid
+
+
+KAURI_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+if str(KAURI_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(KAURI_REPOSITORY_ROOT))
+
+from experiments.adaptive.kauri_experiment import (  # noqa: E402
+    FaultEvidence,
+    FaultJournal,
+    FaultLifecycle,
+    FaultPlan,
+    ReplicaGroupSigkill,
+    ScenarioContext,
+)
+from experiments.adaptive.kauri_experiment.processes import (  # noqa: E402
+    ProcessRegistry,
+    SigkillBatchError,
+)
 
 
 REPLICA_IDS = tuple(range(7))
@@ -94,6 +113,38 @@ SECP256K1_HALF_ORDER = bytes.fromhex(
     "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0"
 )
 FORBIDDEN_COMMAND_TOKENS = frozenset({"killall", "pkill", "sudo", "ssh"})
+FAULT_ERROR_MAX_CHARS = 512
+
+
+def n7_fault_context() -> ScenarioContext:
+    """Return the fixed FI-Core limits for the real N=7 runners."""
+
+    return ScenarioContext(
+        replica_ids=REPLICA_IDS,
+        quorum=QUORUM,
+        crash_budget=FAULT_THRESHOLD,
+        successor_bundle_retry_limit=5,
+    )
+
+
+def n7_crash_fault_plan() -> FaultPlan:
+    """Return the ordinary runner's ordered, crash-only fault plan."""
+
+    return FaultPlan(
+        context=n7_fault_context(),
+        seed=SNAPSHOT_SEED,
+        actions=(
+            ReplicaGroupSigkill(
+                fault_id="crash-replica-0",
+                replica_id=0,
+            ),
+            ReplicaGroupSigkill(
+                fault_id="crash-replica-1",
+                replica_id=1,
+            ),
+        ),
+    )
+
 
 MANIFEST_FIELDS = frozenset(
     {
@@ -1331,6 +1382,7 @@ def write_runtime_inputs(
     app_binary: Path,
     manager_binary: Path,
     manager_extra_args: Sequence[str] = FULL_RUN_MANAGER_EXTRA_ARGS,
+    fault_plan: FaultPlan | None = None,
 ) -> tuple[Path, list[Path], tuple[str, ...], list[tuple[str, ...]], list[dict[str, Any]]]:
     config_directory = run_directory / "config"
     runtime_directory = run_directory / "runtime"
@@ -1447,7 +1499,10 @@ def write_runtime_inputs(
         run_id=run_id,
         source_instance=source_instances[MANAGER_SOURCE_ID],
         structured_event_path=raw_directory / "adaptive-manager.jsonl",
-        manager_extra_args=manager_extra_args,
+        manager_extra_args=(
+            *manager_extra_args,
+            *(fault_plan.manager_cli_args() if fault_plan is not None else ()),
+        ),
         **manager_options,
     )
     epoch_input_path = runtime_directory / "epoch-input.json"
@@ -1549,6 +1604,41 @@ def spawn_process(
     except Exception:
         log_handle.close()
         raise
+
+
+def register_fault_replica(
+    registry: ProcessRegistry,
+    record: ProcessRecord,
+) -> None:
+    """Map one legacy runner record into FI-Core's safe registry."""
+
+    replica_id = record.replica_id
+    if (
+        type(replica_id) is not int
+        or record.name != f"replica-{replica_id}"
+        or int(record.process.pid) != record.pid
+    ):
+        raise RunnerError(
+            "fault registry requires an exact spawned replica identity"
+        )
+    try:
+        registered = registry.register(
+            name=record.name,
+            replica_id=replica_id,
+            process=record.process,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise RunnerError(
+            f"cannot register {record.name} for fault injection: {exc}"
+        ) from exc
+    if (
+        registered.pid != record.pid
+        or registered.pgid != record.pgid
+        or registered.process is not record.process
+    ):
+        raise RunnerError(
+            f"fault registry identity differs for {record.name}"
+        )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -2503,6 +2593,197 @@ def _wait(
     raise RunnerError(f"timed out waiting for {description}")
 
 
+def inject_fault_plan_crashes(
+    registry: ProcessRegistry,
+    fault_plan: FaultPlan,
+    lifecycle: FaultLifecycle | FaultJournal,
+    *,
+    timeout_s: float,
+) -> list[dict[str, Any]]:
+    """Execute one ordered N=7 SIGKILL batch through FI-Core."""
+
+    if isinstance(lifecycle, FaultJournal):
+        lifecycle = FaultLifecycle(fault_plan, lifecycle)
+
+    actions = fault_plan.actions_of_type(ReplicaGroupSigkill)
+    if (
+        fault_plan.context != n7_fault_context()
+        or tuple(action.replica_id for action in actions) != CRASH_TARGETS
+    ):
+        raise RunnerError(
+            "crash injection requires the exact N=7 targets 0 then 1"
+        )
+
+    started_fault_ids: list[str] = []
+    terminal_fault_ids: set[str] = set()
+    try:
+        for action in actions:
+            lifecycle.start(action.fault_id)
+            started_fault_ids.append(action.fault_id)
+
+        outcomes = registry.sigkill_replica_groups(
+            tuple(
+                (action.fault_id, action.replica_id)
+                for action in actions
+            ),
+            timeout_s=timeout_s,
+        )
+    except SigkillBatchError as exc:
+        results = exc.results
+        if len(results) != len(actions):
+            raise RunnerError(
+                "SIGKILL batch failure returned incomplete result evidence"
+            ) from exc
+        for action, result in zip(actions, results, strict=True):
+            if (
+                result.fault_id != action.fault_id
+                or result.replica_id != action.replica_id
+                or result.status
+                not in {"succeeded", "failed", "not_signalled"}
+            ):
+                raise RunnerError(
+                    "SIGKILL batch failure evidence differs from the "
+                    "fault plan"
+                ) from exc
+
+            terminal_outcome: dict[str, object]
+            if result.status == "succeeded":
+                outcome = result.outcome
+                if outcome is None or result.error is not None:
+                    raise RunnerError(
+                        "successful SIGKILL result lacks confirmed evidence"
+                    ) from exc
+                terminal_outcome = {
+                    "confirmed_monotonic_raw_ns": (
+                        outcome.confirmed_monotonic_ns
+                    ),
+                    "pgid": outcome.pgid,
+                    "pid": outcome.pid,
+                    "replica_id": outcome.replica_id,
+                    "requested_monotonic_raw_ns": (
+                        outcome.requested_monotonic_ns
+                    ),
+                    "returncode": outcome.returncode,
+                    "signal": "SIGKILL",
+                    "signal_number": outcome.signal_number,
+                }
+            else:
+                if result.outcome is not None or result.error is None:
+                    raise RunnerError(
+                        "unsuccessful SIGKILL result has invalid evidence"
+                    ) from exc
+                terminal_outcome = {
+                    "error": result.error[:FAULT_ERROR_MAX_CHARS],
+                    "pgid": result.pgid,
+                    "pid": result.pid,
+                    "replica_id": result.replica_id,
+                    "signal": "SIGKILL",
+                    "signal_number": result.signal_number,
+                }
+                if result.requested_monotonic_ns is not None:
+                    terminal_outcome["requested_monotonic_raw_ns"] = (
+                        result.requested_monotonic_ns
+                    )
+            lifecycle.terminal(
+                fault_id=action.fault_id,
+                status=result.status,
+                outcome=terminal_outcome,
+            )
+            terminal_fault_ids.add(action.fault_id)
+        raise RunnerError(str(exc)[:FAULT_ERROR_MAX_CHARS]) from exc
+    except (Exception, KeyboardInterrupt) as exc:
+        error = str(exc).strip() or type(exc).__name__
+        error = error[:FAULT_ERROR_MAX_CHARS]
+        for fault_id in started_fault_ids:
+            if fault_id in terminal_fault_ids:
+                continue
+            lifecycle.terminal(
+                fault_id,
+                "failed",
+                {"error": error},
+            )
+            terminal_fault_ids.add(fault_id)
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        if isinstance(exc, RunnerError):
+            raise
+        raise RunnerError(f"SIGKILL fault batch failed: {error}") from exc
+    try:
+        if len(outcomes) != len(actions):
+            raise RunnerError(
+                "SIGKILL batch returned an incomplete outcome set"
+            )
+        for action, outcome in zip(actions, outcomes, strict=True):
+            if (
+                outcome.fault_id != action.fault_id
+                or outcome.replica_id != action.replica_id
+            ):
+                raise RunnerError(
+                    "SIGKILL batch outcome differs from the fault plan"
+                )
+
+        for action, outcome in zip(actions, outcomes, strict=True):
+            lifecycle.terminal(
+                fault_id=action.fault_id,
+                status="succeeded",
+                outcome={
+                    "confirmed_monotonic_raw_ns": (
+                        outcome.confirmed_monotonic_ns
+                    ),
+                    "pgid": outcome.pgid,
+                    "pid": outcome.pid,
+                    "replica_id": outcome.replica_id,
+                    "requested_monotonic_raw_ns": (
+                        outcome.requested_monotonic_ns
+                    ),
+                    "returncode": outcome.returncode,
+                    "signal": "SIGKILL",
+                    "signal_number": outcome.signal_number,
+                },
+            )
+            terminal_fault_ids.add(action.fault_id)
+    except (Exception, KeyboardInterrupt) as exc:
+        error = str(exc).strip() or type(exc).__name__
+        error = error[:FAULT_ERROR_MAX_CHARS]
+        for fault_id in started_fault_ids:
+            if fault_id in terminal_fault_ids:
+                continue
+            lifecycle.terminal(
+                fault_id,
+                "failed",
+                {"error": error},
+            )
+            terminal_fault_ids.add(fault_id)
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        if isinstance(exc, RunnerError):
+            raise
+        raise RunnerError(f"SIGKILL fault batch failed: {error}") from exc
+
+    return [
+        {
+            "replica_id": outcome.replica_id,
+            "pid": outcome.pid,
+            "pgid": outcome.pgid,
+            "signal": "SIGKILL",
+            "signal_number": outcome.signal_number,
+            "requested_monotonic_raw_ns": (
+                outcome.requested_monotonic_ns
+            ),
+            "confirmed_exit": {
+                "pid": outcome.pid,
+                "pgid": outcome.pgid,
+                "signal": "SIGKILL",
+                "signal_number": outcome.signal_number,
+                "observed_monotonic_raw_ns": (
+                    outcome.confirmed_monotonic_ns
+                ),
+            },
+        }
+        for outcome in outcomes
+    ]
+
+
 def inject_sigkill_crashes(
     records_by_replica: Mapping[int, ProcessRecord],
     targets: Sequence[int],
@@ -3060,6 +3341,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         for replica in REPLICA_IDS
     }
     source_instances[MANAGER_SOURCE_ID] = f"{run_id}-manager-{uuid.uuid4().hex}"
+    fault_plan = n7_crash_fault_plan()
     state_path = run_directory / "runner-state.json"
     state: dict[str, Any] = {
         "schema_version": 1,
@@ -3076,7 +3358,9 @@ def run(argv: Sequence[str] | None = None) -> int:
     _write_json_exclusive(state_path, state)
 
     records: list[ProcessRecord] = []
-    records_by_replica: dict[int, ProcessRecord] = {}
+    fault_registry = ProcessRegistry(monotonic_ns=monotonic_raw_ns)
+    fault_resources = ExitStack()
+    fault_lifecycle: FaultLifecycle | None = None
     crash_markers: list[dict[str, Any]] = []
     crash_configuration_boundary: dict[str, Any] | None = None
     runtime_artifacts: list[dict[str, Any]] = []
@@ -3145,6 +3429,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
     try:
+        fault_lifecycle = fault_resources.enter_context(
+            FaultEvidence(
+                run_directory,
+                fault_plan,
+                monotonic_ns=monotonic_raw_ns,
+            )
+        )
         bls, tls, issuer = generate_identities(
             binaries["keygen"], binaries["tls_keygen"], run_directory / "config"
         )
@@ -3161,6 +3452,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             source_instances=source_instances,
             app_binary=binaries["app"],
             manager_binary=binaries["manager"],
+            fault_plan=fault_plan,
         )
         state["phase"] = "launch"
         _replace_json(state_path, state)
@@ -3181,7 +3473,7 @@ def run(argv: Sequence[str] | None = None) -> int:
                 replica_id=replica_id,
             )
             records.append(record)
-            records_by_replica[replica_id] = record
+            register_fault_replica(fault_registry, record)
         update_manifest()
 
         def all_ready() -> bool:
@@ -3269,9 +3561,12 @@ def run(argv: Sequence[str] | None = None) -> int:
         state["phase"] = "crash"
         state["crash_configuration_boundary"] = crash_configuration_boundary
         _replace_json(state_path, state)
-        crash_markers = inject_sigkill_crashes(
-            records_by_replica,
-            CRASH_TARGETS,
+        if fault_lifecycle is None:
+            raise RunnerError("fault lifecycle was not opened before launch")
+        crash_markers = inject_fault_plan_crashes(
+            fault_registry,
+            fault_plan,
+            fault_lifecycle,
             timeout_s=args.crash_confirm_timeout,
         )
         assert crash_configuration_boundary is not None
@@ -3614,22 +3909,36 @@ def run(argv: Sequence[str] | None = None) -> int:
     except (RunnerError, OSError, subprocess.SubprocessError) as exc:
         runtime_error = str(exc)
     finally:
-        state["phase"] = "cleanup"
-        state["runtime_error"] = runtime_error
-        _replace_json(state_path, state)
-        if records:
-            shutdown_exits, process_errors = _audit_and_shutdown_processes(
-                records,
-                audit_required=runtime_error is None and not interrupted,
-                allow_clean_exit=allow_completed_manager_exit,
-            )
-            unexpected_exits.extend(shutdown_exits)
-            runtime_error = _merge_runtime_errors(runtime_error, process_errors)
-        remaining = _wait_listeners_stopped(ports, 5.0)
-        if remaining:
+        try:
+            state["phase"] = "cleanup"
+            state["runtime_error"] = runtime_error
+            _replace_json(state_path, state)
+            if records:
+                shutdown_exits, process_errors = _audit_and_shutdown_processes(
+                    records,
+                    audit_required=runtime_error is None and not interrupted,
+                    allow_clean_exit=allow_completed_manager_exit,
+                )
+                unexpected_exits.extend(shutdown_exits)
+                runtime_error = _merge_runtime_errors(
+                    runtime_error,
+                    process_errors,
+                )
+            remaining = _wait_listeners_stopped(ports, 5.0)
+            if remaining:
+                runtime_error = _merge_runtime_errors(
+                    runtime_error,
+                    [f"listeners remained active after cleanup: {remaining}"],
+                )
+        finally:
+            fault_errors: list[str] = []
+            try:
+                fault_resources.close()
+            except (OSError, RuntimeError, ValueError) as exc:
+                fault_errors.append(f"fault evidence close failed: {exc}")
             runtime_error = _merge_runtime_errors(
                 runtime_error,
-                [f"listeners remained active after cleanup: {remaining}"],
+                fault_errors,
             )
         if end_ns <= baseline_start_ns:
             end_ns = baseline_start_ns + 1
