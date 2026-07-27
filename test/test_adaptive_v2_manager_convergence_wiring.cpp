@@ -909,8 +909,47 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "manager drains reputation audit backpressure before every exact record",
-    "[adaptive-v2][manager][reputation][structured-event][wiring]")
+    "manager does not report ready or dispatch after initial cycle start fails",
+    "[adaptive-v2][manager][startup][failure][lifecycle][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    const auto run = function_body(manager, "int run()");
+    REQUIRE_FALSE(run.empty());
+
+    const auto failed_start = run.find("if (!begin_current_cycle())");
+    REQUIRE(failed_start != std::string::npos);
+    const auto operational_guard = run.find("if (!failed_)", failed_start);
+    REQUIRE(operational_guard != std::string::npos);
+    CHECK(failed_start < operational_guard);
+    CHECK(contains_in_order(
+        run.substr(failed_start),
+        {"if (!begin_current_cycle())", "fail(", "if (!failed_)"}));
+
+    const auto fail = function_body(
+        manager, "void fail(const char *reason) noexcept");
+    REQUIRE_FALSE(fail.empty());
+    CHECK(contains_in_order(
+        fail, {"failed_ = true", "event_context_.stop()"}));
+
+    const auto operational = function_body(
+        run.substr(operational_guard), "if (!failed_)");
+    REQUIRE_FALSE(operational.empty());
+    CHECK(contains_in_order(
+        operational,
+        {"ProcessLifecycleState::ready",
+         "structured_event_drain_timer.add(",
+         "event_context_.dispatch()"}));
+    CHECK(count_occurrences(
+              run, "ProcessLifecycleState::ready") == 1);
+    CHECK(count_occurrences(
+              run, "event_context_.dispatch()") == 1);
+}
+
+TEST_CASE(
+    "manager isolates reputation snapshot and convergence audit bursts",
+    "[adaptive-v2][manager][reputation][snapshot][convergence]"
+    "[structured-event][wiring]")
 {
     const auto manager = code_without_comments_or_literals(
         source("examples/adaptation_manager.cpp"));
@@ -928,6 +967,41 @@ TEST_CASE(
          "structured_event_sink_.emit_audit(",
          "structured_event_sink_.health()",
          "++emitted_score_trajectory_"}));
+
+    const auto loop = function_body(
+        trajectory,
+        "while (emitted_score_trajectory_ < trajectory.size())");
+    REQUIRE_FALSE(loop.empty());
+    const auto loop_position = trajectory.find(loop);
+    REQUIRE(loop_position != std::string::npos);
+    const auto after_loop =
+        trajectory.substr(loop_position + loop.size());
+    CHECK(contains_in_order(
+        after_loop,
+        {"structured_event_sink_.drain()",
+         "structured_event_sink_.health()",
+         "fail(",
+         "return"}));
+
+    const auto snapshot = function_body(
+        manager, "void emit_evidence_snapshot(");
+    REQUIRE_FALSE(snapshot.empty());
+    CHECK(contains_in_order(
+        snapshot,
+        {"structured_event_sink_.emit_audit(",
+         "structured_event_sink_.drain()",
+         "structured_event_sink_.health()",
+         "write_exclusive_json("}));
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(evaluate.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"emit_new_score_trajectory()",
+         "if (failed_)",
+         "emit_evidence_snapshot(",
+         "session_.start_convergence(",
+         "drive_convergence()"}));
 }
 
 TEST_CASE(

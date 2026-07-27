@@ -1462,13 +1462,16 @@ public:
             if (!begin_current_cycle())
                 fail("manager_cycle_start_failed");
 
-            HOTSTUFF_LOG_INFO(
-                "KAURI_ADAPTIVE_MANAGER listening=%s n=7 f=2 quorum=5",
-                std::string(options_.listen_address).c_str());
-            emit_process_lifecycle(
-                hotstuff::ProcessLifecycleState::ready);
-            structured_event_drain_timer.add(0.05);
-            event_context_.dispatch();
+            if (!failed_)
+            {
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_ADAPTIVE_MANAGER listening=%s n=7 f=2 quorum=5",
+                    std::string(options_.listen_address).c_str());
+                emit_process_lifecycle(
+                    hotstuff::ProcessLifecycleState::ready);
+                structured_event_drain_timer.add(0.05);
+                event_context_.dispatch();
+            }
 
             emit_process_lifecycle(
                 hotstuff::ProcessLifecycleState::stopping);
@@ -1875,10 +1878,11 @@ private:
         canonical_payload.push_back('\n');
         structured_event_sink_.emit_audit(
             hotstuff::AuditStructuredEventPayload{event});
+        structured_event_sink_.drain();
         if (!structured_event_sink_.health().healthy)
         {
             throw std::runtime_error(
-                "evidence snapshot audit emission failed");
+                "evidence snapshot audit drain failed");
         }
         write_exclusive_json(
             request.evidence_snapshot_output, canonical_payload);
@@ -2033,6 +2037,12 @@ private:
                 return;
             }
             ++emitted_score_trajectory_;
+        }
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+        {
+            fail("structured_event_reputation_final_drain_failed");
+            return;
         }
     }
 
