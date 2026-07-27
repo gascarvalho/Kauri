@@ -376,6 +376,21 @@ struct has_complete_terminal_record<
                      .winning_activation.has_value())>> : std::true_type
 {};
 
+template<typename Record, typename = void>
+struct has_terminal_convergence_counts : std::false_type
+{};
+
+template<typename Record>
+struct has_terminal_convergence_counts<
+    Record,
+    std::void_t<
+        decltype(
+            std::declval<const Record &>().accepted_commit_count),
+        decltype(
+            std::declval<const Record &>().accepted_activation_count)>>
+    : std::true_type
+{};
+
 template<typename Session, typename Record, typename = void>
 struct has_cycle_finalizers : std::false_type
 {};
@@ -721,6 +736,30 @@ struct Fixture
         return identity;
     }
 };
+
+template<typename Record>
+void verify_terminal_convergence_counts_survive_rotation()
+{
+    Fixture fixture;
+    const auto identity = fixture.complete_cycle(
+        containment_policy(), 1'600, 160);
+    REQUIRE(fixture.session.terminal_records().size() == 1);
+    const Record &record = fixture.session.terminal_records().front();
+
+    if constexpr (!has_terminal_convergence_counts<Record>::value)
+    {
+        FAIL(
+            "ACK-drain RED: the immutable terminal record loses the final "
+            "accepted commit and activation counts after session rotation");
+    }
+    else
+    {
+        CHECK(record.accepted_commit_count == kSurvivors.size());
+        CHECK(record.accepted_activation_count == kSurvivors.size());
+        REQUIRE(record.winning_activation.has_value());
+        CHECK(*record.winning_activation == identity);
+    }
+}
 
 std::vector<ReplicaID> roots(
     const hotstuff::EpochDefinition &epoch)
@@ -1742,6 +1781,15 @@ TEST_CASE(
     "[intentional-red]")
 {
     verify_bounded_execution_audit_contract<AdaptiveV2ManagerSession>();
+}
+
+TEST_CASE(
+    "terminal record retains Q convergence counts after ready rotation",
+    "[adaptive-v2][manager-session][terminal][ack-drain][audit]"
+    "[intentional-red]")
+{
+    verify_terminal_convergence_counts_survive_rotation<
+        AdaptiveV2ManagerSessionTerminalRecord>();
 }
 
 TEST_CASE(

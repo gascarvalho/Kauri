@@ -236,6 +236,13 @@ struct AdaptiveV2ManagerSession::State
         }
         if (winning != nullptr)
             record.winning_activation = *winning;
+        if (convergence != nullptr)
+        {
+            record.accepted_commit_count =
+                convergence->accepted_commit_count();
+            record.accepted_activation_count =
+                convergence->accepted_activation_count();
+        }
 
         try
         {

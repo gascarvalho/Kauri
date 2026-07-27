@@ -1554,19 +1554,43 @@ private:
         event.delivery_attempt = delivery_attempt;
         event.disposition = disposition;
         event.identity = std::move(identity);
-        const auto convergence = session_.convergence_audit();
-        if (convergence.has_value())
+        bool terminal_counts_applied = false;
+        if (event.identity.has_value())
         {
-            event.accepted_commit_count =
-                convergence->accepted_commit_count;
-            event.accepted_activation_count =
-                transition ==
-                            hotstuff::AdaptiveV2ConvergenceTransition::
-                                converged ||
-                        transition ==
-                            hotstuff::AdaptiveV2ConvergenceTransition::ready
-                    ? convergence->winning_activation_count
-                    : convergence->accepted_activation_count;
+            const auto &records = session_.terminal_records();
+            const auto record = std::find_if(
+                records.rbegin(),
+                records.rend(),
+                [&event](const auto &candidate) {
+                    return candidate.winning_activation.has_value() &&
+                        *candidate.winning_activation == *event.identity;
+                });
+            if (record != records.rend())
+            {
+                event.accepted_commit_count =
+                    record->accepted_commit_count;
+                event.accepted_activation_count =
+                    record->accepted_activation_count;
+                terminal_counts_applied = true;
+            }
+        }
+        if (!terminal_counts_applied)
+        {
+            const auto convergence = session_.convergence_audit();
+            if (convergence.has_value())
+            {
+                event.accepted_commit_count =
+                    convergence->accepted_commit_count;
+                event.accepted_activation_count =
+                    transition ==
+                                hotstuff::AdaptiveV2ConvergenceTransition::
+                                    converged ||
+                            transition ==
+                                hotstuff::AdaptiveV2ConvergenceTransition::
+                                    ready
+                        ? convergence->winning_activation_count
+                        : convergence->accepted_activation_count;
+            }
         }
         event.required_activation_count = kSmokeQuorum;
         event.canonical_payload_digest =

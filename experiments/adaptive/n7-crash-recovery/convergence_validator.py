@@ -1345,12 +1345,17 @@ def _validate_convergence(
         ("activation retransmission", duplicate_payload),
         ("activation ACK during drain", acked_payload),
     ):
-        if (
-            payload["identity"] != identity
-            or payload["accepted_activation_count"] != QUORUM
-            or payload["replica_id"] != target
-        ):
+        if payload["identity"] != identity:
             raise ValidationError(f"{label} does not carry the winning identity")
+        if payload["replica_id"] != target:
+            raise ValidationError(f"{label} comes from the wrong replica")
+        if (
+            payload["accepted_commit_count"] != len(commit_sources)
+            or payload["accepted_activation_count"] != QUORUM
+        ):
+            raise ValidationError(
+                f"{label} does not retain the terminal convergence counts"
+            )
     digests = {
         accepted_payload["canonical_payload_digest"],
         drop_payload["canonical_payload_digest"],

@@ -1065,6 +1065,39 @@ def test_ack_recovery_must_preserve_the_winning_identity(
     assert "winning identity" in verdict["reason"].lower()
 
 
+@pytest.mark.parametrize("disposition", ("duplicate", "ack_sent"))
+def test_ack_recovery_count_failure_is_distinct_from_identity_and_target(
+    tmp_path: Path, disposition: str
+) -> None:
+    manifest, epochs = convergence_run.create_run(
+        tmp_path / f"lost-terminal-counts-{disposition}"
+    )
+
+    def clear_terminal_counts(values: list[dict[str, Any]]) -> None:
+        event = next(
+            value
+            for value in values
+            if value["event_type"] == "adaptive_v2_activation_observed"
+            and value["payload"].get("replica_id") == 6
+            and value["payload"].get("disposition") == disposition
+        )
+        event["payload"]["accepted_commit_count"] = 0
+        event["payload"]["accepted_activation_count"] = 0
+
+    _manager_mutation(manifest, clear_terminal_counts)
+    verdict = _validator().validate_run(
+        manifest,
+        epochs,
+        tmp_path / f"validated-lost-terminal-counts-{disposition}",
+    )
+
+    reason = verdict["reason"].lower()
+    assert verdict["verdict"] == "FAIL"
+    assert "count" in reason
+    assert "winning identity" not in reason
+    assert "wrong replica" not in reason
+
+
 @pytest.mark.parametrize("ack_sent_ns", (3_509_999_999, 3_510_000_000))
 def test_ack_sent_before_or_at_dropped_ack_fails(
     tmp_path: Path, ack_sent_ns: int

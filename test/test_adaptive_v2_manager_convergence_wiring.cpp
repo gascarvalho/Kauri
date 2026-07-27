@@ -691,6 +691,36 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "ACK drain projects matching immutable terminal convergence counts",
+    "[adaptive-v2][convergence][manager][terminal][ack-drain][audit]"
+    "[wiring][intentional-red]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    const auto emit = function_body(
+        manager, "void emit_convergence_event(");
+    REQUIRE_FALSE(emit.empty());
+
+    const auto terminal_records =
+        emit.find("session_.terminal_records()");
+    const auto live_convergence =
+        emit.find("session_.convergence_audit()");
+    REQUIRE(terminal_records != std::string::npos);
+    REQUIRE(live_convergence != std::string::npos);
+    CHECK(terminal_records < live_convergence);
+    CHECK(contains_in_order(
+        emit,
+        {"session_.terminal_records()",
+         "winning_activation",
+         "event.identity",
+         "accepted_commit_count",
+         "accepted_activation_count"}));
+    CHECK(emit.find(
+              "*candidate.winning_activation == *event.identity") !=
+          std::string::npos);
+}
+
+TEST_CASE(
     "manager owns one recurring session and emits transition terminal proof",
     "[adaptive-v2][manager][session][request-sequence][wiring]"
     "[structured-event][intentional-red]")

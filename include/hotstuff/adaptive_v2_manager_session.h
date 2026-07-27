@@ -71,6 +71,8 @@ struct AdaptiveV2ManagerSessionTerminalRecord
     std::optional<uint256_t> successor_epoch_digest;
     std::optional<uint256_t> command_payload_digest;
     std::optional<AdaptiveV2EpochChangeIdentity> winning_activation;
+    std::size_t accepted_commit_count{0};
+    std::size_t accepted_activation_count{0};
 };
 
 struct AdaptiveV2ManagerControllerAuditSnapshot
