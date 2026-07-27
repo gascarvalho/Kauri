@@ -4830,17 +4830,53 @@ def _validate_recurring_commits(
                 "next transition command precedes a common predecessor commit"
             )
 
+    for activation_ns in activation_times:
+        if (
+            activation_ns
+            > analysis.UINT64_MAX
+            - manifest.minimum_post_activation_grace_ns
+        ):
+            raise ValidationError(
+                "post-activation throughput boundary overflows monotonic time"
+            )
     windows = manifest.throughput_windows
-    if (
-        windows[0].start_ns != manifest.baseline_start_ns
-        or windows[0].end_ns != crash_ns
-        or windows[-1].end_ns != manifest.end_ns
-        or windows[2].start_ns < common_first_ns[0]
-        or windows[2].end_ns > command_times[1]
-        or windows[3].start_ns < common_first_ns[1]
-    ):
+    expected_windows = (
+        analysis.PhaseWindow(
+            "baseline",
+            epochs.epochs[0].epoch_number,
+            manifest.baseline_start_ns,
+            crash_ns,
+        ),
+        analysis.PhaseWindow(
+            "degraded",
+            epochs.epochs[0].epoch_number,
+            crash_ns,
+            command_times[0],
+        ),
+        analysis.PhaseWindow(
+            "containment",
+            epochs.epochs[1].epoch_number,
+            max(
+                activation_times[0]
+                + manifest.minimum_post_activation_grace_ns,
+                common_first_ns[0],
+            ),
+            command_times[1],
+        ),
+        analysis.PhaseWindow(
+            "optimized",
+            epochs.epochs[2].epoch_number,
+            max(
+                activation_times[1]
+                + manifest.minimum_post_activation_grace_ns,
+                common_first_ns[1],
+            ),
+            manifest.end_ns,
+        ),
+    )
+    if windows != expected_windows:
         raise ValidationError(
-            "four throughput windows do not bind the causal transition boundaries"
+            "four throughput windows do not match their exact causal boundaries"
         )
     try:
         throughput = analysis.analyze_throughput(commits, windows)

@@ -274,6 +274,36 @@ def test_complete_recurring_run_requires_exact_two_cycle_causality(
     }
 
 
+@pytest.mark.parametrize(
+    ("phase", "start_offset_ns", "end_offset_ns"),
+    (
+        ("degraded", 4_000_000_000, 4_000_000_000),
+        ("containment", 0, -1_000_000_000),
+    ),
+)
+def test_recurring_windows_require_exact_causal_boundaries(
+    tmp_path: Path,
+    phase: str,
+    start_offset_ns: int,
+    end_offset_ns: int,
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    value = synthetic_run.load(manifest)
+    window = next(
+        item
+        for item in value["throughput_windows"]
+        if item["phase"] == phase
+    )
+    window["start_ns"] += start_offset_ns
+    window["end_ns"] += end_offset_ns
+    synthetic_run.save(manifest, value)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "exact causal boundaries" in verdict["reason"]
+
+
 def test_recurring_manager_exit_after_only_first_cycle_is_incomplete(
     tmp_path: Path,
 ) -> None:

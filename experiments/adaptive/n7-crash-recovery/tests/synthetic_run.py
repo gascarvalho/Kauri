@@ -121,6 +121,7 @@ CRASH_0_NS = 36_000_000_000
 CRASH_1_NS = 36_100_000_000
 COMMAND_NS = 54_100_000_000
 ACTIVATION_NS = 74_100_000_000
+RECURRING_COMMAND_NS = 71_000_000_000
 SECOND_COMMAND_NS = 116_100_000_000
 SECOND_ACTIVATION_NS = 136_100_000_000
 MINIMUM_POST_ACTIVATION_GRACE_NS = 1_000_000_000
@@ -372,13 +373,13 @@ def recurring_throughput_windows() -> list[dict[str, Any]]:
             "phase": "degraded",
             "epoch_number": 0,
             "start_ns": CRASH_0_NS,
-            "end_ns": 71_000_000_000,
+            "end_ns": RECURRING_COMMAND_NS + 2_000_000,
         },
         {
             "phase": "containment",
             "epoch_number": 1,
             "start_ns": 76_006_000_000,
-            "end_ns": SECOND_COMMAND_NS,
+            "end_ns": SECOND_COMMAND_NS + 2_000_000,
         },
         {
             "phase": "optimized",
@@ -701,6 +702,14 @@ def _recurring_replica_events(replica: int) -> list[dict[str, Any]]:
 
     source_id = f"replica-{replica}"
     instance = f"synthetic-{source_id}-instance"
+    first_command = next(
+        event
+        for event in events
+        if event["event_type"] == "epoch.command_committed"
+    )
+    first_command["source_monotonic_ns"] = (
+        RECURRING_COMMAND_NS + replica * 1_000_000
+    )
     second_command = command_payload(1)
     events.append(
         _envelope(
