@@ -9,7 +9,10 @@
 
 #include "catch.hpp"
 #include "hotstuff/adaptive_v2_manager_ingress.h"
+#include "hotstuff/adaptive_v2_manager_session.h"
+#include "hotstuff/adaptive_v2_response_evidence.h"
 #include "hotstuff/epoch_activation.h"
+#include "hotstuff/evidence_reputation.h"
 
 namespace
 {
@@ -18,13 +21,21 @@ using hotstuff::AdaptiveV2ManagerIngress;
 using hotstuff::AdaptiveV2ManagerIngressLimits;
 using hotstuff::AdaptiveV2ManagerLifecycleResult;
 using hotstuff::AdaptiveV2ManagerIngressStatus;
+using hotstuff::AdaptiveV2ManagerSession;
+using hotstuff::AdaptiveV2ManagerSessionConfig;
 using hotstuff::AdaptiveV2ReadinessNotice;
+using hotstuff::AdaptiveV2ResponseEvidenceBridge;
+using hotstuff::AdaptiveV2ResponseEvidenceLimits;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
 using hotstuff::EpochDefinitionInput;
 using hotstuff::EpochTreeDefinition;
 using hotstuff::EvidenceLedger;
+using hotstuff::EvidenceReportEnvelope;
+using hotstuff::EvidenceReputationApplyStatus;
+using hotstuff::EvidenceReputationProjection;
+using hotstuff::EvidenceTransportResult;
 using hotstuff::ExpectedMessageType;
 using hotstuff::MsgAdaptiveV2ReadinessNotice;
 using hotstuff::MsgEvidenceReport;
@@ -36,12 +47,16 @@ using hotstuff::ProposalKey;
 using hotstuff::ProposalLifecycleApplyStatus;
 using hotstuff::ProposalLifecycleFact;
 using hotstuff::ProposalLifecycleNotice;
+using hotstuff::ProposalTreeSnapshot;
 using hotstuff::ProposalRetirementFloorAdvanced;
 using hotstuff::ProposalRuntimeAborted;
 using hotstuff::ReplicaID;
 using hotstuff::ResponseObservation;
 using hotstuff::ResponseObservationBatch;
 using hotstuff::ResponseOutcome;
+using hotstuff::SimpleReputation;
+using hotstuff::TreePlacementInput;
+using hotstuff::TreeShape;
 using hotstuff::bytearray_t;
 using hotstuff::uint256_t;
 
@@ -100,6 +115,60 @@ AdaptiveV2ManagerIngressLimits limits()
     configured.lifecycle_accounting = {16, 4096, 64};
     configured.maximum_pending_lifecycle_facts_per_source = 4;
     return configured;
+}
+
+AdaptiveV2ManagerSessionConfig e08_session_config(
+    const AdaptiveV2ManagerIngressLimits &ingress_limits)
+{
+    AdaptiveV2ManagerSessionConfig configured;
+    configured.active_tree_id = 0;
+    configured.activation_generation = 3;
+    configured.ingress_limits = ingress_limits;
+    configured.controller.placement = TreePlacementInput{
+        membership(),
+        TreeShape{2, 2, 5},
+        0xE08,
+        "e08-cross-layer-characterization-v1"};
+    configured.controller.activation_delay_blocks = 5;
+    configured.retry_interval_ticks = 1;
+    configured.maximum_attempts_per_recipient = 1;
+    configured.convergence_window_ticks = 1;
+    return configured;
+}
+
+AdaptiveV2ResponseEvidenceLimits e08_bridge_limits(
+    const AdaptiveV2ManagerIngressLimits &ingress_limits)
+{
+    AdaptiveV2ResponseEvidenceLimits configured;
+    configured.attempts.maximum_attempts = 2;
+    configured.attempts.maximum_signers_per_response = 7;
+    configured.attempts.maximum_generation =
+        std::numeric_limits<std::uint64_t>::max();
+    configured.reporter.maximum_pending_reports = 2;
+    configured.wire = ingress_limits.evidence_wire;
+    configured.maximum_handles = 2;
+    configured.maximum_retained_facts = 2;
+    configured.maximum_late_compensations = 2;
+    return configured;
+}
+
+ProposalTreeSnapshot e08_response_tree()
+{
+    ProposalTreeSnapshot tree;
+    tree.local_replica = 0;
+    tree.root = 0;
+    tree.direct_children = {1, 2};
+    tree.assigned_subtree = membership();
+    tree.child_subtrees = {
+        {1, {1, 3, 4}},
+        {2, {2, 5, 6}}};
+    tree.required_subtree = {0, 1, 2, 3, 4, 5, 6};
+    tree.required_child_subtrees = {
+        {1, {1, 3, 4}},
+        {2, {2, 5, 6}}};
+    tree.fanout = 2;
+    tree.pipeline_stretch = 2;
+    return tree;
 }
 
 AdaptiveV2ReadinessNotice readiness(
@@ -1829,6 +1898,216 @@ TEST_CASE(
     CHECK(manager.ingest_readiness(
               AuthenticatedReporter{0}, message)
               .status == AdaptiveV2ManagerIngressStatus::stopped);
+}
+
+TEST_CASE(
+    "E08 bridge evidence preserves reporter-target identity through the "
+    "manager session",
+    "[adaptive-v2][e08][manager-ingress][manager-session]"
+    "[response-evidence][snapshot][authority]")
+{
+    constexpr std::uint64_t start_monotonic_ns = 1'000'000;
+    constexpr std::uint64_t deadline_duration_us = 100;
+    constexpr std::uint64_t nanoseconds_per_microsecond = 1'000;
+    const auto configured = limits();
+    AdaptiveV2ManagerSession session(
+        membership(),
+        epoch_zero(),
+        e08_session_config(configured));
+
+    const auto original_configuration =
+        session.ingress().current_configuration();
+    const auto original_activation_generation =
+        session.ingress().activation_generation();
+    const auto original_epoch_digest =
+        session.ingress().current_epoch().epoch_digest();
+    const auto proposal = ProposalKey{
+        original_configuration,
+        digest("e08-cross-layer-proposal")};
+
+    for (ReplicaID source = 0; source < 3; ++source)
+    {
+        const auto notice = admission(proposal, source, 1);
+        const MsgProposalLifecycleNotice message(
+            notice, configured.lifecycle_wire);
+        const auto result = session.ingest_lifecycle(
+            AuthenticatedReporter{source}, message);
+        CHECK(result.status ==
+              (source < 2
+                   ? AdaptiveV2ManagerIngressStatus::
+                         awaiting_corroboration
+                   : AdaptiveV2ManagerIngressStatus::processed));
+        CHECK(result.lifecycle.index_changed == (source == 2));
+    }
+
+    AdaptiveV2ResponseEvidenceBridge bridge(
+        0, e08_bridge_limits(configured));
+    REQUIRE(bridge.arm(
+        proposal,
+        e08_response_tree(),
+        start_monotonic_ns,
+        deadline_duration_us));
+    REQUIRE(bridge.record_verified_response(
+        proposal,
+        2,
+        ExpectedMessageType::aggregate_relay,
+        {2, 5, 6},
+        start_monotonic_ns +
+            40 * nanoseconds_per_microsecond));
+    REQUIRE(bridge.record_timeouts(
+                proposal,
+                {1},
+                start_monotonic_ns +
+                    deadline_duration_us *
+                        nanoseconds_per_microsecond) == 1);
+    REQUIRE(bridge.diagnostics().pending_reports == 2);
+
+    std::vector<EvidenceReportEnvelope> emitted;
+    std::vector<hotstuff::AdaptiveV2ManagerEvidenceResult> ingested;
+    emitted.reserve(2);
+    ingested.reserve(2);
+    bridge.bind_transport(
+        [&](const EvidenceReportEnvelope &envelope) {
+            emitted.push_back(envelope);
+            const MsgEvidenceReport message(
+                envelope.canonical_payload);
+            ingested.push_back(session.ingest_evidence(
+                AuthenticatedReporter{
+                    envelope.observation.reporter_id},
+                message));
+            const auto &result = ingested.back();
+            return result.status ==
+                           AdaptiveV2ManagerIngressStatus::processed &&
+                       result.accepted_observations == 1 &&
+                       result.rejected_observations == 0
+                       ? EvidenceTransportResult::accepted
+                       : EvidenceTransportResult::permanent_failure;
+        });
+
+    REQUIRE(emitted.size() == 2);
+    REQUIRE(ingested.size() == 2);
+    for (const auto &result : ingested)
+    {
+        CHECK(result.status ==
+              AdaptiveV2ManagerIngressStatus::processed);
+        CHECK(result.decoded_observations == 1);
+        CHECK(result.processed_observations == 1);
+        CHECK(result.accepted_observations == 1);
+        CHECK(result.rejected_observations == 0);
+        CHECK(result.remaining_quarantined_observations == 0);
+    }
+    CHECK(ingested[0].ledger_high_watermark == 1);
+    CHECK(ingested[1].ledger_high_watermark == 2);
+    CHECK(bridge.diagnostics().pending_reports == 0);
+    CHECK(bridge.diagnostics().healthy);
+
+    const auto &accepted = session.ingress().ledger().accepted();
+    REQUIRE(accepted.size() == emitted.size());
+    CHECK(session.ingress().ledger().rejected().empty());
+    CHECK(session.ingress().ledger().high_watermark() == 2);
+    for (std::size_t index = 0; index < accepted.size(); ++index)
+    {
+        CAPTURE(index);
+        const auto &record = accepted[index];
+        const auto &actual = record.observation;
+        const auto &expected = emitted[index].observation;
+        CHECK(record.ingestion_sequence == index + 1);
+        CHECK(actual.schema_version == expected.schema_version);
+        CHECK(actual.observation_id == expected.observation_id);
+        CHECK(actual.reporter_id == expected.reporter_id);
+        CHECK(actual.observed_replica_id ==
+              expected.observed_replica_id);
+        CHECK(actual.configuration == expected.configuration);
+        CHECK(actual.block_hash == expected.block_hash);
+        CHECK(actual.expected_message_type ==
+              expected.expected_message_type);
+        CHECK(actual.outcome == expected.outcome);
+        CHECK(actual.response_duration_us ==
+              expected.response_duration_us);
+        CHECK(actual.deadline_duration_us ==
+              expected.deadline_duration_us);
+        CHECK(actual.reporter_monotonic_ns ==
+              expected.reporter_monotonic_ns);
+        CHECK(actual.reporter_sequence ==
+              expected.reporter_sequence);
+        CHECK(actual.signer_set == expected.signer_set);
+        CHECK(actual.attempt_identity() ==
+              expected.attempt_identity());
+    }
+
+    CHECK(accepted[0].observation.reporter_id == 0);
+    CHECK(accepted[0].observation.observed_replica_id == 2);
+    CHECK(accepted[0].observation.expected_message_type ==
+          ExpectedMessageType::aggregate_relay);
+    CHECK(accepted[0].observation.outcome ==
+          ResponseOutcome::on_time);
+    CHECK(accepted[0].observation.response_duration_us == 40);
+    CHECK(accepted[0].observation.reporter_sequence == 1);
+    CHECK(accepted[0].observation.signer_set ==
+          std::vector<ReplicaID>{2, 5, 6});
+
+    CHECK(accepted[1].observation.reporter_id == 0);
+    CHECK(accepted[1].observation.observed_replica_id == 1);
+    CHECK(accepted[1].observation.expected_message_type ==
+          ExpectedMessageType::aggregate_relay);
+    CHECK(accepted[1].observation.outcome ==
+          ResponseOutcome::timeout);
+    CHECK(accepted[1].observation.response_duration_us == 0);
+    CHECK(accepted[1].observation.reporter_sequence == 2);
+    CHECK(accepted[1].observation.signer_set.empty());
+    CHECK(accepted[0].observation.observation_id !=
+          accepted[1].observation.observation_id);
+    CHECK(accepted[0].observation.attempt_identity() !=
+          accepted[1].observation.attempt_identity());
+
+    SimpleReputation snapshot_scores(membership());
+    EvidenceReputationProjection snapshot_projection(
+        session.ingress().ledger(),
+        snapshot_scores,
+        hotstuff::EvidenceReputationLimits{2});
+    const auto projected = snapshot_projection.apply_through(
+        session.ingress().ledger().high_watermark());
+    REQUIRE(projected.status ==
+            EvidenceReputationApplyStatus::applied);
+    REQUIRE(projected.applied_updates == 2);
+    const auto &snapshot = snapshot_projection.audit_updates();
+    REQUIRE(snapshot.size() == accepted.size());
+    for (std::size_t index = 0; index < snapshot.size(); ++index)
+    {
+        CAPTURE(index);
+        CHECK(snapshot[index].ingestion_sequence ==
+              accepted[index].ingestion_sequence);
+        CHECK(snapshot[index].observation_id ==
+              accepted[index].observation.observation_id);
+        CHECK(snapshot[index].reporter_id ==
+              accepted[index].observation.reporter_id);
+        CHECK(snapshot[index].target_id ==
+              accepted[index].observation.observed_replica_id);
+        CHECK(snapshot[index].evidence_outcome ==
+              accepted[index].observation.outcome);
+    }
+    CHECK(snapshot_scores.score(0) == 0);
+    CHECK(snapshot_scores.score(1) == -1);
+    CHECK(snapshot_scores.score(2) == 1);
+
+    CHECK(session.ingress().current_configuration() ==
+          original_configuration);
+    CHECK(session.ingress().activation_generation() ==
+          original_activation_generation);
+    CHECK(session.ingress().current_epoch().epoch_digest() ==
+          original_epoch_digest);
+    CHECK(session.ingress().quorum_metadata().replica_count == 7);
+    CHECK(session.ingress().quorum_metadata().fault_threshold == 2);
+    CHECK(session.ingress().quorum_metadata().quorum == 5);
+    CHECK_FALSE(session.ingress().operationally_ready());
+    CHECK_FALSE(session.ingress().all_members_ready());
+    CHECK(session.successor_bundle() == nullptr);
+    CHECK_FALSE(session.controller_audit().has_value());
+    CHECK_FALSE(session.convergence_status().has_value());
+    CHECK_FALSE(session.convergence_audit().has_value());
+    CHECK(session.terminal_records().empty());
+    CHECK(snapshot_projection.healthy());
+    CHECK(session.ingress().healthy());
 }
 
 TEST_CASE(
