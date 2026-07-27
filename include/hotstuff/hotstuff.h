@@ -1138,6 +1138,24 @@ namespace hotstuff
         };
         std::optional<PendingCommittedEpochChange>
             pending_committed_epoch_change;
+        struct CommittedEpochDefinitionRecovery
+        {
+            EpochDefinitionRequest request;
+            AuthorizedEpochChange command;
+            uint256_t command_block_hash;
+            uint256_t payload_digest;
+            std::uint64_t command_commit_height{0};
+            std::uint64_t activation_height{0};
+            block_t activation_block;
+            bool definition_recovered{false};
+            std::uint64_t retry_generation{0};
+            std::uint64_t retry_attempts{0};
+            AggregationScheduler::Cancellation retry_cancellation;
+        };
+        std::optional<CommittedEpochDefinitionRecovery>
+            committed_epoch_definition_recovery;
+        std::uint64_t
+            next_committed_epoch_definition_retry_generation{1};
         std::optional<AdaptiveV2EpochChangeIdentity>
             adaptive_v2_committed_convergence_identity;
         bool adaptive_v2_commit_observation_enqueued{false};
@@ -1227,6 +1245,19 @@ namespace hotstuff
             const uint256_t &successor_epoch_digest) noexcept;
         void retry_deferred_epoch_changes(
             const uint256_t &successor_epoch_digest) noexcept;
+        bool retain_committed_epoch_definition_recovery(
+            const block_t &block,
+            const AuthorizedEpochChange &command,
+            const ActivationRecord &record) noexcept;
+        bool schedule_committed_epoch_definition_retry() noexcept;
+        void dispatch_committed_epoch_definition_retry(
+            std::uint64_t retry_generation,
+            const uint256_t &command_block_hash,
+            const uint256_t &successor_epoch_digest) noexcept;
+        void cancel_committed_epoch_definition_retry() noexcept;
+        void reset_committed_epoch_definition_recovery() noexcept;
+        bool recover_committed_epoch_definition(
+            const EpochDefinition &definition) noexcept;
         void initialize_committed_epoch_change_history() noexcept;
         void record_committed_epoch_change_history(
             const block_t &block) noexcept;

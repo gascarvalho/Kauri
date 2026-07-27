@@ -433,6 +433,14 @@ struct ReplicaEpochActivation::State
         }
 
         const auto &record = *pending_v2_activation_record;
+        if (block_reason == ActivationBlockReason::missing_definition &&
+            exact_staged_v2_definition() == nullptr)
+        {
+            return {
+                ActivationTransition::blocked,
+                ActivationBlockReason::missing_definition,
+                std::nullopt};
+        }
         if (predecessor_digest != record.predecessor_epoch_digest)
         {
             return {
@@ -469,7 +477,11 @@ struct ReplicaEpochActivation::State
         if (preview.transition == ActivationTransition::blocked)
         {
             block_reason = preview.blocked_reason;
-            permanent_block = true;
+            if (preview.blocked_reason !=
+                ActivationBlockReason::missing_definition)
+            {
+                permanent_block = true;
+            }
             return blocked_result();
         }
         if (preview.transition != ActivationTransition::activated)
@@ -680,8 +692,8 @@ ActivationRecordResult ReplicaEpochActivation::record_committed_v2(
 
     const auto &payload = prevalidated_command.payload;
     const auto payload_digest = epoch_change_payload_digest(payload);
-    const auto is_same_command = [&payload, &payload_digest](
-                                     const ActivationRecord &record) {
+    const auto is_same_command =
+        [&payload, &payload_digest](const ActivationRecord &record) {
         return record.payload_digest == payload_digest &&
                record.successor_epoch_number ==
                    payload.successor_epoch_number &&
@@ -695,6 +707,13 @@ ActivationRecordResult ReplicaEpochActivation::record_committed_v2(
     if (state_->pending_v2_activation_record &&
         is_same_command(*state_->pending_v2_activation_record))
     {
+        if (state_->block_reason ==
+                ActivationBlockReason::missing_definition &&
+            state_->exact_staged_v2_definition() != nullptr)
+        {
+            state_->block_reason = ActivationBlockReason::none;
+            state_->permanent_block = false;
+        }
         return {
             ActivationRecordDisposition::duplicate,
             state_->pending_v2_activation_record};
@@ -743,13 +762,27 @@ ActivationRecordResult ReplicaEpochActivation::record_committed_v2(
             ActivationBlockReason::activation_height_overflow);
     }
 
+    const auto activation_height =
+        command_commit_height + payload.activation_delay_blocks;
+    const ActivationRecord record{
+        predecessor->epoch_number(),
+        predecessor->epoch_digest(),
+        payload.successor_epoch_number,
+        payload.successor_epoch_digest,
+        payload_digest,
+        command_commit_height,
+        payload.activation_delay_blocks,
+        activation_height};
     const auto *const successor = state_->store.find_epoch_by_digest(
         payload.successor_epoch_digest);
     if (successor == nullptr)
     {
-        return reject(
+        state_->pending_v2_activation_record.emplace(record);
+        state_->block_reason = ActivationBlockReason::missing_definition;
+        state_->permanent_block = false;
+        return {
             ActivationRecordDisposition::missing_definition,
-            ActivationBlockReason::missing_definition);
+            state_->pending_v2_activation_record};
     }
     if (successor->schema_version() !=
             kEpochDefinitionSchemaVersionV2 ||
@@ -767,17 +800,7 @@ ActivationRecordResult ReplicaEpochActivation::record_committed_v2(
             ActivationBlockReason::invalid_activation_record);
     }
 
-    const auto activation_height =
-        command_commit_height + payload.activation_delay_blocks;
-    state_->pending_v2_activation_record.emplace(ActivationRecord{
-        predecessor->epoch_number(),
-        predecessor->epoch_digest(),
-        payload.successor_epoch_number,
-        payload.successor_epoch_digest,
-        payload_digest,
-        command_commit_height,
-        payload.activation_delay_blocks,
-        activation_height});
+    state_->pending_v2_activation_record.emplace(record);
     return {
         ActivationRecordDisposition::recorded,
         state_->pending_v2_activation_record};

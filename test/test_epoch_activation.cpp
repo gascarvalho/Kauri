@@ -1031,11 +1031,14 @@ TEST_CASE("C08a freezes one committed adaptive-v2 activation record",
         command, commit_height + 3);
     CHECK(later_duplicate.disposition ==
           ActivationRecordDisposition::duplicate);
+    REQUIRE(later_duplicate.record.has_value());
+    CHECK(*later_duplicate.record == *recorded.record);
     REQUIRE(replica.committed_v2_record().has_value());
     CHECK(replica.committed_v2_record()->command_commit_height ==
           commit_height);
     CHECK(replica.committed_v2_record()->activation_height ==
           commit_height + delay);
+    CHECK(replica.blocked_reason() == ActivationBlockReason::none);
     CHECK(replica.admits_new_proposals());
 }
 
@@ -1121,10 +1124,101 @@ TEST_CASE("C08a rejects invalid committed adaptive-v2 records fail closed",
         const auto input = successor_v2_input(*fixture.epoch0);
         const auto command = prevalidated_v2_command(
             *fixture.epoch0, hotstuff::compute_epoch_digest(input), 5);
-        CHECK(replica.record_committed_v2(command, commit_height).disposition ==
+        const auto missing = replica.record_committed_v2(
+            command, commit_height);
+        CHECK(missing.disposition ==
               ActivationRecordDisposition::missing_definition);
-        CHECK_FALSE(replica.committed_v2_record().has_value());
+        REQUIRE(missing.record.has_value());
+        CHECK(missing.record->predecessor_epoch_number ==
+              fixture.epoch0->epoch_number());
+        CHECK(missing.record->predecessor_epoch_digest ==
+              fixture.epoch0->epoch_digest());
+        CHECK(missing.record->successor_epoch_number ==
+              input.epoch_number);
+        CHECK(missing.record->successor_epoch_digest ==
+              hotstuff::compute_epoch_digest(input));
+        CHECK(missing.record->payload_digest ==
+              hotstuff::epoch_change_payload_digest(command.payload));
+        CHECK(missing.record->command_commit_height == commit_height);
+        CHECK(missing.record->activation_delay_blocks == 5);
+        CHECK(missing.record->activation_height == commit_height + 5);
+        REQUIRE(replica.committed_v2_record().has_value());
+        CHECK(*replica.committed_v2_record() == *missing.record);
+        CHECK(replica.blocked_reason() ==
+              ActivationBlockReason::missing_definition);
         CHECK_FALSE(replica.admits_new_proposals());
+
+        SECTION("the exact staged definition resumes the original proof")
+        {
+            const auto blocked = replica.on_v2_post_block_commit(
+                commit_height + 5, fixture.epoch0->epoch_digest());
+            CHECK(blocked.transition == ActivationTransition::blocked);
+            CHECK(blocked.blocked_reason ==
+                  ActivationBlockReason::missing_definition);
+
+            const auto staged = fixture.store.stage_available_v2(
+                input, *fixture.epoch0);
+            REQUIRE(staged.disposition ==
+                    hotstuff::DefinitionAvailabilityDisposition::staged);
+            REQUIRE(staged.definition != nullptr);
+            CHECK_FALSE(replica.admits_new_proposals());
+
+            const auto replayed = replica.record_committed_v2(
+                command, commit_height + 1);
+            CHECK(replayed.disposition ==
+                  ActivationRecordDisposition::duplicate);
+            REQUIRE(replayed.record.has_value());
+            CHECK(*replayed.record == *missing.record);
+            CHECK(replayed.record->command_commit_height ==
+                  commit_height);
+            CHECK(replayed.record->activation_height ==
+                  commit_height + 5);
+            CHECK(replica.blocked_reason() ==
+                  ActivationBlockReason::none);
+            CHECK(replica.admits_new_proposals());
+
+            const auto activated = replica.on_v2_post_block_commit(
+                commit_height + 5, fixture.epoch0->epoch_digest());
+            CHECK(activated.transition ==
+                  ActivationTransition::activated);
+            REQUIRE(activated.effect.has_value());
+            check_effect(*activated.effect, *staged.definition, 0, 0);
+        }
+
+        SECTION("the same payload at a later height retains the boundary")
+        {
+            const auto later_duplicate = replica.record_committed_v2(
+                command, commit_height + 1);
+            CHECK(later_duplicate.disposition ==
+                  ActivationRecordDisposition::duplicate);
+            REQUIRE(later_duplicate.record.has_value());
+            CHECK(*later_duplicate.record == *missing.record);
+            CHECK(later_duplicate.record->command_commit_height ==
+                  commit_height);
+            CHECK(later_duplicate.record->activation_height ==
+                  commit_height + 5);
+            REQUIRE(replica.committed_v2_record().has_value());
+            CHECK(*replica.committed_v2_record() == *missing.record);
+            CHECK(replica.blocked_reason() ==
+                  ActivationBlockReason::missing_definition);
+            CHECK_FALSE(replica.admits_new_proposals());
+        }
+
+        SECTION("a genuinely different payload conflicts")
+        {
+            auto conflicting_command = command;
+            ++conflicting_command.payload.activation_delay_blocks;
+            const auto rejected = replica.record_committed_v2(
+                conflicting_command, commit_height + 1);
+            CHECK(rejected.disposition ==
+                  ActivationRecordDisposition::conflicting_record);
+            CHECK_FALSE(rejected.record.has_value());
+            REQUIRE(replica.committed_v2_record().has_value());
+            CHECK(*replica.committed_v2_record() == *missing.record);
+            CHECK(replica.blocked_reason() ==
+                  ActivationBlockReason::conflicting_activation_record);
+            CHECK_FALSE(replica.admits_new_proposals());
+        }
     }
 
     SECTION("mismatched scheduled definition")
@@ -1335,6 +1429,7 @@ TEST_CASE("C08a schedules a later v2 epoch after completing the prior record",
     REQUIRE(activated.effect.has_value());
     check_effect(*activated.effect, epoch2, 0, 0);
     check_effect(replica.active_effect(), epoch2, 0, 0);
+
 }
 
 TEST_CASE("C08a does not mask a permanent v2 block as already active",

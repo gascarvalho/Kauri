@@ -52,6 +52,10 @@ namespace hotstuff
             std::chrono::milliseconds(5);
         constexpr auto adaptive_v2_evidence_retry_delay =
             std::chrono::milliseconds(5);
+        constexpr auto committed_epoch_definition_retry_base_delay =
+            std::chrono::milliseconds(25);
+        constexpr auto committed_epoch_definition_retry_maximum_delay =
+            std::chrono::seconds(1);
         constexpr std::uint32_t
             adaptive_v2_reporting_maximum_delivery_attempts = 32;
         constexpr auto adaptive_v2_reporting_maximum_retry_delay =
@@ -111,6 +115,25 @@ namespace hotstuff
                 return 0;
             return static_cast<std::uint64_t>(
                 nanoseconds / nanoseconds_per_microsecond);
+        }
+
+        AggregationScheduler::Duration
+        committed_epoch_definition_retry_delay(
+            std::uint64_t completed_attempts) noexcept
+        {
+            const auto maximum = std::chrono::duration_cast<
+                AggregationScheduler::Duration>(
+                committed_epoch_definition_retry_maximum_delay);
+            auto delay = std::chrono::duration_cast<
+                AggregationScheduler::Duration>(
+                committed_epoch_definition_retry_base_delay);
+            for (std::uint64_t attempt = 1;
+                 attempt < completed_attempts && delay < maximum;
+                 ++attempt)
+            {
+                delay = std::min(maximum, delay * 2);
+            }
+            return delay;
         }
 
         EpochChangeProposalChainResult bypass_epoch_change_gate() noexcept
@@ -2002,10 +2025,309 @@ namespace hotstuff
         }
     }
 
+    bool HotStuffBase::retain_committed_epoch_definition_recovery(
+        const block_t &block,
+        const AuthorizedEpochChange &command,
+        const ActivationRecord &record) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            block == nullptr ||
+            block->get_hash() == uint256_t{} ||
+            command.payload.successor_epoch_digest == uint256_t{} ||
+            record.predecessor_epoch_digest !=
+                command.payload.predecessor_epoch_digest ||
+            record.successor_epoch_number !=
+                command.payload.successor_epoch_number ||
+            record.successor_epoch_digest !=
+                command.payload.successor_epoch_digest ||
+            record.payload_digest !=
+                epoch_change_payload_digest(command.payload) ||
+            record.command_commit_height != block->get_height() ||
+            record.activation_delay_blocks !=
+                command.payload.activation_delay_blocks ||
+            record.activation_height <
+                record.command_commit_height)
+            return false;
+
+        try
+        {
+            if (committed_epoch_definition_recovery)
+            {
+                const auto &existing =
+                    *committed_epoch_definition_recovery;
+                const bool same_recovery =
+                    existing.command_block_hash == block->get_hash() &&
+                    existing.payload_digest == record.payload_digest &&
+                    existing.command_commit_height ==
+                        record.command_commit_height &&
+                    existing.activation_height ==
+                        record.activation_height &&
+                    encode_authorized_epoch_change(existing.command) ==
+                        encode_authorized_epoch_change(command);
+                if (!same_recovery)
+                    return false;
+                if (existing.definition_recovered ||
+                    existing.retry_cancellation)
+                    return true;
+                return schedule_committed_epoch_definition_retry();
+            }
+
+            const EpochDefinitionRequest request{
+                kEpochWireSchemaVersionV2,
+                EpochProtocolMode::adaptive_v2,
+                command.payload.successor_epoch_digest};
+            auto retry_generation =
+                next_committed_epoch_definition_retry_generation++;
+            if (retry_generation == 0)
+            {
+                retry_generation =
+                    next_committed_epoch_definition_retry_generation++;
+            }
+            committed_epoch_definition_recovery.emplace(
+                CommittedEpochDefinitionRecovery{
+                    request,
+                    command,
+                    block->get_hash(),
+                    record.payload_digest,
+                    record.command_commit_height,
+                    record.activation_height,
+                    nullptr,
+                    false,
+                    retry_generation,
+                    1,
+                    {}});
+            send_epoch_definition_request(request);
+            if (!schedule_committed_epoch_definition_retry())
+            {
+                reset_committed_epoch_definition_recovery();
+                return false;
+            }
+            return true;
+        }
+        catch (...)
+        {
+            reset_committed_epoch_definition_recovery();
+            return false;
+        }
+    }
+
+    bool HotStuffBase::schedule_committed_epoch_definition_retry() noexcept
+    {
+        if (!committed_epoch_definition_recovery ||
+            committed_epoch_definition_recovery->definition_recovered ||
+            aggregation_scheduler == nullptr)
+            return false;
+        if (committed_epoch_definition_recovery->retry_cancellation)
+            return true;
+
+        try
+        {
+            const auto &recovery =
+                *committed_epoch_definition_recovery;
+            const auto retry_generation =
+                recovery.retry_generation;
+            const auto command_block_hash =
+                recovery.command_block_hash;
+            const auto successor_epoch_digest =
+                recovery.request.successor_epoch_digest;
+            auto cancellation = aggregation_scheduler->schedule_after(
+                committed_epoch_definition_retry_delay(
+                    recovery.retry_attempts),
+                [access = exact_runtime_access,
+                 retry_generation,
+                 command_block_hash,
+                 successor_epoch_digest]() {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    runtime->owner()
+                        .dispatch_committed_epoch_definition_retry(
+                            retry_generation,
+                            command_block_hash,
+                            successor_epoch_digest);
+                });
+            if (!cancellation)
+                return false;
+            committed_epoch_definition_recovery->retry_cancellation =
+                std::move(cancellation);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void HotStuffBase::dispatch_committed_epoch_definition_retry(
+        std::uint64_t retry_generation,
+        const uint256_t &command_block_hash,
+        const uint256_t &successor_epoch_digest) noexcept
+    {
+        if (!committed_epoch_definition_recovery)
+            return;
+        auto &recovery = *committed_epoch_definition_recovery;
+        if (recovery.definition_recovered ||
+            recovery.retry_generation != retry_generation ||
+            recovery.command_block_hash != command_block_hash ||
+            recovery.request.successor_epoch_digest !=
+                successor_epoch_digest)
+            return;
+
+        recovery.retry_cancellation = {};
+        send_epoch_definition_request(recovery.request);
+        if (recovery.retry_attempts !=
+            std::numeric_limits<std::uint64_t>::max())
+        {
+            ++recovery.retry_attempts;
+        }
+        if (schedule_committed_epoch_definition_retry())
+            return;
+
+        HOTSTUFF_LOG_WARN(
+            "[EPOCH] Failed to schedule committed definition retry");
+        pending_committed_epoch_change.reset();
+        reset_committed_epoch_definition_recovery();
+        committed_epoch_change_history.reset();
+        mark_adaptive_v2_convergence_evidence_unhealthy(
+            "committed_definition_retry_schedule_failed");
+        if (adaptive_epoch_runtime != nullptr)
+        {
+            adaptive_epoch_runtime->adapter.fail_committed_v2(
+                ActivationBlockReason::invalid_activation_record);
+        }
+    }
+
+    void HotStuffBase::cancel_committed_epoch_definition_retry() noexcept
+    {
+        if (!committed_epoch_definition_recovery)
+            return;
+        auto cancellation = std::move(
+            committed_epoch_definition_recovery->retry_cancellation);
+        committed_epoch_definition_recovery->retry_cancellation = {};
+        if (!cancellation)
+            return;
+        try
+        {
+            cancellation();
+        }
+        catch (...)
+        {
+            // Cancellation is best effort during recovery teardown.
+        }
+    }
+
+    void HotStuffBase::reset_committed_epoch_definition_recovery() noexcept
+    {
+        cancel_committed_epoch_definition_retry();
+        committed_epoch_definition_recovery.reset();
+    }
+
+    bool HotStuffBase::recover_committed_epoch_definition(
+        const EpochDefinition &definition) noexcept
+    {
+        if (!committed_epoch_definition_recovery ||
+            adaptive_epoch_runtime == nullptr ||
+            epoch_live_binding == nullptr ||
+            exact_epochs == nullptr)
+            return false;
+
+        try
+        {
+            auto &recovery = *committed_epoch_definition_recovery;
+            const auto &command = recovery.command;
+            const auto &payload = command.payload;
+            if (definition.schema_version() !=
+                    kEpochDefinitionSchemaVersionV2 ||
+                definition.activation_height() != 0 ||
+                definition.epoch_number() !=
+                    payload.successor_epoch_number ||
+                definition.previous_epoch_digest() !=
+                    payload.predecessor_epoch_digest ||
+                definition.epoch_digest() !=
+                    payload.successor_epoch_digest ||
+                exact_epochs->find_epoch_by_digest(
+                    payload.successor_epoch_digest) != &definition ||
+                definition.canonical_serialization().empty() ||
+                DataStream(definition.canonical_serialization()).get_hash() !=
+                    payload.successor_epoch_digest ||
+                recovery.payload_digest !=
+                    epoch_change_payload_digest(payload) ||
+                recovery.activation_height <
+                    recovery.command_commit_height ||
+                recovery.activation_height -
+                        recovery.command_commit_height !=
+                    payload.activation_delay_blocks)
+                return false;
+
+            if (!recovery.definition_recovered)
+            {
+                const auto prepared =
+                    adaptive_epoch_runtime->adapter.prepare_committed_v2(
+                        definition);
+                if (prepared != EpochIngressError::none)
+                    return false;
+
+                const auto replayed =
+                    adaptive_epoch_runtime->activation.record_committed_v2(
+                        command, recovery.command_commit_height);
+                if ((replayed.disposition !=
+                         ActivationRecordDisposition::recorded &&
+                     replayed.disposition !=
+                         ActivationRecordDisposition::duplicate) ||
+                    !replayed.record ||
+                    replayed.record->payload_digest !=
+                        recovery.payload_digest ||
+                    replayed.record->command_commit_height !=
+                        recovery.command_commit_height ||
+                    replayed.record->activation_height !=
+                        recovery.activation_height ||
+                    replayed.record->predecessor_epoch_digest !=
+                        payload.predecessor_epoch_digest ||
+                    replayed.record->successor_epoch_number !=
+                        payload.successor_epoch_number ||
+                    replayed.record->successor_epoch_digest !=
+                        payload.successor_epoch_digest ||
+                    adaptive_epoch_runtime->activation.blocked_reason() !=
+                        ActivationBlockReason::none ||
+                    !adaptive_epoch_runtime->activation
+                         .admits_new_proposals())
+                    return false;
+                recovery.definition_recovered = true;
+                cancel_committed_epoch_definition_retry();
+            }
+
+            if (recovery.activation_block == nullptr)
+                return true;
+            if (recovery.activation_block->get_height() !=
+                    recovery.activation_height)
+                return false;
+
+            const auto activation =
+                epoch_live_binding->on_v2_post_block_commit(
+                    recovery.activation_height,
+                    payload.predecessor_epoch_digest);
+            if (activation.error != EpochIngressError::none ||
+                (activation.transition != ActivationTransition::activated &&
+                 activation.transition !=
+                     ActivationTransition::already_active))
+                return false;
+
+            const auto activation_block = recovery.activation_block;
+            finish_adaptive_epoch_commit(activation_block, activation);
+            reset_committed_epoch_definition_recovery();
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void HotStuffBase::initialize_committed_epoch_change_history() noexcept
     {
         committed_epoch_change_history.reset();
         pending_committed_epoch_change.reset();
+        reset_committed_epoch_definition_recovery();
         const auto &genesis = committed_head();
         if (genesis == nullptr || genesis->get_decision() != 1)
             return;
@@ -2074,7 +2396,8 @@ namespace hotstuff
                 epoch_change_maximum_block_extra_bytes);
             if (extracted.disposition ==
                     EpochChangeExtraDisposition::present &&
-                extracted.command && extracted.payload_digest)
+                extracted.command && extracted.payload_digest &&
+                extracted.envelope_digest)
             {
                 if (epoch_change_verifier == nullptr ||
                     exact_epochs == nullptr || proposal_contexts == nullptr)
@@ -2115,16 +2438,33 @@ namespace hotstuff
                 const auto *const successor =
                     exact_epochs->find_epoch_by_digest(
                         extracted.command->payload.successor_epoch_digest);
-                if ((validation.disposition !=
-                         EpochChangeDisposition::accepted &&
-                     validation.disposition !=
-                         EpochChangeDisposition::duplicate) ||
+                const bool available_definition =
+                    (validation.disposition ==
+                         EpochChangeDisposition::accepted ||
+                     validation.disposition ==
+                         EpochChangeDisposition::duplicate) &&
+                    validation.successor_definition != nullptr &&
+                    successor != nullptr &&
+                    validation.successor_definition == successor &&
+                    validation.successor_definition->epoch_digest() ==
+                        extracted.command->payload.successor_epoch_digest;
+                const bool recoverable_missing_definition =
+                    validation.disposition ==
+                        EpochChangeDisposition::defer_missing_definition &&
+                    validation.successor_definition == nullptr &&
+                    successor == nullptr &&
+                    validation.recovery_request.has_value() &&
+                    validation.recovery_request->wire_schema_version ==
+                        kEpochWireSchemaVersionV2 &&
+                    validation.recovery_request->protocol_mode ==
+                        EpochProtocolMode::adaptive_v2 &&
+                    validation.recovery_request->successor_epoch_digest ==
+                        extracted.command->payload.successor_epoch_digest;
+                if ((!available_definition &&
+                     !recoverable_missing_definition) ||
                     validation.payload_digest != *extracted.payload_digest ||
-                    validation.successor_definition == nullptr ||
-                    successor == nullptr ||
-                    validation.successor_definition != successor ||
-                    validation.successor_definition->epoch_digest() !=
-                        extracted.command->payload.successor_epoch_digest)
+                    validation.envelope_digest !=
+                        *extracted.envelope_digest)
                 {
                     fail_closed();
                     return;
@@ -4434,7 +4774,10 @@ namespace hotstuff
             return;
         const auto peer = conn->get_peer_id();
         const auto authenticated = peer_id_map.find(peer);
-        if (peer.is_null() || authenticated == peer_id_map.end())
+        if (peer.is_null() || authenticated == peer_id_map.end() ||
+            authenticated->second >= fixed_membership.size() ||
+            fixed_membership[authenticated->second] !=
+                static_cast<ReplicaID>(authenticated->second))
             return;
 
         const auto decoded = decode_epoch_definition_request(
@@ -4479,7 +4822,10 @@ namespace hotstuff
             return;
         const auto peer = conn->get_peer_id();
         const auto authenticated = peer_id_map.find(peer);
-        if (peer.is_null() || authenticated == peer_id_map.end())
+        if (peer.is_null() || authenticated == peer_id_map.end() ||
+            authenticated->second >= fixed_membership.size() ||
+            fixed_membership[authenticated->second] !=
+                static_cast<ReplicaID>(authenticated->second))
             return;
 
         const auto decoded = decode_epoch_definition_reply(
@@ -4488,12 +4834,27 @@ namespace hotstuff
             epoch_wire_limits);
         if (!decoded)
             return;
-        auto recovery = deferred_epoch_definition_recoveries.find(
-            decoded.value->successor_epoch_digest);
-        if (recovery == deferred_epoch_definition_recoveries.end() ||
-            !recovery->second.request_live ||
-            recovery->second.request.successor_epoch_digest !=
-                decoded.value->successor_epoch_digest)
+
+        const auto successor_epoch_digest =
+            decoded.value->successor_epoch_digest;
+        auto deferred = deferred_epoch_definition_recoveries.find(
+            successor_epoch_digest);
+        const bool deferred_recovery_live =
+            deferred != deferred_epoch_definition_recoveries.end() &&
+            deferred->second.request_live &&
+            deferred->second.request.successor_epoch_digest ==
+                successor_epoch_digest;
+        const bool committed_recovery_live =
+            committed_epoch_definition_recovery.has_value() &&
+            committed_epoch_definition_recovery->request
+                    .wire_schema_version ==
+                kEpochWireSchemaVersionV2 &&
+            committed_epoch_definition_recovery->request.protocol_mode ==
+                EpochProtocolMode::adaptive_v2 &&
+            committed_epoch_definition_recovery->request
+                    .successor_epoch_digest ==
+                successor_epoch_digest;
+        if (!deferred_recovery_live && !committed_recovery_live)
             return;
 
         const auto &active_configuration =
@@ -4503,6 +4864,36 @@ namespace hotstuff
         if (active == nullptr ||
             active->epoch_digest() != active_configuration.epoch_digest)
             return;
+
+        bytearray_t canonical_definition;
+        try
+        {
+            canonical_definition =
+                canonical_serialize_epoch(decoded.value->definition);
+        }
+        catch (...)
+        {
+            return;
+        }
+        if (canonical_definition.empty() ||
+            DataStream(canonical_definition).get_hash() !=
+                successor_epoch_digest ||
+            (decoded.value->definition.epoch_digest &&
+             *decoded.value->definition.epoch_digest !=
+                 successor_epoch_digest))
+            return;
+        if (committed_recovery_live)
+        {
+            const auto &payload =
+                committed_epoch_definition_recovery->command.payload;
+            if (decoded.value->definition.epoch_number !=
+                    payload.successor_epoch_number ||
+                decoded.value->definition.previous_epoch_digest !=
+                    payload.predecessor_epoch_digest ||
+                active->epoch_digest() !=
+                    payload.predecessor_epoch_digest)
+                return;
+        }
 
         DefinitionAvailabilityResult staged;
         try
@@ -4520,20 +4911,27 @@ namespace hotstuff
                  DefinitionAvailabilityDisposition::duplicate) ||
             staged.definition == nullptr ||
             staged.definition->epoch_digest() !=
-                recovery->second.request.successor_epoch_digest ||
-            staged.definition->epoch_digest() !=
-                decoded.value->successor_epoch_digest)
+                successor_epoch_digest ||
+            staged.definition->canonical_serialization() !=
+                canonical_definition)
             return;
 
-        recovery = deferred_epoch_definition_recoveries.find(
-            decoded.value->successor_epoch_digest);
-        if (recovery == deferred_epoch_definition_recoveries.end() ||
-            !recovery->second.request_live)
+        if (committed_recovery_live &&
+            !recover_committed_epoch_definition(*staged.definition))
             return;
-        recovery->second.request_live = false;
-        if (!queue_deferred_epoch_change_retries(
-                decoded.value->successor_epoch_digest))
-            recovery->second.request_live = true;
+
+        if (deferred_recovery_live)
+        {
+            deferred = deferred_epoch_definition_recoveries.find(
+                successor_epoch_digest);
+            if (deferred == deferred_epoch_definition_recoveries.end() ||
+                !deferred->second.request_live)
+                return;
+            deferred->second.request_live = false;
+            if (!queue_deferred_epoch_change_retries(
+                    successor_epoch_digest))
+                deferred->second.request_live = true;
+        }
     }
 
     void HotStuffBase::adaptive_v2_epoch_change_bundle_handler(
@@ -7429,6 +7827,7 @@ namespace hotstuff
 
         const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
             pending_committed_epoch_change.reset();
+            reset_committed_epoch_definition_recovery();
             mark_adaptive_v2_convergence_evidence_unhealthy(
                 "activation_pipeline_failed");
             committed_epoch_change_history.reset();
@@ -7457,11 +7856,33 @@ namespace hotstuff
             {
                 const auto &command =
                     pending_committed_epoch_change->command;
+                if (committed_epoch_definition_recovery)
+                {
+                    const auto &recovery =
+                        *committed_epoch_definition_recovery;
+                    const bool exact_recovery_duplicate =
+                        recovery.payload_digest ==
+                            pending_committed_epoch_change->payload_digest &&
+                        recovery.request.successor_epoch_digest ==
+                            command.payload.successor_epoch_digest &&
+                        encode_authorized_epoch_change(recovery.command) ==
+                            encode_authorized_epoch_change(command);
+                    if (!exact_recovery_duplicate)
+                    {
+                        HOTSTUFF_LOG_WARN(
+                            "[EPOCH] Committed v2 duplicate conflicts with "
+                            "the retained recovery identity");
+                        fail_closed(
+                            ActivationBlockReason::
+                                conflicting_activation_record);
+                        return;
+                    }
+                }
                 const auto *const successor =
                     exact_epochs->find_epoch_by_digest(
                         command.payload.successor_epoch_digest);
-                if (successor == nullptr ||
-                    successor->schema_version() !=
+                if (successor != nullptr &&
+                    (successor->schema_version() !=
                         kEpochDefinitionSchemaVersionV2 ||
                     successor->activation_height() != 0 ||
                     successor->epoch_number() !=
@@ -7469,16 +7890,16 @@ namespace hotstuff
                     successor->previous_epoch_digest() !=
                         command.payload.predecessor_epoch_digest ||
                     successor->epoch_digest() !=
-                        command.payload.successor_epoch_digest)
+                        command.payload.successor_epoch_digest))
                 {
                     HOTSTUFF_LOG_WARN(
-                        "[EPOCH] Committed v2 successor is unavailable");
+                        "[EPOCH] Committed v2 successor is invalid");
                     fail_closed(
-                        successor == nullptr
-                            ? ActivationBlockReason::missing_definition
-                            : ActivationBlockReason::invalid_activation_record);
+                        ActivationBlockReason::invalid_activation_record);
+                    return;
                 }
-                else
+
+                if (successor != nullptr)
                 {
                     const auto prepared = adaptive_epoch_runtime->adapter
                                               .prepare_committed_v2(*successor);
@@ -7488,90 +7909,169 @@ namespace hotstuff
                             "[EPOCH] Failed to prepare committed v2 runtime");
                         fail_closed(
                             ActivationBlockReason::invalid_activation_record);
+                        return;
+                    }
+                }
+
+                const auto recorded =
+                    adaptive_epoch_runtime->activation
+                        .record_committed_v2(command, blk->get_height());
+                const bool exact_existing_recovery =
+                    committed_epoch_definition_recovery &&
+                    recorded.record.has_value() &&
+                    recorded.record->payload_digest ==
+                        committed_epoch_definition_recovery->payload_digest &&
+                    recorded.record->command_commit_height ==
+                        committed_epoch_definition_recovery
+                            ->command_commit_height &&
+                    recorded.record->activation_height ==
+                        committed_epoch_definition_recovery
+                            ->activation_height &&
+                    recorded.record->predecessor_epoch_digest ==
+                        command.payload.predecessor_epoch_digest &&
+                    recorded.record->successor_epoch_number ==
+                        command.payload.successor_epoch_number &&
+                    recorded.record->successor_epoch_digest ==
+                        command.payload.successor_epoch_digest;
+                const bool recoverable_missing_definition =
+                    successor == nullptr &&
+                    recorded.disposition ==
+                        ActivationRecordDisposition::missing_definition &&
+                    recorded.record.has_value() &&
+                    recorded.record->payload_digest ==
+                        pending_committed_epoch_change->payload_digest;
+                const bool recoverable_missing_definition_duplicate =
+                    successor == nullptr &&
+                    recorded.disposition ==
+                        ActivationRecordDisposition::duplicate &&
+                    exact_existing_recovery;
+                const bool available_definition_recorded =
+                    successor != nullptr &&
+                    (recorded.disposition ==
+                         ActivationRecordDisposition::recorded ||
+                     recorded.disposition ==
+                         ActivationRecordDisposition::duplicate) &&
+                    (!committed_epoch_definition_recovery ||
+                     exact_existing_recovery);
+                if (!recoverable_missing_definition &&
+                    !recoverable_missing_definition_duplicate &&
+                    !available_definition_recorded)
+                {
+                    HOTSTUFF_LOG_WARN(
+                        "[EPOCH] Failed to record committed v2 command");
+                    fail_closed(
+                        adaptive_epoch_runtime->activation.blocked_reason());
+                    return;
+                }
+
+                if ((recorded.disposition ==
+                         ActivationRecordDisposition::recorded ||
+                     recorded.disposition ==
+                         ActivationRecordDisposition::missing_definition) &&
+                    recorded.record.has_value())
+                {
+                    AdaptiveV2EpochChangeIdentity identity{
+                        recorded.record->predecessor_epoch_number,
+                        recorded.record->predecessor_epoch_digest,
+                        recorded.record->successor_epoch_number,
+                        recorded.record->successor_epoch_digest,
+                        recorded.record->payload_digest,
+                        blk->get_height(),
+                        blk->get_hash(),
+                        recorded.record->activation_delay_blocks,
+                        recorded.record->activation_height};
+                    adaptive_v2_committed_convergence_identity =
+                        identity;
+                    adaptive_v2_commit_observation_enqueued =
+                        false;
+                    emit_epoch_command_committed_event(
+                        blk, command, *recorded.record);
+                    if (adaptive_v2_reporting_outbox == nullptr)
+                    {
+                        mark_adaptive_v2_convergence_evidence_unhealthy(
+                            "commit_observation_outbox_missing");
                     }
                     else
                     {
-                        const auto recorded =
-                            adaptive_epoch_runtime->activation
-                                .record_committed_v2(command, blk->get_height());
-                        if (recorded.disposition !=
-                                ActivationRecordDisposition::recorded &&
-                            recorded.disposition !=
-                                ActivationRecordDisposition::duplicate)
+                        const auto reporting_status =
+                            adaptive_v2_reporting_outbox
+                                ->enqueue_epoch_change_committed(
+                                    identity);
+                        if (reporting_status ==
+                            AdaptiveV2ReportingEnqueueStatus::queued)
                         {
-                            HOTSTUFF_LOG_WARN(
-                                "[EPOCH] Failed to record committed v2 command");
-                            fail_closed(
-                                adaptive_epoch_runtime->activation
-                                    .blocked_reason());
+                            adaptive_v2_commit_observation_enqueued =
+                                true;
+                            schedule_adaptive_v2_reporting_flush(
+                                adaptive_v2_evidence_retry_delay);
+                        }
+                        else if (reporting_status ==
+                                 AdaptiveV2ReportingEnqueueStatus::
+                                     capacity_exceeded)
+                        {
+                            schedule_adaptive_v2_reporting_flush(
+                                adaptive_v2_evidence_retry_delay);
                         }
                         else
                         {
-                            if (recorded.disposition ==
-                                    ActivationRecordDisposition::recorded &&
-                                recorded.record.has_value())
-                            {
-                                AdaptiveV2EpochChangeIdentity identity{
-                                    recorded.record->predecessor_epoch_number,
-                                    recorded.record->predecessor_epoch_digest,
-                                    recorded.record->successor_epoch_number,
-                                    recorded.record->successor_epoch_digest,
-                                    recorded.record->payload_digest,
-                                    blk->get_height(),
-                                    blk->get_hash(),
-                                    recorded.record->activation_delay_blocks,
-                                    recorded.record->activation_height};
-                                adaptive_v2_committed_convergence_identity =
-                                    identity;
-                                adaptive_v2_commit_observation_enqueued =
-                                    false;
-                                emit_epoch_command_committed_event(
-                                    blk, command, *recorded.record);
-                                if (adaptive_v2_reporting_outbox == nullptr)
-                                {
-                                    mark_adaptive_v2_convergence_evidence_unhealthy(
-                                        "commit_observation_outbox_missing");
-                                }
-                                else
-                                {
-                                    const auto reporting_status =
-                                        adaptive_v2_reporting_outbox
-                                            ->enqueue_epoch_change_committed(
-                                                identity);
-                                    if (reporting_status ==
-                                        AdaptiveV2ReportingEnqueueStatus::queued)
-                                    {
-                                        adaptive_v2_commit_observation_enqueued =
-                                            true;
-                                        schedule_adaptive_v2_reporting_flush(
-                                            adaptive_v2_evidence_retry_delay);
-                                    }
-                                    else if (reporting_status ==
-                                             AdaptiveV2ReportingEnqueueStatus::
-                                                 capacity_exceeded)
-                                    {
-                                        schedule_adaptive_v2_reporting_flush(
-                                            adaptive_v2_evidence_retry_delay);
-                                    }
-                                    else
-                                    {
-                                        mark_adaptive_v2_convergence_evidence_unhealthy(
-                                            "commit_observation_enqueue_failed");
-                                    }
-                                }
-                            }
-                            pending_committed_epoch_change.reset();
+                            mark_adaptive_v2_convergence_evidence_unhealthy(
+                                "commit_observation_enqueue_failed");
                         }
                     }
+                }
+
+                if (recoverable_missing_definition &&
+                    !retain_committed_epoch_definition_recovery(
+                        blk, command, *recorded.record))
+                {
+                    fail_closed(
+                        ActivationBlockReason::invalid_activation_record);
+                    return;
+                }
+                pending_committed_epoch_change.reset();
+            }
+
+            if (committed_epoch_definition_recovery)
+            {
+                auto &recovery =
+                    *committed_epoch_definition_recovery;
+                if (blk->get_height() == recovery.activation_height)
+                    recovery.activation_block = blk;
+                else if (blk->get_height() > recovery.activation_height &&
+                         recovery.activation_block == nullptr)
+                {
+                    fail_closed(
+                        ActivationBlockReason::missed_activation_height);
+                    return;
+                }
+
+                const auto *const recovered_definition =
+                    exact_epochs->find_epoch_by_digest(
+                        recovery.request.successor_epoch_digest);
+                if (recovered_definition != nullptr &&
+                    !recover_committed_epoch_definition(
+                        *recovered_definition))
+                {
+                    fail_closed(
+                        ActivationBlockReason::invalid_activation_record);
+                    return;
                 }
             }
 
             const auto active =
                 adaptive_epoch_runtime->activation.active_effect();
             const auto &configuration = active.configuration;
+            auto post_block_height = blk->get_height();
+            if (committed_epoch_definition_recovery &&
+                post_block_height >
+                    committed_epoch_definition_recovery->activation_height)
+            {
+                post_block_height =
+                    committed_epoch_definition_recovery->activation_height;
+            }
             const auto activation =
                 epoch_live_binding->on_v2_post_block_commit(
-                    blk->get_height(), configuration.epoch_digest);
+                    post_block_height, configuration.epoch_digest);
             finish_adaptive_epoch_commit(blk, activation);
             rotate_adaptive_v2_after_commit(committed_key);
         }
@@ -7765,6 +8265,7 @@ namespace hotstuff
     {
         pmaker->shutdown();
         cancel_adaptive_v2_reporting_flush();
+        reset_committed_epoch_definition_recovery();
         epoch_live_binding = nullptr;
         adaptive_epoch_runtime.reset();
         cancel_all_exact_forwarding_retries();

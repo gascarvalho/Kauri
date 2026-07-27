@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "catch.hpp"
+#include "hotstuff/epoch_change_bundle.h"
+#include "hotstuff/epoch_change_inbox.h"
 #include "hotstuff/epoch_runtime_wiring.h"
 #include "hotstuff/hotstuff.h"
 
@@ -127,6 +129,11 @@ std::vector<ReplicaID> membership()
     return {0, 1, 2, 3, 4, 5, 6};
 }
 
+std::vector<ReplicaID> adversarial_membership()
+{
+    return {0, 1, 2, 3};
+}
+
 EpochDefinitionInput epoch_input(
     std::uint32_t epoch_number,
     const uint256_t &previous = {})
@@ -199,6 +206,64 @@ EpochValidationContext validation_context(std::uint32_t epoch_number)
 EpochWireLimits limits()
 {
     return {8192, 8, 16, 128};
+}
+
+EpochChangeBundleLimits bundle_limits()
+{
+    return {
+        64 * 1024,
+        4096,
+        EpochWireLimits{32 * 1024, 8, 16, 128, 2}};
+}
+
+EpochDefinitionInput adversarial_epoch_v2_input(
+    std::uint32_t epoch_number,
+    const uint256_t &previous = {},
+    const std::string &snapshot = "rem-d11-01-baseline")
+{
+    EpochDefinitionInput input;
+    input.schema_version = kEpochDefinitionSchemaVersionV2;
+    input.epoch_number = epoch_number;
+    input.previous_epoch_digest = previous;
+    input.membership_digest =
+        canonical_membership_digest(adversarial_membership());
+    input.trees =
+        epoch_number == 0
+            ? std::vector<EpochTreeDefinition>{
+                  {0, 2, 2, {0, 1, 2, 3}},
+                  {1, 2, 2, {1, 0, 2, 3}}}
+            : std::vector<EpochTreeDefinition>{
+                  {0, 2, 2, {1, 0, 2, 3}},
+                  {1, 2, 2, {2, 0, 1, 3}}};
+    input.activation_height = 0;
+    input.generation_seed = 0;
+    input.policy_version = "rem-d11-01-adversarial-v1";
+    input.evidence_snapshot_id = snapshot;
+    input.evidence_cutoff = epoch_number;
+    return input;
+}
+
+PrivKeySecp256k1 recovery_issuer_key()
+{
+    PrivKeySecp256k1 key;
+    key.from_hex(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    return key;
+}
+
+AuthorizedEpochChange recovery_command(
+    const EpochDefinitionInput &successor,
+    std::uint64_t delay,
+    const PrivKeySecp256k1 &key)
+{
+    return authorize_epoch_change(
+        EpochChangePayload{
+            successor.epoch_number,
+            successor.previous_epoch_digest,
+            compute_epoch_digest(successor),
+            delay},
+        17,
+        key);
 }
 
 StageEpochDefinition successor_stage(const EpochDefinition &active)
@@ -551,6 +616,85 @@ struct V2Harness
         return value;
     }
 };
+
+struct AdversarialV2Replica
+{
+    EpochStore store{adversarial_membership()};
+    const EpochDefinition &epoch0;
+    ReplicaEpochActivation activation;
+    FutureProposalBuffer future;
+    ProposalContextLifecycle contexts;
+    ProposalEffectsSpy proposal_effects;
+    ProposalAdmissionCoordinator admission;
+    EmptyFutureStore retryable_future;
+    BodyValidatorSpy validator;
+    LiveEffectsSpy live_effects;
+    HotStuffEpochRuntimeTransaction transaction;
+    HotStuffEpochRuntimeAdapter adapter;
+    ManagerEgressSpy manager_egress;
+    ContinuationsSpy continuations;
+    HotStuffEpochLiveBinding binding;
+    AdaptiveV2CommandInbox inbox;
+    EpochChangeVerifier verifier;
+
+    explicit AdversarialV2Replica(
+        ReplicaID replica,
+        const PrivKeySecp256k1 &issuer_key)
+        : epoch0(store.stage(
+              adversarial_epoch_v2_input(0),
+              EpochValidationContext{})),
+          activation(store, epoch0, replica, 0),
+          admission(
+              store,
+              activation.active_effect().configuration,
+              future,
+              proposal_effects),
+          transaction(admission, contexts, live_effects),
+          adapter(
+              activation,
+              contexts,
+              admission,
+              retryable_future,
+              validator,
+              EpochProtocolMode::adaptive_v2,
+              limits(),
+              transaction),
+          binding(
+              adapter,
+              activation,
+              live_effects,
+              manager_egress,
+              continuations),
+          verifier(
+              EpochChangeIssuer{
+                  17, PubKeySecp256k1(issuer_key)},
+              EpochChangeDelayBounds{1, 20})
+    {
+        contexts.activate_configuration(
+            activation.active_effect().configuration);
+    }
+};
+
+bool recover_exact_committed_bundle(
+    AdversarialV2Replica &replica,
+    const AuthorizedEpochChange &committed,
+    const AdaptiveV2EpochChangeBundle &candidate)
+{
+    if (encode_authorized_epoch_change(candidate.command()) !=
+            encode_authorized_epoch_change(committed) ||
+        compute_epoch_digest(candidate.definition()) !=
+            committed.payload.successor_epoch_digest)
+        return false;
+
+    const auto ingested = replica.inbox.ingest(
+        candidate, replica.epoch0, replica.verifier, replica.store);
+    return (ingested.disposition ==
+                AdaptiveV2CommandIngestDisposition::accepted ||
+            ingested.disposition ==
+                AdaptiveV2CommandIngestDisposition::duplicate) &&
+           replica.store.find_epoch_by_digest(
+               committed.payload.successor_epoch_digest) != nullptr;
+}
 
 ReplicaID active_root(const EpochActivationEffect &active)
 {
@@ -1091,6 +1235,204 @@ TEST_CASE("missing v2 runtime leaves the exact boundary retryable",
     CHECK(repeated.transition == ActivationTransition::already_active);
     CHECK(harness.live_effects.arm_count == 1);
     CHECK(harness.live_effects.apply_count == 1);
+}
+
+TEST_CASE(
+    "committed successor recovery restores N4 progress without Byzantine votes",
+    "[rem-d11-01][adaptive-v2][integration][adversarial][intentional-red]")
+{
+    constexpr ReplicaID byzantine = 3;
+    constexpr ReplicaID missing_correct = 2;
+    constexpr std::uint64_t command_commit_height = 40;
+    constexpr std::uint64_t activation_delay = 5;
+    constexpr std::uint64_t activation_height =
+        command_commit_height + activation_delay;
+
+    const auto quorum =
+        derive_byzantine_quorum(adversarial_membership().size());
+    REQUIRE(quorum.has_value());
+    REQUIRE(quorum->replica_count == 4);
+    REQUIRE(quorum->fault_threshold == 1);
+    REQUIRE(quorum->quorum == 3);
+
+    const auto issuer_key = recovery_issuer_key();
+    AdversarialV2Replica correct0(0, issuer_key);
+    AdversarialV2Replica correct1(1, issuer_key);
+    AdversarialV2Replica correct2(missing_correct, issuer_key);
+    REQUIRE(correct0.epoch0.epoch_digest() ==
+            correct1.epoch0.epoch_digest());
+    REQUIRE(correct1.epoch0.epoch_digest() ==
+            correct2.epoch0.epoch_digest());
+
+    const auto exact_definition = adversarial_epoch_v2_input(
+        1,
+        correct0.epoch0.epoch_digest(),
+        "rem-d11-01-exact-successor");
+    const auto command = recovery_command(
+        exact_definition, activation_delay, issuer_key);
+    const AdaptiveV2EpochChangeBundle exact_bundle(
+        command, exact_definition, bundle_limits());
+
+    auto wrong_definition = adversarial_epoch_v2_input(
+        1,
+        correct0.epoch0.epoch_digest(),
+        "rem-d11-01-mismatched-successor");
+    wrong_definition.evidence_cutoff = 99;
+    const auto wrong_command = recovery_command(
+        wrong_definition, activation_delay, issuer_key);
+    const AdaptiveV2EpochChangeBundle wrong_bundle(
+        wrong_command, wrong_definition, bundle_limits());
+    REQUIRE(wrong_command.payload.successor_epoch_digest !=
+            command.payload.successor_epoch_digest);
+
+    const std::vector<ReplicaID> command_certificate_voters{
+        0, 1, byzantine};
+    CHECK(command_certificate_voters.size() == quorum->quorum);
+    CHECK(std::find(
+              command_certificate_voters.begin(),
+              command_certificate_voters.end(),
+              byzantine) != command_certificate_voters.end());
+    CHECK(std::find(
+              command_certificate_voters.begin(),
+              command_certificate_voters.end(),
+              missing_correct) == command_certificate_voters.end());
+
+    std::vector<AdversarialV2Replica *> definition_holders{
+        &correct0, &correct1};
+    for (auto *replica : definition_holders)
+    {
+        REQUIRE(recover_exact_committed_bundle(
+            *replica, command, exact_bundle));
+        const auto *const successor =
+            replica->store.find_epoch_by_digest(
+                command.payload.successor_epoch_digest);
+        REQUIRE(successor != nullptr);
+        REQUIRE(replica->adapter.prepare_committed_v2(*successor) ==
+                EpochIngressError::none);
+        REQUIRE(replica->activation.record_committed_v2(
+                    command, command_commit_height)
+                    .disposition ==
+                ActivationRecordDisposition::recorded);
+    }
+
+    const auto missing_observation =
+        correct2.activation.record_committed_v2(
+            command, command_commit_height);
+    CHECK((
+        missing_observation.disposition ==
+            ActivationRecordDisposition::missing_definition ||
+        missing_observation.disposition ==
+            ActivationRecordDisposition::recorded));
+    CHECK(correct2.activation.committed_v2_record().has_value());
+    CHECK(correct2.activation.blocked_reason() ==
+          ActivationBlockReason::missing_definition);
+    CHECK_FALSE(correct2.activation.admits_new_proposals());
+
+    std::vector<AdversarialV2Replica *> correct_replicas{
+        &correct0, &correct1, &correct2};
+    const auto available_correct_voters = [&]() {
+        std::vector<ReplicaID> voters;
+        for (std::size_t index = 0; index < correct_replicas.size(); ++index)
+            if (correct_replicas[index]->activation.admits_new_proposals())
+                voters.push_back(static_cast<ReplicaID>(index));
+        return voters;
+    };
+
+    const auto stalled_voters = available_correct_voters();
+    CHECK(stalled_voters == std::vector<ReplicaID>{0, 1});
+    CHECK(stalled_voters.size() < quorum->quorum);
+    CHECK(std::find(
+              stalled_voters.begin(), stalled_voters.end(), byzantine) ==
+          stalled_voters.end());
+
+    const auto retained_before_wrong =
+        correct2.activation.committed_v2_record();
+    CHECK_FALSE(recover_exact_committed_bundle(
+        correct2, command, wrong_bundle));
+    CHECK(correct2.store.find_epoch_by_digest(
+              command.payload.successor_epoch_digest) == nullptr);
+    CHECK(correct2.activation.active_effect().definition ==
+          &correct2.epoch0);
+    CHECK_FALSE(correct2.activation.admits_new_proposals());
+    CHECK(correct2.activation.committed_v2_record() ==
+          retained_before_wrong);
+
+    REQUIRE(recover_exact_committed_bundle(
+        correct2, command, exact_bundle));
+    const auto *const recovered_definition =
+        correct2.store.find_epoch_by_digest(
+            command.payload.successor_epoch_digest);
+    REQUIRE(recovered_definition != nullptr);
+    CHECK(recovered_definition->epoch_digest() ==
+          command.payload.successor_epoch_digest);
+    const auto *const reference_definition =
+        correct0.store.find_epoch_by_digest(
+            command.payload.successor_epoch_digest);
+    REQUIRE(reference_definition != nullptr);
+    CHECK(recovered_definition->canonical_serialization() ==
+          reference_definition->canonical_serialization());
+
+    const auto replayed = correct2.activation.record_committed_v2(
+        command, command_commit_height);
+    CHECK((
+        replayed.disposition == ActivationRecordDisposition::recorded ||
+        replayed.disposition == ActivationRecordDisposition::duplicate));
+    const auto retained = correct2.activation.committed_v2_record();
+    CHECK(retained.has_value());
+    if (retained.has_value())
+    {
+        CHECK(retained->predecessor_epoch_digest ==
+              command.payload.predecessor_epoch_digest);
+        CHECK(retained->successor_epoch_digest ==
+              command.payload.successor_epoch_digest);
+        CHECK(retained->payload_digest ==
+              epoch_change_payload_digest(command.payload));
+        CHECK(retained->command_commit_height ==
+              command_commit_height);
+        CHECK(retained->activation_height == activation_height);
+    }
+    REQUIRE(correct2.adapter.prepare_committed_v2(
+                *recovered_definition) == EpochIngressError::none);
+    CHECK(correct2.activation.admits_new_proposals());
+
+    const auto resumed_voters = available_correct_voters();
+    CHECK(resumed_voters == std::vector<ReplicaID>{0, 1, 2});
+    CHECK(resumed_voters.size() == quorum->quorum);
+    CHECK(std::find(
+              resumed_voters.begin(), resumed_voters.end(), byzantine) ==
+          resumed_voters.end());
+
+    for (std::size_t index = 0; index < correct_replicas.size(); ++index)
+    {
+        CAPTURE(index);
+        const auto activated =
+            correct_replicas[index]->binding.on_v2_post_block_commit(
+                activation_height,
+                correct_replicas[index]->epoch0.epoch_digest());
+        CHECK(activated.error == EpochIngressError::none);
+        CHECK(activated.transition ==
+              ActivationTransition::activated);
+        CHECK(correct_replicas[index]
+                  ->activation.active_effect()
+                  .configuration.epoch_number == 1);
+        CHECK(correct_replicas[index]
+                  ->activation.active_effect()
+                  .configuration.epoch_digest ==
+              command.payload.successor_epoch_digest);
+    }
+
+    const auto successor = correct0.activation.active_effect().configuration;
+    CHECK(correct1.activation.active_effect().configuration == successor);
+    CHECK(correct2.activation.active_effect().configuration == successor);
+
+    const auto successor_commit_voters = available_correct_voters();
+    CHECK(successor_commit_voters ==
+          std::vector<ReplicaID>{0, 1, 2});
+    CHECK(successor_commit_voters.size() == quorum->quorum);
+    CHECK(std::find(
+              successor_commit_voters.begin(),
+              successor_commit_voters.end(),
+              byzantine) == successor_commit_voters.end());
 }
 
 TEST_CASE("exact commit applies the prepared update and reports activation once",

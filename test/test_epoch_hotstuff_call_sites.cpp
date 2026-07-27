@@ -925,6 +925,355 @@ TEST_CASE("adaptive v2 recovery handlers authenticate and retry off ingress",
          "send_epoch_definition_request("}));
 }
 
+TEST_CASE(
+    "REM-D11 committed definition recovery is exact and independent",
+    "[rem-d11][epoch-change][committed-definition-recovery][source-wiring]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto state = function_body(
+        header, "struct CommittedEpochDefinitionRecovery");
+    const auto retain = function_body(
+        implementation,
+        "HotStuffBase::retain_committed_epoch_definition_recovery(");
+    const auto request = function_body(
+        implementation,
+        "HotStuffBase::send_epoch_definition_request(");
+    const auto reply = function_body(
+        implementation,
+        "HotStuffBase::adaptive_definition_reply_handler(");
+    const auto recover = function_body(
+        implementation,
+        "HotStuffBase::recover_committed_epoch_definition(");
+    const auto retire_deferred = function_body(
+        implementation,
+        "HotStuffBase::retire_deferred_epoch_changes_for_block(");
+    const auto post_commit = function_body(
+        implementation, "void HotStuffBase::do_post_block_commit(");
+
+    REQUIRE_FALSE(state.empty());
+    CHECK(contains_all(
+        state,
+        {"EpochDefinitionRequest request;",
+         "AuthorizedEpochChange command;",
+         "uint256_t command_block_hash;",
+         "uint256_t payload_digest;",
+         "std::uint64_t command_commit_height",
+         "std::uint64_t activation_height",
+         "block_t activation_block;",
+         "bool definition_recovered"}));
+    CHECK(header.find(
+              "std::optional<CommittedEpochDefinitionRecovery>") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(retain.empty());
+    CHECK(contains_in_order(
+        retain,
+        {"record.command_commit_height != block->get_height()",
+         "record.activation_height <",
+         "EpochDefinitionRequest request{",
+         "kEpochWireSchemaVersionV2",
+         "EpochProtocolMode::adaptive_v2",
+         "command.payload.successor_epoch_digest",
+         "committed_epoch_definition_recovery.emplace(",
+         "block->get_hash()",
+         "record.command_commit_height",
+         "record.activation_height",
+         "send_epoch_definition_request(request)"}));
+    CHECK(retain.find("deferred_epoch_definition_recoveries") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(request.empty());
+    CHECK(contains_in_order(
+        request,
+        {"peer_id_map",
+         "authenticated.second >= fixed_membership.size()",
+         "fixed_membership[authenticated.second] != replica",
+         "targets.emplace_back(replica, authenticated.first)",
+         "std::sort(",
+         "target.first == previous",
+         "MsgEpochDefinitionRequest message(",
+         "request, epoch_wire_limits",
+         "pn.send_msg(message, target.second)"}));
+
+    REQUIRE_FALSE(reply.empty());
+    CHECK(contains_in_order(
+        reply,
+        {"conn->get_peer_id()",
+         "peer_id_map.find(peer)",
+         "authenticated->second >= fixed_membership.size()",
+         "fixed_membership[authenticated->second] !=",
+         "decode_epoch_definition_reply(",
+         "const bool deferred_recovery_live =",
+         "const bool committed_recovery_live =",
+         "committed_epoch_definition_recovery->request",
+         "successor_epoch_digest",
+         "canonical_serialize_epoch(decoded.value->definition)",
+         "DataStream(canonical_definition).get_hash() !=",
+         "payload.successor_epoch_number",
+         "payload.predecessor_epoch_digest",
+         "stage_available_v2(",
+         "staged.definition->canonical_serialization() !=",
+         "if (committed_recovery_live &&",
+         "recover_committed_epoch_definition(*staged.definition)",
+         "if (deferred_recovery_live)",
+         "queue_deferred_epoch_change_retries("}));
+
+    REQUIRE_FALSE(recover.empty());
+    CHECK(contains_in_order(
+        recover,
+        {"definition.schema_version() !=",
+         "kEpochDefinitionSchemaVersionV2",
+         "definition.activation_height() != 0",
+         "definition.epoch_number() !=",
+         "payload.successor_epoch_number",
+         "definition.previous_epoch_digest() !=",
+         "payload.predecessor_epoch_digest",
+         "definition.epoch_digest() !=",
+         "payload.successor_epoch_digest",
+         "exact_epochs->find_epoch_by_digest(",
+         "definition.canonical_serialization().empty()",
+         "DataStream(definition.canonical_serialization()).get_hash() !=",
+         "prepare_committed_v2(",
+         "record_committed_v2(",
+         "command, recovery.command_commit_height",
+         "replayed.record->command_commit_height !=",
+         "recovery.command_commit_height",
+         "replayed.record->activation_height !=",
+         "recovery.activation_height",
+         "recovery.definition_recovered = true",
+         "recovery.activation_block == nullptr",
+         "recovery.activation_block->get_height() !=",
+         "recovery.activation_height",
+         "on_v2_post_block_commit(",
+         "recovery.activation_height",
+         "payload.predecessor_epoch_digest",
+         "const auto activation_block = recovery.activation_block",
+         "finish_adaptive_epoch_commit(activation_block, activation)",
+         "reset_committed_epoch_definition_recovery()"}));
+    CHECK(recover.find("deferred_epoch_definition_recoveries") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(retire_deferred.empty());
+    CHECK(retire_deferred.find(
+              "committed_epoch_definition_recovery") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(post_commit.empty());
+    CHECK(contains_in_order(
+        post_commit,
+        {"record_committed_v2(command, blk->get_height())",
+         "const bool exact_existing_recovery",
+         "recorded.record->command_commit_height ==",
+         "->command_commit_height",
+         "recorded.record->activation_height ==",
+         "->activation_height",
+         "const bool recoverable_missing_definition",
+         "ActivationRecordDisposition::missing_definition",
+         "recorded.record.has_value()",
+         "const bool recoverable_missing_definition_duplicate",
+         "successor == nullptr",
+         "ActivationRecordDisposition::duplicate",
+         "exact_existing_recovery",
+         "!recoverable_missing_definition_duplicate",
+         "if ((recorded.disposition ==",
+         "ActivationRecordDisposition::recorded",
+         "ActivationRecordDisposition::missing_definition",
+         "emit_epoch_command_committed_event(",
+         "if (recoverable_missing_definition &&",
+         "!retain_committed_epoch_definition_recovery(",
+         "pending_committed_epoch_change.reset()",
+         "blk->get_height() == recovery.activation_height",
+         "recovery.activation_block = blk",
+         "recover_committed_epoch_definition("}));
+    CHECK(contains_in_order(
+        post_commit,
+        {"const bool exact_recovery_duplicate",
+         "recovery.payload_digest ==",
+         "pending_committed_epoch_change->payload_digest",
+         "recovery.request.successor_epoch_digest ==",
+         "command.payload.successor_epoch_digest",
+         "encode_authorized_epoch_change(recovery.command) ==",
+         "encode_authorized_epoch_change(command)",
+         "if (!exact_recovery_duplicate)",
+         "ActivationBlockReason::",
+         "conflicting_activation_record"}));
+    CHECK(count_occurrences(
+              post_commit,
+              "retain_committed_epoch_definition_recovery(") == 1);
+    CHECK(count_occurrences(
+              post_commit, "emit_epoch_command_committed_event(") == 1);
+    CHECK(post_commit.find("send_epoch_definition_request(") ==
+          std::string::npos);
+    CHECK(post_commit.find(
+              "ActivationBlockReason::missing_definition") ==
+          std::string::npos);
+}
+
+TEST_CASE(
+    "REM-D11 committed definition recovery retries until a terminal path",
+    "[rem-d11][epoch-change][committed-definition-recovery][retry]"
+    "[source-wiring][intentional-red]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto state = function_body(
+        header, "struct CommittedEpochDefinitionRecovery");
+    const auto retain = function_body(
+        implementation,
+        "HotStuffBase::retain_committed_epoch_definition_recovery(");
+    const auto retry_delay = function_body(
+        implementation,
+        "committed_epoch_definition_retry_delay(");
+    const auto schedule = function_body(
+        implementation,
+        "HotStuffBase::schedule_committed_epoch_definition_retry(");
+    const auto dispatch = function_body(
+        implementation,
+        "HotStuffBase::dispatch_committed_epoch_definition_retry(");
+    const auto cancel = function_body(
+        implementation,
+        "HotStuffBase::cancel_committed_epoch_definition_retry(");
+    const auto reset = function_body(
+        implementation,
+        "HotStuffBase::reset_committed_epoch_definition_recovery(");
+    const auto recover = function_body(
+        implementation,
+        "HotStuffBase::recover_committed_epoch_definition(");
+    const auto initialize = function_body(
+        implementation,
+        "HotStuffBase::initialize_committed_epoch_change_history(");
+    const auto post_commit = function_body(
+        implementation, "void HotStuffBase::do_post_block_commit(");
+    const auto destructor = function_body(
+        implementation, "HotStuffBase::~HotStuffBase(");
+
+    REQUIRE_FALSE(state.empty());
+    CHECK(contains_all(
+        state,
+        {"std::uint64_t retry_generation",
+         "std::uint64_t retry_attempts",
+         "AggregationScheduler::Cancellation retry_cancellation"}));
+    CHECK(count_occurrences(
+              state, "AggregationScheduler::Cancellation") == 1);
+    CHECK(state.find("std::vector<") == std::string::npos);
+    CHECK(state.find("std::map<") == std::string::npos);
+    CHECK(contains_all(
+        header,
+        {"schedule_committed_epoch_definition_retry()",
+         "dispatch_committed_epoch_definition_retry(",
+         "cancel_committed_epoch_definition_retry()",
+         "reset_committed_epoch_definition_recovery()"}));
+
+    REQUIRE_FALSE(retry_delay.empty());
+    CHECK(contains_all(
+        retry_delay,
+        {"committed_epoch_definition_retry_base_delay",
+         "committed_epoch_definition_retry_maximum_delay",
+         "std::min",
+         "completed_attempts"}));
+    CHECK(retry_delay.find("maximum_retry_attempts") ==
+          std::string::npos);
+    CHECK(retry_delay.find("retry_exhausted") == std::string::npos);
+
+    REQUIRE_FALSE(retain.empty());
+    CHECK(contains_in_order(
+        retain,
+        {"EpochDefinitionRequest request{",
+         "command.payload.successor_epoch_digest",
+         "committed_epoch_definition_recovery.emplace(",
+         "send_epoch_definition_request(request)",
+         "schedule_committed_epoch_definition_retry()"}));
+
+    REQUIRE_FALSE(schedule.empty());
+    CHECK(contains_all(
+        schedule,
+        {"committed_epoch_definition_recovery",
+         "aggregation_scheduler",
+         "retry_cancellation",
+         "retry_generation",
+         "retry_attempts",
+         "committed_epoch_definition_retry_delay(",
+         "schedule_after(",
+         "dispatch_committed_epoch_definition_retry(",
+         "command_block_hash",
+         "request",
+         "successor_epoch_digest"}));
+    CHECK(schedule.find("maximum_retry_attempts") == std::string::npos);
+    CHECK(schedule.find("retry_exhausted") == std::string::npos);
+
+    REQUIRE_FALSE(dispatch.empty());
+    CHECK(contains_in_order(
+        dispatch,
+        {"committed_epoch_definition_recovery",
+         "retry_generation != retry_generation",
+         "command_block_hash != command_block_hash",
+         "request.successor_epoch_digest !=",
+         "successor_epoch_digest",
+         "retry_cancellation = {}",
+         "send_epoch_definition_request(recovery.request)",
+         "std::numeric_limits<std::uint64_t>::max()",
+         "++recovery.retry_attempts",
+         "schedule_committed_epoch_definition_retry()"}));
+    CHECK(dispatch.find("maximum_retry_attempts") ==
+          std::string::npos);
+    CHECK(dispatch.find("retry_exhausted") == std::string::npos);
+    CHECK(dispatch.find("record_committed_v2(") ==
+          std::string::npos);
+    CHECK(dispatch.find("retain_committed_epoch_definition_recovery(") ==
+          std::string::npos);
+    CHECK(dispatch.find("do_vote(") == std::string::npos);
+    CHECK(dispatch.find("do_consensus(") == std::string::npos);
+    CHECK(dispatch.find("certificate") == std::string::npos);
+
+    REQUIRE_FALSE(cancel.empty());
+    CHECK(contains_in_order(
+        cancel,
+        {"committed_epoch_definition_recovery",
+         "std::move(",
+         "committed_epoch_definition_recovery->retry_cancellation",
+         "committed_epoch_definition_recovery->retry_cancellation = {}",
+         "cancellation()"}));
+
+    REQUIRE_FALSE(reset.empty());
+    CHECK(contains_in_order(
+        reset,
+        {"cancel_committed_epoch_definition_retry()",
+         "committed_epoch_definition_recovery.reset()"}));
+
+    REQUIRE_FALSE(recover.empty());
+    CHECK(contains_in_order(
+        recover,
+        {"record_committed_v2(",
+         "command, recovery.command_commit_height",
+         "recovery.definition_recovered = true",
+         "cancel_committed_epoch_definition_retry()",
+         "recovery.activation_block->get_height() !=",
+         "recovery.activation_height",
+         "const auto activation_block = recovery.activation_block",
+         "finish_adaptive_epoch_commit(activation_block, activation)",
+         "reset_committed_epoch_definition_recovery()"}));
+
+    REQUIRE_FALSE(post_commit.empty());
+    const auto fail_closed = function_body(
+        post_commit, "const auto fail_closed =");
+    REQUIRE_FALSE(fail_closed.empty());
+    CHECK(contains_in_order(
+        fail_closed,
+        {"pending_committed_epoch_change.reset()",
+         "reset_committed_epoch_definition_recovery()",
+         "adaptive_epoch_runtime->adapter.fail_committed_v2(reason)"}));
+
+    REQUIRE_FALSE(initialize.empty());
+    CHECK(initialize.find(
+              "reset_committed_epoch_definition_recovery()") !=
+          std::string::npos);
+    REQUIRE_FALSE(destructor.empty());
+    CHECK(destructor.find(
+              "reset_committed_epoch_definition_recovery()") !=
+          std::string::npos);
+}
+
 TEST_CASE("deferred recovery is cleared only on deterministic terminal paths",
           "[c08][epoch-change][definition-recovery][lifecycle][intentional-red]")
 {
@@ -989,8 +1338,9 @@ TEST_CASE("deferred recovery is cleared only on deterministic terminal paths",
     REQUIRE_FALSE(reply.empty());
     CHECK(contains_in_order(
         reply,
-        {"deferred_epoch_definition_recoveries.find(",
-         "recovery == deferred_epoch_definition_recoveries.end()",
+        {"const bool deferred_recovery_live =",
+         "const bool committed_recovery_live =",
+         "if (!deferred_recovery_live && !committed_recovery_live)",
          "return;"}));
 
     REQUIRE_FALSE(destructor.empty());
@@ -1130,12 +1480,17 @@ TEST_CASE("committed adaptive v2 commands are cached after history advances",
         record,
         {"EpochChangeDisposition::accepted",
          "EpochChangeDisposition::duplicate",
-         "validation.successor_definition == nullptr",
+         "const bool available_definition",
+         "validation.successor_definition != nullptr",
          "exact_epochs->find_epoch_by_digest(",
          "extracted.command->payload.successor_epoch_digest",
-         "validation.successor_definition != successor",
-         "validation.successor_definition->epoch_digest() !=",
-         "extracted.command->payload.successor_epoch_digest"}));
+         "validation.successor_definition == successor",
+         "EpochChangeDisposition::defer_missing_definition",
+         "const bool recoverable_missing_definition",
+         "validation.successor_definition == nullptr",
+         "successor == nullptr",
+         "validation.recovery_request.has_value()",
+         "validation.recovery_request->successor_epoch_digest =="}));
     CHECK((contains_all(
                record,
                {"proposal_contexts->active_configuration()",
@@ -1227,12 +1582,19 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
          "command.payload.successor_epoch_digest",
          "prepare_committed_v2(*successor)",
          "record_committed_v2(command, blk->get_height())",
+         "recoverable_missing_definition",
+         "ActivationRecordDisposition::missing_definition",
          "ActivationRecordDisposition::recorded",
          "ActivationRecordDisposition::duplicate",
+         "retain_committed_epoch_definition_recovery(",
          "pending_committed_epoch_change.reset()",
+         "committed_epoch_definition_recovery",
+         "recovery.activation_block = blk",
+         "recover_committed_epoch_definition(",
          "activation.active_effect()",
+         "post_block_height",
          "epoch_live_binding->on_v2_post_block_commit(",
-         "blk->get_height()",
+         "post_block_height",
          "configuration.epoch_digest",
          "finish_adaptive_epoch_commit(blk, activation)"}));
     CHECK(contains_all(
@@ -1252,17 +1614,19 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
           1);
     CHECK(count_occurrences(
               post_commit, "on_v2_post_block_commit(") == 1);
-    CHECK(contains_all(
-        post_commit,
-        {"adaptive_epoch_runtime->adapter.fail_committed_v2(",
-         "ActivationBlockReason::missing_definition",
-         "ActivationBlockReason::invalid_activation_record"}));
+    CHECK(post_commit.find(
+              "ActivationBlockReason::missing_definition") ==
+          std::string::npos);
+    CHECK(post_commit.find(
+              "ActivationBlockReason::invalid_activation_record") !=
+          std::string::npos);
     const auto fail_close = function_body(
         post_commit, "const auto fail_closed =");
     REQUIRE_FALSE(fail_close.empty());
     CHECK(contains_in_order(
         fail_close,
         {"pending_committed_epoch_change.reset()",
+         "reset_committed_epoch_definition_recovery()",
          "committed_epoch_change_history.reset()",
          "adaptive_epoch_runtime->adapter.fail_committed_v2(reason)"}));
     REQUIRE_FALSE(admit_local.empty());
