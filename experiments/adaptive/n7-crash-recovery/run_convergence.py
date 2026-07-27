@@ -23,6 +23,13 @@ PROFILE_SHA256 = "31f4e6ee2aab324521ae62f569b1a7a55c61f41f51ac6a7b80adb95bf4e2d3
 SCENARIO = "n7-epoch1-convergence"
 RESULT_ROOT_NAME = "n7-epoch1-convergence"
 MANAGER_SOURCE_ID = "adaptive-manager"
+CONVERGENCE_TRANSITION_ARTIFACT_ID = "e0-to-e1-containment"
+CONVERGENCE_BUNDLE_PATH = (
+    "transitions/e0-to-e1-containment/successor.bundle"
+)
+CONVERGENCE_SNAPSHOT_PATH = (
+    "transitions/e0-to-e1-containment/evidence-snapshot.json"
+)
 
 
 class RunnerError(base.RunnerError):
@@ -81,6 +88,54 @@ def load_frozen_profile(path: Path) -> tuple[dict[str, Any], bytes]:
     if profile != _expected_profile():
         raise RunnerError("convergence profile differs from the exact contract")
     return profile, payload
+
+
+def convergence_transition_request(
+    base_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact frozen containment request used by this scenario."""
+    try:
+        requests = base._profile_transition_requests(base_profile)
+    except base.RunnerError as exc:
+        raise RunnerError(
+            "base profile does not contain one valid ordered transition chain"
+        ) from exc
+    request = requests[0]
+    expected = {
+        "policy_intent": "fault_containment",
+        "evidence_window_rule": (
+            "fresh_exact_predecessor_after_common_commit"
+        ),
+        "transition_artifact_id": CONVERGENCE_TRANSITION_ARTIFACT_ID,
+        "bundle_path": CONVERGENCE_BUNDLE_PATH,
+        "evidence_snapshot_path": CONVERGENCE_SNAPSHOT_PATH,
+        "predecessor_epoch_number": 0,
+        "successor_epoch_number": 1,
+        "minimum_predecessor_residency_ms": 0,
+        "policy_parameters": {
+            "containment_baseline_roots": [
+                {"tree_id": replica, "replica_id": replica}
+                for replica in range(5)
+            ]
+        },
+    }
+    if request != expected:
+        raise RunnerError(
+            "base profile does not begin with the exact frozen "
+            "epoch-0-to-epoch-1 containment request"
+        )
+    return json.loads(json.dumps(request))
+
+
+def convergence_runtime_profile(
+    base_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Isolate the one frozen transition permitted by convergence scope."""
+    runtime_profile = json.loads(json.dumps(base_profile))
+    runtime_profile["transition_requests"] = [
+        convergence_transition_request(base_profile)
+    ]
+    return runtime_profile
 
 
 def loss_control_arguments(profile: Mapping[str, Any]) -> tuple[str, ...]:
@@ -263,6 +318,7 @@ def _manifest(
     manager_exit_code: int,
     crash_markers: Sequence[Mapping[str, Any]],
     crash_configuration_boundary: Mapping[str, Any],
+    successor_bundle_path: Path,
 ) -> dict[str, Any]:
     records_by_source = {record.name: record for record in process_records}
     sources: list[dict[str, Any]] = []
@@ -294,16 +350,32 @@ def _manifest(
             "sha256": _sha256(manager_path),
         }
     )
+    try:
+        successor_bundle_relative = successor_bundle_path.relative_to(
+            run_directory
+        ).as_posix()
+    except ValueError as exc:
+        raise RunnerError(
+            "successor bundle is outside the convergence run directory"
+        ) from exc
+    if successor_bundle_relative != CONVERGENCE_BUNDLE_PATH:
+        raise RunnerError(
+            "successor bundle does not match the frozen containment request"
+        )
     artifacts = []
-    for kind, name in (
-        ("profile", "convergence-profile.json"),
-        ("successor_bundle", "successor.bundle"),
-        ("epochs", "epochs.json"),
-        ("runner_state", "runner-state.json"),
+    for kind, path in (
+        ("profile", run_directory / "convergence-profile.json"),
+        ("successor_bundle", successor_bundle_path),
+        ("epochs", run_directory / "epochs.json"),
+        ("runner_state", run_directory / "runner-state.json"),
     ):
-        path = run_directory / name
+        relative_path = path.relative_to(run_directory).as_posix()
         artifacts.append(
-            {"kind": kind, "path": name, "sha256": _sha256(path)}
+            {
+                "kind": kind,
+                "path": relative_path,
+                "sha256": _sha256(path),
+            }
         )
     return {
         "schema_version": 1,
@@ -391,6 +463,8 @@ def run(argv: Sequence[str] | None = None) -> int:
     repository = args.repository.resolve()
     profile, profile_bytes = load_frozen_profile(args.profile.resolve())
     base_profile, _ = base.load_frozen_profile(args.base_profile.resolve())
+    runtime_profile = convergence_runtime_profile(base_profile)
+    transition_request = convergence_transition_request(runtime_profile)
     snapshot = base.verify_repository_state(repository)
     binaries = {
         "app": args.app_binary.resolve(),
@@ -409,6 +483,7 @@ def run(argv: Sequence[str] | None = None) -> int:
 
     run_directory = base.create_run_directory(args.results_root.resolve())
     run_id = run_directory.name
+    successor_bundle_path = run_directory / transition_request["bundle_path"]
     base._write_private(
         run_directory / "convergence-profile.json", profile_bytes
     )
@@ -444,7 +519,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
         _, _, manager_command, replica_commands, _ = base.write_runtime_inputs(
             run_directory,
-            base_profile,
+            runtime_profile,
             bls,
             tls,
             issuer,
@@ -583,7 +658,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             expected_crashed=set(base.CRASH_TARGETS),
         )
         decoded = base.decode_epoch_change_bundle(
-            (run_directory / "successor.bundle").read_bytes()
+            successor_bundle_path.read_bytes()
         )
         base._write_json_exclusive(
             run_directory / "epochs.json",
@@ -678,6 +753,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         manager_exit_code=manager_exit_code,
         crash_markers=crash_markers,
         crash_configuration_boundary=boundary,
+        successor_bundle_path=successor_bundle_path,
     )
     manifest_path = run_directory / "manifest.json"
     base._write_json_exclusive(manifest_path, manifest)

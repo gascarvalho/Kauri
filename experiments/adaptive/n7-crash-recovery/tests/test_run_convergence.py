@@ -8,6 +8,7 @@ import inspect
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -71,6 +72,211 @@ def test_runner_reuses_existing_n7_helpers_without_mutating_base_profile() -> No
     assert hashlib.sha256(base_path.read_bytes()).hexdigest() == before
     assert before == base_runner.RECURRING_PROFILE_SHA256
     assert convergence_run.BASE_PROFILE_SHA256 == base_runner.PROFILE_SHA256
+
+
+def test_runner_derives_one_exact_containment_request_from_recurring_profile() -> None:
+    runner = _runner()
+    base_profile = json.loads(
+        (SCENARIO_DIRECTORY / "profile.json").read_bytes()
+    )
+    original = json.loads(json.dumps(base_profile))
+
+    request = runner.convergence_transition_request(base_profile)
+    runtime_profile = runner.convergence_runtime_profile(base_profile)
+
+    assert request == {
+        **base_profile["transition_requests"][0],
+        "transition_artifact_id": "e0-to-e1-containment",
+        "bundle_path": (
+            "transitions/e0-to-e1-containment/successor.bundle"
+        ),
+        "predecessor_epoch_number": 0,
+        "successor_epoch_number": 1,
+        "policy_intent": "fault_containment",
+    }
+    assert runtime_profile["transition_requests"] == [request]
+    assert len(base_profile["transition_requests"]) == 2
+    assert base_profile == original
+
+    request["policy_parameters"]["containment_baseline_roots"].clear()
+    runtime_profile["transition_requests"][0]["bundle_path"] = "mutated"
+    assert base_profile == original
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "ambiguous",
+        "mismatched_path",
+    ),
+)
+def test_runner_rejects_non_exact_convergence_transition_contract(
+    mutation: str,
+) -> None:
+    runner = _runner()
+    profile = json.loads(
+        (SCENARIO_DIRECTORY / "profile.json").read_bytes()
+    )
+    if mutation == "missing":
+        profile.pop("transition_requests")
+    elif mutation == "ambiguous":
+        profile["transition_requests"].insert(
+            1,
+            json.loads(json.dumps(profile["transition_requests"][0])),
+        )
+    else:
+        profile["transition_requests"][0]["bundle_path"] = (
+            "transitions/e0-to-e1-containment/renamed.bundle"
+        )
+
+    with pytest.raises(runner.RunnerError):
+        runner.convergence_transition_request(profile)
+    with pytest.raises(runner.RunnerError):
+        runner.convergence_runtime_profile(profile)
+
+
+def test_runner_wires_only_the_exact_request_and_bundle_through_execution() -> None:
+    runner = _runner()
+    source = inspect.getsource(runner.run)
+
+    runtime_profile = source.index(
+        "runtime_profile = convergence_runtime_profile(base_profile)"
+    )
+    runtime_inputs = source.index(
+        "base.write_runtime_inputs(", runtime_profile
+    )
+    launch = source.index('state["phase"] = "launch"', runtime_inputs)
+    assert "runtime_profile," in source[runtime_inputs:launch]
+    assert "base_profile," not in source[runtime_inputs:launch]
+
+    bundle_read = source.index(
+        "successor_bundle_path.read_bytes()", launch
+    )
+    manifest = source.index("manifest = _manifest(", bundle_read)
+    assert '"successor.bundle"' not in source[launch:manifest]
+    assert (
+        "successor_bundle_path=successor_bundle_path"
+        in source[manifest:]
+    )
+
+
+def _manifest_fixture(
+    run_directory: Path,
+) -> tuple[list[Any], dict[str, str], Path]:
+    raw = run_directory / "raw"
+    raw.mkdir(parents=True)
+    process_records: list[Any] = []
+    source_instances: dict[str, str] = {}
+    for replica in base_runner.REPLICA_IDS:
+        source_id = f"replica-{replica}"
+        (raw / f"{source_id}.jsonl").write_text(
+            f'{{"source_id":"{source_id}"}}\n',
+            encoding="utf-8",
+        )
+        source_instances[source_id] = f"instance-{source_id}"
+        process_records.append(
+            SimpleNamespace(
+                name=source_id,
+                pid=10_000 + replica,
+                pgid=20_000 + replica,
+            )
+        )
+    manager = "adaptive-manager"
+    (raw / f"{manager}.jsonl").write_text(
+        f'{{"source_id":"{manager}"}}\n',
+        encoding="utf-8",
+    )
+    source_instances[manager] = f"instance-{manager}"
+    process_records.append(
+        SimpleNamespace(name=manager, pid=30_000, pgid=40_000)
+    )
+    (run_directory / "convergence-profile.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    (run_directory / "epochs.json").write_text("{}\n", encoding="utf-8")
+    (run_directory / "runner-state.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    exact_bundle = (
+        run_directory
+        / "transitions"
+        / "e0-to-e1-containment"
+        / "successor.bundle"
+    )
+    exact_bundle.parent.mkdir(parents=True)
+    return process_records, source_instances, exact_bundle
+
+
+def _build_manifest(
+    runner: Any,
+    run_directory: Path,
+    process_records: list[Any],
+    source_instances: dict[str, str],
+    successor_bundle_path: Path,
+) -> dict[str, Any]:
+    return runner._manifest(
+        run_directory=run_directory,
+        run_id="synthetic-convergence",
+        revision="a" * 40,
+        profile_bytes=b"{}\n",
+        source_instances=source_instances,
+        process_records=process_records,
+        manager_command=(),
+        manager_exit_code=0,
+        crash_markers=(),
+        crash_configuration_boundary={},
+        successor_bundle_path=successor_bundle_path,
+    )
+
+
+def test_manifest_hashes_only_the_exact_qualified_containment_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner()
+    records, instances, exact_bundle = _manifest_fixture(tmp_path)
+    exact_bundle.write_bytes(b"exact-qualified-bundle")
+    legacy_bundle = tmp_path / "successor.bundle"
+    legacy_bundle.write_bytes(b"stale-legacy-root-bundle")
+    monkeypatch.setattr(
+        base_runner, "normalized_manager_argv", lambda _command: []
+    )
+
+    manifest = _build_manifest(
+        runner, tmp_path, records, instances, exact_bundle
+    )
+
+    artifact = next(
+        item
+        for item in manifest["artifacts"]
+        if item["kind"] == "successor_bundle"
+    )
+    assert artifact == {
+        "kind": "successor_bundle",
+        "path": (
+            "transitions/e0-to-e1-containment/successor.bundle"
+        ),
+        "sha256": hashlib.sha256(exact_bundle.read_bytes()).hexdigest(),
+    }
+    assert artifact["sha256"] != hashlib.sha256(
+        legacy_bundle.read_bytes()
+    ).hexdigest()
+
+
+def test_manifest_rejects_missing_qualified_bundle_despite_legacy_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner()
+    records, instances, exact_bundle = _manifest_fixture(tmp_path)
+    (tmp_path / "successor.bundle").write_bytes(b"stale-legacy-root-bundle")
+    monkeypatch.setattr(
+        base_runner, "normalized_manager_argv", lambda _command: []
+    )
+
+    with pytest.raises((runner.RunnerError, OSError)):
+        _build_manifest(
+            runner, tmp_path, records, instances, exact_bundle
+        )
 
 
 def test_base_runner_threads_optional_manager_extra_args_over_full_run_default(
