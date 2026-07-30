@@ -624,4 +624,94 @@ TEST_CASE(
         REQUIRE(emission != std::string::npos);
         CHECK(controller_evaluate < emission);
     }
+
+    SECTION(
+        "accepted ledger cursor emits once per window and restarts after rotation")
+    {
+        const auto emit_observations = function_body(
+            manager,
+            "void emit_new_accepted_observations() noexcept");
+        const auto ingest = function_body(
+            manager, "void ingest(");
+        const auto begin_cycle = function_body(
+            manager, "bool begin_current_cycle() noexcept");
+        const auto rotate = function_body(
+            manager, "void begin_convergence_ack_drain() noexcept");
+        REQUIRE_FALSE(emit_observations.empty());
+        REQUIRE_FALSE(ingest.empty());
+        REQUIRE_FALSE(begin_cycle.empty());
+        REQUIRE_FALSE(rotate.empty());
+
+        const auto accepted = emit_observations.find(
+            "session_.ingress().ledger().accepted()");
+        const auto cursor = emit_observations.find(
+            "emitted_accepted_observations_");
+        const auto suffix_loop = emit_observations.find(
+            "while (emitted_accepted_observations_ < records.size())");
+        const auto event = emit_observations.find(
+            "EvidenceObservationAcceptedStructuredEvent");
+        const auto emit = emit_observations.find(
+            "emit_audit(", event);
+        const auto increment = emit_observations.find(
+            "++emitted_accepted_observations_", emit);
+        REQUIRE(accepted != std::string::npos);
+        REQUIRE(cursor != std::string::npos);
+        REQUIRE(suffix_loop != std::string::npos);
+        REQUIRE(event != std::string::npos);
+        REQUIRE(emit != std::string::npos);
+        REQUIRE(increment != std::string::npos);
+        CHECK(accepted < suffix_loop);
+        CHECK(suffix_loop < event);
+        CHECK(event < emit);
+        CHECK(emit < increment);
+        CHECK(count_occurrences(
+                  emit_observations, "emit_audit(") == 1);
+        CHECK(count_occurrences(
+                  emit_observations,
+                  "++emitted_accepted_observations_") == 1);
+        CHECK(emit_observations.find(
+                  "record}}", event) != std::string::npos);
+        CHECK(emit_observations.find(
+                  "records.size()", cursor) !=
+              std::string::npos);
+
+        const auto operation = ingest.find("operation(");
+        const auto audit_suffix = ingest.find(
+            "emit_new_accepted_observations()", operation);
+        const auto status_check = ingest.find(
+            "result.status", operation);
+        const auto controller_evaluate = ingest.find(
+            "evaluate()", audit_suffix);
+        REQUIRE(operation != std::string::npos);
+        REQUIRE(audit_suffix != std::string::npos);
+        REQUIRE(status_check != std::string::npos);
+        REQUIRE(controller_evaluate != std::string::npos);
+        CHECK(operation < audit_suffix);
+        CHECK(audit_suffix < status_check);
+        CHECK(audit_suffix < controller_evaluate);
+
+        CHECK(manager.find("ingest(\"lifecycle\"") !=
+              std::string::npos);
+        CHECK(begin_cycle.find(
+                  "emitted_accepted_observations_ = 0") ==
+              std::string::npos);
+        CHECK(count_occurrences(
+                  manager,
+                  "emitted_accepted_observations_ = 0;") == 1);
+        const auto publish = rotate.find(
+            "session_.consume_ready_and_rotate()");
+        const auto failed_rotation_return = rotate.find(
+            "return;", publish);
+        const auto reset = rotate.find(
+            "emitted_accepted_observations_ = 0", publish);
+        const auto continue_after_reset = rotate.find(
+            "emit_new_session_terminals()", reset);
+        REQUIRE(publish != std::string::npos);
+        REQUIRE(failed_rotation_return != std::string::npos);
+        REQUIRE(reset != std::string::npos);
+        REQUIRE(continue_after_reset != std::string::npos);
+        CHECK(publish < failed_rotation_return);
+        CHECK(failed_rotation_return < reset);
+        CHECK(reset < continue_after_reset);
+    }
 }

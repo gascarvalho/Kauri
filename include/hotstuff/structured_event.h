@@ -119,6 +119,12 @@ struct ReputationEvidenceAppliedStructuredEvent
     EvidenceReputationAuditUpdate update;
 };
 
+/** One complete record newly accepted by the manager evidence ledger. */
+struct EvidenceObservationAcceptedStructuredEvent
+{
+    AcceptedEvidenceRecord record;
+};
+
 enum class AdaptiveV2ConvergenceTransition : std::uint8_t
 {
     delivery_attempt = 1,
@@ -219,7 +225,8 @@ using AuditStructuredEventPayload = std::variant<
     ReputationEvidenceAppliedStructuredEvent,
     AdaptiveV2ConvergenceStructuredEvent,
     AdaptiveV2EvidenceSnapshotStructuredEvent,
-    AdaptiveV2ManagerSessionTerminalStructuredEvent>;
+    AdaptiveV2ManagerSessionTerminalStructuredEvent,
+    EvidenceObservationAcceptedStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -316,6 +323,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_convergence_failure,
     adaptive_v2_evidence_snapshot,
     adaptive_v2_session_terminal,
+    evidence_observation_accepted,
 };
 
 StructuredEventType structured_event_type(

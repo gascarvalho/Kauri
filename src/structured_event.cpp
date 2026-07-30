@@ -384,6 +384,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 4:
             type = StructuredEventType::adaptive_v2_session_terminal;
             return true;
+        case 5:
+            type = StructuredEventType::evidence_observation_accepted;
+            return true;
         default:
             return false;
     }
@@ -459,6 +462,21 @@ const char *response_outcome_name(ResponseOutcome outcome) noexcept
     return nullptr;
 }
 
+const char *expected_message_type_name(
+    ExpectedMessageType type) noexcept
+{
+    switch (type)
+    {
+        case ExpectedMessageType::direct_vote:
+            return "direct_vote";
+        case ExpectedMessageType::aggregate_relay:
+            return "aggregate_relay";
+        case ExpectedMessageType::leader_progress:
+            return "leader_progress";
+    }
+    return nullptr;
+}
+
 const char *reputation_outcome_name(
     SimpleReputationOutcome outcome) noexcept
 {
@@ -530,6 +548,67 @@ bool valid_reputation_payload(
          update.score == std::numeric_limits<int>::max()))
         return false;
     return true;
+}
+
+bool valid_observation_accepted_payload(
+    const EvidenceObservationAcceptedStructuredEvent &event,
+    StructuredEventSourceKind source_kind) noexcept
+{
+    const auto &record = event.record;
+    const auto &observation = record.observation;
+    if (source_kind != StructuredEventSourceKind::adaptation_manager ||
+        record.ingestion_sequence == 0 ||
+        observation.schema_version !=
+            kResponseObservationSchemaVersion ||
+        observation.observation_id == uint256_t{} ||
+        observation.reporter_id ==
+            observation.observed_replica_id ||
+        observation.configuration.epoch_digest == uint256_t{} ||
+        observation.block_hash == uint256_t{} ||
+        expected_message_type_name(
+            observation.expected_message_type) == nullptr ||
+        response_outcome_name(observation.outcome) == nullptr ||
+        observation.deadline_duration_us == 0 ||
+        observation.reporter_sequence == 0 ||
+        std::adjacent_find(
+            observation.signer_set.begin(),
+            observation.signer_set.end(),
+            [](ReplicaID left, ReplicaID right) {
+                return left >= right;
+            }) != observation.signer_set.end())
+    {
+        return false;
+    }
+
+    if (observation.outcome == ResponseOutcome::timeout)
+    {
+        if (observation.response_duration_us != 0 ||
+            !observation.signer_set.empty())
+        {
+            return false;
+        }
+    }
+    else
+    {
+        if (observation.signer_set.empty() ||
+            (observation.outcome == ResponseOutcome::late &&
+             observation.response_duration_us <
+                 observation.deadline_duration_us))
+        {
+            return false;
+        }
+    }
+
+    try
+    {
+        return observation.observation_id ==
+            compute_response_observation_id(
+                observation.attempt_identity());
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 
 bool valid_convergence_identity(
@@ -862,6 +941,12 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                     AdaptiveV2ManagerSessionTerminalStructuredEvent>(
                         payload),
                 config);
+        case 5:
+            return valid_observation_accepted_payload(
+                std::get<
+                    EvidenceObservationAcceptedStructuredEvent>(
+                        payload),
+                config.source.kind);
         default:
             return false;
     }
@@ -1169,6 +1254,52 @@ void append_reputation_payload(
     builder.append(",\"resulting_score\":");
     builder.append_integer(update.score);
     builder.append('}');
+}
+
+void append_observation_accepted_payload(
+    JsonLineBuilder &builder,
+    const EvidenceObservationAcceptedStructuredEvent &event)
+{
+    const auto &record = event.record;
+    const auto &observation = record.observation;
+    builder.append("{\"ingestion_sequence\":");
+    builder.append_integer(record.ingestion_sequence);
+    builder.append(",\"observation\":{\"schema_version\":");
+    builder.append_integer(observation.schema_version);
+    builder.append(",\"observation_id\":");
+    builder.append_escaped(observation.observation_id.to_hex());
+    builder.append(",\"reporter_id\":");
+    builder.append_integer(observation.reporter_id);
+    builder.append(",\"observed_replica_id\":");
+    builder.append_integer(observation.observed_replica_id);
+    builder.append(",\"configuration\":{");
+    append_configuration(builder, observation.configuration);
+    builder.append("},\"block_hash\":");
+    builder.append_escaped(observation.block_hash.to_hex());
+    builder.append(",\"expected_message_type\":");
+    builder.append_escaped(expected_message_type_name(
+        observation.expected_message_type));
+    builder.append(",\"outcome\":");
+    builder.append_escaped(response_outcome_name(
+        observation.outcome));
+    builder.append(",\"response_duration_us\":");
+    builder.append_integer(observation.response_duration_us);
+    builder.append(",\"deadline_duration_us\":");
+    builder.append_integer(observation.deadline_duration_us);
+    builder.append(",\"reporter_monotonic_ns\":");
+    builder.append_integer(observation.reporter_monotonic_ns);
+    builder.append(",\"reporter_sequence\":");
+    builder.append_integer(observation.reporter_sequence);
+    builder.append(",\"signer_set\":[");
+    bool first = true;
+    for (const auto signer : observation.signer_set)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append_integer(signer);
+        first = false;
+    }
+    builder.append("]}}");
 }
 
 void append_evidence_snapshot_payload(
@@ -1546,6 +1677,13 @@ std::string serialize_audit_event(
                 builder,
                 std::get<
                     AdaptiveV2ManagerSessionTerminalStructuredEvent>(
+                        event));
+            break;
+        case 5:
+            append_observation_accepted_payload(
+                builder,
+                std::get<
+                    EvidenceObservationAcceptedStructuredEvent>(
                         event));
             break;
         default:
@@ -2013,6 +2151,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2_evidence_snapshot";
         case StructuredEventType::adaptive_v2_session_terminal:
             return "adaptive_v2_session_terminal";
+        case StructuredEventType::evidence_observation_accepted:
+            return "evidence.observation_accepted";
         default:
             break;
     }

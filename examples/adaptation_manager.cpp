@@ -2035,6 +2035,43 @@ private:
                     state, std::nullopt}});
     }
 
+    void emit_new_accepted_observations() noexcept
+    {
+        const auto &records =
+            session_.ingress().ledger().accepted();
+        if (emitted_accepted_observations_ > records.size())
+        {
+            fail("accepted_observation_cursor_regression");
+            return;
+        }
+        while (emitted_accepted_observations_ < records.size())
+        {
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("structured_event_observation_drain_failed");
+                return;
+            }
+            const auto &record =
+                records[emitted_accepted_observations_];
+            const hotstuff::AuditStructuredEventPayload event{
+                hotstuff::EvidenceObservationAcceptedStructuredEvent{
+                    record}};
+            structured_event_sink_.emit_audit(event);
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("structured_event_observation_emit_failed");
+                return;
+            }
+            ++emitted_accepted_observations_;
+        }
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+        {
+            fail("structured_event_observation_final_drain_failed");
+        }
+    }
+
     void emit_new_score_trajectory() noexcept
     {
         const auto audit = session_.controller_audit();
@@ -2251,6 +2288,7 @@ private:
             fail("convergence_ready_consumption_failed");
             return;
         }
+        emitted_accepted_observations_ = 0;
         emit_new_session_terminals();
         const auto previous_cursor = request_sequence_.cursor();
         if (!request_sequence_.observe_terminal_records(
@@ -2498,6 +2536,9 @@ private:
             return;
         const auto result = operation(
             AuthenticatedReporter{*source}, message);
+        emit_new_accepted_observations();
+        if (failed_)
+            return;
         if (result.status ==
                 AdaptiveV2ManagerIngressStatus::evidence_unhealthy ||
             result.status == AdaptiveV2ManagerIngressStatus::stopped)
@@ -2863,6 +2904,7 @@ private:
         predecessor_residency_deadline_{};
     std::uint64_t convergence_tick_{0};
     std::size_t emitted_score_trajectory_{0};
+    std::size_t emitted_accepted_observations_{0};
     std::size_t emitted_session_terminals_{0};
     std::vector<CycleAuditContext> cycle_audits_;
     std::uint32_t accepted_activation_ack_ordinal_{0};

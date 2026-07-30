@@ -528,6 +528,7 @@ using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ManagerCycleOutcome;
 using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
 using hotstuff::AdaptiveV2ManagerSessionTerminalStructuredEvent;
+using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AuditStructuredEventEmitter;
 using hotstuff::AuditStructuredEventPayload;
 using hotstuff::CommitObservedStructuredEvent;
@@ -537,8 +538,10 @@ using hotstuff::DataStream;
 using hotstuff::EpochCommandCommittedStructuredEvent;
 using hotstuff::EpochLifecycleEvent;
 using hotstuff::EpochLifecycleTransition;
+using hotstuff::EvidenceObservationAcceptedStructuredEvent;
 using hotstuff::EvidenceReputationAuditUpdate;
 using hotstuff::ExclusiveFileStructuredEventOutput;
+using hotstuff::ExpectedMessageType;
 using hotstuff::MonotonicRawStructuredEventClock;
 using hotstuff::ProcessLifecycleEvent;
 using hotstuff::ProcessLifecycleState;
@@ -546,6 +549,7 @@ using hotstuff::ProposalKey;
 using hotstuff::RequiredBranchSignerGap;
 using hotstuff::ReputationEvidenceAppliedStructuredEvent;
 using hotstuff::ReplicaID;
+using hotstuff::ResponseObservation;
 using hotstuff::ResponseOutcome;
 using hotstuff::SimpleReputationOutcome;
 using hotstuff::StructuredEventClock;
@@ -690,6 +694,30 @@ ReputationEvidenceAppliedStructuredEvent reputation_event()
             SimpleReputationOutcome::timeout,
             -1,
             -3}};
+}
+
+EvidenceObservationAcceptedStructuredEvent observation_accepted_event()
+{
+    ResponseObservation observation;
+    observation.reporter_id = 2;
+    observation.observed_replica_id = 0;
+    observation.configuration =
+        configuration(7, 3, "accepted-observation-epoch");
+    observation.block_hash =
+        digest("accepted-observation-block");
+    observation.expected_message_type =
+        ExpectedMessageType::aggregate_relay;
+    observation.outcome = ResponseOutcome::late;
+    observation.response_duration_us = 150;
+    observation.deadline_duration_us = 100;
+    observation.reporter_monotonic_ns = 91'000;
+    observation.reporter_sequence = 9;
+    observation.signer_set = {0, 1};
+    observation.observation_id =
+        compute_response_observation_id(
+            observation.attempt_identity());
+    return {
+        AcceptedEvidenceRecord{42, std::move(observation)}};
 }
 
 StructuredEventConfig manager_event_config()
@@ -1789,8 +1817,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 5,
-        "the audit capability admits convergence, snapshots, and terminals");
+        std::variant_size<AuditStructuredEventPayload>::value == 6,
+        "the audit capability also admits full accepted observations");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -1806,6 +1834,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<4, AuditStructuredEventPayload>,
             AdaptiveV2ManagerSessionTerminalStructuredEvent>::value,
         "the fifth audit payload is the manager-session terminal event");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<5, AuditStructuredEventPayload>,
+            EvidenceObservationAcceptedStructuredEvent>::value,
+        "the sixth audit payload is one full accepted observation");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -1825,6 +1858,14 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
     CHECK(std::string(
               hotstuff::structured_event_type_name(reputation_type)) ==
           "reputation.evidence_applied");
+
+    const auto observation_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{observation_accepted_event()});
+    CHECK(observation_type ==
+          StructuredEventType::evidence_observation_accepted);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(observation_type)) ==
+          "evidence.observation_accepted");
 
     const auto snapshot_type = hotstuff::structured_event_type(
         AuditStructuredEventPayload{evidence_snapshot_event()});
@@ -1915,6 +1956,51 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
         StructuredEventSink sink(manager_event_config(), clock, output);
         AuditStructuredEventEmitter &audit = sink;
         audit.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+    }
+
+    SECTION("accepted observation preserves the complete ledger record")
+    {
+        const auto event = observation_accepted_event();
+        const auto &observation = event.record.observation;
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7002,"
+            "\"event_type\":\"evidence.observation_accepted\","
+            "\"payload\":{\"ingestion_sequence\":42,"
+            "\"observation\":{\"schema_version\":1,"
+            "\"observation_id\":\"" +
+            observation.observation_id.to_hex() + "\","
+            "\"reporter_id\":2,"
+            "\"observed_replica_id\":0,"
+            "\"configuration\":{\"epoch_number\":7,"
+            "\"tree_id\":3,"
+            "\"epoch_digest\":\"" +
+            observation.configuration.epoch_digest.to_hex() + "\"},"
+            "\"block_hash\":\"" +
+            observation.block_hash.to_hex() + "\","
+            "\"expected_message_type\":\"aggregate_relay\","
+            "\"outcome\":\"late\","
+            "\"response_duration_us\":150,"
+            "\"deadline_duration_us\":100,"
+            "\"reporter_monotonic_ns\":91000,"
+            "\"reporter_sequence\":9,"
+            "\"signer_set\":[0,1]}}}\n";
+
+        FakeClock clock({7002});
+        MemoryOutput output;
+        StructuredEventSink sink(
+            manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
         sink.shutdown();
 
         CHECK(sink.health().healthy);
@@ -2247,6 +2333,96 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         CHECK(rejects(manager_event_config(), invalid));
 
         CHECK(rejects(event_config(), reputation_event()));
+    }
+
+    SECTION("accepted observation must be one complete canonical ledger record")
+    {
+        auto invalid = observation_accepted_event();
+        CHECK(rejects(event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.ingestion_sequence = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.schema_version = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.observation_id = uint256_t{};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        ++invalid.record.observation.configuration.tree_id;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.observed_replica_id =
+            invalid.record.observation.reporter_id;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.configuration.epoch_digest =
+            uint256_t{};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.block_hash = uint256_t{};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.expected_message_type =
+            static_cast<ExpectedMessageType>(0);
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.outcome =
+            static_cast<ResponseOutcome>(0);
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.deadline_duration_us = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.reporter_sequence = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.signer_set = {1, 0};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.signer_set.clear();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.response_duration_us =
+            invalid.record.observation.deadline_duration_us - 1;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = observation_accepted_event();
+        invalid.record.observation.outcome = ResponseOutcome::timeout;
+        invalid.record.observation.response_duration_us = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        auto timeout = observation_accepted_event();
+        timeout.record.observation.outcome = ResponseOutcome::timeout;
+        timeout.record.observation.response_duration_us = 0;
+        timeout.record.observation.signer_set.clear();
+        FakeClock clock({8001});
+        MemoryOutput output;
+        StructuredEventSink sink(
+            manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{timeout});
+        sink.shutdown();
+        CHECK(sink.health().healthy);
+        CHECK(rendered(output).find(
+                  "\"outcome\":\"timeout\","
+                  "\"response_duration_us\":0") !=
+              std::string::npos);
+        CHECK(rendered(output).find("\"signer_set\":[]") !=
+              std::string::npos);
     }
 
     SECTION("evidence snapshot is an exact bounded predecessor prefix")
