@@ -15,6 +15,7 @@ from typing import Any
 from .diagnosis import (
     BoundedTwoModeDiagnosis,
     DiagnosticObservation,
+    FaultHypothesis,
 )
 from .diagnostic_game import (
     DiagnosticProbe,
@@ -26,7 +27,7 @@ from .diagnostic_game import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPLICA_IDS = tuple(range(7))
 DIAGNOSTIC_FAULT_BOUND = 1
 INITIAL_REPORTER_ID = 6
@@ -39,6 +40,7 @@ CLAIMS_NOT_MADE = (
     "the counting bound is a scoped specialization of classical diagnosis",
     "persistent omission does not distinguish crash, attack, or link failure",
     "the model excludes selective omission and mode changes inside a window",
+    "abstract directed pairs are not proof of Kauri topology legality",
     "no throughput improvement or arbitrary-Byzantine diagnosis is claimed",
     "probe scores cannot change consensus membership or safety rules",
 )
@@ -62,6 +64,17 @@ def _probe_value(probe: DiagnosticProbe) -> dict[str, int]:
     return {
         "reporter_id": probe.reporter_id,
         "target_id": probe.target_id,
+    }
+
+
+def _hypothesis_value(
+    hypothesis: FaultHypothesis,
+) -> dict[str, list[int]]:
+    return {
+        "false_reporters": list(hypothesis.false_reporters),
+        "persistent_omitters": list(
+            hypothesis.persistent_omitters
+        ),
     }
 
 
@@ -240,14 +253,14 @@ def _canonical_game() -> dict[str, Any]:
     repeat_probe = DiagnosticProbe(INITIAL_REPORTER_ID, TARGET_ID)
     fresh_probe = DiagnosticProbe(FRESH_REPORTER_ID, TARGET_ID)
     fresh_alternative = DiagnosticProbe(2, TARGET_ID)
-    legal_probes = tuple(
+    abstract_probes = tuple(
         DiagnosticProbe(reporter_id, target_id)
         for reporter_id in REPLICA_IDS
         for target_id in REPLICA_IDS
         if reporter_id != target_id
     )
-    legal_scores = tuple(
-        score_probe(snapshot, probe) for probe in legal_probes
+    abstract_scores = tuple(
+        score_probe(snapshot, probe) for probe in abstract_probes
     )
     primary_values = tuple(
         (
@@ -255,19 +268,19 @@ def _canonical_game() -> dict[str, Any]:
             score.worst_case_surviving_hypotheses,
             0 if score.fresh_reporter_for_target else 1,
         )
-        for score in legal_scores
+        for score in abstract_scores
     )
     best_primary_value = min(primary_values)
     optimal_equivalence_class = tuple(
         score.probe
         for score, primary_value in zip(
-            legal_scores,
+            abstract_scores,
             primary_values,
             strict=True,
         )
         if primary_value == best_primary_value
     )
-    selected = choose_minimax_probe(snapshot, legal_probes)
+    selected = choose_minimax_probe(snapshot, abstract_probes)
     before_safe = robust_safe_replicas(snapshot)
     branches = (
         _challenge_branch("response"),
@@ -305,13 +318,14 @@ def _canonical_game() -> dict[str, Any]:
             score_probe(snapshot, fresh_probe)
         ),
         "selected_probe": _probe_value(selected),
-        "exhaustive_legal_probe_audit": {
-            "legal_probes_scored": len(legal_probes),
+        "exhaustive_abstract_probe_audit": {
+            "abstract_directed_pairs_scored": len(abstract_probes),
             "optimal_equivalence_class": [
                 _probe_value(probe)
                 for probe in optimal_equivalence_class
             ],
-            "selection_from_complete_legal_set": True,
+            "selection_from_complete_abstract_pair_set": True,
+            "topology_legality_claimed": False,
         },
         "challenge_branches": list(branches),
         "ambiguity_tax": {
@@ -365,6 +379,15 @@ def _multi_conflict_probe_audit() -> dict[str, Any]:
         alternative_fresh,
     )
     selected = choose_minimax_probe(snapshot, candidates)
+    robust_safe = frozenset(robust_safe_replicas(snapshot))
+    fresh_safe_round_robin = min(
+        (
+            probe
+            for probe in candidates
+            if probe.reporter_id in robust_safe
+        ),
+        key=lambda probe: (probe.reporter_id, probe.target_id),
+    )
 
     return {
         "scope": (
@@ -393,10 +416,125 @@ def _multi_conflict_probe_audit() -> dict[str, Any]:
             score_probe(snapshot, independent_fresh)
         ),
         "selected_probe": _probe_value(selected),
+        "fresh_safe_round_robin_probe": _probe_value(
+            fresh_safe_round_robin
+        ),
+        "fresh_safe_round_robin_equals_minimax": (
+            fresh_safe_round_robin == selected
+        ),
         "interpretation": (
-            "freshness alone is insufficient when a reporter is already "
-            "implicated by another conflict; exact hypotheses distinguish "
-            "the otherwise legal fresh probes"
+            "target-only freshness is insufficient when a reporter is "
+            "already implicated by another conflict; excluding reporters "
+            "that are not robust-safe ties the minimax choice in this "
+            "fixture"
+        ),
+    }
+
+
+def _value_aware_target_audit() -> dict[str, Any]:
+    membership = tuple(range(7))
+    diagnosis = BoundedTwoModeDiagnosis(membership, 2)
+    snapshot = diagnosis.observe_many(
+        (
+            _observation("target1-response", 0, 1, "response"),
+            _observation("target2-timeout", 0, 2, "timeout"),
+            _observation("target1-timeout", 3, 1, "timeout"),
+        )
+    )
+    role_values = {
+        replica_id: 2 if replica_id == 2 else 1
+        for replica_id in membership
+    }
+    candidates = tuple(
+        DiagnosticProbe(reporter_id, target_id)
+        for target_id in (1, 2)
+        for reporter_id in (4, 5, 6)
+    )
+    uniform_value_minimax = choose_minimax_probe(
+        snapshot,
+        candidates,
+    )
+    selected = choose_minimax_probe(
+        snapshot,
+        candidates,
+        role_values,
+    )
+    baseline_score = score_probe(
+        snapshot,
+        uniform_value_minimax,
+        role_values,
+    )
+    selected_score = score_probe(
+        snapshot,
+        selected,
+        role_values,
+    )
+
+    return {
+        "scope": (
+            "synthetic N=7,d=2 interacting-conflict fixture with one "
+            "frozen higher-value future-role candidate"
+        ),
+        "accepted_observations": [
+            {
+                "reporter_id": observation.reporter_id,
+                "target_id": observation.target_id,
+                "outcome": observation.outcome,
+            }
+            for observation in snapshot.observations
+        ],
+        "compatible_hypotheses": [
+            _hypothesis_value(hypothesis)
+            for hypothesis in snapshot.hypotheses
+        ],
+        "robust_safe_replicas": list(
+            robust_safe_replicas(snapshot)
+        ),
+        "ambiguous_targets": [
+            target_id
+            for target_id in membership
+            if target_omission_status(snapshot, target_id)
+            == "ambiguous"
+        ],
+        "role_values": [
+            {
+                "replica_id": replica_id,
+                "future_role_value": role_values[replica_id],
+            }
+            for replica_id in membership
+        ],
+        "caller_admissible_probes": [
+            _probe_value(probe) for probe in candidates
+        ],
+        "uniform_value_minimax_baseline": {
+            "probe": _probe_value(uniform_value_minimax),
+            "score_under_frozen_role_values": _score_value(
+                baseline_score
+            ),
+        },
+        "minimax_selection": {
+            "probe": _probe_value(selected),
+            "score": _score_value(selected_score),
+        },
+        "strict_value_advantage": {
+            "guaranteed_safe_role_value_recovery_delta": (
+                selected_score.guaranteed_safe_role_value_recovery
+                - baseline_score.guaranteed_safe_role_value_recovery
+            ),
+            "worst_case_robust_safe_role_value_delta": (
+                selected_score.worst_case_robust_safe_role_value
+                - baseline_score.worst_case_robust_safe_role_value
+            ),
+            "worst_case_surviving_hypotheses_delta": (
+                selected_score.worst_case_surviving_hypotheses
+                - baseline_score.worst_case_surviving_hypotheses
+            ),
+        },
+        "interpretation": (
+            "robust-safe reporters tie within each target; adding frozen "
+            "future-role values changes the minimax target and improves "
+            "worst-case future-role recovery without changing the "
+            "worst-case hypothesis count"
         ),
     }
 
@@ -455,11 +593,16 @@ def evaluate_minimax_rematching(
         ],
         "canonical_minimax_game": _canonical_game(),
         "multi_conflict_probe_audit": _multi_conflict_probe_audit(),
+        "value_aware_target_audit": _value_aware_target_audit(),
         "comparison_baseline": {
-            "name": "OptiTree disjoint-suspicion-edge exclusion",
+            "name": (
+                "OptiTree provisional or persistent mutual-suspicion "
+                "edge exclusion"
+            ),
             "scope": (
-                "single-edge candidate-exclusion behavior only; this is "
-                "not a reimplementation of full OptiLog"
+                "single-edge candidate-exclusion behavior only; full "
+                "OptiLog temporal conversion of unreciprocated suspicion "
+                "is not reimplemented"
             ),
             "doi": "10.1145/3767295.3769342",
         },

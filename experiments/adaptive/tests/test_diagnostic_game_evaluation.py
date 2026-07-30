@@ -16,6 +16,41 @@ from experiments.adaptive.kauri_experiment.diagnostic_game_evaluation import (
 REVISION = "a" * 40
 
 
+def _expected_revision_verification(repository_root: Path) -> str:
+    tracked_dirty = any(
+        subprocess.run(
+            command,
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode
+        for command in (
+            ["git", "diff", "--quiet"],
+            ["git", "diff", "--cached", "--quiet"],
+        )
+    )
+    adaptive_status = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "experiments/adaptive",
+        ],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return (
+        "verified_current_head_dirty_override"
+        if tracked_dirty or adaptive_status
+        else "verified_current_clean_head"
+    )
+
+
 def test_evaluation_records_tight_bound_and_ambiguity_tax() -> None:
     evaluation = evaluate_minimax_rematching(REVISION)
 
@@ -59,20 +94,23 @@ def test_evaluation_records_tight_bound_and_ambiguity_tax() -> None:
     assert game["symmetric_policy_result"][
         "fresh_round_robin_equals_minimax"
     ] is True
-    assert game["exhaustive_legal_probe_audit"][
-        "legal_probes_scored"
+    assert game["exhaustive_abstract_probe_audit"][
+        "abstract_directed_pairs_scored"
     ] == 42
     assert len(
-        game["exhaustive_legal_probe_audit"][
+        game["exhaustive_abstract_probe_audit"][
             "optimal_equivalence_class"
         ]
     ) == 5
     assert all(
         probe["target_id"] == 1
-        for probe in game["exhaustive_legal_probe_audit"][
+        for probe in game["exhaustive_abstract_probe_audit"][
             "optimal_equivalence_class"
         ]
     )
+    assert game["exhaustive_abstract_probe_audit"][
+        "topology_legality_claimed"
+    ] is False
     multi_conflict = evaluation["multi_conflict_probe_audit"]
     assert multi_conflict["initial_compatible_hypotheses"] == 3
     assert multi_conflict["lowest_fresh_reporter_score"][
@@ -84,6 +122,37 @@ def test_evaluation_records_tight_bound_and_ambiguity_tax() -> None:
     assert multi_conflict["selected_probe"] == {
         "reporter_id": 3,
         "target_id": 2,
+    }
+    assert multi_conflict["fresh_safe_round_robin_probe"] == {
+        "reporter_id": 3,
+        "target_id": 2,
+    }
+    assert multi_conflict[
+        "fresh_safe_round_robin_equals_minimax"
+    ] is True
+    value_aware = evaluation["value_aware_target_audit"]
+    assert value_aware["robust_safe_replicas"] == [4, 5, 6]
+    assert value_aware["ambiguous_targets"] == [1, 2]
+    assert value_aware["uniform_value_minimax_baseline"][
+        "probe"
+    ] == {
+        "reporter_id": 4,
+        "target_id": 1,
+    }
+    assert value_aware["minimax_selection"]["probe"] == {
+        "reporter_id": 4,
+        "target_id": 2,
+    }
+    assert value_aware["uniform_value_minimax_baseline"][
+        "score_under_frozen_role_values"
+    ]["guaranteed_safe_role_value_recovery"] == 1
+    assert value_aware["minimax_selection"]["score"][
+        "guaranteed_safe_role_value_recovery"
+    ] == 2
+    assert value_aware["strict_value_advantage"] == {
+        "guaranteed_safe_role_value_recovery_delta": 1,
+        "worst_case_robust_safe_role_value_delta": 1,
+        "worst_case_surviving_hypotheses_delta": 0,
     }
 
 
@@ -123,6 +192,9 @@ def test_cli_writes_one_canonical_evidence_artifact(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    expected_revision_verification = _expected_revision_verification(
+        repository_root
+    )
 
     completed = subprocess.run(
         [
@@ -142,19 +214,24 @@ def test_cli_writes_one_canonical_evidence_artifact(
 
     artifact = output_dir / "diagnostic-game-evaluation.json"
     assert completed.stdout.strip() == str(artifact)
+    observed = json.loads(artifact.read_text(encoding="utf-8"))
+    assert observed["kauri_revision_verification"] in {
+        "verified_current_clean_head",
+        "verified_current_head_dirty_override",
+    }
     assert artifact.read_text(encoding="utf-8") == (
         canonical_evaluation_json(
             evaluate_minimax_rematching(
                 revision,
-                revision_verification="verified_current_head_dirty_override",
+                revision_verification=expected_revision_verification,
             )
         )
         + "\n"
     )
-    assert json.loads(artifact.read_text(encoding="utf-8")) == (
+    assert observed == (
         evaluate_minimax_rematching(
             revision,
-            revision_verification="verified_current_head_dirty_override",
+            revision_verification=expected_revision_verification,
         )
     )
 

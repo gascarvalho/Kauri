@@ -1,4 +1,4 @@
-"""Minimax probe selection for bounded Kauri diagnosis experiments.
+"""Minimax probe ranking for bounded Kauri diagnosis experiments.
 
 The defender chooses one authenticated reporter--target probe.  The
 adversary then chooses any outcome that remains compatible with the current
@@ -6,9 +6,11 @@ two-mode hypothesis set.  Probe selection maximizes the worst-case recovery
 of replicas that are safe under every surviving hypothesis and then minimizes
 the worst-case number of surviving hypotheses.
 
-This module is experiment-only decision support.  It accepts no injected
-fault labels and has no authority over membership, quorum, votes,
-certificates, locks, commits, or active topology.
+The caller supplies the admissible probe set and remains responsible for
+Kauri topology, epoch, role, and activation constraints.  This module is
+experiment-only decision support.  It accepts no injected fault labels and
+has no authority over membership, quorum, votes, certificates, locks,
+commits, or active topology.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ TargetOmissionStatus: TypeAlias = Literal[
 
 @dataclass(frozen=True, order=True, slots=True)
 class DiagnosticProbe:
-    """One possible authenticated reporter--target rematch."""
+    """One abstract authenticated reporter--target rematch."""
 
     reporter_id: int
     target_id: int
@@ -298,7 +300,7 @@ def choose_minimax_probe(
     probes: Iterable[DiagnosticProbe],
     role_values: Mapping[int, int] | None = None,
 ) -> DiagnosticProbe:
-    """Choose the deterministic probe with the best worst-case outcome."""
+    """Rank a caller-supplied admissible set by worst-case outcome."""
 
     if isinstance(probes, (str, bytes)):
         raise DiagnosisError("probes must be an iterable of DiagnosticProbe")
