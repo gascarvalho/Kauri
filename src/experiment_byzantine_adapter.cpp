@@ -124,6 +124,20 @@ bool ExperimentByzantineAdapter::should_retain_response_evidence(
            !found->second.timeout_consumed;
 }
 
+bool ExperimentByzantineAdapter::cancel_false_report(
+    const ExperimentByzantineContext &context,
+    ReplicaID target) noexcept
+{
+    if (!state_->options.false_report_target.has_value() ||
+        *state_->options.false_report_target != target)
+        return false;
+    const auto found = state_->false_reports.find(context);
+    if (found == state_->false_reports.end())
+        return false;
+    state_->false_reports.erase(found);
+    return true;
+}
+
 bool ExperimentByzantineAdapter::consume_false_timeout(
     const ExperimentByzantineContext &context,
     ReplicaID target) noexcept

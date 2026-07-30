@@ -9,6 +9,7 @@
 
 #include "catch.hpp"
 #include "hotstuff/configuration.h"
+#include "hotstuff/hotstuff.h"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
 #error "KAURI_PROJECT_SOURCE_DIR must name the repository root"
@@ -77,6 +78,9 @@ public:
         ReplicaID target) noexcept;
     bool should_retain_response_evidence(
         const ExperimentByzantineContext &context) const noexcept;
+    bool cancel_false_report(
+        const ExperimentByzantineContext &context,
+        ReplicaID target) noexcept;
     bool consume_false_timeout(
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;
@@ -91,6 +95,69 @@ private:
 } // namespace hotstuff
 #endif
 
+namespace hotstuff
+{
+
+class ExperimentFalseTimeoutFenceTestAccess final
+{
+public:
+    static bool scheduling_failure_reports_normally()
+    {
+        HotStuffBase::ExperimentFalseTimeoutState state{
+            ReplicaID{4}, false, false};
+        return !state.may_suppress(ReplicaID{4}) &&
+               state.observe_commit(true) ==
+                   HotStuffBase::ExperimentFalseTimeoutCommitAction::
+                       report_now;
+    }
+
+    static bool commit_before_timeout_releases_once()
+    {
+        HotStuffBase::ExperimentFalseTimeoutState state{
+            ReplicaID{4}, true, false};
+        const auto first = state.observe_commit(true);
+        const auto duplicate = state.observe_commit(true);
+        const auto completion = state.complete(true);
+        return first ==
+                   HotStuffBase::ExperimentFalseTimeoutCommitAction::
+                       deferred &&
+               duplicate ==
+                   HotStuffBase::ExperimentFalseTimeoutCommitAction::
+                       already_deferred &&
+               completion ==
+                   HotStuffBase::ExperimentFalseTimeoutCompletionAction::
+                       release_commit;
+    }
+
+    static bool timeout_before_commit_needs_no_release()
+    {
+        HotStuffBase::ExperimentFalseTimeoutState state{
+            ReplicaID{4}, true, false};
+        const auto completion = state.complete(true);
+        const auto later_commit = state.observe_commit(false);
+        return completion ==
+                   HotStuffBase::ExperimentFalseTimeoutCompletionAction::
+                       no_deferred_commit &&
+               later_commit ==
+                   HotStuffBase::ExperimentFalseTimeoutCommitAction::
+                       report_now;
+    }
+
+    static bool backpressure_fails_closed()
+    {
+        HotStuffBase::ExperimentFalseTimeoutState state{
+            ReplicaID{4}, true, false};
+        if (state.observe_commit(true) !=
+            HotStuffBase::ExperimentFalseTimeoutCommitAction::deferred)
+            return false;
+        return state.complete(false) ==
+               HotStuffBase::ExperimentFalseTimeoutCompletionAction::
+                   fail_closed;
+    }
+};
+
+} // namespace hotstuff
+
 namespace
 {
 
@@ -99,6 +166,7 @@ using hotstuff::DataStream;
 using hotstuff::ExperimentByzantineAdapter;
 using hotstuff::ExperimentByzantineContext;
 using hotstuff::ExperimentByzantineOptions;
+using hotstuff::ExperimentFalseTimeoutFenceTestAccess;
 using hotstuff::ProposalKey;
 using hotstuff::ReplicaID;
 using hotstuff::uint256_t;
@@ -244,6 +312,50 @@ TEST_CASE(
     CHECK(adapter.consume_false_timeout(first, 4));
     CHECK_FALSE(adapter.on_verified_response(wrong_configuration, 4));
     CHECK_FALSE(adapter.consume_false_timeout(wrong_window, 4));
+}
+
+TEST_CASE(
+    "cancelled false reporting restores the exact context capacity",
+    "[adaptive-v2][experiment][byzantine][false-report][rollback]")
+{
+    ExperimentByzantineAdapter adapter(enabled_options());
+    const auto first = context("cancel-first");
+    const auto second = context("cancel-second");
+    const auto replacement = context("cancel-replacement");
+
+    REQUIRE(adapter.arm_false_report(first, 4));
+    REQUIRE(adapter.arm_false_report(second, 4));
+    CHECK_FALSE(adapter.arm_false_report(replacement, 4));
+
+    CHECK_FALSE(adapter.cancel_false_report(first, 5));
+    CHECK_FALSE(adapter.cancel_false_report(
+        context(
+            "cancel-first",
+            configuration(),
+            "diagnostic-window-2"),
+        4));
+    REQUIRE(adapter.cancel_false_report(first, 4));
+    CHECK_FALSE(adapter.cancel_false_report(first, 4));
+    CHECK_FALSE(adapter.on_verified_response(first, 4));
+    CHECK(adapter.arm_false_report(replacement, 4));
+}
+
+TEST_CASE(
+    "false timeout fence orders or fails closed without touching consensus",
+    "[adaptive-v2][experiment][byzantine][false-report][commit-fence]")
+{
+    CHECK(
+        ExperimentFalseTimeoutFenceTestAccess::
+            scheduling_failure_reports_normally());
+    CHECK(
+        ExperimentFalseTimeoutFenceTestAccess::
+            timeout_before_commit_needs_no_release());
+    CHECK(
+        ExperimentFalseTimeoutFenceTestAccess::
+            commit_before_timeout_releases_once());
+    CHECK(
+        ExperimentFalseTimeoutFenceTestAccess::
+            backpressure_fails_closed());
 }
 
 TEST_CASE(
@@ -393,6 +505,14 @@ TEST_CASE(
         header.find(
             "schedule_experiment_false_timeout") !=
         std::string::npos);
+    CHECK(
+        header.find(
+            "experiment_false_timeout_states") !=
+        std::string::npos);
+    CHECK(
+        header.find(
+            "maximum_experiment_false_timeout_contexts") !=
+        std::string::npos);
 
     const auto deadline_arm = source_slice(
         implementation,
@@ -453,23 +573,82 @@ TEST_CASE(
         implementation,
         "void HotStuffBase::schedule_experiment_false_timeout",
         "void HotStuffBase::start_aggregation_timer");
+    const auto bounded_state =
+        false_timeout.find("experiment_false_timeout_states.size()");
     const auto real_deadline =
         false_timeout.find("aggregation_scheduler->schedule_after");
     const auto consume =
         false_timeout.find("consume_false_timeout");
     const auto record = false_timeout.find("record_timeouts");
+    const auto recorded_guard =
+        false_timeout.find("if (recorded == 1)", record);
     const auto deadline_retire = false_timeout.find("->retire(key)");
+    const auto failure_boundary = false_timeout.find("catch (...)");
+    const auto empty_schedule =
+        false_timeout.find("if (!cancellation)");
+    const auto rollback =
+        false_timeout.find("cancel_experiment_false_timeout");
+    const auto release_commit =
+        false_timeout.find("release_experiment_false_report_commit");
+    const auto admitted_evidence =
+        false_timeout.find("last_evidence_sequence");
+    const auto fail_closed =
+        false_timeout.find("false_report_commit_suppressed");
+    const auto nonconsumed_cleanup =
+        false_timeout.find(
+            "if (!false_timeout_consumed || recorded != 1)",
+            release_commit);
+    REQUIRE(bounded_state != std::string::npos);
     REQUIRE(real_deadline != std::string::npos);
     REQUIRE(consume != std::string::npos);
     REQUIRE(record != std::string::npos);
+    REQUIRE(recorded_guard != std::string::npos);
     REQUIRE(deadline_retire != std::string::npos);
+    REQUIRE(failure_boundary != std::string::npos);
+    REQUIRE(empty_schedule != std::string::npos);
+    REQUIRE(rollback != std::string::npos);
+    REQUIRE(release_commit != std::string::npos);
+    REQUIRE(admitted_evidence != std::string::npos);
+    REQUIRE(fail_closed != std::string::npos);
+    REQUIRE(nonconsumed_cleanup != std::string::npos);
+    CHECK(bounded_state < real_deadline);
     CHECK(real_deadline < consume);
     CHECK(consume < record);
-    CHECK(record < deadline_retire);
+    CHECK(record < recorded_guard);
+    CHECK(recorded_guard < deadline_retire);
+    CHECK(deadline_retire < failure_boundary);
+    CHECK(failure_boundary < release_commit);
+    CHECK(release_commit < nonconsumed_cleanup);
     CHECK(
         false_timeout.find("KAURI_FAULT false_timeout_emitted") !=
         std::string::npos);
     CHECK(occurrences(implementation, "consume_false_timeout") == 1);
+
+    const auto committed = source_slice(
+        implementation,
+        "void HotStuffBase::report_adaptive_v2_committed",
+        "AdaptiveV2ReportingDeliveryResult");
+    const auto exact_pending =
+        committed.find("experiment_false_timeout_states.find(*key)");
+    const auto verified_response =
+        committed.find("should_retain_response_evidence");
+    const auto defer = committed.find("observe_commit");
+    const auto defer_audit =
+        committed.find("KAURI_FAULT false_report_commit_deferred");
+    const auto defer_exit = committed.find("return;", defer_audit);
+    const auto normal_lifecycle =
+        committed.find("enqueue_lifecycle");
+    REQUIRE(exact_pending != std::string::npos);
+    REQUIRE(verified_response != std::string::npos);
+    REQUIRE(defer != std::string::npos);
+    REQUIRE(defer_audit != std::string::npos);
+    REQUIRE(defer_exit != std::string::npos);
+    REQUIRE(normal_lifecycle != std::string::npos);
+    CHECK(exact_pending < verified_response);
+    CHECK(verified_response < defer);
+    CHECK(defer < defer_audit);
+    CHECK(defer_audit < defer_exit);
+    CHECK(defer_exit < normal_lifecycle);
 }
 
 TEST_CASE(

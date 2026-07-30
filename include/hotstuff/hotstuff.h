@@ -1088,6 +1088,58 @@ namespace hotstuff
         std::unique_ptr<ExperimentByzantineAdapter>
             experiment_byzantine_adapter;
         std::string experiment_diagnostic_window;
+        // Experiment-only ordering state. The configured adapter bound is
+        // copied before startup and caps this exact-proposal map.
+        enum class ExperimentFalseTimeoutCommitAction
+        {
+            report_now,
+            deferred,
+            already_deferred,
+        };
+        enum class ExperimentFalseTimeoutCompletionAction
+        {
+            no_deferred_commit,
+            release_commit,
+            fail_closed,
+        };
+        struct ExperimentFalseTimeoutState
+        {
+            ReplicaID target{0};
+            bool scheduled{false};
+            bool commit_deferred{false};
+
+            bool may_suppress(ReplicaID exact_target) const noexcept
+            {
+                return scheduled && target == exact_target;
+            }
+
+            ExperimentFalseTimeoutCommitAction observe_commit(
+                bool retain_response_evidence) noexcept
+            {
+                if (!scheduled || !retain_response_evidence)
+                    return ExperimentFalseTimeoutCommitAction::report_now;
+                if (commit_deferred)
+                    return ExperimentFalseTimeoutCommitAction::
+                        already_deferred;
+                commit_deferred = true;
+                return ExperimentFalseTimeoutCommitAction::deferred;
+            }
+
+            ExperimentFalseTimeoutCompletionAction complete(
+                bool evidence_queued_before_commit) const noexcept
+            {
+                if (!commit_deferred)
+                    return ExperimentFalseTimeoutCompletionAction::
+                        no_deferred_commit;
+                return evidence_queued_before_commit
+                    ? ExperimentFalseTimeoutCompletionAction::release_commit
+                    : ExperimentFalseTimeoutCompletionAction::fail_closed;
+            }
+        };
+        friend class ExperimentFalseTimeoutFenceTestAccess;
+        std::size_t maximum_experiment_false_timeout_contexts{0};
+        std::map<ProposalKey, ExperimentFalseTimeoutState>
+            experiment_false_timeout_states;
         std::unique_ptr<AdaptiveV2ReportingOutbox>
             adaptive_v2_reporting_outbox;
         AggregationScheduler::Cancellation
@@ -1307,6 +1359,14 @@ namespace hotstuff
             const ProposalKey &key,
             ReplicaID target,
             AggregationScheduler::Duration delay);
+        void cancel_experiment_false_timeout(
+            const ProposalKey &key,
+            ReplicaID target,
+            const char *reason) noexcept;
+        void release_experiment_false_report_commit(
+            const ProposalKey &key,
+            std::size_t recorded_evidence,
+            bool evidence_queued_before_commit) noexcept;
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
             const std::vector<ProposalKey> &committed_keys) const;

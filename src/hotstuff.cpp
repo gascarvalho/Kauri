@@ -4246,7 +4246,12 @@ namespace hotstuff
                 contribution_signers.insert(
                     signers.begin(), signers.end());
             }
+            const auto false_timeout =
+                experiment_false_timeout_states.find(lease.key());
             const bool suppress_positive_observation =
+                false_timeout != experiment_false_timeout_states.end() &&
+                false_timeout->second.may_suppress(
+                    contribution.authenticated_sender) &&
                 experiment_byzantine_adapter != nullptr &&
                 experiment_byzantine_adapter->on_verified_response(
                     ExperimentByzantineContext{
@@ -4595,42 +4600,240 @@ namespace hotstuff
         if (aggregation_scheduler == nullptr ||
             experiment_byzantine_adapter == nullptr ||
             adaptive_v2_response_evidence == nullptr)
+        {
+            cancel_experiment_false_timeout(
+                key, target, "dependencies");
             return;
-        const auto access = exact_runtime_access;
-        const auto window = experiment_diagnostic_window;
-        static_cast<void>(aggregation_scheduler->schedule_after(
-            delay,
-            [access, key, target, window]()
-            {
-                auto runtime = access->acquire();
-                if (!runtime.has_value())
-                    return;
-                auto &owner = runtime->owner();
-                if (owner.experiment_byzantine_adapter == nullptr ||
-                    owner.adaptive_v2_response_evidence == nullptr ||
-                    !owner.experiment_byzantine_adapter
-                         ->consume_false_timeout(
-                             ExperimentByzantineContext{key, window},
-                             target))
-                    return;
-                const auto recorded =
-                    owner.adaptive_v2_response_evidence->record_timeouts(
+        }
+        if (experiment_false_timeout_states.find(key) !=
+            experiment_false_timeout_states.end())
+            return;
+        if (maximum_experiment_false_timeout_contexts == 0 ||
+            experiment_false_timeout_states.size() >=
+                maximum_experiment_false_timeout_contexts)
+        {
+            cancel_experiment_false_timeout(
+                key, target, "capacity");
+            return;
+        }
+        try
+        {
+            const auto access = exact_runtime_access;
+            const auto window = experiment_diagnostic_window;
+            const auto inserted = experiment_false_timeout_states.emplace(
+                key, ExperimentFalseTimeoutState{target, true, false});
+            if (!inserted.second)
+                return;
+            const auto cancellation = aggregation_scheduler->schedule_after(
+                delay,
+                [access, key, target, window]()
+                {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    auto &owner = runtime->owner();
+                    std::size_t recorded = 0;
+                    bool evidence_queued_before_commit = false;
+                    bool false_timeout_consumed = false;
+                    try
+                    {
+                        if (owner.experiment_byzantine_adapter != nullptr &&
+                            owner.adaptive_v2_response_evidence != nullptr &&
+                            (false_timeout_consumed =
+                                 owner.experiment_byzantine_adapter
+                                     ->consume_false_timeout(
+                                         ExperimentByzantineContext{
+                                             key, window},
+                                         target)))
+                        {
+                            const auto evidence_sequence_before =
+                                owner.adaptive_v2_reporting_outbox != nullptr
+                                    ? owner.adaptive_v2_reporting_outbox
+                                          ->diagnostics()
+                                          .last_evidence_sequence
+                                    : std::uint64_t{0};
+                            recorded = owner.adaptive_v2_response_evidence
+                                           ->record_timeouts(
+                                               key,
+                                               std::set<ReplicaID>{target},
+                                               adaptive_monotonic_now_ns());
+                            const auto bridge =
+                                owner.adaptive_v2_response_evidence
+                                    ->diagnostics();
+                            const auto evidence_sequence_after =
+                                owner.adaptive_v2_reporting_outbox != nullptr
+                                    ? owner.adaptive_v2_reporting_outbox
+                                          ->diagnostics()
+                                          .last_evidence_sequence
+                                    : std::uint64_t{0};
+                            evidence_queued_before_commit =
+                                recorded == 1 &&
+                                evidence_sequence_after >
+                                    evidence_sequence_before &&
+                                bridge.pending_reports == 0 &&
+                                bridge.retained_facts == 0 &&
+                                bridge.pending_late_compensations == 0;
+                            if (recorded == 1)
+                            {
+                                static_cast<void>(
+                                    owner.adaptive_v2_response_evidence
+                                        ->retire(key));
+                                HOTSTUFF_LOG_INFO(
+                                    "KAURI_FAULT false_timeout_emitted "
+                                    "reporter=%u target=%u epoch=%u tree=%u "
+                                    "block=%s window=%s",
+                                    owner.get_id(),
+                                    target,
+                                    key.configuration.epoch_number,
+                                    key.configuration.tree_id,
+                                    key.block_hash.to_hex().c_str(),
+                                    window.c_str());
+                            }
+                        }
+                    }
+                    catch (...)
+                    {
+                        HOTSTUFF_LOG_WARN(
+                            "KAURI_FAULT false_timeout_failed reporter=%u "
+                            "target=%u epoch=%u tree=%u block=%s",
+                            owner.get_id(),
+                            target,
+                            key.configuration.epoch_number,
+                            key.configuration.tree_id,
+                            key.block_hash.to_hex().c_str());
+                    }
+                    owner.release_experiment_false_report_commit(
                         key,
-                        std::set<ReplicaID>{target},
-                        adaptive_monotonic_now_ns());
+                        recorded,
+                        evidence_queued_before_commit);
+                    if (!false_timeout_consumed || recorded != 1)
+                    {
+                        if (owner.experiment_byzantine_adapter != nullptr)
+                            static_cast<void>(
+                                owner.experiment_byzantine_adapter
+                                    ->cancel_false_report(
+                                        ExperimentByzantineContext{
+                                            key, window},
+                                        target));
+                    }
+                });
+            if (!cancellation)
+            {
+                cancel_experiment_false_timeout(
+                    key, target, "scheduler");
+                return;
+            }
+        }
+        catch (...)
+        {
+            cancel_experiment_false_timeout(
+                key, target, "scheduler");
+        }
+    }
+
+    void HotStuffBase::cancel_experiment_false_timeout(
+        const ProposalKey &key,
+        ReplicaID target,
+        const char *reason) noexcept
+    {
+        experiment_false_timeout_states.erase(key);
+        try
+        {
+            if (experiment_byzantine_adapter != nullptr)
                 static_cast<void>(
-                    owner.adaptive_v2_response_evidence->retire(key));
-                if (recorded == 1)
-                    HOTSTUFF_LOG_INFO(
-                        "KAURI_FAULT false_timeout_emitted reporter=%u "
-                        "target=%u epoch=%u tree=%u block=%s window=%s",
-                        owner.get_id(),
-                        target,
-                        key.configuration.epoch_number,
-                        key.configuration.tree_id,
-                        key.block_hash.to_hex().c_str(),
-                        window.c_str());
-            }));
+                    experiment_byzantine_adapter->cancel_false_report(
+                        ExperimentByzantineContext{
+                            key,
+                            experiment_diagnostic_window},
+                        target));
+        }
+        catch (...)
+        {}
+        HOTSTUFF_LOG_WARN(
+            "KAURI_FAULT false_timeout_schedule_rejected reporter=%u "
+            "target=%u epoch=%u tree=%u block=%s reason=%s",
+            get_id(),
+            target,
+            key.configuration.epoch_number,
+            key.configuration.tree_id,
+            key.block_hash.to_hex().c_str(),
+            reason == nullptr ? "unknown" : reason);
+    }
+
+    void HotStuffBase::release_experiment_false_report_commit(
+        const ProposalKey &key,
+        std::size_t recorded_evidence,
+        bool evidence_queued_before_commit) noexcept
+    {
+        try
+        {
+            const auto pending =
+                experiment_false_timeout_states.find(key);
+            if (pending == experiment_false_timeout_states.end())
+                return;
+            const auto target = pending->second.target;
+            const auto action = pending->second.complete(
+                evidence_queued_before_commit);
+            experiment_false_timeout_states.erase(pending);
+            if (action ==
+                ExperimentFalseTimeoutCompletionAction::
+                    no_deferred_commit)
+                return;
+            if (action ==
+                ExperimentFalseTimeoutCompletionAction::fail_closed)
+            {
+                HOTSTUFF_LOG_WARN(
+                    "KAURI_FAULT false_report_commit_suppressed reporter=%u "
+                    "target=%u epoch=%u tree=%u block=%s evidence=%zu "
+                    "reason=evidence_not_queued",
+                    get_id(),
+                    target,
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id,
+                    key.block_hash.to_hex().c_str(),
+                    recorded_evidence);
+                mark_adaptive_v2_convergence_evidence_unhealthy(
+                    "false_report_evidence_not_queued_before_commit");
+                return;
+            }
+            const ProposalLifecycleFact fact = ProposalCommitted{key};
+            const auto status =
+                adaptive_v2_reporting_outbox != nullptr
+                    ? adaptive_v2_reporting_outbox->enqueue_lifecycle(fact)
+                    : AdaptiveV2ReportingEnqueueStatus::unhealthy;
+            if (status != AdaptiveV2ReportingEnqueueStatus::queued)
+            {
+                HOTSTUFF_LOG_WARN(
+                    "KAURI_FAULT false_report_commit_suppressed reporter=%u "
+                    "target=%u epoch=%u tree=%u block=%s evidence=%zu "
+                    "reason=commit_not_queued",
+                    get_id(),
+                    target,
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id,
+                    key.block_hash.to_hex().c_str(),
+                    recorded_evidence);
+                mark_adaptive_v2_convergence_evidence_unhealthy(
+                    "false_report_commit_not_queued");
+                return;
+            }
+            schedule_adaptive_v2_reporting_flush(
+                adaptive_v2_evidence_retry_delay);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_FAULT false_report_commit_released reporter=%u "
+                "target=%u epoch=%u tree=%u block=%s evidence=%zu",
+                get_id(),
+                target,
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.block_hash.to_hex().c_str(),
+                recorded_evidence);
+        }
+        catch (...)
+        {
+            // Experiment reporting cannot affect consensus progress.
+            experiment_false_timeout_states.erase(key);
+        }
     }
 
     void HotStuffBase::start_aggregation_timer(const ProposalKey &key)
@@ -6464,6 +6667,36 @@ namespace hotstuff
             return;
         try
         {
+            const auto pending =
+                experiment_false_timeout_states.find(*key);
+            if (pending != experiment_false_timeout_states.end())
+            {
+                const bool retain_response_evidence =
+                    experiment_byzantine_adapter != nullptr &&
+                    experiment_byzantine_adapter
+                        ->should_retain_response_evidence(
+                            ExperimentByzantineContext{
+                                *key,
+                                experiment_diagnostic_window});
+                const auto action = pending->second.observe_commit(
+                    retain_response_evidence);
+                if (action !=
+                    ExperimentFalseTimeoutCommitAction::report_now)
+                {
+                    if (action ==
+                        ExperimentFalseTimeoutCommitAction::deferred)
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_FAULT false_report_commit_deferred "
+                            "reporter=%u target=%u epoch=%u tree=%u "
+                            "block=%s",
+                            get_id(),
+                            pending->second.target,
+                            key->configuration.epoch_number,
+                            key->configuration.tree_id,
+                            key->block_hash.to_hex().c_str());
+                    return;
+                }
+            }
             const ProposalLifecycleFact fact = ProposalCommitted{*key};
             if (adaptive_v2_reporting_outbox->enqueue_lifecycle(fact) ==
                 AdaptiveV2ReportingEnqueueStatus::queued)
@@ -7090,10 +7323,18 @@ namespace hotstuff
             *options.false_report_target == get_id())
             throw std::invalid_argument(
                 "false-report target must differ from local reporter");
-        experiment_diagnostic_window = options.diagnostic_window;
-        experiment_byzantine_adapter =
+        const auto false_timeout_context_bound =
+            options.false_report_target.has_value()
+                ? options.maximum_false_report_contexts
+                : 0;
+        auto diagnostic_window = options.diagnostic_window;
+        auto adapter =
             std::make_unique<ExperimentByzantineAdapter>(
                 std::move(options));
+        maximum_experiment_false_timeout_contexts =
+            false_timeout_context_bound;
+        experiment_diagnostic_window = std::move(diagnostic_window);
+        experiment_byzantine_adapter = std::move(adapter);
     }
 
     void HotStuffBase::set_tree_period(size_t nblocks)

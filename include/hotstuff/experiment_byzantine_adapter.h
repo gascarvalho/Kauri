@@ -63,6 +63,9 @@ public:
         ReplicaID target) noexcept;
     bool should_retain_response_evidence(
         const ExperimentByzantineContext &context) const noexcept;
+    bool cancel_false_report(
+        const ExperimentByzantineContext &context,
+        ReplicaID target) noexcept;
     bool consume_false_timeout(
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;

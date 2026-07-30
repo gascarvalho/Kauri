@@ -911,6 +911,91 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "evidence queued before a deferred commit stays ahead of its exact fence",
+    "[adaptive-v2][reporting-outbox][lifecycle][commit][deferred][fifo]")
+{
+    AdaptiveV2ReportingOutbox outbox(config());
+    const auto exact_proposal = proposal(
+        configuration(8, 3, "deferred-commit-fence"),
+        "deferred-commit-fence");
+    const auto canonical_evidence = evidence_payload({
+        observation(1, exact_proposal)});
+
+    REQUIRE(outbox.enqueue_evidence(canonical_evidence) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.enqueue_lifecycle(
+                ProposalLifecycleFact{
+                    ProposalCommitted{exact_proposal}}) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.diagnostics().pending_reports == 2);
+
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->stream ==
+          AdaptiveV2ReportingStream::evidence);
+    CHECK(outbox.front()->canonical_payload == canonical_evidence);
+    deliver_and_release(outbox, 1);
+
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->stream ==
+          AdaptiveV2ReportingStream::lifecycle);
+    const auto committed =
+        hotstuff::decode_proposal_lifecycle_notice(
+            outbox.front()->canonical_payload,
+            limits().lifecycle_wire);
+    REQUIRE(committed);
+    REQUIRE(std::holds_alternative<ProposalCommitted>(
+        committed.notice->fact));
+    const auto &fact = std::get<ProposalCommitted>(
+        committed.notice->fact);
+    CHECK(fact.proposal == exact_proposal);
+    CHECK(fact.evidence_sequence_fence == 1);
+}
+
+TEST_CASE(
+    "evidence backpressure cannot advance the commit-fence prefix",
+    "[adaptive-v2][reporting-outbox][lifecycle][commit][fence][capacity]")
+{
+    AdaptiveV2ReportingOutbox outbox(config(limits(1)));
+    const auto exact_proposal = proposal(
+        configuration(8, 4, "backpressured-commit-fence"),
+        "backpressured-commit-fence");
+
+    REQUIRE(outbox.enqueue_readiness(
+                exact_proposal.configuration, 1, 0) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    const auto evidence_sequence_before =
+        outbox.diagnostics().last_evidence_sequence;
+    CHECK(outbox.enqueue_evidence(evidence_payload({
+              observation(1, exact_proposal)})) ==
+          AdaptiveV2ReportingEnqueueStatus::capacity_exceeded);
+    CHECK(outbox.diagnostics().last_evidence_sequence ==
+          evidence_sequence_before);
+}
+
+TEST_CASE(
+    "a full FIFO rejects commit admission after accepted evidence",
+    "[adaptive-v2][reporting-outbox][lifecycle][commit][fence][capacity]")
+{
+    AdaptiveV2ReportingOutbox outbox(config(limits(1)));
+    const auto exact_proposal = proposal(
+        configuration(8, 5, "commit-admission-capacity"),
+        "commit-admission-capacity");
+
+    REQUIRE(outbox.enqueue_evidence(evidence_payload({
+                observation(1, exact_proposal)})) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.diagnostics().last_evidence_sequence == 1);
+    CHECK(outbox.enqueue_lifecycle(
+              ProposalLifecycleFact{
+                  ProposalCommitted{exact_proposal}}) ==
+          AdaptiveV2ReportingEnqueueStatus::capacity_exceeded);
+    CHECK(outbox.diagnostics().pending_reports == 1);
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->stream ==
+          AdaptiveV2ReportingStream::evidence);
+}
+
+TEST_CASE(
     "reporting outbox reserves the maximum evidence sequence from commit fences",
     "[adaptive-v2][reporting-outbox][evidence][sequence][fence][maximum]")
 {
