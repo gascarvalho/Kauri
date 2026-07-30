@@ -61,6 +61,12 @@ _RECURRING_PHASE_NAMES = (
     "containment",
     "optimized",
 )
+_CONTROL_PHASE_NAMES = (
+    "baseline",
+    "degraded",
+    "containment",
+    "control_late",
+)
 
 ConfigurationKey = tuple[int, str, int]
 
@@ -188,6 +194,7 @@ class PhaseMedians:
     post_tps: float | None = None
     containment_tps: float | None = None
     optimized_tps: float | None = None
+    control_late_tps: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,10 +607,11 @@ def _validate_legacy_boundaries(boundaries: PhaseBoundaries) -> None:
 
 
 def _validate_phase_windows(windows: Sequence[PhaseWindow]) -> None:
-    if tuple(window.phase for window in windows) != _RECURRING_PHASE_NAMES:
+    phases = tuple(window.phase for window in windows)
+    if phases not in (_RECURRING_PHASE_NAMES, _CONTROL_PHASE_NAMES):
         raise AnalysisError(
             "recurring phase windows must be exactly baseline, degraded, "
-            "containment, optimized"
+            "containment, followed by optimized or control_late"
         )
     previous_end_ns: int | None = None
     for window in windows:
@@ -852,6 +860,8 @@ def compute_phase_medians(
         expected_phases = _LEGACY_PHASE_NAMES
     elif phases == _RECURRING_PHASE_NAMES:
         expected_phases = _RECURRING_PHASE_NAMES
+    elif phases == _CONTROL_PHASE_NAMES:
+        expected_phases = _CONTROL_PHASE_NAMES
     else:
         raise AnalysisError(
             "throughput buckets must contain one complete legacy or recurring "
@@ -876,6 +886,17 @@ def compute_phase_medians(
             baseline_tps=baseline_tps,
             degraded_tps=degraded_tps,
             post_tps=float(statistics.median(values["post"])),
+        )
+    if expected_phases == _CONTROL_PHASE_NAMES:
+        return PhaseMedians(
+            baseline_tps=baseline_tps,
+            degraded_tps=degraded_tps,
+            containment_tps=float(
+                statistics.median(values["containment"])
+            ),
+            control_late_tps=float(
+                statistics.median(values["control_late"])
+            ),
         )
     return PhaseMedians(
         baseline_tps=baseline_tps,

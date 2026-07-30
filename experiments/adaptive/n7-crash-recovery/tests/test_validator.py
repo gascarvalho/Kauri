@@ -274,6 +274,237 @@ def test_complete_recurring_run_requires_exact_two_cycle_causality(
     }
 
 
+def test_complete_paired_adaptive_run_uses_exact_fixed_windows(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_paired_adaptive_run(
+        tmp_path / "run"
+    )
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "PASS"
+    assert verdict["profile_identity"] == validator.PAIRED_ADAPTIVE_PROFILE_ID
+    assert verdict["metrics"]["complete_bucket_counts"] == {
+        "baseline": 7,
+        "degraded": 7,
+        "containment": 7,
+        "optimized": 7,
+    }
+    assert set(verdict["metrics"]["phase_median_tps"]) == {
+        "baseline",
+        "degraded",
+        "containment",
+        "optimized",
+    }
+
+
+def test_paired_adaptive_run_accepts_unfavorable_performance(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_paired_adaptive_run(
+        tmp_path / "run"
+    )
+    for replica in validator.SURVIVING_REPLICAS:
+        stream = tmp_path / "run/raw" / f"replica-{replica}.jsonl"
+
+        def lower_optimized_throughput(
+            values: list[dict[str, object]],
+        ) -> None:
+            for value in values:
+                payload = value.get("payload")
+                if (
+                    value.get("event_type")
+                    in ("block.commit_observed", "block.committed")
+                    and isinstance(payload, dict)
+                    and int(payload.get("block_height", 0)) >= 33
+                ):
+                    payload["transaction_count"] = 1
+
+        _rewrite_jsonl(stream, lower_optimized_throughput)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "PASS"
+    assert verdict["metrics"]["optimized_to_containment_ratio"] < 1.0
+
+
+def test_complete_paired_control_run_has_no_epoch_two(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_paired_control_run(
+        tmp_path / "run"
+    )
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "PASS"
+    assert verdict["profile_identity"] == validator.PAIRED_CONTROL_PROFILE_ID
+    assert [
+        epoch["epoch_number"]
+        for epoch in synthetic_run.load(epochs)["epochs"]
+    ] == [0, 1]
+    assert verdict["metrics"]["complete_bucket_counts"] == {
+        "baseline": 7,
+        "degraded": 7,
+        "containment": 7,
+        "control_late": 7,
+    }
+    assert set(verdict["metrics"]["phase_median_tps"]) == {
+        "baseline",
+        "degraded",
+        "containment",
+        "control_late",
+    }
+    assert "optimized_to_containment_ratio" not in verdict["metrics"]
+
+
+def test_paired_control_run_accepts_unfavorable_performance(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_paired_control_run(
+        tmp_path / "run"
+    )
+    for replica in validator.SURVIVING_REPLICAS:
+        stream = tmp_path / "run/raw" / f"replica-{replica}.jsonl"
+
+        def lower_control_late_throughput(
+            values: list[dict[str, object]],
+        ) -> None:
+            for value in values:
+                payload = value.get("payload")
+                if (
+                    value.get("event_type")
+                    in ("block.commit_observed", "block.committed")
+                    and isinstance(payload, dict)
+                    and int(payload.get("block_height", 0)) >= 30
+                ):
+                    payload["transaction_count"] = 1
+
+        _rewrite_jsonl(stream, lower_control_late_throughput)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "PASS"
+    assert verdict["metrics"]["control_late_to_containment_ratio"] < 1.0
+
+
+@pytest.mark.parametrize(
+    ("epoch_two_event", "reason"),
+    (
+        ("manager", "unrequested transition session"),
+        ("command", "unrequested epoch command"),
+        ("activation", "unrequested epoch activation"),
+        ("commit", "missing validated leader mapping"),
+    ),
+)
+def test_paired_control_rejects_any_epoch_two_traffic(
+    tmp_path: Path,
+    epoch_two_event: str,
+    reason: str,
+) -> None:
+    manifest, epochs = synthetic_run.create_paired_control_run(
+        tmp_path / "run"
+    )
+    if epoch_two_event == "manager":
+        stream = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+        def add_manager_ready(values: list[dict[str, object]]) -> None:
+            extra = json.loads(
+                json.dumps(
+                    next(
+                        value
+                        for value in values
+                        if value["event_type"] == "adaptive_v2_ready"
+                    )
+                )
+            )
+            extra["source_monotonic_ns"] = 145_000_000_000
+            extra["payload"]["identity"] = synthetic_run.transition_identity(1)
+            values.append(extra)
+            values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+        mutation = add_manager_ready
+    else:
+        stream = tmp_path / "run/raw/replica-2.jsonl"
+
+        def add_replica_event(values: list[dict[str, object]]) -> None:
+            if epoch_two_event == "command":
+                extra = json.loads(
+                    json.dumps(
+                        next(
+                            value
+                            for value in values
+                            if value["event_type"]
+                            == "epoch.command_committed"
+                        )
+                    )
+                )
+                extra["source_monotonic_ns"] = 116_500_000_000
+                extra["payload"] = synthetic_run.command_payload(1)
+            elif epoch_two_event == "activation":
+                extra = json.loads(
+                    json.dumps(
+                        next(
+                            value
+                            for value in values
+                            if value["event_type"] == "epoch.activated"
+                        )
+                    )
+                )
+                extra["source_monotonic_ns"] = 136_500_000_000
+                extra["payload"] = {
+                    "epoch_number": 2,
+                    "tree_id": 0,
+                    "epoch_digest": synthetic_run.EPOCH_2_DIGEST,
+                    "activation_height": 33,
+                }
+            else:
+                extra = json.loads(
+                    json.dumps(
+                        next(
+                            value
+                            for value in values
+                            if value["event_type"] == "block.committed"
+                        )
+                    )
+                )
+                extra["source_monotonic_ns"] = 150_500_000_000
+                extra["payload"] = synthetic_run._commit_payload(  # type: ignore[attr-defined]
+                    height=38,
+                    epoch=2,
+                    tree=0,
+                    transaction_count=1,
+                    designated=True,
+                )
+            values.append(extra)
+            values.sort(key=lambda value: int(value["source_monotonic_ns"]))
+
+        mutation = add_replica_event
+    _rewrite_jsonl(stream, mutation)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert reason in verdict["reason"]
+
+
+def test_paired_manifest_arm_must_match_its_exact_profile(
+    tmp_path: Path,
+) -> None:
+    manifest, epochs = synthetic_run.create_paired_adaptive_run(
+        tmp_path / "run"
+    )
+    value = synthetic_run.load(manifest)
+    value["pair_arm"] = "control"
+    synthetic_run.save(manifest, value)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+
+    assert verdict["verdict"] == "FAIL"
+    assert "pair_arm differs" in verdict["reason"]
+
+
 @pytest.mark.parametrize(
     ("phase", "start_offset_ns", "end_offset_ns"),
     (

@@ -67,10 +67,33 @@ RECURRING_PROFILE_ID = "n7-f2-q5-crash-recovery-recurring-v3"
 RECURRING_PROFILE_SHA256 = (
     "ddfb037c707ebc699138e446f365aa51f19624ee997635784249cc464c5eccef"
 )
+PAIRED_ADAPTIVE_PROFILE_ID = (
+    "n7-f2-q5-crash-recovery-matched-adaptive-v1"
+)
+PAIRED_ADAPTIVE_PROFILE_SHA256 = (
+    "faece247365cf0cac5a771abfe67cc7b3e29f04c1ae53befc03e86ebf95c2777"
+)
+PAIRED_CONTROL_PROFILE_ID = (
+    "n7-f2-q5-crash-recovery-containment-control-v1"
+)
+PAIRED_CONTROL_PROFILE_SHA256 = (
+    "70ae0386338f8d66ff9d5489baa5cde403e576a9e32455090810fe5bb5906b03"
+)
+PAIRED_PROFILE_ARMS = {
+    PAIRED_ADAPTIVE_PROFILE_ID: "adaptive",
+    PAIRED_CONTROL_PROFILE_ID: "control",
+}
+FROZEN_PROFILE_SHA256_BY_ID = {
+    RECURRING_PROFILE_ID: RECURRING_PROFILE_SHA256,
+    PAIRED_ADAPTIVE_PROFILE_ID: PAIRED_ADAPTIVE_PROFILE_SHA256,
+    PAIRED_CONTROL_PROFILE_ID: PAIRED_CONTROL_PROFILE_SHA256,
+}
 SCENARIO = "n7-crash-recovery"
 BUCKET_WIDTH_NS = 5_000_000_000
 MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD = "minimum_post_activation_grace_s"
 MAXIMUM_ACTIVATION_TO_SUCCESSOR_PROFILE_FIELD = "maximum_activation_to_successor_s"
+FINAL_MEASUREMENT_DELAY_PROFILE_FIELD = "final_measurement_delay_ms"
+CONTROL_FINAL_MEASUREMENT_DELAY_MS = 40_000
 ACTIVATION_DELAY_BLOCKS = 5
 TREE_SWITCH_PERIOD_BLOCKS = 1
 SNAPSHOT_SEED = 0xA2F7
@@ -174,6 +197,9 @@ MANIFEST_FIELDS = frozenset(
 )
 RECURRING_MANIFEST_FIELDS = frozenset(
     {*MANIFEST_FIELDS, "transition_requests", "throughput_windows"}
+)
+PAIRED_MANIFEST_FIELDS = frozenset(
+    {*RECURRING_MANIFEST_FIELDS, "pair_id", "pair_arm"}
 )
 
 CONFIGURATION_ACTIVE_PAYLOAD_FIELDS = frozenset(
@@ -731,23 +757,65 @@ def _profile_throughput_windows(
     profile: Mapping[str, Any],
 ) -> tuple[dict[str, Any], ...]:
     raw = profile.get("throughput_windows")
-    phases = ("baseline", "degraded", "containment", "optimized")
-    if not isinstance(raw, list) or len(raw) != len(phases):
+    profile_id = profile.get("profile_id")
+    expected = (
+        (
+            ("baseline", 0),
+            ("degraded", 0),
+            ("containment", 1),
+            ("control_late", 1),
+        )
+        if profile_id == PAIRED_CONTROL_PROFILE_ID
+        else (
+            ("baseline", 0),
+            ("degraded", 0),
+            ("containment", 1),
+            ("optimized", 2),
+        )
+    )
+    if (
+        profile_id
+        not in {
+            RECURRING_PROFILE_ID,
+            PAIRED_ADAPTIVE_PROFILE_ID,
+            PAIRED_CONTROL_PROFILE_ID,
+        }
+        or not isinstance(raw, list)
+        or len(raw) != len(expected)
+    ):
         raise RunnerError("frozen profile requires four throughput windows")
     windows: list[dict[str, Any]] = []
-    for index, (item, phase) in enumerate(zip(raw, phases)):
+    for index, (item, (phase, epoch_number)) in enumerate(zip(raw, expected)):
         if (
             not isinstance(item, dict)
             or set(item) != {"phase", "epoch_number", "bucket_count"}
             or item["phase"] != phase
             or type(item["epoch_number"]) is not int
-            or item["epoch_number"] != (0, 0, 1, 2)[index]
+            or item["epoch_number"] != epoch_number
             or type(item["bucket_count"]) is not int
             or item["bucket_count"] <= 0
         ):
             raise RunnerError(f"throughput_windows[{index}] is invalid")
         windows.append(dict(item))
     return tuple(windows)
+
+
+def _profile_final_measurement_delay_ns(
+    profile: Mapping[str, Any],
+) -> int:
+    profile_id = profile.get("profile_id")
+    expected_ms = (
+        CONTROL_FINAL_MEASUREMENT_DELAY_MS
+        if profile_id == PAIRED_CONTROL_PROFILE_ID
+        else 0
+    )
+    value = profile.get(FINAL_MEASUREMENT_DELAY_PROFILE_FIELD, expected_ms)
+    if type(value) is not int or value != expected_ms:
+        raise RunnerError(
+            f"frozen profile field {FINAL_MEASUREMENT_DELAY_PROFILE_FIELD} "
+            f"must equal {expected_ms}"
+        )
+    return value * 1_000_000
 
 
 def _validate_profile_transition_residencies(
@@ -789,10 +857,12 @@ def load_frozen_profile(path: Path) -> tuple[dict[str, Any], bytes]:
         value = json.loads(payload.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunnerError(f"cannot load frozen profile {path}: {exc}") from exc
-    if sha256_bytes(payload) != RECURRING_PROFILE_SHA256:
-        raise RunnerError("frozen profile SHA-256 differs from the canonical profile")
-    if not isinstance(value, dict) or value.get("profile_id") != RECURRING_PROFILE_ID or value.get("frozen") is not True:
+    if not isinstance(value, dict) or value.get("frozen") is not True:
         raise RunnerError("profile is not the frozen N=7 crash-recovery profile")
+    profile_id = value.get("profile_id")
+    expected_sha256 = FROZEN_PROFILE_SHA256_BY_ID.get(profile_id)
+    if expected_sha256 is None or sha256_bytes(payload) != expected_sha256:
+        raise RunnerError("frozen profile SHA-256 differs from the canonical profile")
     expected = {
         "replica_ids": list(REPLICA_IDS),
         "fault_threshold": FAULT_THRESHOLD,
@@ -818,6 +888,7 @@ def load_frozen_profile(path: Path) -> tuple[dict[str, Any], bytes]:
     requests = _profile_transition_requests(value)
     windows = _profile_throughput_windows(value)
     _validate_profile_transition_residencies(value, requests, windows)
+    _profile_final_measurement_delay_ns(value)
     return value, payload
 
 
@@ -1006,6 +1077,10 @@ def runtime_parameters(
         runtime["throughput_windows"] = [
             dict(window) for window in _profile_throughput_windows(profile)
         ]
+        if profile.get("profile_id") in PAIRED_PROFILE_ARMS:
+            runtime[FINAL_MEASUREMENT_DELAY_PROFILE_FIELD] = int(
+                profile[FINAL_MEASUREMENT_DELAY_PROFILE_FIELD]
+            )
     else:
         runtime["successor_roots"] = list(SURVIVORS)
         runtime["successor_wait_exempt"] = list(CRASH_TARGETS)
@@ -3058,6 +3133,9 @@ def build_manifest(
     runtime_artifacts: Sequence[Mapping[str, Any]] = (),
     transition_requests: Sequence[Mapping[str, Any]] = (),
     throughput_windows: Sequence[Mapping[str, Any]] = (),
+    profile_identity: str | None = None,
+    pair_id: str | None = None,
+    pair_arm: str | None = None,
 ) -> dict[str, Any]:
     if (
         type(minimum_post_activation_grace_ns) is not int
@@ -3091,6 +3169,21 @@ def build_manifest(
     )
     runtime_value = dict(runtime or {})
     recurring = "transition_requests" in runtime_value
+    identity = profile_identity or (
+        RECURRING_PROFILE_ID if recurring else PROFILE_ID
+    )
+    paired = identity in PAIRED_PROFILE_ARMS
+    if (pair_id is None) != (pair_arm is None):
+        raise RunnerError("pair_id and pair_arm must be supplied together")
+    if paired:
+        if not isinstance(pair_id, str) or not pair_id:
+            raise RunnerError("paired manifests require a non-empty pair_id")
+        if pair_arm != PAIRED_PROFILE_ARMS[identity]:
+            raise RunnerError(
+                "paired manifest arm differs from its frozen profile"
+            )
+    elif pair_id is not None:
+        raise RunnerError("non-paired profiles cannot carry pair metadata")
     manager_metadata: dict[str, Any] = {
         "source_id": MANAGER_SOURCE_ID,
         "receives_crash_ground_truth": False,
@@ -3107,7 +3200,7 @@ def build_manifest(
         "kauri_revision": revision,
         "kauri_worktree_clean": True,
         "profile": {
-                "identity": RECURRING_PROFILE_ID if recurring else PROFILE_ID,
+            "identity": identity,
             "path": "profile.json",
             "sha256": sha256_bytes(profile_bytes),
         },
@@ -3147,10 +3240,13 @@ def build_manifest(
         manifest["throughput_windows"] = [
             dict(window) for window in throughput_windows
         ]
+    if paired:
+        manifest["pair_id"] = pair_id
+        manifest["pair_arm"] = pair_arm
     expected_manifest_fields = (
-        RECURRING_MANIFEST_FIELDS
-        if recurring
-        else MANIFEST_FIELDS
+        PAIRED_MANIFEST_FIELDS
+        if paired
+        else (RECURRING_MANIFEST_FIELDS if recurring else MANIFEST_FIELDS)
     )
     if set(manifest) != expected_manifest_fields:
         raise RunnerError("internal manifest schema drift")
@@ -3250,6 +3346,15 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--phase-timeout", type=float, default=240.0)
     parser.add_argument("--crash-confirm-timeout", type=float, default=5.0)
     parser.add_argument(
+        "--pair-id",
+        help="matched-pair identity; required only for paired profiles",
+    )
+    parser.add_argument(
+        "--pair-arm",
+        choices=("control", "adaptive"),
+        help="matched-pair arm; required only for paired profiles",
+    )
+    parser.add_argument(
         "--plot",
         action="store_true",
         help="generate PASS-only figures; plotting never changes the validator verdict",
@@ -3310,6 +3415,19 @@ def run(argv: Sequence[str] | None = None) -> int:
     repository = args.repository.resolve()
     profile_path = args.profile.resolve()
     profile, profile_bytes = load_frozen_profile(profile_path)
+    profile_id = str(profile["profile_id"])
+    expected_pair_arm = PAIRED_PROFILE_ARMS.get(profile_id)
+    if (args.pair_id is None) != (args.pair_arm is None):
+        raise RunnerError("--pair-id and --pair-arm must be supplied together")
+    if expected_pair_arm is None:
+        if args.pair_id is not None:
+            raise RunnerError("pair metadata is valid only for paired profiles")
+    else:
+        if not args.pair_id or args.pair_arm != expected_pair_arm:
+            raise RunnerError(
+                f"{profile_id} requires --pair-id and --pair-arm "
+                f"{expected_pair_arm}"
+            )
     minimum_post_activation_grace_ns = _profile_duration_ns(
         profile, MINIMUM_POST_ACTIVATION_GRACE_PROFILE_FIELD
     )
@@ -3354,6 +3472,11 @@ def run(argv: Sequence[str] | None = None) -> int:
             name: {"path": str(path), "sha256": sha256_file(path)}
             for name, path in binaries.items()
         },
+        **(
+            {"pair_id": args.pair_id, "pair_arm": args.pair_arm}
+            if expected_pair_arm is not None
+            else {}
+        ),
     }
     _write_json_exclusive(state_path, state)
 
@@ -3401,6 +3524,9 @@ def run(argv: Sequence[str] | None = None) -> int:
             runtime_artifacts=runtime_artifacts,
             transition_requests=runtime.get("transition_requests", ()),
             throughput_windows=throughput_measurement_windows,
+            profile_identity=profile_id,
+            pair_id=args.pair_id,
+            pair_arm=args.pair_arm,
         )
         if manifest_written:
             _replace_json(manifest_path, value)
@@ -3501,9 +3627,9 @@ def run(argv: Sequence[str] | None = None) -> int:
         state["phase"] = "baseline"
         state["baseline_start_ns"] = baseline_start_ns
         _replace_json(state_path, state)
+        ordered_window_specs = _profile_throughput_windows(profile)
         window_specs = {
-            window["phase"]: window
-            for window in _profile_throughput_windows(profile)
+            window["phase"]: window for window in ordered_window_specs
         }
         baseline_duration_ns = (
             int(window_specs["baseline"]["bucket_count"]) * BUCKET_WIDTH_NS
@@ -3580,6 +3706,16 @@ def run(argv: Sequence[str] | None = None) -> int:
         update_manifest()
 
         transition_requests = tuple(runtime["transition_requests"])
+        transition_phase_specs = ordered_window_specs[
+            2 : 2 + len(transition_requests)
+        ]
+        final_phase_specs = ordered_window_specs[
+            2 + len(transition_requests) :
+        ]
+        if len(transition_phase_specs) != len(transition_requests):
+            raise RunnerError(
+                "throughput phases do not cover every requested transition"
+            )
         crash_start_ns = min(
             marker["requested_monotonic_raw_ns"] for marker in crash_markers
         )
@@ -3595,20 +3731,6 @@ def run(argv: Sequence[str] | None = None) -> int:
         command_payloads: list[dict[str, Any]] = []
         pending_phase: tuple[str, int, int, DecodedBundle] | None = None
         recurring_stall_start_ns: int | None = None
-
-        def phase_for_epoch(epoch_number: int) -> Mapping[str, Any] | None:
-            candidates = [
-                window
-                for window in window_specs.values()
-                if window["epoch_number"] == epoch_number
-            ]
-            if not candidates:
-                return None
-            if len(candidates) != 1:
-                raise RunnerError(
-                    f"successor epoch {epoch_number} has ambiguous throughput phases"
-                )
-            return candidates[0]
 
         for transition_index, request in enumerate(transition_requests):
             predecessor_epoch = int(request["predecessor_epoch_number"])
@@ -3745,7 +3867,11 @@ def run(argv: Sequence[str] | None = None) -> int:
                         "phase": phase,
                         "epoch_number": phase_epoch,
                         "start_ns": phase_start_ns,
-                        "end_ns": command_ns,
+                        "end_ns": (
+                            required_end_ns
+                            if profile_id == PAIRED_ADAPTIVE_PROFILE_ID
+                            else command_ns
+                        ),
                     }
                 )
 
@@ -3812,92 +3938,134 @@ def run(argv: Sequence[str] | None = None) -> int:
                 health=transition_health,
                 allow_clean_exit=allow_completed_manager_exit,
             )
-            phase_spec = phase_for_epoch(successor_epoch)
+            phase_spec = transition_phase_specs[transition_index]
+            if int(phase_spec["epoch_number"]) != successor_epoch:
+                raise RunnerError(
+                    "throughput phase does not bind its requested successor"
+                )
             phase_start_ns = max(
                 activation_ns + minimum_post_activation_grace_ns,
                 common_successors[0].common_ns,
             )
             recurring_stall_start_ns = phase_start_ns
-            if phase_spec is not None:
-                pending_phase = (
-                    str(phase_spec["phase"]),
-                    successor_epoch,
-                    phase_start_ns,
-                    decoded,
-                )
+            pending_phase = (
+                str(phase_spec["phase"]),
+                successor_epoch,
+                phase_start_ns,
+                decoded,
+            )
             update_manifest()
 
         if pending_phase is None:
             raise RunnerError("final transition has no throughput phase")
-        final_phase, final_epoch, final_start_ns, final_bundle = pending_phase
-        final_duration_ns = (
-            int(window_specs[final_phase]["bucket_count"]) * BUCKET_WIDTH_NS
-        )
-        final_end_ns = final_start_ns + final_duration_ns
-        final_tree_roots = {
-            tree.tree_id: tree.members[0] for tree in final_bundle.trees
-        }
-        final_root_cycle = tuple(
-            tree.members[0] for tree in final_bundle.trees
-        )
-
-        def final_phase_complete() -> dict[str, Any] | None:
-            if monotonic_raw_ns() < final_end_ns:
-                return None
-            streams = _event_streams(run_directory)
-            observer_events = [
-                event
-                for event in streams[AUTHORITATIVE_SOURCE_ID]
-                if event.get("event_type") == "block.committed"
-                and final_start_ns <= _event_timestamp(event) < final_end_ns
-            ]
-            for offset in range(len(final_root_cycle)):
-                rotated = (
-                    *final_root_cycle[offset:],
-                    *final_root_cycle[:offset],
-                )
-                found = find_common_root_cycle(
-                    observer_events,
-                    commit_witness_timestamps(streams, SURVIVORS),
-                    participants=SURVIVORS,
-                    epoch_number=final_epoch,
-                    tree_roots=final_tree_roots,
-                    expected_roots=rotated,
-                    require_terminal=False,
-                )
-                if found is not None:
-                    return found
-            return None
-
-        def final_phase_health() -> None:
-            streams = _event_streams(run_directory)
-            _enforce_observer_stall(
-                streams[AUTHORITATIVE_SOURCE_ID],
-                window_start_ns=final_start_ns,
-                now_ns=max(final_start_ns, monotonic_raw_ns()),
-                maximum_gap_ns=maximum_gap_ns,
+        def measure_fixed_phase(
+            phase: str,
+            epoch_number: int,
+            start_ns: int,
+            bundle: DecodedBundle,
+        ) -> int:
+            duration_ns = (
+                int(window_specs[phase]["bucket_count"]) * BUCKET_WIDTH_NS
             )
-
-        state["phase"] = f"measuring_{final_phase}"
-        _replace_json(state_path, state)
-        _wait(
-            f"complete {final_phase} buckets and ranked root cycle",
-            args.phase_timeout,
-            records,
-            final_phase_complete,
-            expected_crashed=set(CRASH_TARGETS),
-            health=final_phase_health,
-            allow_clean_exit=allow_completed_manager_exit,
-        )
-        throughput_measurement_windows.append(
-            {
-                "phase": final_phase,
-                "epoch_number": final_epoch,
-                "start_ns": final_start_ns,
-                "end_ns": final_end_ns,
+            phase_end_ns = start_ns + duration_ns
+            tree_roots = {
+                tree.tree_id: tree.members[0] for tree in bundle.trees
             }
+            root_cycle = tuple(tree.members[0] for tree in bundle.trees)
+
+            def phase_complete() -> dict[str, Any] | None:
+                if monotonic_raw_ns() < phase_end_ns:
+                    return None
+                streams = _event_streams(run_directory)
+                observer_events = [
+                    event
+                    for event in streams[AUTHORITATIVE_SOURCE_ID]
+                    if event.get("event_type") == "block.committed"
+                    and start_ns <= _event_timestamp(event) < phase_end_ns
+                ]
+                for offset in range(len(root_cycle)):
+                    rotated = (*root_cycle[offset:], *root_cycle[:offset])
+                    found = find_common_root_cycle(
+                        observer_events,
+                        commit_witness_timestamps(streams, SURVIVORS),
+                        participants=SURVIVORS,
+                        epoch_number=epoch_number,
+                        tree_roots=tree_roots,
+                        expected_roots=rotated,
+                        require_terminal=False,
+                    )
+                    if found is not None:
+                        return found
+                return None
+
+            def phase_health() -> None:
+                streams = _event_streams(run_directory)
+                _enforce_observer_stall(
+                    streams[AUTHORITATIVE_SOURCE_ID],
+                    window_start_ns=start_ns,
+                    now_ns=max(start_ns, monotonic_raw_ns()),
+                    maximum_gap_ns=maximum_gap_ns,
+                )
+
+            state["phase"] = f"measuring_{phase}"
+            _replace_json(state_path, state)
+            _wait(
+                f"complete {phase} buckets and ranked root cycle",
+                args.phase_timeout,
+                records,
+                phase_complete,
+                expected_crashed=set(CRASH_TARGETS),
+                health=phase_health,
+                allow_clean_exit=allow_completed_manager_exit,
+            )
+            throughput_measurement_windows.append(
+                {
+                    "phase": phase,
+                    "epoch_number": epoch_number,
+                    "start_ns": start_ns,
+                    "end_ns": phase_end_ns,
+                }
+            )
+            return phase_end_ns
+
+        final_phase, final_epoch, final_start_ns, final_bundle = pending_phase
+        end_ns = measure_fixed_phase(
+            final_phase,
+            final_epoch,
+            final_start_ns,
+            final_bundle,
         )
-        end_ns = final_end_ns
+        if final_phase_specs:
+            if (
+                profile_id != PAIRED_CONTROL_PROFILE_ID
+                or len(final_phase_specs) != 1
+            ):
+                raise RunnerError(
+                    "only the containment control may have a delayed final phase"
+                )
+            delayed_spec = final_phase_specs[0]
+            delayed_phase = str(delayed_spec["phase"])
+            if (
+                delayed_phase != "control_late"
+                or int(delayed_spec["epoch_number"]) != final_epoch
+            ):
+                raise RunnerError(
+                    "containment control has an invalid delayed phase"
+                )
+            delayed_start_ns = (
+                final_start_ns
+                + _profile_final_measurement_delay_ns(profile)
+            )
+            if delayed_start_ns < end_ns:
+                raise RunnerError(
+                    "control late phase overlaps the containment phase"
+                )
+            end_ns = measure_fixed_phase(
+                delayed_phase,
+                final_epoch,
+                delayed_start_ns,
+                final_bundle,
+            )
         _write_json_exclusive(
             run_directory / "epochs.json",
             build_epochs_document(decoded_bundles, command_payloads),

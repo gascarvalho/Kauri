@@ -38,9 +38,31 @@ FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-recurring-v3"
 FROZEN_PROFILE_SHA256 = (
     "ddfb037c707ebc699138e446f365aa51f19624ee997635784249cc464c5eccef"
 )
+PAIRED_ADAPTIVE_PROFILE_ID = (
+    "n7-f2-q5-crash-recovery-matched-adaptive-v1"
+)
+PAIRED_ADAPTIVE_PROFILE_SHA256 = (
+    "faece247365cf0cac5a771abfe67cc7b3e29f04c1ae53befc03e86ebf95c2777"
+)
+PAIRED_CONTROL_PROFILE_ID = (
+    "n7-f2-q5-crash-recovery-containment-control-v1"
+)
+PAIRED_CONTROL_PROFILE_SHA256 = (
+    "70ae0386338f8d66ff9d5489baa5cde403e576a9e32455090810fe5bb5906b03"
+)
 LEGACY_FROZEN_PROFILE_ID = "n7-f2-q5-crash-recovery-v2"
 LEGACY_FROZEN_PROFILE_SHA256 = (
     "768c33418937f9b738c607b523ad847a7cb38220c95a499e82823ac41aa1e038"
+)
+RECURRING_PROFILE_IDS = frozenset(
+    {
+        FROZEN_PROFILE_ID,
+        PAIRED_ADAPTIVE_PROFILE_ID,
+        PAIRED_CONTROL_PROFILE_ID,
+    }
+)
+PAIRED_PROFILE_IDS = frozenset(
+    {PAIRED_ADAPTIVE_PROFILE_ID, PAIRED_CONTROL_PROFILE_ID}
 )
 MAXIMUM_PREDECESSOR_RESIDENCY_MS = 3_600_000
 EPOCH_CHANGE_PAYLOAD_DOMAIN = b"kauri-epoch-change-payload-v1"
@@ -121,6 +143,9 @@ _MANIFEST_FIELDS = frozenset(
 _RECURRING_MANIFEST_FIELDS = frozenset(
     {*_MANIFEST_FIELDS, "transition_requests", "throughput_windows"}
 )
+_PAIRED_MANIFEST_FIELDS = frozenset(
+    {*_RECURRING_MANIFEST_FIELDS, "pair_id", "pair_arm"}
+)
 _PROFILE_FIELDS = frozenset({"identity", "path", "sha256"})
 _FROZEN_PROFILE_FIELDS = frozenset(
     {
@@ -174,6 +199,19 @@ _RECURRING_FROZEN_PROFILE_FIELDS = frozenset(
         "throughput_windows",
         "minimum_containment_to_degraded_ratio",
         "minimum_optimized_to_containment_ratio",
+    }
+)
+_PAIRED_ADAPTIVE_FROZEN_PROFILE_FIELDS = frozenset(
+    {*_RECURRING_FROZEN_PROFILE_FIELDS, "final_measurement_delay_ms"}
+)
+_PAIRED_CONTROL_FROZEN_PROFILE_FIELDS = frozenset(
+    {
+        *(
+            _RECURRING_FROZEN_PROFILE_FIELDS
+            - {"minimum_optimized_to_containment_ratio"}
+        ),
+        "final_measurement_delay_ms",
+        "minimum_control_late_to_containment_ratio",
     }
 )
 _RUN_COMPLETION_FIELDS = frozenset(
@@ -363,6 +401,9 @@ _RECURRING_RUNTIME_FIELDS = frozenset(
         "transition_requests",
         "throughput_windows",
     }
+)
+_PAIRED_RUNTIME_FIELDS = frozenset(
+    {*_RECURRING_RUNTIME_FIELDS, "final_measurement_delay_ms"}
 )
 _RUNTIME_EXECUTABLE_FIELDS = frozenset(
     {"hotstuff_app", "adaptation_manager"}
@@ -582,6 +623,8 @@ class Manifest:
     run_id: str
     kauri_revision: str
     profile_identity: str
+    pair_id: str | None
+    pair_arm: str | None
     profile_path: Path
     profile_bytes: bytes
     authoritative_observer: str
@@ -592,11 +635,13 @@ class Manifest:
     maximum_activation_to_successor_ns: int
     baseline_bucket_count: int
     post_bucket_count: int
+    final_measurement_delay_ns: int
     transition_requests: tuple[Mapping[str, Any], ...]
     throughput_windows: tuple[analysis.PhaseWindow, ...]
     required_bucket_counts: Mapping[str, int]
     minimum_containment_to_degraded_ratio: float | None
     minimum_optimized_to_containment_ratio: float | None
+    minimum_control_late_to_containment_ratio: float | None
     maximum_stall_ns: int
     degraded_maximum_stall_ns: int
     runtime: Mapping[str, Any]
@@ -854,6 +899,26 @@ def _decode_frozen_profile(payload: bytes, label: str) -> Mapping[str, Any]:
                 f"{label} differs from the exact frozen recurring v3 settings"
             )
         return value
+    if identity == PAIRED_ADAPTIVE_PROFILE_ID:
+        _exact_fields(value, _PAIRED_ADAPTIVE_FROZEN_PROFILE_FIELDS, label)
+        if (
+            hashlib.sha256(payload).hexdigest()
+            != PAIRED_ADAPTIVE_PROFILE_SHA256
+        ):
+            raise ValidationError(
+                f"{label} differs from the exact frozen paired adaptive settings"
+            )
+        return value
+    if identity == PAIRED_CONTROL_PROFILE_ID:
+        _exact_fields(value, _PAIRED_CONTROL_FROZEN_PROFILE_FIELDS, label)
+        if (
+            hashlib.sha256(payload).hexdigest()
+            != PAIRED_CONTROL_PROFILE_SHA256
+        ):
+            raise ValidationError(
+                f"{label} differs from the exact frozen paired control settings"
+            )
+        return value
     if identity != LEGACY_FROZEN_PROFILE_ID:
         raise ValidationError(f"{label} has an unknown frozen profile identity")
     _exact_fields(value, _FROZEN_PROFILE_FIELDS, label)
@@ -901,13 +966,32 @@ def _decode_frozen_profile(payload: bytes, label: str) -> Mapping[str, Any]:
     return value
 
 
-def _repository_frozen_profile() -> bytes:
-    path = Path(__file__).resolve().with_name("profile.json")
+def _repository_frozen_profile(
+    profile_identity: str = FROZEN_PROFILE_ID,
+) -> bytes:
+    profile_specs = {
+        FROZEN_PROFILE_ID: ("profile.json", FROZEN_PROFILE_SHA256),
+        PAIRED_ADAPTIVE_PROFILE_ID: (
+            "profile-paired-adaptive.json",
+            PAIRED_ADAPTIVE_PROFILE_SHA256,
+        ),
+        PAIRED_CONTROL_PROFILE_ID: (
+            "profile-paired-control.json",
+            PAIRED_CONTROL_PROFILE_SHA256,
+        ),
+    }
+    try:
+        filename, expected_sha256 = profile_specs[profile_identity]
+    except KeyError as exc:
+        raise ValidationError(
+            "repository profile identity is not recurring"
+        ) from exc
+    path = Path(__file__).resolve().with_name(filename)
     try:
         payload = path.read_bytes()
     except OSError as exc:
         raise ValidationError(f"cannot read repository frozen profile: {exc}") from exc
-    if hashlib.sha256(payload).hexdigest() != FROZEN_PROFILE_SHA256:
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
         raise ValidationError("repository frozen profile SHA-256 drifted")
     _decode_frozen_profile(payload, "repository frozen profile")
     return payload
@@ -1032,9 +1116,18 @@ def _throughput_window_specs(
     value: Any, label: str
 ) -> tuple[Mapping[str, Any], ...]:
     windows = _list(value, label)
-    phases = ("baseline", "degraded", "containment", "optimized")
-    if len(windows) != len(phases):
+    if len(windows) != 4:
         raise ValidationError(f"{label} must contain four ordered phases")
+    final_phase = (
+        windows[-1].get("phase")
+        if isinstance(windows[-1], dict)
+        else None
+    )
+    if final_phase not in ("optimized", "control_late"):
+        raise ValidationError(
+            f"{label} final phase must be optimized or control_late"
+        )
+    phases = ("baseline", "degraded", "containment", final_phase)
     result: list[Mapping[str, Any]] = []
     for index, (item, phase) in enumerate(zip(windows, phases)):
         window = _object(item, f"{label}[{index}]")
@@ -1135,9 +1228,13 @@ def _expected_runtime(profile: Mapping[str, Any]) -> dict[str, Any]:
         "snapshot_seed": profile["snapshot_seed"],
         "manager_limits": dict(MANAGER_LIMITS),
     }
-    if profile["profile_id"] == FROZEN_PROFILE_ID:
+    if profile["profile_id"] in RECURRING_PROFILE_IDS:
         expected["transition_requests"] = profile["transition_requests"]
         expected["throughput_windows"] = profile["throughput_windows"]
+        if profile["profile_id"] in PAIRED_PROFILE_IDS:
+            expected["final_measurement_delay_ms"] = profile[
+                "final_measurement_delay_ms"
+            ]
     else:
         expected["successor_roots"] = list(profile["successor_roots"])
         expected["successor_wait_exempt"] = list(
@@ -1150,11 +1247,12 @@ def _validate_runtime(
     value: Any, profile: Mapping[str, Any]
 ) -> Mapping[str, Any]:
     runtime = _object(value, "manifest.runtime")
-    expected_fields = (
-        _RECURRING_RUNTIME_FIELDS
-        if profile["profile_id"] == FROZEN_PROFILE_ID
-        else _RUNTIME_FIELDS
-    )
+    if profile["profile_id"] in PAIRED_PROFILE_IDS:
+        expected_fields = _PAIRED_RUNTIME_FIELDS
+    elif profile["profile_id"] in RECURRING_PROFILE_IDS:
+        expected_fields = _RECURRING_RUNTIME_FIELDS
+    else:
+        expected_fields = _RUNTIME_FIELDS
     _exact_fields(runtime, expected_fields, "manifest.runtime")
     manager_limits = _object(
         runtime["manager_limits"], "manifest.runtime.manager_limits"
@@ -1801,12 +1899,21 @@ def load_manifest(path: Path) -> Manifest:
     profile_identity = _string(
         profile_header.get("identity"), "manifest.profile.identity"
     )
-    recurring = profile_identity == FROZEN_PROFILE_ID
-    if profile_identity not in (FROZEN_PROFILE_ID, LEGACY_FROZEN_PROFILE_ID):
+    recurring = profile_identity in RECURRING_PROFILE_IDS
+    paired = profile_identity in PAIRED_PROFILE_IDS
+    if not recurring and profile_identity != LEGACY_FROZEN_PROFILE_ID:
         raise ValidationError("profile identity is not a frozen N7 campaign profile")
     _exact_fields(
         raw,
-        _RECURRING_MANIFEST_FIELDS if recurring else _MANIFEST_FIELDS,
+        (
+            _PAIRED_MANIFEST_FIELDS
+            if paired
+            else (
+                _RECURRING_MANIFEST_FIELDS
+                if recurring
+                else _MANIFEST_FIELDS
+            )
+        ),
         "manifest",
     )
     if _integer(raw["schema_version"], "manifest.schema_version") != SCHEMA_VERSION:
@@ -1815,6 +1922,20 @@ def load_manifest(path: Path) -> Manifest:
         raise ValidationError(f"manifest.scenario must be {SCENARIO}")
     _require_frozen_header(raw, "manifest")
     run_id = _string(raw["run_id"], "manifest.run_id")
+    pair_id: str | None = None
+    pair_arm: str | None = None
+    if paired:
+        pair_id = _string(raw["pair_id"], "manifest.pair_id")
+        pair_arm = _string(raw["pair_arm"], "manifest.pair_arm")
+        expected_pair_arm = (
+            "adaptive"
+            if profile_identity == PAIRED_ADAPTIVE_PROFILE_ID
+            else "control"
+        )
+        if pair_arm != expected_pair_arm:
+            raise ValidationError(
+                "manifest pair_arm differs from its paired profile identity"
+            )
     revision = _string(raw["kauri_revision"], "manifest.kauri_revision")
     if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
         raise ValidationError("kauri_revision must be a full lowercase 40-digit Git SHA")
@@ -1851,18 +1972,21 @@ def load_manifest(path: Path) -> Manifest:
     except OSError as exc:
         raise IncompleteRun(f"cannot read frozen profile: {exc}") from exc
     profile_sha = _hash(profile["sha256"], "manifest.profile.sha256")
-    expected_profile_sha = (
-        FROZEN_PROFILE_SHA256 if recurring else LEGACY_FROZEN_PROFILE_SHA256
-    )
+    expected_profile_sha = {
+        FROZEN_PROFILE_ID: FROZEN_PROFILE_SHA256,
+        PAIRED_ADAPTIVE_PROFILE_ID: PAIRED_ADAPTIVE_PROFILE_SHA256,
+        PAIRED_CONTROL_PROFILE_ID: PAIRED_CONTROL_PROFILE_SHA256,
+        LEGACY_FROZEN_PROFILE_ID: LEGACY_FROZEN_PROFILE_SHA256,
+    }[profile_identity]
     if profile_sha != expected_profile_sha:
         raise ValidationError("manifest does not pin the canonical frozen profile SHA-256")
     if hashlib.sha256(profile_bytes).hexdigest() != profile_sha:
         raise ValidationError("profile sha256 does not match the preserved profile")
     if recurring:
-        canonical_profile = _repository_frozen_profile()
+        canonical_profile = _repository_frozen_profile(profile_identity)
         if profile_bytes != canonical_profile:
             raise ValidationError(
-                "run profile is not byte-exact canonical frozen recurring v3"
+                "run profile is not byte-exact canonical frozen recurring profile"
             )
     profile_json = _decode_frozen_profile(profile_bytes, "run frozen profile")
     runtime = _validate_runtime(raw["runtime"], profile_json)
@@ -1893,6 +2017,7 @@ def load_manifest(path: Path) -> Manifest:
     required_bucket_counts: dict[str, int]
     containment_ratio: float | None = None
     optimized_ratio: float | None = None
+    control_late_ratio: float | None = None
     if recurring:
         transition_requests = _transition_requests(
             raw["transition_requests"], "manifest.transition_requests"
@@ -1937,9 +2062,16 @@ def load_manifest(path: Path) -> Manifest:
         containment_ratio = float(
             profile_json["minimum_containment_to_degraded_ratio"]
         )
-        optimized_ratio = float(
-            profile_json["minimum_optimized_to_containment_ratio"]
-        )
+        if profile_identity == PAIRED_CONTROL_PROFILE_ID:
+            control_late_ratio = float(
+                profile_json[
+                    "minimum_control_late_to_containment_ratio"
+                ]
+            )
+        else:
+            optimized_ratio = float(
+                profile_json["minimum_optimized_to_containment_ratio"]
+            )
     else:
         required_bucket_counts = {
             "baseline": int(profile_json["baseline_bucket_count"]),
@@ -1983,6 +2115,16 @@ def load_manifest(path: Path) -> Manifest:
     ) * 1_000_000_000
     baseline_bucket_count = required_bucket_counts["baseline"]
     post_bucket_count = required_bucket_counts.get("post", 0)
+    final_measurement_delay_ns = (
+        _integer(
+            profile_json["final_measurement_delay_ms"],
+            "profile.final_measurement_delay_ms",
+            maximum=MAXIMUM_PREDECESSOR_RESIDENCY_MS,
+        )
+        * 1_000_000
+        if paired
+        else 0
+    )
     maximum_stall_ns = _integer(
         profile_json["maximum_stall_s"],
         "profile.maximum_stall_s",
@@ -2204,6 +2346,8 @@ def load_manifest(path: Path) -> Manifest:
         run_id=run_id,
         kauri_revision=revision,
         profile_identity=profile_identity,
+        pair_id=pair_id,
+        pair_arm=pair_arm,
         profile_path=profile_path,
         profile_bytes=profile_bytes,
         authoritative_observer=observer,
@@ -2214,11 +2358,13 @@ def load_manifest(path: Path) -> Manifest:
         maximum_activation_to_successor_ns=maximum_activation_to_successor_ns,
         baseline_bucket_count=baseline_bucket_count,
         post_bucket_count=post_bucket_count,
+        final_measurement_delay_ns=final_measurement_delay_ns,
         transition_requests=transition_requests,
         throughput_windows=throughput_windows,
         required_bucket_counts=required_bucket_counts,
         minimum_containment_to_degraded_ratio=containment_ratio,
         minimum_optimized_to_containment_ratio=optimized_ratio,
+        minimum_control_late_to_containment_ratio=control_late_ratio,
         maximum_stall_ns=maximum_stall_ns,
         degraded_maximum_stall_ns=degraded_maximum_stall_ns,
         runtime=runtime,
@@ -4655,6 +4801,10 @@ def _validate_recurring_command_and_activation(
         activation_events = [
             event for event in events if event.event_type == "epoch.activated"
         ]
+        if len(activation_events) > len(transitions):
+            raise ValidationError(
+                f"replica-{replica} emitted an unrequested epoch activation"
+            )
         for index, (epoch, expected_command, command_event) in enumerate(
             zip(transitions, expected_commands, command_events)
         ):
@@ -4840,40 +4990,107 @@ def _validate_recurring_commits(
                 "post-activation throughput boundary overflows monotonic time"
             )
     windows = manifest.throughput_windows
-    expected_windows = (
-        analysis.PhaseWindow(
-            "baseline",
-            epochs.epochs[0].epoch_number,
-            manifest.baseline_start_ns,
-            crash_ns,
-        ),
-        analysis.PhaseWindow(
-            "degraded",
-            epochs.epochs[0].epoch_number,
-            crash_ns,
-            command_times[0],
-        ),
-        analysis.PhaseWindow(
+    baseline_window = analysis.PhaseWindow(
+        "baseline",
+        epochs.epochs[0].epoch_number,
+        manifest.baseline_start_ns,
+        crash_ns,
+    )
+    degraded_window = analysis.PhaseWindow(
+        "degraded",
+        epochs.epochs[0].epoch_number,
+        crash_ns,
+        command_times[0],
+    )
+    containment_start_ns = max(
+        activation_times[0] + manifest.minimum_post_activation_grace_ns,
+        common_first_ns[0],
+    )
+    if manifest.profile_identity in PAIRED_PROFILE_IDS:
+        containment_duration_ns = (
+            manifest.required_bucket_counts["containment"]
+            * analysis.BUCKET_WIDTH_NS
+        )
+        containment_end_ns = containment_start_ns + containment_duration_ns
+        containment_window = analysis.PhaseWindow(
             "containment",
             epochs.epochs[1].epoch_number,
-            max(
-                activation_times[0]
-                + manifest.minimum_post_activation_grace_ns,
-                common_first_ns[0],
-            ),
-            command_times[1],
-        ),
-        analysis.PhaseWindow(
-            "optimized",
-            epochs.epochs[2].epoch_number,
-            max(
+            containment_start_ns,
+            containment_end_ns,
+        )
+        if manifest.profile_identity == PAIRED_ADAPTIVE_PROFILE_ID:
+            if containment_end_ns > command_times[1]:
+                raise ValidationError(
+                    "paired containment window does not finish before the "
+                    "epoch-2 command"
+                )
+            optimized_start_ns = max(
                 activation_times[1]
                 + manifest.minimum_post_activation_grace_ns,
                 common_first_ns[1],
+            )
+            optimized_end_ns = optimized_start_ns + (
+                manifest.required_bucket_counts["optimized"]
+                * analysis.BUCKET_WIDTH_NS
+            )
+            expected_windows = (
+                baseline_window,
+                degraded_window,
+                containment_window,
+                analysis.PhaseWindow(
+                    "optimized",
+                    epochs.epochs[2].epoch_number,
+                    optimized_start_ns,
+                    optimized_end_ns,
+                ),
+            )
+            expected_end_ns = optimized_end_ns
+        else:
+            control_late_start_ns = (
+                containment_start_ns
+                + manifest.final_measurement_delay_ns
+            )
+            control_late_end_ns = control_late_start_ns + (
+                manifest.required_bucket_counts["control_late"]
+                * analysis.BUCKET_WIDTH_NS
+            )
+            expected_windows = (
+                baseline_window,
+                degraded_window,
+                containment_window,
+                analysis.PhaseWindow(
+                    "control_late",
+                    epochs.epochs[1].epoch_number,
+                    control_late_start_ns,
+                    control_late_end_ns,
+                ),
+            )
+            expected_end_ns = control_late_end_ns
+        if manifest.end_ns != expected_end_ns:
+            raise ValidationError(
+                "paired run end does not match its fixed final measurement window"
+            )
+    else:
+        expected_windows = (
+            baseline_window,
+            degraded_window,
+            analysis.PhaseWindow(
+                "containment",
+                epochs.epochs[1].epoch_number,
+                containment_start_ns,
+                command_times[1],
             ),
-            manifest.end_ns,
-        ),
-    )
+            analysis.PhaseWindow(
+                "optimized",
+                epochs.epochs[2].epoch_number,
+                max(
+                    activation_times[1]
+                    + manifest.minimum_post_activation_grace_ns,
+                    common_first_ns[1],
+                ),
+                manifest.end_ns,
+            ),
+        )
     if windows != expected_windows:
         raise ValidationError(
             "four throughput windows do not match their exact causal boundaries"
@@ -4889,9 +5106,19 @@ def _validate_recurring_commits(
         if bucket.end_ns - bucket.start_ns == analysis.BUCKET_WIDTH_NS:
             counts[bucket.phase] += 1
     for phase, required in manifest.required_bucket_counts.items():
-        if counts[phase] < required:
+        if (
+            counts[phase] != required
+            if manifest.profile_identity in PAIRED_PROFILE_IDS
+            else counts[phase] < required
+        ):
+            requirement = (
+                f"requires exactly {required}"
+                if manifest.profile_identity in PAIRED_PROFILE_IDS
+                else f"requires {required}"
+            )
             raise IncompleteRun(
-                f"{phase} phase has {counts[phase]} complete raw buckets; requires {required}"
+                f"{phase} phase has {counts[phase]} complete raw buckets; "
+                f"{requirement}"
             )
     maximum_stalls = _maximum_commit_stalls(
         commits,
@@ -4975,15 +5202,47 @@ def _validate_recurring_commits(
     )
     medians = throughput.medians
     assert medians.containment_tps is not None
-    assert medians.optimized_tps is not None
-    if medians.degraded_tps <= 0 or medians.containment_tps <= 0:
-        raise ValidationError("recurring throughput ratios require positive medians")
-    containment_ratio = medians.containment_tps / medians.degraded_tps
-    optimized_ratio = medians.optimized_tps / medians.containment_tps
-    if containment_ratio < float(manifest.minimum_containment_to_degraded_ratio):
-        raise ValidationError("containment throughput ratio is below the frozen minimum")
-    if optimized_ratio < float(manifest.minimum_optimized_to_containment_ratio):
-        raise ValidationError("optimized throughput ratio is below the frozen minimum")
+    if manifest.profile_identity == PAIRED_CONTROL_PROFILE_ID:
+        assert medians.control_late_tps is not None
+        paired_medians = (
+            medians.baseline_tps,
+            medians.degraded_tps,
+            medians.containment_tps,
+            medians.control_late_tps,
+        )
+    else:
+        assert medians.optimized_tps is not None
+        paired_medians = (
+            medians.baseline_tps,
+            medians.degraded_tps,
+            medians.containment_tps,
+            medians.optimized_tps,
+        )
+    if manifest.profile_identity in PAIRED_PROFILE_IDS:
+        if any(value <= 0 for value in paired_medians):
+            raise ValidationError(
+                "paired throughput metrics require four positive phase medians"
+            )
+    else:
+        if medians.degraded_tps <= 0 or medians.containment_tps <= 0:
+            raise ValidationError(
+                "recurring throughput ratios require positive medians"
+            )
+        assert medians.optimized_tps is not None
+        containment_ratio = medians.containment_tps / medians.degraded_tps
+        optimized_ratio = medians.optimized_tps / medians.containment_tps
+        if containment_ratio < float(
+            manifest.minimum_containment_to_degraded_ratio
+        ):
+            raise ValidationError(
+                "containment throughput ratio is below the frozen minimum"
+            )
+        if optimized_ratio < float(
+            manifest.minimum_optimized_to_containment_ratio
+        ):
+            raise ValidationError(
+                "optimized throughput ratio is below the frozen minimum"
+            )
     for bucket in throughput.buckets:
         if sum(bucket.leader_transactions) != bucket.transaction_count:
             raise ValidationError("leader transaction columns do not conserve aggregate")
@@ -5297,21 +5556,29 @@ def _pass_record(
     recurring = bool(evaluation.manifest.transition_requests)
     if recurring:
         assert medians.containment_tps is not None
-        assert medians.optimized_tps is not None
+        phase_median_tps = {
+            "baseline": medians.baseline_tps,
+            "degraded": medians.degraded_tps,
+            "containment": medians.containment_tps,
+        }
         metrics: dict[str, Any] = {
-            "phase_median_tps": {
-                "baseline": medians.baseline_tps,
-                "degraded": medians.degraded_tps,
-                "containment": medians.containment_tps,
-                "optimized": medians.optimized_tps,
-            },
             "containment_to_degraded_ratio": (
                 medians.containment_tps / medians.degraded_tps
             ),
-            "optimized_to_containment_ratio": (
-                medians.optimized_tps / medians.containment_tps
-            ),
         }
+        if evaluation.manifest.profile_identity == PAIRED_CONTROL_PROFILE_ID:
+            assert medians.control_late_tps is not None
+            phase_median_tps["control_late"] = medians.control_late_tps
+            metrics["control_late_to_containment_ratio"] = (
+                medians.control_late_tps / medians.containment_tps
+            )
+        else:
+            assert medians.optimized_tps is not None
+            phase_median_tps["optimized"] = medians.optimized_tps
+            metrics["optimized_to_containment_ratio"] = (
+                medians.optimized_tps / medians.containment_tps
+            )
+        metrics["phase_median_tps"] = phase_median_tps
     else:
         assert medians.post_tps is not None
         metrics = {

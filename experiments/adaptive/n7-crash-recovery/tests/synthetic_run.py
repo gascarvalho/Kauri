@@ -1832,6 +1832,258 @@ def create_recurring_run(directory: Path) -> tuple[Path, Path]:
     return manifest_path, epochs_path
 
 
+def create_paired_adaptive_run(directory: Path) -> tuple[Path, Path]:
+    """Create a complete paired-adaptive run with fixed 35-second windows."""
+    manifest_path, epochs_path = create_recurring_run(directory)
+    manifest = load(manifest_path)
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "profile-paired-adaptive.json"
+    )
+    profile_bytes = profile_path.read_bytes()
+    profile = json.loads(profile_bytes)
+    (directory / "profile.json").write_bytes(profile_bytes)
+    manifest["profile"] = {
+        "identity": profile["profile_id"],
+        "path": "profile.json",
+        "sha256": hashlib.sha256(profile_bytes).hexdigest(),
+    }
+    manifest["pair_id"] = "synthetic-pair-non-evidence"
+    manifest["pair_arm"] = "adaptive"
+    containment = next(
+        window
+        for window in manifest["throughput_windows"]
+        if window["phase"] == "containment"
+    )
+    containment["end_ns"] = (
+        containment["start_ns"] + 7 * 5_000_000_000
+    )
+    manifest["runtime"]["final_measurement_delay_ms"] = 0
+    save(manifest_path, manifest)
+    return manifest_path, epochs_path
+
+
+def create_paired_control_run(directory: Path) -> tuple[Path, Path]:
+    """Create a one-transition containment control with no epoch-2 traffic."""
+    manifest_path, epochs_path = create_recurring_run(directory)
+    manifest = load(manifest_path)
+    requests = recurring_transition_requests()[:1]
+    control_end_ns = 151_006_000_000
+    control_windows = [
+        *recurring_throughput_windows()[:2],
+        {
+            "phase": "containment",
+            "epoch_number": 1,
+            "start_ns": 76_006_000_000,
+            "end_ns": 111_006_000_000,
+        },
+        {
+            "phase": "control_late",
+            "epoch_number": 1,
+            "start_ns": 116_006_000_000,
+            "end_ns": control_end_ns,
+        },
+    ]
+
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "profile-paired-control.json"
+    )
+    profile_bytes = profile_path.read_bytes()
+    profile = json.loads(profile_bytes)
+    (directory / "profile.json").write_bytes(profile_bytes)
+    manifest["profile"] = {
+        "identity": profile["profile_id"],
+        "path": "profile.json",
+        "sha256": hashlib.sha256(profile_bytes).hexdigest(),
+    }
+    manifest["pair_id"] = "synthetic-pair-non-evidence"
+    manifest["pair_arm"] = "control"
+    manifest["end_ns"] = control_end_ns
+    manifest["transition_requests"] = requests
+    manifest["throughput_windows"] = control_windows
+    manifest["manager"]["transition_artifact_ids"] = [
+        TRANSITION_ARTIFACT_IDS[0]
+    ]
+    manifest["runtime"]["transition_requests"] = requests
+    manifest["runtime"]["throughput_windows"] = [
+        dict(window) for window in profile["throughput_windows"]
+    ]
+    manifest["runtime"]["final_measurement_delay_ms"] = 40_000
+    manifest["runtime_artifacts"] = [
+        artifact
+        for artifact in manifest["runtime_artifacts"]
+        if artifact["path"]
+        not in (TRANSITION_BUNDLE_PATHS[1], TRANSITION_SNAPSHOT_PATHS[1])
+    ]
+
+    request_path = directory / "runtime/transition-requests.json"
+    request_path.write_text(
+        json.dumps(
+            {"schema_version": 1, "requests": requests},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    next(
+        artifact
+        for artifact in manifest["runtime_artifacts"]
+        if artifact["path"] == "runtime/transition-requests.json"
+    )["sha256"] = hashlib.sha256(request_path.read_bytes()).hexdigest()
+
+    launch_path = directory / "runtime/launch-arguments.json"
+    launch = load(launch_path)
+    manager = launch["processes"][-1]
+    second_request = json.dumps(
+        recurring_transition_requests()[1],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    second_bundle = str(
+        (directory / TRANSITION_BUNDLE_PATHS[1]).resolve()
+    )
+    for flag, value in (
+        ("--transition-request", second_request),
+        ("--bundle-output", second_bundle),
+    ):
+        position = next(
+            index
+            for index, argument in enumerate(manager["argv"][:-1])
+            if argument == flag and manager["argv"][index + 1] == value
+        )
+        del manager["argv"][position : position + 2]
+    manager["effective_options"]["transition_requests"] = requests
+    launch_path.write_text(
+        json.dumps(launch, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    next(
+        artifact
+        for artifact in manifest["runtime_artifacts"]
+        if artifact["path"] == "runtime/launch-arguments.json"
+    )["sha256"] = hashlib.sha256(launch_path.read_bytes()).hexdigest()
+
+    for replica in range(7):
+        events = _recurring_replica_events(replica)
+        if replica not in (0, 1):
+            events = [
+                event
+                for event in events
+                if not (
+                    (
+                        event["event_type"] == "epoch.command_committed"
+                        and event["payload"].get(
+                            "successor_epoch_number"
+                        )
+                        == 2
+                    )
+                    or (
+                        event["event_type"] == "epoch.activated"
+                        and event["payload"].get("epoch_number") == 2
+                    )
+                    or (
+                        event["event_type"]
+                        in ("block.commit_observed", "block.committed")
+                        and event["payload"].get("block_height", 0) >= 33
+                    )
+                    or event["event_type"]
+                    in ("process.stopping", "process.stopped")
+                )
+            ]
+            source_id = f"replica-{replica}"
+            instance = f"synthetic-{source_id}-instance"
+            for height, timestamp_ns in zip(
+                range(33, 38),
+                range(132_000_000_000, 152_000_000_000, 4_000_000_000),
+            ):
+                payload = {
+                    "height": height,
+                    "epoch": 1,
+                    "tree": (height - 18) % 5,
+                    "transaction_count": 80,
+                }
+                events.extend(
+                    (
+                        _envelope(
+                            source_kind="replica",
+                            source_id=source_id,
+                            source_instance=instance,
+                            timestamp_ns=timestamp_ns
+                            + replica * 1_000_000,
+                            event_type="block.commit_observed",
+                            payload=_commit_observed_payload(
+                                height=payload["height"],
+                                transaction_count=payload[
+                                    "transaction_count"
+                                ],
+                            ),
+                        ),
+                        _envelope(
+                            source_kind="replica",
+                            source_id=source_id,
+                            source_instance=instance,
+                            timestamp_ns=timestamp_ns
+                            + replica * 1_000_000,
+                            event_type="block.committed",
+                            payload=_commit_payload(
+                                height=payload["height"],
+                                epoch=payload["epoch"],
+                                tree=payload["tree"],
+                                transaction_count=payload[
+                                    "transaction_count"
+                                ],
+                                designated=replica == 2,
+                            ),
+                        ),
+                    )
+                )
+            events.extend(
+                (
+                    _envelope(
+                        source_kind="replica",
+                        source_id=source_id,
+                        source_instance=instance,
+                        timestamp_ns=152_000_000_000
+                        + replica * 1_000_000,
+                        event_type="process.stopping",
+                        payload={"exit_status": None},
+                    ),
+                    _envelope(
+                        source_kind="replica",
+                        source_id=source_id,
+                        source_instance=instance,
+                        timestamp_ns=153_000_000_000
+                        + replica * 1_000_000,
+                        event_type="process.stopped",
+                        payload={"exit_status": None},
+                    ),
+                )
+            )
+        _write_stream(
+            directory / "raw" / f"replica-{replica}.jsonl",
+            events,
+        )
+
+    manager_events = recurring_manager_events(completed_cycles=1)
+    for event in manager_events:
+        if event["event_type"] == "process.stopping":
+            event["source_monotonic_ns"] = 152_100_000_000
+        elif event["event_type"] == "process.stopped":
+            event["source_monotonic_ns"] = 152_200_000_000
+    _write_stream(
+        directory / "raw/adaptive-manager.jsonl",
+        manager_events,
+    )
+
+    save(manifest_path, manifest)
+    control_epochs = recurring_epochs_document()
+    control_epochs["epochs"] = control_epochs["epochs"][:2]
+    save(epochs_path, control_epochs)
+    return manifest_path, epochs_path
+
+
 def load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
