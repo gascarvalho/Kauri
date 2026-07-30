@@ -191,6 +191,7 @@ add_library(hotstuff
     src/client.cpp
     src/configuration.cpp
     src/crypto.cpp
+    src/diagnosis.cpp
     src/entity.cpp
     src/epoch_activation.cpp
     src/epoch_change.cpp

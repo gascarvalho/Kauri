@@ -355,6 +355,13 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;evidence;reputation;projection"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_diagnosis
+    test_diagnosis.cpp)
+set_tests_properties(
+    test_diagnosis PROPERTIES
+    LABELS "unit;adaptive;diagnosis;f09a"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_proposal_admission
     test_proposal_admission.cpp)
 add_kauri_catch_test(
