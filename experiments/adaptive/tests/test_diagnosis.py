@@ -20,6 +20,15 @@ from experiments.adaptive.kauri_experiment.diagnosis import (
 )
 
 
+MANAGER_PROJECTION_SELECTOR = {
+    "run_id": "run-1",
+    "manager_source_instance": "manager-instance-1",
+    "epoch_number": 0,
+    "tree_id": 6,
+    "epoch_digest": "a" * 64,
+}
+
+
 def _observation(
     attempt_id: str,
     reporter_id: int,
@@ -40,20 +49,46 @@ def _manager_record(
     reporter_id: int,
     target_id: int,
     evidence_outcome: str,
+    ingestion_sequence: int = 1,
+    source_sequence: int | None = None,
 ) -> str:
+    response = evidence_outcome != "timeout"
+    canonical_source_sequence = (
+        ingestion_sequence
+        if source_sequence is None
+        else source_sequence
+    )
     return json.dumps(
         {
             "event_schema_version": 1,
+            "run_id": "run-1",
             "source_kind": "adaptation_manager",
-            "event_type": "reputation.evidence_applied",
+            "source_id": "adaptive-manager",
+            "source_instance": "manager-instance-1",
+            "source_sequence": canonical_source_sequence,
+            "source_monotonic_ns": 1_000 + canonical_source_sequence,
+            "event_type": "evidence.observation_accepted",
             "payload": {
-                "observation_id": observation_id,
-                "reporter_id": reporter_id,
-                "target_id": target_id,
-                "evidence_outcome": evidence_outcome,
-                "reputation_outcome": evidence_outcome,
-                "delta": -1 if evidence_outcome == "timeout" else 1,
-                "resulting_score": 0,
+                "ingestion_sequence": ingestion_sequence,
+                "observation": {
+                    "schema_version": 1,
+                    "observation_id": observation_id,
+                    "reporter_id": reporter_id,
+                    "observed_replica_id": target_id,
+                    "configuration": {
+                        "epoch_number": 0,
+                        "tree_id": 6,
+                        "epoch_digest": "a" * 64,
+                    },
+                    "block_hash": "b" * 64,
+                    "expected_message_type": "direct_vote",
+                    "outcome": evidence_outcome,
+                    "response_duration_us": 10 if response else 0,
+                    "deadline_duration_us": 100,
+                    "reporter_monotonic_ns": 1_000,
+                    "reporter_sequence": ingestion_sequence,
+                    "signer_set": [target_id] if response else [],
+                },
             },
         },
         sort_keys=True,
@@ -288,46 +323,51 @@ def test_manager_jsonl_projection_maps_accepted_outcomes_and_ignores_others() ->
             }
         ),
         _manager_record(
-            observation_id="obs-timeout",
+            observation_id="1" * 64,
             reporter_id=1,
             target_id=3,
             evidence_outcome="timeout",
+            ingestion_sequence=1,
         ),
         _manager_record(
-            observation_id="obs-on-time",
+            observation_id="2" * 64,
             reporter_id=3,
             target_id=2,
             evidence_outcome="on_time",
+            ingestion_sequence=2,
         ),
     )
 
     projected = project_manager_evidence_jsonl(
         records,
         membership=range(4),
+        **MANAGER_PROJECTION_SELECTOR,
     )
 
     assert projected == (
-        _observation("obs-timeout", 1, 3, "timeout"),
-        _observation("obs-on-time", 3, 2, "response"),
+        _observation("1" * 64, 1, 3, "timeout"),
+        _observation("2" * 64, 3, 2, "response"),
     )
-    assert "development-only" in MANAGER_EVIDENCE_PROJECTION_SCOPE
-    assert "tree/block context" in MANAGER_EVIDENCE_PROJECTION_SCOPE
+    assert "manager-accepted exact" in MANAGER_EVIDENCE_PROJECTION_SCOPE
+    assert "late transitions fail closed" in MANAGER_EVIDENCE_PROJECTION_SCOPE
 
 
 def test_manager_projection_rejects_conflicts_invalid_records_and_capacity() -> (
     None
 ):
     timeout = _manager_record(
-        observation_id="same",
+        observation_id="1" * 64,
         reporter_id=1,
         target_id=3,
         evidence_outcome="timeout",
+        ingestion_sequence=1,
     )
     response = _manager_record(
-        observation_id="same",
+        observation_id="1" * 64,
         reporter_id=1,
         target_id=3,
         evidence_outcome="on_time",
+        ingestion_sequence=2,
     )
 
     with pytest.raises(
@@ -337,22 +377,28 @@ def test_manager_projection_rejects_conflicts_invalid_records_and_capacity() -> 
         project_manager_evidence_jsonl(
             (timeout, response),
             membership=range(4),
+            **MANAGER_PROJECTION_SELECTOR,
         )
 
     with pytest.raises(ManagerEvidenceProjectionError, match="JSON"):
-        project_manager_evidence_jsonl(("{bad-json",), membership=range(4))
+        project_manager_evidence_jsonl(
+            ("{bad-json",),
+            membership=range(4),
+            **MANAGER_PROJECTION_SELECTOR,
+        )
 
     with pytest.raises(ManagerEvidenceProjectionError, match="membership"):
         project_manager_evidence_jsonl(
             (
                 _manager_record(
-                    observation_id="unknown",
+                    observation_id="3" * 64,
                     reporter_id=9,
                     target_id=3,
                     evidence_outcome="timeout",
                 ),
             ),
             membership=range(4),
+            **MANAGER_PROJECTION_SELECTOR,
         )
 
     with pytest.raises(ManagerEvidenceProjectionError, match="record capacity"):
@@ -360,21 +406,24 @@ def test_manager_projection_rejects_conflicts_invalid_records_and_capacity() -> 
             (timeout, timeout),
             membership=range(4),
             maximum_records=1,
+            **MANAGER_PROJECTION_SELECTOR,
         )
 
 
 def test_manager_projection_fails_closed_on_late_transition() -> None:
     timeout = _manager_record(
-        observation_id="same",
+        observation_id="1" * 64,
         reporter_id=1,
         target_id=3,
         evidence_outcome="timeout",
+        ingestion_sequence=1,
     )
     late = _manager_record(
-        observation_id="same",
+        observation_id="1" * 64,
         reporter_id=1,
         target_id=3,
         evidence_outcome="late",
+        ingestion_sequence=2,
     )
 
     with pytest.raises(
@@ -384,6 +433,119 @@ def test_manager_projection_fails_closed_on_late_transition() -> None:
         project_manager_evidence_jsonl(
             (timeout, late),
             membership=range(4),
+            **MANAGER_PROJECTION_SELECTOR,
+        )
+
+
+def test_manager_projection_allows_ledger_sequence_reset_after_rotation() -> (
+    None
+):
+    first = _manager_record(
+        observation_id="1" * 64,
+        reporter_id=1,
+        target_id=3,
+        evidence_outcome="timeout",
+        ingestion_sequence=1,
+        source_sequence=8,
+    )
+    after_rotation = _manager_record(
+        observation_id="2" * 64,
+        reporter_id=3,
+        target_id=2,
+        evidence_outcome="on_time",
+        ingestion_sequence=1,
+        source_sequence=9,
+    )
+
+    assert project_manager_evidence_jsonl(
+        (first, after_rotation),
+        membership=range(4),
+        **MANAGER_PROJECTION_SELECTOR,
+    ) == (
+        _observation("1" * 64, 1, 3, "timeout"),
+        _observation("2" * 64, 3, 2, "response"),
+    )
+
+
+def test_manager_projection_selects_one_exact_configuration() -> None:
+    selected = _manager_record(
+        observation_id="1" * 64,
+        reporter_id=1,
+        target_id=3,
+        evidence_outcome="timeout",
+        source_sequence=1,
+    )
+    other_configuration = json.loads(
+        _manager_record(
+            observation_id="2" * 64,
+            reporter_id=3,
+            target_id=2,
+            evidence_outcome="late",
+            source_sequence=2,
+        )
+    )
+    other_configuration["payload"]["observation"]["configuration"][
+        "tree_id"
+    ] = 5
+
+    assert project_manager_evidence_jsonl(
+        (selected, json.dumps(other_configuration, sort_keys=True)),
+        membership=range(4),
+        **MANAGER_PROJECTION_SELECTOR,
+    ) == (_observation("1" * 64, 1, 3, "timeout"),)
+
+
+def test_manager_projection_rejects_selected_configuration_schema_drift() -> (
+    None
+):
+    record = json.loads(
+        _manager_record(
+            observation_id="1" * 64,
+            reporter_id=1,
+            target_id=3,
+            evidence_outcome="timeout",
+        )
+    )
+    record["payload"]["observation"]["configuration"]["extra"] = 1
+
+    with pytest.raises(
+        ManagerEvidenceProjectionError,
+        match="configuration schema",
+    ):
+        project_manager_evidence_jsonl(
+            (json.dumps(record, sort_keys=True),),
+            membership=range(4),
+            **MANAGER_PROJECTION_SELECTOR,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("run_id", "run-2", "another run"),
+        ("source_instance", "manager-instance-2", "another manager"),
+    ),
+)
+def test_manager_projection_rejects_cross_source_mixing(
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    record = json.loads(
+        _manager_record(
+            observation_id="1" * 64,
+            reporter_id=1,
+            target_id=3,
+            evidence_outcome="timeout",
+        )
+    )
+    record[field] = value
+
+    with pytest.raises(ManagerEvidenceProjectionError, match=message):
+        project_manager_evidence_jsonl(
+            (json.dumps(record, sort_keys=True),),
+            membership=range(4),
+            **MANAGER_PROJECTION_SELECTOR,
         )
 
 

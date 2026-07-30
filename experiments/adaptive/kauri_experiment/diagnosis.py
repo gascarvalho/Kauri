@@ -19,6 +19,7 @@ from fractions import Fraction
 from itertools import combinations, islice
 import json
 from math import comb
+import re
 from typing import Literal, TypeAlias
 
 
@@ -30,9 +31,10 @@ DEFAULT_MAXIMUM_JSONL_RECORDS = 4_096
 DEFAULT_MAXIMUM_JSONL_LINE_BYTES = 64 * 1_024
 
 MANAGER_EVIDENCE_PROJECTION_SCOPE = (
-    "development-only projection: reputation.evidence_applied omits exact "
-    "tree/block context and therefore cannot support campaign evidence"
+    "manager-accepted exact observation projection; late transitions fail "
+    "closed until the diagnostic window owns explicit exclusion metadata"
 )
+_HEX_256 = re.compile(r"^[0-9a-f]{64}$")
 
 DiagnosticOutcome: TypeAlias = Literal["response", "timeout"]
 DefinitiveMode: TypeAlias = Literal[
@@ -433,16 +435,20 @@ def project_manager_evidence_jsonl(
     records: Iterable[str],
     *,
     membership: Iterable[int],
+    run_id: str,
+    manager_source_instance: str,
+    epoch_number: int,
+    tree_id: int,
+    epoch_digest: str,
     maximum_records: int = DEFAULT_MAXIMUM_JSONL_RECORDS,
     maximum_line_bytes: int = DEFAULT_MAXIMUM_JSONL_LINE_BYTES,
 ) -> tuple[DiagnosticObservation, ...]:
     """Project accepted manager audit events to diagnostic observations.
 
-    This helper intentionally ignores scalar score fields.  It is
-    development-only because the audit event omits the exact configuration,
-    tree, block, and expected-message identity needed for campaign evidence.
-    Late outcomes fail closed because this projection cannot return exclusion
-    metadata without making an incomplete history look authoritative.
+    Only the explicitly selected run, manager instance, and exact
+    configuration are projected. Late outcomes in that selected context fail
+    closed because this API cannot return exclusion metadata without making an
+    incomplete history look authoritative.
     """
 
     try:
@@ -458,9 +464,40 @@ def project_manager_evidence_jsonl(
         maximum_line_bytes,
         "JSONL line capacity",
     )
+    if not isinstance(run_id, str) or not run_id:
+        raise ManagerEvidenceProjectionError(
+            "run id selector must be non-empty"
+        )
+    if (
+        not isinstance(manager_source_instance, str)
+        or not manager_source_instance
+    ):
+        raise ManagerEvidenceProjectionError(
+            "manager source instance selector must be non-empty"
+        )
+    selected_epoch = _require_integer(epoch_number, "epoch number selector")
+    selected_tree = _require_integer(tree_id, "tree id selector")
+    if selected_epoch < 0 or selected_tree < 0:
+        raise ManagerEvidenceProjectionError(
+            "configuration selectors must be non-negative"
+        )
+    if (
+        not isinstance(epoch_digest, str)
+        or _HEX_256.fullmatch(epoch_digest) is None
+    ):
+        raise ManagerEvidenceProjectionError(
+            "epoch digest selector must be lowercase 256-bit hex"
+        )
+    selected_configuration = {
+        "epoch_number": selected_epoch,
+        "tree_id": selected_tree,
+        "epoch_digest": epoch_digest,
+    }
 
     projected_by_attempt: dict[str, DiagnosticObservation] = {}
+    exact_by_attempt: dict[str, str] = {}
     nonblank_record_count = 0
+    prior_source_sequence = 0
     for line_number, line in enumerate(records, start=1):
         if not isinstance(line, str):
             raise _projection_error(
@@ -499,7 +536,7 @@ def project_manager_evidence_jsonl(
                 line_number,
                 "event_type must be a string",
             )
-        if event_type != "reputation.evidence_applied":
+        if event_type != "evidence.observation_accepted":
             continue
 
         if decoded.get("event_schema_version") != 1:
@@ -512,6 +549,52 @@ def project_manager_evidence_jsonl(
                 line_number,
                 "event source is not the adaptation manager",
             )
+        event_run_id = decoded.get("run_id")
+        source_id = decoded.get("source_id")
+        source_instance = decoded.get("source_instance")
+        source_sequence = decoded.get("source_sequence")
+        source_monotonic_ns = decoded.get("source_monotonic_ns")
+        if (
+            not isinstance(event_run_id, str)
+            or not event_run_id
+            or source_id != "adaptive-manager"
+            or not isinstance(source_instance, str)
+            or not source_instance
+        ):
+            raise _projection_error(
+                line_number,
+                "invalid manager source identity",
+            )
+        if event_run_id != run_id:
+            raise _projection_error(
+                line_number,
+                "accepted observation belongs to another run",
+            )
+        if source_instance != manager_source_instance:
+            raise _projection_error(
+                line_number,
+                "accepted observation belongs to another manager instance",
+            )
+        if (
+            isinstance(source_sequence, bool)
+            or not isinstance(source_sequence, int)
+            or source_sequence < 1
+            or source_sequence > (1 << 64) - 1
+            or isinstance(source_monotonic_ns, bool)
+            or not isinstance(source_monotonic_ns, int)
+            or source_monotonic_ns < 0
+            or source_monotonic_ns > (1 << 64) - 1
+        ):
+            raise _projection_error(
+                line_number,
+                "invalid manager source ordering",
+            )
+        if source_sequence <= prior_source_sequence:
+            raise _projection_error(
+                line_number,
+                "source_sequence must increase within a manager instance",
+            )
+        prior_source_sequence = source_sequence
         payload = decoded.get("payload")
         if not isinstance(payload, Mapping):
             raise _projection_error(
@@ -519,17 +602,41 @@ def project_manager_evidence_jsonl(
                 "payload must be an object",
             )
 
-        observation_id = payload.get("observation_id")
-        reporter_id = payload.get("reporter_id")
-        target_id = payload.get("target_id")
-        evidence_outcome = payload.get("evidence_outcome")
+        ingestion_sequence = payload.get("ingestion_sequence")
         if (
-            not isinstance(observation_id, str)
-            or not observation_id.strip()
+            isinstance(ingestion_sequence, bool)
+            or not isinstance(ingestion_sequence, int)
+            or ingestion_sequence < 1
+            or ingestion_sequence > (1 << 64) - 1
         ):
             raise _projection_error(
                 line_number,
-                "observation_id must be a non-empty string",
+                "ingestion_sequence must be a positive uint64",
+            )
+
+        accepted = payload.get("observation")
+        if not isinstance(accepted, Mapping):
+            raise _projection_error(
+                line_number,
+                "observation must be an object",
+            )
+        if accepted.get("schema_version") != 1:
+            raise _projection_error(
+                line_number,
+                "unsupported observation schema version",
+            )
+
+        observation_id = accepted.get("observation_id")
+        reporter_id = accepted.get("reporter_id")
+        target_id = accepted.get("observed_replica_id")
+        evidence_outcome = accepted.get("outcome")
+        if (
+            not isinstance(observation_id, str)
+            or _HEX_256.fullmatch(observation_id) is None
+        ):
+            raise _projection_error(
+                line_number,
+                "observation_id must be a lowercase 256-bit hex digest",
             )
         if (
             isinstance(reporter_id, bool)
@@ -554,9 +661,110 @@ def project_manager_evidence_jsonl(
                 line_number,
                 "observation reporter and target must be distinct",
             )
+        configuration = accepted.get("configuration")
+        if (
+            not isinstance(configuration, Mapping)
+            or set(configuration)
+            != {"epoch_number", "tree_id", "epoch_digest"}
+        ):
+            raise _projection_error(
+                line_number,
+                "configuration schema must be exact",
+            )
+        for field in ("epoch_number", "tree_id"):
+            value = configuration.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise _projection_error(
+                    line_number,
+                    f"configuration {field} must be a non-negative integer",
+                )
+        event_epoch_digest = configuration.get("epoch_digest")
+        block_hash = accepted.get("block_hash")
+        if (
+            not isinstance(event_epoch_digest, str)
+            or _HEX_256.fullmatch(event_epoch_digest) is None
+            or not isinstance(block_hash, str)
+            or _HEX_256.fullmatch(block_hash) is None
+        ):
+            raise _projection_error(
+                line_number,
+                "configuration and block digests must be lowercase hex",
+            )
+        if dict(configuration) != selected_configuration:
+            continue
+        if accepted.get("expected_message_type") not in (
+            "direct_vote",
+            "aggregate_relay",
+            "leader_progress",
+        ):
+            raise _projection_error(
+                line_number,
+                "unsupported expected message type",
+            )
+
+        numeric_fields: dict[str, int] = {}
+        for field in (
+            "response_duration_us",
+            "deadline_duration_us",
+            "reporter_monotonic_ns",
+            "reporter_sequence",
+        ):
+            value = accepted.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise _projection_error(
+                    line_number,
+                    f"{field} must be a non-negative integer",
+                )
+            numeric_fields[field] = value
+        if (
+            numeric_fields["deadline_duration_us"] == 0
+            or numeric_fields["reporter_sequence"] == 0
+        ):
+            raise _projection_error(
+                line_number,
+                "deadline and reporter sequence must be positive",
+            )
+
+        signer_set = accepted.get("signer_set")
+        if (
+            not isinstance(signer_set, list)
+            or any(
+                isinstance(signer, bool)
+                or not isinstance(signer, int)
+                or signer not in membership_set
+                for signer in signer_set
+            )
+            or signer_set != sorted(set(signer_set))
+        ):
+            raise _projection_error(
+                line_number,
+                "signer_set must be canonical and within membership",
+            )
+
         if evidence_outcome == "timeout":
+            if (
+                numeric_fields["response_duration_us"] != 0
+                or signer_set
+            ):
+                raise _projection_error(
+                    line_number,
+                    "timeout must have zero response duration and no signers",
+                )
             diagnostic_outcome: DiagnosticOutcome = "timeout"
         elif evidence_outcome == "on_time":
+            if not signer_set:
+                raise _projection_error(
+                    line_number,
+                    "on-time response must have a signer set",
+                )
             diagnostic_outcome = "response"
         elif evidence_outcome == "late":
             raise _projection_error(
@@ -575,14 +783,23 @@ def project_manager_evidence_jsonl(
             target_id=target_id,
             outcome=diagnostic_outcome,
         )
+        exact_identity = json.dumps(
+            accepted,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         existing = projected_by_attempt.get(observation_id)
         if existing is not None:
-            if existing != observation:
+            if (
+                existing != observation
+                or exact_by_attempt[observation_id] != exact_identity
+            ):
                 raise _projection_error(
                     line_number,
                     "conflicting duplicate attempt observation",
                 )
             continue
         projected_by_attempt[observation_id] = observation
+        exact_by_attempt[observation_id] = exact_identity
 
     return tuple(projected_by_attempt.values())

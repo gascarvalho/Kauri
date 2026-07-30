@@ -20,15 +20,69 @@ def _arm(name: str):
     return _driver().build_arm(name, "a" * 40)
 
 
+def _accepted_event(
+    *,
+    run_id: str = "run-1",
+    reporter_id: int = 6,
+    target_id: int = 1,
+    block_hash: str = "a" * 64,
+    outcome: str = "timeout",
+) -> dict[str, object]:
+    driver = _driver()
+    return {
+        "event_schema_version": 1,
+        "run_id": run_id,
+        "source_kind": "adaptation_manager",
+        "source_id": "adaptive-manager",
+        "source_instance": "manager-instance-1",
+        "source_sequence": 9,
+        "source_monotonic_ns": 1000,
+        "event_type": driver.ACCEPTED_OBSERVATION_EVENT,
+        "payload": {
+            "ingestion_sequence": 7,
+            "observation": {
+                "schema_version": 1,
+                "observation_id": "b" * 64,
+                "reporter_id": reporter_id,
+                "observed_replica_id": target_id,
+                "configuration": {
+                    "epoch_number": 0,
+                    "tree_id": driver.TREE_ID,
+                    "epoch_digest": driver.EPOCH0_DIGEST,
+                },
+                "block_hash": block_hash,
+                "expected_message_type": "aggregate_relay",
+                "outcome": outcome,
+                "response_duration_us": (
+                    0 if outcome == "timeout" else 250_000
+                ),
+                "deadline_duration_us": 500_000,
+                "reporter_monotonic_ns": 900,
+                "reporter_sequence": 3,
+                "signer_set": [] if outcome == "timeout" else [4],
+            },
+        },
+    }
+
+
 @pytest.mark.parametrize("arm_name", _driver().ARM_NAMES)
 def test_arm_freezes_one_n7_fault_and_never_configures_manager(
     arm_name: str,
 ) -> None:
     driver = _driver()
     arm = _arm(arm_name)
+    expected_faulty_replica = {
+        "sigkill_crash": driver.CRASH_REPLICA_ID,
+        "static_authenticated_false_report": (
+            driver.FALSE_REPORTER_ID
+        ),
+        "static_persistent_omission": (
+            driver.PERSISTENT_OMITTER_ID
+        ),
+    }[arm_name]
 
     assert arm.name == arm_name
-    assert arm.faulty_replica_id == driver.FAULTY_REPLICA_ID
+    assert arm.faulty_replica_id == expected_faulty_replica
     assert arm.plan.seed == driver.SNAPSHOT_SEED
     assert arm.plan.context.replica_ids == driver.REPLICA_IDS
     assert arm.plan.context.quorum == driver.QUORUM
@@ -60,12 +114,13 @@ def test_byzantine_overlays_bind_only_faulty_replica_to_exact_tree6(
         context_limit=3,
     )
 
+    faulty_replica_id = driver.byzantine_faulty_replica_id(arm_name)
     assert all(
         overlays[replica_id] == ()
         for replica_id in driver.REPLICA_IDS
-        if replica_id != driver.FAULTY_REPLICA_ID
+        if replica_id != faulty_replica_id
     )
-    faulty = overlays[driver.FAULTY_REPLICA_ID]
+    faulty = overlays[faulty_replica_id]
     assert mode_option in faulty
     assert faulty[
         faulty.index("--experiment-byzantine-configuration") + 1
@@ -106,8 +161,15 @@ def test_launch_bundle_is_explicitly_claim_limited(tmp_path: Path) -> None:
         "fault_threshold": 2,
         "quorum": 5,
         "seed": driver.SNAPSHOT_SEED,
-        "faulty_replica_id": 1,
-        "false_report_target_id": 4,
+        "crash_replica_id": 1,
+        "false_reporter_id": 6,
+        "false_report_target_id": 1,
+        "persistent_omitter_id": 1,
+        "initial_byzantine_syndrome": {
+            "reporter_id": 6,
+            "target_id": 1,
+            "outcome": "timeout",
+        },
         "tree_id": 6,
         "tree_members_breadth_first": [6, 0, 1, 2, 3, 4, 5],
         "epoch0_digest": driver.EPOCH0_DIGEST,
@@ -127,7 +189,13 @@ def test_pass_verdict_requires_all_modest_live_observations() -> None:
         arm=arm,
         run_id="run-1",
         kauri_revision="a" * 40,
-        action_observation={"kind": "aggregate_omitted"},
+        action_observation={
+            "kind": "aggregate_omitted",
+            "source_id": "replica-1",
+            "block_hash": "a" * 64,
+            "configuration": driver.EXACT_CONFIGURATION,
+        },
+        accepted_timeout_observation=_accepted_event(),
         before_commit={"block_height": 10, "block_hash": "1" * 64},
         after_commit={"block_height": 11, "block_hash": "2" * 64},
         fixed_quorum={
@@ -149,6 +217,7 @@ def test_pass_verdict_requires_all_modest_live_observations() -> None:
     ("field", "value"),
     (
         ("action_observation", None),
+        ("accepted_timeout_observation", None),
         ("after_commit", None),
         (
             "fixed_quorum",
@@ -178,7 +247,13 @@ def test_verdict_refuses_missing_or_conflicting_evidence(
         "arm": _arm("static_persistent_omission"),
         "run_id": "run-1",
         "kauri_revision": "a" * 40,
-        "action_observation": {"kind": "aggregate_omitted"},
+        "action_observation": {
+            "kind": "aggregate_omitted",
+            "source_id": "replica-1",
+            "block_hash": "a" * 64,
+            "configuration": driver.EXACT_CONFIGURATION,
+        },
+        "accepted_timeout_observation": _accepted_event(),
         "before_commit": {"block_height": 10, "block_hash": "1" * 64},
         "after_commit": {"block_height": 11, "block_hash": "2" * 64},
         "fixed_quorum": {
@@ -194,6 +269,160 @@ def test_verdict_refuses_missing_or_conflicting_evidence(
     arguments[field] = value
 
     assert driver.build_arm_verdict(**arguments)["verdict"] == "INCOMPLETE"
+
+
+def test_crash_pass_does_not_require_manager_accepted_timeout() -> None:
+    driver = _driver()
+
+    verdict = driver.build_arm_verdict(
+        arm=_arm("sigkill_crash"),
+        run_id="run-1",
+        kauri_revision="a" * 40,
+        action_observation={"kind": "replica_group_sigkill"},
+        accepted_timeout_observation=None,
+        before_commit={"block_height": 10, "block_hash": "1" * 64},
+        after_commit={"block_height": 11, "block_hash": "2" * 64},
+        fixed_quorum={
+            "configured_quorum": 5,
+            "invalid_records": [],
+        },
+        conflicts=(),
+        runtime_error=None,
+    )
+
+    assert verdict["verdict"] == "PASS"
+    assert verdict["manager_accepted_timeout_observation"] is None
+
+
+def test_byzantine_verdict_refuses_timeout_not_bound_to_marker() -> None:
+    driver = _driver()
+    verdict = driver.build_arm_verdict(
+        arm=_arm("static_persistent_omission"),
+        run_id="run-1",
+        kauri_revision="a" * 40,
+        action_observation={
+            "kind": "aggregate_omitted",
+            "source_id": "replica-1",
+            "block_hash": "c" * 64,
+            "configuration": driver.EXACT_CONFIGURATION,
+        },
+        accepted_timeout_observation=_accepted_event(
+            block_hash="a" * 64,
+        ),
+        before_commit={"block_height": 10, "block_hash": "1" * 64},
+        after_commit={"block_height": 11, "block_hash": "2" * 64},
+        fixed_quorum={
+            "configured_quorum": 5,
+            "invalid_records": [],
+        },
+        conflicts=(),
+        runtime_error=None,
+    )
+
+    assert verdict["verdict"] == "INCOMPLETE"
+
+
+def test_byzantine_verdict_refuses_wrong_action_identity() -> None:
+    driver = _driver()
+    verdict = driver.build_arm_verdict(
+        arm=_arm("static_persistent_omission"),
+        run_id="run-1",
+        kauri_revision="a" * 40,
+        action_observation={
+            "kind": "false_timeout_emitted",
+            "source_id": "replica-6",
+            "block_hash": "a" * 64,
+            "configuration": driver.EXACT_CONFIGURATION,
+        },
+        accepted_timeout_observation=_accepted_event(),
+        before_commit={"block_height": 10, "block_hash": "1" * 64},
+        after_commit={"block_height": 11, "block_hash": "2" * 64},
+        fixed_quorum={
+            "configured_quorum": 5,
+            "invalid_records": [],
+        },
+        conflicts=(),
+        runtime_error=None,
+    )
+
+    assert verdict["verdict"] == "INCOMPLETE"
+
+
+def test_exact_manager_accepted_timeout_is_preserved() -> None:
+    driver = _driver()
+    event = _accepted_event()
+    runner = SimpleNamespace(
+        _event_timestamp=lambda candidate: candidate[
+            "source_monotonic_ns"
+        ]
+    )
+
+    found = driver.find_manager_accepted_timeout(
+        runner,
+        {"adaptive-manager": [event]},
+        run_id="run-1",
+        block_hash="a" * 64,
+    )
+
+    assert found == event
+    observation = found["payload"]["observation"]
+    assert (
+        observation["reporter_id"],
+        observation["observed_replica_id"],
+        observation["outcome"],
+    ) == (6, 1, "timeout")
+
+
+@pytest.mark.parametrize(
+    "event",
+    (
+        _accepted_event(reporter_id=2),
+        _accepted_event(target_id=5),
+        _accepted_event(block_hash="c" * 64),
+        _accepted_event(outcome="on_time"),
+    ),
+)
+def test_manager_accepted_timeout_requires_exact_initial_syndrome(
+    event: dict[str, object],
+) -> None:
+    driver = _driver()
+    runner = SimpleNamespace(
+        _event_timestamp=lambda candidate: candidate[
+            "source_monotonic_ns"
+        ]
+    )
+
+    assert (
+        driver.find_manager_accepted_timeout(
+            runner,
+            {"adaptive-manager": [event]},
+            run_id="run-1",
+            block_hash="a" * 64,
+        )
+        is None
+    )
+
+
+def test_malformed_manager_accepted_timeout_fails_closed() -> None:
+    driver = _driver()
+    event = _accepted_event()
+    event["payload"]["observation"]["signer_set"] = [4]
+    runner = SimpleNamespace(
+        _event_timestamp=lambda candidate: candidate[
+            "source_monotonic_ns"
+        ]
+    )
+
+    with pytest.raises(
+        driver.ComparisonRunError,
+        match="response material",
+    ):
+        driver.find_manager_accepted_timeout(
+            runner,
+            {"adaptive-manager": [event]},
+            run_id="run-1",
+            block_hash="a" * 64,
+        )
 
 
 def test_conflicting_commit_scan_reports_only_same_height_hash_split() -> None:
@@ -307,7 +536,10 @@ def test_fault_marker_cursor_excludes_pre_baseline_marker(
         + "\n"
     )
     log_path.write_text(marker, encoding="utf-8")
-    baseline_cursor = driver.fault_log_cursor(run_directory)
+    baseline_cursor = driver.fault_log_cursor(
+        run_directory,
+        "static_persistent_omission",
+    )
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(marker.replace("a" * 64, "b" * 64))
 
@@ -324,8 +556,10 @@ def test_fault_marker_cursor_excludes_pre_baseline_marker(
 
     assert before is not None
     assert "a" * 64 in before["line"]
+    assert before["block_hash"] == "a" * 64
     assert after is not None
     assert after["matching_line_count"] == 1
+    assert after["block_hash"] == "b" * 64
     assert "b" * 64 in after["line"]
 
 
@@ -413,6 +647,7 @@ def test_dry_run_persists_bundle_plan_journal_and_non_live_verdict(
     assert bundle["fault_plan_sha256"] == arm.plan.sha256
     assert verdict["verdict"] == "DRY_RUN"
     assert verdict["action_observation"] is None
+    assert verdict["manager_accepted_timeout_observation"] is None
     assert journal[0]["lifecycle"] == "terminal"
     assert journal[0]["outcome"] == {"status": "not_reached"}
 

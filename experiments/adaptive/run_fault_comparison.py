@@ -3,10 +3,11 @@
 
 This is deliberately a development evaluator, not a campaign framework.  Each
 invocation runs exactly one frozen arm, preserves canonical FI-Core evidence,
-and emits ``arm-verdict.json``.  PASS means only that the configured action was
-observed, the fixed N=7/Q=5 context remained visible, a common commit existed
-before and after the action, and no conflicting committed hashes were observed.
-It makes no diagnosis, rematching, performance, or statistical claim.
+and emits ``arm-verdict.json``.  Byzantine PASS requires the local action and
+the matching exact manager-accepted timeout observation.  Every PASS also
+requires the fixed N=7/Q=5 context, a common commit before and after the
+action, and no observed conflicting committed hashes.  It makes no diagnosis,
+rematching, performance, or statistical claim.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import sys
 import time
@@ -47,8 +49,10 @@ ARM_NAMES = (
     "static_persistent_omission",
 )
 REPLICA_IDS = tuple(range(7))
-FAULTY_REPLICA_ID = 1
-FALSE_REPORT_TARGET_ID = 4
+CRASH_REPLICA_ID = 1
+FALSE_REPORTER_ID = 6
+FALSE_REPORT_TARGET_ID = 1
+PERSISTENT_OMITTER_ID = 1
 FAULT_THRESHOLD = 2
 QUORUM = 5
 TREE_ID = 6
@@ -70,9 +74,12 @@ EXACT_CONFIGURATION = f"0:{TREE_ID}:{EPOCH0_DIGEST}"
 
 FALSE_REPORT_MARKER = "KAURI_FAULT false_timeout_emitted"
 OMISSION_MARKER = "KAURI_FAULT aggregate_omitted"
+ACCEPTED_OBSERVATION_EVENT = "evidence.observation_accepted"
+_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 LIMITATIONS = (
     "single development run; no statistical inference",
-    "no false-reporter-versus-omitter diagnosis",
+    "one accepted timeout is ambiguous between reporter and target fault",
+    "no false-reporter-versus-omitter diagnosis convergence",
     "no topology rematching or structural-exposure conclusion",
     "no throughput-improvement conclusion",
     "absence of an observed conflicting commit is not a safety proof",
@@ -113,8 +120,10 @@ def build_arm(arm_name: str, kauri_revision: str) -> FaultComparisonArm:
     comparison = build_n7_comparison(
         kauri_revision=kauri_revision,
         seed=SNAPSHOT_SEED,
-        faulty_replica_id=FAULTY_REPLICA_ID,
+        crash_replica_id=CRASH_REPLICA_ID,
+        false_reporter_id=FALSE_REPORTER_ID,
         false_report_target_id=FALSE_REPORT_TARGET_ID,
+        persistent_omitter_id=PERSISTENT_OMITTER_ID,
         diagnostic_window=DIAGNOSTIC_WINDOW,
     )
     return next(arm for arm in comparison.arms if arm.name == arm_name)
@@ -209,8 +218,15 @@ def launch_bundle(
             "fault_threshold": FAULT_THRESHOLD,
             "quorum": QUORUM,
             "seed": SNAPSHOT_SEED,
-            "faulty_replica_id": FAULTY_REPLICA_ID,
+            "crash_replica_id": CRASH_REPLICA_ID,
+            "false_reporter_id": FALSE_REPORTER_ID,
             "false_report_target_id": FALSE_REPORT_TARGET_ID,
+            "persistent_omitter_id": PERSISTENT_OMITTER_ID,
+            "initial_byzantine_syndrome": {
+                "reporter_id": FALSE_REPORTER_ID,
+                "target_id": FALSE_REPORT_TARGET_ID,
+                "outcome": "timeout",
+            },
             "tree_id": TREE_ID,
             "tree_members_breadth_first": list(
                 TREE_MEMBERS_BREADTH_FIRST
@@ -448,6 +464,16 @@ def expected_marker(arm_name: str) -> str | None:
     raise ComparisonRunError(f"unknown comparison arm: {arm_name}")
 
 
+def byzantine_faulty_replica_id(arm_name: str) -> int:
+    """Return the replica whose local log contains the Byzantine marker."""
+
+    if arm_name == "static_authenticated_false_report":
+        return FALSE_REPORTER_ID
+    if arm_name == "static_persistent_omission":
+        return PERSISTENT_OMITTER_ID
+    raise ComparisonRunError(f"arm {arm_name} is not Byzantine")
+
+
 def find_fault_marker(
     run_directory: Path,
     arm_name: str,
@@ -479,7 +505,12 @@ def find_fault_marker(
         raise ComparisonRunError(
             "fault log end offset must follow the start offset"
         )
-    path = run_directory / "logs" / f"replica-{FAULTY_REPLICA_ID}.log"
+    faulty_replica_id = byzantine_faulty_replica_id(arm_name)
+    path = (
+        run_directory
+        / "logs"
+        / f"replica-{faulty_replica_id}.log"
+    )
     try:
         with path.open("rb") as stream:
             stream.seek(start_offset)
@@ -496,7 +527,7 @@ def find_fault_marker(
         raise ComparisonRunError(f"cannot read Byzantine fault log: {exc}") from exc
 
     exact_tokens = (
-        f"reporter={FAULTY_REPLICA_ID}",
+        f"reporter={FALSE_REPORTER_ID}",
         f"target={FALSE_REPORT_TARGET_ID}",
         "epoch=0",
         f"tree={TREE_ID}",
@@ -504,38 +535,483 @@ def find_fault_marker(
     )
     if arm_name == "static_persistent_omission":
         exact_tokens = (
-            f"replica={FAULTY_REPLICA_ID}",
-            "parent=6",
+            f"replica={PERSISTENT_OMITTER_ID}",
+            f"parent={FALSE_REPORTER_ID}",
             "epoch=0",
             f"tree={TREE_ID}",
             f"window={DIAGNOSTIC_WINDOW}",
         )
-    matches = [
-        line
-        for line in lines
-        if marker in line and all(token in line for token in exact_tokens)
-    ]
+    matches = []
+    for line in lines:
+        if marker not in line or not all(
+            token in line for token in exact_tokens
+        ):
+            continue
+        block = re.search(r"(?:^| )block=([0-9a-f]{64})(?: |$)", line)
+        if block is None:
+            raise ComparisonRunError(
+                "Byzantine marker has no exact block identity"
+            )
+        matches.append((line, block.group(1)))
     if not matches:
         return None
     return {
         "kind": marker.removeprefix("KAURI_FAULT "),
-        "source_id": f"replica-{FAULTY_REPLICA_ID}",
+        "source_id": f"replica-{faulty_replica_id}",
         "log_path": str(path.relative_to(run_directory)),
         "matching_line_count": len(matches),
-        "line": matches[0][-1024:],
+        "block_hash": matches[0][1],
+        "line": matches[0][0][-1024:],
     }
 
 
-def fault_log_cursor(run_directory: Path) -> int:
+def fault_log_cursor(run_directory: Path, arm_name: str) -> int:
     """Return the current faulty-replica log size for ordered observation."""
 
-    path = run_directory / "logs" / f"replica-{FAULTY_REPLICA_ID}.log"
+    faulty_replica_id = byzantine_faulty_replica_id(arm_name)
+    path = (
+        run_directory
+        / "logs"
+        / f"replica-{faulty_replica_id}.log"
+    )
     try:
         return path.stat().st_size
     except OSError as exc:
         raise ComparisonRunError(
             f"cannot snapshot Byzantine fault log: {exc}"
         ) from exc
+
+
+def _uint(
+    value: object,
+    *,
+    field: str,
+    bits: int,
+    positive: bool = False,
+) -> int:
+    maximum = (1 << bits) - 1
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < (1 if positive else 0)
+        or value > maximum
+    ):
+        raise ComparisonRunError(
+            f"accepted observation has invalid {field}"
+        )
+    return value
+
+
+def _accepted_observation_event(
+    runner: ModuleType,
+    event: Mapping[str, Any],
+    *,
+    expected_run_id: str,
+) -> dict[str, object]:
+    """Validate and normalize one manager-accepted observation event."""
+
+    if set(event) != {
+        "event_schema_version",
+        "run_id",
+        "source_kind",
+        "source_id",
+        "source_instance",
+        "source_sequence",
+        "source_monotonic_ns",
+        "event_type",
+        "payload",
+    }:
+        raise ComparisonRunError(
+            "accepted observation has manager envelope schema drift"
+        )
+    if (
+        event.get("event_schema_version") != 1
+        or event.get("run_id") != expected_run_id
+        or event.get("source_kind") != "adaptation_manager"
+        or event.get("source_id") != MANAGER_SOURCE_ID
+        or event.get("event_type") != ACCEPTED_OBSERVATION_EVENT
+    ):
+        raise ComparisonRunError(
+            "accepted observation has invalid manager envelope"
+        )
+    source_instance = event.get("source_instance")
+    if not isinstance(source_instance, str) or not source_instance:
+        raise ComparisonRunError(
+            "accepted observation has invalid source instance"
+        )
+    source_sequence = _uint(
+        event.get("source_sequence"),
+        field="source sequence",
+        bits=64,
+        positive=True,
+    )
+    source_monotonic_ns = _event_timestamp(runner, event)
+
+    payload = event.get("payload")
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"ingestion_sequence", "observation"}
+    ):
+        raise ComparisonRunError(
+            "accepted observation has payload schema drift"
+        )
+    ingestion_sequence = _uint(
+        payload.get("ingestion_sequence"),
+        field="ingestion sequence",
+        bits=64,
+        positive=True,
+    )
+    observation = payload.get("observation")
+    if (
+        not isinstance(observation, Mapping)
+        or set(observation)
+        != {
+            "schema_version",
+            "observation_id",
+            "reporter_id",
+            "observed_replica_id",
+            "configuration",
+            "block_hash",
+            "expected_message_type",
+            "outcome",
+            "response_duration_us",
+            "deadline_duration_us",
+            "reporter_monotonic_ns",
+            "reporter_sequence",
+            "signer_set",
+        }
+    ):
+        raise ComparisonRunError(
+            "accepted observation has observation schema drift"
+        )
+    if observation.get("schema_version") != 1:
+        raise ComparisonRunError(
+            "accepted observation has unsupported schema"
+        )
+    observation_id = observation.get("observation_id")
+    if (
+        not isinstance(observation_id, str)
+        or _HEX_64.fullmatch(observation_id) is None
+    ):
+        raise ComparisonRunError(
+            "accepted observation has invalid observation id"
+        )
+    reporter_id = _uint(
+        observation.get("reporter_id"),
+        field="reporter id",
+        bits=32,
+    )
+    observed_replica_id = _uint(
+        observation.get("observed_replica_id"),
+        field="observed replica id",
+        bits=32,
+    )
+    if (
+        reporter_id not in REPLICA_IDS
+        or observed_replica_id not in REPLICA_IDS
+    ):
+        raise ComparisonRunError(
+            "accepted observation is outside N=7 membership"
+        )
+
+    configuration = observation.get("configuration")
+    if (
+        not isinstance(configuration, Mapping)
+        or set(configuration)
+        != {"epoch_number", "tree_id", "epoch_digest"}
+    ):
+        raise ComparisonRunError(
+            "accepted observation has configuration schema drift"
+        )
+    epoch_number = _uint(
+        configuration.get("epoch_number"),
+        field="epoch number",
+        bits=32,
+    )
+    tree_id = _uint(
+        configuration.get("tree_id"),
+        field="tree id",
+        bits=32,
+    )
+    epoch_digest = configuration.get("epoch_digest")
+    if (
+        not isinstance(epoch_digest, str)
+        or _HEX_64.fullmatch(epoch_digest) is None
+    ):
+        raise ComparisonRunError(
+            "accepted observation has invalid epoch digest"
+        )
+    block_hash = observation.get("block_hash")
+    if (
+        not isinstance(block_hash, str)
+        or _HEX_64.fullmatch(block_hash) is None
+    ):
+        raise ComparisonRunError(
+            "accepted observation has invalid block hash"
+        )
+    expected_message_type = observation.get("expected_message_type")
+    if expected_message_type not in (
+        "direct_vote",
+        "aggregate_relay",
+        "leader_progress",
+    ):
+        raise ComparisonRunError(
+            "accepted observation has invalid expected message type"
+        )
+    outcome = observation.get("outcome")
+    if outcome not in ("on_time", "timeout", "late"):
+        raise ComparisonRunError(
+            "accepted observation has invalid outcome"
+        )
+    response_duration_us = _uint(
+        observation.get("response_duration_us"),
+        field="response duration",
+        bits=64,
+    )
+    deadline_duration_us = _uint(
+        observation.get("deadline_duration_us"),
+        field="deadline duration",
+        bits=64,
+        positive=True,
+    )
+    reporter_monotonic_ns = _uint(
+        observation.get("reporter_monotonic_ns"),
+        field="reporter monotonic timestamp",
+        bits=64,
+        positive=True,
+    )
+    reporter_sequence = _uint(
+        observation.get("reporter_sequence"),
+        field="reporter sequence",
+        bits=64,
+        positive=True,
+    )
+    signer_set = observation.get("signer_set")
+    if not isinstance(signer_set, list):
+        raise ComparisonRunError(
+            "accepted observation has invalid signer set"
+        )
+    normalized_signers = [
+        _uint(signer, field="signer id", bits=32)
+        for signer in signer_set
+    ]
+    if (
+        normalized_signers != sorted(set(normalized_signers))
+        or any(signer not in REPLICA_IDS for signer in normalized_signers)
+    ):
+        raise ComparisonRunError(
+            "accepted observation has non-canonical signer set"
+        )
+    if outcome == "timeout" and (
+        response_duration_us != 0 or normalized_signers
+    ):
+        raise ComparisonRunError(
+            "accepted timeout observation has response material"
+        )
+    if outcome != "timeout" and not normalized_signers:
+        raise ComparisonRunError(
+            "accepted response observation has no signer"
+        )
+    if (
+        outcome == "late"
+        and response_duration_us < deadline_duration_us
+    ):
+        raise ComparisonRunError(
+            "accepted late observation precedes its deadline"
+        )
+
+    return {
+        "event_schema_version": 1,
+        "run_id": expected_run_id,
+        "source_kind": "adaptation_manager",
+        "source_id": MANAGER_SOURCE_ID,
+        "source_instance": source_instance,
+        "source_sequence": source_sequence,
+        "source_monotonic_ns": source_monotonic_ns,
+        "event_type": ACCEPTED_OBSERVATION_EVENT,
+        "payload": {
+            "ingestion_sequence": ingestion_sequence,
+            "observation": {
+                "schema_version": 1,
+                "observation_id": observation_id,
+                "reporter_id": reporter_id,
+                "observed_replica_id": observed_replica_id,
+                "configuration": {
+                    "epoch_number": epoch_number,
+                    "tree_id": tree_id,
+                    "epoch_digest": epoch_digest,
+                },
+                "block_hash": block_hash,
+                "expected_message_type": expected_message_type,
+                "outcome": outcome,
+                "response_duration_us": response_duration_us,
+                "deadline_duration_us": deadline_duration_us,
+                "reporter_monotonic_ns": reporter_monotonic_ns,
+                "reporter_sequence": reporter_sequence,
+                "signer_set": normalized_signers,
+            },
+        },
+    }
+
+
+def find_manager_accepted_timeout(
+    runner: ModuleType,
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    run_id: str,
+    block_hash: str,
+) -> dict[str, object] | None:
+    """Find the exact manager-accepted matched Byzantine timeout."""
+
+    if _HEX_64.fullmatch(block_hash) is None:
+        raise ComparisonRunError(
+            "Byzantine marker block identity is invalid"
+        )
+    matches: list[dict[str, object]] = []
+    for event in streams.get(MANAGER_SOURCE_ID, ()):
+        if event.get("event_type") != ACCEPTED_OBSERVATION_EVENT:
+            continue
+        accepted = _accepted_observation_event(
+            runner,
+            event,
+            expected_run_id=run_id,
+        )
+        observation = accepted["payload"]["observation"]
+        configuration = observation["configuration"]
+        if (
+            observation["reporter_id"] == FALSE_REPORTER_ID
+            and observation["observed_replica_id"]
+            == FALSE_REPORT_TARGET_ID
+            and configuration
+            == {
+                "epoch_number": 0,
+                "tree_id": TREE_ID,
+                "epoch_digest": EPOCH0_DIGEST,
+            }
+            and observation["block_hash"] == block_hash
+            and observation["expected_message_type"]
+            == "aggregate_relay"
+            and observation["outcome"] == "timeout"
+            and observation["response_duration_us"] == 0
+            and observation["signer_set"] == []
+        ):
+            matches.append(accepted)
+    if len(matches) > 1:
+        raise ComparisonRunError(
+            "manager emitted duplicate accepted timeout observations"
+        )
+    return matches[0] if matches else None
+
+
+def _verdict_has_exact_accepted_timeout(
+    event: Mapping[str, object] | None,
+    action_observation: Mapping[str, object] | None,
+    *,
+    arm_name: str,
+    run_id: str,
+) -> bool:
+    """Recheck the normalized manager event before granting PASS."""
+
+    if event is None or action_observation is None:
+        return False
+    if set(event) != {
+        "event_schema_version",
+        "run_id",
+        "source_kind",
+        "source_id",
+        "source_instance",
+        "source_sequence",
+        "source_monotonic_ns",
+        "event_type",
+        "payload",
+    }:
+        return False
+    payload = event.get("payload")
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"ingestion_sequence", "observation"}
+    ):
+        return False
+    observation = payload.get("observation")
+    if (
+        not isinstance(observation, Mapping)
+        or set(observation)
+        != {
+            "schema_version",
+            "observation_id",
+            "reporter_id",
+            "observed_replica_id",
+            "configuration",
+            "block_hash",
+            "expected_message_type",
+            "outcome",
+            "response_duration_us",
+            "deadline_duration_us",
+            "reporter_monotonic_ns",
+            "reporter_sequence",
+            "signer_set",
+        }
+    ):
+        return False
+    configuration = observation.get("configuration")
+    if (
+        not isinstance(configuration, Mapping)
+        or set(configuration)
+        != {"epoch_number", "tree_id", "epoch_digest"}
+    ):
+        return False
+    marker_block = action_observation.get("block_hash")
+    expected_action = {
+        "static_authenticated_false_report": (
+            "false_timeout_emitted",
+            f"replica-{FALSE_REPORTER_ID}",
+        ),
+        "static_persistent_omission": (
+            "aggregate_omitted",
+            f"replica-{PERSISTENT_OMITTER_ID}",
+        ),
+    }.get(arm_name)
+    if expected_action is None:
+        return False
+    return (
+        event.get("event_schema_version") == 1
+        and event.get("run_id") == run_id
+        and event.get("source_kind") == "adaptation_manager"
+        and event.get("source_id") == MANAGER_SOURCE_ID
+        and event.get("event_type") == ACCEPTED_OBSERVATION_EVENT
+        and isinstance(event.get("source_instance"), str)
+        and bool(event.get("source_instance"))
+        and isinstance(event.get("source_sequence"), int)
+        and not isinstance(event.get("source_sequence"), bool)
+        and event["source_sequence"] > 0
+        and isinstance(payload.get("ingestion_sequence"), int)
+        and not isinstance(payload.get("ingestion_sequence"), bool)
+        and payload["ingestion_sequence"] > 0
+        and observation.get("schema_version") == 1
+        and isinstance(observation.get("observation_id"), str)
+        and _HEX_64.fullmatch(observation["observation_id"]) is not None
+        and observation.get("reporter_id") == FALSE_REPORTER_ID
+        and observation.get("observed_replica_id")
+        == FALSE_REPORT_TARGET_ID
+        and configuration
+        == {
+            "epoch_number": 0,
+            "tree_id": TREE_ID,
+            "epoch_digest": EPOCH0_DIGEST,
+        }
+        and isinstance(marker_block, str)
+        and _HEX_64.fullmatch(marker_block) is not None
+        and observation.get("block_hash") == marker_block
+        and action_observation.get("configuration")
+        == EXACT_CONFIGURATION
+        and action_observation.get("kind") == expected_action[0]
+        and action_observation.get("source_id") == expected_action[1]
+        and observation.get("expected_message_type")
+        == "aggregate_relay"
+        and observation.get("outcome") == "timeout"
+        and observation.get("response_duration_us") == 0
+        and observation.get("signer_set") == []
+    )
 
 
 def validate_fault_evidence(
@@ -602,6 +1078,7 @@ def build_arm_verdict(
     run_id: str,
     kauri_revision: str,
     action_observation: Mapping[str, object] | None,
+    accepted_timeout_observation: Mapping[str, object] | None,
     before_commit: Mapping[str, object] | None,
     after_commit: Mapping[str, object] | None,
     fixed_quorum: Mapping[str, object] | None,
@@ -614,9 +1091,20 @@ def build_arm_verdict(
     if dry_run:
         verdict = "DRY_RUN"
     else:
+        accepted_evidence_present = (
+            accepted_timeout_observation is None
+            if arm.name == "sigkill_crash"
+            else _verdict_has_exact_accepted_timeout(
+                accepted_timeout_observation,
+                action_observation,
+                arm_name=arm.name,
+                run_id=run_id,
+            )
+        )
         passed = (
             runtime_error is None
             and action_observation is not None
+            and accepted_evidence_present
             and before_commit is not None
             and after_commit is not None
             and fixed_quorum is not None
@@ -635,6 +1123,11 @@ def build_arm_verdict(
         "action_observation": (
             dict(action_observation)
             if action_observation is not None
+            else None
+        ),
+        "manager_accepted_timeout_observation": (
+            dict(accepted_timeout_observation)
+            if accepted_timeout_observation is not None
             else None
         ),
         "common_commit_before": (
@@ -764,6 +1257,7 @@ def _dry_run(
         run_id=run_directory.name,
         kauri_revision=revision,
         action_observation=None,
+        accepted_timeout_observation=None,
         before_commit=None,
         after_commit=None,
         fixed_quorum=None,
@@ -834,6 +1328,7 @@ def _run_live(
     before_commit: dict[str, object] | None = None
     after_commit: dict[str, object] | None = None
     action_observation: dict[str, object] | None = None
+    accepted_timeout_observation: dict[str, object] | None = None
     fixed_quorum: dict[str, object] | None = None
     conflicts: list[dict[str, object]] = []
     runtime_error: str | None = None
@@ -958,7 +1453,10 @@ def _run_live(
             allow_clean_exit=allow_manager_exit,
         )
         if arm.name != "sigkill_crash":
-            fault_marker_offset = fault_log_cursor(run_directory)
+            fault_marker_offset = fault_log_cursor(
+                run_directory,
+                arm.name,
+            )
             if find_fault_marker(
                 run_directory,
                 arm.name,
@@ -1029,7 +1527,7 @@ def _run_live(
                     "signal_number": outcome.signal_number,
                 },
             )
-            expected_crashed.add(FAULTY_REPLICA_ID)
+            expected_crashed.add(CRASH_REPLICA_ID)
             fault_observed_ns = outcome.confirmed_monotonic_ns
             action_observation = {
                 "kind": "replica_group_sigkill",
@@ -1071,6 +1569,32 @@ def _run_live(
                 "succeeded",
                 action_observation,
             )
+            marker_block_hash = marker.get("block_hash")
+            if not isinstance(marker_block_hash, str):
+                raise ComparisonRunError(
+                    "Byzantine marker omitted its block identity"
+                )
+
+            def manager_accepted_timeout() -> (
+                dict[str, object] | None
+            ):
+                return find_manager_accepted_timeout(
+                    runner,
+                    runner._event_streams(run_directory),
+                    run_id=run_id,
+                    block_hash=marker_block_hash,
+                )
+
+            accepted_timeout_observation = runner._wait(
+                "matching manager-accepted Byzantine timeout",
+                args.fault_timeout,
+                records,
+                manager_accepted_timeout,
+                allow_clean_exit=allow_manager_exit,
+            )
+            action_observation[
+                "manager_acceptance_observed_monotonic_raw_ns"
+            ] = runner.monotonic_raw_ns()
 
         participants = tuple(
             replica_id
@@ -1196,6 +1720,7 @@ def _run_live(
         run_id=run_id,
         kauri_revision=revision,
         action_observation=action_observation,
+        accepted_timeout_observation=accepted_timeout_observation,
         before_commit=before_commit,
         after_commit=after_commit,
         fixed_quorum=fixed_quorum,
