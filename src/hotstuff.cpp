@@ -2910,6 +2910,24 @@ namespace hotstuff
         if (parent.is_null())
             return false;
 
+        if (experiment_byzantine_adapter != nullptr &&
+            experiment_byzantine_adapter->consume_outbound_aggregate(
+                ExperimentByzantineContext{
+                    lease.key(),
+                    experiment_diagnostic_window}))
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_FAULT aggregate_omitted replica=%u parent=%u "
+                "epoch=%u tree=%u block=%s window=%s",
+                get_id(),
+                *lease.tree().parent,
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                experiment_diagnostic_window.c_str());
+            return true;
+        }
+
         try
         {
             VoteRelay relay(
@@ -4218,7 +4236,15 @@ namespace hotstuff
                 contribution_signers.insert(
                     signers.begin(), signers.end());
             }
-            if (adaptive_v2_response_evidence != nullptr)
+            const bool suppress_positive_observation =
+                experiment_byzantine_adapter != nullptr &&
+                experiment_byzantine_adapter->on_verified_response(
+                    ExperimentByzantineContext{
+                        lease.key(),
+                        experiment_diagnostic_window},
+                    contribution.authenticated_sender);
+            if (adaptive_v2_response_evidence != nullptr &&
+                !suppress_positive_observation)
                 static_cast<void>(
                     adaptive_v2_response_evidence->record_verified_response(
                         lease.key(),
@@ -4228,6 +4254,17 @@ namespace hotstuff
                             : ExpectedMessageType::aggregate_relay,
                         contribution_signers,
                         adaptive_monotonic_now_ns()));
+            if (suppress_positive_observation)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_FAULT false_report_positive_suppressed "
+                    "reporter=%u target=%u epoch=%u tree=%u block=%s "
+                    "window=%s",
+                    get_id(),
+                    contribution.authenticated_sender,
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str(),
+                    experiment_diagnostic_window.c_str());
             if (proposal_contexts->delta_open_enabled(lease))
             {
                 std::set<ReplicaID> accepted_optional;
@@ -4503,16 +4540,85 @@ namespace hotstuff
             const auto duration = aggregation_timeout_policy.timeout_for(
                 static_cast<std::uint32_t>(tree->get_level(get_id())),
                 static_cast<std::uint32_t>(tree->get_max_level()));
-            static_cast<void>(adaptive_v2_response_evidence->arm(
+            const auto evidence_armed =
+                adaptive_v2_response_evidence->arm(
                 key,
                 lease->tree(),
                 adaptive_monotonic_now_ns(),
-                adaptive_deadline_duration_us(duration)));
+                adaptive_deadline_duration_us(duration));
+            if (!evidence_armed ||
+                experiment_byzantine_adapter == nullptr)
+                return;
+            for (const auto child : lease->tree().direct_children)
+            {
+                const ExperimentByzantineContext context{
+                    key,
+                    experiment_diagnostic_window};
+                if (!experiment_byzantine_adapter->arm_false_report(
+                        context, child))
+                    continue;
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_FAULT false_report_armed reporter=%u "
+                    "target=%u epoch=%u tree=%u block=%s window=%s",
+                    get_id(),
+                    child,
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id,
+                    key.block_hash.to_hex().c_str(),
+                    experiment_diagnostic_window.c_str());
+                schedule_experiment_false_timeout(
+                    key, child, duration);
+                break;
+            }
         }
         catch (...)
         {
             // Evidence is observational and cannot stop proposal progress.
         }
+    }
+
+    void HotStuffBase::schedule_experiment_false_timeout(
+        const ProposalKey &key,
+        ReplicaID target,
+        AggregationScheduler::Duration delay)
+    {
+        if (aggregation_scheduler == nullptr ||
+            experiment_byzantine_adapter == nullptr ||
+            adaptive_v2_response_evidence == nullptr)
+            return;
+        const auto access = exact_runtime_access;
+        const auto window = experiment_diagnostic_window;
+        static_cast<void>(aggregation_scheduler->schedule_after(
+            delay,
+            [access, key, target, window]()
+            {
+                auto runtime = access->acquire();
+                if (!runtime.has_value())
+                    return;
+                auto &owner = runtime->owner();
+                if (owner.experiment_byzantine_adapter == nullptr ||
+                    owner.adaptive_v2_response_evidence == nullptr ||
+                    !owner.experiment_byzantine_adapter
+                         ->consume_false_timeout(
+                             ExperimentByzantineContext{key, window},
+                             target))
+                    return;
+                const auto recorded =
+                    owner.adaptive_v2_response_evidence->record_timeouts(
+                        key,
+                        std::set<ReplicaID>{target},
+                        adaptive_monotonic_now_ns());
+                if (recorded == 1)
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_FAULT false_timeout_emitted reporter=%u "
+                        "target=%u epoch=%u tree=%u block=%s window=%s",
+                        owner.get_id(),
+                        target,
+                        key.configuration.epoch_number,
+                        key.configuration.tree_id,
+                        key.block_hash.to_hex().c_str(),
+                        window.c_str());
+            }));
     }
 
     void HotStuffBase::start_aggregation_timer(const ProposalKey &key)
@@ -6857,6 +6963,24 @@ namespace hotstuff
             [this](const ProposalContextLease &lease,
                    ProposalForwardingClaim claim)
             {
+                if (experiment_byzantine_adapter != nullptr &&
+                    experiment_byzantine_adapter
+                        ->consume_outbound_aggregate(
+                            ExperimentByzantineContext{
+                                lease.key(),
+                                experiment_diagnostic_window}))
+                {
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_FAULT aggregate_omitted replica=%u "
+                        "parent=%u epoch=%u tree=%u block=%s window=%s",
+                        get_id(),
+                        lease.tree().parent.value_or(get_id()),
+                        lease.key().configuration.epoch_number,
+                        lease.key().configuration.tree_id,
+                        lease.key().block_hash.to_hex().c_str(),
+                        experiment_diagnostic_window.c_str());
+                    return true;
+                }
                 auto retained = claim.certificate == nullptr
                                     ? quorum_cert_bt()
                                     : claim.certificate->clone();
@@ -6935,6 +7059,29 @@ namespace hotstuff
         aggregation_timeout_policy = AggregationTimeoutPolicy(
             adaptive_timeout_from_seconds(timeout_seconds));
         rebuild_aggregation_timeout_coordinator();
+    }
+
+    void HotStuffBase::configure_experiment_byzantine_faults(
+        ExperimentByzantineOptions options)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            throw std::logic_error(
+                "Byzantine experiment faults require adaptive-v2");
+        if (proposal_contexts->active_configuration().has_value())
+            throw std::logic_error(
+                "Byzantine experiment faults must be configured "
+                "before startup");
+        if (!options.enabled || options.configuration.epoch_digest.is_null())
+            throw std::invalid_argument(
+                "Byzantine experiment fault configuration is invalid");
+        if (options.false_report_target.has_value() &&
+            *options.false_report_target == get_id())
+            throw std::invalid_argument(
+                "false-report target must differ from local reporter");
+        experiment_diagnostic_window = options.diagnostic_window;
+        experiment_byzantine_adapter =
+            std::make_unique<ExperimentByzantineAdapter>(
+                std::move(options));
     }
 
     void HotStuffBase::set_tree_period(size_t nblocks)

@@ -38,6 +38,7 @@
 #include "hotstuff/epoch_change_inbox.h"
 #include "hotstuff/epoch_live_binding.h"
 #include "hotstuff/epoch_runtime_wiring.h"
+#include "hotstuff/experiment_byzantine_adapter.h"
 #include "hotstuff/pending_exact_contribution_buffer.h"
 #include "hotstuff/proposal_admission.h"
 #include "hotstuff/structured_event.h"
@@ -1084,6 +1085,9 @@ namespace hotstuff
             aggregation_timeout_coordinator;
         std::unique_ptr<AdaptiveV2ResponseEvidenceBridge>
             adaptive_v2_response_evidence;
+        std::unique_ptr<ExperimentByzantineAdapter>
+            experiment_byzantine_adapter;
+        std::string experiment_diagnostic_window;
         std::unique_ptr<AdaptiveV2ReportingOutbox>
             adaptive_v2_reporting_outbox;
         AggregationScheduler::Cancellation
@@ -1299,6 +1303,10 @@ namespace hotstuff
         void mark_adaptive_v2_convergence_evidence_unhealthy(
             const char *reason) noexcept;
         void rebuild_aggregation_timeout_coordinator();
+        void schedule_experiment_false_timeout(
+            const ProposalKey &key,
+            ReplicaID target,
+            AggregationScheduler::Duration delay);
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
             const std::vector<ProposalKey> &committed_keys) const;
@@ -1552,6 +1560,8 @@ namespace hotstuff
                    bool ec_loop = false);
         void set_tree_period(size_t nblocks);
         void set_aggregation_timeout(double timeout_seconds);
+        void configure_experiment_byzantine_faults(
+            ExperimentByzantineOptions options);
         /**
          * Pin adaptive-v2 authorization and resource bounds before startup.
          * Until this is configured, adaptive-v2 proposal voting fails closed.

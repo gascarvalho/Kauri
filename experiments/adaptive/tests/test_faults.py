@@ -35,6 +35,60 @@ def _scenario(faults: ModuleType, **overrides: Any) -> Any:
     return faults.ScenarioContext(**values)
 
 
+def _required_symbol(faults: ModuleType, name: str) -> Any:
+    symbol = getattr(faults, name, None)
+    assert symbol is not None, (
+        f"FI-Core RED: experiments.adaptive.kauri_experiment.faults.{name} "
+        "is required by the bounded diagnostic fault contract"
+    )
+    return symbol
+
+
+def _diagnostic_scenario(
+    faults: ModuleType,
+    *,
+    diagnostic_fault_bound: int = 2,
+) -> Any:
+    return _scenario(
+        faults,
+        diagnostic_fault_bound=diagnostic_fault_bound,
+    )
+
+
+def _false_report(
+    faults: ModuleType,
+    *,
+    fault_id: str = "false-report-1-to-4",
+    reporter_id: int = 1,
+    target_id: int = 4,
+    reported_outcome: str = "timeout",
+    diagnostic_window: str = "diagnostic-window-1",
+) -> Any:
+    action = _required_symbol(faults, "StaticAuthenticatedFalseReport")
+    return action(
+        fault_id=fault_id,
+        reporter_id=reporter_id,
+        target_id=target_id,
+        reported_outcome=reported_outcome,
+        diagnostic_window=diagnostic_window,
+    )
+
+
+def _persistent_omission(
+    faults: ModuleType,
+    *,
+    fault_id: str = "persistent-omission-2",
+    replica_id: int = 2,
+    diagnostic_window: str = "diagnostic-window-1",
+) -> Any:
+    action = _required_symbol(faults, "StaticPersistentOmission")
+    return action(
+        fault_id=fault_id,
+        replica_id=replica_id,
+        diagnostic_window=diagnostic_window,
+    )
+
+
 def _representative_plan(faults: ModuleType) -> Any:
     return faults.FaultPlan(
         context=_scenario(faults),
@@ -291,6 +345,209 @@ def test_empty_fault_plan_adds_no_manager_arguments() -> None:
     )
 
     assert plan.manager_cli_args() == ()
+
+
+def test_diagnostic_fault_modes_are_disabled_by_default() -> None:
+    faults = _faults()
+    context = _scenario(faults)
+    plan = faults.FaultPlan(
+        context=context,
+        seed=1729,
+        actions=(),
+    )
+
+    assert context.diagnostic_fault_bound == 0
+    assert json.loads(plan.canonical_json())["actions"] == []
+    assert plan.manager_cli_args() == ()
+
+
+def test_static_authenticated_false_report_action_is_public() -> None:
+    faults = _faults()
+    action = _false_report(faults)
+
+    assert action.reporter_id == 1
+    assert action.target_id == 4
+    assert action.reported_outcome == "timeout"
+    assert action.diagnostic_window == "diagnostic-window-1"
+
+
+def test_static_persistent_omission_action_is_public() -> None:
+    faults = _faults()
+    action = _persistent_omission(faults)
+
+    assert action.replica_id == 2
+    assert action.diagnostic_window == "diagnostic-window-1"
+
+
+def test_static_diagnostic_actions_are_canonical_and_manager_blind() -> None:
+    faults = _faults()
+    plan = faults.FaultPlan(
+        context=_diagnostic_scenario(faults),
+        seed=1729,
+        actions=(
+            _false_report(faults),
+            _persistent_omission(faults),
+        ),
+    )
+
+    document = json.loads(plan.canonical_json())
+    assert document["scenario"]["diagnostic_fault_bound"] == 2
+    assert document["actions"] == [
+        {
+            "diagnostic_window": "diagnostic-window-1",
+            "fault_id": "false-report-1-to-4",
+            "kind": "static_authenticated_false_report",
+            "reported_outcome": "timeout",
+            "reporter_id": 1,
+            "target_id": 4,
+        },
+        {
+            "diagnostic_window": "diagnostic-window-1",
+            "fault_id": "persistent-omission-2",
+            "kind": "static_persistent_omission",
+            "replica_id": 2,
+        },
+    ]
+    assert plan.canonical_json() == json.dumps(
+        document,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert plan.sha256 == hashlib.sha256(
+        plan.canonical_json().encode("utf-8")
+    ).hexdigest()
+
+    # Ground-truth modes and identities remain orchestrator/validator data.
+    # The manager observes the resulting authenticated evidence only.
+    assert plan.manager_cli_args() == ()
+
+
+def test_diagnostic_fault_sets_must_be_disjoint() -> None:
+    faults = _faults()
+
+    with pytest.raises(
+        ValueError,
+        match="disjoint|both.*mode|false.*omission",
+    ):
+        faults.FaultPlan(
+            context=_diagnostic_scenario(faults),
+            seed=1729,
+            actions=(
+                _false_report(
+                    faults,
+                    reporter_id=2,
+                    target_id=4,
+                ),
+                _persistent_omission(
+                    faults,
+                    replica_id=2,
+                ),
+            ),
+        )
+
+
+def test_diagnostic_fault_sets_must_respect_the_declared_bound() -> None:
+    faults = _faults()
+
+    with pytest.raises(
+        ValueError,
+        match="diagnostic.*bound|fault.*bound",
+    ):
+        faults.FaultPlan(
+            context=_diagnostic_scenario(
+                faults,
+                diagnostic_fault_bound=2,
+            ),
+            seed=1729,
+            actions=(
+                _false_report(
+                    faults,
+                    reporter_id=0,
+                    target_id=4,
+                ),
+                _persistent_omission(
+                    faults,
+                    fault_id="persistent-omission-1",
+                    replica_id=1,
+                ),
+                _persistent_omission(
+                    faults,
+                    fault_id="persistent-omission-2",
+                    replica_id=2,
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "action_factory",
+    (
+        lambda faults: _false_report(
+            faults,
+            reporter_id=7,
+        ),
+        lambda faults: _false_report(
+            faults,
+            target_id=7,
+        ),
+        lambda faults: _persistent_omission(
+            faults,
+            replica_id=7,
+        ),
+    ),
+)
+def test_diagnostic_actions_bind_only_to_scenario_members(
+    action_factory: Any,
+) -> None:
+    faults = _faults()
+
+    with pytest.raises(ValueError, match="membership|replica"):
+        faults.FaultPlan(
+            context=_diagnostic_scenario(faults),
+            seed=1729,
+            actions=(action_factory(faults),),
+        )
+
+
+def test_diagnostic_plan_and_journal_preserve_one_canonical_identity(
+    tmp_path: Path,
+) -> None:
+    faults = _faults()
+    plan = faults.FaultPlan(
+        context=_diagnostic_scenario(faults),
+        seed=1729,
+        actions=(
+            _false_report(faults),
+            _persistent_omission(faults),
+        ),
+    )
+
+    with faults.FaultEvidence(
+        run_directory=tmp_path,
+        plan=plan,
+        monotonic_ns=itertools.count(100).__next__,
+    ):
+        pass
+
+    plan_path = tmp_path / "fault-plan.json"
+    journal_path = tmp_path / "raw" / "fault-orchestrator.jsonl"
+    assert plan_path.read_bytes() == plan.canonical_json().encode("utf-8")
+    events = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["fault_id"] for event in events] == [
+        "false-report-1-to-4",
+        "persistent-omission-2",
+    ]
+    assert [event["source_sequence"] for event in events] == [0, 1]
+    assert {event["plan_sha256"] for event in events} == {plan.sha256}
+    assert all(event["lifecycle"] == "terminal" for event in events)
+    assert all(
+        event["outcome"] == {"status": "not_reached"}
+        for event in events
+    )
 
 
 def test_fault_journal_flushes_a_contiguous_readable_lifecycle(

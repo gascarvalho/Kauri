@@ -207,6 +207,7 @@ add_library(hotstuff
     src/evidence_ingress.cpp
     src/evidence_reporter.cpp
     src/evidence_reputation.cpp
+    src/experiment_byzantine_adapter.cpp
     src/exact_vote_handler.cpp
     src/future_proposal_buffer.cpp
     src/pending_exact_contribution_buffer.cpp

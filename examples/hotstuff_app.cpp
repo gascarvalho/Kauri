@@ -212,6 +212,103 @@ Value parse_adaptive_v2_unsigned(
     return value;
 }
 
+std::optional<hotstuff::ExperimentByzantineOptions>
+parse_experiment_byzantine_options(
+    const std::string &protocol_mode,
+    ReplicaID local_replica,
+    std::size_t replica_count,
+    const std::string &raw_configuration,
+    const std::string &diagnostic_window,
+    const std::string &raw_false_report_target,
+    bool omit_outbound_aggregate,
+    int context_limit)
+{
+    const bool requested =
+        !raw_configuration.empty() ||
+        !diagnostic_window.empty() ||
+        !raw_false_report_target.empty() ||
+        omit_outbound_aggregate ||
+        context_limit != 0;
+    if (!requested)
+        return std::nullopt;
+    if (protocol_mode != "adaptive_v2")
+        throw HotStuffError(
+            "experiment Byzantine faults require adaptive-v2");
+    if (raw_configuration.empty() || diagnostic_window.empty())
+        throw HotStuffError(
+            "experiment Byzantine configuration and window are required");
+    if (diagnostic_window.size() > 128 ||
+        !std::all_of(
+            diagnostic_window.begin(),
+            diagnostic_window.end(),
+            [](unsigned char character)
+            {
+                return std::isalnum(character) != 0 ||
+                       character == '-' || character == '_' ||
+                       character == '.';
+            }))
+        throw HotStuffError(
+            "experiment Byzantine window must be a safe identifier");
+    if (context_limit <= 0)
+        throw HotStuffError(
+            "experiment Byzantine context limit must be positive");
+    if (raw_false_report_target.empty() ==
+        !omit_outbound_aggregate)
+        throw HotStuffError(
+            "select exactly one experiment Byzantine fault mode");
+
+    const auto parts = trim_all(split(raw_configuration, ":"));
+    if (parts.size() != 3)
+        throw HotStuffError(
+            "experiment Byzantine configuration must use "
+            "epoch:tree:digest");
+    const auto epoch =
+        parse_adaptive_v2_unsigned<std::uint32_t>(
+            parts[0], "experiment Byzantine epoch", false);
+    const auto tree =
+        parse_adaptive_v2_unsigned<std::uint32_t>(
+            parts[1], "experiment Byzantine tree", false);
+    if (parts[2].size() != 64 ||
+        !std::all_of(
+            parts[2].begin(),
+            parts[2].end(),
+            [](unsigned char character)
+            {
+                return std::isxdigit(character) != 0;
+            }))
+        throw HotStuffError(
+            "experiment Byzantine configuration digest is invalid");
+
+    hotstuff::ExperimentByzantineOptions options;
+    options.enabled = true;
+    options.configuration = hotstuff::ConfigurationId{
+        epoch,
+        tree,
+        uint256_t(hotstuff::from_hex(parts[2]))};
+    options.diagnostic_window = diagnostic_window;
+    if (!raw_false_report_target.empty())
+    {
+        const auto target =
+            parse_adaptive_v2_unsigned<ReplicaID>(
+                raw_false_report_target,
+                "experiment false-report target",
+                false);
+        if (target >= replica_count || target == local_replica)
+            throw HotStuffError(
+                "experiment false-report target is invalid");
+        options.false_report_target = target;
+        options.maximum_false_report_contexts =
+            static_cast<std::size_t>(context_limit);
+    }
+    else
+    {
+        options.omit_outbound_aggregate = true;
+        options.maximum_omission_contexts =
+            static_cast<std::size_t>(context_limit);
+    }
+    return options;
+}
+
 hotstuff::PubKeySecp256k1 parse_adaptive_v2_issuer_public_key(
     const std::string &issuer_public_key_hex)
 {
@@ -452,6 +549,16 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_structured_event_commit_observer_instance =
         Config::OptValStr::create("");
+    auto opt_experiment_byzantine_configuration =
+        Config::OptValStr::create("");
+    auto opt_experiment_byzantine_window =
+        Config::OptValStr::create("");
+    auto opt_experiment_false_report_target =
+        Config::OptValStr::create("");
+    auto opt_experiment_omit_outbound_aggregate =
+        Config::OptValFlag::create(false);
+    auto opt_experiment_byzantine_context_limit =
+        Config::OptValInt::create(0);
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
     config.add_opt("client-ip", opt_client_ip, Config::SET_VAL);
@@ -585,6 +692,36 @@ int main(int argc, char **argv)
         Config::SET_VAL,
         -1,
         "exact instance ID of the designated commit observer");
+    config.add_opt(
+        "experiment-byzantine-configuration",
+        opt_experiment_byzantine_configuration,
+        Config::SET_VAL,
+        -1,
+        "exact epoch:tree:digest for experiment-only Byzantine faults");
+    config.add_opt(
+        "experiment-byzantine-window",
+        opt_experiment_byzantine_window,
+        Config::SET_VAL,
+        -1,
+        "frozen experiment-only diagnostic window identity");
+    config.add_opt(
+        "experiment-false-report-target",
+        opt_experiment_false_report_target,
+        Config::SET_VAL,
+        -1,
+        "target for a local authenticated false timeout report");
+    config.add_opt(
+        "experiment-omit-outbound-aggregate",
+        opt_experiment_omit_outbound_aggregate,
+        Config::SWITCH_ON,
+        -1,
+        "omit one timeout-flushed aggregate per exact proposal");
+    config.add_opt(
+        "experiment-byzantine-context-limit",
+        opt_experiment_byzantine_context_limit,
+        Config::SET_VAL,
+        -1,
+        "maximum exact proposal contexts affected by the fault");
 
     EventContext ec;
     config.parse(argc, argv);
@@ -644,6 +781,16 @@ int main(int argc, char **argv)
         epoch_protocol_mode = EpochProtocolMode::adaptive_v2;
     else
         throw HotStuffError("invalid epoch protocol mode");
+    const auto experiment_byzantine_options =
+        parse_experiment_byzantine_options(
+            opt_epoch_protocol_mode->get(),
+            static_cast<ReplicaID>(idx),
+            replicas.size(),
+            opt_experiment_byzantine_configuration->get(),
+            opt_experiment_byzantine_window->get(),
+            opt_experiment_false_report_target->get(),
+            opt_experiment_omit_outbound_aggregate->get(),
+            opt_experiment_byzantine_context_limit->get());
     const auto adaptive_v2_manager_pin = parse_adaptive_v2_manager_pin(
         opt_epoch_protocol_mode->get(),
         opt_epoch_manager_address->get(),
@@ -792,6 +939,9 @@ int main(int argc, char **argv)
         static_cast<std::uint64_t>(
             opt_adaptive_activation_height->get()));
     papp->set_aggregation_timeout(opt_aggregation_timeout->get());
+    if (experiment_byzantine_options.has_value())
+        papp->configure_experiment_byzantine_faults(
+            *experiment_byzantine_options);
     if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
     {
         if (!adaptive_v2_pre_vote_config.has_value())

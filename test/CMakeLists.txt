@@ -167,6 +167,16 @@ set_tests_properties(
     LABELS "unit;adaptive;evidence;response-attempt;adaptive-v2"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_experiment_byzantine_adapter
+    test_experiment_byzantine_adapter.cpp)
+target_compile_definitions(
+    test_experiment_byzantine_adapter PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_experiment_byzantine_adapter PROPERTIES
+    LABELS "unit;adaptive;experiment;byzantine;intentional-red"
+    TIMEOUT 5)
+add_kauri_catch_test(
     test_evidence_ingress
     test_evidence_ingress.cpp)
 target_compile_definitions(

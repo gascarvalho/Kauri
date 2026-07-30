@@ -9,6 +9,8 @@ from .faults import (
     FaultPlan,
     ReplicaGroupSigkill,
     ScenarioContext,
+    StaticAuthenticatedFalseReport,
+    StaticPersistentOmission,
     SuccessorBundleAttemptDrop,
 )
 from .processes import (
@@ -31,5 +33,7 @@ __all__ = (
     "SigkillBatchError",
     "SigkillBatchResult",
     "SigkillOutcome",
+    "StaticAuthenticatedFalseReport",
+    "StaticPersistentOmission",
     "SuccessorBundleAttemptDrop",
 )

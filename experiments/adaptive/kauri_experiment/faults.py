@@ -1,9 +1,9 @@
 """Typed fault plans and orchestrator-owned evidence for adaptive experiments.
 
-FI-Core deliberately models only effects that the current experiments already
-implement.  Scenario runners remain responsible for deciding *when* a process
-crash is safe to execute, and the adaptation manager receives only its two
-existing one-shot loss controls.
+Scenario runners remain responsible for deciding *when* a fault is safe to
+execute.  The adaptation manager receives only its two existing one-shot loss
+controls; diagnostic ground truth remains in the orchestrator-owned plan and
+journal.
 """
 
 from __future__ import annotations
@@ -33,6 +33,12 @@ def _validate_fault_id(fault_id: object) -> str:
     if not isinstance(fault_id, str) or not fault_id.strip():
         raise ValueError("fault id must be a non-empty string")
     return fault_id
+
+
+def _validate_non_empty_string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,15 +82,62 @@ class ActivationAckDrop:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class StaticAuthenticatedFalseReport:
+    """Falsify one local reporter-target observation in a frozen window."""
+
+    fault_id: str
+    reporter_id: int
+    target_id: int
+    reported_outcome: str
+    diagnostic_window: str
+
+    def __post_init__(self) -> None:
+        _validate_fault_id(self.fault_id)
+        _require_integer(self.reporter_id, "reporter id")
+        _require_integer(self.target_id, "target id")
+        if self.reporter_id == self.target_id:
+            raise ValueError("false reporter and target must be distinct")
+        if self.reported_outcome != "timeout":
+            raise ValueError(
+                "the bounded false-report mode supports only timeout"
+            )
+        _validate_non_empty_string(
+            self.diagnostic_window,
+            "diagnostic window",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StaticPersistentOmission:
+    """Omit a replica's expected contribution in a frozen window."""
+
+    fault_id: str
+    replica_id: int
+    diagnostic_window: str
+
+    def __post_init__(self) -> None:
+        _validate_fault_id(self.fault_id)
+        _require_integer(self.replica_id, "replica id")
+        _validate_non_empty_string(
+            self.diagnostic_window,
+            "diagnostic window",
+        )
+
+
 FaultAction: TypeAlias = (
     ReplicaGroupSigkill
     | SuccessorBundleAttemptDrop
     | ActivationAckDrop
+    | StaticAuthenticatedFalseReport
+    | StaticPersistentOmission
 )
 _ACTION_TYPES = (
     ReplicaGroupSigkill,
     SuccessorBundleAttemptDrop,
     ActivationAckDrop,
+    StaticAuthenticatedFalseReport,
+    StaticPersistentOmission,
 )
 _ActionT = TypeVar("_ActionT", bound=FaultAction)
 
@@ -97,6 +150,7 @@ class ScenarioContext:
     quorum: int
     crash_budget: int
     successor_bundle_retry_limit: int
+    diagnostic_fault_bound: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.replica_ids, tuple) or not self.replica_ids:
@@ -131,10 +185,23 @@ class ScenarioContext:
                 "successor bundle retry limit must be at least one"
             )
 
+        diagnostic_fault_bound = _require_integer(
+            self.diagnostic_fault_bound,
+            "diagnostic fault bound",
+        )
+        if (
+            diagnostic_fault_bound < 0
+            or diagnostic_fault_bound > crash_budget
+        ):
+            raise ValueError(
+                "diagnostic fault bound must be within the consensus "
+                "fault budget"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class FaultPlan:
-    """A canonical, preflighted v1 plan for the three approved effects."""
+    """A canonical, preflighted v1 plan for approved experiment effects."""
 
     context: ScenarioContext
     seed: int
@@ -151,6 +218,9 @@ class FaultPlan:
         crash_replicas: set[int] = set()
         bundle_controls: set[tuple[int, int]] = set()
         activation_ack_count = 0
+        false_reporters: set[int] = set()
+        persistent_omitters: set[int] = set()
+        diagnostic_windows: set[str] = set()
 
         for action in self.actions:
             if type(action) not in _ACTION_TYPES:
@@ -190,7 +260,7 @@ class FaultPlan:
                         "successor bundle attempt may be dropped at most once"
                     )
                 bundle_controls.add(control)
-            else:
+            elif type(action) is ActivationAckDrop:
                 acknowledgement = cast(ActivationAckDrop, action)
                 if (
                     acknowledgement.accepted_activation_ordinal
@@ -201,6 +271,26 @@ class FaultPlan:
                         "quorum-completing ordinal"
                     )
                 activation_ack_count += 1
+            elif type(action) is StaticAuthenticatedFalseReport:
+                false_report = cast(
+                    StaticAuthenticatedFalseReport,
+                    action,
+                )
+                self._validate_replica_membership(
+                    false_report.reporter_id
+                )
+                self._validate_replica_membership(
+                    false_report.target_id
+                )
+                false_reporters.add(false_report.reporter_id)
+                diagnostic_windows.add(
+                    false_report.diagnostic_window
+                )
+            else:
+                omission = cast(StaticPersistentOmission, action)
+                self._validate_replica_membership(omission.replica_id)
+                persistent_omitters.add(omission.replica_id)
+                diagnostic_windows.add(omission.diagnostic_window)
 
         if len(crash_replicas) > self.context.crash_budget:
             raise ValueError("fault plan exceeds the scenario crash budget")
@@ -211,6 +301,23 @@ class FaultPlan:
         if activation_ack_count > 1:
             raise ValueError(
                 "the manager supports one activation ACK drop control"
+            )
+        if false_reporters & persistent_omitters:
+            raise ValueError(
+                "false-reporter and persistent-omission sets must "
+                "be disjoint"
+            )
+        diagnostic_identities = false_reporters | persistent_omitters
+        if (
+            len(diagnostic_identities)
+            > self.context.diagnostic_fault_bound
+        ):
+            raise ValueError(
+                "fault plan exceeds the diagnostic fault bound"
+            )
+        if len(diagnostic_windows) > 1:
+            raise ValueError(
+                "diagnostic fault modes must share one frozen window"
             )
 
     def _validate_replica_membership(self, replica_id: int) -> None:
@@ -256,20 +363,74 @@ class FaultPlan:
             )
         return tuple(arguments)
 
+    def replica_cli_args(self, replica_id: int) -> tuple[str, ...]:
+        """Translate diagnostic controls only for their faulty replica.
+
+        Exact runtime configuration and application bounds belong to the
+        frozen scenario profile and are appended by its runner.  This method
+        intentionally has no manager equivalent.
+        """
+        _require_integer(replica_id, "replica id")
+        self._validate_replica_membership(replica_id)
+        arguments: list[str] = []
+        for action in self.actions:
+            if (
+                type(action) is StaticAuthenticatedFalseReport
+                and cast(
+                    StaticAuthenticatedFalseReport,
+                    action,
+                ).reporter_id
+                == replica_id
+            ):
+                false_report = cast(
+                    StaticAuthenticatedFalseReport,
+                    action,
+                )
+                arguments.extend(
+                    (
+                        "--experiment-byzantine-window",
+                        false_report.diagnostic_window,
+                        "--experiment-false-report-target",
+                        str(false_report.target_id),
+                    )
+                )
+            elif (
+                type(action) is StaticPersistentOmission
+                and cast(
+                    StaticPersistentOmission,
+                    action,
+                ).replica_id
+                == replica_id
+            ):
+                omission = cast(StaticPersistentOmission, action)
+                arguments.extend(
+                    (
+                        "--experiment-byzantine-window",
+                        omission.diagnostic_window,
+                        "--experiment-omit-outbound-aggregate",
+                    )
+                )
+        return tuple(arguments)
+
     def canonical_json(self) -> str:
         """Return the compact, key-sorted canonical schema-v1 document."""
+        scenario: dict[str, object] = {
+            "crash_budget": self.context.crash_budget,
+            "quorum": self.context.quorum,
+            "replica_ids": list(self.context.replica_ids),
+            "successor_bundle_retry_limit": (
+                self.context.successor_bundle_retry_limit
+            ),
+        }
+        if self.context.diagnostic_fault_bound:
+            scenario["diagnostic_fault_bound"] = (
+                self.context.diagnostic_fault_bound
+            )
         value = {
             "actions": [
                 self._canonical_action(action) for action in self.actions
             ],
-            "scenario": {
-                "crash_budget": self.context.crash_budget,
-                "quorum": self.context.quorum,
-                "replica_ids": list(self.context.replica_ids),
-                "successor_bundle_retry_limit": (
-                    self.context.successor_bundle_retry_limit
-                ),
-            },
+            "scenario": scenario,
             "schema_version": SCHEMA_VERSION,
             "seed": self.seed,
         }
@@ -310,6 +471,27 @@ class FaultPlan:
                 ),
                 "fault_id": acknowledgement.fault_id,
                 "kind": "activation_ack_drop",
+            }
+        if type(action) is StaticAuthenticatedFalseReport:
+            false_report = cast(
+                StaticAuthenticatedFalseReport,
+                action,
+            )
+            return {
+                "diagnostic_window": false_report.diagnostic_window,
+                "fault_id": false_report.fault_id,
+                "kind": "static_authenticated_false_report",
+                "reported_outcome": false_report.reported_outcome,
+                "reporter_id": false_report.reporter_id,
+                "target_id": false_report.target_id,
+            }
+        if type(action) is StaticPersistentOmission:
+            omission = cast(StaticPersistentOmission, action)
+            return {
+                "diagnostic_window": omission.diagnostic_window,
+                "fault_id": omission.fault_id,
+                "kind": "static_persistent_omission",
+                "replica_id": omission.replica_id,
             }
         raise TypeError("unsupported fault action type")
 
