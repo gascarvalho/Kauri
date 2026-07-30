@@ -25,7 +25,7 @@ import validator
 
 
 PAIR_SCENARIO = "n7-matched-containment-adaptive-pair"
-PAIR_VERDICT_SCHEMA_VERSION = 1
+PAIR_VERDICT_SCHEMA_VERSION = 2
 CONTROL_PROFILE = Path(__file__).resolve().with_name(
     "profile-paired-control.json"
 )
@@ -130,6 +130,41 @@ def _evaluation_phase_medians(
             f"{arm} canonical {phase} median TPS",
         )
         for phase, _ in EXPECTED_PHASES[arm]
+    }
+
+
+def _containment_successor(
+    epochs: validator.EpochDocument,
+    arm: str,
+) -> dict[str, Any]:
+    matches = [
+        epoch
+        for epoch in epochs.epochs
+        if epoch.epoch_number == 1
+    ]
+    if len(matches) != 1:
+        raise PairError(
+            f"{arm} epochs require exactly one containment epoch 1"
+        )
+    epoch = matches[0]
+    digest = _hash(
+        epoch.epoch_digest,
+        f"{arm} containment epoch digest",
+    )
+    if not epoch.trees:
+        raise PairError(f"{arm} containment epoch trees are invalid")
+    return {
+        "epoch_number": 1,
+        "epoch_digest": digest,
+        "trees": [
+            {
+                "tree_id": tree.tree_id,
+                "fanout": tree.fanout,
+                "members_breadth_first": list(tree.members),
+                "wait_exempt": list(tree.wait_exempt),
+            }
+            for tree in epoch.trees
+        ],
     }
 
 
@@ -289,6 +324,10 @@ def _validated_arm(
         raise PairError(
             f"{arm} validation metrics differ from canonical raw-evidence replay"
         )
+    containment_successor = _containment_successor(
+        evaluation.epochs,
+        arm,
+    )
     return {
         "run_id": run_id,
         "revision": revision,
@@ -296,6 +335,7 @@ def _validated_arm(
         "runtime": frozen_runtime,
         "executables": executable_hashes,
         "phase_medians": phase_medians,
+        "containment_successor": containment_successor,
         "validation_sha256": _sha256(validation_bytes),
         "manifest_artifact_sha256": expected_digest,
     }
@@ -320,6 +360,13 @@ def build_pair_verdict(
         if control["runtime"][field] != adaptive["runtime"][field]:
             label = "seed" if field == "snapshot_seed" else field
             raise PairError(f"pair arms use different matched {label}")
+    if (
+        control["containment_successor"]
+        != adaptive["containment_successor"]
+    ):
+        raise PairError(
+            "pair arms use different containment epoch 1 successors"
+        )
 
     control_medians = control["phase_medians"]
     adaptive_medians = adaptive["phase_medians"]
@@ -348,6 +395,20 @@ def build_pair_verdict(
         "control_run_id": control["run_id"],
         "adaptive_run_id": adaptive["run_id"],
         "kauri_revision": control["revision"],
+        "shared_containment_successor": {
+            "epoch_number": 1,
+            "epoch_digest": control["containment_successor"][
+                "epoch_digest"
+            ],
+            "trees_sha256": _sha256(
+                json.dumps(
+                    control["containment_successor"]["trees"],
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ),
+        },
         "profiles": {
             "control": {
                 "identity": EXPECTED_PROFILES["control"],

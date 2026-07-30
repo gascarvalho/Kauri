@@ -260,6 +260,15 @@ def test_pair_verdict_reports_primary_and_secondary_normalized_effects(
     assert verdict["adaptive_run_id"] == _load_json(
         adaptive / "manifest.json"
     )["run_id"]
+    assert verdict["schema_version"] == 2
+    assert verdict["shared_containment_successor"]["epoch_number"] == 1
+    assert (
+        verdict["shared_containment_successor"]["epoch_digest"]
+        == synthetic_run.EPOCH_1_DIGEST
+    )
+    assert len(
+        verdict["shared_containment_successor"]["trees_sha256"]
+    ) == 64
     control_medians = _phase_medians(control)
     adaptive_medians = _phase_medians(adaptive)
     adaptive_ratio = (
@@ -375,6 +384,83 @@ def test_pair_verdict_rejects_mismatched_frozen_inputs(
 
     with pytest.raises((ValueError, RuntimeError), match=message):
         run_pair().build_pair_verdict(PAIR_ID, control, adaptive)
+
+
+def test_pair_verdict_binds_the_replayed_containment_snapshot(
+    matched_arms: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = run_pair()
+    control_path, adaptive_path = matched_arms
+    original_evaluate = module.validator.evaluate
+
+    def evaluate_then_mutate(
+        manifest_path: Path,
+        epochs_path: Path,
+    ) -> Any:
+        evaluation = original_evaluate(manifest_path, epochs_path)
+        document = _load_json(epochs_path)
+        containment = next(
+            epoch
+            for epoch in document["epochs"]
+            if epoch["epoch_number"] == 1
+        )
+        containment["epoch_digest"] = "a" * 64
+        containment["trees"][0]["members_breadth_first"].reverse()
+        _save_json(epochs_path, document)
+        return evaluation
+
+    monkeypatch.setattr(
+        module.validator,
+        "evaluate",
+        evaluate_then_mutate,
+    )
+
+    verdict = module.build_pair_verdict(
+        PAIR_ID, control_path, adaptive_path
+    )
+
+    assert (
+        verdict["shared_containment_successor"]["epoch_digest"]
+        == synthetic_run.EPOCH_1_DIGEST
+    )
+
+
+@pytest.mark.parametrize(
+    "difference",
+    ("digest_only", "topology_only"),
+)
+def test_pair_verdict_rejects_different_containment_successors(
+    matched_arms: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    difference: str,
+) -> None:
+    module = run_pair()
+    control_path, adaptive_path = matched_arms
+    original_successor = module._containment_successor
+
+    def mismatched_successor(source: Any, arm: str) -> dict[str, Any]:
+        successor = original_successor(source, arm)
+        if arm != "adaptive":
+            return successor
+        mutated = json.loads(json.dumps(successor))
+        if difference == "digest_only":
+            mutated["epoch_digest"] = "b" * 64
+        else:
+            mutated["trees"][0]["members_breadth_first"].reverse()
+        return mutated
+
+    monkeypatch.setattr(
+        module,
+        "_containment_successor",
+        mismatched_successor,
+    )
+
+    with pytest.raises(
+        (ValueError, RuntimeError),
+        match="containment|epoch 1|E1",
+    ):
+        module.build_pair_verdict(PAIR_ID, control_path, adaptive_path)
 
 
 @pytest.mark.parametrize(
