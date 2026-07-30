@@ -2854,8 +2854,18 @@ namespace hotstuff
             key, preserve_scheduled_vote_fallback);
         static_cast<void>(pending_exact_contributions.purge(key));
         if (adaptive_v2_response_evidence != nullptr)
-            static_cast<void>(
-                adaptive_v2_response_evidence->retire(key));
+        {
+            const bool retain_experiment_evidence =
+                experiment_byzantine_adapter != nullptr &&
+                experiment_byzantine_adapter
+                    ->should_retain_response_evidence(
+                        ExperimentByzantineContext{
+                            key,
+                            experiment_diagnostic_window});
+            if (!retain_experiment_evidence)
+                static_cast<void>(
+                    adaptive_v2_response_evidence->retire(key));
+        }
     }
 
     promise_t HotStuffBase::deliver_exact_contribution(
@@ -4608,6 +4618,8 @@ namespace hotstuff
                         key,
                         std::set<ReplicaID>{target},
                         adaptive_monotonic_now_ns());
+                static_cast<void>(
+                    owner.adaptive_v2_response_evidence->retire(key));
                 if (recorded == 1)
                     HOTSTUFF_LOG_INFO(
                         "KAURI_FAULT false_timeout_emitted reporter=%u "

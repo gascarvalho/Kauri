@@ -61,6 +61,8 @@ public:
     bool on_verified_response(
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;
+    bool should_retain_response_evidence(
+        const ExperimentByzantineContext &context) const noexcept;
     bool consume_false_timeout(
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;

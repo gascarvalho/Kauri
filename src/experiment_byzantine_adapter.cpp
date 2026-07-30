@@ -115,6 +115,15 @@ bool ExperimentByzantineAdapter::on_verified_response(
     return true;
 }
 
+bool ExperimentByzantineAdapter::should_retain_response_evidence(
+    const ExperimentByzantineContext &context) const noexcept
+{
+    const auto found = state_->false_reports.find(context);
+    return found != state_->false_reports.end() &&
+           found->second.verified_response_observed &&
+           !found->second.timeout_consumed;
+}
+
 bool ExperimentByzantineAdapter::consume_false_timeout(
     const ExperimentByzantineContext &context,
     ReplicaID target) noexcept

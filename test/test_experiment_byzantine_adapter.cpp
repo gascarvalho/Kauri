@@ -75,6 +75,8 @@ public:
     bool on_verified_response(
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;
+    bool should_retain_response_evidence(
+        const ExperimentByzantineContext &context) const noexcept;
     bool consume_false_timeout(
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;
@@ -197,15 +199,18 @@ TEST_CASE(
     const auto exact = context("false-report");
 
     REQUIRE(adapter.arm_false_report(exact, 4));
+    CHECK_FALSE(adapter.should_retain_response_evidence(exact));
     CHECK_FALSE(adapter.consume_false_timeout(exact, 4));
 
     // The verified contribution continues through consensus. This return
     // value controls only the separate positive evidence observation.
     CHECK(adapter.on_verified_response(exact, 4));
+    CHECK(adapter.should_retain_response_evidence(exact));
 
     // The runtime invokes this method from its real deadline callback. Exactly
     // one evidence-only false timeout is consumed for the exact context.
     CHECK(adapter.consume_false_timeout(exact, 4));
+    CHECK_FALSE(adapter.should_retain_response_evidence(exact));
     CHECK_FALSE(adapter.consume_false_timeout(exact, 4));
     CHECK(adapter.on_verified_response(exact, 4));
 }
@@ -432,6 +437,18 @@ TEST_CASE(
         contribution.find("consume_false_timeout") ==
         std::string::npos);
 
+    const auto cleanup = source_slice(
+        implementation,
+        "void HotStuffBase::purge_pending_exact_contributions",
+        "promise_t HotStuffBase::deliver_exact_contribution");
+    const auto retain =
+        cleanup.find("should_retain_response_evidence");
+    const auto retire = cleanup.find(
+        "adaptive_v2_response_evidence->retire");
+    REQUIRE(retain != std::string::npos);
+    REQUIRE(retire != std::string::npos);
+    CHECK(retain < retire);
+
     const auto false_timeout = source_slice(
         implementation,
         "void HotStuffBase::schedule_experiment_false_timeout",
@@ -441,11 +458,14 @@ TEST_CASE(
     const auto consume =
         false_timeout.find("consume_false_timeout");
     const auto record = false_timeout.find("record_timeouts");
+    const auto deadline_retire = false_timeout.find("->retire(key)");
     REQUIRE(real_deadline != std::string::npos);
     REQUIRE(consume != std::string::npos);
     REQUIRE(record != std::string::npos);
+    REQUIRE(deadline_retire != std::string::npos);
     CHECK(real_deadline < consume);
     CHECK(consume < record);
+    CHECK(record < deadline_retire);
     CHECK(
         false_timeout.find("KAURI_FAULT false_timeout_emitted") !=
         std::string::npos);
