@@ -359,6 +359,25 @@ def test_complete_paired_control_run_has_no_epoch_two(
     assert "optimized_to_containment_ratio" not in verdict["metrics"]
 
 
+def test_paired_exact_bucket_gate_excludes_causal_windows() -> None:
+    for profile_identity in validator.PAIRED_PROFILE_IDS:
+        assert not validator._requires_exact_bucket_count(
+            profile_identity, "baseline"
+        )
+        assert not validator._requires_exact_bucket_count(
+            profile_identity, "degraded"
+        )
+        assert validator._requires_exact_bucket_count(
+            profile_identity, "containment"
+        )
+    assert validator._requires_exact_bucket_count(
+        validator.PAIRED_CONTROL_PROFILE_ID, "control_late"
+    )
+    assert validator._requires_exact_bucket_count(
+        validator.PAIRED_ADAPTIVE_PROFILE_ID, "optimized"
+    )
+
+
 def test_paired_control_run_accepts_unfavorable_performance(
     tmp_path: Path,
 ) -> None:

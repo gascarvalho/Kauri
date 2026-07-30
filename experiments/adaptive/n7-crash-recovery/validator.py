@@ -1148,6 +1148,15 @@ def _throughput_window_specs(
     return tuple(result)
 
 
+def _requires_exact_bucket_count(
+    profile_identity: str, phase: str
+) -> bool:
+    return (
+        profile_identity in PAIRED_PROFILE_IDS
+        and phase in {"containment", "control_late", "optimized"}
+    )
+
+
 def _validate_transition_residencies(
     requests: Sequence[Mapping[str, Any]],
     windows: Sequence[Mapping[str, Any]],
@@ -5108,12 +5117,16 @@ def _validate_recurring_commits(
     for phase, required in manifest.required_bucket_counts.items():
         if (
             counts[phase] != required
-            if manifest.profile_identity in PAIRED_PROFILE_IDS
+            if _requires_exact_bucket_count(
+                manifest.profile_identity, phase
+            )
             else counts[phase] < required
         ):
             requirement = (
                 f"requires exactly {required}"
-                if manifest.profile_identity in PAIRED_PROFILE_IDS
+                if _requires_exact_bucket_count(
+                    manifest.profile_identity, phase
+                )
                 else f"requires {required}"
             )
             raise IncompleteRun(
