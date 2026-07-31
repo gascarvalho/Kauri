@@ -7,8 +7,9 @@ model evidence, not a live protocol run or a consensus-safety proof.
 
 from __future__ import annotations
 
-from itertools import product
+from itertools import permutations, product
 import json
+from math import ceil
 import re
 from typing import Any
 
@@ -27,7 +28,7 @@ from .diagnostic_game import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 REPLICA_IDS = tuple(range(7))
 DIAGNOSTIC_FAULT_BOUND = 1
 INITIAL_REPORTER_ID = 6
@@ -44,6 +45,80 @@ CLAIMS_NOT_MADE = (
     "no throughput improvement or arbitrary-Byzantine diagnosis is claimed",
     "probe scores cannot change consensus membership or safety rules",
 )
+
+
+def _aggregate_only_worst_gap(schedule: tuple[int, ...]) -> int:
+    """Return the worst cyclic gap between a target's two exposures."""
+
+    replica_count = len(schedule)
+    positions = {
+        root_id: position
+        for position, root_id in enumerate(schedule)
+    }
+    worst_gap = 0
+    for target_id in range(replica_count):
+        exposure_positions = sorted(
+            (
+                positions[(target_id - 2) % replica_count],
+                positions[(target_id - 1) % replica_count],
+            )
+        )
+        first_gap = exposure_positions[1] - exposure_positions[0]
+        second_gap = replica_count - first_gap
+        worst_gap = max(worst_gap, first_gap, second_gap)
+    return worst_gap
+
+
+def aggregate_only_schedule_audit() -> dict[str, Any]:
+    """Exhaust the normalized N=7 aggregate-only root schedules.
+
+    Fixing root zero in the first position removes rotational duplicates, so
+    all remaining ``6!`` schedules are scored.  Each target is exposed under
+    the two roots immediately preceding it in the frozen cyclic tree family.
+    """
+
+    replica_count = len(REPLICA_IDS)
+    sequential = REPLICA_IDS
+    stride2 = (0, 2, 4, 6, 1, 3, 5)
+    exposures_per_target = [
+        len(
+            {
+                (target_id - 2) % replica_count,
+                (target_id - 1) % replica_count,
+            }
+        )
+        for target_id in REPLICA_IDS
+    ]
+    lower_bound = ceil(
+        replica_count / min(exposures_per_target)
+    )
+
+    exhaustive_minimum = replica_count
+    optimal_schedules: list[tuple[int, ...]] = []
+    for suffix in permutations(REPLICA_IDS[1:]):
+        schedule = (REPLICA_IDS[0], *suffix)
+        worst_gap = _aggregate_only_worst_gap(schedule)
+        if worst_gap < exhaustive_minimum:
+            exhaustive_minimum = worst_gap
+            optimal_schedules = [schedule]
+        elif worst_gap == exhaustive_minimum:
+            optimal_schedules.append(schedule)
+
+    return {
+        "replica_count": replica_count,
+        "exposures_per_target": exposures_per_target,
+        "sequential_schedule": list(sequential),
+        "sequential_worst_gap": _aggregate_only_worst_gap(
+            sequential
+        ),
+        "stride2_schedule": list(stride2),
+        "stride2_worst_gap": _aggregate_only_worst_gap(stride2),
+        "lower_bound": lower_bound,
+        "exhaustive_minimum": exhaustive_minimum,
+        "normalized_optimal_schedules": [
+            list(schedule) for schedule in optimal_schedules
+        ],
+    }
 
 
 def _observation(
@@ -591,6 +666,9 @@ def evaluate_minimax_rematching(
             _tight_bound_audit(diagnostic_fault_bound)
             for diagnostic_fault_bound in (1, 2, 3)
         ],
+        "aggregate_only_schedule_audit": (
+            aggregate_only_schedule_audit()
+        ),
         "canonical_minimax_game": _canonical_game(),
         "multi_conflict_probe_audit": _multi_conflict_probe_audit(),
         "value_aware_target_audit": _value_aware_target_audit(),
@@ -621,6 +699,7 @@ def canonical_evaluation_json(evaluation: dict[str, Any]) -> str:
 
 
 __all__ = (
+    "aggregate_only_schedule_audit",
     "canonical_evaluation_json",
     "evaluate_minimax_rematching",
 )

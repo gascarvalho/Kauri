@@ -3,11 +3,12 @@
 
 This is deliberately a development evaluator, not a campaign framework.  Each
 invocation runs exactly one frozen arm, preserves canonical FI-Core evidence,
-and emits ``arm-verdict.json``.  Byzantine PASS requires the local action and
-the matching exact manager-accepted timeout observation.  Every PASS also
-requires the fixed N=7/Q=5 context, a common commit before and after the
-action, and no observed conflicting committed hashes.  It makes no diagnosis,
-rematching, performance, or statistical claim.
+and emits ``arm-verdict.json``.  Byzantine PASS requires a T6 timeout followed
+by an exact T0 aggregate-relay cross-check from a distinct reporter.  The
+result is a proof-gated bounded diagnostic certificate, not a consensus input.
+Every PASS also requires the fixed N=7/Q=5 context, a common commit before and
+after the cross-check, and no observed conflicting committed hashes.  It makes
+no rematching, performance, statistical, or universal Byzantine claim.
 """
 
 from __future__ import annotations
@@ -41,6 +42,12 @@ from experiments.adaptive.kauri_experiment.comparison import (  # noqa: E402
     FaultComparisonArm,
     build_n7_comparison,
 )
+from experiments.adaptive.kauri_experiment.passive_crosscheck import (  # noqa: E402
+    PassiveCrosscheckObservation,
+    PassiveCrosscheckPhase,
+    PassiveCrosscheckScope,
+    build_passive_crosscheck_certificate,
+)
 
 
 ARM_NAMES = (
@@ -57,8 +64,11 @@ FAULT_THRESHOLD = 2
 QUORUM = 5
 TREE_ID = 6
 TREE_MEMBERS_BREADTH_FIRST = (6, 0, 1, 2, 3, 4, 5)
+FOLLOWUP_TREE_ID = 0
+FOLLOWUP_REPORTER_ID = 0
+FOLLOWUP_TREE_MEMBERS_BREADTH_FIRST = (0, 1, 2, 3, 4, 5, 6)
 SNAPSHOT_SEED = 0xA2F7
-DIAGNOSTIC_WINDOW = "n7-epoch0-tree6-static-v1"
+DIAGNOSTIC_WINDOW = "n7-epoch0-tree6-tree0-static-v1"
 DEFAULT_CONTEXT_LIMIT = 8
 AUTHORITATIVE_SOURCE_ID = "replica-2"
 MANAGER_SOURCE_ID = "adaptive-manager"
@@ -71,6 +81,9 @@ EPOCH0_DIGEST = (
     "b75699f4f2a9e955f4cc829b52bec81"
 )
 EXACT_CONFIGURATION = f"0:{TREE_ID}:{EPOCH0_DIGEST}"
+FOLLOWUP_OMISSION_CONFIGURATION = (
+    f"0:{FOLLOWUP_TREE_ID}:{EPOCH0_DIGEST}"
+)
 
 FALSE_REPORT_MARKER = "KAURI_FAULT false_timeout_emitted"
 OMISSION_MARKER = "KAURI_FAULT aggregate_omitted"
@@ -78,10 +91,11 @@ ACCEPTED_OBSERVATION_EVENT = "evidence.observation_accepted"
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 LIMITATIONS = (
     "single development run; no statistical inference",
-    "one accepted timeout is ambiguous between reporter and target fault",
-    "no false-reporter-versus-omitter diagnosis convergence",
+    "diagnosis ordering uses manager receipt order, not a protocol phase fence",
+    "diagnostic exclusions are not applied to the live topology",
     "no topology rematching or structural-exposure conclusion",
     "no throughput-improvement conclusion",
+    "only static aggregate-relay false-report and omission modes are covered",
     "absence of an observed conflicting commit is not a safety proof",
 )
 
@@ -155,11 +169,20 @@ def replica_launch_overlays(
     for replica_id in REPLICA_IDS:
         plan_arguments = arm.plan.replica_cli_args(replica_id)
         if plan_arguments:
+            omission_followup = (
+                (
+                    "--experiment-omission-additional-configuration",
+                    FOLLOWUP_OMISSION_CONFIGURATION,
+                )
+                if arm.name == "static_persistent_omission"
+                else ()
+            )
             result.append(
                 (
                     *plan_arguments,
                     "--experiment-byzantine-configuration",
                     EXACT_CONFIGURATION,
+                    *omission_followup,
                     "--experiment-byzantine-context-limit",
                     str(context_limit),
                 )
@@ -204,7 +227,7 @@ def launch_bundle(
         context_limit=context_limit,
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario": "n7-static-fault-comparison",
         "arm": arm.name,
         "kauri_revision": kauri_revision,
@@ -231,9 +254,20 @@ def launch_bundle(
             "tree_members_breadth_first": list(
                 TREE_MEMBERS_BREADTH_FIRST
             ),
+            "followup_tree_id": FOLLOWUP_TREE_ID,
+            "followup_reporter_id": FOLLOWUP_REPORTER_ID,
+            "followup_tree_members_breadth_first": list(
+                FOLLOWUP_TREE_MEMBERS_BREADTH_FIRST
+            ),
             "epoch0_digest": EPOCH0_DIGEST,
             "diagnostic_window": DIAGNOSTIC_WINDOW,
             "byzantine_context_limit": context_limit,
+            "passive_crosscheck": {
+                "ordering_basis": "manager_receipt_order",
+                "added_protocol_messages": 0,
+                "added_protocol_trees": 0,
+                "forced_tree_rotations": 0,
+            },
         },
         "replica_overlays": [
             {
@@ -294,6 +328,10 @@ def persist_augmented_launch_arguments(
             effective["experiment_byzantine_configuration"] = (
                 EXACT_CONFIGURATION
             )
+            if arm.name == "static_persistent_omission":
+                effective[
+                    "experiment_omission_additional_configuration"
+                ] = FOLLOWUP_OMISSION_CONFIGURATION
             effective["experiment_byzantine_window"] = DIAGNOSTIC_WINDOW
             effective["experiment_byzantine_context_limit"] = context_limit
             effective["experiment_fault_arm"] = arm.name
@@ -310,6 +348,7 @@ def persist_augmented_launch_arguments(
         str(argument).startswith("--experiment-byzantine")
         or str(argument).startswith("--experiment-false-report")
         or str(argument).startswith("--experiment-omit-outbound")
+        or str(argument).startswith("--experiment-omission-additional")
         for argument in manager_argv
     ):
         raise ComparisonRunError(
@@ -370,6 +409,91 @@ def common_commit_after(
         "block_hash": key[1],
         "common_monotonic_raw_ns": int(found.common_ns),
         "participants": list(participant_tuple),
+    }
+
+
+def _configuration_boundary_references(
+    boundary: Mapping[str, Any],
+    *,
+    tree_id: int,
+    root_replica: int,
+) -> dict[str, tuple[int, int]]:
+    if (
+        boundary.get("epoch_number") != 0
+        or boundary.get("tree_id") != tree_id
+        or boundary.get("root_replica") != root_replica
+        or boundary.get("epoch_digest") != EPOCH0_DIGEST
+    ):
+        raise ComparisonRunError(
+            "configuration boundary is outside the frozen phase"
+        )
+    evidence = boundary.get("replica_evidence")
+    if not isinstance(evidence, list) or len(evidence) != len(
+        REPLICA_IDS
+    ):
+        raise ComparisonRunError(
+            "configuration boundary lacks seven replica references"
+        )
+    references: dict[str, tuple[int, int]] = {}
+    for replica_id, reference in zip(REPLICA_IDS, evidence, strict=True):
+        source_id = f"replica-{replica_id}"
+        if (
+            not isinstance(reference, Mapping)
+            or set(reference)
+            != {
+                "source_id",
+                "source_sequence",
+                "source_monotonic_ns",
+            }
+            or reference.get("source_id") != source_id
+        ):
+            raise ComparisonRunError(
+                "configuration boundary reference is not canonical"
+            )
+        source_sequence = reference.get("source_sequence")
+        timestamp = reference.get("source_monotonic_ns")
+        if (
+            isinstance(source_sequence, bool)
+            or not isinstance(source_sequence, int)
+            or source_sequence <= 0
+            or isinstance(timestamp, bool)
+            or not isinstance(timestamp, int)
+            or timestamp <= 0
+        ):
+            raise ComparisonRunError(
+                "configuration boundary reference is not positive"
+            )
+        references[source_id] = (source_sequence, timestamp)
+    return references
+
+
+def require_followup_configuration_boundary(
+    tree6_boundary: Mapping[str, Any],
+    tree0_boundary: Mapping[str, Any],
+) -> dict[str, int]:
+    """Require every exact T0 activation to follow selected T6 evidence."""
+
+    predecessor = _configuration_boundary_references(
+        tree6_boundary,
+        tree_id=TREE_ID,
+        root_replica=FALSE_REPORTER_ID,
+    )
+    followup = _configuration_boundary_references(
+        tree0_boundary,
+        tree_id=FOLLOWUP_TREE_ID,
+        root_replica=FOLLOWUP_REPORTER_ID,
+    )
+    if any(
+        followup[source_id][0] <= predecessor[source_id][0]
+        or followup[source_id][1] <= predecessor[source_id][1]
+        for source_id in predecessor
+    ):
+        raise ComparisonRunError(
+            "T0 configuration does not follow T6 for every replica"
+        )
+    return {
+        source_id: sequence
+        for source_id, (sequence, _timestamp) in predecessor.items()
     }
 
 
@@ -480,12 +604,29 @@ def find_fault_marker(
     *,
     start_offset: int = 0,
     end_offset: int | None = None,
+    tree_id: int = TREE_ID,
+    reporter_id: int = FALSE_REPORTER_ID,
 ) -> dict[str, object] | None:
     """Find the exact log marker proving one Byzantine action occurred."""
 
     marker = expected_marker(arm_name)
     if marker is None:
         return None
+    if (
+        tree_id,
+        reporter_id,
+    ) not in (
+        (TREE_ID, FALSE_REPORTER_ID),
+        (FOLLOWUP_TREE_ID, FOLLOWUP_REPORTER_ID),
+    ):
+        raise ComparisonRunError("fault marker phase is outside T6/T0 scope")
+    if (
+        arm_name == "static_authenticated_false_report"
+        and (tree_id, reporter_id) != (TREE_ID, FALSE_REPORTER_ID)
+    ):
+        raise ComparisonRunError(
+            "false reporting is scoped only to the initial T6 phase"
+        )
     if (
         isinstance(start_offset, bool)
         or not isinstance(start_offset, int)
@@ -530,15 +671,15 @@ def find_fault_marker(
         f"reporter={FALSE_REPORTER_ID}",
         f"target={FALSE_REPORT_TARGET_ID}",
         "epoch=0",
-        f"tree={TREE_ID}",
+        f"tree={tree_id}",
         f"window={DIAGNOSTIC_WINDOW}",
     )
     if arm_name == "static_persistent_omission":
         exact_tokens = (
             f"replica={PERSISTENT_OMITTER_ID}",
-            f"parent={FALSE_REPORTER_ID}",
+            f"parent={reporter_id}",
             "epoch=0",
-            f"tree={TREE_ID}",
+            f"tree={tree_id}",
             f"window={DIAGNOSTIC_WINDOW}",
         )
     matches = []
@@ -561,6 +702,8 @@ def find_fault_marker(
         "log_path": str(path.relative_to(run_directory)),
         "matching_line_count": len(matches),
         "block_hash": matches[0][1],
+        "tree_id": tree_id,
+        "reporter_id": reporter_id,
         "line": matches[0][0][-1024:],
     }
 
@@ -580,6 +723,43 @@ def fault_log_cursor(run_directory: Path, arm_name: str) -> int:
         raise ComparisonRunError(
             f"cannot snapshot Byzantine fault log: {exc}"
         ) from exc
+
+
+def require_shared_omission_context_bound(
+    tree6_marker: Mapping[str, object],
+    tree0_marker: Mapping[str, object],
+    *,
+    context_limit: int,
+) -> int:
+    """Bind both omission phases to the adapter's one shared bound."""
+
+    if (
+        isinstance(context_limit, bool)
+        or not isinstance(context_limit, int)
+        or context_limit <= 0
+    ):
+        raise ComparisonRunError(
+            "shared omission context bound must be positive"
+        )
+    counts = (
+        tree6_marker.get("matching_line_count"),
+        tree0_marker.get("matching_line_count"),
+    )
+    if any(
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count <= 0
+        for count in counts
+    ):
+        raise ComparisonRunError(
+            "shared omission marker counts must be positive"
+        )
+    total = sum(counts)
+    if total > context_limit:
+        raise ComparisonRunError(
+            "T6 and T0 omissions exceed the shared context bound"
+        )
+    return total
 
 
 def _uint(
@@ -813,6 +993,13 @@ def _accepted_observation_event(
             "accepted response observation has no signer"
         )
     if (
+        outcome == "on_time"
+        and response_duration_us > deadline_duration_us
+    ):
+        raise ComparisonRunError(
+            "accepted on-time observation exceeds its deadline"
+        )
+    if (
         outcome == "late"
         and response_duration_us < deadline_duration_us
     ):
@@ -868,6 +1055,7 @@ def find_manager_accepted_timeout(
             "Byzantine marker block identity is invalid"
         )
     matches: list[dict[str, object]] = []
+    late_transitions: list[dict[str, object]] = []
     for event in streams.get(MANAGER_SOURCE_ID, ()):
         if event.get("event_type") != ACCEPTED_OBSERVATION_EVENT:
             continue
@@ -878,7 +1066,7 @@ def find_manager_accepted_timeout(
         )
         observation = accepted["payload"]["observation"]
         configuration = observation["configuration"]
-        if (
+        exact_identity = (
             observation["reporter_id"] == FALSE_REPORTER_ID
             and observation["observed_replica_id"]
             == FALSE_REPORT_TARGET_ID
@@ -891,16 +1079,204 @@ def find_manager_accepted_timeout(
             and observation["block_hash"] == block_hash
             and observation["expected_message_type"]
             == "aggregate_relay"
-            and observation["outcome"] == "timeout"
-            and observation["response_duration_us"] == 0
-            and observation["signer_set"] == []
-        ):
+        )
+        if exact_identity and observation["outcome"] == "timeout":
             matches.append(accepted)
+        elif exact_identity and observation["outcome"] == "late":
+            late_transitions.append(accepted)
     if len(matches) > 1:
         raise ComparisonRunError(
             "manager emitted duplicate accepted timeout observations"
         )
+    if matches and any(
+        late["payload"]["observation"]["observation_id"]
+        == matches[0]["payload"]["observation"]["observation_id"]
+        for late in late_transitions
+    ):
+        raise ComparisonRunError(
+            "initial timeout transitioned to late and is not final"
+        )
     return matches[0] if matches else None
+
+
+def find_manager_followup_observation(
+    runner: ModuleType,
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    run_id: str,
+    initial_observation: Mapping[str, Any],
+) -> dict[str, object] | None:
+    """Find the first finalized exact T0 aggregate-relay cross-check."""
+
+    initial = _accepted_observation_event(
+        runner,
+        initial_observation,
+        expected_run_id=run_id,
+    )
+    initial_payload = initial["payload"]
+    initial_attempt = initial_payload["observation"]
+    if (
+        initial_attempt["reporter_id"] != FALSE_REPORTER_ID
+        or initial_attempt["observed_replica_id"]
+        != FALSE_REPORT_TARGET_ID
+        or initial_attempt["configuration"]
+        != {
+            "epoch_number": 0,
+            "tree_id": TREE_ID,
+            "epoch_digest": EPOCH0_DIGEST,
+        }
+        or initial_attempt["expected_message_type"] != "aggregate_relay"
+        or initial_attempt["outcome"] != "timeout"
+    ):
+        raise ComparisonRunError(
+            "follow-up requires the exact initial T6 timeout"
+        )
+
+    finalized: list[dict[str, object]] = []
+    late: list[dict[str, object]] = []
+    for event in streams.get(MANAGER_SOURCE_ID, ()):
+        if event.get("event_type") != ACCEPTED_OBSERVATION_EVENT:
+            continue
+        accepted = _accepted_observation_event(
+            runner,
+            event,
+            expected_run_id=run_id,
+        )
+        observation = accepted["payload"]["observation"]
+        if (
+            observation["reporter_id"] != FOLLOWUP_REPORTER_ID
+            or observation["observed_replica_id"]
+            != FALSE_REPORT_TARGET_ID
+            or observation["configuration"]
+            != {
+                "epoch_number": 0,
+                "tree_id": FOLLOWUP_TREE_ID,
+                "epoch_digest": EPOCH0_DIGEST,
+            }
+            or observation["expected_message_type"] != "aggregate_relay"
+        ):
+            continue
+        if (
+            accepted["source_sequence"] <= initial["source_sequence"]
+            or accepted["payload"]["ingestion_sequence"]
+            <= initial_payload["ingestion_sequence"]
+        ):
+            continue
+        if accepted["source_instance"] != initial["source_instance"]:
+            raise ComparisonRunError(
+                "diagnostic cross-check crossed a manager restart"
+            )
+        if (
+            observation["observation_id"]
+            == initial_attempt["observation_id"]
+            or observation["block_hash"] == initial_attempt["block_hash"]
+        ):
+            raise ComparisonRunError(
+                "T0 cross-check must use a distinct attempt and block"
+            )
+        if observation["outcome"] == "late":
+            late.append(accepted)
+        elif observation["outcome"] in ("on_time", "timeout"):
+            finalized.append(accepted)
+
+    finalized.sort(
+        key=lambda event: (
+            event["source_sequence"],
+            event["payload"]["ingestion_sequence"],
+        )
+    )
+    if late:
+        raise ComparisonRunError(
+            "T0 cross-check contains a non-final late transition"
+        )
+    if not finalized:
+        return None
+    if len(
+        {
+            event["payload"]["observation"]["outcome"]
+            for event in finalized
+        }
+    ) != 1:
+        raise ComparisonRunError(
+            "T0 cross-check has conflicting finalized outcomes"
+        )
+    selected = finalized[0]
+    selected_id = selected["payload"]["observation"]["observation_id"]
+    if sum(
+        event["payload"]["observation"]["observation_id"] == selected_id
+        for event in finalized
+    ) != 1:
+        raise ComparisonRunError(
+            "manager emitted duplicate finalized T0 observations"
+        )
+    return selected
+
+
+def build_live_diagnostic_certificate(
+    initial_observation: Mapping[str, Any],
+    followup_observation: Mapping[str, Any],
+) -> dict[str, object]:
+    """Build the bounded certificate from two normalized manager events."""
+
+    initial_payload = initial_observation["payload"]
+    followup_payload = followup_observation["payload"]
+    initial = initial_payload["observation"]
+    followup = followup_payload["observation"]
+    if (
+        initial_observation["source_instance"]
+        != followup_observation["source_instance"]
+        or followup_observation["source_sequence"]
+        <= initial_observation["source_sequence"]
+        or followup_payload["ingestion_sequence"]
+        <= initial_payload["ingestion_sequence"]
+        or initial["block_hash"] == followup["block_hash"]
+    ):
+        raise ComparisonRunError(
+            "diagnostic observations are not distinct receipt-ordered phases"
+        )
+
+    def project(
+        observation: Mapping[str, Any],
+    ) -> PassiveCrosscheckObservation:
+        configuration = observation["configuration"]
+        outcome = observation["outcome"]
+        if outcome not in ("on_time", "timeout"):
+            raise ComparisonRunError(
+                "diagnostic certificate requires finalized observations"
+            )
+        return PassiveCrosscheckObservation(
+            observation_id=observation["observation_id"],
+            reporter_id=observation["reporter_id"],
+            target_id=observation["observed_replica_id"],
+            epoch_number=configuration["epoch_number"],
+            tree_id=configuration["tree_id"],
+            epoch_digest=configuration["epoch_digest"],
+            expected_message_type=observation["expected_message_type"],
+            outcome="response" if outcome == "on_time" else "timeout",
+        )
+
+    scope = PassiveCrosscheckScope(
+        epoch_number=0,
+        epoch_digest=EPOCH0_DIGEST,
+        target_id=FALSE_REPORT_TARGET_ID,
+        expected_message_type="aggregate_relay",
+        phases=(
+            PassiveCrosscheckPhase(
+                tree_id=TREE_ID,
+                reporter_id=FALSE_REPORTER_ID,
+            ),
+            PassiveCrosscheckPhase(
+                tree_id=FOLLOWUP_TREE_ID,
+                reporter_id=FOLLOWUP_REPORTER_ID,
+            ),
+        ),
+        diagnostic_fault_bound=1,
+    )
+    return build_passive_crosscheck_certificate(
+        scope,
+        (project(initial), project(followup)),
+        membership=REPLICA_IDS,
+    )
 
 
 def _verdict_has_exact_accepted_timeout(
@@ -1014,6 +1390,230 @@ def _verdict_has_exact_accepted_timeout(
     )
 
 
+def _verdict_has_canonical_followup_event(
+    event: Mapping[str, Any],
+    initial_event: Mapping[str, Any],
+    *,
+    run_id: str,
+) -> bool:
+    if set(event) != {
+        "event_schema_version",
+        "run_id",
+        "source_kind",
+        "source_id",
+        "source_instance",
+        "source_sequence",
+        "source_monotonic_ns",
+        "event_type",
+        "payload",
+    }:
+        return False
+    payload = event.get("payload")
+    initial_payload = initial_event.get("payload")
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"ingestion_sequence", "observation"}
+        or not isinstance(initial_payload, Mapping)
+    ):
+        return False
+    observation = payload.get("observation")
+    initial = initial_payload.get("observation")
+    if (
+        not isinstance(observation, Mapping)
+        or not isinstance(initial, Mapping)
+        or set(observation)
+        != {
+            "schema_version",
+            "observation_id",
+            "reporter_id",
+            "observed_replica_id",
+            "configuration",
+            "block_hash",
+            "expected_message_type",
+            "outcome",
+            "response_duration_us",
+            "deadline_duration_us",
+            "reporter_monotonic_ns",
+            "reporter_sequence",
+            "signer_set",
+        }
+    ):
+        return False
+    configuration = observation.get("configuration")
+    if (
+        not isinstance(configuration, Mapping)
+        or set(configuration)
+        != {"epoch_number", "tree_id", "epoch_digest"}
+    ):
+        return False
+    source_sequence = event.get("source_sequence")
+    source_monotonic_ns = event.get("source_monotonic_ns")
+    ingestion_sequence = payload.get("ingestion_sequence")
+    initial_source_sequence = initial_event.get("source_sequence")
+    initial_ingestion_sequence = initial_payload.get(
+        "ingestion_sequence"
+    )
+    response_duration_us = observation.get("response_duration_us")
+    deadline_duration_us = observation.get("deadline_duration_us")
+    reporter_monotonic_ns = observation.get("reporter_monotonic_ns")
+    reporter_sequence = observation.get("reporter_sequence")
+    signer_set = observation.get("signer_set")
+    integral_values = (
+        source_sequence,
+        source_monotonic_ns,
+        ingestion_sequence,
+        initial_source_sequence,
+        initial_ingestion_sequence,
+        response_duration_us,
+        deadline_duration_us,
+        reporter_monotonic_ns,
+        reporter_sequence,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in integral_values
+    ):
+        return False
+    if (
+        source_sequence <= initial_source_sequence
+        or source_monotonic_ns <= 0
+        or ingestion_sequence <= initial_ingestion_sequence
+        or response_duration_us < 0
+        or deadline_duration_us <= 0
+        or reporter_monotonic_ns <= 0
+        or reporter_sequence <= 0
+        or not isinstance(signer_set, list)
+        or signer_set
+        != sorted(
+            {
+                signer
+                for signer in signer_set
+                if isinstance(signer, int)
+                and not isinstance(signer, bool)
+                and signer in REPLICA_IDS
+            }
+        )
+    ):
+        return False
+    outcome = observation.get("outcome")
+    response_is_canonical = (
+        outcome == "timeout"
+        and response_duration_us == 0
+        and signer_set == []
+    ) or (
+        outcome == "on_time"
+        and response_duration_us <= deadline_duration_us
+        and bool(signer_set)
+    )
+    return (
+        event.get("event_schema_version") == 1
+        and event.get("run_id") == run_id
+        and event.get("source_kind") == "adaptation_manager"
+        and event.get("source_id") == MANAGER_SOURCE_ID
+        and event.get("event_type") == ACCEPTED_OBSERVATION_EVENT
+        and isinstance(event.get("source_instance"), str)
+        and bool(event.get("source_instance"))
+        and event.get("source_instance")
+        == initial_event.get("source_instance")
+        and observation.get("schema_version") == 1
+        and isinstance(observation.get("observation_id"), str)
+        and _HEX_64.fullmatch(observation["observation_id"]) is not None
+        and observation.get("observation_id")
+        != initial.get("observation_id")
+        and observation.get("reporter_id") == FOLLOWUP_REPORTER_ID
+        and observation.get("observed_replica_id")
+        == FALSE_REPORT_TARGET_ID
+        and configuration
+        == {
+            "epoch_number": 0,
+            "tree_id": FOLLOWUP_TREE_ID,
+            "epoch_digest": EPOCH0_DIGEST,
+        }
+        and isinstance(observation.get("block_hash"), str)
+        and _HEX_64.fullmatch(observation["block_hash"]) is not None
+        and observation.get("block_hash") != initial.get("block_hash")
+        and observation.get("expected_message_type")
+        == "aggregate_relay"
+        and response_is_canonical
+    )
+
+
+def _verdict_has_exact_diagnostic_settlement(
+    *,
+    arm_name: str,
+    run_id: str,
+    initial_observation: Mapping[str, Any] | None,
+    followup_observation: Mapping[str, Any] | None,
+    certificate: Mapping[str, object] | None,
+    followup_omission_observation: Mapping[str, object] | None,
+) -> bool:
+    if (
+        initial_observation is None
+        or followup_observation is None
+        or certificate is None
+    ):
+        return False
+    if not _verdict_has_canonical_followup_event(
+        followup_observation,
+        initial_observation,
+        run_id=run_id,
+    ):
+        return False
+    try:
+        expected_certificate = build_live_diagnostic_certificate(
+            initial_observation,
+            followup_observation,
+        )
+        followup = followup_observation["payload"]["observation"]
+    except (KeyError, TypeError, ValueError, ComparisonRunError):
+        return False
+    if dict(certificate) != expected_certificate:
+        return False
+    expected = {
+        "static_authenticated_false_report": {
+            "manager_outcome": "on_time",
+            "hypothesis": {
+                "false_reporters": [FALSE_REPORTER_ID],
+                "persistent_omitters": [],
+            },
+            "exclusion": [FALSE_REPORTER_ID],
+        },
+        "static_persistent_omission": {
+            "manager_outcome": "timeout",
+            "hypothesis": {
+                "false_reporters": [],
+                "persistent_omitters": [PERSISTENT_OMITTER_ID],
+            },
+            "exclusion": [PERSISTENT_OMITTER_ID],
+        },
+    }.get(arm_name)
+    if expected is None:
+        return False
+    if (
+        expected_certificate.get("status") != "settled"
+        or expected_certificate.get("settled_hypothesis")
+        != expected["hypothesis"]
+        or expected_certificate.get("durable_role_exclusions")
+        != expected["exclusion"]
+        or followup.get("outcome") != expected["manager_outcome"]
+    ):
+        return False
+    if arm_name == "static_authenticated_false_report":
+        return followup_omission_observation is None
+    if followup_omission_observation is None:
+        return False
+    return (
+        followup_omission_observation.get("kind")
+        == "aggregate_omitted"
+        and followup_omission_observation.get("source_id")
+        == f"replica-{PERSISTENT_OMITTER_ID}"
+        and followup_omission_observation.get("configuration")
+        == FOLLOWUP_OMISSION_CONFIGURATION
+        and followup_omission_observation.get("block_hash")
+        == followup.get("block_hash")
+    )
+
+
 def validate_fault_evidence(
     run_directory: Path,
     arm: FaultComparisonArm,
@@ -1084,6 +1684,9 @@ def build_arm_verdict(
     fixed_quorum: Mapping[str, object] | None,
     conflicts: Sequence[Mapping[str, object]],
     runtime_error: str | None,
+    followup_manager_observation: Mapping[str, Any] | None = None,
+    diagnostic_certificate: Mapping[str, object] | None = None,
+    followup_omission_observation: Mapping[str, object] | None = None,
     dry_run: bool = False,
 ) -> dict[str, object]:
     """Build a conservative immutable verdict for one arm."""
@@ -1101,10 +1704,27 @@ def build_arm_verdict(
                 run_id=run_id,
             )
         )
+        diagnostic_settlement_present = (
+            followup_manager_observation is None
+            and diagnostic_certificate is None
+            and followup_omission_observation is None
+            if arm.name == "sigkill_crash"
+            else _verdict_has_exact_diagnostic_settlement(
+                arm_name=arm.name,
+                run_id=run_id,
+                initial_observation=accepted_timeout_observation,
+                followup_observation=followup_manager_observation,
+                certificate=diagnostic_certificate,
+                followup_omission_observation=(
+                    followup_omission_observation
+                ),
+            )
+        )
         passed = (
             runtime_error is None
             and action_observation is not None
             and accepted_evidence_present
+            and diagnostic_settlement_present
             and before_commit is not None
             and after_commit is not None
             and fixed_quorum is not None
@@ -1113,7 +1733,7 @@ def build_arm_verdict(
         )
         verdict = "PASS" if passed else "INCOMPLETE"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario": "n7-static-fault-comparison",
         "arm": arm.name,
         "run_id": run_id,
@@ -1128,6 +1748,21 @@ def build_arm_verdict(
         "manager_accepted_timeout_observation": (
             dict(accepted_timeout_observation)
             if accepted_timeout_observation is not None
+            else None
+        ),
+        "followup_manager_observation": (
+            dict(followup_manager_observation)
+            if followup_manager_observation is not None
+            else None
+        ),
+        "diagnostic_certificate": (
+            dict(diagnostic_certificate)
+            if diagnostic_certificate is not None
+            else None
+        ),
+        "followup_omission_observation": (
+            dict(followup_omission_observation)
+            if followup_omission_observation is not None
             else None
         ),
         "common_commit_before": (
@@ -1310,7 +1945,7 @@ def _run_live(
 
     state_path = run_directory / "runner-state.json"
     state: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario": "n7-static-fault-comparison",
         "arm": arm.name,
         "run_id": run_id,
@@ -1329,6 +1964,9 @@ def _run_live(
     after_commit: dict[str, object] | None = None
     action_observation: dict[str, object] | None = None
     accepted_timeout_observation: dict[str, object] | None = None
+    followup_manager_observation: dict[str, object] | None = None
+    diagnostic_certificate: dict[str, object] | None = None
+    followup_omission_observation: dict[str, object] | None = None
     fixed_quorum: dict[str, object] | None = None
     conflicts: list[dict[str, object]] = []
     runtime_error: str | None = None
@@ -1497,6 +2135,32 @@ def _run_live(
             raise ComparisonRunError(
                 "live epoch-0 digest differs from frozen launch binding"
             )
+        tree6_references = _configuration_boundary_references(
+            boundary,
+            tree_id=TREE_ID,
+            root_replica=FALSE_REPORTER_ID,
+        )
+        followup_poller = runner.FreshConfigurationPoller(
+            run_directory,
+            {
+                source_id: sequence
+                for source_id, (sequence, _timestamp) in (
+                    tree6_references.items()
+                )
+            },
+            start_offsets=offsets,
+            maximum_skew_ns=(
+                int(runtime["aggregation_timeout_ms"]) * 1_000_000
+            ),
+            epoch_number=0,
+            tree_id=FOLLOWUP_TREE_ID,
+            root_replica=FOLLOWUP_REPORTER_ID,
+            members_breadth_first=(
+                FOLLOWUP_TREE_MEMBERS_BREADTH_FIRST
+            ),
+            fanout=2,
+            allow_later_configurations=True,
+        )
 
         state["phase"] = "inject_or_observe_fault"
         state["tree6_boundary"] = boundary
@@ -1545,7 +2209,7 @@ def _run_live(
         else:
             assert fault_marker_offset is not None
             marker = runner._wait(
-                f"{arm.name} runtime marker",
+                f"{arm.name} T6 runtime marker",
                 args.fault_timeout,
                 records,
                 lambda: find_fault_marker(
@@ -1555,20 +2219,14 @@ def _run_live(
                 ),
                 allow_clean_exit=allow_manager_exit,
             )
-            fault_observed_ns = runner.monotonic_raw_ns()
             action_observation = {
                 **marker,
                 "fault_id": arm.plan.actions[0].fault_id,
-                "observed_monotonic_raw_ns": fault_observed_ns,
+                "observed_monotonic_raw_ns": runner.monotonic_raw_ns(),
                 "configuration": EXACT_CONFIGURATION,
                 "context_limit": args.context_limit,
                 "log_start_offset": fault_marker_offset,
             }
-            lifecycle.terminal(
-                arm.plan.actions[0].fault_id,
-                "succeeded",
-                action_observation,
-            )
             marker_block_hash = marker.get("block_hash")
             if not isinstance(marker_block_hash, str):
                 raise ComparisonRunError(
@@ -1595,6 +2253,119 @@ def _run_live(
             action_observation[
                 "manager_acceptance_observed_monotonic_raw_ns"
             ] = runner.monotonic_raw_ns()
+
+            state["phase"] = "awaiting_epoch0_tree0_crosscheck"
+            state["initial_manager_observation_id"] = (
+                accepted_timeout_observation["payload"]["observation"][
+                    "observation_id"
+                ]
+            )
+            runner._replace_json(state_path, state)
+            followup_boundary = runner._wait(
+                "common epoch-0 tree-0 cross-check configuration",
+                args.fault_timeout,
+                records,
+                followup_poller.poll,
+                allow_clean_exit=allow_manager_exit,
+            )
+            if followup_boundary.get("epoch_digest") != EPOCH0_DIGEST:
+                raise ComparisonRunError(
+                    "T0 cross-check digest differs from T6"
+                )
+            require_followup_configuration_boundary(
+                boundary,
+                followup_boundary,
+            )
+            state["tree0_boundary"] = followup_boundary
+            runner._replace_json(state_path, state)
+
+            if arm.name == "static_persistent_omission":
+                followup_marker = runner._wait(
+                    "persistent omission T0 runtime marker",
+                    args.fault_timeout,
+                    records,
+                    lambda: find_fault_marker(
+                        run_directory,
+                        arm.name,
+                        start_offset=fault_marker_offset,
+                        tree_id=FOLLOWUP_TREE_ID,
+                        reporter_id=FOLLOWUP_REPORTER_ID,
+                    ),
+                    allow_clean_exit=allow_manager_exit,
+                )
+                followup_omission_observation = {
+                    **followup_marker,
+                    "configuration": FOLLOWUP_OMISSION_CONFIGURATION,
+                    "log_start_offset": fault_marker_offset,
+                }
+
+            def manager_followup() -> dict[str, object] | None:
+                assert accepted_timeout_observation is not None
+                return find_manager_followup_observation(
+                    runner,
+                    runner._event_streams(run_directory),
+                    run_id=run_id,
+                    initial_observation=accepted_timeout_observation,
+                )
+
+            followup_manager_observation = runner._wait(
+                "matching manager-accepted T0 cross-check",
+                args.fault_timeout,
+                records,
+                manager_followup,
+                allow_clean_exit=allow_manager_exit,
+            )
+            diagnostic_certificate = build_live_diagnostic_certificate(
+                accepted_timeout_observation,
+                followup_manager_observation,
+            )
+            expected_hypothesis = (
+                {
+                    "false_reporters": [FALSE_REPORTER_ID],
+                    "persistent_omitters": [],
+                }
+                if arm.name == "static_authenticated_false_report"
+                else {
+                    "false_reporters": [],
+                    "persistent_omitters": [PERSISTENT_OMITTER_ID],
+                }
+            )
+            if (
+                diagnostic_certificate.get("status") != "settled"
+                or diagnostic_certificate.get("settled_hypothesis")
+                != expected_hypothesis
+            ):
+                raise ComparisonRunError(
+                    "live cross-check settled the unexpected fault mode"
+                )
+            if followup_omission_observation is not None:
+                followup_block = followup_manager_observation["payload"][
+                    "observation"
+                ]["block_hash"]
+                if (
+                    followup_omission_observation.get("block_hash")
+                    != followup_block
+                ):
+                    raise ComparisonRunError(
+                        "T0 omission marker and manager observation differ"
+                    )
+            fault_observed_ns = runner.monotonic_raw_ns()
+            action_observation["diagnostic_certificate_sha256"] = (
+                diagnostic_certificate["certificate_sha256"]
+            )
+            lifecycle.terminal(
+                arm.plan.actions[0].fault_id,
+                "succeeded",
+                {
+                    **action_observation,
+                    "followup_omission_observation": (
+                        followup_omission_observation
+                    ),
+                    "diagnostic_certificate_sha256": (
+                        diagnostic_certificate["certificate_sha256"]
+                    ),
+                },
+            )
 
         participants = tuple(
             replica_id
@@ -1647,6 +2418,79 @@ def _run_live(
                 )
             assert action_observation is not None
             action_observation.update(final_marker)
+            assert accepted_timeout_observation is not None
+            final_initial = find_manager_accepted_timeout(
+                runner,
+                streams,
+                run_id=run_id,
+                block_hash=str(final_marker["block_hash"]),
+            )
+            if (
+                final_initial is None
+                or final_initial["payload"]["observation"][
+                    "observation_id"
+                ]
+                != accepted_timeout_observation["payload"]["observation"][
+                    "observation_id"
+                ]
+            ):
+                raise ComparisonRunError(
+                    "initial timeout was not stable through final validation"
+                )
+            assert followup_manager_observation is not None
+            final_followup = find_manager_followup_observation(
+                runner,
+                streams,
+                run_id=run_id,
+                initial_observation=accepted_timeout_observation,
+            )
+            if (
+                final_followup is None
+                or final_followup["payload"]["observation"][
+                    "observation_id"
+                ]
+                != followup_manager_observation["payload"][
+                    "observation"
+                ]["observation_id"]
+            ):
+                raise ComparisonRunError(
+                    "T0 cross-check was not stable through final validation"
+                )
+            if arm.name == "static_persistent_omission":
+                final_followup_marker = find_fault_marker(
+                    run_directory,
+                    arm.name,
+                    start_offset=fault_marker_offset,
+                    tree_id=FOLLOWUP_TREE_ID,
+                    reporter_id=FOLLOWUP_REPORTER_ID,
+                )
+                if final_followup_marker is None:
+                    raise ComparisonRunError(
+                        "T0 omission marker disappeared before validation"
+                    )
+                followup_count = final_followup_marker[
+                    "matching_line_count"
+                ]
+                if not isinstance(followup_count, int) or not (
+                    1 <= followup_count <= args.context_limit
+                ):
+                    raise ComparisonRunError(
+                        "T0 omission exceeded its proposal-context bound"
+                    )
+                assert followup_omission_observation is not None
+                followup_omission_observation.update(
+                    final_followup_marker
+                )
+                followup_omission_observation[
+                    "configuration"
+                ] = FOLLOWUP_OMISSION_CONFIGURATION
+                action_observation[
+                    "omission_context_count_total"
+                ] = require_shared_omission_context_bound(
+                    final_marker,
+                    final_followup_marker,
+                    context_limit=args.context_limit,
+                )
         if fixed_quorum["invalid_records"]:
             raise ComparisonRunError(
                 "an active configuration changed the fixed quorum"
@@ -1656,6 +2500,11 @@ def _run_live(
                 "conflicting committed hashes were observed"
             )
         state["phase"] = "validated"
+        state["diagnostic_certificate_sha256"] = (
+            diagnostic_certificate.get("certificate_sha256")
+            if diagnostic_certificate is not None
+            else None
+        )
     except KeyboardInterrupt:
         interrupted = True
         runtime_error = "comparison interrupted"
@@ -1696,6 +2545,75 @@ def _run_live(
                 f"{runtime_error}; " if runtime_error else ""
             ) + f"cleanup failed: {exc}"
         try:
+            if runtime_error is None and records:
+                final_streams = runner._event_streams(run_directory)
+                fixed_quorum = observed_fixed_quorum(final_streams)
+                conflicts = conflicting_commits(runner, final_streams)
+                if fixed_quorum["invalid_records"]:
+                    raise ComparisonRunError(
+                        "an active configuration changed the fixed quorum"
+                    )
+                if conflicts:
+                    raise ComparisonRunError(
+                        "conflicting commits appeared before shutdown"
+                    )
+                if arm.name != "sigkill_crash":
+                    assert accepted_timeout_observation is not None
+                    assert followup_manager_observation is not None
+                    initial_attempt = accepted_timeout_observation[
+                        "payload"
+                    ]["observation"]
+                    stable_initial = find_manager_accepted_timeout(
+                        runner,
+                        final_streams,
+                        run_id=run_id,
+                        block_hash=initial_attempt["block_hash"],
+                    )
+                    stable_followup = (
+                        find_manager_followup_observation(
+                            runner,
+                            final_streams,
+                            run_id=run_id,
+                            initial_observation=(
+                                accepted_timeout_observation
+                            ),
+                        )
+                    )
+                    if (
+                        stable_initial is None
+                        or stable_followup is None
+                        or stable_initial["payload"]["observation"][
+                            "observation_id"
+                        ]
+                        != initial_attempt["observation_id"]
+                        or stable_followup["payload"]["observation"][
+                            "observation_id"
+                        ]
+                        != followup_manager_observation["payload"][
+                            "observation"
+                        ]["observation_id"]
+                    ):
+                        raise ComparisonRunError(
+                            "diagnostic settlement changed before shutdown"
+                        )
+                    rebuilt = build_live_diagnostic_certificate(
+                        stable_initial,
+                        stable_followup,
+                    )
+                    if rebuilt != diagnostic_certificate:
+                        raise ComparisonRunError(
+                            "diagnostic certificate changed before shutdown"
+                        )
+        except (
+            ComparisonRunError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            runtime_error = (
+                f"{runtime_error}; " if runtime_error else ""
+            ) + f"final evidence validation failed: {exc}"
+        try:
             resources.close()
         except (OSError, RuntimeError, ValueError) as exc:
             runtime_error = (
@@ -1726,6 +2644,11 @@ def _run_live(
         fixed_quorum=fixed_quorum,
         conflicts=conflicts,
         runtime_error=runtime_error,
+        followup_manager_observation=followup_manager_observation,
+        diagnostic_certificate=diagnostic_certificate,
+        followup_omission_observation=(
+            followup_omission_observation
+        ),
     )
     verdict["cleanup"] = cleanup
     verdict["interrupted"] = interrupted

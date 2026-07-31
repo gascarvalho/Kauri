@@ -25,6 +25,7 @@ struct ExperimentByzantineOptions final
 {
     bool enabled{false};
     ConfigurationId configuration;
+    std::optional<ConfigurationId> additional_omission_configuration;
     std::string diagnostic_window;
     std::optional<ReplicaID> false_report_target;
     bool omit_outbound_aggregate{false};

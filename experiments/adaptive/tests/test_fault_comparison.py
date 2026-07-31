@@ -116,6 +116,116 @@ def _verdicts(comparison: Any) -> dict[str, dict[str, object]]:
                     },
                 },
             }
+            followup_outcome = (
+                "on_time"
+                if arm.name == "static_authenticated_false_report"
+                else "timeout"
+            )
+            verdict["followup_manager_observation"] = {
+                "event_schema_version": 1,
+                "run_id": run_id,
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": "manager-instance-1",
+                "source_sequence": 10,
+                "source_monotonic_ns": 2_000,
+                "event_type": "evidence.observation_accepted",
+                "payload": {
+                    "ingestion_sequence": 8,
+                    "observation": {
+                        "schema_version": 1,
+                        "observation_id": "e" * 64,
+                        "reporter_id": 0,
+                        "observed_replica_id": (
+                            FALSE_REPORT_TARGET_ID
+                        ),
+                        "configuration": {
+                            "epoch_number": 0,
+                            "tree_id": 0,
+                            "epoch_digest": epoch_digest,
+                        },
+                        "block_hash": "f" * 64,
+                        "expected_message_type": "aggregate_relay",
+                        "outcome": followup_outcome,
+                        "response_duration_us": (
+                            250_000
+                            if followup_outcome == "on_time"
+                            else 0
+                        ),
+                        "deadline_duration_us": 500_000,
+                        "reporter_monotonic_ns": 1_900,
+                        "reporter_sequence": 4,
+                        "signer_set": (
+                            [4]
+                            if followup_outcome == "on_time"
+                            else []
+                        ),
+                    },
+                },
+            }
+            passive = importlib.import_module(
+                "experiments.adaptive.kauri_experiment.passive_crosscheck"
+            )
+            scope = passive.PassiveCrosscheckScope(
+                epoch_number=0,
+                epoch_digest=epoch_digest,
+                target_id=FALSE_REPORT_TARGET_ID,
+                expected_message_type="aggregate_relay",
+                phases=(
+                    passive.PassiveCrosscheckPhase(
+                        tree_id=6,
+                        reporter_id=FALSE_REPORTER_ID,
+                    ),
+                    passive.PassiveCrosscheckPhase(
+                        tree_id=0,
+                        reporter_id=0,
+                    ),
+                ),
+                diagnostic_fault_bound=1,
+            )
+            verdict["diagnostic_certificate"] = (
+                passive.build_passive_crosscheck_certificate(
+                    scope,
+                    (
+                        passive.PassiveCrosscheckObservation(
+                            observation_id="c" * 64,
+                            reporter_id=FALSE_REPORTER_ID,
+                            target_id=FALSE_REPORT_TARGET_ID,
+                            epoch_number=0,
+                            tree_id=6,
+                            epoch_digest=epoch_digest,
+                            expected_message_type="aggregate_relay",
+                            outcome="timeout",
+                        ),
+                        passive.PassiveCrosscheckObservation(
+                            observation_id="e" * 64,
+                            reporter_id=0,
+                            target_id=FALSE_REPORT_TARGET_ID,
+                            epoch_number=0,
+                            tree_id=0,
+                            epoch_digest=epoch_digest,
+                            expected_message_type="aggregate_relay",
+                            outcome=(
+                                "response"
+                                if followup_outcome == "on_time"
+                                else "timeout"
+                            ),
+                        ),
+                    ),
+                )
+            )
+            verdict["followup_omission_observation"] = (
+                {
+                    "kind": "aggregate_omitted",
+                    "source_id": (
+                        f"replica-{PERSISTENT_OMITTER_ID}"
+                    ),
+                    "configuration": f"0:0:{epoch_digest}",
+                    "block_hash": "f" * 64,
+                }
+                if arm.name == "static_persistent_omission"
+                else None
+            )
         verdicts[arm.name] = verdict
     return verdicts
 
@@ -260,7 +370,7 @@ def test_summary_accepts_only_complete_pass_bound_comparison() -> None:
     )
 
     assert summary == {
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario": "n7-static-fault-comparison",
         "kauri_revision": KAURI_REVISION,
         "seed": SEED,
@@ -276,6 +386,14 @@ def test_summary_accepts_only_complete_pass_bound_comparison() -> None:
             "outcome": "timeout",
         },
         "diagnostic_fault_bound": 1,
+        "passive_crosscheck": {
+            "phase_trees": [6, 0],
+            "phase_reporters": [FALSE_REPORTER_ID, 0],
+            "ordering_basis": "manager_receipt_order",
+            "added_protocol_messages": 0,
+            "added_protocol_trees": 0,
+            "forced_tree_rotations": 0,
+        },
         "arms": [
             {
                 "name": arm.name,
@@ -284,6 +402,34 @@ def test_summary_accepts_only_complete_pass_bound_comparison() -> None:
                 "fault_plan_sha256": arm.plan.sha256,
                 "manager_accepted_observation_id": (
                     None if arm.name == "sigkill_crash" else "c" * 64
+                ),
+                "followup_manager_observation_id": (
+                    None if arm.name == "sigkill_crash" else "e" * 64
+                ),
+                "diagnostic_certificate_sha256": (
+                    None
+                    if arm.name == "sigkill_crash"
+                    else _verdicts(comparison)[arm.name][
+                        "diagnostic_certificate"
+                    ]["certificate_sha256"]
+                ),
+                "settled_hypothesis": (
+                    None
+                    if arm.name == "sigkill_crash"
+                    else (
+                        {
+                            "false_reporters": [FALSE_REPORTER_ID],
+                            "persistent_omitters": [],
+                        }
+                        if arm.name
+                        == "static_authenticated_false_report"
+                        else {
+                            "false_reporters": [],
+                            "persistent_omitters": [
+                                PERSISTENT_OMITTER_ID
+                            ],
+                        }
+                    )
                 ),
             }
             for arm in comparison.arms
@@ -358,6 +504,24 @@ def test_summary_revalidates_arm_specific_action_identity() -> None:
     with pytest.raises(
         module.ComparisonError,
         match="timeout|syndrome|evidence",
+    ):
+        module.summarize_comparison(comparison, verdicts)
+
+
+@pytest.mark.parametrize("signer_set", ([99], [4, 4]))
+def test_summary_rejects_noncanonical_followup_signers(
+    signer_set: list[int],
+) -> None:
+    module = _comparison_module()
+    comparison = _comparison()
+    verdicts = _verdicts(comparison)
+    verdicts["static_authenticated_false_report"][
+        "followup_manager_observation"
+    ]["payload"]["observation"]["signer_set"] = signer_set
+
+    with pytest.raises(
+        module.ComparisonError,
+        match="cross-check|diagnostic",
     ):
         module.summarize_comparison(comparison, verdicts)
 

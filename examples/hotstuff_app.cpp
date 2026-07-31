@@ -218,6 +218,7 @@ parse_experiment_byzantine_options(
     ReplicaID local_replica,
     std::size_t replica_count,
     const std::string &raw_configuration,
+    const std::string &raw_additional_omission_configuration,
     const std::string &diagnostic_window,
     const std::string &raw_false_report_target,
     bool omit_outbound_aggregate,
@@ -225,6 +226,7 @@ parse_experiment_byzantine_options(
 {
     const bool requested =
         !raw_configuration.empty() ||
+        !raw_additional_omission_configuration.empty() ||
         !diagnostic_window.empty() ||
         !raw_false_report_target.empty() ||
         omit_outbound_aggregate ||
@@ -256,35 +258,66 @@ parse_experiment_byzantine_options(
         !omit_outbound_aggregate)
         throw HotStuffError(
             "select exactly one experiment Byzantine fault mode");
+    if (!raw_additional_omission_configuration.empty() &&
+        !omit_outbound_aggregate)
+        throw HotStuffError(
+            "additional experiment omission configuration requires "
+            "aggregate omission");
 
-    const auto parts = trim_all(split(raw_configuration, ":"));
-    if (parts.size() != 3)
-        throw HotStuffError(
-            "experiment Byzantine configuration must use "
-            "epoch:tree:digest");
-    const auto epoch =
-        parse_adaptive_v2_unsigned<std::uint32_t>(
-            parts[0], "experiment Byzantine epoch", false);
-    const auto tree =
-        parse_adaptive_v2_unsigned<std::uint32_t>(
-            parts[1], "experiment Byzantine tree", false);
-    if (parts[2].size() != 64 ||
-        !std::all_of(
-            parts[2].begin(),
-            parts[2].end(),
-            [](unsigned char character)
-            {
-                return std::isxdigit(character) != 0;
-            }))
-        throw HotStuffError(
-            "experiment Byzantine configuration digest is invalid");
+    const auto parse_configuration =
+        [](const std::string &raw_value,
+           const std::string &name) -> hotstuff::ConfigurationId
+        {
+            const auto parts = trim_all(split(raw_value, ":"));
+            if (parts.size() != 3)
+                throw HotStuffError(
+                    name + " must use epoch:tree:digest");
+            const auto epoch_name = name + " epoch";
+            const auto tree_name = name + " tree";
+            const auto epoch =
+                parse_adaptive_v2_unsigned<std::uint32_t>(
+                    parts[0], epoch_name.c_str(), false);
+            const auto tree =
+                parse_adaptive_v2_unsigned<std::uint32_t>(
+                    parts[1], tree_name.c_str(), false);
+            if (parts[2].size() != 64 ||
+                !std::all_of(
+                    parts[2].begin(),
+                    parts[2].end(),
+                    [](unsigned char character)
+                    {
+                        return std::isxdigit(character) != 0;
+                    }))
+                throw HotStuffError(name + " digest is invalid");
+            return hotstuff::ConfigurationId{
+                epoch,
+                tree,
+                uint256_t(hotstuff::from_hex(parts[2]))};
+        };
 
     hotstuff::ExperimentByzantineOptions options;
     options.enabled = true;
-    options.configuration = hotstuff::ConfigurationId{
-        epoch,
-        tree,
-        uint256_t(hotstuff::from_hex(parts[2]))};
+    options.configuration = parse_configuration(
+        raw_configuration,
+        "experiment Byzantine configuration");
+    if (!raw_additional_omission_configuration.empty())
+    {
+        const auto additional = parse_configuration(
+            raw_additional_omission_configuration,
+            "additional experiment omission configuration");
+        if (additional.epoch_number !=
+                options.configuration.epoch_number ||
+            additional.epoch_digest !=
+                options.configuration.epoch_digest)
+            throw HotStuffError(
+                "additional experiment omission configuration must "
+                "share the primary epoch and digest");
+        if (additional.tree_id == options.configuration.tree_id)
+            throw HotStuffError(
+                "additional experiment omission configuration must "
+                "use a distinct tree");
+        options.additional_omission_configuration = additional;
+    }
     options.diagnostic_window = diagnostic_window;
     if (!raw_false_report_target.empty())
     {
@@ -551,6 +584,8 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_experiment_byzantine_configuration =
         Config::OptValStr::create("");
+    auto opt_experiment_omission_additional_configuration =
+        Config::OptValStr::create("");
     auto opt_experiment_byzantine_window =
         Config::OptValStr::create("");
     auto opt_experiment_false_report_target =
@@ -699,6 +734,12 @@ int main(int argc, char **argv)
         -1,
         "exact epoch:tree:digest for experiment-only Byzantine faults");
     config.add_opt(
+        "experiment-omission-additional-configuration",
+        opt_experiment_omission_additional_configuration,
+        Config::SET_VAL,
+        -1,
+        "optional second exact epoch:tree:digest for aggregate omission");
+    config.add_opt(
         "experiment-byzantine-window",
         opt_experiment_byzantine_window,
         Config::SET_VAL,
@@ -787,6 +828,7 @@ int main(int argc, char **argv)
             static_cast<ReplicaID>(idx),
             replicas.size(),
             opt_experiment_byzantine_configuration->get(),
+            opt_experiment_omission_additional_configuration->get(),
             opt_experiment_byzantine_window->get(),
             opt_experiment_false_report_target->get(),
             opt_experiment_omit_outbound_aggregate->get(),

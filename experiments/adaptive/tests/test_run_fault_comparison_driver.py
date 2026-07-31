@@ -6,6 +6,7 @@ import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import copy
 
 import pytest
 
@@ -27,31 +28,37 @@ def _accepted_event(
     target_id: int = 1,
     block_hash: str = "a" * 64,
     outcome: str = "timeout",
+    tree_id: int | None = None,
+    observation_id: str = "b" * 64,
+    expected_message_type: str = "aggregate_relay",
+    source_sequence: int = 9,
+    ingestion_sequence: int = 7,
 ) -> dict[str, object]:
     driver = _driver()
+    selected_tree_id = driver.TREE_ID if tree_id is None else tree_id
     return {
         "event_schema_version": 1,
         "run_id": run_id,
         "source_kind": "adaptation_manager",
         "source_id": "adaptive-manager",
         "source_instance": "manager-instance-1",
-        "source_sequence": 9,
+        "source_sequence": source_sequence,
         "source_monotonic_ns": 1000,
         "event_type": driver.ACCEPTED_OBSERVATION_EVENT,
         "payload": {
-            "ingestion_sequence": 7,
+            "ingestion_sequence": ingestion_sequence,
             "observation": {
                 "schema_version": 1,
-                "observation_id": "b" * 64,
+                "observation_id": observation_id,
                 "reporter_id": reporter_id,
                 "observed_replica_id": target_id,
                 "configuration": {
                     "epoch_number": 0,
-                    "tree_id": driver.TREE_ID,
+                    "tree_id": selected_tree_id,
                     "epoch_digest": driver.EPOCH0_DIGEST,
                 },
                 "block_hash": block_hash,
-                "expected_message_type": "aggregate_relay",
+                "expected_message_type": expected_message_type,
                 "outcome": outcome,
                 "response_duration_us": (
                     0 if outcome == "timeout" else 250_000
@@ -63,6 +70,63 @@ def _accepted_event(
             },
         },
     }
+
+
+def _diagnostic_certificate(
+    *,
+    followup_outcome: str = "timeout",
+    include_followup: bool = True,
+) -> dict[str, object]:
+    driver = _driver()
+    api = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.passive_crosscheck"
+    )
+    scope = api.PassiveCrosscheckScope(
+        epoch_number=0,
+        epoch_digest=driver.EPOCH0_DIGEST,
+        target_id=driver.FALSE_REPORT_TARGET_ID,
+        expected_message_type="aggregate_relay",
+        phases=(
+            api.PassiveCrosscheckPhase(
+                tree_id=driver.TREE_ID,
+                reporter_id=driver.FALSE_REPORTER_ID,
+            ),
+            api.PassiveCrosscheckPhase(
+                tree_id=driver.FOLLOWUP_TREE_ID,
+                reporter_id=driver.FOLLOWUP_REPORTER_ID,
+            ),
+        ),
+        diagnostic_fault_bound=1,
+    )
+    observations = [
+        api.PassiveCrosscheckObservation(
+            observation_id="b" * 64,
+            reporter_id=driver.FALSE_REPORTER_ID,
+            target_id=driver.FALSE_REPORT_TARGET_ID,
+            epoch_number=0,
+            tree_id=driver.TREE_ID,
+            epoch_digest=driver.EPOCH0_DIGEST,
+            expected_message_type="aggregate_relay",
+            outcome="timeout",
+        )
+    ]
+    if include_followup:
+        observations.append(
+            api.PassiveCrosscheckObservation(
+                observation_id="d" * 64,
+                reporter_id=driver.FOLLOWUP_REPORTER_ID,
+                target_id=driver.FALSE_REPORT_TARGET_ID,
+                epoch_number=0,
+                tree_id=driver.FOLLOWUP_TREE_ID,
+                epoch_digest=driver.EPOCH0_DIGEST,
+                expected_message_type="aggregate_relay",
+                outcome=followup_outcome,
+            )
+        )
+    return api.build_passive_crosscheck_certificate(
+        scope,
+        observations,
+    )
 
 
 @pytest.mark.parametrize("arm_name", _driver().ARM_NAMES)
@@ -133,6 +197,44 @@ def test_byzantine_overlays_bind_only_faulty_replica_to_exact_tree6(
     ] == "3"
 
 
+def test_omission_overlay_carries_t6_and_t0_only_to_replica_one(
+    tmp_path: Path,
+) -> None:
+    driver = _driver()
+    arm = _arm("static_persistent_omission")
+
+    overlays = driver.replica_launch_overlays(arm, context_limit=3)
+    assert all(
+        overlays[replica_id] == ()
+        for replica_id in driver.REPLICA_IDS
+        if replica_id != driver.PERSISTENT_OMITTER_ID
+    )
+    omission = overlays[driver.PERSISTENT_OMITTER_ID]
+    assert omission[
+        omission.index("--experiment-byzantine-configuration") + 1
+    ] == driver.EXACT_CONFIGURATION
+    assert omission[
+        omission.index(
+            "--experiment-omission-additional-configuration"
+        )
+        + 1
+    ] == driver.FOLLOWUP_OMISSION_CONFIGURATION
+
+    bundle = driver.launch_bundle(
+        arm,
+        kauri_revision="a" * 40,
+        profile_path=tmp_path / "profile.json",
+        profile_sha256="b" * 64,
+        context_limit=3,
+    )
+    assert bundle["manager_overlay"] == []
+    assert all(
+        replica["argv"] == []
+        for replica in bundle["replica_overlays"]
+        if replica["replica_id"] != driver.PERSISTENT_OMITTER_ID
+    )
+
+
 def test_crash_arm_has_no_replica_or_manager_byzantine_overlay() -> None:
     driver = _driver()
     arm = _arm("sigkill_crash")
@@ -172,9 +274,18 @@ def test_launch_bundle_is_explicitly_claim_limited(tmp_path: Path) -> None:
         },
         "tree_id": 6,
         "tree_members_breadth_first": [6, 0, 1, 2, 3, 4, 5],
+        "followup_tree_id": 0,
+        "followup_reporter_id": 0,
+        "followup_tree_members_breadth_first": [0, 1, 2, 3, 4, 5, 6],
         "epoch0_digest": driver.EPOCH0_DIGEST,
         "diagnostic_window": driver.DIAGNOSTIC_WINDOW,
         "byzantine_context_limit": 5,
+        "passive_crosscheck": {
+            "ordering_basis": "manager_receipt_order",
+            "added_protocol_messages": 0,
+            "added_protocol_trees": 0,
+            "forced_tree_rotations": 0,
+        },
     }
     claims = bundle["claims_not_made"]
     assert any("diagnosis" in claim for claim in claims)
@@ -196,6 +307,22 @@ def test_pass_verdict_requires_all_modest_live_observations() -> None:
             "configuration": driver.EXACT_CONFIGURATION,
         },
         accepted_timeout_observation=_accepted_event(),
+        followup_manager_observation=_accepted_event(
+            reporter_id=driver.FOLLOWUP_REPORTER_ID,
+            block_hash="c" * 64,
+            outcome="timeout",
+            tree_id=driver.FOLLOWUP_TREE_ID,
+            observation_id="d" * 64,
+            source_sequence=10,
+            ingestion_sequence=8,
+        ),
+        diagnostic_certificate=_diagnostic_certificate(),
+        followup_omission_observation={
+            "kind": "aggregate_omitted",
+            "source_id": "replica-1",
+            "block_hash": "c" * 64,
+            "configuration": driver.FOLLOWUP_OMISSION_CONFIGURATION,
+        },
         before_commit={"block_height": 10, "block_hash": "1" * 64},
         after_commit={"block_height": 11, "block_hash": "2" * 64},
         fixed_quorum={
@@ -211,6 +338,40 @@ def test_pass_verdict_requires_all_modest_live_observations() -> None:
 
     assert verdict["verdict"] == "PASS"
     assert verdict["claims_not_made"] == list(driver.LIMITATIONS)
+
+
+def test_omission_verdict_refuses_t6_only_evidence() -> None:
+    driver = _driver()
+    verdict = driver.build_arm_verdict(
+        arm=_arm("static_persistent_omission"),
+        run_id="run-1",
+        kauri_revision="a" * 40,
+        action_observation={
+            "kind": "aggregate_omitted",
+            "source_id": "replica-1",
+            "block_hash": "a" * 64,
+            "configuration": driver.EXACT_CONFIGURATION,
+        },
+        accepted_timeout_observation=_accepted_event(),
+        followup_manager_observation=None,
+        diagnostic_certificate=_diagnostic_certificate(
+            include_followup=False,
+        ),
+        followup_omission_observation=None,
+        before_commit={"block_height": 10, "block_hash": "1" * 64},
+        after_commit={"block_height": 11, "block_hash": "2" * 64},
+        fixed_quorum={
+            "configured_replica_count": 7,
+            "configured_fault_threshold": 2,
+            "configured_quorum": 5,
+            "active_configuration_records": 7,
+            "invalid_records": [],
+        },
+        conflicts=(),
+        runtime_error=None,
+    )
+
+    assert verdict["verdict"] == "INCOMPLETE"
 
 
 @pytest.mark.parametrize(
@@ -423,6 +584,266 @@ def test_malformed_manager_accepted_timeout_fails_closed() -> None:
             run_id="run-1",
             block_hash="a" * 64,
         )
+
+
+@pytest.mark.parametrize(
+    ("manager_outcome", "settled_hypothesis"),
+    (
+        (
+            "on_time",
+            {
+                "false_reporters": [6],
+                "persistent_omitters": [],
+            },
+        ),
+        (
+            "timeout",
+            {
+                "false_reporters": [],
+                "persistent_omitters": [1],
+            },
+        ),
+    ),
+)
+def test_exact_t0_manager_crosscheck_builds_settled_certificate(
+    manager_outcome: str,
+    settled_hypothesis: dict[str, list[int]],
+) -> None:
+    driver = _driver()
+    initial = _accepted_event()
+    followup = _accepted_event(
+        reporter_id=driver.FOLLOWUP_REPORTER_ID,
+        block_hash="c" * 64,
+        outcome=manager_outcome,
+        tree_id=driver.FOLLOWUP_TREE_ID,
+        observation_id="d" * 64,
+        source_sequence=10,
+        ingestion_sequence=8,
+    )
+    runner = SimpleNamespace(
+        _event_timestamp=lambda candidate: candidate[
+            "source_monotonic_ns"
+        ]
+    )
+
+    found = driver.find_manager_followup_observation(
+        runner,
+        {"adaptive-manager": [initial, followup]},
+        run_id="run-1",
+        initial_observation=initial,
+    )
+    certificate = driver.build_live_diagnostic_certificate(
+        initial,
+        found,
+    )
+
+    assert found == followup
+    assert certificate["status"] == "settled"
+    assert certificate["settled_hypothesis"] == settled_hypothesis
+
+
+def test_timeout_late_transition_cannot_enter_diagnostic_certificate() -> None:
+    driver = _driver()
+    initial = _accepted_event()
+    late = _accepted_event(
+        outcome="late",
+        source_sequence=10,
+        ingestion_sequence=8,
+    )
+    late["payload"]["observation"]["response_duration_us"] = 600_000
+    runner = SimpleNamespace(
+        _event_timestamp=lambda candidate: candidate[
+            "source_monotonic_ns"
+        ]
+    )
+
+    with pytest.raises(driver.ComparisonRunError, match="not final"):
+        driver.find_manager_accepted_timeout(
+            runner,
+            {"adaptive-manager": [initial, late]},
+            run_id="run-1",
+            block_hash="a" * 64,
+        )
+
+
+def test_mixed_t0_outcomes_cannot_settle_static_diagnosis() -> None:
+    driver = _driver()
+    initial = _accepted_event()
+    response = _accepted_event(
+        reporter_id=driver.FOLLOWUP_REPORTER_ID,
+        block_hash="c" * 64,
+        outcome="on_time",
+        tree_id=driver.FOLLOWUP_TREE_ID,
+        observation_id="d" * 64,
+        source_sequence=10,
+        ingestion_sequence=8,
+    )
+    timeout = _accepted_event(
+        reporter_id=driver.FOLLOWUP_REPORTER_ID,
+        block_hash="e" * 64,
+        outcome="timeout",
+        tree_id=driver.FOLLOWUP_TREE_ID,
+        observation_id="f" * 64,
+        source_sequence=11,
+        ingestion_sequence=9,
+    )
+    runner = SimpleNamespace(
+        _event_timestamp=lambda candidate: candidate[
+            "source_monotonic_ns"
+        ]
+    )
+
+    with pytest.raises(driver.ComparisonRunError, match="conflicting"):
+        driver.find_manager_followup_observation(
+            runner,
+            {"adaptive-manager": [initial, response, timeout]},
+            run_id="run-1",
+            initial_observation=initial,
+        )
+
+
+def test_preinitial_t0_does_not_block_later_ordered_crosscheck() -> None:
+    driver = _driver()
+    earlier = _accepted_event(
+        reporter_id=driver.FOLLOWUP_REPORTER_ID,
+        block_hash="c" * 64,
+        outcome="on_time",
+        tree_id=driver.FOLLOWUP_TREE_ID,
+        observation_id="d" * 64,
+        source_sequence=8,
+        ingestion_sequence=6,
+    )
+    initial = _accepted_event()
+    later = _accepted_event(
+        reporter_id=driver.FOLLOWUP_REPORTER_ID,
+        block_hash="e" * 64,
+        outcome="on_time",
+        tree_id=driver.FOLLOWUP_TREE_ID,
+        observation_id="f" * 64,
+        source_sequence=10,
+        ingestion_sequence=8,
+    )
+    runner = SimpleNamespace(
+        _event_timestamp=lambda candidate: candidate[
+            "source_monotonic_ns"
+        ]
+    )
+
+    assert driver.find_manager_followup_observation(
+        runner,
+        {"adaptive-manager": [earlier, initial, later]},
+        run_id="run-1",
+        initial_observation=initial,
+    ) == later
+
+
+def test_t0_boundary_must_follow_selected_t6_for_every_replica() -> None:
+    driver = _driver()
+
+    def boundary(tree_id: int, sequence: int, timestamp: int):
+        return {
+            "epoch_number": 0,
+            "tree_id": tree_id,
+            "root_replica": tree_id,
+            "epoch_digest": driver.EPOCH0_DIGEST,
+            "context_generation": None,
+            "replica_evidence": [
+                {
+                    "source_id": f"replica-{replica}",
+                    "source_sequence": sequence,
+                    "source_monotonic_ns": timestamp + replica,
+                }
+                for replica in driver.REPLICA_IDS
+            ],
+        }
+
+    with pytest.raises(driver.ComparisonRunError, match="follow T6"):
+        driver.require_followup_configuration_boundary(
+            boundary(driver.TREE_ID, 12, 1_200),
+            boundary(driver.FOLLOWUP_TREE_ID, 11, 1_100),
+        )
+
+    assert driver.require_followup_configuration_boundary(
+        boundary(driver.TREE_ID, 12, 1_200),
+        boundary(driver.FOLLOWUP_TREE_ID, 13, 1_300),
+    ) == {
+        f"replica-{replica}": 12
+        for replica in driver.REPLICA_IDS
+    }
+
+
+def test_omission_context_bound_is_shared_across_t6_and_t0() -> None:
+    driver = _driver()
+
+    assert driver.require_shared_omission_context_bound(
+        {"matching_line_count": 4},
+        {"matching_line_count": 4},
+        context_limit=8,
+    ) == 8
+    with pytest.raises(driver.ComparisonRunError, match="shared.*bound"):
+        driver.require_shared_omission_context_bound(
+            {"matching_line_count": 5},
+            {"matching_line_count": 4},
+            context_limit=8,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_path", "value"),
+    (
+        (("run_id",), "other-run"),
+        (("source_id",), "replica-0"),
+        (("payload", "observation", "signer_set"), []),
+    ),
+)
+def test_verdict_rejects_noncanonical_followup_manager_envelope(
+    field_path: tuple[str, ...],
+    value: object,
+) -> None:
+    driver = _driver()
+    initial = _accepted_event()
+    followup = _accepted_event(
+        reporter_id=driver.FOLLOWUP_REPORTER_ID,
+        block_hash="c" * 64,
+        outcome="on_time",
+        tree_id=driver.FOLLOWUP_TREE_ID,
+        observation_id="d" * 64,
+        source_sequence=10,
+        ingestion_sequence=8,
+    )
+    corrupted = copy.deepcopy(followup)
+    target = corrupted
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = value
+
+    verdict = driver.build_arm_verdict(
+        arm=_arm("static_authenticated_false_report"),
+        run_id="run-1",
+        kauri_revision="a" * 40,
+        action_observation={
+            "kind": "false_timeout_emitted",
+            "source_id": "replica-6",
+            "block_hash": "a" * 64,
+            "configuration": driver.EXACT_CONFIGURATION,
+        },
+        accepted_timeout_observation=initial,
+        followup_manager_observation=corrupted,
+        diagnostic_certificate=_diagnostic_certificate(
+            followup_outcome="response",
+        ),
+        followup_omission_observation=None,
+        before_commit={"block_height": 10, "block_hash": "1" * 64},
+        after_commit={"block_height": 11, "block_hash": "2" * 64},
+        fixed_quorum={
+            "configured_quorum": 5,
+            "invalid_records": [],
+        },
+        conflicts=(),
+        runtime_error=None,
+    )
+
+    assert verdict["verdict"] == "INCOMPLETE"
 
 
 def test_conflicting_commit_scan_reports_only_same_height_hash_split() -> None:

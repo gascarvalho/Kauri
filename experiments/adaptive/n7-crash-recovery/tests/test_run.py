@@ -759,6 +759,101 @@ def test_configuration_poller_tails_fresh_events_incrementally(
     assert len(boundary["replica_evidence"]) == 7
 
 
+def test_common_configuration_boundary_selects_requested_historical_tree() -> None:
+    watermarks = {f"replica-{replica}": 10 for replica in range(7)}
+    streams = {
+        f"replica-{replica}": [
+            _configuration_active_event(
+                replica=replica,
+                sequence=11,
+                timestamp_ns=1_000_000_000 + replica,
+                tree=0,
+            ),
+            _configuration_active_event(
+                replica=replica,
+                sequence=12,
+                timestamp_ns=1_100_000_000 + replica,
+                tree=1,
+            ),
+        ]
+        for replica in range(7)
+    }
+
+    boundary = campaign.common_active_configuration_boundary(
+        streams,
+        minimum_source_sequences=watermarks,
+        epoch_number=0,
+        tree_id=0,
+        root_replica=0,
+        members_breadth_first=(0, 1, 2, 3, 4, 5, 6),
+        fanout=2,
+        maximum_skew_ns=500_000_000,
+        observed_ns=1_200_000_000,
+        allow_later_configurations=True,
+    )
+
+    assert boundary is not None
+    assert boundary["tree_id"] == 0
+    assert {
+        reference["source_sequence"]
+        for reference in boundary["replica_evidence"]
+    } == {11}
+
+
+def test_configuration_poller_accepts_exact_followup_tree(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for replica in range(7):
+        path = raw / f"replica-{replica}.jsonl"
+        path.write_text(
+            json.dumps(
+                _configuration_active_event(
+                    replica=replica,
+                    sequence=1,
+                    timestamp_ns=100_000_000 + replica,
+                    tree=6,
+                ),
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    watermarks, offsets = campaign.replica_event_tail_snapshot(tmp_path)
+    poller = campaign.FreshConfigurationPoller(
+        tmp_path,
+        watermarks,
+        start_offsets=offsets,
+        maximum_skew_ns=500_000_000,
+        epoch_number=0,
+        tree_id=0,
+        root_replica=0,
+        members_breadth_first=(0, 1, 2, 3, 4, 5, 6),
+        fanout=2,
+        allow_later_configurations=True,
+        clock_ns=lambda: 1_100_000_000,
+    )
+    for replica in range(7):
+        event = _configuration_active_event(
+            replica=replica,
+            sequence=2,
+            timestamp_ns=1_000_000_000 + replica,
+            tree=0,
+        )
+        with (raw / f"replica-{replica}.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+    boundary = poller.poll()
+
+    assert boundary is not None
+    assert boundary["tree_id"] == 0
+    assert boundary["root_replica"] == 0
+
+
 def test_crash_injection_targets_only_registered_replica_groups() -> None:
     records = {replica: _record(replica, -signal.SIGKILL) for replica in range(7)}
     killed: list[tuple[int, int]] = []

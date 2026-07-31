@@ -33,6 +33,18 @@ bool exact_context(
            context.diagnostic_window == options.diagnostic_window;
 }
 
+bool exact_omission_context(
+    const ExperimentByzantineOptions &options,
+    const ExperimentByzantineContext &context) noexcept
+{
+    return options.enabled &&
+           context.diagnostic_window == options.diagnostic_window &&
+           (context.proposal.configuration == options.configuration ||
+            (options.additional_omission_configuration.has_value() &&
+             context.proposal.configuration ==
+                 *options.additional_omission_configuration));
+}
+
 } // namespace
 
 struct ExperimentByzantineAdapter::State
@@ -46,6 +58,11 @@ struct ExperimentByzantineAdapter::State
     explicit State(ExperimentByzantineOptions configured)
         : options(std::move(configured))
     {
+        if (options.additional_omission_configuration.has_value() &&
+            (!options.enabled || !options.omit_outbound_aggregate))
+            throw std::invalid_argument(
+                "additional omission configuration requires enabled "
+                "aggregate omission");
         if (!options.enabled)
             return;
         if (options.diagnostic_window.empty())
@@ -63,6 +80,22 @@ struct ExperimentByzantineAdapter::State
             options.maximum_omission_contexts == 0)
             throw std::invalid_argument(
                 "omission context bound must be positive");
+        if (options.additional_omission_configuration.has_value())
+        {
+            const auto &additional =
+                *options.additional_omission_configuration;
+            if (additional.epoch_number !=
+                    options.configuration.epoch_number ||
+                additional.epoch_digest !=
+                    options.configuration.epoch_digest)
+                throw std::invalid_argument(
+                    "additional omission configuration must share the "
+                    "primary epoch and digest");
+            if (additional.tree_id == options.configuration.tree_id)
+                throw std::invalid_argument(
+                    "additional omission configuration must use a "
+                    "distinct tree");
+        }
     }
 
     ExperimentByzantineOptions options;
@@ -158,7 +191,7 @@ bool ExperimentByzantineAdapter::consume_outbound_aggregate(
     const ExperimentByzantineContext &context)
 {
     if (!state_->options.omit_outbound_aggregate ||
-        !exact_context(state_->options, context))
+        !exact_omission_context(state_->options, context))
         return false;
     if (state_->omissions.find(context) != state_->omissions.end())
         return true;

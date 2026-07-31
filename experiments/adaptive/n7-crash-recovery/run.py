@@ -2041,6 +2041,26 @@ def _validate_crash_tree_roles(
             )
 
 
+def _validate_configuration_tree_roles(
+    members_breadth_first: Sequence[int],
+    *,
+    fanout: int,
+    root_replica: int,
+) -> None:
+    members = tuple(members_breadth_first)
+    if (
+        members != tuple(dict.fromkeys(members))
+        or set(members) != set(REPLICA_IDS)
+        or fanout != 2
+        or root_replica not in REPLICA_IDS
+        or not members
+        or members[0] != root_replica
+    ):
+        raise RunnerError(
+            "configuration boundary must use one frozen N=7 breadth-first tree"
+        )
+
+
 def _active_configuration_payload(
     event: Mapping[str, Any],
     *,
@@ -2097,12 +2117,23 @@ def common_active_configuration_boundary(
     fanout: int,
     maximum_skew_ns: int,
     observed_ns: int,
+    allow_later_configurations: bool = False,
 ) -> dict[str, Any] | None:
-    _validate_crash_tree_roles(
+    _validate_configuration_tree_roles(
         members_breadth_first,
         fanout=fanout,
         root_replica=root_replica,
     )
+    if tree_id == 6:
+        _validate_crash_tree_roles(
+            members_breadth_first,
+            fanout=fanout,
+            root_replica=root_replica,
+        )
+    if not isinstance(allow_later_configurations, bool):
+        raise RunnerError(
+            "configuration boundary history policy must be boolean"
+        )
     if maximum_skew_ns <= 0 or observed_ns <= 0:
         raise RunnerError("configuration boundary clocks must be positive")
     expected_sources = {f"replica-{replica}" for replica in REPLICA_IDS}
@@ -2122,10 +2153,21 @@ def common_active_configuration_boundary(
         ]
         if not candidates:
             return None
-        event = candidates[-1]
-        payload = _active_configuration_payload(event, replica=replica)
-        if payload.get("epoch_number") != epoch_number or payload.get("tree_id") != tree_id:
+        validated = [
+            (event, _active_configuration_payload(event, replica=replica))
+            for event in candidates
+        ]
+        matching = [
+            (event, payload)
+            for event, payload in validated
+            if payload.get("epoch_number") == epoch_number
+            and payload.get("tree_id") == tree_id
+        ]
+        if not matching:
             return None
+        if not allow_later_configurations and matching[-1][0] is not candidates[-1]:
+            return None
+        event, payload = matching[-1]
         sequence = _source_sequence(event)
         timestamp = _event_timestamp(event)
         if timestamp > observed_ns:
@@ -2164,6 +2206,12 @@ class FreshConfigurationPoller:
         *,
         start_offsets: Mapping[str, int],
         maximum_skew_ns: int,
+        epoch_number: int = 0,
+        tree_id: int = 6,
+        root_replica: int = 6,
+        members_breadth_first: Sequence[int] = (6, 0, 1, 2, 3, 4, 5),
+        fanout: int = 2,
+        allow_later_configurations: bool = False,
         clock_ns: Callable[[], int] = monotonic_raw_ns,
     ) -> None:
         self._paths = {
@@ -2176,6 +2224,27 @@ class FreshConfigurationPoller:
         ):
             raise RunnerError("configuration poller requires seven source cursors")
         self._maximum_skew_ns = maximum_skew_ns
+        self._epoch_number = epoch_number
+        self._tree_id = tree_id
+        self._root_replica = root_replica
+        self._members_breadth_first = tuple(members_breadth_first)
+        self._fanout = fanout
+        self._allow_later_configurations = allow_later_configurations
+        _validate_configuration_tree_roles(
+            self._members_breadth_first,
+            fanout=self._fanout,
+            root_replica=self._root_replica,
+        )
+        if self._tree_id == 6:
+            _validate_crash_tree_roles(
+                self._members_breadth_first,
+                fanout=self._fanout,
+                root_replica=self._root_replica,
+            )
+        if not isinstance(self._allow_later_configurations, bool):
+            raise RunnerError(
+                "configuration poller history policy must be boolean"
+            )
         self._clock_ns = clock_ns
         self._offsets = dict(start_offsets)
         if any(type(offset) is not int or offset < 0 for offset in self._offsets.values()):
@@ -2228,13 +2297,14 @@ class FreshConfigurationPoller:
         candidate = common_active_configuration_boundary(
             self._events,
             minimum_source_sequences=self._minimum,
-            epoch_number=0,
-            tree_id=6,
-            root_replica=6,
-            members_breadth_first=(6, 0, 1, 2, 3, 4, 5),
-            fanout=2,
+            epoch_number=self._epoch_number,
+            tree_id=self._tree_id,
+            root_replica=self._root_replica,
+            members_breadth_first=self._members_breadth_first,
+            fanout=self._fanout,
             maximum_skew_ns=self._maximum_skew_ns,
             observed_ns=observed_ns,
+            allow_later_configurations=self._allow_later_configurations,
         )
         if candidate is None:
             return None
@@ -2244,13 +2314,14 @@ class FreshConfigurationPoller:
         return common_active_configuration_boundary(
             self._events,
             minimum_source_sequences=self._minimum,
-            epoch_number=0,
-            tree_id=6,
-            root_replica=6,
-            members_breadth_first=(6, 0, 1, 2, 3, 4, 5),
-            fanout=2,
+            epoch_number=self._epoch_number,
+            tree_id=self._tree_id,
+            root_replica=self._root_replica,
+            members_breadth_first=self._members_breadth_first,
+            fanout=self._fanout,
             maximum_skew_ns=self._maximum_skew_ns,
             observed_ns=self._clock_ns(),
+            allow_later_configurations=self._allow_later_configurations,
         )
 
 

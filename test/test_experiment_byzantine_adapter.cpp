@@ -49,6 +49,7 @@ struct ExperimentByzantineOptions final
 {
     bool enabled{false};
     ConfigurationId configuration;
+    std::optional<ConfigurationId> additional_omission_configuration;
     std::string diagnostic_window;
     std::optional<ReplicaID> false_report_target;
     bool omit_outbound_aggregate{false};
@@ -386,6 +387,65 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "persistent omission accepts one additional exact configuration only",
+    "[adaptive-v2][experiment][byzantine][omission][crosscheck]")
+{
+    auto options = enabled_options();
+    options.configuration = configuration(7, 6, "shared-epoch");
+    options.additional_omission_configuration =
+        configuration(7, 0, "shared-epoch");
+    options.maximum_omission_contexts = 2;
+    ExperimentByzantineAdapter adapter(options);
+
+    const auto primary = context(
+        "tree-6-aggregate",
+        configuration(7, 6, "shared-epoch"));
+    const auto followup = context(
+        "tree-0-aggregate",
+        configuration(7, 0, "shared-epoch"));
+
+    CHECK(adapter.consume_outbound_aggregate(primary));
+    CHECK(adapter.consume_outbound_aggregate(followup));
+
+    // The additional configuration is omission-only. False reporting remains
+    // exact to the primary configuration selected for the injected reporter.
+    CHECK(adapter.arm_false_report(primary, 4));
+    CHECK_FALSE(adapter.arm_false_report(followup, 4));
+    CHECK_FALSE(adapter.on_verified_response(followup, 4));
+    CHECK_FALSE(adapter.consume_false_timeout(followup, 4));
+
+    CHECK_FALSE(adapter.consume_outbound_aggregate(context(
+        "wrong-epoch",
+        configuration(8, 0, "shared-epoch"))));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(context(
+        "wrong-digest",
+        configuration(7, 0, "other-epoch"))));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(context(
+        "wrong-tree",
+        configuration(7, 1, "shared-epoch"))));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(context(
+        "wrong-window",
+        configuration(7, 0, "shared-epoch"),
+        "diagnostic-window-2")));
+}
+
+TEST_CASE(
+    "additional omission configuration stays optional",
+    "[adaptive-v2][experiment][byzantine][omission][crosscheck]")
+{
+    auto options = enabled_options();
+    options.configuration = configuration(7, 6, "shared-epoch");
+    ExperimentByzantineAdapter adapter(options);
+
+    CHECK(adapter.consume_outbound_aggregate(context(
+        "tree-6-aggregate",
+        configuration(7, 6, "shared-epoch"))));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(context(
+        "tree-0-aggregate",
+        configuration(7, 0, "shared-epoch"))));
+}
+
+TEST_CASE(
     "experiment Byzantine ground truth has no adaptation-manager seam",
     "[adaptive-v2][experiment][byzantine][manager-isolation]")
 {
@@ -429,6 +489,10 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         declarations.find(
+            "opt_experiment_omission_additional_configuration") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
             "opt_experiment_byzantine_window") !=
         std::string::npos);
     CHECK(
@@ -455,6 +519,10 @@ TEST_CASE(
 
     CHECK(
         application.find("\"experiment-byzantine-configuration\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-omission-additional-configuration\"") !=
         std::string::npos);
     CHECK(
         application.find("\"experiment-byzantine-window\"") !=

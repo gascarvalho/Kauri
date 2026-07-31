@@ -7,6 +7,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+from experiments.adaptive.kauri_experiment import (
+    diagnostic_game_evaluation as evaluation_module,
+)
 from experiments.adaptive.kauri_experiment.diagnostic_game_evaluation import (
     canonical_evaluation_json,
     evaluate_minimax_rematching,
@@ -154,6 +157,23 @@ def test_evaluation_records_tight_bound_and_ambiguity_tax() -> None:
         "worst_case_robust_safe_role_value_delta": 1,
         "worst_case_surviving_hypotheses_delta": 0,
     }
+
+
+def test_frozen_n7_aggregate_only_schedule_audit_is_tight() -> None:
+    audit = evaluation_module.aggregate_only_schedule_audit()
+
+    assert audit["replica_count"] == 7
+    assert audit["exposures_per_target"] == [2] * 7
+    assert audit["sequential_schedule"] == list(range(7))
+    assert audit["sequential_worst_gap"] == 6
+    assert audit["stride2_schedule"] == [0, 2, 4, 6, 1, 3, 5]
+    assert audit["stride2_worst_gap"] == 4
+    assert audit["lower_bound"] == 4
+    assert audit["exhaustive_minimum"] == 4
+    assert audit["normalized_optimal_schedules"] == [
+        [0, 2, 4, 6, 1, 3, 5],
+        [0, 5, 3, 1, 6, 4, 2],
+    ]
 
 
 def test_evaluation_is_canonical_and_rejects_invalid_revision() -> None:
