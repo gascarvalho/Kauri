@@ -69,7 +69,11 @@ FOLLOWUP_REPORTER_ID = 0
 FOLLOWUP_TREE_MEMBERS_BREADTH_FIRST = (0, 1, 2, 3, 4, 5, 6)
 SNAPSHOT_SEED = 0xA2F7
 DIAGNOSTIC_WINDOW = "n7-epoch0-tree6-tree0-static-v1"
-DEFAULT_CONTEXT_LIMIT = 8
+# The frozen T6 -> T0 window can consume several pipelined proposal contexts
+# before the second reporter's aggregation deadline matures.  Keep the
+# injector finite, but large enough that the omission mode cannot expire
+# inside the diagnostic window under the frozen N=7 profile.
+DEFAULT_CONTEXT_LIMIT = 32
 AUTHORITATIVE_SOURCE_ID = "replica-2"
 MANAGER_SOURCE_ID = "adaptive-manager"
 
