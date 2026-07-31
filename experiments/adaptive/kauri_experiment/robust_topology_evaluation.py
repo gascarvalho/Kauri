@@ -28,6 +28,9 @@ from .diagnosis import (
     DiagnosticOutcome,
     FaultHypothesis,
 )
+from .passive_reconfiguration_evaluation import (
+    run_passive_reconfiguration_game_evaluation,
+)
 from .robust_topology import (
     JointFaultHypothesis,
     KauriTreeCandidate,
@@ -37,7 +40,7 @@ from .robust_topology import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 N7_MEMBERSHIP = tuple(range(7))
 N7_SAFE_ROOT = 6
 N7_FANOUT = 2
@@ -78,6 +81,11 @@ CLAIMS_NOT_MADE = (
     "the scalar lower bound applies to deterministic marginal-only placement",
     "the N=5 reachable audit is a diagnostic submodel, not a BFT deployment",
     "the bounded literature search does not establish global novelty",
+    "finite-horizon active diagnosis and minimax games are established prior art",
+    "the N=31 lookahead witness is synthetic and its equal latency is modeled",
+    "the N=31 strict gap uses a declared coarsened outcome abstraction",
+    "the finite-horizon selector is not wired into live Kauri epoch activation",
+    "the exact lookahead solver is exponential in compatible hypotheses",
 )
 
 
@@ -590,17 +598,23 @@ def evaluate_robust_topology(
         "kauri_revision": kauri_revision,
         "revision_verification": revision_verification,
         "claim": (
-            "For deterministic Kauri placement, retaining joint compatible "
-            "fault hypotheses can strictly reduce worst-case tree exposure "
-            "compared with retaining only per-replica marginals; among "
-            "equally robust and equally fast trees, existing-traffic "
-            "outcomes can then improve diagnosis without extra messages."
+            "Retaining joint compatible fault hypotheses can strictly "
+            "reduce worst-case Kauri tree exposure compared with retaining "
+            "only per-replica marginals. Among trees tied for minimum "
+            "exposure and predicted latency, finite-horizon planning can "
+            "also strictly reduce worst-case fault ambiguity relative to "
+            "greedy one-epoch selection using existing-traffic outcomes, "
+            "while a shared outcome under every tree certifies one passive "
+            "identification impossibility condition."
         ),
         "correlation_gap": run_correlation_gap_evaluation(),
         "reachable_diagnosis_collision": (
             run_reachable_diagnosis_collision_evaluation()
         ),
         "passive_diagnosis": run_passive_diagnosis_evaluation(),
+        "passive_reconfiguration_game": (
+            run_passive_reconfiguration_game_evaluation()
+        ),
         "exhaustive_minimax_audit": run_exhaustive_minimax_audit(),
         "claims_not_made": list(CLAIMS_NOT_MADE),
     }
