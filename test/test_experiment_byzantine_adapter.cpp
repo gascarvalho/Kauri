@@ -644,14 +644,17 @@ TEST_CASE(
     const auto bounded_state =
         false_timeout.find("experiment_false_timeout_states.size()");
     const auto real_deadline =
-        false_timeout.find("aggregation_scheduler->schedule_after");
+        false_timeout.find("schedule_at_or_after_deadline");
+    const auto monotonic_deadline =
+        false_timeout.find("aggregation_scheduler->monotonic_now()");
     const auto consume =
         false_timeout.find("consume_false_timeout");
     const auto record = false_timeout.find("record_timeouts");
     const auto recorded_guard =
         false_timeout.find("if (recorded == 1)", record);
     const auto deadline_retire = false_timeout.find("->retire(key)");
-    const auto failure_boundary = false_timeout.find("catch (...)");
+    const auto failure_boundary =
+        false_timeout.find("catch (...)", deadline_retire);
     const auto empty_schedule =
         false_timeout.find("if (!cancellation)");
     const auto rollback =
@@ -668,6 +671,7 @@ TEST_CASE(
             release_commit);
     REQUIRE(bounded_state != std::string::npos);
     REQUIRE(real_deadline != std::string::npos);
+    REQUIRE(monotonic_deadline != std::string::npos);
     REQUIRE(consume != std::string::npos);
     REQUIRE(record != std::string::npos);
     REQUIRE(recorded_guard != std::string::npos);
@@ -680,6 +684,7 @@ TEST_CASE(
     REQUIRE(fail_closed != std::string::npos);
     REQUIRE(nonconsumed_cleanup != std::string::npos);
     CHECK(bounded_state < real_deadline);
+    CHECK(monotonic_deadline < real_deadline);
     CHECK(real_deadline < consume);
     CHECK(consume < record);
     CHECK(record < recorded_guard);

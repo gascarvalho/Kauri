@@ -1359,6 +1359,10 @@ namespace hotstuff
             const ProposalKey &key,
             ReplicaID target,
             AggregationScheduler::Duration delay);
+        void dispatch_experiment_false_timeout(
+            const ProposalKey &key,
+            ReplicaID target,
+            std::string window);
         void cancel_experiment_false_timeout(
             const ProposalKey &key,
             ReplicaID target,

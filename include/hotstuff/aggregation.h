@@ -37,6 +37,16 @@ public:
                                         Callback callback) = 0;
 };
 
+// Run an effect only after an absolute monotonic deadline. Some event-loop
+// timers may wake slightly early, so an early callback is rearmed for the
+// exact remaining duration. The optional failure callback runs once if any
+// scheduling attempt is rejected.
+AggregationScheduler::Cancellation schedule_at_or_after_deadline(
+    AggregationScheduler &scheduler,
+    AggregationScheduler::Duration deadline,
+    AggregationScheduler::Callback callback,
+    AggregationScheduler::Callback failure_callback = {});
+
 class AggregationTimeoutEffects
 {
 public:

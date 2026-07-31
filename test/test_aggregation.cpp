@@ -564,6 +564,54 @@ TEST_CASE("A06 early timer callbacks wait for the strict deadline",
     CHECK_FALSE(scheduler.pending());
 }
 
+TEST_CASE("A06 generic strict deadline timer rearms and cancels",
+          "[a06][aggregation][control][clock][deadline]")
+{
+    EarlyAggregationScheduler scheduler;
+    const auto deadline = std::chrono::milliseconds(10);
+    std::size_t calls = 0;
+    std::size_t failures = 0;
+
+    auto cancel = schedule_at_or_after_deadline(
+        scheduler,
+        deadline,
+        [&calls]() { ++calls; },
+        [&failures]() { ++failures; });
+    REQUIRE(cancel);
+    REQUIRE(scheduler.pending());
+    CHECK(scheduler.delay() == deadline);
+
+    scheduler.fire_after(deadline - std::chrono::nanoseconds(1));
+
+    CHECK(calls == 0);
+    CHECK(failures == 0);
+    REQUIRE(scheduler.pending());
+    CHECK(scheduler.delay() == std::chrono::nanoseconds(1));
+
+    scheduler.fire_after(std::chrono::nanoseconds(1));
+
+    CHECK(calls == 1);
+    CHECK(failures == 0);
+    CHECK_FALSE(scheduler.pending());
+    cancel();
+    CHECK(calls == 1);
+
+    const auto second_deadline =
+        scheduler.monotonic_now() + deadline;
+    cancel = schedule_at_or_after_deadline(
+        scheduler,
+        second_deadline,
+        [&calls]() { ++calls; },
+        [&failures]() { ++failures; });
+    REQUIRE(cancel);
+    scheduler.fire_after(deadline - std::chrono::nanoseconds(1));
+    REQUIRE(scheduler.pending());
+    cancel();
+    CHECK_FALSE(scheduler.pending());
+    CHECK(calls == 1);
+    CHECK(failures == 0);
+}
+
 TEST_CASE("A06 lifecycle timer generations are exact-key isolated",
           "[a06][aggregation][control][generation][configuration]")
 {

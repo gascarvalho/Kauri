@@ -10,6 +10,165 @@
 
 namespace hotstuff
 {
+namespace
+{
+
+class StrictDeadlineSchedule final
+    : public std::enable_shared_from_this<StrictDeadlineSchedule>
+{
+public:
+    using Callback = AggregationScheduler::Callback;
+    using Cancellation = AggregationScheduler::Cancellation;
+    using Duration = AggregationScheduler::Duration;
+
+    StrictDeadlineSchedule(
+        AggregationScheduler &scheduler,
+        Duration deadline,
+        Callback callback,
+        Callback failure_callback)
+        : scheduler_(scheduler),
+          deadline_(deadline),
+          callback_(std::move(callback)),
+          failure_callback_(std::move(failure_callback))
+    {}
+
+    bool start() noexcept
+    {
+        return schedule_or_dispatch();
+    }
+
+    void cancel() noexcept
+    {
+        stop(false);
+    }
+
+private:
+    bool schedule_or_dispatch() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopped_)
+                return true;
+        }
+
+        const auto now = scheduler_.monotonic_now();
+        if (now >= deadline_)
+        {
+            Callback callback;
+            Cancellation cancellation;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stopped_)
+                    return true;
+                stopped_ = true;
+                callback = std::move(callback_);
+                failure_callback_ = {};
+                cancellation = std::move(cancellation_);
+            }
+            if (cancellation)
+                cancellation();
+            try
+            {
+                if (callback)
+                    callback();
+            }
+            catch (...)
+            {}
+            return true;
+        }
+
+        Cancellation cancellation;
+        try
+        {
+            const auto self = shared_from_this();
+            cancellation = scheduler_.schedule_after(
+                deadline_ - now,
+                [self]() { static_cast<void>(self->schedule_or_dispatch()); });
+        }
+        catch (...)
+        {
+            stop(true);
+            return false;
+        }
+        if (!cancellation)
+        {
+            stop(true);
+            return false;
+        }
+
+        Cancellation cancel_now;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopped_)
+                cancel_now = std::move(cancellation);
+            else
+                cancellation_ = std::move(cancellation);
+        }
+        if (cancel_now)
+            cancel_now();
+        return true;
+    }
+
+    void stop(bool failed) noexcept
+    {
+        Callback failure_callback;
+        Cancellation cancellation;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopped_)
+                return;
+            stopped_ = true;
+            callback_ = {};
+            if (failed)
+                failure_callback = std::move(failure_callback_);
+            else
+                failure_callback_ = {};
+            cancellation = std::move(cancellation_);
+        }
+        try
+        {
+            if (cancellation)
+                cancellation();
+        }
+        catch (...)
+        {}
+        try
+        {
+            if (failure_callback)
+                failure_callback();
+        }
+        catch (...)
+        {}
+    }
+
+    AggregationScheduler &scheduler_;
+    Duration deadline_;
+    Callback callback_;
+    Callback failure_callback_;
+    std::mutex mutex_;
+    Cancellation cancellation_;
+    bool stopped_{false};
+};
+
+} // namespace
+
+AggregationScheduler::Cancellation schedule_at_or_after_deadline(
+    AggregationScheduler &scheduler,
+    AggregationScheduler::Duration deadline,
+    AggregationScheduler::Callback callback,
+    AggregationScheduler::Callback failure_callback)
+{
+    if (!callback)
+        return {};
+    auto state = std::make_shared<StrictDeadlineSchedule>(
+        scheduler,
+        deadline,
+        std::move(callback),
+        std::move(failure_callback));
+    if (!state->start())
+        return {};
+    return [state]() { state->cancel(); };
+}
 
 class AggregationTimeoutCoordinator::ScheduledCancellation final
 {
