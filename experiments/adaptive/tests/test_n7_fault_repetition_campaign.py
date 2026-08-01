@@ -699,6 +699,48 @@ def test_runner_executes_the_frozen_rotated_15_slot_schedule(
         evidence_root=output,
     ) == observed
 
+    relocated = tmp_path / "relocated-n7-repetitions"
+    output.rename(relocated)
+    assert not output.exists()
+    assert validate_n7_fault_repetition_campaign(
+        comparison,
+        observed,
+        evidence_root=relocated,
+    ) == observed
+
+    first_record = binding["execution_records"][0]
+    recorded_results_root = Path(first_record["results_root"])
+    recorded_verdict = Path(first_record["arm_verdict"]["path"])
+    relative_verdict = recorded_verdict.relative_to(recorded_results_root)
+    relocated_verdict = (
+        relocated / recorded_results_root.name / relative_verdict
+    )
+    outside_verdict = tmp_path / "outside-arm-verdict.json"
+    relocated_verdict.rename(outside_verdict)
+    relocated_verdict.symlink_to(outside_verdict)
+    with pytest.raises(
+        campaign_module.N7FaultRepetitionCampaignError,
+        match="verdict path escapes the campaign",
+    ):
+        validate_n7_fault_repetition_campaign(
+            comparison,
+            observed,
+            evidence_root=relocated,
+        )
+
+    relocated_verdict.unlink()
+    outside_verdict.rename(relocated_verdict)
+    relocated_verdict.write_bytes(relocated_verdict.read_bytes() + b"\n")
+    with pytest.raises(
+        campaign_module.N7FaultRepetitionCampaignError,
+        match="raw verdict hash changed",
+    ):
+        validate_n7_fault_repetition_campaign(
+            comparison,
+            observed,
+            evidence_root=relocated,
+        )
+
 
 def test_runner_never_retries_and_preserves_a_missing_verdict(
     repository_root: Path,

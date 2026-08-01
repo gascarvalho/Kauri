@@ -828,9 +828,19 @@ def _verify_bound_evidence_files(
             record.get("arm_verdict"),
             f"execution record {ordinal} verdict binding",
         )
-        verdict_path = Path(str(verdict_binding["path"]))
+        recorded_results_root = Path(str(record["results_root"]))
+        recorded_verdict_path = Path(str(verdict_binding["path"]))
+        expected_results_root_name = f"attempt-{ordinal:02d}-results"
         try:
-            verdict_path.resolve(strict=True).relative_to(root)
+            if recorded_results_root.name != expected_results_root_name:
+                raise ValueError("unexpected results-root name")
+            relative_verdict_path = recorded_verdict_path.resolve(
+                strict=False
+            ).relative_to(recorded_results_root.resolve(strict=False))
+            verdict_path = (
+                root / expected_results_root_name / relative_verdict_path
+            ).resolve(strict=True)
+            verdict_path.relative_to(root)
         except (OSError, ValueError) as error:
             raise N7FaultRepetitionCampaignError(
                 f"execution record {ordinal} verdict path escapes the campaign"
