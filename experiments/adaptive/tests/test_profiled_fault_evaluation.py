@@ -387,6 +387,44 @@ def test_internal1_profile_changes_only_the_controlled_crash_position() -> None:
     assert internal1.retry_failed_attempts is False
 
 
+def test_internal1_handoff_diagnostic_changes_only_identity_metadata() -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    control_path = profiles / "n31-f5-internal1-crash-shakedown-v1.json"
+    diagnostic_path = (
+        profiles / "n31-f5-internal1-handoff-diagnostic-v1.json"
+    )
+    control_document = json.loads(control_path.read_text(encoding="utf-8"))
+    diagnostic_document = json.loads(
+        diagnostic_path.read_text(encoding="utf-8")
+    )
+    control_fault = control_document.pop("fault")
+    diagnostic_fault = diagnostic_document.pop("fault")
+    control_document.pop("profile_id")
+    diagnostic_document.pop("profile_id")
+    control_fault.pop("fault_id")
+    diagnostic_fault.pop("fault_id")
+
+    assert diagnostic_document == control_document
+    assert diagnostic_fault == control_fault
+
+    control = api.load_frozen_profile(control_path)
+    diagnostic = api.load_frozen_profile(diagnostic_path)
+
+    runtime.require_shipped_profile(diagnostic)
+    assert diagnostic.profile_id == (
+        "n31-f5-q21-internal1-handoff-diagnostic-v1"
+    )
+    assert diagnostic.fault.fault_id == (
+        "single-internal-replica1-handoff-diagnostic"
+    )
+    assert diagnostic.fault.replica_id == control.fault.replica_id == 1
+    assert diagnostic.profile_sha256 == (
+        "daea7057ef840706dfc8d060c1fdcac538a54a23850084b5eb84ca431eab61c6"
+    )
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:
