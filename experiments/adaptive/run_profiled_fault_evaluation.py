@@ -29,17 +29,14 @@ EXPECTED_PROFILE_ID = "n31-f5-q21-sigkill-shakedown-v1"
 EXPECTED_PROFILE_SHA256 = (
     "2ce1bcc8e8f6af3201710d34b23cd66c70d05a7658b7ec737e35b5a35e73bcfa"
 )
+EXPECTED_PROFILES = runtime.SHIPPED_PROFILES
 
 
 def _verify_shipped_profile(profile_path: Path) -> None:
     profile = load_frozen_profile(profile_path)
-    if profile.profile_id != EXPECTED_PROFILE_ID:
+    if EXPECTED_PROFILES.get(profile.profile_id) != profile.profile_sha256:
         raise runtime.ProfiledFaultRuntimeError(
-            "profile ID does not match the shipped N31 profile"
-        )
-    if profile.profile_sha256 != EXPECTED_PROFILE_SHA256:
-        raise runtime.ProfiledFaultRuntimeError(
-            "profile SHA-256 does not match the shipped N31 profile"
+            "profile ID and SHA-256 do not match a shipped N31 profile"
         )
 
 

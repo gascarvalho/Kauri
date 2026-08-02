@@ -13,6 +13,11 @@ import pytest
 SHIPPED_PROFILE = (
     Path(__file__).parents[1] / "profiles" / "n31-f5-crash-shakedown-v1.json"
 )
+INTERNAL1_PROFILE = (
+    Path(__file__).parents[1]
+    / "profiles"
+    / "n31-f5-internal1-crash-shakedown-v1.json"
+)
 
 
 def _api():
@@ -299,13 +304,13 @@ def test_transition_request_is_zero_residency_fault_containment() -> None:
     ]
 
 
-def test_cli_pins_the_exact_shipped_profile() -> None:
+@pytest.mark.parametrize("profile_path", (SHIPPED_PROFILE, INTERNAL1_PROFILE))
+def test_cli_pins_the_exact_shipped_profiles(profile_path: Path) -> None:
     runner = _runner()
-    profile = _api().load_frozen_profile(SHIPPED_PROFILE)
+    profile = _api().load_frozen_profile(profile_path)
 
-    assert runner.EXPECTED_PROFILE_ID == profile.profile_id
-    assert runner.EXPECTED_PROFILE_SHA256 == profile.profile_sha256
-    runner._verify_shipped_profile(SHIPPED_PROFILE)
+    assert runner.EXPECTED_PROFILES[profile.profile_id] == profile.profile_sha256
+    runner._verify_shipped_profile(profile_path)
 
 
 def test_n31_config_and_argv_cardinality(tmp_path: Path) -> None:

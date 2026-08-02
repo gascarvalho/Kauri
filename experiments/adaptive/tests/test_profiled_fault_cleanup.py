@@ -139,7 +139,11 @@ def test_cleanup_continues_after_one_group_signal_error(
 
     monkeypatch.setattr(runtime.os, "killpg", killpg)
 
-    ledger, started_ns = runtime.concurrent_cleanup(records, post_end_ns=80)
+    ledger, started_ns = runtime.concurrent_cleanup(
+        records,
+        faulted_replica_id=0,
+        post_end_ns=80,
+    )
 
     assert started_ns == 90_000_000_000
     assert any(pgid == second.pid for pgid, _ in sent)
@@ -176,10 +180,33 @@ def test_cleanup_never_signals_a_drifted_process_group(
 
     monkeypatch.setattr(runtime.os, "killpg", killpg)
 
-    ledger, _ = runtime.concurrent_cleanup(records, post_end_ns=80)
+    ledger, _ = runtime.concurrent_cleanup(
+        records,
+        faulted_replica_id=0,
+        post_end_ns=80,
+    )
 
     assert drifted.pid not in sent
     assert healthy.pid in sent
     drifted_row = next(row for row in ledger if row["name"] == "replica-1")
     assert drifted_row["classification"] == "unexpected_exit"
     assert "identity changed" in " ".join(drifted_row["cleanup_errors"])
+
+
+def test_cleanup_classifies_the_profile_selected_fault_replica(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    crashed = _Process(8301)
+    crashed.returncode = -signal.SIGKILL
+    record = runtime.ProcessRecord("replica-1", 1, 8301, 8301, crashed)
+    monkeypatch.setattr(runtime, "monotonic_raw_ns", lambda: 90_000_000_000)
+    monkeypatch.setattr(runtime.os, "getpgrp", lambda: 7000)
+
+    ledger, _ = runtime.concurrent_cleanup(
+        (record,),
+        faulted_replica_id=1,
+        post_end_ns=80,
+    )
+
+    assert ledger[0]["classification"] == "expected_fault"

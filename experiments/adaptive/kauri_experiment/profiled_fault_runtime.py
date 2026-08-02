@@ -51,6 +51,14 @@ SHIPPED_PROFILE_ID = "n31-f5-q21-sigkill-shakedown-v1"
 SHIPPED_PROFILE_SHA256 = (
     "2ce1bcc8e8f6af3201710d34b23cd66c70d05a7658b7ec737e35b5a35e73bcfa"
 )
+INTERNAL1_PROFILE_ID = "n31-f5-q21-internal1-sigkill-shakedown-v1"
+INTERNAL1_PROFILE_SHA256 = (
+    "0defdaa9b69c949365eea3b3029da75cee3ea8334f845401103e2f7af8507650"
+)
+SHIPPED_PROFILES = {
+    SHIPPED_PROFILE_ID: SHIPPED_PROFILE_SHA256,
+    INTERNAL1_PROFILE_ID: INTERNAL1_PROFILE_SHA256,
+}
 EXPECTED_EPOCH_ZERO_DIGEST = (
     "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
 )
@@ -110,10 +118,7 @@ class IncompleteProfiledFaultRun(ProfiledFaultRuntimeError):
 
 
 def require_shipped_profile(profile: FrozenProfile) -> None:
-    if (
-        profile.profile_id != SHIPPED_PROFILE_ID
-        or profile.profile_sha256 != SHIPPED_PROFILE_SHA256
-    ):
+    if SHIPPED_PROFILES.get(profile.profile_id) != profile.profile_sha256:
         raise ProfiledFaultRuntimeError(
             "live runtime requires the exact shipped frozen profile bytes"
         )
@@ -1807,6 +1812,7 @@ def wait_for_fixed_postfault_window(
 def concurrent_cleanup(
     records: Sequence[ProcessRecord],
     *,
+    faulted_replica_id: int,
     post_end_ns: int | None,
 ) -> tuple[list[dict[str, object]], int]:
     cleanup_started_ns = monotonic_raw_ns()
@@ -1903,7 +1909,10 @@ def concurrent_cleanup(
     ledger: list[dict[str, object]] = []
     for record in records:
         returncode = record.process.poll()
-        if record.replica_id == 0 and returncode == -signal.SIGKILL:
+        if (
+            record.replica_id == faulted_replica_id
+            and returncode == -signal.SIGKILL
+        ):
             classification = "expected_fault"
         elif record.name == MANAGER_SOURCE_ID and sent[record.name] and returncode == 1:
             classification = "expected_cleanup"
@@ -3097,7 +3106,9 @@ def run_once(
         try:
             if records:
                 cleanup_ledger, cleanup_started_ns = concurrent_cleanup(
-                    records, post_end_ns=post_end_ns
+                    records,
+                    faulted_replica_id=profile.fault.replica_id,
+                    post_end_ns=post_end_ns,
                 )
                 unexpected_cleanup = []
                 for item in cleanup_ledger:

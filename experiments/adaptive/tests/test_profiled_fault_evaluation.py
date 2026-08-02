@@ -326,6 +326,67 @@ def test_shipped_profile_pins_runtime_and_external_q21_witnesses() -> None:
     )
 
 
+def test_internal1_profile_changes_only_the_controlled_crash_position() -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    original_path = profiles / "n31-f5-crash-shakedown-v1.json"
+    internal1_path = profiles / "n31-f5-internal1-crash-shakedown-v1.json"
+    original_document = json.loads(original_path.read_text(encoding="utf-8"))
+    internal1_document = json.loads(internal1_path.read_text(encoding="utf-8"))
+    original_fault = original_document.pop("fault")
+    internal1_fault = internal1_document.pop("fault")
+    original_document.pop("profile_id")
+    internal1_document.pop("profile_id")
+    original_fault.pop("fault_id")
+    internal1_fault.pop("fault_id")
+    original_fault.pop("replica_id")
+    internal1_fault.pop("replica_id")
+
+    assert internal1_document == original_document
+    assert internal1_fault == original_fault
+
+    original = api.load_frozen_profile(original_path)
+    internal1 = api.load_frozen_profile(internal1_path)
+
+    runtime.require_shipped_profile(internal1)
+    assert internal1.profile_id == "n31-f5-q21-internal1-sigkill-shakedown-v1"
+    assert internal1.fault.fault_id == "single-internal-replica1-sigkill"
+    assert internal1.fault.replica_id == 1
+    assert internal1.fault.tree_id == 30
+    assert internal1.crash_subtree == (1, 10, 11, 12, 13, 14)
+    assert api.postfault_witnesses(internal1) == (
+        0,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+    )
+    assert internal1.aggregation_timeout_s == original.aggregation_timeout_s == 0.5
+    assert internal1.replica_ids == original.replica_ids
+    assert internal1.quorum == original.quorum == 21
+    assert internal1.fanout == original.fanout == 5
+    assert internal1.pipeline_depth == original.pipeline_depth == 2
+    assert internal1.attempt_count == 1
+    assert internal1.retry_failed_attempts is False
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:

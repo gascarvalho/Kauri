@@ -729,6 +729,7 @@ def test_review_manager_cleanup_requires_exit_one(
         monkeypatch.setattr(runtime.os, "killpg", killpg)
         ledger, _ = runtime.concurrent_cleanup(
             (record,),
+            faulted_replica_id=0,
             post_end_ns=POST_END_NS,
         )
         return str(ledger[0]["classification"])
