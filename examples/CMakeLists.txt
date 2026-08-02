@@ -21,6 +21,7 @@
 add_executable(hotstuff-app hotstuff_app.cpp)
 add_executable(hotstuff-client hotstuff_client.cpp)
 add_executable(adaptation-manager adaptation_manager.cpp)
+add_executable(epoch-profile-digest epoch_profile_digest.cpp)
 
 target_compile_options(hotstuff-app PUBLIC -Wl,-no_pie)
 target_compile_options(hotstuff-client PUBLIC -Wl,-no_pie)
@@ -56,5 +57,21 @@ target_include_directories(adaptation-manager PUBLIC ../bls/src)
 
 TARGET_LINK_LIBRARIES(
     adaptation-manager PRIVATE
+    ${GMP_LIBRARIES} ${GMPXX_LIBRARIES}
+    hotstuff_static blstmp relic_s pthread sodium)
+
+target_include_directories(
+    epoch-profile-digest PUBLIC ${relic_BINARY_DIR}/include)
+target_include_directories(
+    epoch-profile-digest PUBLIC ${relic_SOURCE_DIR}/include)
+target_include_directories(epoch-profile-digest PUBLIC ${GMP_INCLUDES})
+target_include_directories(
+    epoch-profile-digest PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../bls/contrib/catch)
+target_include_directories(epoch-profile-digest PUBLIC ${INCLUDE_DIRECTORIES})
+target_include_directories(epoch-profile-digest PUBLIC ../bls/src)
+
+TARGET_LINK_LIBRARIES(
+    epoch-profile-digest PRIVATE
     ${GMP_LIBRARIES} ${GMPXX_LIBRARIES}
     hotstuff_static blstmp relic_s pthread sodium)

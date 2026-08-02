@@ -44,6 +44,7 @@
 #include "salticidae/util.h"
 
 #include "hotstuff/adaptation_manager.h"
+#include "hotstuff/adaptation_manager_profile.h"
 #include "hotstuff/adaptive_v2_convergence_ack_wire.h"
 #include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/structured_event.h"
@@ -64,15 +65,13 @@ using hotstuff::AdaptiveV2ManagerSessionConfig;
 using hotstuff::AdaptiveV2ConvergenceAckDisposition;
 using hotstuff::AdaptiveV2ConvergenceObservationAck;
 using hotstuff::AdaptiveV2ConvergenceObservationKind;
-using hotstuff::AdaptiveV2ManagerIngressLimits;
 using hotstuff::AdaptiveV2ManagerIngressStatus;
+using hotstuff::AdaptiveV2ManagerRuntimeShape;
 using hotstuff::AdaptiveV2TransitionPolicy;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::DataStream;
-using hotstuff::EpochChangeBundleLimits;
 using hotstuff::EpochDefinitionInput;
 using hotstuff::EpochTreeDefinition;
-using hotstuff::EpochWireLimits;
 using hotstuff::MsgAdaptiveV2EpochChangeBundle;
 using hotstuff::MsgAdaptiveV2EpochChangeCommittedObservation;
 using hotstuff::MsgAdaptiveV2EpochActivatedObservation;
@@ -84,7 +83,6 @@ using hotstuff::PrivKeySecp256k1;
 using hotstuff::ReplicaID;
 using hotstuff::TreePlacementInput;
 using hotstuff::TreePolicyKind;
-using hotstuff::TreeShape;
 using hotstuff::bytearray_t;
 using hotstuff::opcode_t;
 using salticidae::Config;
@@ -94,21 +92,10 @@ using salticidae::PeerId;
 
 using ManagerNetwork = salticidae::PeerNetwork<opcode_t>;
 
-constexpr std::size_t kSmokeReplicaCount = 7;
-constexpr std::uint32_t kSmokeFaultThreshold = 2;
-constexpr std::uint32_t kSmokeQuorum = 5;
 constexpr std::uint32_t kInitialTreeId = 0;
 constexpr std::uint64_t kInitialActivationGeneration = 1;
 constexpr std::uint64_t kSnapshotSeed = 0xA2F7;
 constexpr std::uint32_t kTimeoutsPerReporter = 2;
-constexpr std::uint32_t kMinimumScoreDrop =
-    (kSmokeFaultThreshold + 1) * kTimeoutsPerReporter;
-constexpr std::size_t kMaximumExactProposals = 8192;
-constexpr std::size_t kMaximumEvidenceRecords = 131072;
-constexpr std::size_t kMaximumQuarantinedRecords = 1024;
-constexpr std::size_t kMaximumQuarantinedBytes = 256 * 1024;
-constexpr std::size_t kMaximumQuarantinedSignerEntries = 8192;
-constexpr std::size_t kMaximumQuarantinedPerReporter = 128;
 constexpr std::uint64_t kConvergenceRetryIntervalTicks = 1;
 constexpr std::uint32_t kConvergenceMaximumAttempts = 5;
 constexpr std::uint64_t kConvergenceTicksPerSecond = 10;
@@ -127,8 +114,6 @@ constexpr opcode_t kCommittedObservationOpcode =
     MsgAdaptiveV2EpochChangeCommittedObservation::opcode;
 constexpr opcode_t kActivatedObservationOpcode =
     MsgAdaptiveV2EpochActivatedObservation::opcode;
-
-static_assert(kMinimumScoreDrop == 6);
 
 struct ReplicaEndpoint
 {
@@ -173,6 +158,8 @@ struct ManagerOptions
     bytearray_t tls_certificate_der;
     PeerId local_peer_id;
     std::vector<ReplicaEndpoint> replicas;
+    std::vector<ReplicaID> membership;
+    AdaptiveV2ManagerRuntimeShape runtime_shape;
     hotstuff::EpochChangeIssuerId issuer_id{0};
     PrivKeySecp256k1 issuer_private_key;
     std::uint64_t activation_delay_blocks{5};
@@ -217,8 +204,13 @@ Value parse_unsigned(
 class TransitionJsonParser final
 {
 public:
-    explicit TransitionJsonParser(const std::string &text)
-        : text_(text)
+    TransitionJsonParser(
+        const std::string &text,
+        std::uint32_t replica_count,
+        std::uint32_t tree_count)
+        : text_(text),
+          replica_count_(replica_count),
+          tree_count_(tree_count)
     {
         if (text_.empty() ||
             text_.size() > kMaximumTransitionRequestBytes)
@@ -522,7 +514,7 @@ private:
                 expect(',');
             first = false;
             roots.push_back(parse_baseline_root());
-            if (roots.size() > kSmokeQuorum)
+            if (roots.size() > tree_count_)
                 fail("too many containment baseline roots");
         }
         return roots;
@@ -549,7 +541,7 @@ private:
                 unknown(key);
         }
         if (!tree_id || !replica_id ||
-            *replica_id >= kSmokeReplicaCount)
+            *replica_id >= replica_count_)
         {
             fail("invalid containment baseline root");
         }
@@ -559,13 +551,13 @@ private:
     void validate_containment_roots(
         const std::vector<hotstuff::BaselineRoot> &roots)
     {
-        if (roots.size() != kSmokeQuorum)
+        if (roots.size() != tree_count_)
             fail("containment requires one baseline root per tree");
         std::set<std::uint32_t> tree_ids;
         std::set<ReplicaID> replica_ids;
         for (const auto &root : roots)
         {
-            if (root.tree_id >= kSmokeQuorum ||
+            if (root.tree_id >= tree_count_ ||
                 !tree_ids.insert(root.tree_id).second ||
                 !replica_ids.insert(root.replica_id).second)
             {
@@ -573,7 +565,7 @@ private:
             }
         }
         for (std::uint32_t tree_id = 0;
-             tree_id < kSmokeQuorum;
+             tree_id < tree_count_;
              ++tree_id)
         {
             if (tree_ids.count(tree_id) == 0)
@@ -582,16 +574,25 @@ private:
     }
 
     const std::string &text_;
+    std::uint32_t replica_count_{0};
+    std::uint32_t tree_count_{0};
     std::size_t position_{0};
 };
 
-TransitionRequest parse_transition_request(const std::string &text)
+TransitionRequest parse_transition_request(
+    const std::string &text,
+    const AdaptiveV2ManagerRuntimeShape &runtime_shape)
 {
-    return TransitionJsonParser(text).parse();
+    return TransitionJsonParser(
+        text,
+        runtime_shape.quorum.replica_count,
+        runtime_shape.tree_shape.tree_count)
+        .parse();
 }
 
 ExperimentBundleAttempt parse_experiment_bundle_attempt(
-    const std::string &text)
+    const std::string &text,
+    std::uint32_t replica_count)
 {
     const auto separator = text.find(':');
     if (separator == std::string::npos || separator == 0 ||
@@ -607,7 +608,7 @@ ExperimentBundleAttempt parse_experiment_bundle_attempt(
     const auto attempt = parse_unsigned<std::uint32_t>(
         text.substr(separator + 1),
         "experiment bundle attempt", true);
-    if (recipient >= kSmokeReplicaCount ||
+    if (recipient >= replica_count ||
         attempt > kConvergenceMaximumAttempts)
     {
         throw std::invalid_argument(
@@ -665,78 +666,28 @@ ReplicaEndpoint parse_replica_endpoint(const std::string &raw)
         PeerId(certificate)};
 }
 
-std::vector<ReplicaID> smoke_membership()
+EpochDefinitionInput manager_epoch_zero(const ManagerOptions &options)
 {
-    std::vector<ReplicaID> membership;
-    membership.reserve(kSmokeReplicaCount);
-    for (std::size_t index = 0; index < kSmokeReplicaCount; ++index)
-        membership.push_back(static_cast<ReplicaID>(index));
-    return membership;
-}
-
-EpochDefinitionInput smoke_epoch_zero()
-{
-    const auto membership = smoke_membership();
-    std::vector<EpochTreeDefinition> trees;
-    trees.reserve(membership.size());
-    for (std::uint32_t root = 0; root < membership.size(); ++root)
+    auto epoch = hotstuff::derive_adaptive_v2_cyclic_epoch_zero(
+        options.membership,
+        options.runtime_shape.tree_shape.fanout,
+        options.runtime_shape.tree_shape.pipeline_stretch);
+    if (!epoch.has_value())
     {
-        std::vector<ReplicaID> breadth_first;
-        breadth_first.reserve(membership.size());
-        for (std::size_t offset = 0;
-             offset < membership.size();
-             ++offset)
-        {
-            breadth_first.push_back(static_cast<ReplicaID>(
-                (root + offset) % membership.size()));
-        }
-        trees.push_back(EpochTreeDefinition{
-            root, 2, 2, std::move(breadth_first), {}});
+        throw std::logic_error(
+            "validated manager shape cannot derive canonical epoch zero");
     }
-    return hotstuff::adaptive_v2_epoch_zero_input(
-        membership, std::move(trees));
+    return std::move(*epoch);
 }
 
-AdaptiveV2ManagerIngressLimits smoke_ingress_limits()
-{
-    AdaptiveV2ManagerIngressLimits limits;
-    limits.maximum_members = kSmokeReplicaCount;
-    limits.readiness_wire.maximum_payload_bytes = 256;
-    limits.lifecycle_wire.maximum_payload_bytes = 512;
-    limits.evidence_wire = {4096, 8, kSmokeReplicaCount};
-    limits.proposal_index = {kMaximumExactProposals, 16};
-    limits.evidence_store = {
-        kMaximumEvidenceRecords, kMaximumEvidenceRecords};
-    limits.lifecycle = {
-        kMaximumQuarantinedRecords,
-        kMaximumQuarantinedBytes,
-        kSmokeReplicaCount,
-        kMaximumQuarantinedSignerEntries,
-        kMaximumQuarantinedRecords,
-        kSmokeReplicaCount,
-        kMaximumQuarantinedPerReporter};
-    limits.lifecycle_accounting = {
-        kMaximumQuarantinedRecords,
-        kMaximumQuarantinedBytes,
-        kMaximumQuarantinedSignerEntries};
-    limits.maximum_pending_lifecycle_facts_per_source = 64;
-    return limits;
-}
-
-EpochChangeBundleLimits smoke_bundle_limits()
-{
-    return {
-        64 * 1024,
-        4096,
-        EpochWireLimits{32 * 1024, 8, 8, 128, 2}};
-}
-
-AdaptiveV2ManagerControllerConfig smoke_controller_config(
+AdaptiveV2ManagerControllerConfig manager_controller_config(
     const ManagerOptions &options)
 {
     AdaptiveV2ManagerControllerConfig config;
-    config.selection.required_nonresponsive = kSmokeFaultThreshold;
-    config.selection.minimum_score_drop = kMinimumScoreDrop;
+    config.selection.required_nonresponsive =
+        options.runtime_shape.required_nonresponsive;
+    config.selection.minimum_score_drop =
+        options.runtime_shape.minimum_score_drop;
     config.selection.minimum_timeouts_per_reporter =
         kTimeoutsPerReporter;
     config.selection.maximum_post_baseline_timeout_attempts = 128;
@@ -753,27 +704,28 @@ AdaptiveV2ManagerControllerConfig smoke_controller_config(
         .latency_percentile_basis_points = 5'000;
     config.selection.snapshot_seed = kSnapshotSeed;
     config.reputation_limits.maximum_audit_updates =
-        kMaximumEvidenceRecords;
+        options.runtime_shape.ingress_limits.evidence_store
+            .maximum_accepted_records;
     config.placement = TreePlacementInput{
-        smoke_membership(),
-        TreeShape{2, 2, 5},
+        options.membership,
+        options.runtime_shape.tree_shape,
         kSnapshotSeed,
         "adaptive-v2-performance-optimization-v1"};
     config.activation_delay_blocks = options.activation_delay_blocks;
     config.issuer_id = options.issuer_id;
     config.issuer_private_key = options.issuer_private_key;
-    config.bundle_limits = smoke_bundle_limits();
+    config.bundle_limits = options.runtime_shape.bundle_limits;
     return config;
 }
 
-AdaptiveV2ManagerSessionConfig smoke_session_config(
+AdaptiveV2ManagerSessionConfig manager_session_config(
     const ManagerOptions &options)
 {
     AdaptiveV2ManagerSessionConfig config;
     config.active_tree_id = kInitialTreeId;
     config.activation_generation = kInitialActivationGeneration;
-    config.ingress_limits = smoke_ingress_limits();
-    config.controller = smoke_controller_config(options);
+    config.ingress_limits = options.runtime_shape.ingress_limits;
+    config.controller = manager_controller_config(options);
     config.retry_interval_ticks = kConvergenceRetryIntervalTicks;
     config.maximum_attempts_per_recipient =
         kConvergenceMaximumAttempts;
@@ -1068,6 +1020,8 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_activation_delay = Config::OptValStr::create("5");
     auto opt_convergence_deadline_seconds =
         Config::OptValStr::create("12");
+    auto opt_tree_fanout = Config::OptValStr::create("2");
+    auto opt_pipeline_stretch = Config::OptValStr::create("2");
     auto opt_transition_requests = Config::OptValStrVec::create();
     auto opt_bundle_outputs = Config::OptValStrVec::create();
     auto opt_structured_event_run_id = Config::OptValStr::create();
@@ -1094,6 +1048,10 @@ ManagerOptions parse_options(int argc, char **argv)
         "convergence-deadline-seconds",
         opt_convergence_deadline_seconds,
         Config::SET_VAL);
+    config.add_opt(
+        "tree-fanout", opt_tree_fanout, Config::SET_VAL);
+    config.add_opt(
+        "pipeline-stretch", opt_pipeline_stretch, Config::SET_VAL);
     config.add_opt(
         "transition-request", opt_transition_requests, Config::APPEND);
     config.add_opt(
@@ -1164,6 +1122,51 @@ ManagerOptions parse_options(int argc, char **argv)
     }
     options.convergence_deadline_ticks =
         convergence_deadline_seconds * kConvergenceTicksPerSecond;
+
+    for (const auto &raw : opt_replicas->get())
+        options.replicas.push_back(parse_replica_endpoint(raw));
+    std::sort(
+        options.replicas.begin(), options.replicas.end(),
+        [](const auto &left, const auto &right) {
+            return left.replica_id < right.replica_id;
+        });
+
+    std::set<ReplicaID> ids;
+    std::set<PeerId> peer_ids;
+    std::set<std::string> addresses;
+    options.membership.reserve(options.replicas.size());
+    for (std::size_t index = 0;
+         index < options.replicas.size();
+         ++index)
+    {
+        const auto &replica = options.replicas[index];
+        if (index > std::numeric_limits<ReplicaID>::max() ||
+            replica.replica_id != static_cast<ReplicaID>(index) ||
+            !ids.insert(replica.replica_id).second ||
+            !peer_ids.insert(replica.peer_id).second ||
+            !addresses.insert(std::string(replica.address)).second ||
+            replica.peer_id == options.local_peer_id)
+        {
+            throw std::invalid_argument(
+                "replica IDs, addresses, and TLS identities must be exact and unique");
+        }
+        options.membership.push_back(replica.replica_id);
+    }
+
+    const auto tree_fanout = parse_unsigned<std::uint32_t>(
+        opt_tree_fanout->get(), "tree fanout", true);
+    const auto pipeline_stretch = parse_unsigned<std::uint32_t>(
+        opt_pipeline_stretch->get(), "pipeline stretch", true);
+    const auto runtime_shape =
+        hotstuff::derive_adaptive_v2_manager_runtime_shape(
+            options.membership, tree_fanout, pipeline_stretch);
+    if (!runtime_shape.has_value())
+    {
+        throw std::invalid_argument(
+            "replicas and topology must define a bounded contiguous N=3f+1 adaptive-v2 manager shape");
+    }
+    options.runtime_shape = *runtime_shape;
+
     const auto &raw_transition_requests =
         opt_transition_requests->get();
     const auto &bundle_outputs = opt_bundle_outputs->get();
@@ -1183,7 +1186,7 @@ ManagerOptions parse_options(int argc, char **argv)
          ++index)
     {
         auto request = parse_transition_request(
-            raw_transition_requests[index]);
+            raw_transition_requests[index], options.runtime_shape);
         request.bundle_output = bundle_outputs[index];
         if (request.bundle_output.size() >=
             request.declared_bundle_path.size())
@@ -1284,14 +1287,15 @@ ManagerOptions parse_options(int argc, char **argv)
     {
         options.experiment_drop_bundle_attempt =
             parse_experiment_bundle_attempt(
-                opt_experiment_drop_bundle_attempt->get());
+                opt_experiment_drop_bundle_attempt->get(),
+                options.runtime_shape.quorum.replica_count);
     }
     if (!opt_experiment_drop_activation_ack->get().empty())
     {
         const auto ordinal = parse_unsigned<std::uint32_t>(
             opt_experiment_drop_activation_ack->get(),
             "experiment activation ACK ordinal", true);
-        if (ordinal != kSmokeQuorum)
+        if (ordinal != options.runtime_shape.quorum.quorum)
         {
             throw std::invalid_argument(
                 "experiment activation ACK ordinal must equal quorum");
@@ -1299,48 +1303,6 @@ ManagerOptions parse_options(int argc, char **argv)
         options.experiment_drop_activation_ack = ordinal;
     }
 
-    for (const auto &raw : opt_replicas->get())
-        options.replicas.push_back(parse_replica_endpoint(raw));
-    if (options.replicas.size() != kSmokeReplicaCount)
-    {
-        throw std::invalid_argument(
-            "the frozen smoke manager requires exactly seven replicas");
-    }
-    std::sort(
-        options.replicas.begin(), options.replicas.end(),
-        [](const auto &left, const auto &right) {
-            return left.replica_id < right.replica_id;
-        });
-
-    std::set<ReplicaID> ids;
-    std::set<PeerId> peer_ids;
-    std::set<std::string> addresses;
-    for (std::size_t index = 0;
-         index < options.replicas.size();
-         ++index)
-    {
-        const auto &replica = options.replicas[index];
-        if (replica.replica_id != index ||
-            !ids.insert(replica.replica_id).second ||
-            !peer_ids.insert(replica.peer_id).second ||
-            !addresses.insert(std::string(replica.address)).second ||
-            replica.peer_id == options.local_peer_id)
-        {
-            throw std::invalid_argument(
-                "replica IDs, addresses, and TLS identities must be exact and unique");
-        }
-    }
-
-    const auto quorum = hotstuff::derive_byzantine_quorum(
-        options.replicas.size());
-    if (!quorum.has_value() ||
-        quorum->replica_count != kSmokeReplicaCount ||
-        quorum->fault_threshold != kSmokeFaultThreshold ||
-        quorum->quorum != kSmokeQuorum)
-    {
-        throw std::logic_error(
-            "the frozen smoke manager must preserve N=7, f=2, Q=5");
-    }
     return options;
 }
 
@@ -1373,9 +1335,9 @@ public:
           options_(std::move(options)),
           network_(event_context_, net_config),
           session_(
-              smoke_membership(),
-              smoke_epoch_zero(),
-              smoke_session_config(options_)),
+              options_.membership,
+              manager_epoch_zero(options_),
+              manager_session_config(options_)),
           request_sequence_(transition_policies(options_)),
           structured_event_sink_(structured_event_sink)
     {
@@ -1465,8 +1427,14 @@ public:
             if (!failed_)
             {
                 HOTSTUFF_LOG_INFO(
-                    "KAURI_ADAPTIVE_MANAGER listening=%s n=7 f=2 quorum=5",
-                    std::string(options_.listen_address).c_str());
+                    "KAURI_ADAPTIVE_MANAGER listening=%s n=%u f=%u quorum=%u "
+                    "fanout=%u pipeline_stretch=%u",
+                    std::string(options_.listen_address).c_str(),
+                    options_.runtime_shape.quorum.replica_count,
+                    options_.runtime_shape.quorum.fault_threshold,
+                    options_.runtime_shape.quorum.quorum,
+                    options_.runtime_shape.tree_shape.fanout,
+                    options_.runtime_shape.tree_shape.pipeline_stretch);
                 emit_process_lifecycle(
                     hotstuff::ProcessLifecycleState::ready);
                 structured_event_drain_timer.add(0.05);
@@ -1592,7 +1560,8 @@ private:
                         : convergence->accepted_activation_count;
             }
         }
-        event.required_activation_count = kSmokeQuorum;
+        event.required_activation_count =
+            options_.runtime_shape.quorum.quorum;
         event.canonical_payload_digest =
             std::move(canonical_payload_digest);
         event.failure_reason = failure_reason;
@@ -2160,7 +2129,7 @@ private:
                 payload.successor_epoch_number,
                 payload.successor_epoch_digest.to_hex().c_str(),
                 bundle->canonical_bytes().size(),
-                kSmokeQuorum);
+                options_.runtime_shape.quorum.quorum);
             drive_convergence();
         }
         catch (const std::exception &error)

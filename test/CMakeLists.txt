@@ -341,6 +341,13 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;adaptation-manager;m12"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_adaptation_manager_profile
+    test_adaptation_manager_profile.cpp)
+set_tests_properties(
+    test_adaptation_manager_profile PROPERTIES
+    LABELS "unit;adaptive;adaptation-manager;manager-profile;n7;n31"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_simple_reputation
     test_simple_reputation.cpp)
 set_tests_properties(
