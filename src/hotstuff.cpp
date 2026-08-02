@@ -3074,18 +3074,62 @@ namespace hotstuff
     {
         if (vote.cert == nullptr || vote.key() != lease.key())
             return nullptr;
+        const bool trace_local_root =
+            vote.voter == get_id() && lease.tree().root == get_id();
         try
         {
             auto certificate = create_quorum_cert(lease.key());
             certificate->add_verified_part(
                 config, vote.voter, *vote.cert);
+            if (trace_local_root)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_LOCAL_PROPOSAL stage=candidate_compute_begin "
+                    "replica=%u epoch=%u tree=%u block=%s",
+                    static_cast<unsigned>(get_id()),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str());
             certificate->compute();
-            if (!certificate->verify(config))
+            if (trace_local_root)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_LOCAL_PROPOSAL stage=candidate_compute_end "
+                    "replica=%u epoch=%u tree=%u block=%s",
+                    static_cast<unsigned>(get_id()),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str());
+            if (trace_local_root)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_LOCAL_PROPOSAL stage=candidate_verify_begin "
+                    "replica=%u epoch=%u tree=%u block=%s",
+                    static_cast<unsigned>(get_id()),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str());
+            const bool verified = certificate->verify(config);
+            if (trace_local_root)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_LOCAL_PROPOSAL stage=candidate_verify_end "
+                    "replica=%u epoch=%u tree=%u block=%s verified=%u",
+                    static_cast<unsigned>(get_id()),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str(),
+                    static_cast<unsigned>(verified));
+            if (!verified)
                 return nullptr;
             return certificate;
         }
         catch (...)
         {
+            if (trace_local_root)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_LOCAL_PROPOSAL stage=candidate_exception "
+                    "replica=%u epoch=%u tree=%u block=%s",
+                    static_cast<unsigned>(get_id()),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str());
             return nullptr;
         }
     }
@@ -7484,28 +7528,97 @@ namespace hotstuff
             proposal_contexts->acquire_open_context(vote.key());
         if (!lease.has_value() || vote.cert == nullptr)
             return;
+        const bool trace_local_root = lease->tree().root == get_id();
+        if (trace_local_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL stage=candidate_begin replica=%u "
+                "epoch=%u tree=%u block=%s",
+                static_cast<unsigned>(get_id()),
+                lease->key().configuration.epoch_number,
+                lease->key().configuration.tree_id,
+                lease->key().block_hash.to_hex().c_str());
         auto forwarding_candidate =
             make_exact_direct_forwarding_candidate(*lease, vote);
-        if (forwarding_candidate == nullptr ||
-            !proposal_contexts->record_local_part(
-                *lease,
-                config,
-                get_id(),
-                *vote.cert,
-                std::move(forwarding_candidate)))
+        if (trace_local_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL stage=candidate_end replica=%u "
+                "epoch=%u tree=%u block=%s accepted=%u",
+                static_cast<unsigned>(get_id()),
+                lease->key().configuration.epoch_number,
+                lease->key().configuration.tree_id,
+                lease->key().block_hash.to_hex().c_str(),
+                static_cast<unsigned>(forwarding_candidate != nullptr));
+        if (forwarding_candidate == nullptr)
+            return;
+        if (trace_local_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL stage=record_begin replica=%u "
+                "epoch=%u tree=%u block=%s",
+                static_cast<unsigned>(get_id()),
+                lease->key().configuration.epoch_number,
+                lease->key().configuration.tree_id,
+                lease->key().block_hash.to_hex().c_str());
+        const bool recorded = proposal_contexts->record_local_part(
+            *lease,
+            config,
+            get_id(),
+            *vote.cert,
+            std::move(forwarding_candidate));
+        if (trace_local_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL stage=record_end replica=%u "
+                "epoch=%u tree=%u block=%s accepted=%u",
+                static_cast<unsigned>(get_id()),
+                lease->key().configuration.epoch_number,
+                lease->key().configuration.tree_id,
+                lease->key().block_hash.to_hex().c_str(),
+                static_cast<unsigned>(recorded));
+        if (!recorded)
             return;
         schedule_exact_vote_fallback(*lease, vote);
         if (proposal_contexts->delta_open_enabled(*lease))
         {
             if (!lease->tree().parent.has_value())
             {
+                if (trace_local_root)
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_LOCAL_PROPOSAL stage=finish_begin "
+                        "replica=%u epoch=%u tree=%u block=%s",
+                        static_cast<unsigned>(get_id()),
+                        lease->key().configuration.epoch_number,
+                        lease->key().configuration.tree_id,
+                        lease->key().block_hash.to_hex().c_str());
                 try_finish_exact_context(*lease);
+                if (trace_local_root)
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_LOCAL_PROPOSAL stage=finish_end "
+                        "replica=%u epoch=%u tree=%u block=%s",
+                        static_cast<unsigned>(get_id()),
+                        lease->key().configuration.epoch_number,
+                        lease->key().configuration.tree_id,
+                        lease->key().block_hash.to_hex().c_str());
                 return;
             }
             static_cast<void>(forward_exact_direct(*lease, vote));
             return;
         }
+        if (trace_local_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL stage=finish_begin replica=%u "
+                "epoch=%u tree=%u block=%s",
+                static_cast<unsigned>(get_id()),
+                lease->key().configuration.epoch_number,
+                lease->key().configuration.tree_id,
+                lease->key().block_hash.to_hex().c_str());
         try_finish_exact_context(*lease);
+        if (trace_local_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL stage=finish_end replica=%u "
+                "epoch=%u tree=%u block=%s",
+                static_cast<unsigned>(get_id()),
+                lease->key().configuration.epoch_number,
+                lease->key().configuration.tree_id,
+                lease->key().block_hash.to_hex().c_str());
     }
 
     void HotStuffBase::on_local_proposal_processed(
@@ -9561,11 +9674,43 @@ namespace hotstuff
                         /* broadcast to other replicas */
                         gettimeofday(&last_block_time, NULL);
                         on_deliver_blk(piped_block);
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_LOCAL_PROPOSAL "
+                            "stage=piped_process_begin replica=%u "
+                            "epoch=%u tree=%u block=%s",
+                            static_cast<unsigned>(get_id()),
+                            configuration.epoch_number,
+                            configuration.tree_id,
+                            piped_block->hash.to_hex().c_str());
                         Proposal prop = process_block(
                             piped_block, false, configuration);
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_LOCAL_PROPOSAL "
+                            "stage=piped_process_end replica=%u "
+                            "epoch=%u tree=%u block=%s",
+                            static_cast<unsigned>(get_id()),
+                            configuration.epoch_number,
+                            configuration.tree_id,
+                            piped_block->hash.to_hex().c_str());
                         on_local_proposal_processed(prop.key());
                         piped_block->piped_delivered = true;
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_LOCAL_PROPOSAL "
+                            "stage=piped_broadcast_begin replica=%u "
+                            "epoch=%u tree=%u block=%s",
+                            static_cast<unsigned>(get_id()),
+                            configuration.epoch_number,
+                            configuration.tree_id,
+                            piped_block->hash.to_hex().c_str());
                         do_broadcast_proposal(prop);
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_LOCAL_PROPOSAL "
+                            "stage=piped_broadcast_end replica=%u "
+                            "epoch=%u tree=%u block=%s",
+                            static_cast<unsigned>(get_id()),
+                            configuration.epoch_number,
+                            configuration.tree_id,
+                            piped_block->hash.to_hex().c_str());
                     }
                     catch (...)
                     {

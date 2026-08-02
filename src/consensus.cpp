@@ -391,18 +391,61 @@ namespace hotstuff
         LOG_PROTO("propose %s", std::string(*bnew).c_str());
         on_deliver_blk(bnew);
         const auto epoch_number = get_cur_epoch_nr();
+        const ConfigurationId configuration{
+            epoch_number,
+            get_tree_id(),
+            get_epoch_digest(epoch_number)};
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=ordinary_process_begin replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew->hash.to_hex().c_str());
         Proposal prop = process_block(
             bnew,
             true,
-            ConfigurationId{
-                epoch_number,
-                get_tree_id(),
-                get_epoch_digest(epoch_number)});
+            configuration);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=ordinary_process_end replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew->hash.to_hex().c_str());
 
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=ordinary_hook_begin replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew->hash.to_hex().c_str());
         on_local_proposal_processed(prop.key());
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=ordinary_hook_end replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew->hash.to_hex().c_str());
 
         /* broadcast to other replicas */
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=ordinary_broadcast_begin "
+            "replica=%u epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew->hash.to_hex().c_str());
         do_broadcast_proposal(prop);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=ordinary_broadcast_end replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew->hash.to_hex().c_str());
 
         // Gather stats
         if (is_proposer(id))
@@ -470,10 +513,38 @@ namespace hotstuff
         }
 
         // Vote for own proposed block
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=local_vote_begin replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew_hash.to_hex().c_str());
         on_receive_vote(Vote(
             id, prop.key(), create_part_cert(*priv_key, prop.key()), this));
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=local_vote_end replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew_hash.to_hex().c_str());
 
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=proposal_notify_begin replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew_hash.to_hex().c_str());
         on_propose_(prop);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=proposal_notify_end replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(id),
+            configuration.epoch_number,
+            configuration.tree_id,
+            bnew_hash.to_hex().c_str());
 
         return prop;
     }

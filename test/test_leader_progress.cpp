@@ -5,6 +5,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -145,6 +146,21 @@ std::string source_slice(const std::string &source,
     INFO("missing source marker: " << end_marker);
     REQUIRE(end != std::string::npos);
     return source.substr(begin, end - begin);
+}
+
+bool contains_in_order(
+    const std::string &source,
+    std::initializer_list<const char *> markers)
+{
+    std::size_t cursor = 0;
+    for (const auto *marker : markers)
+    {
+        const auto found = source.find(marker, cursor);
+        if (found == std::string::npos)
+            return false;
+        cursor = found + std::char_traits<char>::length(marker);
+    }
+    return true;
 }
 
 std::string without_whitespace(const std::string &source)
@@ -1694,6 +1710,94 @@ TEST_CASE("adaptive runtime activation releases the new leader's first beat",
     CHECK(wait_qc.find("rebase->get_height()") != std::string::npos);
     CHECK(wait_qc.find("hsc->piped_submitted = false") !=
           std::string::npos);
+}
+
+TEST_CASE("local proposal diagnostics bracket the pre-broadcast wedge",
+          "[l07][leader-progress][source-audit][handoff-diagnostic]")
+{
+    const auto consensus = read_source("src/consensus.cpp");
+    const auto hotstuff = read_source("src/hotstuff.cpp");
+    const auto proposal_context = read_source("src/proposal_context.cpp");
+    const auto ordinary = function_body(
+        consensus, "block_t HotStuffCore::on_propose(");
+    const auto process = function_body(
+        consensus, "Proposal HotStuffCore::process_block(");
+    const auto candidate = function_body(
+        hotstuff,
+        "HotStuffBase::make_exact_direct_forwarding_candidate(");
+    const auto local_vote = function_body(
+        hotstuff, "void HotStuffBase::apply_local_vote(");
+    const auto record = function_body(
+        proposal_context,
+        "bool ProposalContextLifecycle::record_local_part(");
+    const auto beat = function_body(
+        hotstuff, "void HotStuffBase::beat()");
+
+    REQUIRE_FALSE(ordinary.empty());
+    CHECK(contains_in_order(
+        ordinary,
+        {"stage=ordinary_process_begin",
+         "process_block(",
+         "stage=ordinary_process_end",
+         "stage=ordinary_hook_begin",
+         "on_local_proposal_processed(prop.key())",
+         "stage=ordinary_hook_end",
+         "stage=ordinary_broadcast_begin",
+         "do_broadcast_proposal(prop)",
+         "stage=ordinary_broadcast_end"}));
+
+    REQUIRE_FALSE(process.empty());
+    CHECK(contains_in_order(
+        process,
+        {"stage=local_vote_begin",
+         "on_receive_vote(",
+         "stage=local_vote_end",
+         "stage=proposal_notify_begin",
+         "on_propose_(prop)",
+         "stage=proposal_notify_end"}));
+
+    REQUIRE_FALSE(candidate.empty());
+    CHECK(contains_in_order(
+        candidate,
+        {"stage=candidate_compute_begin",
+         "certificate->compute()",
+         "stage=candidate_compute_end",
+         "stage=candidate_verify_begin",
+         "certificate->verify(config)",
+         "stage=candidate_verify_end"}));
+
+    REQUIRE_FALSE(local_vote.empty());
+    CHECK(contains_in_order(
+        local_vote,
+        {"stage=candidate_begin",
+         "make_exact_direct_forwarding_candidate",
+         "stage=candidate_end",
+         "stage=record_begin",
+         "record_local_part",
+         "stage=record_end",
+         "stage=finish_begin",
+         "try_finish_exact_context",
+         "stage=finish_end"}));
+
+    REQUIRE_FALSE(record.empty());
+    CHECK(contains_in_order(
+        record,
+        {"stage=record_verify_begin",
+         "forwarding_candidate->verify(config)",
+         "stage=record_verify_end",
+         "stage=record_lock_begin",
+         "std::lock_guard<std::mutex> lock(mutex_)",
+         "stage=record_lock_end"}));
+
+    REQUIRE_FALSE(beat.empty());
+    CHECK(contains_in_order(
+        beat,
+        {"stage=piped_process_begin",
+         "process_block(",
+         "stage=piped_process_end",
+         "stage=piped_broadcast_begin",
+         "do_broadcast_proposal(prop)",
+         "stage=piped_broadcast_end"}));
 }
 
 TEST_CASE("pacemaker shuts leader monitor down before runtime teardown",

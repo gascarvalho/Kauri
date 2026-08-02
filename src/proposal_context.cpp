@@ -822,14 +822,47 @@ bool ProposalContextLifecycle::record_local_part(
     if (part.get_proposal_key() != lease.key())
         return false;
     std::set<ReplicaID> candidate_signers;
-    if (forwarding_candidate != nullptr &&
-        (forwarding_candidate->get_proposal_key() != lease.key() ||
-         !exact_signer_set(*forwarding_candidate, candidate_signers) ||
-         candidate_signers != std::set<ReplicaID>{signer} ||
-         !forwarding_candidate->verify(config)))
-        return false;
+    if (forwarding_candidate != nullptr)
+    {
+        if (forwarding_candidate->get_proposal_key() != lease.key() ||
+            !exact_signer_set(*forwarding_candidate, candidate_signers) ||
+            candidate_signers != std::set<ReplicaID>{signer})
+            return false;
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=record_verify_begin replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(signer),
+            lease.key().configuration.epoch_number,
+            lease.key().configuration.tree_id,
+            lease.key().block_hash.to_hex().c_str());
+        const bool verified = forwarding_candidate->verify(config);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=record_verify_end replica=%u "
+            "epoch=%u tree=%u block=%s verified=%u",
+            static_cast<unsigned>(signer),
+            lease.key().configuration.epoch_number,
+            lease.key().configuration.tree_id,
+            lease.key().block_hash.to_hex().c_str(),
+            static_cast<unsigned>(verified));
+        if (!verified)
+            return false;
+    }
 
+    HOTSTUFF_LOG_INFO(
+        "KAURI_LOCAL_PROPOSAL stage=record_lock_begin replica=%u "
+        "epoch=%u tree=%u block=%s",
+        static_cast<unsigned>(signer),
+        lease.key().configuration.epoch_number,
+        lease.key().configuration.tree_id,
+        lease.key().block_hash.to_hex().c_str());
     std::lock_guard<std::mutex> lock(mutex_);
+    HOTSTUFF_LOG_INFO(
+        "KAURI_LOCAL_PROPOSAL stage=record_lock_end replica=%u "
+        "epoch=%u tree=%u block=%s",
+        static_cast<unsigned>(signer),
+        lease.key().configuration.epoch_number,
+        lease.key().configuration.tree_id,
+        lease.key().block_hash.to_hex().c_str());
     const auto found = entries_.find(lease.key());
     if (found == entries_.end() ||
         found->second->status != ProposalContextStatus::admitted_open ||
