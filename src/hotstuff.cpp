@@ -2616,6 +2616,8 @@ namespace hotstuff
             auto delivery = async_deliver_blk(block->get_hash(), source);
             const auto access = exact_runtime_access;
             const auto delivery_key = metadata->key;
+            const auto delivery_recipient = metadata->tree.local_replica;
+            const auto delivery_root = metadata->tree.root;
             delivery.then(
                 [access,
                  metadata = std::move(*metadata),
@@ -2623,11 +2625,33 @@ namespace hotstuff
                  deferred = proposal](
                     const block_t &delivered) mutable
                 {
+                    const auto log_callback = [&metadata](
+                        const char *stage, const char *outcome) {
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_PROPOSAL_PROCESS stage=%s outcome=%s "
+                            "recipient=%u root=%u epoch=%u tree=%u "
+                            "block=%s",
+                            stage,
+                            outcome,
+                            static_cast<unsigned>(
+                                metadata.tree.local_replica),
+                            static_cast<unsigned>(metadata.tree.root),
+                            metadata.key.configuration.epoch_number,
+                            metadata.key.configuration.tree_id,
+                            metadata.key.block_hash.to_hex().c_str());
+                    };
+                    log_callback("callback_begin", "started");
                     auto runtime = access->acquire();
                     if (!runtime.has_value())
+                    {
+                        log_callback(
+                            "callback_abort", "runtime_unavailable");
                         return;
+                    }
                     auto &owner = runtime->owner();
-                    const auto abort = [&owner, &metadata]() {
+                    const auto abort =
+                        [&owner, &metadata, &log_callback](
+                            const char *reason) {
                         owner.erase_deferred_epoch_change(metadata.key);
                         owner.proposal_contexts->close(
                             metadata.key,
@@ -2637,12 +2661,13 @@ namespace hotstuff
                             owner.proposal_admission->retire_proposal(
                                 metadata.key);
                         owner.purge_pending_exact_contributions(metadata.key);
+                        log_callback("callback_abort", reason);
                     };
 
                     if (delivered == nullptr || !delivered->delivered ||
                         delivered->get_hash() != metadata.key.block_hash)
                     {
-                        abort();
+                        abort("delivery_invalid");
                         return;
                     }
 
@@ -2662,10 +2687,12 @@ namespace hotstuff
                                 !owner.retain_deferred_epoch_change(
                                     std::move(deferred),
                                     *gate.recovery_request))
-                                abort();
+                                abort("defer_retention_failed");
+                            else
+                                log_callback("callback_end", "deferred");
                             return;
                         case EpochChangeProposalDisposition::rejected:
-                            abort();
+                            abort("epoch_change_rejected");
                             return;
                         }
 
@@ -2674,7 +2701,7 @@ namespace hotstuff
                             ProposalContextOrigin::remote);
                         if (!lease.has_value())
                         {
-                            abort();
+                            abort("context_admission_failed");
                             return;
                         }
                         if (owner.on_receive_proposal(parsed))
@@ -2695,31 +2722,57 @@ namespace hotstuff
                             // still use the default full cleanup path.
                             owner.purge_pending_exact_contributions(
                                 metadata.key, true);
+                            log_callback(
+                                "callback_end", "context_closed");
                             return;
                         }
                         owner.create_expected_vote_state(metadata.key);
                         owner.start_latency_deadline(metadata.key);
                         owner.start_aggregation_timer(metadata.key);
                         owner.drain_pending_exact_contributions(metadata.key);
+                        log_callback("callback_end", "complete");
                     }
                     catch (const std::exception &error)
                     {
-                        abort();
+                        abort("processing_exception");
                         HOTSTUFF_LOG_WARN(
                             "[PROP HANDLER] Active proposal failed: %s",
                             error.what());
                     }
                     catch (...)
                     {
-                        abort();
+                        abort("processing_exception");
                         HOTSTUFF_LOG_WARN(
                             "[PROP HANDLER] Active proposal failed");
                     }
                 },
-                [access, delivery_key]() {
+                [access,
+                 delivery_key,
+                 delivery_recipient,
+                 delivery_root]() {
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_PROPOSAL_PROCESS stage=callback_begin "
+                        "outcome=delivery_rejected recipient=%u root=%u "
+                        "epoch=%u tree=%u block=%s",
+                        static_cast<unsigned>(delivery_recipient),
+                        static_cast<unsigned>(delivery_root),
+                        delivery_key.configuration.epoch_number,
+                        delivery_key.configuration.tree_id,
+                        delivery_key.block_hash.to_hex().c_str());
                     auto runtime = access->acquire();
                     if (!runtime.has_value())
+                    {
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_PROPOSAL_PROCESS stage=callback_abort "
+                            "outcome=runtime_unavailable recipient=%u "
+                            "root=%u epoch=%u tree=%u block=%s",
+                            static_cast<unsigned>(delivery_recipient),
+                            static_cast<unsigned>(delivery_root),
+                            delivery_key.configuration.epoch_number,
+                            delivery_key.configuration.tree_id,
+                            delivery_key.block_hash.to_hex().c_str());
                         return;
+                    }
                     auto &owner = runtime->owner();
                     owner.erase_deferred_epoch_change(delivery_key);
                     owner.proposal_contexts->close(
@@ -2730,6 +2783,15 @@ namespace hotstuff
                         owner.proposal_admission->retire_proposal(
                             delivery_key);
                     owner.purge_pending_exact_contributions(delivery_key);
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_PROPOSAL_PROCESS stage=callback_abort "
+                        "outcome=delivery_rejected recipient=%u root=%u "
+                        "epoch=%u tree=%u block=%s",
+                        static_cast<unsigned>(delivery_recipient),
+                        static_cast<unsigned>(delivery_root),
+                        delivery_key.configuration.epoch_number,
+                        delivery_key.configuration.tree_id,
+                        delivery_key.block_hash.to_hex().c_str());
                 });
         }
         catch (const std::exception &error)
@@ -2984,6 +3046,9 @@ namespace hotstuff
         const auto reservation_id = claim.reservation_id;
         if (reservation_id == 0 || claim.certificate == nullptr)
             return false;
+        const bool trace_non_root =
+            lease.tree().parent.has_value() &&
+            lease.tree().root != get_id();
         auto retained = claim.certificate->clone();
         const auto signers = claim.signers;
         const auto pending_candidate_id = claim.pending_candidate_id;
@@ -3006,8 +3071,34 @@ namespace hotstuff
                 : AdaptiveAggregationTransition::delta_released;
         emit_adaptive_aggregation_event(
             reserved_event, lease, &signers);
+        if (trace_non_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_RELAY_EGRESS stage=send_begin replica=%u parent=%u "
+                "root=%u epoch=%u tree=%u block=%s role=%u attempts=%u "
+                "signers=%zu",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(*lease.tree().parent),
+                static_cast<unsigned>(lease.tree().root),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                static_cast<unsigned>(role),
+                attempts,
+                signers.size());
         const bool enqueued = send_exact_relay(
             lease, std::move(claim.certificate));
+        if (trace_non_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_RELAY_EGRESS stage=send_return replica=%u "
+                "parent=%u root=%u epoch=%u tree=%u block=%s "
+                "enqueued=%u",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(*lease.tree().parent),
+                static_cast<unsigned>(lease.tree().root),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                static_cast<unsigned>(enqueued));
         if (!enqueued)
         {
             if (proposal_contexts->release_forwarding_claim(
@@ -3032,8 +3123,31 @@ namespace hotstuff
         }
         emit_adaptive_aggregation_event(
             enqueued_event, lease, &signers);
-        if (!proposal_contexts->commit_forwarding_claim(
-                lease, reservation_id))
+        if (trace_non_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_RELAY_EGRESS stage=claim_commit_begin replica=%u "
+                "parent=%u root=%u epoch=%u tree=%u block=%s",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(*lease.tree().parent),
+                static_cast<unsigned>(lease.tree().root),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str());
+        const bool committed =
+            proposal_contexts->commit_forwarding_claim(
+                lease, reservation_id);
+        if (trace_non_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_RELAY_EGRESS stage=claim_commit_result replica=%u "
+                "parent=%u root=%u epoch=%u tree=%u block=%s committed=%u",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(*lease.tree().parent),
+                static_cast<unsigned>(lease.tree().root),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                static_cast<unsigned>(committed));
+        if (!committed)
         {
             if (proposal_contexts->release_forwarding_claim(
                     lease, reservation_id))
@@ -3064,7 +3178,27 @@ namespace hotstuff
             committed_event, lease, &signers);
         if (retry != nullptr)
             exact_forwarding_retry_jobs.erase(retry->id);
+        if (trace_non_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_RELAY_EGRESS stage=complete_begin replica=%u "
+                "parent=%u root=%u epoch=%u tree=%u block=%s",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(*lease.tree().parent),
+                static_cast<unsigned>(lease.tree().root),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str());
         complete_exact_forwarding(lease, role);
+        if (trace_non_root)
+            HOTSTUFF_LOG_INFO(
+                "KAURI_RELAY_EGRESS stage=complete_end replica=%u parent=%u "
+                "root=%u epoch=%u tree=%u block=%s",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(*lease.tree().parent),
+                static_cast<unsigned>(lease.tree().root),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str());
         return true;
     }
 
@@ -3841,6 +3975,8 @@ namespace hotstuff
             lease.tree().root != get_id() ||
             lease.tree().parent.has_value())
             return false;
+        std::size_t send_attempts = 0;
+        std::size_t send_successes = 0;
         try
         {
             bytearray_t encoded;
@@ -3869,15 +4005,52 @@ namespace hotstuff
                 const auto peer = config.get_peer_id(member);
                 if (peer.is_null())
                     continue;
-                enqueued = is_adaptive_epoch_mode(epoch_protocol_mode)
+                ++send_attempts;
+                const bool sent = is_adaptive_epoch_mode(epoch_protocol_mode)
                     ? pn.send_msg(
-                          MsgPropose(DataStream(encoded)), peer) || enqueued
-                    : pn.send_msg(MsgPropose(proposal), peer) || enqueued;
+                          MsgPropose(DataStream(encoded)), peer)
+                    : pn.send_msg(MsgPropose(proposal), peer);
+                if (sent)
+                    ++send_successes;
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST "
+                    "stage=fallback_target_result root=%u target=%u "
+                    "epoch=%u tree=%u block=%s enqueued=%u",
+                    static_cast<unsigned>(get_id()),
+                    static_cast<unsigned>(member),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str(),
+                    static_cast<unsigned>(sent));
+                enqueued = sent || enqueued;
             }
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=fallback_dispatch_summary outcome=complete "
+                "root=%u epoch=%u tree=%u block=%s attempts=%zu "
+                "successes=%zu enqueued=%u",
+                static_cast<unsigned>(get_id()),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                send_attempts,
+                send_successes,
+                static_cast<unsigned>(enqueued));
             return enqueued;
         }
         catch (...)
         {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=fallback_dispatch_summary outcome=exception "
+                "root=%u epoch=%u tree=%u block=%s attempts=%zu "
+                "successes=%zu enqueued=0",
+                static_cast<unsigned>(get_id()),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                send_attempts,
+                send_successes);
             return false;
         }
     }
@@ -5540,8 +5713,55 @@ namespace hotstuff
             return;
         const auto authenticated_peer = authenticated_epoch_replica(
             authenticated->second, peer);
-        static_cast<void>(epoch_live_binding->handle_relay(
-            std::move(message), authenticated_peer));
+        const auto source_replica =
+            authenticated_peer.replica_id.value_or(0);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_RELAY_INGRESS stage=begin recipient=%u "
+            "source_replica=%u",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(source_replica));
+        const auto result = epoch_live_binding->handle_relay(
+            std::move(message), authenticated_peer);
+        const auto *envelope = result.decoded_envelope.has_value()
+            ? &*result.decoded_envelope
+            : nullptr;
+        const auto block = envelope != nullptr
+            ? envelope->block_hash.to_hex()
+            : std::string{"none"};
+        const bool dispatched =
+            result.permission ==
+                EpochConsensusPermission::accept_contribution &&
+            envelope != nullptr;
+        HOTSTUFF_LOG_INFO(
+            "KAURI_RELAY_INGRESS stage=result recipient=%u "
+            "source_replica=%u root=%u error=%u wire_error=%u "
+            "permission=%u envelope=%u epoch=%u tree=%u block=%s "
+            "generation=%llu",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(source_replica),
+            static_cast<unsigned>(
+                envelope != nullptr ? envelope->proposer : 0),
+            static_cast<unsigned>(result.error),
+            static_cast<unsigned>(result.wire_error),
+            static_cast<unsigned>(result.permission),
+            envelope != nullptr ? 1U : 0U,
+            envelope != nullptr
+                ? envelope->configuration.epoch_number
+                : 0U,
+            envelope != nullptr
+                ? envelope->configuration.tree_id
+                : 0U,
+            block.c_str(),
+            static_cast<unsigned long long>(
+                envelope != nullptr ? envelope->view_generation : 0));
+        HOTSTUFF_LOG_INFO(
+            "KAURI_RELAY_INGRESS stage=dispatch_complete recipient=%u "
+            "source_replica=%u root=%u dispatched=%u",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(source_replica),
+            static_cast<unsigned>(
+                envelope != nullptr ? envelope->proposer : 0),
+            static_cast<unsigned>(dispatched));
     }
 
 #if 0

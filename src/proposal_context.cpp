@@ -855,48 +855,57 @@ bool ProposalContextLifecycle::record_local_part(
         lease.key().configuration.epoch_number,
         lease.key().configuration.tree_id,
         lease.key().block_hash.to_hex().c_str());
-    std::lock_guard<std::mutex> lock(mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=record_lock_end replica=%u "
+            "epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(signer),
+            lease.key().configuration.epoch_number,
+            lease.key().configuration.tree_id,
+            lease.key().block_hash.to_hex().c_str());
+        const auto found = entries_.find(lease.key());
+        if (found == entries_.end() ||
+            found->second->status != ProposalContextStatus::admitted_open ||
+            found->second->generation != lease.generation() ||
+            !found->second->runtime.has_value() ||
+            found->second->accumulator == nullptr ||
+            found->second->tree->local_replica != signer ||
+            found->second->runtime->verified_signers.count(signer) != 0)
+            return false;
+
+        auto expected = found->second->runtime->verified_signers;
+        expected.insert(signer);
+        quorum_cert_bt next(found->second->accumulator->clone());
+        try
+        {
+            next->add_verified_part(config, signer, part);
+        }
+        catch (...)
+        {
+            return false;
+        }
+        std::set<ReplicaID> next_signers;
+        if (!exact_signer_set(*next, next_signers) ||
+            next_signers != expected)
+            return false;
+        if (!retain_pending_forwarding_candidate(
+                *found->second,
+                next_pending_forwarding_candidate_,
+                std::move(forwarding_candidate),
+                candidate_signers))
+            return false;
+
+        found->second->accumulator = std::move(next);
+        found->second->runtime->verified_signers = std::move(expected);
+    }
     HOTSTUFF_LOG_INFO(
-        "KAURI_LOCAL_PROPOSAL stage=record_lock_end replica=%u "
-        "epoch=%u tree=%u block=%s",
+        "KAURI_LOCAL_PROPOSAL stage=record_return replica=%u epoch=%u "
+        "tree=%u block=%s recorded=1",
         static_cast<unsigned>(signer),
         lease.key().configuration.epoch_number,
         lease.key().configuration.tree_id,
         lease.key().block_hash.to_hex().c_str());
-    const auto found = entries_.find(lease.key());
-    if (found == entries_.end() ||
-        found->second->status != ProposalContextStatus::admitted_open ||
-        found->second->generation != lease.generation() ||
-        !found->second->runtime.has_value() ||
-        found->second->accumulator == nullptr ||
-        found->second->tree->local_replica != signer ||
-        found->second->runtime->verified_signers.count(signer) != 0)
-        return false;
-
-    auto expected = found->second->runtime->verified_signers;
-    expected.insert(signer);
-    quorum_cert_bt next(found->second->accumulator->clone());
-    try
-    {
-        next->add_verified_part(config, signer, part);
-    }
-    catch (...)
-    {
-        return false;
-    }
-    std::set<ReplicaID> next_signers;
-    if (!exact_signer_set(*next, next_signers) ||
-        next_signers != expected)
-        return false;
-    if (!retain_pending_forwarding_candidate(
-            *found->second,
-            next_pending_forwarding_candidate_,
-            std::move(forwarding_candidate),
-            candidate_signers))
-        return false;
-
-    found->second->accumulator = std::move(next);
-    found->second->runtime->verified_signers = std::move(expected);
     return true;
 }
 

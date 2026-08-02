@@ -1890,6 +1890,100 @@ TEST_CASE("local proposal diagnostics bracket the pre-broadcast wedge",
           std::string::npos);
 }
 
+TEST_CASE("proposal tail diagnostics bracket relay and callback completion",
+          "[l07][leader-progress][source-audit][tail-diagnostic]")
+{
+    const auto hotstuff = read_source("src/hotstuff.cpp");
+    const auto proposal_context = read_source("src/proposal_context.cpp");
+    const auto record = function_body(
+        proposal_context,
+        "bool ProposalContextLifecycle::record_local_part(");
+    const auto relay_send = function_body(
+        hotstuff, "bool HotStuffBase::send_exact_relay_reserved(");
+    const auto relay_ingress = function_body(
+        hotstuff, "void HotStuffBase::adaptive_relay_handler(");
+    const auto fallback_dispatch = function_body(
+        hotstuff,
+        "bool HotStuffBase::broadcast_exact_proposal_fallback(");
+    const auto active_processing = function_body(
+        hotstuff, "void HotStuffBase::process_active(");
+
+    REQUIRE_FALSE(record.empty());
+    CHECK(contains_in_order(
+        record,
+        {"found->second->accumulator = std::move(next)",
+         "found->second->runtime->verified_signers = std::move(expected)",
+         "stage=record_return",
+         "return true"}));
+
+    REQUIRE_FALSE(relay_send.empty());
+    CHECK(contains_in_order(
+        relay_send,
+        {"stage=send_begin",
+         "send_exact_relay(",
+         "stage=send_return",
+         "stage=claim_commit_begin",
+         "commit_forwarding_claim(",
+         "stage=claim_commit_result",
+         "stage=complete_begin",
+         "complete_exact_forwarding(",
+         "stage=complete_end"}));
+    CHECK(relay_send.find("trace_non_root") != std::string::npos);
+    CHECK(relay_send.find("parent=%u") != std::string::npos);
+    CHECK(relay_send.find("root=%u") != std::string::npos);
+
+    REQUIRE_FALSE(relay_ingress.empty());
+    CHECK(contains_in_order(
+        relay_ingress,
+        {"KAURI_RELAY_INGRESS stage=begin",
+         "const auto result = epoch_live_binding->handle_relay(",
+         "KAURI_RELAY_INGRESS stage=result",
+         "KAURI_RELAY_INGRESS stage=dispatch_complete"}));
+    CHECK(relay_ingress.find("recipient=%u") != std::string::npos);
+    CHECK(relay_ingress.find("source_replica=%u") != std::string::npos);
+    CHECK(relay_ingress.find("root=%u") != std::string::npos);
+    CHECK(relay_ingress.find("source_peer") == std::string::npos);
+
+    REQUIRE_FALSE(fallback_dispatch.empty());
+    CHECK(contains_in_order(
+        fallback_dispatch,
+        {"bool enqueued = false",
+         "++send_attempts",
+         "pn.send_msg(",
+         "stage=fallback_target_result",
+         "stage=fallback_dispatch_summary",
+         "return enqueued"}));
+    const auto target_result = source_slice(
+        fallback_dispatch,
+        "stage=fallback_target_result",
+        "enqueued = sent || enqueued");
+    CHECK(target_result.find("root=%u") != std::string::npos);
+    CHECK(target_result.find("target=%u") != std::string::npos);
+    CHECK(target_result.find("epoch=%u") != std::string::npos);
+    CHECK(target_result.find("tree=%u") != std::string::npos);
+    CHECK(target_result.find("block=%s") != std::string::npos);
+    CHECK(target_result.find("peer") == std::string::npos);
+    CHECK(target_result.find("payload") == std::string::npos);
+
+    REQUIRE_FALSE(active_processing.empty());
+    CHECK(contains_in_order(
+        active_processing,
+        {"delivery.then(",
+         "log_callback(\"callback_begin\"",
+         "owner.on_receive_proposal(parsed)",
+         "log_callback(\"callback_end\""}));
+    CHECK(active_processing.find(
+              "log_callback(\"callback_abort\"") !=
+          std::string::npos);
+    CHECK(active_processing.find("recipient=%u") != std::string::npos);
+    CHECK(active_processing.find("root=%u") != std::string::npos);
+    const auto callback_marker = source_slice(
+        active_processing,
+        "KAURI_PROPOSAL_PROCESS stage=%s",
+        "log_callback(\"callback_begin\"");
+    CHECK(callback_marker.find("payload") == std::string::npos);
+}
+
 TEST_CASE("pacemaker shuts leader monitor down before runtime teardown",
           "[l07][leader-progress][source-audit][shutdown-order]"
           "[intentional-red]")
