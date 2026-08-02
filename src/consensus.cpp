@@ -399,7 +399,7 @@ namespace hotstuff
                 get_tree_id(),
                 get_epoch_digest(epoch_number)});
 
-        on_verified_local_proposal_progress(prop.key());
+        on_local_proposal_processed(prop.key());
 
         /* broadcast to other replicas */
         do_broadcast_proposal(prop);

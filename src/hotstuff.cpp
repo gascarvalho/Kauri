@@ -7508,12 +7508,12 @@ namespace hotstuff
         try_finish_exact_context(*lease);
     }
 
-    void HotStuffBase::on_verified_local_proposal_progress(
+    void HotStuffBase::on_local_proposal_processed(
         const ProposalKey &key)
     {
-        pmaker->record_verified_progress(
-            key.configuration,
-            LeaderProgressEvent::verified_proposal);
+        // Self-authored traffic is not evidence that another replica can
+        // make progress in this view. Only received proposals, QCs, and
+        // commits may postpone leader suspicion.
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
             adaptive_v2_command_inbox == nullptr ||
             !adaptive_v2_pending_command_reservation.has_value())
@@ -9563,7 +9563,7 @@ namespace hotstuff
                         on_deliver_blk(piped_block);
                         Proposal prop = process_block(
                             piped_block, false, configuration);
-                        on_verified_local_proposal_progress(prop.key());
+                        on_local_proposal_processed(prop.key());
                         piped_block->piped_delivered = true;
                         do_broadcast_proposal(prop);
                     }

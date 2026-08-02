@@ -1572,7 +1572,7 @@ namespace hotstuff
         void do_vote(Proposal, const Vote &) override;
         bool admit_local(const Proposal &) override;
         void apply_local_vote(const Vote &) override;
-        void on_verified_local_proposal_progress(
+        void on_local_proposal_processed(
             const ProposalKey &key) override;
         void on_verified_commit_progress(
             const ProposalKey &key) override;

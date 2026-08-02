@@ -262,8 +262,8 @@ namespace hotstuff
         /** Record an already-created local vote in derived runtime state. */
         virtual void apply_local_vote(const Vote &) {}
 
-        /** Report protocol-accepted progress with an exact proposal key. */
-        virtual void on_verified_local_proposal_progress(
+        /** Report local proposal processing with an exact proposal key. */
+        virtual void on_local_proposal_processed(
             const ProposalKey &) {}
         virtual void on_verified_commit_progress(
             const ProposalKey &) {}

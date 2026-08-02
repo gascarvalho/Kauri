@@ -467,9 +467,9 @@ TEST_CASE(
         source("src/hotstuff.cpp"));
     const auto beat = function_body(
         implementation, "void HotStuffBase::beat()");
-    const auto progress = function_body(
+    const auto local_hook = function_body(
         implementation,
-        "void HotStuffBase::on_verified_local_proposal_progress(");
+        "void HotStuffBase::on_local_proposal_processed(");
 
     REQUIRE_FALSE(beat.empty());
 
@@ -566,13 +566,14 @@ TEST_CASE(
         CHECK(ordinary_catch < ordinary_release);
     }
 
-    SECTION("the existing pre-broadcast exact-key hook marks the reservation")
+    SECTION("the pre-broadcast exact-key hook marks only the reservation")
     {
-        REQUIRE_FALSE(progress.empty());
-        CHECK(progress.find("pmaker->record_verified_progress(") !=
+        REQUIRE_FALSE(local_hook.empty());
+        CHECK(local_hook.find("pmaker->record_verified_progress(") ==
               std::string::npos);
-        CHECK(count_occurrences(progress, ".mark_proposed(") == 1);
-        const auto mark = call_expression(progress, ".mark_proposed(");
+        CHECK(local_hook.find("LeaderProgressEvent") == std::string::npos);
+        CHECK(count_occurrences(local_hook, ".mark_proposed(") == 1);
+        const auto mark = call_expression(local_hook, ".mark_proposed(");
         REQUIRE(mark.has_value());
         const auto arguments = call_arguments(*mark);
         REQUIRE(arguments.size() == 2);
@@ -595,7 +596,7 @@ TEST_CASE(
     CHECK(contains_in_order(
         ordinary,
         {"process_block(",
-         "on_verified_local_proposal_progress(prop.key())",
+         "on_local_proposal_processed(prop.key())",
          "do_broadcast_proposal(prop)"}));
     REQUIRE_FALSE(processing.empty());
     CHECK(contains_in_order(

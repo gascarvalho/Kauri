@@ -1323,7 +1323,7 @@ TEST_CASE("verified proposal progress is gated by protocol acceptance",
     CHECK(active.find("bool opinion") == std::string::npos);
 }
 
-TEST_CASE("local proposal progress follows exact processing before broadcast",
+TEST_CASE("locally authored proposals do not reset leader suspicion",
           "[l07][leader-progress][source-audit][local-proposal]"
           "[intentional-red]")
 {
@@ -1334,34 +1334,35 @@ TEST_CASE("local proposal progress follows exact processing before broadcast",
         "block_t HotStuffCore::on_propose",
         "Proposal HotStuffCore::process_block");
     const auto processed = local.find("process_block(");
-    const auto progress =
-        local.find("on_verified_local_proposal_progress");
+    const auto local_hook =
+        local.find("on_local_proposal_processed");
     const auto broadcast = local.find("do_broadcast_proposal(prop)");
 
     REQUIRE(processed != std::string::npos);
-    REQUIRE(progress != std::string::npos);
+    REQUIRE(local_hook != std::string::npos);
     REQUIRE(broadcast != std::string::npos);
-    CHECK(processed < progress);
-    CHECK(progress < broadcast);
+    CHECK(processed < local_hook);
+    CHECK(local_hook < broadcast);
     CHECK(count_occurrences(
-              local, "on_verified_local_proposal_progress") == 1);
-    const auto progress_end = local.find(';', progress);
-    REQUIRE(progress_end != std::string::npos);
-    const auto progress_call =
-        local.substr(progress, progress_end - progress);
-    CHECK(progress_call.find("prop.key()") != std::string::npos);
+              local, "on_local_proposal_processed") == 1);
+    const auto hook_end = local.find(';', local_hook);
+    REQUIRE(hook_end != std::string::npos);
+    const auto hook_call =
+        local.substr(local_hook, hook_end - local_hook);
+    CHECK(hook_call.find("prop.key()") != std::string::npos);
 
-    const auto owner = hotstuff.find(
-        "HotStuffBase::on_verified_local_proposal_progress");
-    REQUIRE(owner != std::string::npos);
-    const auto event = hotstuff.find(
-        "LeaderProgressEvent::verified_proposal", owner);
-    REQUIRE(event != std::string::npos);
-    const auto owner_window = hotstuff.substr(owner, event - owner + 200);
-    CHECK(owner_window.find("key.configuration") != std::string::npos);
+    const auto owner = source_slice(
+        hotstuff,
+        "void HotStuffBase::on_local_proposal_processed",
+        "void HotStuffBase::on_verified_commit_progress");
+    REQUIRE_FALSE(owner.empty());
+    INFO("a proposer cannot keep its own view alive with self-authored "
+         "traffic; quorum certificates and commits remain valid progress");
+    CHECK(owner.find("record_verified_progress") == std::string::npos);
+    CHECK(owner.find("LeaderProgressEvent") == std::string::npos);
 }
 
-TEST_CASE("every leader-local proposal path records verified progress",
+TEST_CASE("every leader-local proposal path records local processing only",
           "[l07][rem-l07-02][leader-progress][source-audit]"
           "[local-proposal][pipelined-proposal][intentional-red]")
 {
@@ -1374,7 +1375,7 @@ TEST_CASE("every leader-local proposal path records verified progress",
     const auto pipelined = function_body(
         hotstuff, "void HotStuffBase::beat()");
 
-    const auto require_progress_between_processing_and_broadcast = [](
+    const auto require_hook_between_processing_and_broadcast = [](
         const std::string &path,
         const std::string &path_name) {
         INFO("leader-local proposal path: " << path_name);
@@ -1392,14 +1393,14 @@ TEST_CASE("every leader-local proposal path records verified progress",
             processing_complete + 1,
             broadcast - processing_complete - 1);
         const auto normalized = without_whitespace(after_processing);
-        const std::string exact_progress =
-            "on_verified_local_proposal_progress(prop.key());";
-        CHECK(count_occurrences(normalized, exact_progress) == 1);
+        const std::string exact_hook =
+            "on_local_proposal_processed(prop.key());";
+        CHECK(count_occurrences(normalized, exact_hook) == 1);
     };
 
     SECTION("ordinary proposal production")
     {
-        require_progress_between_processing_and_broadcast(
+        require_hook_between_processing_and_broadcast(
             ordinary, "HotStuffCore::on_propose");
     }
 
@@ -1416,7 +1417,7 @@ TEST_CASE("every leader-local proposal path records verified progress",
         REQUIRE(marked_delivered != std::string::npos);
         CHECK(queued < processed);
         CHECK(processed < marked_delivered);
-        require_progress_between_processing_and_broadcast(
+        require_hook_between_processing_and_broadcast(
             pipelined, "HotStuffBase::beat pipelined branch");
     }
 }
