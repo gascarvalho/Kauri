@@ -3,6 +3,7 @@
 
 #include "catch.hpp"
 #include "hotstuff/adaptation_manager_profile.h"
+#include "hotstuff/adaptive_v2_manager_ingress.h"
 
 namespace
 {
@@ -42,6 +43,9 @@ TEST_CASE(
         derived->ingress_limits.lifecycle.maximum_reporter_queues == 7);
     CHECK(
         derived->ingress_limits.lifecycle.maximum_lifecycle_sources == 7);
+    CHECK(
+        derived->ingress_limits.lifecycle
+            .maximum_quarantined_records_per_reporter == 128);
     CHECK(derived->bundle_limits.definition_limits.maximum_trees == 5);
     CHECK(
         derived->bundle_limits.definition_limits
@@ -120,6 +124,33 @@ TEST_CASE(
     CHECK(
         first_digest.to_hex() ==
         "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a");
+}
+
+TEST_CASE(
+    "derived N31 ingress limits construct the real manager ingress",
+    "[adaptive-v2][manager-profile][n31][ingress][unit]")
+{
+    const auto members = membership(31);
+    const auto derived =
+        hotstuff::derive_adaptive_v2_manager_runtime_shape(
+            members, 5, 2);
+    const auto epoch =
+        hotstuff::derive_adaptive_v2_cyclic_epoch_zero(
+            members, 5, 2);
+
+    REQUIRE(derived.has_value());
+    REQUIRE(epoch.has_value());
+    CHECK(
+        derived->ingress_limits.lifecycle
+            .maximum_quarantined_records_per_reporter == 33);
+    CHECK_NOTHROW([&] {
+        hotstuff::AdaptiveV2ManagerIngress ingress(
+            members,
+            *epoch,
+            0,
+            1,
+            derived->ingress_limits);
+    }());
 }
 
 TEST_CASE(

@@ -83,9 +83,19 @@ std::optional<std::uint32_t> minimum_score_drop(
     return reporters * kTimeoutsPerReporter;
 }
 
-AdaptiveV2ManagerIngressLimits ingress_limits(
+std::optional<AdaptiveV2ManagerIngressLimits> ingress_limits(
     std::uint32_t replica_count)
 {
+    if (replica_count == 0 ||
+        replica_count > kMaximumQuarantinedRecords)
+    {
+        return std::nullopt;
+    }
+    const auto maximum_quarantined_per_reporter =
+        std::min(
+            kMaximumQuarantinedPerReporter,
+            kMaximumQuarantinedRecords /
+                static_cast<std::size_t>(replica_count));
     AdaptiveV2ManagerIngressLimits limits;
     limits.maximum_members = replica_count;
     limits.readiness_wire.maximum_payload_bytes = 256;
@@ -101,7 +111,7 @@ AdaptiveV2ManagerIngressLimits ingress_limits(
         kMaximumQuarantinedSignerEntries,
         kMaximumQuarantinedRecords,
         replica_count,
-        kMaximumQuarantinedPerReporter};
+        maximum_quarantined_per_reporter};
     limits.lifecycle_accounting = {
         kMaximumQuarantinedRecords,
         kMaximumQuarantinedBytes,
@@ -180,8 +190,11 @@ derive_adaptive_v2_manager_runtime_shape(
 
     const auto score_drop = minimum_score_drop(
         quorum->fault_threshold);
+    const auto derived_ingress_limits = ingress_limits(
+        quorum->replica_count);
     const auto derived_bundle_limits = bundle_limits(*quorum);
     if (!score_drop.has_value() ||
+        !derived_ingress_limits.has_value() ||
         !derived_bundle_limits.has_value())
         return std::nullopt;
 
@@ -191,7 +204,7 @@ derive_adaptive_v2_manager_runtime_shape(
     shape.minimum_score_drop = *score_drop;
     shape.tree_shape = {
         tree_fanout, pipeline_stretch, quorum->quorum};
-    shape.ingress_limits = ingress_limits(quorum->replica_count);
+    shape.ingress_limits = *derived_ingress_limits;
     shape.bundle_limits = *derived_bundle_limits;
     return shape;
 }
