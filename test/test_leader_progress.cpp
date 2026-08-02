@@ -1717,6 +1717,7 @@ TEST_CASE("local proposal diagnostics bracket the pre-broadcast wedge",
 {
     const auto consensus = read_source("src/consensus.cpp");
     const auto hotstuff = read_source("src/hotstuff.cpp");
+    const auto liveness = read_source("include/hotstuff/liveness.h");
     const auto proposal_context = read_source("src/proposal_context.cpp");
     const auto ordinary = function_body(
         consensus, "block_t HotStuffCore::on_propose(");
@@ -1732,6 +1733,20 @@ TEST_CASE("local proposal diagnostics bracket the pre-broadcast wedge",
         "bool ProposalContextLifecycle::record_local_part(");
     const auto beat = function_body(
         hotstuff, "void HotStuffBase::beat()");
+    const auto broadcast = function_body(
+        hotstuff, "void HotStuffBase::do_broadcast_proposal(");
+    const auto aggregation_timer = function_body(
+        hotstuff, "void HotStuffBase::start_aggregation_timer(");
+    const auto fallback = function_body(
+        hotstuff,
+        "void HotStuffBase::schedule_exact_proposal_fallback(");
+    const auto ingress = function_body(
+        hotstuff, "void HotStuffBase::adaptive_propose_handler(");
+    const auto multitree = source_slice(
+        liveness,
+        "class PaceMakerMultitree",
+        "class PMRoundRobinProposer");
+    const auto unlock = function_body(multitree, "void unlock(TimerEvent &)");
 
     REQUIRE_FALSE(ordinary.empty());
     CHECK(contains_in_order(
@@ -1797,7 +1812,82 @@ TEST_CASE("local proposal diagnostics bracket the pre-broadcast wedge",
          "stage=piped_process_end",
          "stage=piped_broadcast_begin",
          "do_broadcast_proposal(prop)",
-         "stage=piped_broadcast_end"}));
+         "stage=piped_broadcast_end",
+         "stage=piped_scope_tail",
+         "piped_submitted = false",
+         "stage=piped_tail_released",
+         "stage=piped_tail_end",
+         "stage=beat_callback_exit"}));
+
+    REQUIRE_FALSE(unlock.empty());
+    CHECK(contains_in_order(
+        unlock,
+        {"stage=unlock_schedule_begin",
+         "schedule_next()",
+         "stage=unlock_schedule_end"}));
+
+    REQUIRE_FALSE(broadcast.empty());
+    CHECK(contains_in_order(
+        broadcast,
+        {"stage=entry outcome=begin",
+         "reason=exact_tree_missing",
+         "reason=inadmissible_context",
+         "stage=context outcome=ready",
+         "stage=local_timers",
+         "start_aggregation_timer(prop.key())",
+         "stage=payload outcome=ready",
+         "bool enqueued = false",
+         "++send_attempts",
+         "++send_successes",
+         "stage=direct_children",
+         "stage=fallback_call",
+         "schedule_exact_proposal_fallback(*lease, prop)",
+         "stage=summary outcome=complete"}));
+    CHECK(broadcast.find("reason=runtime_missing") != std::string::npos);
+    CHECK(broadcast.find("reason=generation_missing") != std::string::npos);
+    CHECK(broadcast.find("reason=encode_exception") != std::string::npos);
+    CHECK(broadcast.find("reason=empty_payload") != std::string::npos);
+    CHECK(broadcast.find("generation=%llu") != std::string::npos);
+    CHECK(broadcast.find("payload_bytes=%zu") != std::string::npos);
+
+    REQUIRE_FALSE(aggregation_timer.empty());
+    CHECK(contains_in_order(
+        aggregation_timer,
+        {"reason=precondition",
+         "arm_timeout(",
+         "timer_generation == 0 ? \"skipped\" : \"armed\""}));
+
+    REQUIRE_FALSE(fallback.empty());
+    CHECK(contains_in_order(
+        fallback,
+        {"reason=precondition",
+         "reason=exact_runtime",
+         "schedule_after(",
+         "reason=schedule_rejected",
+         "outcome=armed",
+         "reason=schedule_exception"}));
+
+    REQUIRE_FALSE(ingress.empty());
+    CHECK(contains_in_order(
+        ingress,
+        {"const auto authenticated_peer",
+         "KAURI_PROPOSAL_INGRESS stage=begin",
+         "const auto result = epoch_live_binding->handle_proposal(",
+         "result.decoded_envelope",
+         "KAURI_PROPOSAL_INGRESS stage=result"}));
+    CHECK(ingress.find("result.error") != std::string::npos);
+    CHECK(ingress.find("result.permission") != std::string::npos);
+    CHECK(ingress.find("result.admission_disposition") !=
+          std::string::npos);
+    CHECK(ingress.find("recipient=%u") != std::string::npos);
+    CHECK(ingress.find("source_replica=%u") != std::string::npos);
+    CHECK(ingress.find("source_peer=%s") != std::string::npos);
+    CHECK(ingress.find("envelope->configuration.epoch_number") !=
+          std::string::npos);
+    CHECK(ingress.find("envelope->configuration.tree_id") !=
+          std::string::npos);
+    CHECK(ingress.find("envelope->block_hash.to_hex()") !=
+          std::string::npos);
 }
 
 TEST_CASE("pacemaker shuts leader monitor down before runtime teardown",

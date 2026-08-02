@@ -793,7 +793,27 @@ namespace hotstuff
             timer.del();
             delaying_proposal = false;
             locked = false;
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL "
+                "stage=unlock_schedule_begin replica=%u epoch=%zu "
+                "tree=%zu proposer=%u handoff_ready=%u pending=%zu",
+                static_cast<unsigned>(hsc->get_id()),
+                current_epoch,
+                current_tid,
+                static_cast<unsigned>(proposer),
+                runtime_leader_handoff_ready ? 1U : 0U,
+                pending_beats.size());
             schedule_next();
+            HOTSTUFF_LOG_INFO(
+                "KAURI_LOCAL_PROPOSAL "
+                "stage=unlock_schedule_end replica=%u epoch=%zu "
+                "tree=%zu proposer=%u handoff_ready=%u pending=%zu",
+                static_cast<unsigned>(hsc->get_id()),
+                current_epoch,
+                current_tid,
+                static_cast<unsigned>(proposer),
+                runtime_leader_handoff_ready ? 1U : 0U,
+                pending_beats.size());
         }
 
         void inc_time(ReconfigurationType reconfig_type) override

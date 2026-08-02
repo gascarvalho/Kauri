@@ -3703,13 +3703,44 @@ namespace hotstuff
             lease.tree().root != get_id() || proposal.key() != lease.key() ||
             aggregation_scheduler == nullptr ||
             exact_proposal_fallback_jobs.count(lease.key()) != 0)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=fallback "
+                "outcome=skipped reason=precondition replica=%u epoch=%u "
+                "tree=%u block=%s parent=%u local_match=%u root_match=%u "
+                "key_match=%u scheduler=%u duplicate=%u",
+                static_cast<unsigned>(get_id()),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                lease.tree().parent.has_value() ? 1U : 0U,
+                lease.tree().local_replica == get_id() ? 1U : 0U,
+                lease.tree().root == get_id() ? 1U : 0U,
+                proposal.key() == lease.key() ? 1U : 0U,
+                aggregation_scheduler != nullptr ? 1U : 0U,
+                exact_proposal_fallback_jobs.count(lease.key()) != 0
+                    ? 1U
+                    : 0U);
             return;
+        }
         const auto *tree = find_exact_runtime_tree(
             lease.key().configuration);
         const auto generation = find_exact_runtime_generation(
             lease.key().configuration);
         if (tree == nullptr || !generation.has_value())
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=fallback "
+                "outcome=skipped reason=exact_runtime replica=%u epoch=%u "
+                "tree=%u block=%s exact_tree=%u generation=%u",
+                static_cast<unsigned>(get_id()),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                tree != nullptr ? 1U : 0U,
+                generation.has_value() ? 1U : 0U);
             return;
+        }
 
         try
         {
@@ -3733,13 +3764,41 @@ namespace hotstuff
             if (!cancellation)
             {
                 exact_proposal_fallback_jobs.erase(lease.key());
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST stage=fallback "
+                    "outcome=skipped reason=schedule_rejected replica=%u "
+                    "epoch=%u tree=%u block=%s generation=%llu",
+                    static_cast<unsigned>(get_id()),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str(),
+                    static_cast<unsigned long long>(*generation));
                 return;
             }
             job->cancellation = std::move(cancellation);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=fallback outcome=armed "
+                "reason=none replica=%u epoch=%u tree=%u block=%s "
+                "generation=%llu delay_ticks=%lld",
+                static_cast<unsigned>(get_id()),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                static_cast<unsigned long long>(*generation),
+                static_cast<long long>(delay.count()));
         }
         catch (...)
         {
             exact_proposal_fallback_jobs.erase(lease.key());
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=fallback "
+                "outcome=skipped reason=schedule_exception replica=%u "
+                "epoch=%u tree=%u block=%s generation=%llu",
+                static_cast<unsigned>(get_id()),
+                lease.key().configuration.epoch_number,
+                lease.key().configuration.tree_id,
+                lease.key().block_hash.to_hex().c_str(),
+                static_cast<unsigned long long>(*generation));
         }
     }
 
@@ -4910,13 +4969,43 @@ namespace hotstuff
             lease->tree().direct_children.empty() ||
             aggregation_timeout_coordinator == nullptr ||
             aggregation_scheduler == nullptr)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=aggregation_timer "
+                "outcome=skipped reason=precondition replica=%u epoch=%u "
+                "tree=%u block=%s exact_tree=%u context_open=%u "
+                "direct_children=%zu coordinator=%u scheduler=%u",
+                static_cast<unsigned>(get_id()),
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.block_hash.to_hex().c_str(),
+                tree != nullptr ? 1U : 0U,
+                lease.has_value() ? 1U : 0U,
+                lease.has_value()
+                    ? lease->tree().direct_children.size()
+                    : std::size_t{0},
+                aggregation_timeout_coordinator != nullptr ? 1U : 0U,
+                aggregation_scheduler != nullptr ? 1U : 0U);
             return;
+        }
 
-        aggregation_timeout_coordinator->arm_timeout(
+        const auto timer_generation =
+            aggregation_timeout_coordinator->arm_timeout(
             *lease,
             *aggregation_scheduler,
             static_cast<std::uint32_t>(tree->get_level(get_id())),
             static_cast<std::uint32_t>(tree->get_max_level()));
+        HOTSTUFF_LOG_INFO(
+            "KAURI_PROPOSAL_BROADCAST stage=aggregation_timer outcome=%s "
+            "reason=%s replica=%u epoch=%u tree=%u block=%s "
+            "timer_generation=%llu",
+            timer_generation == 0 ? "skipped" : "armed",
+            timer_generation == 0 ? "context_rejected" : "none",
+            static_cast<unsigned>(get_id()),
+            key.configuration.epoch_number,
+            key.configuration.tree_id,
+            key.block_hash.to_hex().c_str(),
+            static_cast<unsigned long long>(timer_generation));
     }
 
     void HotStuffBase::emit_timeout_report(const ProposalKey &)
@@ -5381,8 +5470,48 @@ namespace hotstuff
             return;
         const auto authenticated_peer = authenticated_epoch_replica(
             authenticated->second, peer);
-        static_cast<void>(epoch_live_binding->handle_proposal(
-            std::move(message), authenticated_peer));
+        const auto source = authenticated_peer.source_peer.to_hex();
+        HOTSTUFF_LOG_INFO(
+            "KAURI_PROPOSAL_INGRESS stage=begin recipient=%u "
+            "source_replica=%u source_peer=%s",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(
+                authenticated_peer.replica_id.value_or(0)),
+            source.c_str());
+        const auto result = epoch_live_binding->handle_proposal(
+            std::move(message), authenticated_peer);
+        const auto *envelope = result.decoded_envelope.has_value()
+            ? &*result.decoded_envelope
+            : nullptr;
+        const auto block = envelope != nullptr
+            ? envelope->block_hash.to_hex()
+            : std::string{"none"};
+        HOTSTUFF_LOG_INFO(
+            "KAURI_PROPOSAL_INGRESS stage=result recipient=%u "
+            "source_replica=%u "
+            "source_peer=%s error=%u wire_error=%u permission=%u "
+            "disposition=%d envelope=%u epoch=%u tree=%u block=%s "
+            "generation=%llu",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(
+                authenticated_peer.replica_id.value_or(0)),
+            source.c_str(),
+            static_cast<unsigned>(result.error),
+            static_cast<unsigned>(result.wire_error),
+            static_cast<unsigned>(result.permission),
+            result.admission_disposition.has_value()
+                ? static_cast<int>(*result.admission_disposition)
+                : -1,
+            envelope != nullptr ? 1U : 0U,
+            envelope != nullptr
+                ? envelope->configuration.epoch_number
+                : 0U,
+            envelope != nullptr
+                ? envelope->configuration.tree_id
+                : 0U,
+            block.c_str(),
+            static_cast<unsigned long long>(
+                envelope != nullptr ? envelope->view_generation : 0));
     }
 
     void HotStuffBase::adaptive_vote_handler(
@@ -7655,10 +7784,25 @@ namespace hotstuff
     void HotStuffBase::do_broadcast_proposal(const Proposal &prop)
     {
         HOTSTUFF_LOG_PROTO("[BROADCASTING] Broadcasting proposal of size %llu bytes in epoch_nr:%d on tid=%d.", sizeof(prop), prop.epoch_nr, prop.tid);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_PROPOSAL_BROADCAST stage=entry outcome=begin "
+            "reason=none replica=%u epoch=%u tree=%u block=%s",
+            static_cast<unsigned>(get_id()),
+            prop.configuration().epoch_number,
+            prop.configuration().tree_id,
+            prop.key().block_hash.to_hex().c_str());
 
         const auto *tree = find_exact_runtime_tree(prop.configuration());
         if (tree == nullptr)
         {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=context outcome=skipped "
+                "reason=exact_tree_missing replica=%u epoch=%u tree=%u "
+                "block=%s",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str());
             HOTSTUFF_LOG_WARN(
                 "[BROADCASTING] Refusing proposal for unknown exact configuration");
             return;
@@ -7676,26 +7820,87 @@ namespace hotstuff
         if (!metadata.has_value() ||
             (!lease.has_value() && !finalized_before_broadcast))
         {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=context outcome=skipped "
+                "reason=inadmissible_context replica=%u epoch=%u tree=%u "
+                "block=%s metadata=%u lease=%u finalized=%u",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str(),
+                metadata.has_value() ? 1U : 0U,
+                lease.has_value() ? 1U : 0U,
+                finalized_before_broadcast ? 1U : 0U);
             HOTSTUFF_LOG_WARN(
                 "[BROADCASTING] Refusing an inadmissible exact proposal");
             return;
         }
+        HOTSTUFF_LOG_INFO(
+            "KAURI_PROPOSAL_BROADCAST stage=context outcome=ready "
+            "reason=none replica=%u epoch=%u tree=%u block=%s root=%u "
+            "direct_children=%zu lease=%u finalized=%u",
+            static_cast<unsigned>(get_id()),
+            prop.configuration().epoch_number,
+            prop.configuration().tree_id,
+            prop.key().block_hash.to_hex().c_str(),
+            static_cast<unsigned>(metadata->tree.root),
+            metadata->tree.direct_children.size(),
+            lease.has_value() ? 1U : 0U,
+            finalized_before_broadcast ? 1U : 0U);
         if (lease.has_value())
         {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=local_timers "
+                "outcome=begin reason=none replica=%u epoch=%u tree=%u "
+                "block=%s",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str());
             create_expected_vote_state(prop.key());
             start_latency_deadline(prop.key());
             start_aggregation_timer(prop.key());
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=local_timers "
+                "outcome=returned reason=none replica=%u epoch=%u tree=%u "
+                "block=%s",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str());
         }
 
         bytearray_t adaptive_payload;
+        std::uint64_t wire_generation = 0;
         if (is_adaptive_epoch_mode(epoch_protocol_mode))
         {
             if (adaptive_epoch_runtime == nullptr)
+            {
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST stage=payload "
+                    "outcome=skipped reason=runtime_missing replica=%u "
+                    "epoch=%u tree=%u block=%s",
+                    static_cast<unsigned>(get_id()),
+                    prop.configuration().epoch_number,
+                    prop.configuration().tree_id,
+                    prop.key().block_hash.to_hex().c_str());
                 return;
+            }
             const auto generation = find_exact_runtime_generation(
                 prop.configuration());
             if (!generation.has_value())
+            {
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST stage=payload "
+                    "outcome=skipped reason=generation_missing replica=%u "
+                    "epoch=%u tree=%u block=%s",
+                    static_cast<unsigned>(get_id()),
+                    prop.configuration().epoch_number,
+                    prop.configuration().tree_id,
+                    prop.key().block_hash.to_hex().c_str());
                 return;
+            }
+            wire_generation = *generation;
             try
             {
                 const MsgPropose native(prop);
@@ -7712,27 +7917,105 @@ namespace hotstuff
             }
             catch (...)
             {
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST stage=payload "
+                    "outcome=skipped reason=encode_exception replica=%u "
+                    "epoch=%u tree=%u block=%s generation=%llu",
+                    static_cast<unsigned>(get_id()),
+                    prop.configuration().epoch_number,
+                    prop.configuration().tree_id,
+                    prop.key().block_hash.to_hex().c_str(),
+                    static_cast<unsigned long long>(wire_generation));
                 return;
             }
             if (adaptive_payload.empty())
+            {
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST stage=payload "
+                    "outcome=skipped reason=empty_payload replica=%u "
+                    "epoch=%u tree=%u block=%s generation=%llu",
+                    static_cast<unsigned>(get_id()),
+                    prop.configuration().epoch_number,
+                    prop.configuration().tree_id,
+                    prop.key().block_hash.to_hex().c_str(),
+                    static_cast<unsigned long long>(wire_generation));
                 return;
+            }
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=payload outcome=ready "
+                "reason=none replica=%u epoch=%u tree=%u block=%s "
+                "generation=%llu bytes=%zu",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str(),
+                static_cast<unsigned long long>(wire_generation),
+                adaptive_payload.size());
             if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
                 static_cast<void>(observe_proposal_view_generation(
                     prop.key(), *generation));
         }
 
+        std::size_t send_attempts = 0;
+        std::size_t send_successes = 0;
         for (const auto child : metadata->tree.direct_children)
         {
+            bool enqueued = false;
             if (is_adaptive_epoch_mode(epoch_protocol_mode))
-                pn.send_msg(
+                enqueued = pn.send_msg(
                     MsgPropose(DataStream(adaptive_payload)),
                     config.get_peer_id(child));
             else
-                pn.send_msg(
+                enqueued = pn.send_msg(
                     MsgPropose(prop), config.get_peer_id(child));
+            ++send_attempts;
+            if (enqueued)
+                ++send_successes;
         }
+        HOTSTUFF_LOG_INFO(
+            "KAURI_PROPOSAL_BROADCAST stage=direct_children "
+            "outcome=returned reason=none replica=%u epoch=%u tree=%u "
+            "block=%s attempts=%zu successes=%zu",
+            static_cast<unsigned>(get_id()),
+            prop.configuration().epoch_number,
+            prop.configuration().tree_id,
+            prop.key().block_hash.to_hex().c_str(),
+            send_attempts,
+            send_successes);
         if (lease.has_value())
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=fallback_call "
+                "outcome=begin reason=none replica=%u epoch=%u tree=%u "
+                "block=%s",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str());
             schedule_exact_proposal_fallback(*lease, prop);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=fallback_call "
+                "outcome=returned reason=none replica=%u epoch=%u tree=%u "
+                "block=%s",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str());
+        }
+        HOTSTUFF_LOG_INFO(
+            "KAURI_PROPOSAL_BROADCAST stage=summary outcome=complete "
+            "reason=none replica=%u epoch=%u tree=%u block=%s "
+            "generation=%llu payload_bytes=%zu children=%zu successes=%zu "
+            "fallback_requested=%u",
+            static_cast<unsigned>(get_id()),
+            prop.configuration().epoch_number,
+            prop.configuration().tree_id,
+            prop.key().block_hash.to_hex().c_str(),
+            static_cast<unsigned long long>(wire_generation),
+            adaptive_payload.size(),
+            send_attempts,
+            send_successes,
+            lease.has_value() ? 1U : 0U);
     }
 
     void HotStuffBase::inc_time(ReconfigurationType reconfig_type)
@@ -9724,12 +10007,24 @@ namespace hotstuff
                         }
                         throw;
                     }
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_LOCAL_PROPOSAL "
+                        "stage=piped_scope_tail replica=%u block=%s",
+                        static_cast<unsigned>(get_id()),
+                        piped_block->hash.to_hex().c_str());
                     /*if (id == get_pace_maker()->get_proposer()) {
                         gettimeofday(&timeEnd, NULL);
                         long usec = ((timeEnd.tv_sec - timeStart.tv_sec) * 1000000 + timeEnd.tv_usec - timeStart.tv_usec);
                         stats.insert(std::make_pair(piped_block->hash, usec));
                     }*/
                     piped_submitted = false;
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_LOCAL_PROPOSAL "
+                        "stage=piped_tail_released replica=%u block=%s "
+                        "piped_submitted=%u",
+                        static_cast<unsigned>(get_id()),
+                        piped_block->hash.to_hex().c_str(),
+                        piped_submitted ? 1U : 0U);
 
                     // TREE ROTATION FOR PROPOSER CASE 2
                     if (epoch_protocol_mode ==
@@ -9752,6 +10047,11 @@ namespace hotstuff
                                  get_total_system_trees())
                             inc_time(switch_type);
                     }
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_LOCAL_PROPOSAL "
+                        "stage=piped_tail_end replica=%u block=%s",
+                        static_cast<unsigned>(get_id()),
+                        piped_block->hash.to_hex().c_str());
                     
 
                     /** 
@@ -9796,7 +10096,13 @@ namespace hotstuff
                     throw;
                 }
             }
-        } });
+        }
+        HOTSTUFF_LOG_INFO(
+            "KAURI_LOCAL_PROPOSAL stage=beat_callback_exit replica=%u "
+            "proposer=%u",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(proposer));
+        });
     }
 
     void HotStuffBase::print_pipe_queues(bool printPiped, bool printRdy)
