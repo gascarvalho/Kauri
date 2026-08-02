@@ -348,6 +348,12 @@ def test_n31_config_and_argv_cardinality(tmp_path: Path) -> None:
     )
 
     assert sum(line.startswith("replica = ") for line in main_config.splitlines()) == 31
+    stat_periods = [
+        float(line.partition("=")[2])
+        for line in main_config.splitlines()
+        if line.startswith("stat-period = ")
+    ]
+    assert stat_periods == [profile.hard_timeout_s + 60.0]
     assert len(replica_commands) == 31
     assert len(set(replica_commands)) == 31
     assert manager_command.count("--replica") == 31

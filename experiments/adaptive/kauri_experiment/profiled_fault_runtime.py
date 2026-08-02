@@ -792,6 +792,7 @@ def main_config_payload(
         f"block-size = {profile.block_size}",
         "nworker = 2",
         "repnworker = 1",
+        f"stat-period = {profile.hard_timeout_s + 60.0}",
         "pace-maker = dummy",
         "proposer = 0",
         f"fan-out = {profile.fanout}",
