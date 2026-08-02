@@ -1948,6 +1948,8 @@ TEST_CASE("proposal tail diagnostics bracket relay and callback completion",
     CHECK(contains_in_order(
         fallback_dispatch,
         {"bool enqueued = false",
+         "proposal_contexts->snapshot(proposal.key())",
+         "snapshot->verified_signers.count(member) != 0",
          "++send_attempts",
          "pn.send_msg(",
          "stage=fallback_target_result",

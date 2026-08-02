@@ -3998,10 +3998,23 @@ namespace hotstuff
             }
 
             bool enqueued = false;
+            std::size_t skipped_verified = 0;
+            const auto snapshot =
+                proposal_contexts->snapshot(proposal.key());
+            if (!snapshot.has_value())
+                return false;
             for (const auto member : lease.tree().assigned_subtree)
             {
                 if (member == get_id())
                     continue;
+                // A verified signature proves that this replica already
+                // received this exact proposal. Repair only the missing
+                // recipients instead of rebroadcasting to the full tree.
+                if (snapshot->verified_signers.count(member) != 0)
+                {
+                    ++skipped_verified;
+                    continue;
+                }
                 const auto peer = config.get_peer_id(member);
                 if (peer.is_null())
                     continue;
@@ -4028,13 +4041,14 @@ namespace hotstuff
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=fallback_dispatch_summary outcome=complete "
                 "root=%u epoch=%u tree=%u block=%s attempts=%zu "
-                "successes=%zu enqueued=%u",
+                "successes=%zu skipped_verified=%zu enqueued=%u",
                 static_cast<unsigned>(get_id()),
                 lease.key().configuration.epoch_number,
                 lease.key().configuration.tree_id,
                 lease.key().block_hash.to_hex().c_str(),
                 send_attempts,
                 send_successes,
+                skipped_verified,
                 static_cast<unsigned>(enqueued));
             return enqueued;
         }

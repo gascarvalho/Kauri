@@ -697,6 +697,18 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
     CHECK(proposal_send.find(
               "for (const auto member : lease.tree().assigned_subtree)") !=
           std::string::npos);
+    const auto snapshot = proposal_send.find(
+        "proposal_contexts->snapshot(proposal.key())");
+    const auto skip_verified = proposal_send.find(
+        "snapshot->verified_signers.count(member) != 0");
+    const auto proposal_send_attempt = proposal_send.find(
+        "pn.send_msg(");
+    REQUIRE(snapshot != std::string::npos);
+    REQUIRE(skip_verified != std::string::npos);
+    REQUIRE(proposal_send_attempt != std::string::npos);
+    CHECK(snapshot < skip_verified);
+    CHECK(skip_verified < proposal_send_attempt);
+    CHECK(proposal_send.find("skipped_verified") != std::string::npos);
     CHECK(vote_dispatch.find("contains_admitted(key)") !=
           std::string::npos);
     CHECK(vote_dispatch.find("*active != key.configuration") !=
