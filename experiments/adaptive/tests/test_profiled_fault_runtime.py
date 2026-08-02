@@ -305,6 +305,112 @@ def test_validate_final_streams_accepts_measured_zero_postfault_bucket(
     assert all(row["tps"] == 200 for row in verdict["postfault_rows"][1:])
 
 
+def test_live_postfault_qualification_waits_for_the_complete_fixed_window() -> None:
+    fixture = _fixture()
+    runtime = _runtime()
+    observer = f"replica-{fixture['profile'].authoritative_observer}"
+    fixture["streams"][observer] = [
+        event
+        for event in fixture["streams"][observer]
+        if not (
+            event["event_type"] == "block.committed"
+            and event["payload"].get("block_height") == 200
+        )
+    ]
+
+    assert (
+        runtime.evaluate_complete_postfault_window(
+            fixture["profile"],
+            {
+                source: events
+                for source, events in fixture["streams"].items()
+                if source.startswith("replica-")
+            },
+            start_ns=POST_START_NS,
+            end_ns=POST_END_NS,
+            observed_ns=POST_END_NS - 1,
+        )
+        is None
+    )
+
+    qualified = runtime.evaluate_complete_postfault_window(
+        fixture["profile"],
+        {
+            source: events
+            for source, events in fixture["streams"].items()
+            if source.startswith("replica-")
+        },
+        start_ns=POST_START_NS,
+        end_ns=POST_END_NS,
+        observed_ns=POST_END_NS,
+    )
+
+    assert qualified is not None
+    assert qualified["common_commit"]["block_height"] == 205
+    assert qualified["rows"][0]["tps"] == 0
+
+
+def test_live_postfault_qualification_rejects_missing_q21_at_window_end() -> None:
+    fixture = _fixture()
+    runtime = _runtime()
+    fixture["streams"]["replica-1"] = [
+        event
+        for event in fixture["streams"]["replica-1"]
+        if not (
+            event["event_type"] == "block.commit_observed"
+            and event["payload"].get("block_height") == 205
+        )
+    ]
+
+    with pytest.raises(
+        runtime.IncompleteProfiledFaultRun,
+        match="fixed Q21 common commit.*complete postfault window",
+    ):
+        runtime.evaluate_complete_postfault_window(
+            fixture["profile"],
+            {
+                source: events
+                for source, events in fixture["streams"].items()
+                if source.startswith("replica-")
+            },
+            start_ns=POST_START_NS,
+            end_ns=POST_END_NS,
+            observed_ns=POST_END_NS,
+        )
+
+
+def test_live_postfault_wait_has_no_premature_observer_stall_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(PROFILE_PATH)
+    captured: dict[str, object] = {}
+
+    def wait_until(
+        description: str,
+        predicate: object,
+        **kwargs: object,
+    ) -> str:
+        captured.update({"description": description, "predicate": predicate, **kwargs})
+        return "qualified"
+
+    monkeypatch.setattr(runtime, "wait_until", wait_until)
+    predicate = lambda: None
+
+    assert (
+        runtime.wait_for_fixed_postfault_window(
+            profile,
+            predicate=predicate,
+            hard_deadline_ns=123,
+            records=(),
+        )
+        == "qualified"
+    )
+    assert captured["health"] is None
+    assert captured["predicate"] is predicate
+    assert captured["crashed_replica"] == profile.fault.replica_id
+
+
 def test_validate_final_streams_rejects_missing_process_ready(
     tmp_path: Path,
 ) -> None:

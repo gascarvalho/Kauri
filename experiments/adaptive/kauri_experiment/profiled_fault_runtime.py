@@ -1226,6 +1226,38 @@ def require_positive_buckets(
         )
 
 
+def evaluate_complete_postfault_window(
+    profile: FrozenProfile,
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    start_ns: int,
+    end_ns: int,
+    observed_ns: int,
+) -> dict[str, Any] | None:
+    """Qualify only the fixed post-fault window, including measured downtime."""
+    if observed_ns < end_ns:
+        return None
+    rows = throughput_rows(
+        profile,
+        streams[f"replica-{profile.authoritative_observer}"],
+        phase="postfault",
+        start_ns=start_ns,
+        bucket_count=profile.post_bucket_count,
+    )
+    common = find_common_commit(
+        profile,
+        streams,
+        witnesses=postfault_witnesses(profile),
+        after_ns=start_ns,
+        before_ns=end_ns,
+    )
+    if common is None:
+        raise IncompleteProfiledFaultRun(
+            "fixed Q21 common commit is absent from the complete postfault window"
+        )
+    return {"rows": rows, "common_commit": common}
+
+
 def write_throughput_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
     if not rows:
         raise ProfiledFaultRuntimeError("throughput CSV requires rows")
@@ -1750,6 +1782,25 @@ def wait_until(
         if now >= phase_deadline_ns:
             raise IncompleteProfiledFaultRun(f"timed out waiting for {description}")
         time.sleep(poll_interval_s)
+
+
+def wait_for_fixed_postfault_window(
+    profile: FrozenProfile,
+    *,
+    predicate: Callable[[], object | None],
+    hard_deadline_ns: int,
+    records: Sequence[ProcessRecord],
+) -> object:
+    """Observe the full window; zero-throughput buckets are measured evidence."""
+    return wait_until(
+        "complete postfault window and a fixed Q21 common commit",
+        predicate,
+        phase_timeout_s=profile.startup_timeout_s,
+        hard_deadline_ns=hard_deadline_ns,
+        records=records,
+        crashed_replica=profile.fault.replica_id,
+        health=None,
+    )
 
 
 def concurrent_cleanup(
@@ -2997,7 +3048,8 @@ def run_once(
         )
 
         def post_complete() -> dict[str, object] | None:
-            if monotonic_raw_ns() < post_end_ns:
+            observed_ns = monotonic_raw_ns()
+            if observed_ns < post_end_ns:
                 return None
             streams = event_streams(profile, run_directory, allow_partial=True)
             assert_no_successor_activity(
@@ -3010,33 +3062,23 @@ def run_once(
                 },
                 run_directory=run_directory,
             )
-            rows = throughput_rows(
-                profile,
-                streams[f"replica-{profile.authoritative_observer}"],
-                phase="postfault",
-                start_ns=post_start_ns,
-                bucket_count=profile.post_bucket_count,
-            )
-            common = find_common_commit(
+            qualification = evaluate_complete_postfault_window(
                 profile,
                 streams,
-                witnesses=postfault_witnesses(profile),
-                after_ns=post_start_ns,
-                before_ns=post_end_ns,
+                start_ns=post_start_ns,
+                end_ns=post_end_ns,
+                observed_ns=observed_ns,
             )
-            if common is None:
+            if qualification is None:
                 return None
-            post_rows.extend(rows)
-            return common
+            post_rows.extend(qualification["rows"])
+            return qualification["common_commit"]
 
-        wait_until(
-            "complete postfault window and a fixed Q21 common commit",
-            post_complete,
-            phase_timeout_s=profile.startup_timeout_s,
+        wait_for_fixed_postfault_window(
+            profile,
+            predicate=post_complete,
             hard_deadline_ns=hard_deadline_ns,
             records=records,
-            crashed_replica=profile.fault.replica_id,
-            health=observer_progress_health,
         )
         update_state("qualified_pending_cleanup")
     except KeyboardInterrupt as exc:
