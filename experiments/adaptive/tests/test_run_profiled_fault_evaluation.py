@@ -28,6 +28,11 @@ INTERNAL1_TAIL_DIAGNOSTIC_PROFILE = (
     / "profiles"
     / "n31-f5-internal1-handoff-tail-diagnostic-v2.json"
 )
+INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE = (
+    Path(__file__).parents[1]
+    / "profiles"
+    / "n31-f5-internal1-forwarding-tail-diagnostic-v3.json"
+)
 
 
 def _api():
@@ -321,6 +326,7 @@ def test_transition_request_is_zero_residency_fault_containment() -> None:
         INTERNAL1_PROFILE,
         INTERNAL1_DIAGNOSTIC_PROFILE,
         INTERNAL1_TAIL_DIAGNOSTIC_PROFILE,
+        INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE,
     ),
 )
 def test_cli_pins_the_exact_shipped_profiles(profile_path: Path) -> None:
