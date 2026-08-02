@@ -501,6 +501,42 @@ def test_internal1_forwarding_tail_diagnostic_changes_only_identity_metadata() -
     )
 
 
+def test_internal1_repnet2_diagnostic_changes_only_identity_metadata() -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    control_path = profiles / "n31-f5-internal1-crash-shakedown-v1.json"
+    diagnostic_path = profiles / "n31-f5-internal1-repnet2-diagnostic-v4.json"
+    control_document = json.loads(control_path.read_text(encoding="utf-8"))
+    diagnostic_document = json.loads(
+        diagnostic_path.read_text(encoding="utf-8")
+    )
+    control_fault = control_document.pop("fault")
+    diagnostic_fault = diagnostic_document.pop("fault")
+    control_document.pop("profile_id")
+    diagnostic_document.pop("profile_id")
+    control_fault.pop("fault_id")
+    diagnostic_fault.pop("fault_id")
+
+    assert diagnostic_document == control_document
+    assert diagnostic_fault == control_fault
+
+    control = api.load_frozen_profile(control_path)
+    diagnostic = api.load_frozen_profile(diagnostic_path)
+
+    runtime.require_shipped_profile(diagnostic)
+    assert diagnostic.profile_id == (
+        "n31-f5-q21-internal1-repnet2-diagnostic-v4"
+    )
+    assert diagnostic.fault.fault_id == (
+        "single-internal-replica1-repnet2-diagnostic"
+    )
+    assert diagnostic.fault.replica_id == control.fault.replica_id == 1
+    assert diagnostic.profile_sha256 == (
+        "c61aad2d835f4ffdac79e18a7373196d82d6b03a109009abad15b17966fb4561"
+    )
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:

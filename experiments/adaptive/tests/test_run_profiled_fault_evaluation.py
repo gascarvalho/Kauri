@@ -33,6 +33,11 @@ INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE = (
     / "profiles"
     / "n31-f5-internal1-forwarding-tail-diagnostic-v3.json"
 )
+INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE = (
+    Path(__file__).parents[1]
+    / "profiles"
+    / "n31-f5-internal1-repnet2-diagnostic-v4.json"
+)
 
 
 def _api():
@@ -327,6 +332,7 @@ def test_transition_request_is_zero_residency_fault_containment() -> None:
         INTERNAL1_DIAGNOSTIC_PROFILE,
         INTERNAL1_TAIL_DIAGNOSTIC_PROFILE,
         INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE,
+        INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE,
     ),
 )
 def test_cli_pins_the_exact_shipped_profiles(profile_path: Path) -> None:
@@ -383,6 +389,13 @@ def test_n31_config_and_argv_cardinality(tmp_path: Path) -> None:
         if line.startswith("stat-period = ")
     ]
     assert stat_periods == [profile.hard_timeout_s + 60.0]
+    assert [
+        line for line in main_config.splitlines()
+        if line.startswith("repnworker = ")
+    ] == ["repnworker = 2"]
+    assert runtime.effective_runtime(profile)[
+        "replica_network_workers"
+    ] == 2
     assert len(replica_commands) == 31
     assert len(set(replica_commands)) == 31
     assert manager_command.count("--replica") == 31

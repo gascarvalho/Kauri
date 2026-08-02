@@ -73,6 +73,12 @@ INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_ID = (
 INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_SHA256 = (
     "fca3d8e0b99b6cd7c576e5db2d69c406ba13b3f19af30a2445de4f604bcb9e00"
 )
+INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_ID = (
+    "n31-f5-q21-internal1-repnet2-diagnostic-v4"
+)
+INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_SHA256 = (
+    "c61aad2d835f4ffdac79e18a7373196d82d6b03a109009abad15b17966fb4561"
+)
 SHIPPED_PROFILES = {
     SHIPPED_PROFILE_ID: SHIPPED_PROFILE_SHA256,
     INTERNAL1_PROFILE_ID: INTERNAL1_PROFILE_SHA256,
@@ -81,6 +87,8 @@ SHIPPED_PROFILES = {
         INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_SHA256,
     INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_ID:
         INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_ID:
+        INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_SHA256,
 }
 EXPECTED_EPOCH_ZERO_DIGEST = (
     "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
@@ -92,6 +100,7 @@ MAX_COMMAND_BYTES = 4096
 MAX_ANCESTRY_BLOCKS = 128
 TRANSITION_ARTIFACT_ID = "e0-to-e1-shakedown-containment"
 MINIMUM_PREDECESSOR_RESIDENCY_MS = 0
+REPLICA_NETWORK_WORKERS = 2
 BUILD_PROVENANCE_FILENAME = "n31-exact-build-provenance.json"
 EXACT_BUILD_TARGETS = (
     "hotstuff-app",
@@ -794,6 +803,7 @@ def effective_runtime(profile: FrozenProfile) -> dict[str, object]:
         "quorum": profile.quorum,
         "fanout": profile.fanout,
         "pipeline_depth": profile.pipeline_depth,
+        "replica_network_workers": REPLICA_NETWORK_WORKERS,
         "block_size": profile.block_size,
         "tree_switch_period_blocks": profile.tree_switch_period_blocks,
         "aggregation_timeout_ms": int(profile.aggregation_timeout_s * 1000),
@@ -819,7 +829,7 @@ def main_config_payload(
     lines = [
         f"block-size = {profile.block_size}",
         "nworker = 2",
-        "repnworker = 1",
+        f"repnworker = {REPLICA_NETWORK_WORKERS}",
         f"stat-period = {profile.hard_timeout_s + 60.0}",
         "pace-maker = dummy",
         "proposer = 0",
