@@ -537,6 +537,43 @@ def test_internal1_repnet2_diagnostic_changes_only_identity_metadata() -> None:
     )
 
 
+def test_missing_signer_repair_diagnostic_changes_only_identity_metadata(
+) -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    control_path = profiles / "n31-f5-internal1-repnet2-diagnostic-v4.json"
+    diagnostic_path = (
+        profiles
+        / "n31-f5-internal1-missing-signer-repair-diagnostic-v5.json"
+    )
+    control_document = json.loads(control_path.read_text(encoding="utf-8"))
+    diagnostic_document = json.loads(
+        diagnostic_path.read_text(encoding="utf-8")
+    )
+    control_fault = control_document.pop("fault")
+    diagnostic_fault = diagnostic_document.pop("fault")
+    control_document.pop("profile_id")
+    diagnostic_document.pop("profile_id")
+    control_fault.pop("fault_id")
+    diagnostic_fault.pop("fault_id")
+
+    assert diagnostic_document == control_document
+    assert diagnostic_fault == control_fault
+
+    diagnostic = api.load_frozen_profile(diagnostic_path)
+    runtime.require_shipped_profile(diagnostic)
+    assert diagnostic.profile_id == (
+        "n31-f5-q21-internal1-missing-signer-repair-diagnostic-v5"
+    )
+    assert diagnostic.fault.fault_id == (
+        "single-internal-replica1-missing-signer-repair-diagnostic"
+    )
+    assert diagnostic.profile_sha256 == (
+        "512d69ffe4df0acb50035cb65017cc2abfdce0238f3d2fe5504957f762e3cabc"
+    )
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:
