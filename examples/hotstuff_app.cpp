@@ -222,6 +222,7 @@ parse_experiment_byzantine_options(
     const std::string &diagnostic_window,
     const std::string &raw_false_report_target,
     bool omit_outbound_aggregate,
+    bool omit_outbound_direct_vote,
     int context_limit)
 {
     const bool requested =
@@ -230,6 +231,7 @@ parse_experiment_byzantine_options(
         !diagnostic_window.empty() ||
         !raw_false_report_target.empty() ||
         omit_outbound_aggregate ||
+        omit_outbound_direct_vote ||
         context_limit != 0;
     if (!requested)
         return std::nullopt;
@@ -254,16 +256,23 @@ parse_experiment_byzantine_options(
     if (context_limit <= 0)
         throw HotStuffError(
             "experiment Byzantine context limit must be positive");
-    if (raw_false_report_target.empty() ==
-        !omit_outbound_aggregate)
+    const auto fault_mode_count =
+        static_cast<unsigned>(!raw_false_report_target.empty()) +
+        static_cast<unsigned>(omit_outbound_aggregate) +
+        static_cast<unsigned>(omit_outbound_direct_vote);
+    if (fault_mode_count != 1)
         throw HotStuffError(
             "select exactly one experiment Byzantine fault mode");
+    if (omit_outbound_direct_vote &&
+        !raw_additional_omission_configuration.empty())
+        throw HotStuffError(
+            "direct-vote omission does not accept an additional "
+            "configuration");
     if (!raw_additional_omission_configuration.empty() &&
         !omit_outbound_aggregate)
         throw HotStuffError(
             "additional experiment omission configuration requires "
             "aggregate omission");
-
     const auto parse_configuration =
         [](const std::string &raw_value,
            const std::string &name) -> hotstuff::ConfigurationId
@@ -333,10 +342,16 @@ parse_experiment_byzantine_options(
         options.maximum_false_report_contexts =
             static_cast<std::size_t>(context_limit);
     }
-    else
+    else if (omit_outbound_aggregate)
     {
         options.omit_outbound_aggregate = true;
         options.maximum_omission_contexts =
+            static_cast<std::size_t>(context_limit);
+    }
+    else
+    {
+        options.omit_outbound_direct_vote = true;
+        options.maximum_direct_vote_omission_contexts =
             static_cast<std::size_t>(context_limit);
     }
     return options;
@@ -592,6 +607,8 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_experiment_omit_outbound_aggregate =
         Config::OptValFlag::create(false);
+    auto opt_experiment_omit_outbound_direct_vote =
+        Config::OptValFlag::create(false);
     auto opt_experiment_byzantine_context_limit =
         Config::OptValInt::create(0);
 
@@ -758,6 +775,12 @@ int main(int argc, char **argv)
         -1,
         "omit one timeout-flushed aggregate per exact proposal");
     config.add_opt(
+        "experiment-omit-outbound-direct-vote",
+        opt_experiment_omit_outbound_direct_vote,
+        Config::SWITCH_ON,
+        -1,
+        "omit one leaf's outbound direct vote per exact proposal");
+    config.add_opt(
         "experiment-byzantine-context-limit",
         opt_experiment_byzantine_context_limit,
         Config::SET_VAL,
@@ -832,6 +855,7 @@ int main(int argc, char **argv)
             opt_experiment_byzantine_window->get(),
             opt_experiment_false_report_target->get(),
             opt_experiment_omit_outbound_aggregate->get(),
+            opt_experiment_omit_outbound_direct_vote->get(),
             opt_experiment_byzantine_context_limit->get());
     const auto adaptive_v2_manager_pin = parse_adaptive_v2_manager_pin(
         opt_epoch_protocol_mode->get(),

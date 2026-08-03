@@ -472,7 +472,7 @@ TEST_CASE(
         "void HotStuffBase::start_aggregation_timer");
     CHECK(start_deadline.find("aggregation_timeout_policy.timeout_for") !=
           std::string::npos);
-    CHECK(start_deadline.find("adaptive_monotonic_now_ns()") !=
+    CHECK(start_deadline.find("adaptive_evidence_monotonic_now_ns()") !=
           std::string::npos);
     CHECK(start_deadline.find("adaptive_v2_response_evidence->arm") !=
           std::string::npos);

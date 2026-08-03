@@ -23,6 +23,7 @@
 #include <ctime>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <random>
 #include <future>
 #include <iostream>
@@ -97,6 +98,7 @@ namespace hotstuff
 
         std::uint64_t adaptive_monotonic_now_ns() noexcept
         {
+            // Keep retry scheduling on the scheduler-compatible steady clock.
             const auto elapsed = std::chrono::duration_cast<
                 std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
@@ -104,6 +106,40 @@ namespace hotstuff
             return elapsed > 0
                        ? static_cast<std::uint64_t>(elapsed)
                        : 0;
+        }
+
+        std::uint64_t adaptive_evidence_monotonic_now_ns() noexcept
+        {
+            // Evidence facts and fault markers share this frozen raw-clock
+            // domain so campaign validators can compare their timestamps.
+            struct timespec timestamp{};
+            if (::clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) != 0 ||
+                timestamp.tv_sec < 0 || timestamp.tv_nsec < 0 ||
+                timestamp.tv_nsec >= 1'000'000'000)
+                return 0;
+
+            constexpr std::uint64_t nanoseconds_per_second =
+                1'000'000'000;
+            const auto seconds =
+                static_cast<std::uint64_t>(timestamp.tv_sec);
+            const auto nanoseconds =
+                static_cast<std::uint64_t>(timestamp.tv_nsec);
+            if (seconds >
+                (std::numeric_limits<std::uint64_t>::max() -
+                 nanoseconds) /
+                    nanoseconds_per_second)
+                return 0;
+            return seconds * nanoseconds_per_second + nanoseconds;
+        }
+
+        std::optional<std::uint64_t>
+        experiment_fault_marker_monotonic_now_ns() noexcept
+        {
+            const auto monotonic_ns =
+                adaptive_evidence_monotonic_now_ns();
+            if (monotonic_ns == 0)
+                return std::nullopt;
+            return monotonic_ns;
         }
 
         std::uint64_t adaptive_deadline_duration_us(
@@ -3003,6 +3039,51 @@ namespace hotstuff
             bounded);
     }
 
+    bool HotStuffBase::consume_experiment_outbound_direct_vote(
+        const ProposalKey &key,
+        const ProposalTreeSnapshot &tree)
+    {
+        if (experiment_byzantine_adapter == nullptr ||
+            tree.local_replica != get_id() ||
+            !tree.parent.has_value() || !tree.direct_children.empty())
+            return false;
+
+        const auto disposition = experiment_byzantine_adapter
+                                     ->consume_outbound_direct_vote(
+            ExperimentByzantineContext{
+                key,
+                experiment_diagnostic_window});
+        if (disposition == ExperimentDirectVoteDisposition::forward)
+            return false;
+        if (disposition ==
+            ExperimentDirectVoteDisposition::omit_repeat)
+            return true;
+
+        const auto marker_monotonic_ns =
+            experiment_fault_marker_monotonic_now_ns();
+        if (marker_monotonic_ns.has_value())
+            HOTSTUFF_LOG_INFO(
+                "KAURI_FAULT direct_vote_omitted replica=%u parent=%u "
+                "epoch=%u tree=%u block=%s window=%s monotonic_ns=%llu",
+                get_id(),
+                *tree.parent,
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.block_hash.to_hex().c_str(),
+                experiment_diagnostic_window.c_str(),
+                static_cast<unsigned long long>(*marker_monotonic_ns));
+        else
+            HOTSTUFF_LOG_WARN(
+                "KAURI_FAULT marker_skipped marker=direct_vote_omitted "
+                "replica=%u epoch=%u tree=%u block=%s "
+                "reason=event_clock_unavailable",
+                get_id(),
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.block_hash.to_hex().c_str());
+        return true;
+    }
+
     bool HotStuffBase::send_exact_relay(
         const ProposalContextLease &lease,
         quorum_cert_bt certificate)
@@ -3016,20 +3097,42 @@ namespace hotstuff
             return false;
 
         if (experiment_byzantine_adapter != nullptr &&
+            experiment_byzantine_adapter
+                ->outbound_direct_vote_omitted(
+                    ExperimentByzantineContext{
+                        lease.key(),
+                        experiment_diagnostic_window}))
+            return true;
+
+        if (experiment_byzantine_adapter != nullptr &&
             experiment_byzantine_adapter->consume_outbound_aggregate(
                 ExperimentByzantineContext{
                     lease.key(),
                     experiment_diagnostic_window}))
         {
-            HOTSTUFF_LOG_INFO(
-                "KAURI_FAULT aggregate_omitted replica=%u parent=%u "
-                "epoch=%u tree=%u block=%s window=%s",
-                get_id(),
-                *lease.tree().parent,
-                lease.key().configuration.epoch_number,
-                lease.key().configuration.tree_id,
-                lease.key().block_hash.to_hex().c_str(),
-                experiment_diagnostic_window.c_str());
+            const auto marker_monotonic_ns =
+                experiment_fault_marker_monotonic_now_ns();
+            if (marker_monotonic_ns.has_value())
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_FAULT aggregate_omitted replica=%u parent=%u "
+                    "epoch=%u tree=%u block=%s window=%s monotonic_ns=%llu",
+                    get_id(),
+                    *lease.tree().parent,
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str(),
+                    experiment_diagnostic_window.c_str(),
+                    static_cast<unsigned long long>(
+                        *marker_monotonic_ns));
+            else
+                HOTSTUFF_LOG_WARN(
+                    "KAURI_FAULT marker_skipped marker=aggregate_omitted "
+                    "replica=%u epoch=%u tree=%u block=%s "
+                    "reason=event_clock_unavailable",
+                    get_id(),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().block_hash.to_hex().c_str());
             return true;
         }
 
@@ -3942,6 +4045,13 @@ namespace hotstuff
         if (vote.key() != key || vote.voter != get_id() ||
             vote.cert == nullptr || root == get_id())
             return false;
+        if (experiment_byzantine_adapter != nullptr &&
+            experiment_byzantine_adapter
+                ->outbound_direct_vote_omitted(
+                    ExperimentByzantineContext{
+                        key,
+                        experiment_diagnostic_window}))
+            return true;
         const auto peer = config.get_peer_id(root);
         if (peer.is_null())
             return false;
@@ -5253,7 +5363,7 @@ namespace hotstuff
                 adaptive_v2_response_evidence->record_timeouts(
                     lease.key(),
                     missing,
-                    adaptive_monotonic_now_ns());
+                    adaptive_evidence_monotonic_now_ns());
             const auto diagnostics =
                 adaptive_v2_response_evidence->diagnostics();
             HOTSTUFF_LOG_INFO(
@@ -5636,6 +5746,14 @@ namespace hotstuff
                         lease.key(),
                         experiment_diagnostic_window},
                     contribution.authenticated_sender);
+            const bool emit_positive_suppression_marker =
+                suppress_positive_observation &&
+                experiment_byzantine_adapter
+                    ->consume_false_report_positive_marker(
+                        ExperimentByzantineContext{
+                            lease.key(),
+                            experiment_diagnostic_window},
+                        contribution.authenticated_sender);
             if (adaptive_v2_response_evidence != nullptr &&
                 !suppress_positive_observation)
                 static_cast<void>(
@@ -5646,18 +5764,36 @@ namespace hotstuff
                             ? ExpectedMessageType::direct_vote
                             : ExpectedMessageType::aggregate_relay,
                         contribution_signers,
-                        adaptive_monotonic_now_ns()));
-            if (suppress_positive_observation)
-                HOTSTUFF_LOG_INFO(
-                    "KAURI_FAULT false_report_positive_suppressed "
-                    "reporter=%u target=%u epoch=%u tree=%u block=%s "
-                    "window=%s",
-                    get_id(),
-                    contribution.authenticated_sender,
-                    lease.key().configuration.epoch_number,
-                    lease.key().configuration.tree_id,
-                    lease.key().block_hash.to_hex().c_str(),
-                    experiment_diagnostic_window.c_str());
+                        adaptive_evidence_monotonic_now_ns()));
+            if (emit_positive_suppression_marker)
+            {
+                const auto marker_monotonic_ns =
+                    experiment_fault_marker_monotonic_now_ns();
+                if (marker_monotonic_ns.has_value())
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_FAULT false_report_positive_suppressed "
+                        "reporter=%u target=%u epoch=%u tree=%u block=%s "
+                        "window=%s monotonic_ns=%llu",
+                        get_id(),
+                        contribution.authenticated_sender,
+                        lease.key().configuration.epoch_number,
+                        lease.key().configuration.tree_id,
+                        lease.key().block_hash.to_hex().c_str(),
+                        experiment_diagnostic_window.c_str(),
+                        static_cast<unsigned long long>(
+                            *marker_monotonic_ns));
+                else
+                    HOTSTUFF_LOG_WARN(
+                        "KAURI_FAULT marker_skipped "
+                        "marker=false_report_positive_suppressed "
+                        "reporter=%u target=%u epoch=%u tree=%u block=%s "
+                        "reason=event_clock_unavailable",
+                        get_id(),
+                        contribution.authenticated_sender,
+                        lease.key().configuration.epoch_number,
+                        lease.key().configuration.tree_id,
+                        lease.key().block_hash.to_hex().c_str());
+            }
             if (proposal_contexts->delta_open_enabled(lease))
             {
                 std::set<ReplicaID> accepted_optional;
@@ -5941,7 +6077,7 @@ namespace hotstuff
                 adaptive_v2_response_evidence->arm(
                 key,
                 lease->tree(),
-                adaptive_monotonic_now_ns(),
+                adaptive_evidence_monotonic_now_ns(),
                 adaptive_deadline_duration_us(duration));
             if (!evidence_armed ||
                 experiment_byzantine_adapter == nullptr)
@@ -6080,7 +6216,7 @@ namespace hotstuff
                 recorded = adaptive_v2_response_evidence->record_timeouts(
                     key,
                     std::set<ReplicaID>{target},
-                    adaptive_monotonic_now_ns());
+                    adaptive_evidence_monotonic_now_ns());
                 const auto bridge =
                     adaptive_v2_response_evidence->diagnostics();
                 const auto evidence_sequence_after =
@@ -6099,16 +6235,32 @@ namespace hotstuff
                 {
                     static_cast<void>(
                         adaptive_v2_response_evidence->retire(key));
-                    HOTSTUFF_LOG_INFO(
-                        "KAURI_FAULT false_timeout_emitted "
-                        "reporter=%u target=%u epoch=%u tree=%u "
-                        "block=%s window=%s",
-                        get_id(),
-                        target,
-                        key.configuration.epoch_number,
-                        key.configuration.tree_id,
-                        key.block_hash.to_hex().c_str(),
-                        window.c_str());
+                    const auto marker_monotonic_ns =
+                        experiment_fault_marker_monotonic_now_ns();
+                    if (marker_monotonic_ns.has_value())
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_FAULT false_timeout_emitted "
+                            "reporter=%u target=%u epoch=%u tree=%u "
+                            "block=%s window=%s monotonic_ns=%llu",
+                            get_id(),
+                            target,
+                            key.configuration.epoch_number,
+                            key.configuration.tree_id,
+                            key.block_hash.to_hex().c_str(),
+                            window.c_str(),
+                            static_cast<unsigned long long>(
+                                *marker_monotonic_ns));
+                    else
+                        HOTSTUFF_LOG_WARN(
+                            "KAURI_FAULT marker_skipped "
+                            "marker=false_timeout_emitted reporter=%u "
+                            "target=%u epoch=%u tree=%u block=%s "
+                            "reason=event_clock_unavailable",
+                            get_id(),
+                            target,
+                            key.configuration.epoch_number,
+                            key.configuration.tree_id,
+                            key.block_hash.to_hex().c_str());
                 }
             }
         }
@@ -8743,20 +8895,43 @@ namespace hotstuff
             {
                 if (experiment_byzantine_adapter != nullptr &&
                     experiment_byzantine_adapter
+                        ->outbound_direct_vote_omitted(
+                            ExperimentByzantineContext{
+                                lease.key(),
+                                experiment_diagnostic_window}))
+                    return true;
+                if (experiment_byzantine_adapter != nullptr &&
+                    experiment_byzantine_adapter
                         ->consume_outbound_aggregate(
                             ExperimentByzantineContext{
                                 lease.key(),
                                 experiment_diagnostic_window}))
                 {
-                    HOTSTUFF_LOG_INFO(
-                        "KAURI_FAULT aggregate_omitted replica=%u "
-                        "parent=%u epoch=%u tree=%u block=%s window=%s",
-                        get_id(),
-                        lease.tree().parent.value_or(get_id()),
-                        lease.key().configuration.epoch_number,
-                        lease.key().configuration.tree_id,
-                        lease.key().block_hash.to_hex().c_str(),
-                        experiment_diagnostic_window.c_str());
+                    const auto marker_monotonic_ns =
+                        experiment_fault_marker_monotonic_now_ns();
+                    if (marker_monotonic_ns.has_value())
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_FAULT aggregate_omitted replica=%u "
+                            "parent=%u epoch=%u tree=%u block=%s window=%s "
+                            "monotonic_ns=%llu",
+                            get_id(),
+                            lease.tree().parent.value_or(get_id()),
+                            lease.key().configuration.epoch_number,
+                            lease.key().configuration.tree_id,
+                            lease.key().block_hash.to_hex().c_str(),
+                            experiment_diagnostic_window.c_str(),
+                            static_cast<unsigned long long>(
+                                *marker_monotonic_ns));
+                    else
+                        HOTSTUFF_LOG_WARN(
+                            "KAURI_FAULT marker_skipped "
+                            "marker=aggregate_omitted replica=%u epoch=%u "
+                            "tree=%u block=%s "
+                            "reason=event_clock_unavailable",
+                            get_id(),
+                            lease.key().configuration.epoch_number,
+                            lease.key().configuration.tree_id,
+                            lease.key().block_hash.to_hex().c_str());
                     return true;
                 }
                 auto retained = claim.certificate == nullptr
@@ -9042,6 +9217,14 @@ namespace hotstuff
                 static_cast<unsigned>(recorded));
         if (!recorded)
             return;
+        if (consume_experiment_outbound_direct_vote(
+                lease->key(), lease->tree()))
+        {
+            static_cast<void>(proposal_contexts->close(
+                lease->key(),
+                ProposalContextEvent::proposal_aborted));
+            return;
+        }
         schedule_exact_vote_fallback(*lease, vote);
         if (proposal_contexts->delta_open_enabled(*lease))
         {
@@ -9419,6 +9602,14 @@ namespace hotstuff
                         *vote.cert,
                         std::move(forwarding_candidate)))
                     return;
+                if (owner.consume_experiment_outbound_direct_vote(
+                        lease->key(), lease->tree()))
+                {
+                    static_cast<void>(owner.proposal_contexts->close(
+                        lease->key(),
+                        ProposalContextEvent::proposal_aborted));
+                    return;
+                }
                 owner.schedule_exact_vote_fallback(*lease, vote);
 
                 if (owner.proposal_contexts->delta_open_enabled(

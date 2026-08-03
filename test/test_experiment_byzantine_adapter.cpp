@@ -1,9 +1,11 @@
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 
@@ -26,6 +28,11 @@
  * aggregate as a successful experiment drop so the consensus path does not
  * schedule a retry.
  *
+ * The static diagnosis is deliberately constrained to two modes: signer
+ * inclusion cryptographically proves a false report, while signer exclusion
+ * identifies the target omission only within that frozen two-mode model, not
+ * arbitrary Byzantine attribution.
+ *
  * This fallback keeps the missing production API compile-visible. Its methods
  * are deliberately undefined so the target fails to link until the adapter is
  * implemented.
@@ -45,6 +52,13 @@ struct ExperimentByzantineContext final
     std::string diagnostic_window;
 };
 
+enum class ExperimentDirectVoteDisposition
+{
+    forward,
+    omit_first,
+    omit_repeat
+};
+
 struct ExperimentByzantineOptions final
 {
     bool enabled{false};
@@ -53,8 +67,10 @@ struct ExperimentByzantineOptions final
     std::string diagnostic_window;
     std::optional<ReplicaID> false_report_target;
     bool omit_outbound_aggregate{false};
+    bool omit_outbound_direct_vote{false};
     std::size_t maximum_false_report_contexts{0};
     std::size_t maximum_omission_contexts{0};
+    std::size_t maximum_direct_vote_omission_contexts{0};
 };
 
 class ExperimentByzantineAdapter final
@@ -77,6 +93,9 @@ public:
     bool on_verified_response(
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;
+    bool consume_false_report_positive_marker(
+        const ExperimentByzantineContext &context,
+        ReplicaID target) noexcept;
     bool should_retain_response_evidence(
         const ExperimentByzantineContext &context) const noexcept;
     bool cancel_false_report(
@@ -87,6 +106,10 @@ public:
         ReplicaID target) noexcept;
     bool consume_outbound_aggregate(
         const ExperimentByzantineContext &context);
+    ExperimentDirectVoteDisposition consume_outbound_direct_vote(
+        const ExperimentByzantineContext &context);
+    bool outbound_direct_vote_omitted(
+        const ExperimentByzantineContext &context) const noexcept;
 
 private:
     struct State;
@@ -167,6 +190,7 @@ using hotstuff::DataStream;
 using hotstuff::ExperimentByzantineAdapter;
 using hotstuff::ExperimentByzantineContext;
 using hotstuff::ExperimentByzantineOptions;
+using hotstuff::ExperimentDirectVoteDisposition;
 using hotstuff::ExperimentFalseTimeoutFenceTestAccess;
 using hotstuff::ProposalKey;
 using hotstuff::ReplicaID;
@@ -202,9 +226,27 @@ ExperimentByzantineOptions enabled_options()
     options.configuration = configuration();
     options.diagnostic_window = "diagnostic-window-1";
     options.false_report_target = ReplicaID{4};
-    options.omit_outbound_aggregate = true;
     options.maximum_false_report_contexts = 2;
+    return options;
+}
+
+ExperimentByzantineOptions aggregate_omission_options()
+{
+    auto options = enabled_options();
+    options.false_report_target.reset();
+    options.maximum_false_report_contexts = 0;
+    options.omit_outbound_aggregate = true;
     options.maximum_omission_contexts = 2;
+    return options;
+}
+
+ExperimentByzantineOptions direct_vote_omission_options()
+{
+    auto options = enabled_options();
+    options.false_report_target.reset();
+    options.maximum_false_report_contexts = 0;
+    options.omit_outbound_direct_vote = true;
+    options.maximum_direct_vote_omission_contexts = 2;
     return options;
 }
 
@@ -256,8 +298,13 @@ TEST_CASE(
 
     CHECK_FALSE(adapter.arm_false_report(exact, 4));
     CHECK_FALSE(adapter.on_verified_response(exact, 4));
+    CHECK_FALSE(adapter.consume_false_report_positive_marker(exact, 4));
     CHECK_FALSE(adapter.consume_false_timeout(exact, 4));
     CHECK_FALSE(adapter.consume_outbound_aggregate(exact));
+    CHECK(
+        adapter.consume_outbound_direct_vote(exact) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(adapter.outbound_direct_vote_omitted(exact));
 }
 
 TEST_CASE(
@@ -275,6 +322,13 @@ TEST_CASE(
     // value controls only the separate positive evidence observation.
     CHECK(adapter.on_verified_response(exact, 4));
     CHECK(adapter.should_retain_response_evidence(exact));
+    CHECK(adapter.consume_false_report_positive_marker(exact, 4));
+    CHECK_FALSE(adapter.consume_false_report_positive_marker(exact, 4));
+
+    // Duplicate verified contributions remain suppressed without emitting a
+    // duplicate ground-truth marker for the same exact context and window.
+    CHECK(adapter.on_verified_response(exact, 4));
+    CHECK_FALSE(adapter.consume_false_report_positive_marker(exact, 4));
 
     // The runtime invokes this method from its real deadline callback. Exactly
     // one evidence-only false timeout is consumed for the exact context.
@@ -301,6 +355,8 @@ TEST_CASE(
     CHECK_FALSE(adapter.arm_false_report(wrong_target, 5));
     CHECK_FALSE(adapter.arm_false_report(wrong_configuration, 4));
     CHECK_FALSE(adapter.arm_false_report(wrong_window, 4));
+    CHECK_FALSE(
+        adapter.consume_false_report_positive_marker(wrong_target, 5));
 
     const auto first = context("bounded-first");
     const auto second = context("bounded-second");
@@ -363,7 +419,7 @@ TEST_CASE(
     "persistent omitter consumes one aggregate per exact bounded context",
     "[adaptive-v2][experiment][byzantine][omission]")
 {
-    ExperimentByzantineAdapter adapter(enabled_options());
+    ExperimentByzantineAdapter adapter(aggregate_omission_options());
     const auto first = context("omission-first");
     const auto second = context("omission-second");
     const auto over_limit = context("omission-third");
@@ -390,7 +446,7 @@ TEST_CASE(
     "persistent omission accepts one additional exact configuration only",
     "[adaptive-v2][experiment][byzantine][omission][crosscheck]")
 {
-    auto options = enabled_options();
+    auto options = aggregate_omission_options();
     options.configuration = configuration(7, 6, "shared-epoch");
     options.additional_omission_configuration =
         configuration(7, 0, "shared-epoch");
@@ -404,12 +460,13 @@ TEST_CASE(
         "tree-0-aggregate",
         configuration(7, 0, "shared-epoch"));
 
-    CHECK(adapter.consume_outbound_aggregate(primary));
+    // The additional tree is independently exact; it does not wait for the
+    // primary tree to be omitted first.
     CHECK(adapter.consume_outbound_aggregate(followup));
+    CHECK(adapter.consume_outbound_aggregate(primary));
 
-    // The additional configuration is omission-only. False reporting remains
-    // exact to the primary configuration selected for the injected reporter.
-    CHECK(adapter.arm_false_report(primary, 4));
+    // Aggregate omission is the adapter's only configured fault mode.
+    CHECK_FALSE(adapter.arm_false_report(primary, 4));
     CHECK_FALSE(adapter.arm_false_report(followup, 4));
     CHECK_FALSE(adapter.on_verified_response(followup, 4));
     CHECK_FALSE(adapter.consume_false_timeout(followup, 4));
@@ -433,7 +490,7 @@ TEST_CASE(
     "additional omission configuration stays optional",
     "[adaptive-v2][experiment][byzantine][omission][crosscheck]")
 {
-    auto options = enabled_options();
+    auto options = aggregate_omission_options();
     options.configuration = configuration(7, 6, "shared-epoch");
     ExperimentByzantineAdapter adapter(options);
 
@@ -443,6 +500,94 @@ TEST_CASE(
     CHECK_FALSE(adapter.consume_outbound_aggregate(context(
         "tree-0-aggregate",
         configuration(7, 0, "shared-epoch"))));
+}
+
+TEST_CASE(
+    "direct-vote omission is exact bounded and persistent across retries",
+    "[adaptive-v2][experiment][byzantine][direct-vote][ordering]")
+{
+    ExperimentByzantineAdapter adapter(direct_vote_omission_options());
+    const auto first = context("direct-first");
+    const auto second = context("direct-second");
+    const auto over_limit = context("direct-third");
+
+    CHECK_FALSE(adapter.outbound_direct_vote_omitted(first));
+    CHECK(
+        adapter.consume_outbound_direct_vote(context(
+            "wrong-configuration",
+            configuration(8, 3, "other-epoch"))) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK(
+        adapter.consume_outbound_direct_vote(context(
+            "wrong-window",
+            configuration(),
+            "diagnostic-window-2")) ==
+        ExperimentDirectVoteDisposition::forward);
+
+    CHECK(
+        adapter.consume_outbound_direct_vote(first) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(adapter.outbound_direct_vote_omitted(first));
+    // A parent retry or a direct-to-root fallback for the same exact proposal
+    // remains suppressed without claiming a second audit marker.
+    CHECK(
+        adapter.consume_outbound_direct_vote(first) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+    CHECK(
+        adapter.consume_outbound_direct_vote(first) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+
+    CHECK(
+        adapter.consume_outbound_direct_vote(second) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(
+        adapter.consume_outbound_direct_vote(over_limit) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(adapter.outbound_direct_vote_omitted(over_limit));
+}
+
+TEST_CASE(
+    "direct-vote omission construction rejects ambiguous fault modes",
+    "[adaptive-v2][experiment][byzantine][direct-vote][validation]")
+{
+    auto missing_bound = direct_vote_omission_options();
+    missing_bound.maximum_direct_vote_omission_contexts = 0;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(missing_bound),
+        std::invalid_argument);
+
+    auto with_false_report = direct_vote_omission_options();
+    with_false_report.false_report_target = ReplicaID{4};
+    with_false_report.maximum_false_report_contexts = 2;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(with_false_report),
+        std::invalid_argument);
+
+    auto with_aggregate = direct_vote_omission_options();
+    with_aggregate.omit_outbound_aggregate = true;
+    with_aggregate.maximum_omission_contexts = 2;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(with_aggregate),
+        std::invalid_argument);
+
+    auto with_additional = direct_vote_omission_options();
+    with_additional.additional_omission_configuration =
+        configuration(7, 0, "diagnostic-epoch");
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(with_additional),
+        std::invalid_argument);
+}
+
+TEST_CASE(
+    "experiment marker raw clock is available and positive",
+    "[adaptive-v2][experiment][byzantine][clock]")
+{
+    struct timespec timestamp{};
+    REQUIRE(::clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) == 0);
+    CHECK(timestamp.tv_sec >= 0);
+    CHECK(timestamp.tv_nsec >= 0);
+    CHECK(timestamp.tv_nsec < 1'000'000'000);
+    CHECK((timestamp.tv_sec > 0 || timestamp.tv_nsec > 0));
 }
 
 TEST_CASE(
@@ -458,10 +603,23 @@ TEST_CASE(
                   bool>);
     static_assert(std::is_same_v<
                   decltype(std::declval<ExperimentByzantineAdapter &>()
+                               .consume_false_report_positive_marker(
+                                   std::declval<
+                                       const ExperimentByzantineContext &>(),
+                                   std::declval<ReplicaID>())),
+                  bool>);
+    static_assert(std::is_same_v<
+                  decltype(std::declval<ExperimentByzantineAdapter &>()
                                .consume_outbound_aggregate(
                                    std::declval<
                                        const ExperimentByzantineContext &>())),
                   bool>);
+    static_assert(std::is_same_v<
+                  decltype(std::declval<ExperimentByzantineAdapter &>()
+                               .consume_outbound_direct_vote(
+                                   std::declval<
+                                       const ExperimentByzantineContext &>())),
+                  ExperimentDirectVoteDisposition>);
 
     const auto manager = source("examples/adaptation_manager.cpp");
     CHECK(manager.find("ExperimentByzantineAdapter") == std::string::npos);
@@ -470,6 +628,9 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         manager.find("experiment-omit-outbound-aggregate") ==
+        std::string::npos);
+    CHECK(
+        manager.find("experiment-omit-outbound-direct-vote") ==
         std::string::npos);
 }
 
@@ -505,6 +666,10 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         declarations.find(
+            "opt_experiment_omit_outbound_direct_vote") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
             "opt_experiment_byzantine_context_limit") !=
         std::string::npos);
     CHECK(
@@ -534,7 +699,34 @@ TEST_CASE(
         application.find("\"experiment-omit-outbound-aggregate\"") !=
         std::string::npos);
     CHECK(
+        application.find(
+            "\"experiment-omit-outbound-direct-vote\"") !=
+        std::string::npos);
+    CHECK(
         application.find("\"experiment-byzantine-context-limit\"") !=
+        std::string::npos);
+
+    const auto parser = source_slice(
+        application,
+        "parse_experiment_byzantine_options(",
+        "hotstuff::PubKeySecp256k1 parse_adaptive_v2_issuer_public_key");
+    CHECK(
+        parser.find("bool omit_outbound_direct_vote") !=
+        std::string::npos);
+    CHECK(parser.find("fault_mode_count != 1") != std::string::npos);
+    CHECK(
+        parser.find(
+            "direct-vote omission does not accept an additional ") !=
+        std::string::npos);
+    CHECK(
+        parser.find("options.omit_outbound_direct_vote = true") !=
+        std::string::npos);
+    CHECK(
+        parser.find(
+            "options.maximum_direct_vote_omission_contexts") !=
+        std::string::npos);
+    CHECK(
+        parser.find("additional_omission_after_primary") ==
         std::string::npos);
 
     const auto configuration = source_slice(
@@ -607,19 +799,34 @@ TEST_CASE(
     const auto accepted = contribution.find("if (!accepted)");
     const auto suppress =
         contribution.find("on_verified_response");
+    const auto marker_latch = contribution.find(
+        "consume_false_report_positive_marker");
     const auto positive =
         contribution.find("record_verified_response");
     REQUIRE(accepted != std::string::npos);
     REQUIRE(suppress != std::string::npos);
+    REQUIRE(marker_latch != std::string::npos);
     REQUIRE(positive != std::string::npos);
     CHECK(accepted < suppress);
-    CHECK(suppress < positive);
+    CHECK(suppress < marker_latch);
+    CHECK(marker_latch < positive);
     CHECK(
         contribution.find("suppress_positive_observation") !=
         std::string::npos);
     CHECK(
         contribution.find(
             "KAURI_FAULT false_report_positive_suppressed") !=
+        std::string::npos);
+    CHECK(
+        occurrences(
+            implementation,
+            "KAURI_FAULT false_report_positive_suppressed ") == 1);
+    CHECK(
+        contribution.find("experiment_fault_marker_monotonic_now_ns") <
+        contribution.find(
+            "KAURI_FAULT false_report_positive_suppressed"));
+    CHECK(
+        contribution.find("window=%s monotonic_ns=%llu") !=
         std::string::npos);
     CHECK(
         contribution.find("consume_false_timeout") ==
@@ -695,6 +902,12 @@ TEST_CASE(
     CHECK(
         false_timeout.find("KAURI_FAULT false_timeout_emitted") !=
         std::string::npos);
+    CHECK(
+        false_timeout.find("experiment_fault_marker_monotonic_now_ns") <
+        false_timeout.find("KAURI_FAULT false_timeout_emitted"));
+    CHECK(
+        false_timeout.find("window=%s monotonic_ns=%llu") !=
+        std::string::npos);
     CHECK(occurrences(implementation, "consume_false_timeout") == 1);
 
     const auto committed = source_slice(
@@ -739,20 +952,93 @@ TEST_CASE(
         coordinator.find("consume_outbound_aggregate");
     const auto audit =
         coordinator.find("KAURI_FAULT aggregate_omitted");
+    const auto marker_clock =
+        coordinator.find("experiment_fault_marker_monotonic_now_ns");
     const auto transport = coordinator.find("send_exact_relay");
     const auto retry =
         coordinator.find("schedule_exact_forwarding_retry");
     REQUIRE(consume != std::string::npos);
     REQUIRE(audit != std::string::npos);
+    REQUIRE(marker_clock != std::string::npos);
     REQUIRE(transport != std::string::npos);
     REQUIRE(retry != std::string::npos);
     CHECK(consume < audit);
+    CHECK(consume < marker_clock);
+    CHECK(marker_clock < audit);
     CHECK(audit < transport);
     CHECK(transport < retry);
 
     const auto omitted_branch =
         coordinator.substr(consume, transport - consume);
     CHECK(omitted_branch.find("return true") != std::string::npos);
+    CHECK(
+        omitted_branch.find("monotonic_ns=%llu") !=
+        std::string::npos);
+    CHECK(
+        implementation.find(
+            "::clock_gettime(CLOCK_MONOTONIC_RAW") !=
+        std::string::npos);
+    const auto raw_clock = source_slice(
+        implementation,
+        "std::uint64_t adaptive_evidence_monotonic_now_ns",
+        "std::optional<std::uint64_t>\n"
+        "        experiment_fault_marker_monotonic_now_ns");
+    CHECK(
+        raw_clock.find("::clock_gettime(CLOCK_MONOTONIC_RAW") !=
+        std::string::npos);
+    const auto marker_clock_wrapper = source_slice(
+        implementation,
+        "experiment_fault_marker_monotonic_now_ns() noexcept",
+        "std::uint64_t adaptive_deadline_duration_us");
+    CHECK(
+        marker_clock_wrapper.find(
+            "adaptive_evidence_monotonic_now_ns()") !=
+        std::string::npos);
+    const auto zero_guard =
+        marker_clock_wrapper.find("if (monotonic_ns == 0)");
+    const auto reject_zero =
+        marker_clock_wrapper.find("return std::nullopt", zero_guard);
+    REQUIRE(zero_guard != std::string::npos);
+    REQUIRE(reject_zero != std::string::npos);
+    CHECK(zero_guard < reject_zero);
+
+    CHECK(
+        occurrences(
+            implementation,
+            "adaptive_evidence_monotonic_now_ns()") == 6);
+    CHECK(
+        occurrences(
+            implementation,
+            "adaptive_monotonic_now_ns()") == 2);
+    const auto reporting_flush = source_slice(
+        implementation,
+        "void HotStuffBase::flush_adaptive_v2_reporting",
+        "void HotStuffBase::mark_adaptive_v2_convergence_evidence_unhealthy");
+    CHECK(
+        reporting_flush.find("adaptive_monotonic_now_ns()") !=
+        std::string::npos);
+    CHECK(
+        reporting_flush.find("adaptive_evidence_monotonic_now_ns()") ==
+        std::string::npos);
+
+    const auto relay = source_slice(
+        implementation,
+        "bool HotStuffBase::send_exact_relay",
+        "void HotStuffBase::schedule_exact_forwarding_retry");
+    const auto relay_consume =
+        relay.find("consume_outbound_aggregate");
+    const auto relay_marker_clock =
+        relay.find("experiment_fault_marker_monotonic_now_ns");
+    const auto relay_audit =
+        relay.find("KAURI_FAULT aggregate_omitted");
+    REQUIRE(relay_consume != std::string::npos);
+    REQUIRE(relay_marker_clock != std::string::npos);
+    REQUIRE(relay_audit != std::string::npos);
+    CHECK(relay_consume < relay_marker_clock);
+    CHECK(relay_marker_clock < relay_audit);
+    CHECK(
+        relay.find("window=%s monotonic_ns=%llu") !=
+        std::string::npos);
 
     const auto timeout_application = source_slice(
         aggregation,
@@ -778,4 +1064,150 @@ TEST_CASE(
     CHECK(
         manager.find("ExperimentByzantineAdapter") ==
         std::string::npos);
+}
+
+TEST_CASE(
+    "runtime direct-vote omission closes before every outbound path",
+    "[adaptive-v2][experiment][byzantine][runtime][direct-vote]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto adapter_header =
+        source("include/hotstuff/experiment_byzantine_adapter.h");
+    const auto implementation = source("src/hotstuff.cpp");
+
+    CHECK(
+        header.find("consume_experiment_outbound_direct_vote") !=
+        std::string::npos);
+    CHECK(
+        adapter_header.find(
+            "cryptographically proves a false report") !=
+        std::string::npos);
+    CHECK(
+        adapter_header.find(
+            "Byzantine attribution") !=
+        std::string::npos);
+
+    const auto decision = source_slice(
+        implementation,
+        "bool HotStuffBase::consume_experiment_outbound_direct_vote",
+        "bool HotStuffBase::send_exact_relay");
+    const auto leaf_guard = decision.find("!tree.direct_children.empty()");
+    const auto leaf_guard_return = decision.find("return false;", leaf_guard);
+    const auto consume = decision.find("consume_outbound_direct_vote");
+    const auto repeat = decision.find(
+        "ExperimentDirectVoteDisposition::omit_repeat");
+    const auto repeat_return = decision.find("return true;", repeat);
+    const auto marker_clock =
+        decision.find("experiment_fault_marker_monotonic_now_ns");
+    const auto marker = decision.find("KAURI_FAULT direct_vote_omitted");
+    REQUIRE(leaf_guard != std::string::npos);
+    REQUIRE(leaf_guard_return != std::string::npos);
+    REQUIRE(consume != std::string::npos);
+    REQUIRE(repeat != std::string::npos);
+    REQUIRE(repeat_return != std::string::npos);
+    REQUIRE(marker_clock != std::string::npos);
+    REQUIRE(marker != std::string::npos);
+    CHECK(leaf_guard < consume);
+    CHECK(leaf_guard < leaf_guard_return);
+    CHECK(leaf_guard_return < consume);
+    CHECK(consume < repeat);
+    CHECK(repeat < repeat_return);
+    CHECK(repeat_return < marker_clock);
+    CHECK(marker_clock < marker);
+    CHECK(
+        decision.find(
+            "epoch=%u tree=%u block=%s window=%s monotonic_ns=%llu") !=
+        std::string::npos);
+    CHECK(
+        occurrences(
+            implementation,
+            "KAURI_FAULT direct_vote_omitted replica=%u parent=%u") == 1);
+
+    const auto assert_local_path =
+        [](const std::string &path, const std::string &transport)
+        {
+            const auto record = path.find("record_local_part");
+            const auto omit = path.find(
+                "consume_experiment_outbound_direct_vote");
+            const auto close = path.find("proposal_contexts->close", omit);
+            const auto aborted =
+                path.find("ProposalContextEvent::proposal_aborted", close);
+            const auto early_return = path.find("return;", aborted);
+            const auto fallback =
+                path.find("schedule_exact_vote_fallback", omit);
+            const auto outbound = path.find(transport, omit);
+            REQUIRE(record != std::string::npos);
+            REQUIRE(omit != std::string::npos);
+            REQUIRE(close != std::string::npos);
+            REQUIRE(aborted != std::string::npos);
+            REQUIRE(early_return != std::string::npos);
+            REQUIRE(fallback != std::string::npos);
+            REQUIRE(outbound != std::string::npos);
+            CHECK(record < omit);
+            CHECK(omit < close);
+            CHECK(close < aborted);
+            CHECK(aborted < early_return);
+            CHECK(early_return < fallback);
+            CHECK(fallback < outbound);
+        };
+
+    const auto local_proposal_vote = source_slice(
+        implementation,
+        "void HotStuffBase::apply_local_vote",
+        "void HotStuffBase::on_local_proposal_processed");
+    assert_local_path(local_proposal_vote, "forward_exact_direct");
+
+    const auto remote_proposal_vote = source_slice(
+        implementation,
+        "void HotStuffBase::do_vote",
+        "std::optional<ProposalKey> HotStuffBase::committed_proposal_key");
+    assert_local_path(remote_proposal_vote, "owner.pn.send_msg");
+
+    const auto root_fallback = source_slice(
+        implementation,
+        "bool HotStuffBase::send_exact_vote_to_root",
+        "void HotStuffBase::schedule_exact_proposal_fallback");
+    const auto root_guard =
+        root_fallback.find("outbound_direct_vote_omitted");
+    const auto root_suppressed =
+        root_fallback.find("return true;", root_guard);
+    const auto root_transport = root_fallback.find("pn.send_msg");
+    REQUIRE(root_guard != std::string::npos);
+    REQUIRE(root_suppressed != std::string::npos);
+    REQUIRE(root_transport != std::string::npos);
+    CHECK(root_guard < root_suppressed);
+    CHECK(root_suppressed < root_transport);
+    CHECK(
+        root_fallback.find("consume_outbound_direct_vote") ==
+        std::string::npos);
+
+    const auto relay = source_slice(
+        implementation,
+        "bool HotStuffBase::send_exact_relay",
+        "void HotStuffBase::schedule_exact_forwarding_retry");
+    const auto relay_guard =
+        relay.find("outbound_direct_vote_omitted");
+    const auto relay_suppressed =
+        relay.find("return true;", relay_guard);
+    const auto relay_transport = relay.find("pn.send_msg");
+    REQUIRE(relay_guard != std::string::npos);
+    REQUIRE(relay_suppressed != std::string::npos);
+    REQUIRE(relay_transport != std::string::npos);
+    CHECK(relay_guard < relay_suppressed);
+    CHECK(relay_suppressed < relay_transport);
+
+    const auto coordinator = source_slice(
+        implementation,
+        "void HotStuffBase::rebuild_aggregation_timeout_coordinator",
+        "void HotStuffBase::set_aggregation_timeout");
+    const auto timeout_guard =
+        coordinator.find("outbound_direct_vote_omitted");
+    const auto timeout_suppressed =
+        coordinator.find("return true;", timeout_guard);
+    const auto timeout_relay = coordinator.find("send_exact_relay");
+    REQUIRE(timeout_guard != std::string::npos);
+    REQUIRE(timeout_suppressed != std::string::npos);
+    REQUIRE(timeout_relay != std::string::npos);
+    CHECK(timeout_guard < timeout_suppressed);
+    CHECK(timeout_suppressed < timeout_relay);
 }

@@ -1520,6 +1520,9 @@ namespace hotstuff
         void discard_exact_fallbacks_before_epoch(
             std::uint32_t first_live_epoch) noexcept;
         void cancel_all_exact_fallbacks() noexcept;
+        bool consume_experiment_outbound_direct_vote(
+            const ProposalKey &key,
+            const ProposalTreeSnapshot &tree);
         bool forward_exact_direct(
             const ProposalContextLease &lease,
             const Vote &vote);

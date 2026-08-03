@@ -52,12 +52,18 @@ struct ExperimentByzantineAdapter::State
     struct FalseReportState
     {
         bool verified_response_observed{false};
+        bool positive_marker_consumed{false};
         bool timeout_consumed{false};
     };
 
     explicit State(ExperimentByzantineOptions configured)
         : options(std::move(configured))
     {
+        if (options.additional_omission_configuration.has_value() &&
+            options.omit_outbound_direct_vote)
+            throw std::invalid_argument(
+                "direct-vote omission does not accept an additional "
+                "configuration");
         if (options.additional_omission_configuration.has_value() &&
             (!options.enabled || !options.omit_outbound_aggregate))
             throw std::invalid_argument(
@@ -68,10 +74,14 @@ struct ExperimentByzantineAdapter::State
         if (options.diagnostic_window.empty())
             throw std::invalid_argument(
                 "diagnostic window must be non-empty");
-        if (!options.false_report_target.has_value() &&
-            !options.omit_outbound_aggregate)
+        const auto fault_mode_count =
+            static_cast<unsigned>(
+                options.false_report_target.has_value()) +
+            static_cast<unsigned>(options.omit_outbound_aggregate) +
+            static_cast<unsigned>(options.omit_outbound_direct_vote);
+        if (fault_mode_count != 1)
             throw std::invalid_argument(
-                "enabled Byzantine adapter requires a fault mode");
+                "enabled Byzantine adapter requires exactly one fault mode");
         if (options.false_report_target.has_value() &&
             options.maximum_false_report_contexts == 0)
             throw std::invalid_argument(
@@ -80,6 +90,10 @@ struct ExperimentByzantineAdapter::State
             options.maximum_omission_contexts == 0)
             throw std::invalid_argument(
                 "omission context bound must be positive");
+        if (options.omit_outbound_direct_vote &&
+            options.maximum_direct_vote_omission_contexts == 0)
+            throw std::invalid_argument(
+                "direct-vote omission context bound must be positive");
         if (options.additional_omission_configuration.has_value())
         {
             const auto &additional =
@@ -105,6 +119,8 @@ struct ExperimentByzantineAdapter::State
         ContextLess>
         false_reports;
     std::set<ExperimentByzantineContext, ContextLess> omissions;
+    std::set<ExperimentByzantineContext, ContextLess>
+        direct_vote_omissions;
 };
 
 ExperimentByzantineAdapter::ExperimentByzantineAdapter(
@@ -145,6 +161,22 @@ bool ExperimentByzantineAdapter::on_verified_response(
     if (found == state_->false_reports.end())
         return false;
     found->second.verified_response_observed = true;
+    return true;
+}
+
+bool ExperimentByzantineAdapter::consume_false_report_positive_marker(
+    const ExperimentByzantineContext &context,
+    ReplicaID target) noexcept
+{
+    if (!state_->options.false_report_target.has_value() ||
+        *state_->options.false_report_target != target)
+        return false;
+    const auto found = state_->false_reports.find(context);
+    if (found == state_->false_reports.end() ||
+        !found->second.verified_response_observed ||
+        found->second.positive_marker_consumed)
+        return false;
+    found->second.positive_marker_consumed = true;
     return true;
 }
 
@@ -199,6 +231,31 @@ bool ExperimentByzantineAdapter::consume_outbound_aggregate(
         state_->options.maximum_omission_contexts)
         return false;
     return state_->omissions.insert(context).second;
+}
+
+ExperimentDirectVoteDisposition
+ExperimentByzantineAdapter::consume_outbound_direct_vote(
+    const ExperimentByzantineContext &context)
+{
+    if (!state_->options.omit_outbound_direct_vote ||
+        !exact_context(state_->options, context))
+        return ExperimentDirectVoteDisposition::forward;
+    if (state_->direct_vote_omissions.find(context) !=
+        state_->direct_vote_omissions.end())
+        return ExperimentDirectVoteDisposition::omit_repeat;
+    if (state_->direct_vote_omissions.size() >=
+        state_->options.maximum_direct_vote_omission_contexts)
+        return ExperimentDirectVoteDisposition::forward;
+    if (!state_->direct_vote_omissions.insert(context).second)
+        return ExperimentDirectVoteDisposition::forward;
+    return ExperimentDirectVoteDisposition::omit_first;
+}
+
+bool ExperimentByzantineAdapter::outbound_direct_vote_omitted(
+    const ExperimentByzantineContext &context) const noexcept
+{
+    return state_->direct_vote_omissions.find(context) !=
+           state_->direct_vote_omissions.end();
 }
 
 } // namespace hotstuff
