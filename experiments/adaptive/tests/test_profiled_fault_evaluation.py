@@ -612,6 +612,48 @@ def test_staged_repair_diagnostic_changes_only_identity_metadata() -> None:
     )
 
 
+def test_commit_dwell_diagnostic_changes_only_cadence_and_identity() -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    control_path = (
+        profiles / "n31-f5-internal1-staged-repair-diagnostic-v6.json"
+    )
+    diagnostic_path = (
+        profiles / "n31-f5-internal1-commit-dwell-diagnostic-v7.json"
+    )
+    control_document = json.loads(control_path.read_text(encoding="utf-8"))
+    diagnostic_document = json.loads(
+        diagnostic_path.read_text(encoding="utf-8")
+    )
+    control_fault = control_document.pop("fault")
+    diagnostic_fault = diagnostic_document.pop("fault")
+    control_document.pop("profile_id")
+    diagnostic_document.pop("profile_id")
+    control_fault.pop("fault_id")
+    diagnostic_fault.pop("fault_id")
+    control_period = control_document.pop("tree_switch_period_blocks")
+    diagnostic_period = diagnostic_document.pop("tree_switch_period_blocks")
+
+    assert diagnostic_document == control_document
+    assert diagnostic_fault == control_fault
+    assert control_period == 1
+    assert diagnostic_period == 5
+
+    diagnostic = api.load_frozen_profile(diagnostic_path)
+    runtime.require_shipped_profile(diagnostic)
+    assert diagnostic.profile_id == (
+        "n31-f5-q21-internal1-commit-dwell-diagnostic-v7"
+    )
+    assert diagnostic.fault.fault_id == (
+        "single-internal-replica1-commit-dwell-diagnostic"
+    )
+    assert diagnostic.tree_switch_period_blocks == 5
+    assert diagnostic.profile_sha256 == (
+        "c9e8d6385ced8c7d70b78d22d865cea893097f6e75bf71475edbbee45a0ae84f"
+    )
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:
