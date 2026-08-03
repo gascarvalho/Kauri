@@ -63,6 +63,11 @@ INTERNAL1_PRE_QC_CREDIT_DIAGNOSTIC_PROFILE = (
     / "profiles"
     / "n31-f5-internal1-pre-qc-credit-diagnostic-v9.json"
 )
+INTERNAL1_CONNECTION_REFRESH_DIAGNOSTIC_PROFILE = (
+    Path(__file__).parents[1]
+    / "profiles"
+    / "n31-f5-internal1-connection-refresh-diagnostic-v10.json"
+)
 
 
 def _api():
@@ -363,6 +368,7 @@ def test_transition_request_is_zero_residency_fault_containment() -> None:
         INTERNAL1_COMMIT_DWELL_DIAGNOSTIC_PROFILE,
         INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE,
         INTERNAL1_PRE_QC_CREDIT_DIAGNOSTIC_PROFILE,
+        INTERNAL1_CONNECTION_REFRESH_DIAGNOSTIC_PROFILE,
     ),
 )
 def test_cli_pins_the_exact_shipped_profiles(profile_path: Path) -> None:
