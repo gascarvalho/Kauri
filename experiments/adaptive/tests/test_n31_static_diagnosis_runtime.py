@@ -1292,28 +1292,40 @@ def test_cli_preflight_builds_once_without_launch(
     tmp_path: Path,
 ) -> None:
     runner = _runner()
-    calls = {"build": 0, "preflight": 0}
+    calls = {"build": 0, "derive": 0, "preflight": 0, "write": 0}
+    trusted = _trusted_receipt()
+    real_write = runner.runtime.write_trusted_provenance
 
     def prepare(**_kwargs: object) -> None:
         calls["build"] += 1
+
+    def derive(**_kwargs: object) -> Any:
+        calls["derive"] += 1
+        return trusted
 
     def preflight(**_kwargs: object) -> dict[str, object]:
         calls["preflight"] += 1
         return {"verdict": "PASS"}
 
+    def write(path: Path, receipt: Any) -> str:
+        calls["write"] += 1
+        assert receipt == trusted
+        return real_write(path, receipt)
+
     monkeypatch.setattr(
         runner.profiled_fault_runtime, "prepare_exact_revision_build", prepare
     )
-    monkeypatch.setattr(
-        runner.runtime,
-        "derive_trusted_provenance",
-        lambda **_kwargs: _trusted_receipt(),
-    )
+    monkeypatch.setattr(runner.runtime, "derive_trusted_provenance", derive)
     monkeypatch.setattr(runner.runtime, "preflight", preflight)
+    monkeypatch.setattr(runner.runtime, "write_trusted_provenance", write)
     argv = _run_arguments(tmp_path)
     argv[0] = "preflight"
     assert runner.main(argv) == 0
-    assert calls == {"build": 1, "preflight": 1}
+    assert calls == {"build": 1, "derive": 1, "preflight": 1, "write": 1}
+    assert (
+        runner.runtime.load_trusted_provenance(tmp_path / "trusted-provenance.json")
+        == trusted
+    )
 
 
 @pytest.mark.parametrize(("verdict", "exit_code"), (("PASS", 0), ("FAIL", 1)))
@@ -1324,20 +1336,34 @@ def test_cli_run_invokes_exactly_one_attempt(
     exit_code: int,
 ) -> None:
     runner = _runner()
-    calls = {"build": 0, "run": 0}
+    trusted = _trusted_receipt()
+    runner.runtime.write_trusted_provenance(
+        tmp_path / "trusted-provenance.json",
+        trusted,
+    )
+    calls = {"derive": 0, "run": 0}
+
+    def reject_build(**_kwargs: object) -> None:
+        raise AssertionError("run must not rebuild")
+
+    def reject_write(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("run must not write the trusted receipt")
+
+    def derive(**_kwargs: object) -> Any:
+        calls["derive"] += 1
+        return trusted
+
     monkeypatch.setattr(
         runner.profiled_fault_runtime,
         "prepare_exact_revision_build",
-        lambda **_kwargs: calls.__setitem__("build", calls["build"] + 1),
+        reject_build,
     )
-    monkeypatch.setattr(
-        runner.runtime,
-        "derive_trusted_provenance",
-        lambda **_kwargs: _trusted_receipt(),
-    )
+    monkeypatch.setattr(runner.runtime, "write_trusted_provenance", reject_write)
+    monkeypatch.setattr(runner.runtime, "derive_trusted_provenance", derive)
 
-    def run_once(**_kwargs: object) -> tuple[Path, str]:
+    def run_once(**kwargs: object) -> tuple[Path, str]:
         calls["run"] += 1
+        assert kwargs["trusted_provenance"] == trusted
         return tmp_path / "one-attempt", verdict
 
     monkeypatch.setattr(runner.runtime, "run_once", run_once)
@@ -1345,7 +1371,58 @@ def test_cli_run_invokes_exactly_one_attempt(
         runner.main(_run_arguments(tmp_path, arm=_diagnosis().ARM_NAMES[0]))
         == exit_code
     )
-    assert calls == {"build": 1, "run": 1}
+    assert calls == {"derive": 1, "run": 1}
+
+
+def test_cli_run_rejects_current_provenance_mismatch_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = _runner()
+    trusted = _trusted_receipt()
+    runner.runtime.write_trusted_provenance(
+        tmp_path / "trusted-provenance.json",
+        trusted,
+    )
+    current_provenance = _build_provenance()
+    binaries = current_provenance["binaries"]
+    assert isinstance(binaries, dict)
+    app = binaries["app"]
+    assert isinstance(app, dict)
+    app["sha256"] = "e" * 64
+    current = _trusted_receipt(current_provenance)
+    calls = {"derive": 0, "run": 0}
+
+    def reject_build(**_kwargs: object) -> None:
+        raise AssertionError("run must not rebuild")
+
+    def reject_write(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("run must not write the trusted receipt")
+
+    def derive(**_kwargs: object) -> Any:
+        calls["derive"] += 1
+        return current
+
+    def run_once(**_kwargs: object) -> tuple[Path, str]:
+        calls["run"] += 1
+        raise AssertionError("provenance mismatch must reject before launch")
+
+    monkeypatch.setattr(
+        runner.profiled_fault_runtime,
+        "prepare_exact_revision_build",
+        reject_build,
+    )
+    monkeypatch.setattr(runner.runtime, "write_trusted_provenance", reject_write)
+    monkeypatch.setattr(runner.runtime, "derive_trusted_provenance", derive)
+    monkeypatch.setattr(runner.runtime, "run_once", run_once)
+
+    assert runner.main(_run_arguments(tmp_path, arm=_diagnosis().ARM_NAMES[0])) == 2
+    assert calls == {"derive": 1, "run": 0}
+    assert (
+        "current repository/build provenance differs from the external "
+        "preflight receipt"
+    ) in capsys.readouterr().err
 
 
 def test_cli_validate_is_source_blind_and_does_not_build(
@@ -1421,16 +1498,29 @@ def test_cli_rejection_is_exit_two_without_retry(
     tmp_path: Path,
 ) -> None:
     runner = _runner()
+    trusted = _trusted_receipt()
+    runner.runtime.write_trusted_provenance(
+        tmp_path / "trusted-provenance.json",
+        trusted,
+    )
     calls = 0
+
+    def reject_build(**_kwargs: object) -> None:
+        raise AssertionError("run must not rebuild")
+
+    def reject_write(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("run must not write the trusted receipt")
+
     monkeypatch.setattr(
         runner.profiled_fault_runtime,
         "prepare_exact_revision_build",
-        lambda **_kwargs: None,
+        reject_build,
     )
+    monkeypatch.setattr(runner.runtime, "write_trusted_provenance", reject_write)
     monkeypatch.setattr(
         runner.runtime,
         "derive_trusted_provenance",
-        lambda **_kwargs: _trusted_receipt(),
+        lambda **_kwargs: trusted,
     )
 
     def reject(**_kwargs: object) -> tuple[Path, str]:

@@ -158,21 +158,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "run" and args.arm is None:
             raise runtime.N31StaticDiagnosisRuntimeError("run requires --arm")
         arguments = _runtime_arguments(args)
-        profiled_fault_runtime.prepare_exact_revision_build(
-            repository=arguments["repository"],
-            build_directory=arguments["build_directory"],
-        )
-        trusted = runtime.derive_trusted_provenance(
-            repository=arguments["repository"],
-            app_binary=arguments["app_binary"],
-            manager_binary=arguments["manager_binary"],
-            keygen_binary=arguments["keygen_binary"],
-            tls_keygen_binary=arguments["tls_keygen_binary"],
-            epoch_profile_digest_binary=arguments["epoch_profile_digest_binary"],
-            build_directory=arguments["build_directory"],
-            build_provenance_path=arguments["build_provenance_path"],
-        )
         if args.command == "preflight":
+            profiled_fault_runtime.prepare_exact_revision_build(
+                repository=arguments["repository"],
+                build_directory=arguments["build_directory"],
+            )
+            trusted = runtime.derive_trusted_provenance(
+                repository=arguments["repository"],
+                app_binary=arguments["app_binary"],
+                manager_binary=arguments["manager_binary"],
+                keygen_binary=arguments["keygen_binary"],
+                tls_keygen_binary=arguments["tls_keygen_binary"],
+                epoch_profile_digest_binary=arguments["epoch_profile_digest_binary"],
+                build_directory=arguments["build_directory"],
+                build_provenance_path=arguments["build_provenance_path"],
+            )
             result = runtime.preflight(**arguments)
             if result.get("verdict") != "PASS":
                 raise runtime.N31StaticDiagnosisRuntimeError(
@@ -191,10 +191,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
 
-        receipt_sha256 = runtime.write_trusted_provenance(
-            trusted_path,
-            trusted,
+        trusted = runtime.load_trusted_provenance(trusted_path)
+        current = runtime.derive_trusted_provenance(
+            repository=arguments["repository"],
+            app_binary=arguments["app_binary"],
+            manager_binary=arguments["manager_binary"],
+            keygen_binary=arguments["keygen_binary"],
+            tls_keygen_binary=arguments["tls_keygen_binary"],
+            epoch_profile_digest_binary=arguments["epoch_profile_digest_binary"],
+            build_directory=arguments["build_directory"],
+            build_provenance_path=arguments["build_provenance_path"],
         )
+        if current != trusted:
+            raise runtime.N31StaticDiagnosisRuntimeError(
+                "current repository/build provenance differs from the "
+                "external preflight receipt"
+            )
         run_directory, verdict = runtime.run_once(
             **arguments,
             arm=args.arm,
@@ -210,7 +222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "run_directory": str(run_directory),
                 "verdict": verdict,
                 "trusted_provenance_path": str(trusted_path),
-                "trusted_provenance_sha256": receipt_sha256,
+                "trusted_provenance_sha256": trusted.sha256,
             }
         )
         return 0 if verdict == "PASS" else 1
