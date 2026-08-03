@@ -764,6 +764,13 @@ namespace hotstuff
 
     struct HotStuffBase::ExactProposalFallbackJob final
     {
+        struct PendingPreQuorumRefresh final
+        {
+            ReplicaID target;
+            Net::conn_t old_connection;
+            AggregationScheduler::Duration observation_deadline;
+        };
+
         ExactProposalFallbackJob(
             const ProposalContextLease &lease,
             std::uint64_t exact_epoch_generation,
@@ -771,7 +778,9 @@ namespace hotstuff
             std::size_t exact_global_quorum,
             std::size_t exact_total_attempt_budget,
             std::size_t exact_stage_target_limit,
-            AggregationTimeoutPolicy::Duration exact_stage_interval)
+            AggregationTimeoutPolicy::Duration exact_stage_interval,
+            AggregationTimeoutPolicy::Duration
+                exact_refresh_observation_window)
             : key(lease.key()),
               context_generation(lease.generation()),
               epoch_generation(exact_epoch_generation),
@@ -779,7 +788,8 @@ namespace hotstuff
               global_quorum(exact_global_quorum),
               total_attempt_budget(exact_total_attempt_budget),
               stage_target_limit(exact_stage_target_limit),
-              stage_interval(exact_stage_interval)
+              stage_interval(exact_stage_interval),
+              refresh_observation_window(exact_refresh_observation_window)
         {}
 
         const ProposalKey key;
@@ -790,11 +800,15 @@ namespace hotstuff
         const std::size_t total_attempt_budget;
         const std::size_t stage_target_limit;
         const AggregationTimeoutPolicy::Duration stage_interval;
+        const AggregationTimeoutPolicy::Duration
+            refresh_observation_window;
         std::size_t target_cursor{0};
         std::size_t total_send_attempts{0};
         std::vector<ReplicaID> attempted_targets;
         std::vector<ReplicaID> pre_quorum_retry_targets;
         std::size_t pre_quorum_retry_cursor{0};
+        std::vector<PendingPreQuorumRefresh>
+            pending_pre_quorum_refresh_batch;
         std::set<ReplicaID> confirmed_signers;
         std::vector<ReplicaID> tail_targets;
         std::size_t tail_target_cursor{0};
@@ -4054,7 +4068,8 @@ namespace hotstuff
                 *global_quorum,
                 target_count,
                 stage_target_limit,
-                stage_interval);
+                stage_interval,
+                exact_fallback_recovery_horizon(delay));
             exact_proposal_fallback_jobs.emplace(lease.key(), job);
             auto cancellation = aggregation_scheduler->schedule_after(
                 delay,
@@ -4168,16 +4183,22 @@ namespace hotstuff
             job->dispatching = false;
             return;
         }
-        if (job->total_send_attempts >= job->total_attempt_budget)
+        if (job->pending_pre_quorum_refresh_batch.empty() &&
+            job->total_send_attempts >= job->total_attempt_budget)
         {
             erase_job();
             return;
         }
 
+        const bool had_pending_refresh_batch =
+            !job->pending_pre_quorum_refresh_batch.empty();
         const auto retry_cursor_before = job->pre_quorum_retry_cursor;
         const auto attempts_before = job->total_send_attempts;
         ++job->completed_stages;
-        if (job->pre_quorum_retry_armed)
+        if (!job->pending_pre_quorum_refresh_batch.empty())
+            static_cast<void>(
+                broadcast_exact_proposal_pre_quorum_retry(*lease, *job));
+        else if (job->pre_quorum_retry_armed)
         {
             const auto missing_votes =
                 *quorum - before->verified_signers.size();
@@ -4186,7 +4207,7 @@ namespace hotstuff
             const auto maximum_attempts = std::min(
                 {missing_votes, job->stage_target_limit, remaining_budget});
             static_cast<void>(
-                broadcast_exact_proposal_pre_quorum_retry(
+                reserve_exact_proposal_pre_quorum_refresh(
                     *lease, *job, maximum_attempts));
         }
         else
@@ -4228,17 +4249,25 @@ namespace hotstuff
             return;
         }
 
-        if (job->total_send_attempts >= job->total_attempt_budget)
+        if (job->pending_pre_quorum_refresh_batch.empty() &&
+            job->total_send_attempts >= job->total_attempt_budget)
         {
             erase_job();
             return;
         }
         if (job->pre_quorum_retry_armed)
         {
-            if ((job->pre_quorum_retry_cursor == retry_cursor_before &&
-                 job->total_send_attempts == attempts_before) ||
+            const bool no_reservation_progress =
+                !had_pending_refresh_batch &&
+                job->pending_pre_quorum_refresh_batch.empty() &&
+                job->pre_quorum_retry_cursor == retry_cursor_before &&
+                job->total_send_attempts == attempts_before;
+            const bool candidates_exhausted =
                 job->pre_quorum_retry_cursor >=
-                    job->pre_quorum_retry_targets.size())
+                job->pre_quorum_retry_targets.size();
+            if (no_reservation_progress ||
+                (job->pending_pre_quorum_refresh_batch.empty() &&
+                 candidates_exhausted))
             {
                 erase_job();
                 return;
@@ -4298,7 +4327,8 @@ namespace hotstuff
                     "KAURI_PROPOSAL_BROADCAST stage=fallback_stage "
                     "outcome=armed root=%u epoch=%u tree=%u block=%s "
                     "completed_stages=%u next_stage=%u verified=%zu "
-                    "quorum=%zu cursor=%zu delay_ticks=%lld",
+                    "quorum=%zu cursor=%zu pending_refresh=%zu "
+                    "delay_ticks=%lld",
                     static_cast<unsigned>(get_id()),
                     key.configuration.epoch_number,
                     key.configuration.tree_id,
@@ -4310,6 +4340,7 @@ namespace hotstuff
                     job->pre_quorum_retry_armed
                         ? job->pre_quorum_retry_cursor
                         : job->target_cursor,
+                    job->pending_pre_quorum_refresh_batch.size(),
                     static_cast<long long>(job->stage_interval.count()));
                 return;
             }
@@ -4658,7 +4689,7 @@ namespace hotstuff
         }
     }
 
-    bool HotStuffBase::broadcast_exact_proposal_pre_quorum_retry(
+    bool HotStuffBase::reserve_exact_proposal_pre_quorum_refresh(
         const ProposalContextLease &lease,
         ExactProposalFallbackJob &job,
         std::size_t maximum_attempts)
@@ -4666,10 +4697,128 @@ namespace hotstuff
         if (job.proposal == nullptr || job.proposal->key() != lease.key() ||
             job.key != lease.key() || lease.tree().root != get_id() ||
             lease.tree().parent.has_value() ||
-            !job.pre_quorum_retry_armed || maximum_attempts == 0)
+            !job.pre_quorum_retry_armed ||
+            !job.pending_pre_quorum_refresh_batch.empty() ||
+            maximum_attempts == 0)
+            return false;
+        std::size_t refresh_attempts = 0;
+        try
+        {
+            std::size_t skipped_confirmed = 0;
+            const auto snapshot = proposal_contexts->snapshot(job.key);
+            if (!snapshot.has_value())
+                return false;
+            if (snapshot->verified_signers.size() >= job.global_quorum)
+                return false;
+            const auto fresh_missing_votes =
+                job.global_quorum - snapshot->verified_signers.size();
+            maximum_attempts = std::min(
+                maximum_attempts, fresh_missing_votes);
+            while (job.pre_quorum_retry_cursor <
+                       job.pre_quorum_retry_targets.size() &&
+                   !job.quorum_observed &&
+                   refresh_attempts < maximum_attempts &&
+                   refresh_attempts < job.stage_target_limit &&
+                   job.total_send_attempts < job.total_attempt_budget)
+            {
+                const auto member = job.pre_quorum_retry_targets[
+                    job.pre_quorum_retry_cursor++];
+                if (member == get_id() ||
+                    snapshot->verified_signers.count(member) != 0)
+                {
+                    ++skipped_confirmed;
+                    continue;
+                }
+                const auto peer = config.get_peer_id(member);
+                if (peer.is_null())
+                    continue;
+                const auto old_connection = pn.get_peer_conn(peer);
+                const auto now = aggregation_scheduler->monotonic_now();
+                const auto maximum_deadline =
+                    AggregationScheduler::Duration::max();
+                const auto observation_deadline =
+                    now > maximum_deadline -
+                              job.refresh_observation_window
+                        ? maximum_deadline
+                        : now + job.refresh_observation_window;
+                job.pending_pre_quorum_refresh_batch.push_back(
+                    {member, old_connection, observation_deadline});
+                ++refresh_attempts;
+                ++job.total_send_attempts;
+                const bool old_terminated =
+                    old_connection != nullptr &&
+                    old_connection->is_terminated();
+                if (old_connection == nullptr || !old_terminated)
+                    pn.conn_peer(peer);
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST "
+                    "stage=pre_qc_refresh_target_result root=%u target=%u "
+                    "epoch=%u tree=%u block=%s stage=%u refresh=%s "
+                    "old_terminated=%u credit=%zu total=%zu budget=%zu",
+                    static_cast<unsigned>(get_id()),
+                    static_cast<unsigned>(member),
+                    job.key.configuration.epoch_number,
+                    job.key.configuration.tree_id,
+                    job.key.block_hash.to_hex().c_str(),
+                    job.completed_stages,
+                    old_terminated ? "joined" : "requested",
+                    static_cast<unsigned>(old_terminated),
+                    refresh_attempts,
+                    job.total_send_attempts,
+                    job.total_attempt_budget);
+            }
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=pre_qc_refresh_dispatch_summary outcome=complete "
+                "root=%u epoch=%u tree=%u block=%s stage=%u "
+                "reserved=%zu skipped_confirmed=%zu cursor=%zu total=%zu "
+                "budget=%zu pending=%zu",
+                static_cast<unsigned>(get_id()),
+                job.key.configuration.epoch_number,
+                job.key.configuration.tree_id,
+                job.key.block_hash.to_hex().c_str(),
+                job.completed_stages,
+                refresh_attempts,
+                skipped_confirmed,
+                job.pre_quorum_retry_cursor,
+                job.total_send_attempts,
+                job.total_attempt_budget,
+                job.pending_pre_quorum_refresh_batch.size());
+            return !job.pending_pre_quorum_refresh_batch.empty();
+        }
+        catch (...)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=pre_qc_refresh_dispatch_summary outcome=exception "
+                "root=%u epoch=%u tree=%u block=%s stage=%u reserved=%zu "
+                "cursor=%zu total=%zu budget=%zu pending=%zu",
+                static_cast<unsigned>(get_id()),
+                job.key.configuration.epoch_number,
+                job.key.configuration.tree_id,
+                job.key.block_hash.to_hex().c_str(),
+                job.completed_stages,
+                refresh_attempts,
+                job.pre_quorum_retry_cursor,
+                job.total_send_attempts,
+                job.total_attempt_budget,
+                job.pending_pre_quorum_refresh_batch.size());
+            return false;
+        }
+    }
+
+    bool HotStuffBase::broadcast_exact_proposal_pre_quorum_retry(
+        const ProposalContextLease &lease,
+        ExactProposalFallbackJob &job)
+    {
+        if (job.proposal == nullptr || job.proposal->key() != lease.key() ||
+            job.key != lease.key() || lease.tree().root != get_id() ||
+            lease.tree().parent.has_value() ||
+            !job.pre_quorum_retry_armed ||
+            job.pending_pre_quorum_refresh_batch.empty())
             return false;
         std::size_t send_attempts = 0;
-        std::size_t send_successes = 0;
+        std::size_t send_dispatches = 0;
         try
         {
             bytearray_t encoded;
@@ -4687,92 +4836,136 @@ namespace hotstuff
                     epoch_wire_limits,
                     epoch_protocol_mode);
                 if (encoded.empty())
+                {
+                    job.pending_pre_quorum_refresh_batch.clear();
                     return false;
+                }
             }
 
-            bool enqueued = false;
+            bool dispatched = false;
             std::size_t skipped_confirmed = 0;
+            std::size_t waiting_for_refresh = 0;
             const auto snapshot = proposal_contexts->snapshot(job.key);
-            if (!snapshot.has_value())
+            if (!snapshot.has_value() ||
+                snapshot->verified_signers.size() >= job.global_quorum)
                 return false;
-            if (snapshot->verified_signers.size() >= job.global_quorum)
-                return false;
-            const auto fresh_missing_votes =
-                job.global_quorum - snapshot->verified_signers.size();
-            maximum_attempts = std::min(
-                maximum_attempts, fresh_missing_votes);
-            while (job.pre_quorum_retry_cursor <
-                       job.pre_quorum_retry_targets.size() &&
-                   !job.quorum_observed &&
-                   send_attempts < maximum_attempts &&
-                   send_attempts < job.stage_target_limit &&
-                   job.total_send_attempts < job.total_attempt_budget)
+            auto pending_batch =
+                std::move(job.pending_pre_quorum_refresh_batch);
+            job.pending_pre_quorum_refresh_batch.clear();
+            const auto now = aggregation_scheduler->monotonic_now();
+            for (const auto &pending : pending_batch)
             {
-                const auto member = job.pre_quorum_retry_targets[
-                    job.pre_quorum_retry_cursor++];
-                if (member == get_id() ||
-                    snapshot->verified_signers.count(member) != 0)
+                if (snapshot->verified_signers.count(pending.target) != 0)
                 {
                     ++skipped_confirmed;
                     continue;
                 }
-                const auto peer = config.get_peer_id(member);
+                const auto peer = config.get_peer_id(pending.target);
                 if (peer.is_null())
                     continue;
+                const auto current_connection = pn.get_peer_conn(peer);
+                const bool old_terminated =
+                    pending.old_connection != nullptr &&
+                    pending.old_connection->is_terminated();
+                const bool connection_changed =
+                    current_connection != pending.old_connection;
+                const bool refresh_timed_out =
+                    !connection_changed && !old_terminated &&
+                    now >= pending.observation_deadline;
+                if (!connection_changed && !old_terminated &&
+                    !refresh_timed_out)
+                {
+                    ++waiting_for_refresh;
+                    job.pending_pre_quorum_refresh_batch.push_back(
+                        pending);
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_PROPOSAL_BROADCAST "
+                        "stage=pre_qc_retry_target_result outcome="
+                        "refresh_wait root=%u target=%u epoch=%u "
+                        "tree=%u block=%s stage=%u old_terminated=0 "
+                        "connection_changed=0 deadline_ticks=%lld "
+                        "total=%zu budget=%zu",
+                        static_cast<unsigned>(get_id()),
+                        static_cast<unsigned>(pending.target),
+                        job.key.configuration.epoch_number,
+                        job.key.configuration.tree_id,
+                        job.key.block_hash.to_hex().c_str(),
+                        job.completed_stages,
+                        static_cast<long long>(
+                            pending.observation_deadline.count()),
+                        job.total_send_attempts,
+                        job.total_attempt_budget);
+                    continue;
+                }
                 ++send_attempts;
-                ++job.total_send_attempts;
-                const bool sent = is_adaptive_epoch_mode(epoch_protocol_mode)
-                    ? pn.send_msg(MsgPropose(DataStream(encoded)), peer)
-                    : pn.send_msg(MsgPropose(*job.proposal), peer);
-                if (sent)
-                    ++send_successes;
+                const auto deferred_id =
+                    is_adaptive_epoch_mode(epoch_protocol_mode)
+                        ? pn.send_msg_deferred(
+                              MsgPropose(DataStream(encoded)), peer)
+                        : pn.send_msg_deferred(
+                              MsgPropose(*job.proposal), peer);
+                ++send_dispatches;
+                dispatched = true;
                 HOTSTUFF_LOG_INFO(
                     "KAURI_PROPOSAL_BROADCAST "
-                    "stage=pre_qc_retry_target_result root=%u target=%u "
-                    "epoch=%u tree=%u block=%s stage=%u enqueued=%u",
+                    "stage=pre_qc_retry_target_result outcome=%s "
+                    "root=%u target=%u epoch=%u tree=%u block=%s "
+                    "stage=%u old_terminated=%u connection_changed=%u "
+                    "deferred_id=%d total=%zu budget=%zu",
+                    refresh_timed_out
+                        ? "refresh_timeout_dispatch"
+                        : "refresh_observed_dispatch",
                     static_cast<unsigned>(get_id()),
-                    static_cast<unsigned>(member),
+                    static_cast<unsigned>(pending.target),
                     job.key.configuration.epoch_number,
                     job.key.configuration.tree_id,
                     job.key.block_hash.to_hex().c_str(),
                     job.completed_stages,
-                    static_cast<unsigned>(sent));
-                enqueued = sent || enqueued;
+                    static_cast<unsigned>(old_terminated),
+                    static_cast<unsigned>(connection_changed),
+                    deferred_id,
+                    job.total_send_attempts,
+                    job.total_attempt_budget);
             }
             HOTSTUFF_LOG_INFO(
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=pre_qc_retry_dispatch_summary outcome=complete "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "successes=%zu skipped_confirmed=%zu cursor=%zu total=%zu "
-                "budget=%zu enqueued=%u",
+                "dispatches=%zu skipped_confirmed=%zu waiting=%zu "
+                "cursor=%zu total=%zu budget=%zu pending=%zu "
+                "dispatched=%u",
                 static_cast<unsigned>(get_id()),
                 job.key.configuration.epoch_number,
                 job.key.configuration.tree_id,
                 job.key.block_hash.to_hex().c_str(),
                 job.completed_stages,
                 send_attempts,
-                send_successes,
+                send_dispatches,
                 skipped_confirmed,
+                waiting_for_refresh,
                 job.pre_quorum_retry_cursor,
                 job.total_send_attempts,
                 job.total_attempt_budget,
-                static_cast<unsigned>(enqueued));
-            return enqueued;
+                job.pending_pre_quorum_refresh_batch.size(),
+                static_cast<unsigned>(dispatched));
+            return dispatched;
         }
         catch (...)
         {
+            job.pending_pre_quorum_refresh_batch.clear();
             HOTSTUFF_LOG_INFO(
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=pre_qc_retry_dispatch_summary outcome=exception "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "successes=%zu cursor=%zu total=%zu budget=%zu enqueued=0",
+                "dispatches=%zu cursor=%zu total=%zu budget=%zu "
+                "dispatched=0",
                 static_cast<unsigned>(get_id()),
                 job.key.configuration.epoch_number,
                 job.key.configuration.tree_id,
                 job.key.block_hash.to_hex().c_str(),
                 job.completed_stages,
                 send_attempts,
-                send_successes,
+                send_dispatches,
                 job.pre_quorum_retry_cursor,
                 job.total_send_attempts,
                 job.total_attempt_budget);

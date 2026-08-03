@@ -994,8 +994,9 @@ TEST_CASE("confirmation repair tail shares the original send budget and cancels"
           std::string::npos);
 }
 
-TEST_CASE("pre-QC repair recycles only unused attempts toward the frozen quorum",
-          "[fallback][proposal][pre-qc-repair][budget][bounded]")
+TEST_CASE("pre-QC repair refreshes a bounded connection generation before send",
+          "[fallback][proposal][pre-qc-repair][connection-refresh]"
+          "[budget][bounded]")
 {
     const auto source = read_source("src/hotstuff.cpp");
     const auto job = source_slice(
@@ -1006,14 +1007,42 @@ TEST_CASE("pre-QC repair recycles only unused attempts toward the frozen quorum"
         source,
         "void HotStuffBase::dispatch_exact_proposal_fallback",
         "void HotStuffBase::arm_exact_proposal_repair_tail");
+    const auto arming = source_slice(
+        source,
+        "void HotStuffBase::schedule_exact_proposal_fallback",
+        "void HotStuffBase::dispatch_exact_proposal_fallback");
+    const auto first_pass = source_slice(
+        source,
+        "bool HotStuffBase::broadcast_exact_proposal_fallback",
+        "bool HotStuffBase::reserve_exact_proposal_pre_quorum_refresh");
+    const auto refresh = source_slice(
+        source,
+        "bool HotStuffBase::reserve_exact_proposal_pre_quorum_refresh",
+        "bool HotStuffBase::broadcast_exact_proposal_pre_quorum_retry");
     const auto retry_send = source_slice(
         source,
         "bool HotStuffBase::broadcast_exact_proposal_pre_quorum_retry",
         "bool HotStuffBase::broadcast_exact_proposal_repair_tail");
+    const auto tail_send = source_slice(
+        source,
+        "bool HotStuffBase::broadcast_exact_proposal_repair_tail",
+        "void HotStuffBase::discard_exact_fallbacks");
 
     CHECK(job.find("std::vector<ReplicaID> pre_quorum_retry_targets") !=
           std::string::npos);
     CHECK(job.find("std::size_t pre_quorum_retry_cursor{0}") !=
+          std::string::npos);
+    CHECK(job.find("struct PendingPreQuorumRefresh") !=
+          std::string::npos);
+    CHECK(job.find("Net::conn_t old_connection") !=
+          std::string::npos);
+    CHECK(job.find("observation_deadline") !=
+          std::string::npos);
+    CHECK(job.find("refresh_observation_window") !=
+          std::string::npos);
+    CHECK(job.find("std::vector<PendingPreQuorumRefresh>") !=
+          std::string::npos);
+    CHECK(job.find("pending_pre_quorum_refresh_batch") !=
           std::string::npos);
     CHECK(job.find("bool pre_quorum_retry_armed{false}") !=
           std::string::npos);
@@ -1044,8 +1073,8 @@ TEST_CASE("pre-QC repair recycles only unused attempts toward the frozen quorum"
     CHECK(dispatch.find("std::set<ReplicaID> retry_members") !=
           std::string::npos);
 
-    INFO("each retry stage spends only the current deficit, capped by fanout "
-         "and the unused N-1 budget");
+    INFO("each refresh batch spends only the current deficit, capped by "
+         "fanout and the unused N-1 budget");
     const auto retry_branch = dispatch.find(
         "if (job->pre_quorum_retry_armed)");
     const auto deficit = dispatch.find(
@@ -1056,7 +1085,7 @@ TEST_CASE("pre-QC repair recycles only unused attempts toward the frozen quorum"
     const auto stage_cap = dispatch.find(
         "const auto maximum_attempts = std::min(", retry_branch);
     const auto retry = dispatch.find(
-        "broadcast_exact_proposal_pre_quorum_retry(", retry_branch);
+        "reserve_exact_proposal_pre_quorum_refresh(", retry_branch);
     REQUIRE(retry_branch != std::string::npos);
     REQUIRE(deficit != std::string::npos);
     REQUIRE(remaining != std::string::npos);
@@ -1066,56 +1095,134 @@ TEST_CASE("pre-QC repair recycles only unused attempts toward the frozen quorum"
     CHECK(remaining < stage_cap);
     CHECK(stage_cap < retry);
 
-    INFO("the retry cursor is monotone, newly confirmed replicas are skipped, "
-         "and every charged retry remains inside the original budget");
-    CHECK(retry_send.find("job.pre_quorum_retry_cursor <") !=
+    INFO("reservation is cursor-monotone and charges each retry once before "
+         "requesting or joining a connection refresh");
+    CHECK(refresh.find("job.pre_quorum_retry_cursor <") !=
           std::string::npos);
-    CHECK(retry_send.find("job.pre_quorum_retry_targets.size()") !=
+    CHECK(refresh.find("job.pre_quorum_retry_targets.size()") !=
           std::string::npos);
-    CHECK(retry_send.find(
-              "send_attempts < job.stage_target_limit") !=
+    CHECK(refresh.find(
+              "refresh_attempts < job.stage_target_limit") !=
           std::string::npos);
-    CHECK(retry_send.find("send_attempts < maximum_attempts") !=
+    CHECK(refresh.find("refresh_attempts < maximum_attempts") !=
           std::string::npos);
-    CHECK(retry_send.find(
+    CHECK(refresh.find(
               "job.total_send_attempts < job.total_attempt_budget") !=
           std::string::npos);
-    CHECK(retry_send.find("job.pre_quorum_retry_targets[") !=
+    CHECK(refresh.find("job.pre_quorum_retry_targets[") !=
           std::string::npos);
-    CHECK(retry_send.find("job.pre_quorum_retry_cursor++]") !=
+    CHECK(refresh.find("job.pre_quorum_retry_cursor++]") !=
           std::string::npos);
-    CHECK(retry_send.find(
+    CHECK(refresh.find(
               "proposal_contexts->snapshot(job.key)") !=
           std::string::npos);
-    CHECK(retry_send.find(
+    CHECK(refresh.find(
               "snapshot->verified_signers.count(member) != 0") !=
           std::string::npos);
-    const auto fresh_snapshot = retry_send.find(
+    const auto fresh_snapshot = refresh.find(
         "proposal_contexts->snapshot(job.key)");
-    const auto fresh_deficit = retry_send.find(
+    const auto fresh_deficit = refresh.find(
         "job.global_quorum - snapshot->verified_signers.size()");
-    const auto fresh_cap = retry_send.find(
+    const auto fresh_cap = refresh.find(
         "maximum_attempts = std::min(", fresh_deficit);
     REQUIRE(fresh_snapshot != std::string::npos);
     REQUIRE(fresh_deficit != std::string::npos);
     REQUIRE(fresh_cap != std::string::npos);
     CHECK(fresh_snapshot < fresh_deficit);
     CHECK(fresh_deficit < fresh_cap);
-    const auto charge = retry_send.find("++job.total_send_attempts");
-    const auto enqueue = retry_send.find("pn.send_msg(");
+    const auto capture_connection = refresh.find(
+        "const auto old_connection = pn.get_peer_conn(peer)");
+    const auto reserve = refresh.find(
+        "job.pending_pre_quorum_refresh_batch.push_back(");
+    const auto charge = refresh.find("++job.total_send_attempts");
+    const auto request = refresh.find("pn.conn_peer(peer)");
+    REQUIRE(capture_connection != std::string::npos);
+    REQUIRE(reserve != std::string::npos);
     REQUIRE(charge != std::string::npos);
-    REQUIRE(enqueue != std::string::npos);
-    CHECK(charge < enqueue);
+    REQUIRE(request != std::string::npos);
+    CHECK(capture_connection < reserve);
+    CHECK(reserve < charge);
+    CHECK(charge < request);
+    CHECK(refresh.find("pn.conn_peer(peer,") == std::string::npos);
+    CHECK(refresh.find("pn.send_msg(") == std::string::npos);
+    CHECK(refresh.find("old_connection->is_terminated()") !=
+          std::string::npos);
+    CHECK(arming.find("exact_fallback_recovery_horizon(delay)") !=
+          std::string::npos);
+    CHECK(refresh.find("aggregation_scheduler->monotonic_now()") !=
+          std::string::npos);
+    CHECK(refresh.find("job.refresh_observation_window") !=
+          std::string::npos);
 
-    INFO("stale generation/admission checks precede retry sends, and a "
-         "monotone cursor or budget exhaustion makes the process finite");
+    INFO("a later stage revalidates the exact context, waits only to a "
+         "bounded deadline, and preserves a still-pending reserved credit");
+    const auto pending_branch = dispatch.find(
+        "if (!job->pending_pre_quorum_refresh_batch.empty())");
     const auto active = dispatch.find("*active != key.configuration");
     const auto generation = dispatch.find(
         "*generation != job->epoch_generation");
     const auto admission = dispatch.find("admits_new_proposals()");
+    const auto frozen_quorum = dispatch.find(
+        "proposal_contexts->frozen_global_quorum(*lease)");
+    const auto below_quorum = dispatch.find(
+        "before->verified_signers.size() >= *quorum");
+    REQUIRE(pending_branch != std::string::npos);
     REQUIRE(active != std::string::npos);
     REQUIRE(generation != std::string::npos);
     REQUIRE(admission != std::string::npos);
+    REQUIRE(frozen_quorum != std::string::npos);
+    REQUIRE(below_quorum != std::string::npos);
+    CHECK(active < pending_branch);
+    CHECK(generation < pending_branch);
+    CHECK(admission < pending_branch);
+    CHECK(frozen_quorum < pending_branch);
+    CHECK(below_quorum < pending_branch);
+    CHECK(retry_send.find(
+              "snapshot->verified_signers.count(pending.target) != 0") !=
+          std::string::npos);
+    CHECK(retry_send.find("pn.get_peer_conn(peer)") !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "current_connection != pending.old_connection") !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "pending.old_connection->is_terminated()") !=
+          std::string::npos);
+    const auto deadline = retry_send.find(
+        "now >= pending.observation_deadline");
+    const auto wait = retry_send.find(
+        "if (!connection_changed && !old_terminated &&");
+    const auto retain = retry_send.find(
+        "job.pending_pre_quorum_refresh_batch.push_back(", wait);
+    const auto dispatch_deferred = retry_send.find(
+        "pn.send_msg_deferred(", wait);
+    REQUIRE(deadline != std::string::npos);
+    REQUIRE(wait != std::string::npos);
+    REQUIRE(retain != std::string::npos);
+    REQUIRE(dispatch_deferred != std::string::npos);
+    CHECK(deadline < wait);
+    CHECK(wait < retain);
+    CHECK(retain < dispatch_deferred);
+    CHECK(retry_send.find("refresh_timeout_dispatch") !=
+          std::string::npos);
+    CHECK(retry_send.find("pn.send_msg(") == std::string::npos);
+    CHECK(retry_send.find("++job.total_send_attempts") ==
+          std::string::npos);
+
+    INFO("reservation and send are separated by the existing stage interval, "
+         "and a fully reserved budget may still dispatch its pending batch");
+    const auto scheduled = dispatch.find(
+        "schedule_after(\n                job->stage_interval",
+        retry);
+    REQUIRE(scheduled != std::string::npos);
+    CHECK(retry < scheduled);
+    CHECK(dispatch.find(
+              "job->pending_pre_quorum_refresh_batch.empty() &&\n"
+              "            job->total_send_attempts >= "
+              "job->total_attempt_budget") != std::string::npos);
+
+    INFO("stale generation/admission checks precede retry sends, and a "
+         "monotone cursor or budget exhaustion makes the process finite");
     CHECK(active < retry_branch);
     CHECK(generation < retry_branch);
     CHECK(admission < retry_branch);
@@ -1132,6 +1239,14 @@ TEST_CASE("pre-QC repair recycles only unused attempts toward the frozen quorum"
     CHECK(dispatch.find(
               "job->total_send_attempts == attempts_before") !=
           std::string::npos);
+
+    INFO("connection churn is confined to pre-QC retries; first-pass and the "
+         "post-QC confirmation tail retain their existing send path");
+    CHECK(first_pass.find("conn_peer(") == std::string::npos);
+    CHECK(tail_send.find("conn_peer(") == std::string::npos);
+    CHECK(retry_send.find("conn_peer(") == std::string::npos);
+    CHECK(first_pass.find("send_msg_deferred(") == std::string::npos);
+    CHECK(tail_send.find("send_msg_deferred(") == std::string::npos);
 }
 
 TEST_CASE("timed-out root consumes late votes toward its frozen quorum",
