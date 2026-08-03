@@ -4284,7 +4284,27 @@ namespace hotstuff
                 (job->pending_pre_quorum_refresh_batch.empty() &&
                  candidates_exhausted))
             {
-                erase_job();
+                // The first pass may finish before a delayed contribution
+                // completes the quorum.  Keep the immutable job parked so
+                // try_finish_exact_context can spend the remaining budget on
+                // the post-QC repair tail.  Terminal context cleanup still
+                // erases an unarmed job, and parking sends no extra traffic.
+                job->dispatching = false;
+                job->cancellation = {};
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST stage=fallback "
+                    "outcome=parked "
+                    "reason=pre_qc_candidates_exhausted root=%u epoch=%u "
+                    "tree=%u block=%s verified=%zu quorum=%zu attempts=%zu "
+                    "budget=%zu",
+                    static_cast<unsigned>(get_id()),
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id,
+                    key.block_hash.to_hex().c_str(),
+                    after->verified_signers.size(),
+                    *quorum,
+                    job->total_send_attempts,
+                    job->total_attempt_budget);
                 return;
             }
         }
@@ -5104,6 +5124,45 @@ namespace hotstuff
         }
         for (auto &cancel : cancellations)
             cancel();
+    }
+
+    void HotStuffBase::discard_exact_fallbacks_before_epoch(
+        std::uint32_t first_live_epoch) noexcept
+    {
+        std::vector<AggregationScheduler::Cancellation> cancellations;
+        for (auto job = exact_vote_fallback_jobs.begin();
+             job != exact_vote_fallback_jobs.end();)
+        {
+            if (job->first.configuration.epoch_number >= first_live_epoch)
+            {
+                ++job;
+                continue;
+            }
+            if (job->second->cancellation)
+                cancellations.push_back(
+                    std::move(job->second->cancellation));
+            job = exact_vote_fallback_jobs.erase(job);
+        }
+        for (auto job = exact_proposal_fallback_jobs.begin();
+             job != exact_proposal_fallback_jobs.end();)
+        {
+            if (job->first.configuration.epoch_number >= first_live_epoch)
+            {
+                ++job;
+                continue;
+            }
+            if (job->second->cancellation)
+                cancellations.push_back(
+                    std::move(job->second->cancellation));
+            job = exact_proposal_fallback_jobs.erase(job);
+        }
+        for (auto &cancel : cancellations)
+            try
+            {
+                cancel();
+            }
+            catch (...)
+            {}
     }
 
     void HotStuffBase::cancel_all_exact_fallbacks() noexcept
@@ -9722,6 +9781,10 @@ namespace hotstuff
                 first_live_epoch);
             pending_exact_contributions.purge_before_epoch(
                 first_live_epoch);
+            // The open-context guard above preserves delayed-QC repair. Once
+            // the old configuration is irreversibly retired, no parked or
+            // armed fallback from it may retain immutable proposal state.
+            discard_exact_fallbacks_before_epoch(first_live_epoch);
             proposal_contexts->advance_retirement_floor(
                 first_live_epoch);
             forget_proposal_view_generations_before_epoch(

@@ -929,11 +929,19 @@ TEST_CASE("confirmation repair tail shares the original send budget and cancels"
     const auto cleanup = source_slice(
         source,
         "void HotStuffBase::discard_exact_fallbacks",
+        "void HotStuffBase::discard_exact_fallbacks_before_epoch");
+    const auto floor_cleanup = source_slice(
+        source,
+        "void HotStuffBase::discard_exact_fallbacks_before_epoch",
         "void HotStuffBase::cancel_all_exact_fallbacks");
     const auto shutdown = source_slice(
         source,
         "void HotStuffBase::cancel_all_exact_fallbacks",
         "quorum_cert_bt HotStuffBase::verified_aggregation_candidate");
+    const auto retirement = source_slice(
+        source,
+        "void HotStuffBase::advance_committed_retirement_floor",
+        "void HotStuffBase::retire_deferred_epoch_changes_for_block");
 
     CHECK(job.find("const std::size_t total_attempt_budget") !=
           std::string::npos);
@@ -1003,6 +1011,23 @@ TEST_CASE("confirmation repair tail shares the original send budget and cancels"
          "shutdown still cancels every outstanding job");
     CHECK(cleanup.find("!proposal->second->tail_armed") !=
           std::string::npos);
+    CHECK(floor_cleanup.find("exact_vote_fallback_jobs.erase(job)") !=
+          std::string::npos);
+    CHECK(floor_cleanup.find("exact_proposal_fallback_jobs.erase(job)") !=
+          std::string::npos);
+    CHECK(floor_cleanup.find("epoch_number >= first_live_epoch") !=
+          std::string::npos);
+    const auto open_guard = retirement.find(
+        "has_open_context_before_epoch(");
+    const auto floor_fallbacks = retirement.find(
+        "discard_exact_fallbacks_before_epoch(first_live_epoch)");
+    const auto floor_contexts = retirement.find(
+        "proposal_contexts->advance_retirement_floor(");
+    REQUIRE(open_guard != std::string::npos);
+    REQUIRE(floor_fallbacks != std::string::npos);
+    REQUIRE(floor_contexts != std::string::npos);
+    CHECK(open_guard < floor_fallbacks);
+    CHECK(floor_fallbacks < floor_contexts);
     CHECK(shutdown.find("exact_proposal_fallback_jobs.clear()") !=
           std::string::npos);
 }
@@ -1120,6 +1145,30 @@ TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
     REQUIRE(stage_cap != std::string::npos);
     REQUIRE(reserve_call != std::string::npos);
     REQUIRE(immediate_dispatch != std::string::npos);
+
+    INFO("an exhausted first pass parks the job without traffic so a delayed "
+         "quorum can still arm the bounded post-QC repair tail");
+    const auto exhausted = dispatch.find(
+        "const bool candidates_exhausted", immediate_dispatch);
+    const auto parked = dispatch.find(
+        "reason=pre_qc_candidates_exhausted", exhausted);
+    const auto parked_idle = dispatch.find(
+        "job->dispatching = false", exhausted);
+    const auto parked_return = dispatch.find("return;", parked);
+    REQUIRE(exhausted != std::string::npos);
+    REQUIRE(parked != std::string::npos);
+    REQUIRE(parked_idle != std::string::npos);
+    REQUIRE(parked_return != std::string::npos);
+    CHECK(exhausted < parked_idle);
+    CHECK(parked_idle < parked);
+    const auto parked_branch = dispatch.substr(
+        exhausted, parked_return + std::string("return;").size() - exhausted);
+    CHECK(parked_branch.find("erase_job();") == std::string::npos);
+    CHECK(parked_branch.find("schedule_after(") == std::string::npos);
+    CHECK(parked_branch.find("send_msg") == std::string::npos);
+    CHECK(parked_branch.find("broadcast_exact_proposal") ==
+          std::string::npos);
+
     const auto refresh_loop = refresh.find("std::size_t refresh_attempts");
     REQUIRE(refresh_loop != std::string::npos);
     CHECK(refresh.substr(0, refresh_loop).find(

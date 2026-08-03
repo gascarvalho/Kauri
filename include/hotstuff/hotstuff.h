@@ -1517,6 +1517,8 @@ namespace hotstuff
         void discard_exact_fallbacks(
             const ProposalKey &key,
             bool preserve_scheduled_vote_fallback = false);
+        void discard_exact_fallbacks_before_epoch(
+            std::uint32_t first_live_epoch) noexcept;
         void cancel_all_exact_fallbacks() noexcept;
         bool forward_exact_direct(
             const ProposalContextLease &lease,
