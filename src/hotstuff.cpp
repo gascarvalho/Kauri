@@ -4381,9 +4381,35 @@ namespace hotstuff
                 job->total_send_attempts < job->total_attempt_budget
                     ? job->total_attempt_budget - job->total_send_attempts
                     : 0;
+
+            // Spend the immutable N-1 fallback budget on fresh repair targets
+            // before a retry.  A replica omitted from every repair stage
+            // cannot process a later pipelined proposal if this proposal is
+            // missing from its ancestry.  The old attempted-only tail could
+            // therefore retry a slow path while leaving a fresh path behind.
+            std::set<ReplicaID> attempted_targets(
+                job->attempted_targets.begin(),
+                job->attempted_targets.end());
+            std::set<ReplicaID> assigned_targets(
+                lease.tree().assigned_subtree.begin(),
+                lease.tree().assigned_subtree.end());
+            std::set<ReplicaID> queued_targets;
+            const auto queue_tail_target = [&](ReplicaID member) {
+                if (member == get_id() ||
+                    assigned_targets.count(member) == 0 ||
+                    snapshot->verified_signers.count(member) != 0 ||
+                    !queued_targets.insert(member).second)
+                    return;
+                job->tail_targets.push_back(member);
+            };
+            for (const auto member : lease.tree().assigned_subtree)
+                if (attempted_targets.count(member) == 0)
+                    queue_tail_target(member);
+            const auto fresh_candidate_count = job->tail_targets.size();
             for (const auto member : job->attempted_targets)
-                if (snapshot->verified_signers.count(member) == 0)
-                    job->tail_targets.push_back(member);
+                queue_tail_target(member);
+            const auto retry_candidate_count =
+                job->tail_targets.size() - fresh_candidate_count;
 
             auto previous = std::move(job->cancellation);
             job->cancellation = {};
@@ -4424,7 +4450,8 @@ namespace hotstuff
                 HOTSTUFF_LOG_INFO(
                     "KAURI_PROPOSAL_BROADCAST stage=repair_tail "
                     "outcome=armed root=%u epoch=%u tree=%u block=%s "
-                    "confirmed=%zu candidates=%zu attempts=%zu budget=%zu "
+                    "confirmed=%zu candidates=%zu fresh_candidates=%zu "
+                    "retry_candidates=%zu attempts=%zu budget=%zu "
                     "delay_ticks=%lld",
                     static_cast<unsigned>(get_id()),
                     job->key.configuration.epoch_number,
@@ -4432,6 +4459,8 @@ namespace hotstuff
                     job->key.block_hash.to_hex().c_str(),
                     job->confirmed_signers.size(),
                     job->tail_targets.size(),
+                    fresh_candidate_count,
+                    retry_candidate_count,
                     job->total_send_attempts,
                     job->total_attempt_budget,
                     static_cast<long long>(job->stage_interval.count()));

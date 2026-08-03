@@ -873,8 +873,9 @@ TEST_CASE("root quorum arms a bounded confirmation repair tail before closure",
           std::string::npos);
     CHECK(arm.find("snapshot->verified_signers.size() < job->global_quorum") !=
           std::string::npos);
+    CHECK(arm.find("lease.tree().assigned_subtree") != std::string::npos);
     CHECK(arm.find("job->attempted_targets") != std::string::npos);
-    CHECK(arm.find("snapshot->verified_signers.count(member) == 0") !=
+    CHECK(arm.find("snapshot->verified_signers.count(member) != 0") !=
           std::string::npos);
     CHECK(arm.find("job->tail_targets.push_back(member)") !=
           std::string::npos);
@@ -1161,11 +1162,39 @@ TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
     CHECK(refresh.find("!old_terminated") == std::string::npos);
     CHECK(refresh.find("pn.conn_peer(peer,") == std::string::npos);
     CHECK(refresh.find("++job.total_send_attempts") == std::string::npos);
-    CHECK(tail_arm.find(
-              "for (const auto member : job->attempted_targets)") !=
+    INFO("the post-quorum tail spends its remaining budget on fresh fallback "
+         "targets before retrying an uncertain path");
+    const auto attempted_set = tail_arm.find(
+        "std::set<ReplicaID> attempted_targets(");
+    const auto assigned_set = tail_arm.find(
+        "std::set<ReplicaID> assigned_targets(", attempted_set);
+    const auto fresh_members = tail_arm.find(
+        "for (const auto member : lease.tree().assigned_subtree)",
+        assigned_set);
+    const auto fresh_guard = tail_arm.find(
+        "attempted_targets.count(member) == 0", fresh_members);
+    const auto fresh_queue = tail_arm.find(
+        "queue_tail_target(member)", fresh_guard);
+    const auto retry_members = tail_arm.find(
+        "for (const auto member : job->attempted_targets)", fresh_queue);
+    const auto retry_queue = tail_arm.find(
+        "queue_tail_target(member)", retry_members);
+    REQUIRE(attempted_set != std::string::npos);
+    REQUIRE(assigned_set != std::string::npos);
+    REQUIRE(fresh_members != std::string::npos);
+    REQUIRE(fresh_guard != std::string::npos);
+    REQUIRE(fresh_queue != std::string::npos);
+    REQUIRE(retry_members != std::string::npos);
+    REQUIRE(retry_queue != std::string::npos);
+    CHECK(fresh_queue < retry_queue);
+    CHECK(tail_arm.find("std::set<ReplicaID> queued_targets") !=
+          std::string::npos);
+    CHECK(tail_arm.find("assigned_targets.count(member) == 0") !=
           std::string::npos);
     CHECK(tail_arm.find("job->tail_targets.push_back(member)") !=
           std::string::npos);
+    CHECK(tail_arm.find("fresh_candidates=%zu") != std::string::npos);
+    CHECK(tail_arm.find("retry_candidates=%zu") != std::string::npos);
 
     INFO("live and reconnecting paths dispatch by PeerId immediately, while "
          "the N-1 budget is charged directly before the deferred send");
