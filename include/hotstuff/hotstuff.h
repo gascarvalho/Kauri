@@ -1505,6 +1505,10 @@ namespace hotstuff
             std::size_t total_attempt_budget,
             std::size_t maximum_attempts,
             std::uint32_t repair_stage);
+        bool broadcast_exact_proposal_pre_quorum_retry(
+            const ProposalContextLease &lease,
+            ExactProposalFallbackJob &job,
+            std::size_t maximum_attempts);
         bool broadcast_exact_proposal_repair_tail(
             ExactProposalFallbackJob &job);
         void discard_exact_fallbacks(

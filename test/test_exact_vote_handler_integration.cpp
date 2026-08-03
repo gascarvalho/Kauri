@@ -994,6 +994,146 @@ TEST_CASE("confirmation repair tail shares the original send budget and cancels"
           std::string::npos);
 }
 
+TEST_CASE("pre-QC repair recycles only unused attempts toward the frozen quorum",
+          "[fallback][proposal][pre-qc-repair][budget][bounded]")
+{
+    const auto source = read_source("src/hotstuff.cpp");
+    const auto job = source_slice(
+        source,
+        "struct HotStuffBase::ExactProposalFallbackJob",
+        "class HotStuffBase::ExactContributionEffects");
+    const auto dispatch = source_slice(
+        source,
+        "void HotStuffBase::dispatch_exact_proposal_fallback",
+        "void HotStuffBase::arm_exact_proposal_repair_tail");
+    const auto retry_send = source_slice(
+        source,
+        "bool HotStuffBase::broadcast_exact_proposal_pre_quorum_retry",
+        "bool HotStuffBase::broadcast_exact_proposal_repair_tail");
+
+    CHECK(job.find("std::vector<ReplicaID> pre_quorum_retry_targets") !=
+          std::string::npos);
+    CHECK(job.find("std::size_t pre_quorum_retry_cursor{0}") !=
+          std::string::npos);
+    CHECK(job.find("bool pre_quorum_retry_armed{false}") !=
+          std::string::npos);
+
+    INFO("cursor exhaustion must recycle the remaining shared budget instead "
+         "of erasing a Q20 job");
+    const auto after = dispatch.find("const auto after =");
+    const auto exhausted = dispatch.find(
+        "else if (job->target_cursor >=");
+    const auto candidates = dispatch.find(
+        "for (const auto member : job->attempted_targets)", exhausted);
+    const auto skip_confirmed = dispatch.find(
+        "after->verified_signers.count(member) == 0", candidates);
+    const auto append = dispatch.find(
+        "job->pre_quorum_retry_targets.push_back(member)", candidates);
+    const auto arm = dispatch.find(
+        "job->pre_quorum_retry_armed = true", candidates);
+    REQUIRE(after != std::string::npos);
+    REQUIRE(exhausted != std::string::npos);
+    REQUIRE(candidates != std::string::npos);
+    REQUIRE(skip_confirmed != std::string::npos);
+    REQUIRE(append != std::string::npos);
+    REQUIRE(arm != std::string::npos);
+    CHECK(after < exhausted);
+    CHECK(exhausted < candidates);
+    CHECK(candidates < arm);
+    CHECK(skip_confirmed < append);
+    CHECK(dispatch.find("std::set<ReplicaID> retry_members") !=
+          std::string::npos);
+
+    INFO("each retry stage spends only the current deficit, capped by fanout "
+         "and the unused N-1 budget");
+    const auto retry_branch = dispatch.find(
+        "if (job->pre_quorum_retry_armed)");
+    const auto deficit = dispatch.find(
+        "*quorum - before->verified_signers.size()", retry_branch);
+    const auto remaining = dispatch.find(
+        "job->total_attempt_budget - job->total_send_attempts",
+        retry_branch);
+    const auto stage_cap = dispatch.find(
+        "const auto maximum_attempts = std::min(", retry_branch);
+    const auto retry = dispatch.find(
+        "broadcast_exact_proposal_pre_quorum_retry(", retry_branch);
+    REQUIRE(retry_branch != std::string::npos);
+    REQUIRE(deficit != std::string::npos);
+    REQUIRE(remaining != std::string::npos);
+    REQUIRE(stage_cap != std::string::npos);
+    REQUIRE(retry != std::string::npos);
+    CHECK(deficit < stage_cap);
+    CHECK(remaining < stage_cap);
+    CHECK(stage_cap < retry);
+
+    INFO("the retry cursor is monotone, newly confirmed replicas are skipped, "
+         "and every charged retry remains inside the original budget");
+    CHECK(retry_send.find("job.pre_quorum_retry_cursor <") !=
+          std::string::npos);
+    CHECK(retry_send.find("job.pre_quorum_retry_targets.size()") !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "send_attempts < job.stage_target_limit") !=
+          std::string::npos);
+    CHECK(retry_send.find("send_attempts < maximum_attempts") !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "job.total_send_attempts < job.total_attempt_budget") !=
+          std::string::npos);
+    CHECK(retry_send.find("job.pre_quorum_retry_targets[") !=
+          std::string::npos);
+    CHECK(retry_send.find("job.pre_quorum_retry_cursor++]") !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "proposal_contexts->snapshot(job.key)") !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "snapshot->verified_signers.count(member) != 0") !=
+          std::string::npos);
+    const auto fresh_snapshot = retry_send.find(
+        "proposal_contexts->snapshot(job.key)");
+    const auto fresh_deficit = retry_send.find(
+        "job.global_quorum - snapshot->verified_signers.size()");
+    const auto fresh_cap = retry_send.find(
+        "maximum_attempts = std::min(", fresh_deficit);
+    REQUIRE(fresh_snapshot != std::string::npos);
+    REQUIRE(fresh_deficit != std::string::npos);
+    REQUIRE(fresh_cap != std::string::npos);
+    CHECK(fresh_snapshot < fresh_deficit);
+    CHECK(fresh_deficit < fresh_cap);
+    const auto charge = retry_send.find("++job.total_send_attempts");
+    const auto enqueue = retry_send.find("pn.send_msg(");
+    REQUIRE(charge != std::string::npos);
+    REQUIRE(enqueue != std::string::npos);
+    CHECK(charge < enqueue);
+
+    INFO("stale generation/admission checks precede retry sends, and a "
+         "monotone cursor or budget exhaustion makes the process finite");
+    const auto active = dispatch.find("*active != key.configuration");
+    const auto generation = dispatch.find(
+        "*generation != job->epoch_generation");
+    const auto admission = dispatch.find("admits_new_proposals()");
+    REQUIRE(active != std::string::npos);
+    REQUIRE(generation != std::string::npos);
+    REQUIRE(admission != std::string::npos);
+    CHECK(active < retry_branch);
+    CHECK(generation < retry_branch);
+    CHECK(admission < retry_branch);
+    CHECK(dispatch.find("job->pre_quorum_retry_cursor >=") !=
+          std::string::npos);
+    CHECK(dispatch.find("job->pre_quorum_retry_targets.size()") !=
+          std::string::npos);
+    CHECK(dispatch.find(
+              "job->total_send_attempts >= job->total_attempt_budget") !=
+          std::string::npos);
+    CHECK(dispatch.find(
+              "job->pre_quorum_retry_cursor == retry_cursor_before") !=
+          std::string::npos);
+    CHECK(dispatch.find(
+              "job->total_send_attempts == attempts_before") !=
+          std::string::npos);
+}
+
 TEST_CASE("timed-out root consumes late votes toward its frozen quorum",
           "[a06][a06-wiring-audit][production-wiring][root][late-vote]"
           "[intentional-red]")

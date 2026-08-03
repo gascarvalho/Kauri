@@ -793,11 +793,14 @@ namespace hotstuff
         std::size_t target_cursor{0};
         std::size_t total_send_attempts{0};
         std::vector<ReplicaID> attempted_targets;
+        std::vector<ReplicaID> pre_quorum_retry_targets;
+        std::size_t pre_quorum_retry_cursor{0};
         std::set<ReplicaID> confirmed_signers;
         std::vector<ReplicaID> tail_targets;
         std::size_t tail_target_cursor{0};
         std::uint32_t completed_stages{0};
         bool quorum_observed{false};
+        bool pre_quorum_retry_armed{false};
         bool tail_armed{false};
         bool dispatching{false};
         AggregationScheduler::Cancellation cancellation;
@@ -4165,28 +4168,42 @@ namespace hotstuff
             job->dispatching = false;
             return;
         }
+        if (job->total_send_attempts >= job->total_attempt_budget)
+        {
+            erase_job();
+            return;
+        }
 
+        const auto retry_cursor_before = job->pre_quorum_retry_cursor;
+        const auto attempts_before = job->total_send_attempts;
         ++job->completed_stages;
-        static_cast<void>(broadcast_exact_proposal_fallback(
-            *lease,
-            job->epoch_generation,
-            *job->proposal,
-            job->target_cursor,
-            job->total_send_attempts,
-            job->attempted_targets,
-            job->quorum_observed,
-            job->total_attempt_budget,
-            job->stage_target_limit,
-            job->completed_stages));
+        if (job->pre_quorum_retry_armed)
+        {
+            const auto missing_votes =
+                *quorum - before->verified_signers.size();
+            const auto remaining_budget =
+                job->total_attempt_budget - job->total_send_attempts;
+            const auto maximum_attempts = std::min(
+                {missing_votes, job->stage_target_limit, remaining_budget});
+            static_cast<void>(
+                broadcast_exact_proposal_pre_quorum_retry(
+                    *lease, *job, maximum_attempts));
+        }
+        else
+            static_cast<void>(broadcast_exact_proposal_fallback(
+                *lease,
+                job->epoch_generation,
+                *job->proposal,
+                job->target_cursor,
+                job->total_send_attempts,
+                job->attempted_targets,
+                job->quorum_observed,
+                job->total_attempt_budget,
+                job->stage_target_limit,
+                job->completed_stages));
         if (job->quorum_observed)
         {
             job->dispatching = false;
-            return;
-        }
-        if (job->target_cursor >= lease->tree().assigned_subtree.size() ||
-            job->total_send_attempts >= job->total_attempt_budget)
-        {
-            erase_job();
             return;
         }
 
@@ -4209,6 +4226,52 @@ namespace hotstuff
             arm_exact_proposal_repair_tail(*next_lease);
             job->dispatching = false;
             return;
+        }
+
+        if (job->total_send_attempts >= job->total_attempt_budget)
+        {
+            erase_job();
+            return;
+        }
+        if (job->pre_quorum_retry_armed)
+        {
+            if ((job->pre_quorum_retry_cursor == retry_cursor_before &&
+                 job->total_send_attempts == attempts_before) ||
+                job->pre_quorum_retry_cursor >=
+                    job->pre_quorum_retry_targets.size())
+            {
+                erase_job();
+                return;
+            }
+        }
+        else if (job->target_cursor >=
+                 next_lease->tree().assigned_subtree.size())
+        {
+            std::set<ReplicaID> retry_members;
+            for (const auto member : job->attempted_targets)
+                if (after->verified_signers.count(member) == 0 &&
+                    retry_members.insert(member).second)
+                    job->pre_quorum_retry_targets.push_back(member);
+            if (job->pre_quorum_retry_targets.empty())
+            {
+                erase_job();
+                return;
+            }
+            job->pre_quorum_retry_armed = true;
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=pre_qc_retry "
+                "outcome=armed root=%u epoch=%u tree=%u block=%s "
+                "verified=%zu quorum=%zu candidates=%zu attempts=%zu "
+                "budget=%zu",
+                static_cast<unsigned>(get_id()),
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.block_hash.to_hex().c_str(),
+                after->verified_signers.size(),
+                *quorum,
+                job->pre_quorum_retry_targets.size(),
+                job->total_send_attempts,
+                job->total_attempt_budget);
         }
 
         bool rearm_failed = false;
@@ -4244,7 +4307,9 @@ namespace hotstuff
                     job->completed_stages + 1,
                     after->verified_signers.size(),
                     *quorum,
-                    job->target_cursor,
+                    job->pre_quorum_retry_armed
+                        ? job->pre_quorum_retry_cursor
+                        : job->target_cursor,
                     static_cast<long long>(job->stage_interval.count()));
                 return;
             }
@@ -4260,6 +4325,11 @@ namespace hotstuff
         // at most once.
         if (!rearm_failed)
             return;
+        if (job->pre_quorum_retry_armed)
+        {
+            erase_job();
+            return;
+        }
         const auto drain_lease =
             proposal_contexts->acquire_open_context(key);
         if (!drain_lease.has_value() ||
@@ -4584,6 +4654,128 @@ namespace hotstuff
                 target_cursor,
                 total_send_attempts,
                 total_attempt_budget);
+            return false;
+        }
+    }
+
+    bool HotStuffBase::broadcast_exact_proposal_pre_quorum_retry(
+        const ProposalContextLease &lease,
+        ExactProposalFallbackJob &job,
+        std::size_t maximum_attempts)
+    {
+        if (job.proposal == nullptr || job.proposal->key() != lease.key() ||
+            job.key != lease.key() || lease.tree().root != get_id() ||
+            lease.tree().parent.has_value() ||
+            !job.pre_quorum_retry_armed || maximum_attempts == 0)
+            return false;
+        std::size_t send_attempts = 0;
+        std::size_t send_successes = 0;
+        try
+        {
+            bytearray_t encoded;
+            if (is_adaptive_epoch_mode(epoch_protocol_mode))
+            {
+                const MsgPropose native(*job.proposal);
+                encoded = adaptive_epoch_consensus_message(
+                    job.key.configuration,
+                    job.epoch_generation,
+                    EpochConsensusWireKind::proposal,
+                    job.key,
+                    get_id(),
+                    get_id(),
+                    static_cast<bytearray_t>(native.serialized),
+                    epoch_wire_limits,
+                    epoch_protocol_mode);
+                if (encoded.empty())
+                    return false;
+            }
+
+            bool enqueued = false;
+            std::size_t skipped_confirmed = 0;
+            const auto snapshot = proposal_contexts->snapshot(job.key);
+            if (!snapshot.has_value())
+                return false;
+            if (snapshot->verified_signers.size() >= job.global_quorum)
+                return false;
+            const auto fresh_missing_votes =
+                job.global_quorum - snapshot->verified_signers.size();
+            maximum_attempts = std::min(
+                maximum_attempts, fresh_missing_votes);
+            while (job.pre_quorum_retry_cursor <
+                       job.pre_quorum_retry_targets.size() &&
+                   !job.quorum_observed &&
+                   send_attempts < maximum_attempts &&
+                   send_attempts < job.stage_target_limit &&
+                   job.total_send_attempts < job.total_attempt_budget)
+            {
+                const auto member = job.pre_quorum_retry_targets[
+                    job.pre_quorum_retry_cursor++];
+                if (member == get_id() ||
+                    snapshot->verified_signers.count(member) != 0)
+                {
+                    ++skipped_confirmed;
+                    continue;
+                }
+                const auto peer = config.get_peer_id(member);
+                if (peer.is_null())
+                    continue;
+                ++send_attempts;
+                ++job.total_send_attempts;
+                const bool sent = is_adaptive_epoch_mode(epoch_protocol_mode)
+                    ? pn.send_msg(MsgPropose(DataStream(encoded)), peer)
+                    : pn.send_msg(MsgPropose(*job.proposal), peer);
+                if (sent)
+                    ++send_successes;
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST "
+                    "stage=pre_qc_retry_target_result root=%u target=%u "
+                    "epoch=%u tree=%u block=%s stage=%u enqueued=%u",
+                    static_cast<unsigned>(get_id()),
+                    static_cast<unsigned>(member),
+                    job.key.configuration.epoch_number,
+                    job.key.configuration.tree_id,
+                    job.key.block_hash.to_hex().c_str(),
+                    job.completed_stages,
+                    static_cast<unsigned>(sent));
+                enqueued = sent || enqueued;
+            }
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=pre_qc_retry_dispatch_summary outcome=complete "
+                "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
+                "successes=%zu skipped_confirmed=%zu cursor=%zu total=%zu "
+                "budget=%zu enqueued=%u",
+                static_cast<unsigned>(get_id()),
+                job.key.configuration.epoch_number,
+                job.key.configuration.tree_id,
+                job.key.block_hash.to_hex().c_str(),
+                job.completed_stages,
+                send_attempts,
+                send_successes,
+                skipped_confirmed,
+                job.pre_quorum_retry_cursor,
+                job.total_send_attempts,
+                job.total_attempt_budget,
+                static_cast<unsigned>(enqueued));
+            return enqueued;
+        }
+        catch (...)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=pre_qc_retry_dispatch_summary outcome=exception "
+                "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
+                "successes=%zu cursor=%zu total=%zu budget=%zu enqueued=0",
+                static_cast<unsigned>(get_id()),
+                job.key.configuration.epoch_number,
+                job.key.configuration.tree_id,
+                job.key.block_hash.to_hex().c_str(),
+                job.completed_stages,
+                send_attempts,
+                send_successes,
+                job.pre_quorum_retry_cursor,
+                job.total_send_attempts,
+                job.total_attempt_budget);
             return false;
         }
     }
