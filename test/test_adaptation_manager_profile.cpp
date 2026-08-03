@@ -32,6 +32,10 @@ TEST_CASE(
     CHECK(derived->quorum.fault_threshold == 2);
     CHECK(derived->quorum.quorum == 5);
     CHECK(derived->required_nonresponsive == 2);
+    CHECK(
+        derived->maximum_post_baseline_timeout_attempts ==
+        derived->ingress_limits.evidence_store
+            .maximum_accepted_records);
     CHECK(derived->tree_shape.fanout == 2);
     CHECK(derived->tree_shape.pipeline_stretch == 2);
     CHECK(derived->tree_shape.tree_count == 5);
@@ -68,6 +72,11 @@ TEST_CASE(
     CHECK(derived->quorum.fault_threshold == 10);
     CHECK(derived->quorum.quorum == 21);
     CHECK(derived->required_nonresponsive == 10);
+    CHECK(
+        derived->maximum_post_baseline_timeout_attempts ==
+        derived->ingress_limits.evidence_store
+            .maximum_accepted_records);
+    CHECK(derived->maximum_post_baseline_timeout_attempts > 128);
     CHECK(derived->tree_shape.fanout == 5);
     CHECK(derived->tree_shape.pipeline_stretch == 2);
     CHECK(derived->tree_shape.tree_count == 21);

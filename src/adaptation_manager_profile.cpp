@@ -202,6 +202,9 @@ derive_adaptive_v2_manager_runtime_shape(
     shape.quorum = *quorum;
     shape.required_nonresponsive = quorum->fault_threshold;
     shape.minimum_score_drop = *score_drop;
+    shape.maximum_post_baseline_timeout_attempts =
+        derived_ingress_limits->evidence_store
+            .maximum_accepted_records;
     shape.tree_shape = {
         tree_fanout, pipeline_stretch, quorum->quorum};
     shape.ingress_limits = *derived_ingress_limits;

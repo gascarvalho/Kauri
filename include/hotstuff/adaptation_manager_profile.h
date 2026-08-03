@@ -28,6 +28,7 @@ struct AdaptiveV2ManagerRuntimeShape
     ByzantineQuorum quorum;
     std::uint32_t required_nonresponsive{0};
     std::uint32_t minimum_score_drop{0};
+    std::size_t maximum_post_baseline_timeout_attempts{0};
     TreeShape tree_shape;
     AdaptiveV2ManagerIngressLimits ingress_limits;
     EpochChangeBundleLimits bundle_limits;

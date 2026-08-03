@@ -690,7 +690,8 @@ AdaptiveV2ManagerControllerConfig manager_controller_config(
         options.runtime_shape.minimum_score_drop;
     config.selection.minimum_timeouts_per_reporter =
         kTimeoutsPerReporter;
-    config.selection.maximum_post_baseline_timeout_attempts = 128;
+    config.selection.maximum_post_baseline_timeout_attempts =
+        options.runtime_shape.maximum_post_baseline_timeout_attempts;
     config.selection.responsiveness_policy.policy_version =
         "adaptive-v2-controller-responsiveness-v1";
     config.selection.responsiveness_policy.attempt_window = 32;
