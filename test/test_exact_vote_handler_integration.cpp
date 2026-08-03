@@ -1180,7 +1180,8 @@ TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
           std::string::npos);
 
     INFO("reservation is cursor-monotone, preserves healthy connections, "
-         "joins existing reconnects, and retains tail accounting");
+         "joins existing reconnects, and defers attempted-target accounting "
+         "until enqueue succeeds");
     const auto capture = refresh.find(
         "const auto current_connection = pn.get_peer_conn(peer)");
     const auto request_required = refresh.find(
@@ -1189,18 +1190,17 @@ TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
         "const bool reconnect_in_progress =", request_required);
     const auto reserve = refresh.find(
         "job.pending_pre_quorum_refresh_batch.push_back(", reconnecting);
-    const auto tail_candidate = refresh.find(
-        "job.attempted_targets.push_back(member)", reserve);
     const auto reconnect_guard = refresh.find(
-        "if (reconnect_request_required)", tail_candidate);
+        "if (reconnect_request_required)", reserve);
     const auto request = refresh.find("pn.conn_peer(peer)", reconnect_guard);
     REQUIRE(capture != std::string::npos);
     REQUIRE(request_required != std::string::npos);
     REQUIRE(reconnecting != std::string::npos);
     REQUIRE(reserve != std::string::npos);
-    REQUIRE(tail_candidate != std::string::npos);
     REQUIRE(reconnect_guard != std::string::npos);
     REQUIRE(request != std::string::npos);
+    CHECK(refresh.find("job.attempted_targets.push_back(member)") ==
+          std::string::npos);
     CHECK(reconnect_guard < request);
     CHECK(refresh.find(
               "current_connection == nullptr", request_required) !=
@@ -1245,8 +1245,9 @@ TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
     CHECK(tail_arm.find("fresh_candidates=%zu") != std::string::npos);
     CHECK(tail_arm.find("retry_candidates=%zu") != std::string::npos);
 
-    INFO("live and reconnecting paths dispatch by PeerId immediately, while "
-         "the N-1 budget is charged directly before the deferred send");
+    INFO("live and reconnecting paths retire a target only after the PeerId "
+         "send reports a real enqueue; a failed enqueue stays pending for a "
+         "bounded later stage");
     CHECK(retry_send.find("const bool reconnect_path_observed =") !=
           std::string::npos);
     CHECK(retry_send.find("connection_changed") == std::string::npos);
@@ -1256,21 +1257,99 @@ TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
           std::string::npos);
     const auto budget_guard = retry_send.find(
         "job.total_send_attempts >= job.total_attempt_budget");
-    const auto charge = retry_send.find(
-        "++job.total_send_attempts", budget_guard);
-    const auto deferred = retry_send.find("pn.send_msg_deferred(", charge);
     REQUIRE(budget_guard != std::string::npos);
-    REQUIRE(charge != std::string::npos);
-    REQUIRE(deferred != std::string::npos);
-    CHECK(charge < deferred);
+    CHECK(retry_send.find("pn.send_msg_deferred(") == std::string::npos);
+    const auto pending_move = retry_send.find(
+        "std::move(job.pending_pre_quorum_refresh_batch)");
+    const auto pending_loop = retry_send.find(
+        "for (const auto &pending : pending_batch)", pending_move);
+    const auto enqueue = retry_send.find("pn.send_msg(", pending_loop);
+    REQUIRE(pending_move != std::string::npos);
+    REQUIRE(pending_loop != std::string::npos);
+    REQUIRE(enqueue != std::string::npos);
+
+    const std::string boolean_declaration = "const bool ";
+    const auto outcome_declaration = retry_send.rfind(
+        boolean_declaration, enqueue);
+    REQUIRE(outcome_declaration != std::string::npos);
+    REQUIRE(outcome_declaration > pending_loop);
+    const auto outcome_begin =
+        outcome_declaration + boolean_declaration.size();
+    const auto outcome_end = retry_send.find_first_of(
+        " \t=", outcome_begin);
+    REQUIRE(outcome_end != std::string::npos);
+    const auto outcome = retry_send.substr(
+        outcome_begin, outcome_end - outcome_begin);
+    const auto success_guard = retry_send.find(
+        "if (" + outcome + ")", enqueue);
+    REQUIRE(success_guard != std::string::npos);
+    const auto charge_stage_attempt = retry_send.find(
+        "++send_attempts", enqueue);
+    const auto charge_total_attempt = retry_send.find(
+        "++job.total_send_attempts", enqueue);
+    REQUIRE(charge_stage_attempt != std::string::npos);
+    REQUIRE(charge_total_attempt != std::string::npos);
+    CHECK(enqueue < charge_stage_attempt);
+    CHECK(enqueue < charge_total_attempt);
+    CHECK(charge_stage_attempt < success_guard);
+    CHECK(charge_total_attempt < success_guard);
+    CHECK(count_occurrences(retry_send, "++send_attempts") == 1);
+    CHECK(count_occurrences(
+              retry_send, "++job.total_send_attempts") == 1);
+    const auto success_open = retry_send.find('{', success_guard);
+    const auto success_close = matching_closing_brace(
+        retry_send, success_open);
+    REQUIRE(success_open != std::string::npos);
+    REQUIRE(success_close != std::string::npos);
+    const auto success_branch = retry_send.substr(
+        success_open, success_close - success_open + 1);
+    CHECK(success_branch.find("++send_dispatches") != std::string::npos);
+    CHECK(success_branch.find(
+              "job.attempted_targets.push_back(pending.target)") !=
+          std::string::npos);
+    CHECK(success_branch.find("dispatched = true") != std::string::npos);
+
+    const auto failure_else = retry_send.find("else", success_close);
+    const auto failure_open = retry_send.find('{', failure_else);
+    const auto failure_close = matching_closing_brace(
+        retry_send, failure_open);
+    REQUIRE(failure_else != std::string::npos);
+    REQUIRE(failure_open != std::string::npos);
+    REQUIRE(failure_close != std::string::npos);
+    const auto failure_branch = retry_send.substr(
+        failure_open, failure_close - failure_open + 1);
+    const auto remaining_budget_guard = failure_branch.find(
+        "job.total_send_attempts < job.total_attempt_budget");
+    REQUIRE(remaining_budget_guard != std::string::npos);
+    const auto remaining_budget_open = failure_branch.find(
+        '{', remaining_budget_guard);
+    const auto remaining_budget_close = matching_closing_brace(
+        failure_branch, remaining_budget_open);
+    REQUIRE(remaining_budget_open != std::string::npos);
+    REQUIRE(remaining_budget_close != std::string::npos);
+    const auto retry_eligible_branch = failure_branch.substr(
+        remaining_budget_open,
+        remaining_budget_close - remaining_budget_open + 1);
+    CHECK(retry_eligible_branch.find(
+              "job.pending_pre_quorum_refresh_batch.push_back") !=
+          std::string::npos);
+    CHECK(count_occurrences(
+              failure_branch,
+              "job.pending_pre_quorum_refresh_batch.push_back") == 1);
+    CHECK(failure_branch.find("++job.total_send_attempts") ==
+          std::string::npos);
+    CHECK(failure_branch.find("++send_attempts") == std::string::npos);
+    CHECK(failure_branch.find("++send_dispatches") == std::string::npos);
+    CHECK(failure_branch.find("job.attempted_targets.push_back") ==
+          std::string::npos);
+    CHECK(failure_branch.find("dispatched = true") == std::string::npos);
     CHECK(retry_send.find(
-              "MsgPropose(DataStream(encoded)), peer", deferred) !=
+              "MsgPropose(DataStream(encoded)), peer", enqueue) !=
           std::string::npos);
     CHECK(retry_send.find("reconnect_path_dispatch") !=
           std::string::npos);
     CHECK(retry_send.find("live_connection_dispatch") !=
           std::string::npos);
-    CHECK(retry_send.find("pn.send_msg(") == std::string::npos);
     INFO("the pinned transport supports migrating buffered bytes from a "
          "terminated peer connection into a successful replacement");
     const auto buffered = transport.find(

@@ -4756,14 +4756,13 @@ namespace hotstuff
                     current_connection != nullptr &&
                     current_connection->is_terminated();
                 job.pending_pre_quorum_refresh_batch.push_back({member});
-                job.attempted_targets.push_back(member);
                 ++refresh_attempts;
                 // Kauri configures every peer with Salticidae's infinite
                 // retry policy at startup.  Preserve a healthy path and join
                 // an existing reconnect instead of restarting it.  The
-                // deferred PeerId send below uses the replacement if ready;
-                // otherwise finish_handshake migrates the terminated
-                // connection's buffered bytes into that replacement.
+                // PeerId send below uses the replacement if ready; otherwise
+                // finish_handshake migrates the terminated connection's
+                // buffered bytes into that replacement.
                 if (reconnect_request_required)
                     pn.conn_peer(peer);
                 const auto *refresh_outcome =
@@ -4909,27 +4908,44 @@ namespace hotstuff
                         job.total_attempt_budget);
                     continue;
                 }
+                const bool sent =
+                    is_adaptive_epoch_mode(epoch_protocol_mode)
+                        ? pn.send_msg(
+                              MsgPropose(DataStream(encoded)), peer)
+                        : pn.send_msg(MsgPropose(*job.proposal), peer);
                 ++send_attempts;
                 ++job.total_send_attempts;
-                const auto deferred_id =
-                    is_adaptive_epoch_mode(epoch_protocol_mode)
-                        ? pn.send_msg_deferred(
-                              MsgPropose(DataStream(encoded)), peer)
-                        : pn.send_msg_deferred(
-                              MsgPropose(*job.proposal), peer);
-                ++send_dispatches;
-                if (reconnect_path_observed)
-                    ++reconnect_path_dispatches;
-                dispatched = true;
+                bool retained = false;
+                if (sent)
+                {
+                    ++send_dispatches;
+                    job.attempted_targets.push_back(pending.target);
+                    if (reconnect_path_observed)
+                        ++reconnect_path_dispatches;
+                    dispatched = true;
+                }
+                else
+                {
+                    if (job.total_send_attempts < job.total_attempt_budget)
+                    {
+                        job.pending_pre_quorum_refresh_batch.push_back(
+                            pending);
+                        retained = true;
+                    }
+                }
                 HOTSTUFF_LOG_INFO(
                     "KAURI_PROPOSAL_BROADCAST "
                     "stage=pre_qc_retry_target_result outcome=%s "
                     "root=%u target=%u epoch=%u tree=%u block=%s "
-                    "stage=%u reconnect_path_observed=%u deferred_id=%d "
-                    "total=%zu budget=%zu",
-                    reconnect_path_observed
-                        ? "reconnect_path_dispatch"
-                        : "live_connection_dispatch",
+                    "stage=%u reconnect_path_observed=%u enqueued=%u "
+                    "retained=%u total=%zu budget=%zu",
+                    sent
+                        ? reconnect_path_observed
+                            ? "reconnect_path_dispatch"
+                            : "live_connection_dispatch"
+                        : retained
+                            ? "enqueue_failed_retained"
+                            : "enqueue_failed_budget_exhausted",
                     static_cast<unsigned>(get_id()),
                     static_cast<unsigned>(pending.target),
                     job.key.configuration.epoch_number,
@@ -4937,7 +4953,8 @@ namespace hotstuff
                     job.key.block_hash.to_hex().c_str(),
                     job.completed_stages,
                     static_cast<unsigned>(reconnect_path_observed),
-                    deferred_id,
+                    static_cast<unsigned>(sent),
+                    static_cast<unsigned>(retained),
                     job.total_send_attempts,
                     job.total_attempt_budget);
             }
