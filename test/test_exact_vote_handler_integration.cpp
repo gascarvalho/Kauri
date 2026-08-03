@@ -711,6 +711,7 @@ TEST_CASE("exact fallback stages repair and fast-returns root repair votes",
           std::string::npos);
     CHECK(proposal_send.find("send_attempts < maximum_attempts") !=
           std::string::npos);
+    CHECK(proposal_send.find("!quorum_observed") != std::string::npos);
     CHECK(proposal_send.find("targets[target_cursor++]") !=
           std::string::npos);
     const auto snapshot = proposal_send.find(
@@ -719,11 +720,19 @@ TEST_CASE("exact fallback stages repair and fast-returns root repair votes",
         "snapshot->verified_signers.count(member) != 0");
     const auto proposal_send_attempt = proposal_send.find(
         "pn.send_msg(");
+    const auto record_attempt = proposal_send.find(
+        "attempted_targets.push_back(member)");
+    const auto charge_attempt = proposal_send.find(
+        "++total_send_attempts");
     REQUIRE(snapshot != std::string::npos);
     REQUIRE(skip_verified != std::string::npos);
+    REQUIRE(record_attempt != std::string::npos);
+    REQUIRE(charge_attempt != std::string::npos);
     REQUIRE(proposal_send_attempt != std::string::npos);
     CHECK(snapshot < skip_verified);
     CHECK(skip_verified < proposal_send_attempt);
+    CHECK(record_attempt < proposal_send_attempt);
+    CHECK(charge_attempt < proposal_send_attempt);
     CHECK(proposal_send.find("skipped_verified") != std::string::npos);
     CHECK(proposal_schedule.find("stage_target_limit") !=
           std::string::npos);
@@ -822,6 +831,166 @@ TEST_CASE("exact fallback stages repair and fast-returns root repair votes",
               "exact_proposal_fallback_jobs.find(key)") !=
           std::string::npos);
     CHECK(fallback_shutdown.find("exact_root_repair_deliveries.clear()") !=
+          std::string::npos);
+}
+
+TEST_CASE("root quorum arms a bounded confirmation repair tail before closure",
+          "[fallback][proposal][confirmation-tail][race][bounded]")
+{
+    const auto source = read_source("src/hotstuff.cpp");
+    const auto finish = source_slice(
+        source,
+        "void HotStuffBase::try_finish_exact_context",
+        "void HotStuffBase::local_vote_authorized");
+    const auto arm = source_slice(
+        source,
+        "void HotStuffBase::arm_exact_proposal_repair_tail",
+        "void HotStuffBase::dispatch_exact_proposal_repair_tail");
+    const auto first_pass = source_slice(
+        source,
+        "void HotStuffBase::dispatch_exact_proposal_fallback",
+        "void HotStuffBase::arm_exact_proposal_repair_tail");
+
+    const auto arm_tail = finish.find(
+        "arm_exact_proposal_repair_tail(lease)");
+    const auto publish = finish.find("publish_exact_root_qc(");
+    const auto close = finish.find(
+        "ProposalContextEvent::root_qc_published");
+    REQUIRE(arm_tail != std::string::npos);
+    REQUIRE(publish != std::string::npos);
+    REQUIRE(close != std::string::npos);
+    INFO("the immutable tail must be captured before QC callbacks or terminal "
+         "compaction can purge the signer snapshot");
+    CHECK(arm_tail < publish);
+    CHECK(publish < close);
+
+    CHECK(arm.find("proposal_contexts->snapshot(job->key)") !=
+          std::string::npos);
+    CHECK(arm.find("snapshot->verified_signers.size() < job->global_quorum") !=
+          std::string::npos);
+    CHECK(arm.find("job->attempted_targets") != std::string::npos);
+    CHECK(arm.find("snapshot->verified_signers.count(member) == 0") !=
+          std::string::npos);
+    CHECK(arm.find("job->tail_targets.push_back(member)") !=
+          std::string::npos);
+    CHECK(arm.find("job->total_attempt_budget - job->total_send_attempts") !=
+          std::string::npos);
+    CHECK(arm.find("schedule_after(") != std::string::npos);
+
+    INFO("a synchronous quorum callback during a first-pass send must still "
+         "find the registered immutable job");
+    CHECK(first_pass.find(
+              "exact_proposal_fallback_jobs.erase(found)") ==
+          std::string::npos);
+    const auto send = first_pass.find(
+        "broadcast_exact_proposal_fallback(");
+    const auto raced_tail = first_pass.find("job->quorum_observed", send);
+    REQUIRE(send != std::string::npos);
+    REQUIRE(raced_tail != std::string::npos);
+    CHECK(send < raced_tail);
+    CHECK(first_pass.find("dispatch_exact_proposal_repair_tail(") ==
+          std::string::npos);
+    const auto observed = arm.find("job->quorum_observed = true");
+    const auto candidates = arm.find("job->tail_targets.push_back(member)");
+    REQUIRE(observed != std::string::npos);
+    REQUIRE(candidates != std::string::npos);
+    CHECK(observed < candidates);
+}
+
+TEST_CASE("confirmation repair tail shares the original send budget and cancels",
+          "[fallback][proposal][confirmation-tail][budget][generation]")
+{
+    const auto source = read_source("src/hotstuff.cpp");
+    const auto job = source_slice(
+        source,
+        "struct HotStuffBase::ExactProposalFallbackJob",
+        "class HotStuffBase::ExactContributionEffects");
+    const auto tail_dispatch = source_slice(
+        source,
+        "void HotStuffBase::dispatch_exact_proposal_repair_tail",
+        "bool HotStuffBase::broadcast_exact_proposal_fallback");
+    const auto tail_send = source_slice(
+        source,
+        "bool HotStuffBase::broadcast_exact_proposal_repair_tail",
+        "void HotStuffBase::discard_exact_fallbacks");
+    const auto cleanup = source_slice(
+        source,
+        "void HotStuffBase::discard_exact_fallbacks",
+        "void HotStuffBase::cancel_all_exact_fallbacks");
+    const auto shutdown = source_slice(
+        source,
+        "void HotStuffBase::cancel_all_exact_fallbacks",
+        "quorum_cert_bt HotStuffBase::verified_aggregation_candidate");
+
+    CHECK(job.find("const std::size_t total_attempt_budget") !=
+          std::string::npos);
+    CHECK(job.find("std::size_t total_send_attempts{0}") !=
+          std::string::npos);
+    CHECK(job.find("std::vector<ReplicaID> attempted_targets") !=
+          std::string::npos);
+    CHECK(job.find("std::vector<ReplicaID> tail_targets") !=
+          std::string::npos);
+    CHECK(job.find("std::size_t tail_target_cursor{0}") !=
+          std::string::npos);
+    CHECK(job.find("bool quorum_observed{false}") !=
+          std::string::npos);
+
+    const auto active = tail_dispatch.find(
+        "*active != job->key.configuration");
+    const auto generation = tail_dispatch.find(
+        "*generation != job->epoch_generation");
+    const auto send = tail_dispatch.find(
+        "broadcast_exact_proposal_repair_tail(");
+    REQUIRE(active != std::string::npos);
+    REQUIRE(generation != std::string::npos);
+    REQUIRE(send != std::string::npos);
+    CHECK(active < send);
+    CHECK(generation < send);
+    CHECK(tail_dispatch.find("found->second != job") !=
+          std::string::npos);
+    CHECK(tail_dispatch.find("admits_new_proposals()") !=
+          std::string::npos);
+    CHECK(tail_dispatch.find("acquire_open_context(") ==
+          std::string::npos);
+    CHECK(tail_dispatch.find("frozen_global_quorum(") ==
+          std::string::npos);
+    CHECK(tail_dispatch.find(
+              "job->tail_target_cursor == cursor_before") !=
+          std::string::npos);
+    CHECK(tail_dispatch.find(
+              "job->total_send_attempts == attempts_before") !=
+          std::string::npos);
+
+    CHECK(tail_send.find(
+              "job.tail_target_cursor < job.tail_targets.size()") !=
+          std::string::npos);
+    CHECK(tail_send.find(
+              "job.total_send_attempts < job.total_attempt_budget") !=
+          std::string::npos);
+    CHECK(tail_send.find(
+              "send_attempts < job.stage_target_limit") !=
+          std::string::npos);
+    CHECK(tail_send.find(
+              "job.tail_targets[job.tail_target_cursor++]") !=
+          std::string::npos);
+    CHECK(tail_send.find("++job.total_send_attempts") !=
+          std::string::npos);
+    const auto tail_charge = tail_send.find(
+        "++job.total_send_attempts");
+    const auto tail_enqueue = tail_send.find("pn.send_msg(");
+    REQUIRE(tail_charge != std::string::npos);
+    REQUIRE(tail_enqueue != std::string::npos);
+    CHECK(tail_charge < tail_enqueue);
+    CHECK(tail_send.find("try_finish_exact_context") ==
+          std::string::npos);
+    CHECK(tail_send.find("publish_exact_root_qc") ==
+          std::string::npos);
+
+    INFO("ordinary terminal cleanup preserves only an already-armed tail; "
+         "shutdown still cancels every outstanding job");
+    CHECK(cleanup.find("!proposal->second->tail_armed") !=
+          std::string::npos);
+    CHECK(shutdown.find("exact_proposal_fallback_jobs.clear()") !=
           std::string::npos);
 }
 

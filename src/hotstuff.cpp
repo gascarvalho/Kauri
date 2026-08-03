@@ -768,12 +768,16 @@ namespace hotstuff
             const ProposalContextLease &lease,
             std::uint64_t exact_epoch_generation,
             const Proposal &exact_proposal,
+            std::size_t exact_global_quorum,
+            std::size_t exact_total_attempt_budget,
             std::size_t exact_stage_target_limit,
             AggregationTimeoutPolicy::Duration exact_stage_interval)
             : key(lease.key()),
               context_generation(lease.generation()),
               epoch_generation(exact_epoch_generation),
               proposal(std::make_shared<const Proposal>(exact_proposal)),
+              global_quorum(exact_global_quorum),
+              total_attempt_budget(exact_total_attempt_budget),
               stage_target_limit(exact_stage_target_limit),
               stage_interval(exact_stage_interval)
         {}
@@ -782,10 +786,20 @@ namespace hotstuff
         const std::uint64_t context_generation;
         const std::uint64_t epoch_generation;
         const std::shared_ptr<const Proposal> proposal;
+        const std::size_t global_quorum;
+        const std::size_t total_attempt_budget;
         const std::size_t stage_target_limit;
         const AggregationTimeoutPolicy::Duration stage_interval;
         std::size_t target_cursor{0};
+        std::size_t total_send_attempts{0};
+        std::vector<ReplicaID> attempted_targets;
+        std::set<ReplicaID> confirmed_signers;
+        std::vector<ReplicaID> tail_targets;
+        std::size_t tail_target_cursor{0};
         std::uint32_t completed_stages{0};
+        bool quorum_observed{false};
+        bool tail_armed{false};
+        bool dispatching{false};
         AggregationScheduler::Cancellation cancellation;
     };
 
@@ -4010,6 +4024,10 @@ namespace hotstuff
                 lease.tree().assigned_subtree.begin(),
                 lease.tree().assigned_subtree.end(),
                 [this](ReplicaID member) { return member != get_id(); }));
+            const auto global_quorum =
+                proposal_contexts->frozen_global_quorum(lease);
+            if (!global_quorum.has_value() || target_count == 0)
+                return;
             const auto stage_target_limit = std::max<std::size_t>(
                 1, lease.tree().fanout);
             const auto stage_count = std::max<std::size_t>(
@@ -4030,6 +4048,8 @@ namespace hotstuff
                 lease,
                 *generation,
                 proposal,
+                *global_quorum,
+                target_count,
                 stage_target_limit,
                 stage_interval);
             exact_proposal_fallback_jobs.emplace(lease.key(), job);
@@ -4098,8 +4118,19 @@ namespace hotstuff
             found->second->context_generation != context_generation)
             return;
         auto job = found->second;
+        if (job->tail_armed || job->quorum_observed)
+            return;
+        if (job->dispatching)
+            return;
+        job->dispatching = true;
         job->cancellation = {};
-        exact_proposal_fallback_jobs.erase(found);
+
+        const auto erase_job = [this, &key, &job]() {
+            const auto current = exact_proposal_fallback_jobs.find(key);
+            if (current != exact_proposal_fallback_jobs.end() &&
+                current->second == job)
+                exact_proposal_fallback_jobs.erase(current);
+        };
 
         const auto lease = proposal_contexts->acquire_open_context(key);
         const auto active = proposal_contexts->active_configuration();
@@ -4116,12 +4147,24 @@ namespace hotstuff
             adaptive_epoch_runtime == nullptr ||
             !adaptive_epoch_runtime->activation.admits_new_proposals() ||
             job->proposal == nullptr)
+        {
+            erase_job();
             return;
+        }
         const auto before = proposal_contexts->snapshot(key);
         const auto quorum = proposal_contexts->frozen_global_quorum(*lease);
         if (!before.has_value() || !quorum.has_value() ||
-            before->verified_signers.size() >= *quorum)
+            *quorum != job->global_quorum)
+        {
+            erase_job();
             return;
+        }
+        if (before->verified_signers.size() >= *quorum)
+        {
+            arm_exact_proposal_repair_tail(*lease);
+            job->dispatching = false;
+            return;
+        }
 
         ++job->completed_stages;
         static_cast<void>(broadcast_exact_proposal_fallback(
@@ -4129,28 +4172,48 @@ namespace hotstuff
             job->epoch_generation,
             *job->proposal,
             job->target_cursor,
+            job->total_send_attempts,
+            job->attempted_targets,
+            job->quorum_observed,
+            job->total_attempt_budget,
             job->stage_target_limit,
             job->completed_stages));
-        if (job->target_cursor >= lease->tree().assigned_subtree.size())
+        if (job->quorum_observed)
+        {
+            job->dispatching = false;
             return;
+        }
+        if (job->target_cursor >= lease->tree().assigned_subtree.size() ||
+            job->total_send_attempts >= job->total_attempt_budget)
+        {
+            erase_job();
+            return;
+        }
 
         const auto next_lease =
             proposal_contexts->acquire_open_context(key);
         if (!next_lease.has_value() ||
             next_lease->generation() != context_generation)
+        {
+            erase_job();
             return;
+        }
         const auto after = proposal_contexts->snapshot(key);
-        if (!after.has_value() ||
-            after->verified_signers.size() >= *quorum)
+        if (!after.has_value())
+        {
+            erase_job();
             return;
+        }
+        if (after->verified_signers.size() >= *quorum)
+        {
+            arm_exact_proposal_repair_tail(*next_lease);
+            job->dispatching = false;
+            return;
+        }
 
         bool rearm_failed = false;
         try
         {
-            const auto inserted =
-                exact_proposal_fallback_jobs.emplace(key, job);
-            if (!inserted.second)
-                return;
             auto cancellation = aggregation_scheduler->schedule_after(
                 job->stage_interval,
                 [access = exact_runtime_access,
@@ -4163,13 +4226,11 @@ namespace hotstuff
                         key, context_generation);
                 });
             if (!cancellation)
-            {
-                exact_proposal_fallback_jobs.erase(key);
                 rearm_failed = true;
-            }
             else
             {
                 job->cancellation = std::move(cancellation);
+                job->dispatching = false;
                 HOTSTUFF_LOG_INFO(
                     "KAURI_PROPOSAL_BROADCAST stage=fallback_stage "
                     "outcome=armed root=%u epoch=%u tree=%u block=%s "
@@ -4190,7 +4251,6 @@ namespace hotstuff
         }
         catch (...)
         {
-            exact_proposal_fallback_jobs.erase(key);
             rearm_failed = true;
         }
 
@@ -4204,15 +4264,201 @@ namespace hotstuff
             proposal_contexts->acquire_open_context(key);
         if (!drain_lease.has_value() ||
             drain_lease->generation() != context_generation)
+        {
+            erase_job();
             return;
+        }
         ++job->completed_stages;
         static_cast<void>(broadcast_exact_proposal_fallback(
             *drain_lease,
             job->epoch_generation,
             *job->proposal,
             job->target_cursor,
+            job->total_send_attempts,
+            job->attempted_targets,
+            job->quorum_observed,
+            job->total_attempt_budget,
             std::numeric_limits<std::size_t>::max(),
             job->completed_stages));
+        if (job->quorum_observed)
+            job->dispatching = false;
+        else
+            erase_job();
+    }
+
+    void HotStuffBase::arm_exact_proposal_repair_tail(
+        const ProposalContextLease &lease) noexcept
+    {
+        try
+        {
+            const auto found =
+                exact_proposal_fallback_jobs.find(lease.key());
+            if (found == exact_proposal_fallback_jobs.end() ||
+                found->second->context_generation != lease.generation())
+                return;
+            auto job = found->second;
+            if (job->tail_armed || job->proposal == nullptr)
+                return;
+            const auto snapshot = proposal_contexts->snapshot(job->key);
+            if (!snapshot.has_value() ||
+                snapshot->verified_signers.size() < job->global_quorum)
+                return;
+
+            // This bit stops an in-flight first-pass send loop even when
+            // every attempted target is already confirmed and no tail is
+            // necessary.
+            job->quorum_observed = true;
+            job->confirmed_signers = snapshot->verified_signers;
+            const auto remaining_budget =
+                job->total_send_attempts < job->total_attempt_budget
+                    ? job->total_attempt_budget - job->total_send_attempts
+                    : 0;
+            for (const auto member : job->attempted_targets)
+                if (snapshot->verified_signers.count(member) == 0)
+                    job->tail_targets.push_back(member);
+
+            auto previous = std::move(job->cancellation);
+            job->cancellation = {};
+            if (previous)
+                try
+                {
+                    previous();
+                }
+                catch (...)
+                {}
+
+            if (remaining_budget == 0 || job->tail_targets.empty() ||
+                aggregation_scheduler == nullptr)
+            {
+                exact_proposal_fallback_jobs.erase(found);
+                return;
+            }
+
+            job->tail_armed = true;
+            try
+            {
+                auto cancellation = aggregation_scheduler->schedule_after(
+                    job->stage_interval,
+                    [access = exact_runtime_access,
+                     job]() {
+                        auto runtime = access->acquire();
+                        if (!runtime.has_value())
+                            return;
+                        runtime->owner()
+                            .dispatch_exact_proposal_repair_tail(job);
+                    });
+                if (!cancellation)
+                {
+                    exact_proposal_fallback_jobs.erase(found);
+                    return;
+                }
+                job->cancellation = std::move(cancellation);
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST stage=repair_tail "
+                    "outcome=armed root=%u epoch=%u tree=%u block=%s "
+                    "confirmed=%zu candidates=%zu attempts=%zu budget=%zu "
+                    "delay_ticks=%lld",
+                    static_cast<unsigned>(get_id()),
+                    job->key.configuration.epoch_number,
+                    job->key.configuration.tree_id,
+                    job->key.block_hash.to_hex().c_str(),
+                    job->confirmed_signers.size(),
+                    job->tail_targets.size(),
+                    job->total_send_attempts,
+                    job->total_attempt_budget,
+                    static_cast<long long>(job->stage_interval.count()));
+            }
+            catch (...)
+            {
+                exact_proposal_fallback_jobs.erase(found);
+            }
+        }
+        catch (...)
+        {
+            // Repair is best-effort dissemination. Resource or scheduler
+            // failure must never escape into the verified QC path.
+            const auto failed =
+                exact_proposal_fallback_jobs.find(lease.key());
+            if (failed == exact_proposal_fallback_jobs.end())
+                return;
+            auto cancellation = std::move(failed->second->cancellation);
+            exact_proposal_fallback_jobs.erase(failed);
+            if (cancellation)
+                try
+                {
+                    cancellation();
+                }
+                catch (...)
+                {}
+        }
+    }
+
+    void HotStuffBase::dispatch_exact_proposal_repair_tail(
+        const std::shared_ptr<ExactProposalFallbackJob> &job)
+    {
+        if (job == nullptr)
+            return;
+        const auto found = exact_proposal_fallback_jobs.find(job->key);
+        if (found == exact_proposal_fallback_jobs.end() ||
+            found->second != job || !job->tail_armed || job->dispatching)
+            return;
+        job->dispatching = true;
+        job->cancellation = {};
+
+        const auto active = proposal_contexts->active_configuration();
+        const auto generation = find_exact_runtime_generation(
+            job->key.configuration);
+        if (!active.has_value() ||
+            *active != job->key.configuration ||
+            !generation.has_value() ||
+            *generation != job->epoch_generation ||
+            adaptive_epoch_runtime == nullptr ||
+            !adaptive_epoch_runtime->activation.admits_new_proposals() ||
+            aggregation_scheduler == nullptr ||
+            job->proposal == nullptr || job->proposal->key() != job->key ||
+            job->total_send_attempts >= job->total_attempt_budget)
+        {
+            exact_proposal_fallback_jobs.erase(found);
+            return;
+        }
+
+        ++job->completed_stages;
+        const auto cursor_before = job->tail_target_cursor;
+        const auto attempts_before = job->total_send_attempts;
+        static_cast<void>(broadcast_exact_proposal_repair_tail(*job));
+        job->dispatching = false;
+        if ((job->tail_target_cursor == cursor_before &&
+             job->total_send_attempts == attempts_before) ||
+            job->tail_target_cursor >= job->tail_targets.size() ||
+            job->total_send_attempts >= job->total_attempt_budget)
+        {
+            exact_proposal_fallback_jobs.erase(found);
+            return;
+        }
+
+        try
+        {
+            auto cancellation = aggregation_scheduler->schedule_after(
+                job->stage_interval,
+                [access = exact_runtime_access,
+                 job]() {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    runtime->owner().dispatch_exact_proposal_repair_tail(
+                        job);
+                });
+            if (!cancellation)
+            {
+                exact_proposal_fallback_jobs.erase(found);
+                return;
+            }
+            job->cancellation = std::move(cancellation);
+        }
+        catch (...)
+        {
+            exact_proposal_fallback_jobs.erase(found);
+        }
     }
 
     bool HotStuffBase::broadcast_exact_proposal_fallback(
@@ -4220,6 +4466,10 @@ namespace hotstuff
         std::uint64_t epoch_generation,
         const Proposal &proposal,
         std::size_t &target_cursor,
+        std::size_t &total_send_attempts,
+        std::vector<ReplicaID> &attempted_targets,
+        const bool &quorum_observed,
+        std::size_t total_attempt_budget,
         std::size_t maximum_attempts,
         std::uint32_t repair_stage)
     {
@@ -4257,7 +4507,9 @@ namespace hotstuff
                 return false;
             const auto &targets = lease.tree().assigned_subtree;
             while (target_cursor < targets.size() &&
-                   send_attempts < maximum_attempts)
+                   !quorum_observed &&
+                   send_attempts < maximum_attempts &&
+                   total_send_attempts < total_attempt_budget)
             {
                 const auto member = targets[target_cursor++];
                 if (member == get_id())
@@ -4273,7 +4525,9 @@ namespace hotstuff
                 const auto peer = config.get_peer_id(member);
                 if (peer.is_null())
                     continue;
+                attempted_targets.push_back(member);
                 ++send_attempts;
+                ++total_send_attempts;
                 const bool sent = is_adaptive_epoch_mode(epoch_protocol_mode)
                     ? pn.send_msg(
                           MsgPropose(DataStream(encoded)), peer)
@@ -4297,7 +4551,8 @@ namespace hotstuff
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=fallback_dispatch_summary outcome=complete "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "successes=%zu skipped_verified=%zu cursor=%zu enqueued=%u",
+                "successes=%zu skipped_verified=%zu cursor=%zu total=%zu "
+                "budget=%zu enqueued=%u",
                 static_cast<unsigned>(get_id()),
                 lease.key().configuration.epoch_number,
                 lease.key().configuration.tree_id,
@@ -4307,6 +4562,8 @@ namespace hotstuff
                 send_successes,
                 skipped_verified,
                 target_cursor,
+                total_send_attempts,
+                total_attempt_budget,
                 static_cast<unsigned>(enqueued));
             return enqueued;
         }
@@ -4316,7 +4573,7 @@ namespace hotstuff
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=fallback_dispatch_summary outcome=exception "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "successes=%zu cursor=%zu enqueued=0",
+                "successes=%zu cursor=%zu total=%zu budget=%zu enqueued=0",
                 static_cast<unsigned>(get_id()),
                 lease.key().configuration.epoch_number,
                 lease.key().configuration.tree_id,
@@ -4324,7 +4581,116 @@ namespace hotstuff
                 repair_stage,
                 send_attempts,
                 send_successes,
-                target_cursor);
+                target_cursor,
+                total_send_attempts,
+                total_attempt_budget);
+            return false;
+        }
+    }
+
+    bool HotStuffBase::broadcast_exact_proposal_repair_tail(
+        ExactProposalFallbackJob &job)
+    {
+        if (job.proposal == nullptr || job.proposal->key() != job.key ||
+            !job.tail_armed)
+            return false;
+        std::size_t send_attempts = 0;
+        std::size_t send_successes = 0;
+        try
+        {
+            bytearray_t encoded;
+            if (is_adaptive_epoch_mode(epoch_protocol_mode))
+            {
+                const MsgPropose native(*job.proposal);
+                encoded = adaptive_epoch_consensus_message(
+                    job.key.configuration,
+                    job.epoch_generation,
+                    EpochConsensusWireKind::proposal,
+                    job.key,
+                    get_id(),
+                    get_id(),
+                    static_cast<bytearray_t>(native.serialized),
+                    epoch_wire_limits,
+                    epoch_protocol_mode);
+                if (encoded.empty())
+                    return false;
+            }
+
+            bool enqueued = false;
+            std::size_t skipped_confirmed = 0;
+            while (job.tail_target_cursor < job.tail_targets.size() &&
+                   send_attempts < job.stage_target_limit &&
+                   job.total_send_attempts < job.total_attempt_budget)
+            {
+                const auto member =
+                    job.tail_targets[job.tail_target_cursor++];
+                if (member == get_id() ||
+                    job.confirmed_signers.count(member) != 0)
+                {
+                    ++skipped_confirmed;
+                    continue;
+                }
+                const auto peer = config.get_peer_id(member);
+                if (peer.is_null())
+                    continue;
+                ++send_attempts;
+                ++job.total_send_attempts;
+                const bool sent = is_adaptive_epoch_mode(epoch_protocol_mode)
+                    ? pn.send_msg(
+                          MsgPropose(DataStream(encoded)), peer)
+                    : pn.send_msg(MsgPropose(*job.proposal), peer);
+                if (sent)
+                    ++send_successes;
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_PROPOSAL_BROADCAST "
+                    "stage=repair_tail_target_result root=%u target=%u "
+                    "epoch=%u tree=%u block=%s stage=%u enqueued=%u",
+                    static_cast<unsigned>(get_id()),
+                    static_cast<unsigned>(member),
+                    job.key.configuration.epoch_number,
+                    job.key.configuration.tree_id,
+                    job.key.block_hash.to_hex().c_str(),
+                    job.completed_stages,
+                    static_cast<unsigned>(sent));
+                enqueued = sent || enqueued;
+            }
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=repair_tail_dispatch_summary outcome=complete "
+                "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
+                "successes=%zu skipped_confirmed=%zu cursor=%zu total=%zu "
+                "budget=%zu enqueued=%u",
+                static_cast<unsigned>(get_id()),
+                job.key.configuration.epoch_number,
+                job.key.configuration.tree_id,
+                job.key.block_hash.to_hex().c_str(),
+                job.completed_stages,
+                send_attempts,
+                send_successes,
+                skipped_confirmed,
+                job.tail_target_cursor,
+                job.total_send_attempts,
+                job.total_attempt_budget,
+                static_cast<unsigned>(enqueued));
+            return enqueued;
+        }
+        catch (...)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=repair_tail_dispatch_summary outcome=exception "
+                "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
+                "successes=%zu cursor=%zu total=%zu budget=%zu enqueued=0",
+                static_cast<unsigned>(get_id()),
+                job.key.configuration.epoch_number,
+                job.key.configuration.tree_id,
+                job.key.block_hash.to_hex().c_str(),
+                job.completed_stages,
+                send_attempts,
+                send_successes,
+                job.tail_target_cursor,
+                job.total_send_attempts,
+                job.total_attempt_budget);
             return false;
         }
     }
@@ -4344,7 +4710,11 @@ namespace hotstuff
             exact_vote_fallback_jobs.erase(vote);
         }
         const auto proposal = exact_proposal_fallback_jobs.find(key);
-        if (proposal != exact_proposal_fallback_jobs.end())
+        // Only a verified root quorum can arm this tail. Preserve that
+        // bounded dissemination job across terminal context/commit cleanup;
+        // generation guards and shutdown still cancel it.
+        if (proposal != exact_proposal_fallback_jobs.end() &&
+            !proposal->second->tail_armed)
         {
             if (proposal->second->cancellation)
                 cancellations.push_back(
@@ -5003,6 +5373,10 @@ namespace hotstuff
                 pmaker->record_verified_progress(
                     lease.key().configuration,
                     LeaderProgressEvent::quorum_certificate);
+            // Capture the verified signer set while the exact context is
+            // still open. QC publication may synchronously commit or compact
+            // it; the asynchronous tail owns only immutable proposal data.
+            arm_exact_proposal_repair_tail(lease);
             if (!publish_exact_root_qc(
                     lease, std::move(final_qc)))
                 return;

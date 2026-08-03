@@ -1490,13 +1490,23 @@ namespace hotstuff
         void dispatch_exact_proposal_fallback(
             const ProposalKey &key,
             std::uint64_t context_generation);
+        void arm_exact_proposal_repair_tail(
+            const ProposalContextLease &lease) noexcept;
+        void dispatch_exact_proposal_repair_tail(
+            const std::shared_ptr<ExactProposalFallbackJob> &job);
         bool broadcast_exact_proposal_fallback(
             const ProposalContextLease &lease,
             std::uint64_t epoch_generation,
             const Proposal &proposal,
             std::size_t &target_cursor,
+            std::size_t &total_send_attempts,
+            std::vector<ReplicaID> &attempted_targets,
+            const bool &quorum_observed,
+            std::size_t total_attempt_budget,
             std::size_t maximum_attempts,
             std::uint32_t repair_stage);
+        bool broadcast_exact_proposal_repair_tail(
+            ExactProposalFallbackJob &job);
         void discard_exact_fallbacks(
             const ProposalKey &key,
             bool preserve_scheduled_vote_fallback = false);
