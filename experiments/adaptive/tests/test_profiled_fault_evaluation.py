@@ -765,6 +765,47 @@ def test_connection_refresh_diagnostic_changes_only_identity_metadata() -> None:
     )
 
 
+def test_connection_refresh_capacity_diagnostic_changes_only_identity_metadata(
+) -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    control_path = (
+        profiles / "n31-f5-internal1-connection-refresh-diagnostic-v10.json"
+    )
+    diagnostic_path = (
+        profiles
+        / "n31-f5-internal1-connection-refresh-capacity-diagnostic-v11.json"
+    )
+    control_document = json.loads(control_path.read_text(encoding="utf-8"))
+    diagnostic_document = json.loads(
+        diagnostic_path.read_text(encoding="utf-8")
+    )
+    control_fault = control_document.pop("fault")
+    diagnostic_fault = diagnostic_document.pop("fault")
+    control_document.pop("profile_id")
+    diagnostic_document.pop("profile_id")
+    control_fault.pop("fault_id")
+    diagnostic_fault.pop("fault_id")
+
+    assert diagnostic_document == control_document
+    assert diagnostic_fault == control_fault
+
+    diagnostic = api.load_frozen_profile(diagnostic_path)
+    runtime.require_shipped_profile(diagnostic)
+    assert diagnostic.profile_id == (
+        "n31-f5-q21-internal1-connection-refresh-capacity-diagnostic-v11"
+    )
+    assert diagnostic.fault.fault_id == (
+        "single-internal-replica1-connection-refresh-capacity-diagnostic"
+    )
+    assert diagnostic.attempt_count == 1
+    assert diagnostic.retry_failed_attempts is False
+    assert diagnostic.profile_sha256 == (
+        "36c4bdc9740a0bf92cb059f3e3068335102320d0a7db7f994ebbea6efb745b6e"
+    )
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:
