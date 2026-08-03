@@ -767,8 +767,6 @@ namespace hotstuff
         struct PendingPreQuorumRefresh final
         {
             ReplicaID target;
-            Net::conn_t old_connection;
-            AggregationScheduler::Duration observation_deadline;
         };
 
         ExactProposalFallbackJob(
@@ -778,9 +776,7 @@ namespace hotstuff
             std::size_t exact_global_quorum,
             std::size_t exact_total_attempt_budget,
             std::size_t exact_stage_target_limit,
-            AggregationTimeoutPolicy::Duration exact_stage_interval,
-            AggregationTimeoutPolicy::Duration
-                exact_refresh_observation_window)
+            AggregationTimeoutPolicy::Duration exact_stage_interval)
             : key(lease.key()),
               context_generation(lease.generation()),
               epoch_generation(exact_epoch_generation),
@@ -788,8 +784,7 @@ namespace hotstuff
               global_quorum(exact_global_quorum),
               total_attempt_budget(exact_total_attempt_budget),
               stage_target_limit(exact_stage_target_limit),
-              stage_interval(exact_stage_interval),
-              refresh_observation_window(exact_refresh_observation_window)
+              stage_interval(exact_stage_interval)
         {}
 
         const ProposalKey key;
@@ -800,8 +795,6 @@ namespace hotstuff
         const std::size_t total_attempt_budget;
         const std::size_t stage_target_limit;
         const AggregationTimeoutPolicy::Duration stage_interval;
-        const AggregationTimeoutPolicy::Duration
-            refresh_observation_window;
         std::size_t target_cursor{0};
         std::size_t total_send_attempts{0};
         std::vector<ReplicaID> attempted_targets;
@@ -4068,8 +4061,7 @@ namespace hotstuff
                 *global_quorum,
                 target_count,
                 stage_target_limit,
-                stage_interval,
-                exact_fallback_recovery_horizon(delay));
+                stage_interval);
             exact_proposal_fallback_jobs.emplace(lease.key(), job);
             auto cancellation = aggregation_scheduler->schedule_after(
                 delay,
@@ -4248,6 +4240,9 @@ namespace hotstuff
             job->stage_target_limit, remaining_budget);
         static_cast<void>(reserve_exact_proposal_pre_quorum_refresh(
             *lease, *job, maximum_attempts));
+        if (!job->pending_pre_quorum_refresh_batch.empty())
+            static_cast<void>(
+                broadcast_exact_proposal_pre_quorum_retry(*lease, *job));
 
         const auto next_lease =
             proposal_contexts->acquire_open_context(key);
@@ -4341,8 +4336,8 @@ namespace hotstuff
             rearm_failed = true;
         }
 
-        // A scheduler failure gets one bounded chance to use replacements that
-        // are already live. It never falls back to a blind send.
+        // A scheduler failure gets one bounded chance to dispatch work that
+        // was already reserved. It never falls back to a blind send.
         if (!rearm_failed)
             return;
         const auto drain_lease =
@@ -4705,37 +4700,45 @@ namespace hotstuff
                 const auto peer = config.get_peer_id(member);
                 if (peer.is_null())
                     continue;
-                const auto old_connection = pn.get_peer_conn(peer);
-                const auto now = aggregation_scheduler->monotonic_now();
-                const auto maximum_deadline =
-                    AggregationScheduler::Duration::max();
-                const auto observation_deadline =
-                    now > maximum_deadline -
-                              job.refresh_observation_window
-                        ? maximum_deadline
-                        : now + job.refresh_observation_window;
-                job.pending_pre_quorum_refresh_batch.push_back(
-                    {member, old_connection, observation_deadline});
+                const auto current_connection = pn.get_peer_conn(peer);
+                const bool reconnect_request_required =
+                    current_connection == nullptr;
+                const bool reconnect_in_progress =
+                    current_connection != nullptr &&
+                    current_connection->is_terminated();
+                job.pending_pre_quorum_refresh_batch.push_back({member});
                 job.attempted_targets.push_back(member);
                 ++refresh_attempts;
-                const bool old_terminated =
-                    old_connection != nullptr &&
-                    old_connection->is_terminated();
-                if (old_connection == nullptr || !old_terminated)
+                // Kauri configures every peer with Salticidae's infinite
+                // retry policy at startup.  Preserve a healthy path and join
+                // an existing reconnect instead of restarting it.  The
+                // deferred PeerId send below uses the replacement if ready;
+                // otherwise finish_handshake migrates the terminated
+                // connection's buffered bytes into that replacement.
+                if (reconnect_request_required)
                     pn.conn_peer(peer);
+                const auto *refresh_outcome =
+                    reconnect_request_required
+                        ? "requested"
+                        : reconnect_in_progress
+                            ? "joined"
+                            : "live_preserved";
                 HOTSTUFF_LOG_INFO(
                     "KAURI_PROPOSAL_BROADCAST "
                     "stage=pre_qc_refresh_target_result root=%u target=%u "
                     "epoch=%u tree=%u block=%s stage=%u refresh=%s "
-                    "old_terminated=%u reserved=%zu total=%zu budget=%zu",
+                    "reconnect_request_required=%u "
+                    "reconnect_in_progress=%u reserved=%zu total=%zu "
+                    "budget=%zu",
                     static_cast<unsigned>(get_id()),
                     static_cast<unsigned>(member),
                     job.key.configuration.epoch_number,
                     job.key.configuration.tree_id,
                     job.key.block_hash.to_hex().c_str(),
                     job.completed_stages,
-                    old_terminated ? "joined" : "requested",
-                    static_cast<unsigned>(old_terminated),
+                    refresh_outcome,
+                    static_cast<unsigned>(reconnect_request_required),
+                    static_cast<unsigned>(reconnect_in_progress),
                     refresh_attempts,
                     job.total_send_attempts,
                     job.total_attempt_budget);
@@ -4792,7 +4795,7 @@ namespace hotstuff
             return false;
         std::size_t send_attempts = 0;
         std::size_t send_dispatches = 0;
-        std::size_t timed_out_no_dispatch = 0;
+        std::size_t reconnect_path_dispatches = 0;
         try
         {
             bytearray_t encoded;
@@ -4818,7 +4821,6 @@ namespace hotstuff
 
             bool dispatched = false;
             std::size_t skipped_confirmed = 0;
-            std::size_t waiting_for_refresh = 0;
             const auto snapshot = proposal_contexts->snapshot(job.key);
             if (!snapshot.has_value() ||
                 snapshot->verified_signers.size() >= job.global_quorum)
@@ -4826,7 +4828,6 @@ namespace hotstuff
             auto pending_batch =
                 std::move(job.pending_pre_quorum_refresh_batch);
             job.pending_pre_quorum_refresh_batch.clear();
-            const auto now = aggregation_scheduler->monotonic_now();
             for (const auto &pending : pending_batch)
             {
                 if (snapshot->verified_signers.count(pending.target) != 0)
@@ -4838,78 +4839,9 @@ namespace hotstuff
                 if (peer.is_null())
                     continue;
                 const auto current_connection = pn.get_peer_conn(peer);
-                const bool old_terminated =
-                    pending.old_connection != nullptr &&
-                    pending.old_connection->is_terminated();
-                const bool connection_changed =
-                    current_connection != pending.old_connection;
-                const bool current_present =
-                    current_connection != nullptr;
-                const bool current_terminated =
-                    current_present && current_connection->is_terminated();
-                const bool replacement_ready =
-                    current_present &&
-                    current_connection != pending.old_connection &&
-                    !current_terminated;
-                const bool refresh_timed_out =
-                    now >= pending.observation_deadline;
-                if (!replacement_ready)
-                {
-                    if (refresh_timed_out)
-                    {
-                        ++timed_out_no_dispatch;
-                        HOTSTUFF_LOG_INFO(
-                            "KAURI_PROPOSAL_BROADCAST "
-                            "stage=pre_qc_retry_target_result outcome="
-                            "refresh_timeout_no_dispatch root=%u "
-                            "target=%u epoch=%u tree=%u block=%s "
-                            "stage=%u old_terminated=%u "
-                            "connection_changed=%u current_present=%u "
-                            "current_terminated=%u deadline_ticks=%lld "
-                            "total=%zu budget=%zu",
-                            static_cast<unsigned>(get_id()),
-                            static_cast<unsigned>(pending.target),
-                            job.key.configuration.epoch_number,
-                            job.key.configuration.tree_id,
-                            job.key.block_hash.to_hex().c_str(),
-                            job.completed_stages,
-                            static_cast<unsigned>(old_terminated),
-                            static_cast<unsigned>(connection_changed),
-                            static_cast<unsigned>(current_present),
-                            static_cast<unsigned>(current_terminated),
-                            static_cast<long long>(
-                                pending.observation_deadline.count()),
-                            job.total_send_attempts,
-                            job.total_attempt_budget);
-                        continue;
-                    }
-                    ++waiting_for_refresh;
-                    job.pending_pre_quorum_refresh_batch.push_back(
-                        pending);
-                    HOTSTUFF_LOG_INFO(
-                        "KAURI_PROPOSAL_BROADCAST "
-                        "stage=pre_qc_retry_target_result outcome="
-                        "refresh_wait root=%u target=%u epoch=%u "
-                        "tree=%u block=%s stage=%u old_terminated=%u "
-                        "connection_changed=%u current_present=%u "
-                        "current_terminated=%u deadline_ticks=%lld "
-                        "total=%zu budget=%zu",
-                        static_cast<unsigned>(get_id()),
-                        static_cast<unsigned>(pending.target),
-                        job.key.configuration.epoch_number,
-                        job.key.configuration.tree_id,
-                        job.key.block_hash.to_hex().c_str(),
-                        job.completed_stages,
-                        static_cast<unsigned>(old_terminated),
-                        static_cast<unsigned>(connection_changed),
-                        static_cast<unsigned>(current_present),
-                        static_cast<unsigned>(current_terminated),
-                        static_cast<long long>(
-                            pending.observation_deadline.count()),
-                        job.total_send_attempts,
-                        job.total_attempt_budget);
-                    continue;
-                }
+                const bool reconnect_path_observed =
+                    current_connection == nullptr ||
+                    current_connection->is_terminated();
                 if (job.total_send_attempts >= job.total_attempt_budget)
                 {
                     HOTSTUFF_LOG_INFO(
@@ -4937,22 +4869,25 @@ namespace hotstuff
                         : pn.send_msg_deferred(
                               MsgPropose(*job.proposal), peer);
                 ++send_dispatches;
+                if (reconnect_path_observed)
+                    ++reconnect_path_dispatches;
                 dispatched = true;
                 HOTSTUFF_LOG_INFO(
                     "KAURI_PROPOSAL_BROADCAST "
-                    "stage=pre_qc_retry_target_result "
-                    "outcome=live_replacement_dispatch "
+                    "stage=pre_qc_retry_target_result outcome=%s "
                     "root=%u target=%u epoch=%u tree=%u block=%s "
-                    "stage=%u old_terminated=%u connection_changed=%u "
-                    "deferred_id=%d total=%zu budget=%zu",
+                    "stage=%u reconnect_path_observed=%u deferred_id=%d "
+                    "total=%zu budget=%zu",
+                    reconnect_path_observed
+                        ? "reconnect_path_dispatch"
+                        : "live_connection_dispatch",
                     static_cast<unsigned>(get_id()),
                     static_cast<unsigned>(pending.target),
                     job.key.configuration.epoch_number,
                     job.key.configuration.tree_id,
                     job.key.block_hash.to_hex().c_str(),
                     job.completed_stages,
-                    static_cast<unsigned>(old_terminated),
-                    static_cast<unsigned>(connection_changed),
+                    static_cast<unsigned>(reconnect_path_observed),
                     deferred_id,
                     job.total_send_attempts,
                     job.total_attempt_budget);
@@ -4961,8 +4896,8 @@ namespace hotstuff
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=pre_qc_retry_dispatch_summary outcome=complete "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "dispatches=%zu timed_out_no_dispatch=%zu "
-                "skipped_confirmed=%zu waiting=%zu cursor=%zu total=%zu "
+                "dispatches=%zu reconnect_path_dispatches=%zu "
+                "skipped_confirmed=%zu cursor=%zu total=%zu "
                 "budget=%zu pending=%zu dispatched=%u",
                 static_cast<unsigned>(get_id()),
                 job.key.configuration.epoch_number,
@@ -4971,9 +4906,8 @@ namespace hotstuff
                 job.completed_stages,
                 send_attempts,
                 send_dispatches,
-                timed_out_no_dispatch,
+                reconnect_path_dispatches,
                 skipped_confirmed,
-                waiting_for_refresh,
                 job.pre_quorum_retry_cursor,
                 job.total_send_attempts,
                 job.total_attempt_budget,
@@ -4988,7 +4922,7 @@ namespace hotstuff
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=pre_qc_retry_dispatch_summary outcome=exception "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "dispatches=%zu timed_out_no_dispatch=%zu cursor=%zu "
+                "dispatches=%zu reconnect_path_dispatches=%zu cursor=%zu "
                 "total=%zu budget=%zu dispatched=%u",
                 static_cast<unsigned>(get_id()),
                 job.key.configuration.epoch_number,
@@ -4997,7 +4931,7 @@ namespace hotstuff
                 job.completed_stages,
                 send_attempts,
                 send_dispatches,
-                timed_out_no_dispatch,
+                reconnect_path_dispatches,
                 job.pre_quorum_retry_cursor,
                 job.total_send_attempts,
                 job.total_attempt_budget,

@@ -1006,11 +1006,13 @@ TEST_CASE("confirmation repair tail shares the original send budget and cancels"
           std::string::npos);
 }
 
-TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
-          "[fallback][proposal][pre-qc-repair][connection-refresh]"
+TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
+          "[fallback][proposal][pre-qc-repair][connection-repair]"
           "[budget][bounded]")
 {
     const auto source = read_source("src/hotstuff.cpp");
+    const auto transport = read_source(
+        "salticidae/include/salticidae/network.h");
     const auto job = source_slice(
         source,
         "struct HotStuffBase::ExactProposalFallbackJob",
@@ -1046,9 +1048,9 @@ TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
           std::string::npos);
     CHECK(job.find("struct PendingPreQuorumRefresh") !=
           std::string::npos);
-    CHECK(job.find("Net::conn_t old_connection") != std::string::npos);
-    CHECK(job.find("observation_deadline") != std::string::npos);
-    CHECK(job.find("refresh_observation_window") != std::string::npos);
+    CHECK(job.find("Net::conn_t old_connection") == std::string::npos);
+    CHECK(job.find("observation_deadline") == std::string::npos);
+    CHECK(job.find("refresh_observation_window") == std::string::npos);
     CHECK(job.find("pending_pre_quorum_refresh_batch") !=
           std::string::npos);
 
@@ -1073,11 +1075,9 @@ TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
     CHECK(dispatch.find("broadcast_exact_proposal_fallback(") ==
           std::string::npos);
 
-    INFO("repair remains at the root-aware deadline with an N-1 budget and a "
-         "bounded observation horizon");
+    INFO("repair remains at the root-aware deadline with the fixed N-1 "
+         "application-send budget");
     CHECK(arming.find("target_count") != std::string::npos);
-    CHECK(arming.find("exact_fallback_recovery_horizon(delay)") !=
-          std::string::npos);
     CHECK(arming.find("schedule_after(\n                delay") !=
           std::string::npos);
     CHECK(job.find("const std::size_t total_attempt_budget") !=
@@ -1099,8 +1099,8 @@ TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
     CHECK(tail_dispatch.find("admits_new_proposals()") !=
           std::string::npos);
 
-    INFO("each stage polls old reservations and then reserves up to fanout new "
-         "candidates even while an older peer is still pending");
+    INFO("each stage dispatches old reservations, reserves up to fanout new "
+         "candidates, and immediately dispatches those new reservations");
     const auto poll = dispatch.find(
         "broadcast_exact_proposal_pre_quorum_retry(");
     const auto refreshed = dispatch.find(
@@ -1111,11 +1111,14 @@ TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
         "job->stage_target_limit, remaining_budget", remaining);
     const auto reserve_call = dispatch.find(
         "reserve_exact_proposal_pre_quorum_refresh(", stage_cap);
+    const auto immediate_dispatch = dispatch.find(
+        "broadcast_exact_proposal_pre_quorum_retry(", reserve_call);
     REQUIRE(poll != std::string::npos);
     REQUIRE(refreshed != std::string::npos);
     REQUIRE(remaining != std::string::npos);
     REQUIRE(stage_cap != std::string::npos);
     REQUIRE(reserve_call != std::string::npos);
+    REQUIRE(immediate_dispatch != std::string::npos);
     const auto refresh_loop = refresh.find("std::size_t refresh_attempts");
     REQUIRE(refresh_loop != std::string::npos);
     CHECK(refresh.substr(0, refresh_loop).find(
@@ -1126,19 +1129,36 @@ TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
     CHECK(refresh.find("refresh_attempts < maximum_attempts") !=
           std::string::npos);
 
-    INFO("reservation is cursor-monotone, uses the default reconnect policy, "
-         "and feeds every reserved candidate into post-QC tail accounting");
+    INFO("reservation is cursor-monotone, preserves healthy connections, "
+         "joins existing reconnects, and retains tail accounting");
     const auto capture = refresh.find(
-        "const auto old_connection = pn.get_peer_conn(peer)");
+        "const auto current_connection = pn.get_peer_conn(peer)");
+    const auto request_required = refresh.find(
+        "const bool reconnect_request_required =", capture);
+    const auto reconnecting = refresh.find(
+        "const bool reconnect_in_progress =", request_required);
     const auto reserve = refresh.find(
-        "job.pending_pre_quorum_refresh_batch.push_back(", capture);
+        "job.pending_pre_quorum_refresh_batch.push_back(", reconnecting);
     const auto tail_candidate = refresh.find(
         "job.attempted_targets.push_back(member)", reserve);
-    const auto request = refresh.find("pn.conn_peer(peer)", tail_candidate);
+    const auto reconnect_guard = refresh.find(
+        "if (reconnect_request_required)", tail_candidate);
+    const auto request = refresh.find("pn.conn_peer(peer)", reconnect_guard);
     REQUIRE(capture != std::string::npos);
+    REQUIRE(request_required != std::string::npos);
+    REQUIRE(reconnecting != std::string::npos);
     REQUIRE(reserve != std::string::npos);
     REQUIRE(tail_candidate != std::string::npos);
+    REQUIRE(reconnect_guard != std::string::npos);
     REQUIRE(request != std::string::npos);
+    CHECK(reconnect_guard < request);
+    CHECK(refresh.find(
+              "current_connection == nullptr", request_required) !=
+          std::string::npos);
+    CHECK(refresh.find(
+              "current_connection->is_terminated()", reconnecting) !=
+          std::string::npos);
+    CHECK(refresh.find("!old_terminated") == std::string::npos);
     CHECK(refresh.find("pn.conn_peer(peer,") == std::string::npos);
     CHECK(refresh.find("++job.total_send_attempts") == std::string::npos);
     CHECK(tail_arm.find(
@@ -1147,15 +1167,14 @@ TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
     CHECK(tail_arm.find("job->tail_targets.push_back(member)") !=
           std::string::npos);
 
-    INFO("only a changed live connection dispatches, and the N-1 send budget "
-         "is charged immediately before the deferred application send");
-    CHECK(retry_send.find("const bool replacement_ready =") !=
+    INFO("live and reconnecting paths dispatch by PeerId immediately, while "
+         "the N-1 budget is charged directly before the deferred send");
+    CHECK(retry_send.find("const bool reconnect_path_observed =") !=
           std::string::npos);
-    CHECK(retry_send.find(
-              "current_connection != pending.old_connection") !=
-          std::string::npos);
-    CHECK(retry_send.find("!current_terminated") != std::string::npos);
-    CHECK(retry_send.find("refresh_timeout_no_dispatch") !=
+    CHECK(retry_send.find("connection_changed") == std::string::npos);
+    CHECK(retry_send.find("replacement_ready") == std::string::npos);
+    CHECK(retry_send.find("refresh_wait") == std::string::npos);
+    CHECK(retry_send.find("refresh_timeout_no_dispatch") ==
           std::string::npos);
     const auto budget_guard = retry_send.find(
         "job.total_send_attempts >= job.total_attempt_budget");
@@ -1166,11 +1185,25 @@ TEST_CASE("pre-QC repair refreshes every missing path before its bounded send",
     REQUIRE(charge != std::string::npos);
     REQUIRE(deferred != std::string::npos);
     CHECK(charge < deferred);
-    CHECK(retry_send.find("refresh_timeout_dispatch") ==
+    CHECK(retry_send.find(
+              "MsgPropose(DataStream(encoded)), peer", deferred) !=
+          std::string::npos);
+    CHECK(retry_send.find("reconnect_path_dispatch") !=
+          std::string::npos);
+    CHECK(retry_send.find("live_connection_dispatch") !=
           std::string::npos);
     CHECK(retry_send.find("pn.send_msg(") == std::string::npos);
+    INFO("the pinned transport supports migrating buffered bytes from a "
+         "terminated peer connection into a successful replacement");
+    const auto buffered = transport.find(
+        "old_conn->send_buffer.move_pop()");
+    const auto migrated = transport.find(
+        "new_conn->write(std::move(buff_seg))", buffered);
+    REQUIRE(buffered != std::string::npos);
+    REQUIRE(migrated != std::string::npos);
+    CHECK(buffered < migrated);
 
-    INFO("scheduler failure polls only already-reserved live replacements and "
+    INFO("scheduler failure dispatches only already-reserved bounded work and "
          "cannot reactivate the blind send path");
     const auto rearm_failure = dispatch.find("if (!rearm_failed)");
     const auto emergency_pending = dispatch.find(
