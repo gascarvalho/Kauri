@@ -1188,26 +1188,71 @@ TEST_CASE("pre-QC repair refreshes a bounded connection generation before send",
     CHECK(retry_send.find(
               "pending.old_connection->is_terminated()") !=
           std::string::npos);
+    const auto current_present = retry_send.find(
+        "const bool current_present =");
+    const auto current_terminated = retry_send.find(
+        "const bool current_terminated =", current_present);
+    const auto fresh_connection = retry_send.find(
+        "const bool replacement_ready =");
+    REQUIRE(current_present != std::string::npos);
+    REQUIRE(current_terminated != std::string::npos);
+    REQUIRE(fresh_connection != std::string::npos);
+    CHECK(retry_send.find(
+              "current_connection != nullptr", current_present) !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "current_present && current_connection->is_terminated()",
+              current_terminated) != std::string::npos);
+    CHECK(retry_send.find(
+              "current_connection != pending.old_connection",
+              fresh_connection) != std::string::npos);
+    CHECK(retry_send.find(
+              "current_present &&", fresh_connection) !=
+          std::string::npos);
+    CHECK(retry_send.find(
+              "!current_terminated",
+              fresh_connection) != std::string::npos);
+    CHECK(current_present < current_terminated);
+    CHECK(current_terminated < fresh_connection);
     const auto deadline = retry_send.find(
         "now >= pending.observation_deadline");
     const auto wait = retry_send.find(
-        "if (!connection_changed && !old_terminated &&");
+        "if (!replacement_ready)");
+    const auto timeout = retry_send.find(
+        "if (refresh_timed_out)", wait);
+    const auto timeout_log = retry_send.find(
+        "refresh_timeout_no_dispatch", timeout);
+    const auto timeout_continue = retry_send.find(
+        "continue;", timeout_log);
     const auto retain = retry_send.find(
-        "job.pending_pre_quorum_refresh_batch.push_back(", wait);
+        "job.pending_pre_quorum_refresh_batch.push_back(",
+        timeout_continue);
     const auto dispatch_deferred = retry_send.find(
         "pn.send_msg_deferred(", wait);
     REQUIRE(deadline != std::string::npos);
     REQUIRE(wait != std::string::npos);
+    REQUIRE(timeout != std::string::npos);
+    REQUIRE(timeout_log != std::string::npos);
+    REQUIRE(timeout_continue != std::string::npos);
     REQUIRE(retain != std::string::npos);
     REQUIRE(dispatch_deferred != std::string::npos);
     CHECK(deadline < wait);
-    CHECK(wait < retain);
+    CHECK(wait < timeout);
+    CHECK(timeout < timeout_log);
+    CHECK(timeout_log < timeout_continue);
+    CHECK(timeout_continue < retain);
     CHECK(retain < dispatch_deferred);
-    CHECK(retry_send.find("refresh_timeout_dispatch") !=
+    CHECK(retry_send.find("live_replacement_dispatch") !=
+          std::string::npos);
+    CHECK(retry_send.find("refresh_timeout_dispatch") ==
+          std::string::npos);
+    CHECK(retry_send.find(
+              "!connection_changed && !old_terminated") ==
           std::string::npos);
     CHECK(retry_send.find("pn.send_msg(") == std::string::npos);
     CHECK(retry_send.find("++job.total_send_attempts") ==
           std::string::npos);
+    CHECK(retry_send.find("dispatched=0") == std::string::npos);
 
     INFO("reservation and send are separated by the existing stage interval, "
          "and a fully reserved budget may still dispatch its pending batch");

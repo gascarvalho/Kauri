@@ -4819,6 +4819,7 @@ namespace hotstuff
             return false;
         std::size_t send_attempts = 0;
         std::size_t send_dispatches = 0;
+        std::size_t timed_out_no_dispatch = 0;
         try
         {
             bytearray_t encoded;
@@ -4869,12 +4870,46 @@ namespace hotstuff
                     pending.old_connection->is_terminated();
                 const bool connection_changed =
                     current_connection != pending.old_connection;
+                const bool current_present =
+                    current_connection != nullptr;
+                const bool current_terminated =
+                    current_present && current_connection->is_terminated();
+                const bool replacement_ready =
+                    current_present &&
+                    current_connection != pending.old_connection &&
+                    !current_terminated;
                 const bool refresh_timed_out =
-                    !connection_changed && !old_terminated &&
                     now >= pending.observation_deadline;
-                if (!connection_changed && !old_terminated &&
-                    !refresh_timed_out)
+                if (!replacement_ready)
                 {
+                    if (refresh_timed_out)
+                    {
+                        ++timed_out_no_dispatch;
+                        HOTSTUFF_LOG_INFO(
+                            "KAURI_PROPOSAL_BROADCAST "
+                            "stage=pre_qc_retry_target_result outcome="
+                            "refresh_timeout_no_dispatch root=%u "
+                            "target=%u epoch=%u tree=%u block=%s "
+                            "stage=%u old_terminated=%u "
+                            "connection_changed=%u current_present=%u "
+                            "current_terminated=%u deadline_ticks=%lld "
+                            "total=%zu budget=%zu",
+                            static_cast<unsigned>(get_id()),
+                            static_cast<unsigned>(pending.target),
+                            job.key.configuration.epoch_number,
+                            job.key.configuration.tree_id,
+                            job.key.block_hash.to_hex().c_str(),
+                            job.completed_stages,
+                            static_cast<unsigned>(old_terminated),
+                            static_cast<unsigned>(connection_changed),
+                            static_cast<unsigned>(current_present),
+                            static_cast<unsigned>(current_terminated),
+                            static_cast<long long>(
+                                pending.observation_deadline.count()),
+                            job.total_send_attempts,
+                            job.total_attempt_budget);
+                        continue;
+                    }
                     ++waiting_for_refresh;
                     job.pending_pre_quorum_refresh_batch.push_back(
                         pending);
@@ -4882,8 +4917,9 @@ namespace hotstuff
                         "KAURI_PROPOSAL_BROADCAST "
                         "stage=pre_qc_retry_target_result outcome="
                         "refresh_wait root=%u target=%u epoch=%u "
-                        "tree=%u block=%s stage=%u old_terminated=0 "
-                        "connection_changed=0 deadline_ticks=%lld "
+                        "tree=%u block=%s stage=%u old_terminated=%u "
+                        "connection_changed=%u current_present=%u "
+                        "current_terminated=%u deadline_ticks=%lld "
                         "total=%zu budget=%zu",
                         static_cast<unsigned>(get_id()),
                         static_cast<unsigned>(pending.target),
@@ -4891,6 +4927,10 @@ namespace hotstuff
                         job.key.configuration.tree_id,
                         job.key.block_hash.to_hex().c_str(),
                         job.completed_stages,
+                        static_cast<unsigned>(old_terminated),
+                        static_cast<unsigned>(connection_changed),
+                        static_cast<unsigned>(current_present),
+                        static_cast<unsigned>(current_terminated),
                         static_cast<long long>(
                             pending.observation_deadline.count()),
                         job.total_send_attempts,
@@ -4908,13 +4948,11 @@ namespace hotstuff
                 dispatched = true;
                 HOTSTUFF_LOG_INFO(
                     "KAURI_PROPOSAL_BROADCAST "
-                    "stage=pre_qc_retry_target_result outcome=%s "
+                    "stage=pre_qc_retry_target_result "
+                    "outcome=live_replacement_dispatch "
                     "root=%u target=%u epoch=%u tree=%u block=%s "
                     "stage=%u old_terminated=%u connection_changed=%u "
                     "deferred_id=%d total=%zu budget=%zu",
-                    refresh_timed_out
-                        ? "refresh_timeout_dispatch"
-                        : "refresh_observed_dispatch",
                     static_cast<unsigned>(get_id()),
                     static_cast<unsigned>(pending.target),
                     job.key.configuration.epoch_number,
@@ -4931,9 +4969,9 @@ namespace hotstuff
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=pre_qc_retry_dispatch_summary outcome=complete "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "dispatches=%zu skipped_confirmed=%zu waiting=%zu "
-                "cursor=%zu total=%zu budget=%zu pending=%zu "
-                "dispatched=%u",
+                "dispatches=%zu timed_out_no_dispatch=%zu "
+                "skipped_confirmed=%zu waiting=%zu cursor=%zu total=%zu "
+                "budget=%zu pending=%zu dispatched=%u",
                 static_cast<unsigned>(get_id()),
                 job.key.configuration.epoch_number,
                 job.key.configuration.tree_id,
@@ -4941,6 +4979,7 @@ namespace hotstuff
                 job.completed_stages,
                 send_attempts,
                 send_dispatches,
+                timed_out_no_dispatch,
                 skipped_confirmed,
                 waiting_for_refresh,
                 job.pre_quorum_retry_cursor,
@@ -4957,8 +4996,8 @@ namespace hotstuff
                 "KAURI_PROPOSAL_BROADCAST "
                 "stage=pre_qc_retry_dispatch_summary outcome=exception "
                 "root=%u epoch=%u tree=%u block=%s stage=%u attempts=%zu "
-                "dispatches=%zu cursor=%zu total=%zu budget=%zu "
-                "dispatched=0",
+                "dispatches=%zu timed_out_no_dispatch=%zu cursor=%zu "
+                "total=%zu budget=%zu dispatched=%u",
                 static_cast<unsigned>(get_id()),
                 job.key.configuration.epoch_number,
                 job.key.configuration.tree_id,
@@ -4966,9 +5005,11 @@ namespace hotstuff
                 job.completed_stages,
                 send_attempts,
                 send_dispatches,
+                timed_out_no_dispatch,
                 job.pre_quorum_retry_cursor,
                 job.total_send_attempts,
-                job.total_attempt_budget);
+                job.total_attempt_budget,
+                static_cast<unsigned>(send_dispatches != 0));
             return false;
         }
     }
