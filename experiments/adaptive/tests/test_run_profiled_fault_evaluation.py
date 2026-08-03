@@ -83,6 +83,11 @@ INTERNAL1_FRESH_FIRST_DRAINING_REPAIR_DIAGNOSTIC_PROFILE = (
     / "profiles"
     / "n31-f5-internal1-fresh-first-draining-repair-diagnostic-v13.json"
 )
+INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE = (
+    Path(__file__).parents[1]
+    / "profiles"
+    / "n31-f5-internal1-peer-identity-dispatch-diagnostic-v14.json"
+)
 
 
 def _api():
@@ -387,6 +392,7 @@ def test_transition_request_is_zero_residency_fault_containment() -> None:
         INTERNAL1_CONNECTION_REFRESH_CAPACITY_DIAGNOSTIC_PROFILE,
         INTERNAL1_FRESH_CONNECTION_COALESCING_DIAGNOSTIC_PROFILE,
         INTERNAL1_FRESH_FIRST_DRAINING_REPAIR_DIAGNOSTIC_PROFILE,
+        INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE,
     ),
 )
 def test_cli_pins_the_exact_shipped_profiles(profile_path: Path) -> None:
