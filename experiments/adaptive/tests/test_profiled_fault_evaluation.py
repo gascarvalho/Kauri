@@ -925,6 +925,59 @@ def test_stable_tree_recovery_diagnostic_freezes_strict_gate() -> None:
     assert profile.retry_failed_attempts is False
 
 
+def test_fresh_tail_coverage_diagnostic_freezes_strict_gate() -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    control_path = (
+        profiles / "n31-f5-internal1-stable-tree-recovery-diagnostic-v15.json"
+    )
+    profile_path = (
+        profiles / "n31-f5-internal1-fresh-tail-coverage-diagnostic-v16.json"
+    )
+    control_document = json.loads(control_path.read_text(encoding="utf-8"))
+    diagnostic_document = json.loads(profile_path.read_text(encoding="utf-8"))
+    control_fault = control_document.pop("fault")
+    diagnostic_fault = diagnostic_document.pop("fault")
+    control_document.pop("profile_id")
+    diagnostic_document.pop("profile_id")
+    control_document.pop("ports")
+    diagnostic_ports = diagnostic_document.pop("ports")
+    control_fault.pop("fault_id")
+    diagnostic_fault.pop("fault_id")
+
+    assert diagnostic_document == control_document
+    assert diagnostic_fault == control_fault
+    assert diagnostic_ports == {
+        "peer_base": 25200,
+        "client_base": 26200,
+        "manager": 27200,
+    }
+
+    profile = api.load_frozen_profile(profile_path)
+
+    runtime.require_shipped_profile(profile)
+    assert profile.profile_id == (
+        "n31-f5-q21-internal1-fresh-tail-coverage-diagnostic-v16"
+    )
+    assert profile.profile_sha256 == (
+        "96daff4a11185cd397105c1cfa5183ab7ce4fb378b997d94db81ab9d6d4677d2"
+    )
+    assert profile.fault.fault_id == (
+        "single-internal-replica1-fresh-tail-coverage-diagnostic"
+    )
+    assert profile.fault.tree_id == 0
+    assert profile.fault.replica_id == 1
+    assert profile.crash_subtree == (1, 6, 7, 8, 9, 10)
+    assert profile.tree_switch_period_blocks == 100000
+    assert profile.leader_progress_timeout_s == 20
+    assert profile.minimum_positive_postfault_buckets == 6
+    assert profile.minimum_mean_throughput_retention == 0.8
+    assert profile.quorum == 21
+    assert profile.attempt_count == 1
+    assert profile.retry_failed_attempts is False
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:
