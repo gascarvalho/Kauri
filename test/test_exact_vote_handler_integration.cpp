@@ -628,7 +628,7 @@ TEST_CASE("leader-local broadcast initializes child timing exactly once",
     }
 }
 
-TEST_CASE("exact fallback waits for the full tree deadline and targets the root",
+TEST_CASE("exact fallback stages repair and fast-returns root repair votes",
           "[fallback][production-wiring][proposal][vote][bounded]")
 {
     const auto source = read_source("src/hotstuff.cpp");
@@ -651,6 +651,10 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
     const auto vote_schedule = source_slice(
         source,
         "void HotStuffBase::schedule_exact_vote_fallback",
+        "void HotStuffBase::observe_exact_root_repair_delivery");
+    const auto repair_delivery = source_slice(
+        source,
+        "void HotStuffBase::observe_exact_root_repair_delivery",
         "void HotStuffBase::dispatch_exact_vote_fallback");
     const auto vote_dispatch = source_slice(
         source,
@@ -672,6 +676,14 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
         source,
         "void HotStuffBase::discard_exact_fallbacks",
         "void HotStuffBase::cancel_all_exact_fallbacks");
+    const auto fallback_shutdown = source_slice(
+        source,
+        "void HotStuffBase::cancel_all_exact_fallbacks",
+        "quorum_cert_bt HotStuffBase::verified_aggregation_candidate");
+    const auto proposal_ingress = source_slice(
+        source,
+        "void HotStuffBase::adaptive_propose_handler",
+        "void HotStuffBase::adaptive_vote_handler");
 
     const auto primary = broadcast.find(
         "for (const auto child : metadata->tree.direct_children)");
@@ -695,7 +707,11 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
     CHECK(proposal_dispatch.find("admits_new_proposals()") !=
           std::string::npos);
     CHECK(proposal_send.find(
-              "for (const auto member : lease.tree().assigned_subtree)") !=
+              "while (target_cursor < targets.size()") !=
+          std::string::npos);
+    CHECK(proposal_send.find("send_attempts < maximum_attempts") !=
+          std::string::npos);
+    CHECK(proposal_send.find("targets[target_cursor++]") !=
           std::string::npos);
     const auto snapshot = proposal_send.find(
         "proposal_contexts->snapshot(proposal.key())");
@@ -709,6 +725,80 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
     CHECK(snapshot < skip_verified);
     CHECK(skip_verified < proposal_send_attempt);
     CHECK(proposal_send.find("skipped_verified") != std::string::npos);
+    CHECK(proposal_schedule.find("stage_target_limit") !=
+          std::string::npos);
+    CHECK(proposal_schedule.find("stage_interval") !=
+          std::string::npos);
+    CHECK(proposal_dispatch.find("frozen_global_quorum") !=
+          std::string::npos);
+    CHECK(proposal_dispatch.find(
+              "schedule_after(\n                job->stage_interval") !=
+          std::string::npos);
+    CHECK(proposal_dispatch.find(
+              "std::numeric_limits<std::size_t>::max()") !=
+          std::string::npos);
+    const auto repair_marker = vote_schedule.find(
+        "exact_root_repair_deliveries.find(lease.key())");
+    const auto fast_return = vote_schedule.find("send_exact_vote_to_root(");
+    const auto delayed_return = vote_schedule.find("schedule_after(");
+    REQUIRE(repair_marker != std::string::npos);
+    REQUIRE(fast_return != std::string::npos);
+    REQUIRE(delayed_return != std::string::npos);
+    CHECK(repair_marker < fast_return);
+    CHECK(fast_return < delayed_return);
+    CHECK(vote_schedule.find("if (sent)\n                return;") !=
+          std::string::npos);
+
+    CHECK(repair_delivery.find("active != key.configuration") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "*generation != envelope.view_generation") !=
+          std::string::npos);
+    CHECK(repair_delivery.find("exact_context_metadata(key)") !=
+          std::string::npos);
+    CHECK(repair_delivery.find("contains_admitted(key)") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "authenticated_sender != metadata->tree.root") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "*metadata->tree.parent == authenticated_sender") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "found == exact_vote_fallback_jobs.end()") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "status == ProposalContextStatus::terminal_closed") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "status == ProposalContextStatus::retired") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "snapshot->verified_signers.count(get_id())") !=
+          std::string::npos);
+    CHECK(repair_delivery.find(
+              "exact_root_repair_deliveries.insert_or_assign(") !=
+          std::string::npos);
+    CHECK(repair_delivery.find("acquire_open_context(key)") ==
+          std::string::npos);
+    CHECK(repair_delivery.find("job->key != key") !=
+          std::string::npos);
+    CHECK(repair_delivery.find("send_exact_vote_to_root(") !=
+          std::string::npos);
+    CHECK(repair_delivery.find("exact_vote_fallback_jobs.erase(found)") !=
+          std::string::npos);
+    CHECK(repair_delivery.find("cancellation()") != std::string::npos);
+
+    CHECK(proposal_ingress.find(
+              "ProposalDisposition::admitted_active") !=
+          std::string::npos);
+    CHECK(proposal_ingress.find("ProposalDisposition::duplicate") !=
+          std::string::npos);
+    CHECK(proposal_ingress.find(
+              "observe_exact_root_repair_delivery(") !=
+          std::string::npos);
+    CHECK(proposal_ingress.find("ProposalDisposition::buffered_future") ==
+          std::string::npos);
     CHECK(vote_dispatch.find("contains_admitted(key)") !=
           std::string::npos);
     CHECK(vote_dispatch.find("*active != key.configuration") !=
@@ -721,6 +811,8 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
           std::string::npos);
     CHECK(purge.find("discard_exact_fallbacks(") !=
           std::string::npos);
+    CHECK(purge.find("exact_root_repair_deliveries.erase(key)") !=
+          std::string::npos);
     CHECK(active_proposal.find(
               "metadata.key, true") != std::string::npos);
     CHECK(fallback_cleanup.find(
@@ -728,6 +820,8 @@ TEST_CASE("exact fallback waits for the full tree deadline and targets the root"
           std::string::npos);
     CHECK(fallback_cleanup.find(
               "exact_proposal_fallback_jobs.find(key)") !=
+          std::string::npos);
+    CHECK(fallback_shutdown.find("exact_root_repair_deliveries.clear()") !=
           std::string::npos);
 }
 

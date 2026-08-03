@@ -1164,6 +1164,12 @@ namespace hotstuff
         std::map<ProposalKey,
                  std::shared_ptr<ExactVoteFallbackJob>>
             exact_vote_fallback_jobs;
+        // Active exact proposals delivered directly from their authenticated
+        // root to a non-child descendant are repair traffic.  The descendant
+        // may return its already-authorized vote immediately instead of
+        // waiting for the ordinary full-tree vote fallback deadline.
+        std::map<ProposalKey, std::uint64_t>
+            exact_root_repair_deliveries;
         std::map<ProposalKey,
                  std::shared_ptr<ExactProposalFallbackJob>>
             exact_proposal_fallback_jobs;
@@ -1466,6 +1472,10 @@ namespace hotstuff
         void schedule_exact_vote_fallback(
             const ProposalContextLease &lease,
             const Vote &vote);
+        void observe_exact_root_repair_delivery(
+            const EpochConsensusEnvelope &envelope,
+            ReplicaID authenticated_sender,
+            ProposalDisposition disposition);
         void dispatch_exact_vote_fallback(
             const ProposalKey &key,
             std::uint64_t context_generation);
@@ -1483,7 +1493,10 @@ namespace hotstuff
         bool broadcast_exact_proposal_fallback(
             const ProposalContextLease &lease,
             std::uint64_t epoch_generation,
-            const Proposal &proposal);
+            const Proposal &proposal,
+            std::size_t &target_cursor,
+            std::size_t maximum_attempts,
+            std::uint32_t repair_stage);
         void discard_exact_fallbacks(
             const ProposalKey &key,
             bool preserve_scheduled_vote_fallback = false);
