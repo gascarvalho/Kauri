@@ -770,7 +770,7 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
          "retain_deferred_epoch_change(",
          "return;",
          "EpochChangeProposalDisposition::rejected",
-         "abort();",
+         "abort(",
          "admit_exact_context(",
          "ProposalContextOrigin::remote",
          "on_receive_proposal(parsed)",
@@ -788,7 +788,7 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
         fail_closed_path,
         {"gate.recovery_request",
          "retain_deferred_epoch_change(",
-         "abort();",
+         "abort(",
          "return;"}));
     for (const auto *forbidden : {
              "admit_exact_context(",
@@ -1306,7 +1306,7 @@ TEST_CASE("deferred recovery is cleared only on deterministic terminal paths",
          "case EpochChangeProposalDisposition::defer:",
          "retain_deferred_epoch_change(",
          "case EpochChangeProposalDisposition::rejected:",
-         "abort();"}));
+         "abort("}));
 
     REQUIRE_FALSE(activate.empty());
     CHECK(activate.find(
