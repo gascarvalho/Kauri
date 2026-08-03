@@ -89,6 +89,46 @@ def test_loads_n31_fanout_five_profile_and_derives_fixed_quorum(
     assert loaded.attempt_count == 1
     assert loaded.retry_failed_attempts is False
     assert loaded.require_successor_activation is False
+    assert loaded.minimum_positive_postfault_buckets == 0
+    assert loaded.minimum_mean_throughput_retention == 0.0
+
+
+def test_loads_optional_strict_postfault_recovery_requirements(
+    tmp_path: Path,
+) -> None:
+    api = _api()
+    raw = _profile()
+    raw["minimum_positive_postfault_buckets"] = 5
+    raw["minimum_mean_throughput_retention"] = 0.8
+
+    loaded = api.load_frozen_profile(_write_profile(tmp_path, raw))
+
+    assert loaded.minimum_positive_postfault_buckets == 5
+    assert loaded.minimum_mean_throughput_retention == 0.8
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("minimum_positive_postfault_buckets", -1, "positive postfault buckets"),
+        ("minimum_positive_postfault_buckets", 7, "positive postfault buckets"),
+        ("minimum_positive_postfault_buckets", 1.5, "integer"),
+        ("minimum_mean_throughput_retention", -0.01, "throughput retention"),
+        ("minimum_mean_throughput_retention", float("nan"), "throughput retention"),
+    ),
+)
+def test_rejects_invalid_strict_postfault_recovery_requirements(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    api = _api()
+    raw = _profile()
+    raw[field] = value
+
+    with pytest.raises(api.ProfiledFaultEvaluationError, match=message):
+        api.load_frozen_profile(_write_profile(tmp_path, raw))
 
 
 @pytest.mark.parametrize("replica_count", (0, 8, 30, 32))
@@ -392,13 +432,9 @@ def test_internal1_handoff_diagnostic_changes_only_identity_metadata() -> None:
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = profiles / "n31-f5-internal1-crash-shakedown-v1.json"
-    diagnostic_path = (
-        profiles / "n31-f5-internal1-handoff-diagnostic-v1.json"
-    )
+    diagnostic_path = profiles / "n31-f5-internal1-handoff-diagnostic-v1.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -413,12 +449,8 @@ def test_internal1_handoff_diagnostic_changes_only_identity_metadata() -> None:
     diagnostic = api.load_frozen_profile(diagnostic_path)
 
     runtime.require_shipped_profile(diagnostic)
-    assert diagnostic.profile_id == (
-        "n31-f5-q21-internal1-handoff-diagnostic-v1"
-    )
-    assert diagnostic.fault.fault_id == (
-        "single-internal-replica1-handoff-diagnostic"
-    )
+    assert diagnostic.profile_id == ("n31-f5-q21-internal1-handoff-diagnostic-v1")
+    assert diagnostic.fault.fault_id == ("single-internal-replica1-handoff-diagnostic")
     assert diagnostic.fault.replica_id == control.fault.replica_id == 1
     assert diagnostic.profile_sha256 == (
         "daea7057ef840706dfc8d060c1fdcac538a54a23850084b5eb84ca431eab61c6"
@@ -430,13 +462,9 @@ def test_internal1_handoff_tail_diagnostic_changes_only_identity_metadata() -> N
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = profiles / "n31-f5-internal1-crash-shakedown-v1.json"
-    diagnostic_path = (
-        profiles / "n31-f5-internal1-handoff-tail-diagnostic-v2.json"
-    )
+    diagnostic_path = profiles / "n31-f5-internal1-handoff-tail-diagnostic-v2.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -451,9 +479,7 @@ def test_internal1_handoff_tail_diagnostic_changes_only_identity_metadata() -> N
     diagnostic = api.load_frozen_profile(diagnostic_path)
 
     runtime.require_shipped_profile(diagnostic)
-    assert diagnostic.profile_id == (
-        "n31-f5-q21-internal1-handoff-tail-diagnostic-v2"
-    )
+    assert diagnostic.profile_id == ("n31-f5-q21-internal1-handoff-tail-diagnostic-v2")
     assert diagnostic.fault.fault_id == (
         "single-internal-replica1-handoff-tail-diagnostic"
     )
@@ -468,13 +494,9 @@ def test_internal1_forwarding_tail_diagnostic_changes_only_identity_metadata() -
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = profiles / "n31-f5-internal1-crash-shakedown-v1.json"
-    diagnostic_path = (
-        profiles / "n31-f5-internal1-forwarding-tail-diagnostic-v3.json"
-    )
+    diagnostic_path = profiles / "n31-f5-internal1-forwarding-tail-diagnostic-v3.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -508,9 +530,7 @@ def test_internal1_repnet2_diagnostic_changes_only_identity_metadata() -> None:
     control_path = profiles / "n31-f5-internal1-crash-shakedown-v1.json"
     diagnostic_path = profiles / "n31-f5-internal1-repnet2-diagnostic-v4.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -525,32 +545,24 @@ def test_internal1_repnet2_diagnostic_changes_only_identity_metadata() -> None:
     diagnostic = api.load_frozen_profile(diagnostic_path)
 
     runtime.require_shipped_profile(diagnostic)
-    assert diagnostic.profile_id == (
-        "n31-f5-q21-internal1-repnet2-diagnostic-v4"
-    )
-    assert diagnostic.fault.fault_id == (
-        "single-internal-replica1-repnet2-diagnostic"
-    )
+    assert diagnostic.profile_id == ("n31-f5-q21-internal1-repnet2-diagnostic-v4")
+    assert diagnostic.fault.fault_id == ("single-internal-replica1-repnet2-diagnostic")
     assert diagnostic.fault.replica_id == control.fault.replica_id == 1
     assert diagnostic.profile_sha256 == (
         "c61aad2d835f4ffdac79e18a7373196d82d6b03a109009abad15b17966fb4561"
     )
 
 
-def test_missing_signer_repair_diagnostic_changes_only_identity_metadata(
-) -> None:
+def test_missing_signer_repair_diagnostic_changes_only_identity_metadata() -> None:
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = profiles / "n31-f5-internal1-repnet2-diagnostic-v4.json"
     diagnostic_path = (
-        profiles
-        / "n31-f5-internal1-missing-signer-repair-diagnostic-v5.json"
+        profiles / "n31-f5-internal1-missing-signer-repair-diagnostic-v5.json"
     )
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -579,16 +591,11 @@ def test_staged_repair_diagnostic_changes_only_identity_metadata() -> None:
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = (
-        profiles
-        / "n31-f5-internal1-missing-signer-repair-diagnostic-v5.json"
+        profiles / "n31-f5-internal1-missing-signer-repair-diagnostic-v5.json"
     )
-    diagnostic_path = (
-        profiles / "n31-f5-internal1-staged-repair-diagnostic-v6.json"
-    )
+    diagnostic_path = profiles / "n31-f5-internal1-staged-repair-diagnostic-v6.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -601,9 +608,7 @@ def test_staged_repair_diagnostic_changes_only_identity_metadata() -> None:
 
     diagnostic = api.load_frozen_profile(diagnostic_path)
     runtime.require_shipped_profile(diagnostic)
-    assert diagnostic.profile_id == (
-        "n31-f5-q21-internal1-staged-repair-diagnostic-v6"
-    )
+    assert diagnostic.profile_id == ("n31-f5-q21-internal1-staged-repair-diagnostic-v6")
     assert diagnostic.fault.fault_id == (
         "single-internal-replica1-staged-repair-diagnostic"
     )
@@ -616,16 +621,10 @@ def test_commit_dwell_diagnostic_changes_only_cadence_and_identity() -> None:
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
-    control_path = (
-        profiles / "n31-f5-internal1-staged-repair-diagnostic-v6.json"
-    )
-    diagnostic_path = (
-        profiles / "n31-f5-internal1-commit-dwell-diagnostic-v7.json"
-    )
+    control_path = profiles / "n31-f5-internal1-staged-repair-diagnostic-v6.json"
+    diagnostic_path = profiles / "n31-f5-internal1-commit-dwell-diagnostic-v7.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -642,9 +641,7 @@ def test_commit_dwell_diagnostic_changes_only_cadence_and_identity() -> None:
 
     diagnostic = api.load_frozen_profile(diagnostic_path)
     runtime.require_shipped_profile(diagnostic)
-    assert diagnostic.profile_id == (
-        "n31-f5-q21-internal1-commit-dwell-diagnostic-v7"
-    )
+    assert diagnostic.profile_id == ("n31-f5-q21-internal1-commit-dwell-diagnostic-v7")
     assert diagnostic.fault.fault_id == (
         "single-internal-replica1-commit-dwell-diagnostic"
     )
@@ -658,16 +655,10 @@ def test_ack_tail_diagnostic_changes_only_identity_metadata() -> None:
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
-    control_path = (
-        profiles / "n31-f5-internal1-commit-dwell-diagnostic-v7.json"
-    )
-    diagnostic_path = (
-        profiles / "n31-f5-internal1-ack-tail-diagnostic-v8.json"
-    )
+    control_path = profiles / "n31-f5-internal1-commit-dwell-diagnostic-v7.json"
+    diagnostic_path = profiles / "n31-f5-internal1-ack-tail-diagnostic-v8.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -680,12 +671,8 @@ def test_ack_tail_diagnostic_changes_only_identity_metadata() -> None:
 
     diagnostic = api.load_frozen_profile(diagnostic_path)
     runtime.require_shipped_profile(diagnostic)
-    assert diagnostic.profile_id == (
-        "n31-f5-q21-internal1-ack-tail-diagnostic-v8"
-    )
-    assert diagnostic.fault.fault_id == (
-        "single-internal-replica1-ack-tail-diagnostic"
-    )
+    assert diagnostic.profile_id == ("n31-f5-q21-internal1-ack-tail-diagnostic-v8")
+    assert diagnostic.fault.fault_id == ("single-internal-replica1-ack-tail-diagnostic")
     assert diagnostic.profile_sha256 == (
         "71f942e69735380216f4906e40d22c4456ee9a3cb3d5afa89c59af4690cc6750"
     )
@@ -695,16 +682,10 @@ def test_pre_qc_credit_diagnostic_changes_only_identity_metadata() -> None:
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
-    control_path = (
-        profiles / "n31-f5-internal1-ack-tail-diagnostic-v8.json"
-    )
-    diagnostic_path = (
-        profiles / "n31-f5-internal1-pre-qc-credit-diagnostic-v9.json"
-    )
+    control_path = profiles / "n31-f5-internal1-ack-tail-diagnostic-v8.json"
+    diagnostic_path = profiles / "n31-f5-internal1-pre-qc-credit-diagnostic-v9.json"
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -717,9 +698,7 @@ def test_pre_qc_credit_diagnostic_changes_only_identity_metadata() -> None:
 
     diagnostic = api.load_frozen_profile(diagnostic_path)
     runtime.require_shipped_profile(diagnostic)
-    assert diagnostic.profile_id == (
-        "n31-f5-q21-internal1-pre-qc-credit-diagnostic-v9"
-    )
+    assert diagnostic.profile_id == ("n31-f5-q21-internal1-pre-qc-credit-diagnostic-v9")
     assert diagnostic.fault.fault_id == (
         "single-internal-replica1-pre-qc-credit-diagnostic"
     )
@@ -732,16 +711,12 @@ def test_connection_refresh_diagnostic_changes_only_identity_metadata() -> None:
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
-    control_path = (
-        profiles / "n31-f5-internal1-pre-qc-credit-diagnostic-v9.json"
-    )
+    control_path = profiles / "n31-f5-internal1-pre-qc-credit-diagnostic-v9.json"
     diagnostic_path = (
         profiles / "n31-f5-internal1-connection-refresh-diagnostic-v10.json"
     )
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -765,22 +740,18 @@ def test_connection_refresh_diagnostic_changes_only_identity_metadata() -> None:
     )
 
 
-def test_connection_refresh_capacity_diagnostic_changes_only_identity_metadata(
-) -> None:
+def test_connection_refresh_capacity_diagnostic_changes_only_identity_metadata() -> (
+    None
+):
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
-    control_path = (
-        profiles / "n31-f5-internal1-connection-refresh-diagnostic-v10.json"
-    )
+    control_path = profiles / "n31-f5-internal1-connection-refresh-diagnostic-v10.json"
     diagnostic_path = (
-        profiles
-        / "n31-f5-internal1-connection-refresh-capacity-diagnostic-v11.json"
+        profiles / "n31-f5-internal1-connection-refresh-capacity-diagnostic-v11.json"
     )
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -806,23 +777,20 @@ def test_connection_refresh_capacity_diagnostic_changes_only_identity_metadata(
     )
 
 
-def test_fresh_connection_coalescing_diagnostic_changes_only_identity_metadata(
-) -> None:
+def test_fresh_connection_coalescing_diagnostic_changes_only_identity_metadata() -> (
+    None
+):
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = (
-        profiles
-        / "n31-f5-internal1-connection-refresh-capacity-diagnostic-v11.json"
+        profiles / "n31-f5-internal1-connection-refresh-capacity-diagnostic-v11.json"
     )
     diagnostic_path = (
-        profiles
-        / "n31-f5-internal1-fresh-connection-coalescing-diagnostic-v12.json"
+        profiles / "n31-f5-internal1-fresh-connection-coalescing-diagnostic-v12.json"
     )
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -848,23 +816,20 @@ def test_fresh_connection_coalescing_diagnostic_changes_only_identity_metadata(
     )
 
 
-def test_fresh_first_draining_repair_diagnostic_changes_only_identity_metadata(
-) -> None:
+def test_fresh_first_draining_repair_diagnostic_changes_only_identity_metadata() -> (
+    None
+):
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = (
-        profiles
-        / "n31-f5-internal1-fresh-connection-coalescing-diagnostic-v12.json"
+        profiles / "n31-f5-internal1-fresh-connection-coalescing-diagnostic-v12.json"
     )
     diagnostic_path = (
-        profiles
-        / "n31-f5-internal1-fresh-first-draining-repair-diagnostic-v13.json"
+        profiles / "n31-f5-internal1-fresh-first-draining-repair-diagnostic-v13.json"
     )
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -890,23 +855,18 @@ def test_fresh_first_draining_repair_diagnostic_changes_only_identity_metadata(
     )
 
 
-def test_peer_identity_dispatch_diagnostic_changes_only_identity_metadata(
-) -> None:
+def test_peer_identity_dispatch_diagnostic_changes_only_identity_metadata() -> None:
     api = _api()
     runtime = _runtime()
     profiles = Path(__file__).resolve().parents[1] / "profiles"
     control_path = (
-        profiles
-        / "n31-f5-internal1-fresh-first-draining-repair-diagnostic-v13.json"
+        profiles / "n31-f5-internal1-fresh-first-draining-repair-diagnostic-v13.json"
     )
     diagnostic_path = (
-        profiles
-        / "n31-f5-internal1-peer-identity-dispatch-diagnostic-v14.json"
+        profiles / "n31-f5-internal1-peer-identity-dispatch-diagnostic-v14.json"
     )
     control_document = json.loads(control_path.read_text(encoding="utf-8"))
-    diagnostic_document = json.loads(
-        diagnostic_path.read_text(encoding="utf-8")
-    )
+    diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
     control_fault = control_document.pop("fault")
     diagnostic_fault = diagnostic_document.pop("fault")
     control_document.pop("profile_id")
@@ -930,6 +890,39 @@ def test_peer_identity_dispatch_diagnostic_changes_only_identity_metadata(
     assert diagnostic.profile_sha256 == (
         "0b73b9c3485cf9b3e74d09c68260cad61219d43022c8aa0972f933b54125f6b8"
     )
+
+
+def test_stable_tree_recovery_diagnostic_freezes_strict_gate() -> None:
+    api = _api()
+    runtime = _runtime()
+    profile_path = (
+        Path(__file__).resolve().parents[1]
+        / "profiles"
+        / "n31-f5-internal1-stable-tree-recovery-diagnostic-v15.json"
+    )
+
+    profile = api.load_frozen_profile(profile_path)
+
+    runtime.require_shipped_profile(profile)
+    assert profile.profile_id == (
+        "n31-f5-q21-internal1-stable-tree-recovery-diagnostic-v15"
+    )
+    assert profile.profile_sha256 == (
+        "5a640ae1c12e6b4fe6a2420dc9efbc95d617388a0a2d0304a334e703392ac471"
+    )
+    assert profile.fault.fault_id == (
+        "single-internal-replica1-stable-tree-recovery-diagnostic"
+    )
+    assert profile.fault.tree_id == 0
+    assert profile.fault.replica_id == 1
+    assert profile.crash_subtree == (1, 6, 7, 8, 9, 10)
+    assert profile.tree_switch_period_blocks == 100000
+    assert profile.leader_progress_timeout_s == 20
+    assert profile.minimum_positive_postfault_buckets == 6
+    assert profile.minimum_mean_throughput_retention == 0.8
+    assert profile.quorum == 21
+    assert profile.attempt_count == 1
+    assert profile.retry_failed_attempts is False
 
 
 def test_manager_argv_freezes_containment_without_exposing_secrets(

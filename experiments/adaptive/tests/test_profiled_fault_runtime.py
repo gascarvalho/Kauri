@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import importlib
 import json
 from pathlib import Path
@@ -11,6 +12,11 @@ from typing import Any
 import pytest
 
 PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-crash-shakedown-v1.json"
+STABLE_TREE_PROFILE_PATH = (
+    Path(__file__).parents[1]
+    / "profiles"
+    / "n31-f5-internal1-stable-tree-recovery-diagnostic-v15.json"
+)
 RUN_ID = "synthetic-n31-final"
 BASELINE_START_NS = 1_000_000_000
 BASELINE_END_NS = 31_000_000_000
@@ -300,6 +306,45 @@ def test_validate_final_streams_accepts_exact_rich_n31_evidence(
     assert len(verdict["postfault_rows"]) == 6
     assert all(row["tps"] == 200 for row in verdict["baseline_rows"])
     assert all(row["tps"] == 200 for row in verdict["postfault_rows"])
+    assert verdict["recovery_gate"] == {
+        "requirements": {
+            "minimum_positive_postfault_buckets": 0,
+            "minimum_mean_throughput_retention": 0.0,
+        },
+        "observations": {
+            "positive_postfault_buckets": 6,
+            "baseline_mean_tps": 200.0,
+            "postfault_mean_tps": 200.0,
+            "mean_throughput_retention": 1.0,
+        },
+        "passed": True,
+        "violations": [],
+    }
+
+
+def test_validate_final_streams_accepts_strict_recovery_gate(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    fixture["profile"] = replace(
+        fixture["profile"],
+        minimum_positive_postfault_buckets=6,
+        minimum_mean_throughput_retention=0.8,
+    )
+
+    verdict = _validate(fixture, tmp_path)
+
+    assert verdict["recovery_gate"]["requirements"] == {
+        "minimum_positive_postfault_buckets": 6,
+        "minimum_mean_throughput_retention": 0.8,
+    }
+    assert verdict["recovery_gate"]["observations"] == {
+        "positive_postfault_buckets": 6,
+        "baseline_mean_tps": 200.0,
+        "postfault_mean_tps": 200.0,
+        "mean_throughput_retention": 1.0,
+    }
+    assert verdict["recovery_gate"]["passed"] is True
 
 
 def test_validate_final_streams_accepts_replica_local_commit_batch_indexes(
@@ -390,9 +435,67 @@ def test_validate_final_streams_accepts_measured_zero_postfault_bucket(
     assert all(row["tps"] == 200 for row in verdict["postfault_rows"][1:])
 
 
+def test_strict_recovery_gate_rejects_too_few_positive_postfault_buckets(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    fixture["profile"] = replace(
+        fixture["profile"],
+        minimum_positive_postfault_buckets=6,
+    )
+    observer = f"replica-{fixture['profile'].authoritative_observer}"
+    fixture["streams"][observer] = [
+        event
+        for event in fixture["streams"][observer]
+        if not (
+            event["event_type"] == "block.committed"
+            and event["payload"].get("block_height") == 200
+        )
+    ]
+    for sequence, event in enumerate(fixture["streams"][observer], 1):
+        event["source_sequence"] = sequence
+
+    with pytest.raises(
+        _runtime().RecoveryGateFailure,
+        match="positive postfault buckets.*5.*minimum 6",
+    ) as failure:
+        _validate(fixture, tmp_path)
+
+    assert failure.value.recovery_gate["passed"] is False
+    assert failure.value.recovery_gate["violations"] == [
+        "minimum_positive_postfault_buckets"
+    ]
+
+
+def test_strict_recovery_gate_rejects_low_mean_throughput_retention(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    fixture["profile"] = replace(
+        fixture["profile"],
+        minimum_mean_throughput_retention=1.01,
+    )
+
+    with pytest.raises(
+        _runtime().RecoveryGateFailure,
+        match="mean throughput retention.*1.0.*minimum 1.01",
+    ) as failure:
+        _validate(fixture, tmp_path)
+
+    assert failure.value.recovery_gate["passed"] is False
+    assert failure.value.recovery_gate["violations"] == [
+        "minimum_mean_throughput_retention"
+    ]
+
+
 def test_live_postfault_qualification_waits_for_the_complete_fixed_window() -> None:
     fixture = _fixture()
     runtime = _runtime()
+    fixture["profile"] = replace(
+        fixture["profile"],
+        minimum_positive_postfault_buckets=6,
+        minimum_mean_throughput_retention=1.01,
+    )
     observer = f"replica-{fixture['profile'].authoritative_observer}"
     fixture["streams"][observer] = [
         event
@@ -433,6 +536,77 @@ def test_live_postfault_qualification_waits_for_the_complete_fixed_window() -> N
     assert qualified is not None
     assert qualified["common_commit"]["block_height"] == 205
     assert qualified["rows"][0]["tps"] == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        lambda record: record["recovery_gate"]["requirements"].__setitem__(
+            "minimum_positive_postfault_buckets", 5
+        ),
+        lambda record: record["recovery_gate"]["observations"].__setitem__(
+            "positive_postfault_buckets", 5
+        ),
+        lambda record: record["recovery_gate"].__setitem__("passed", False),
+        lambda record: record.pop("recovery_gate"),
+    ),
+)
+def test_strict_preserved_validation_rejects_recovery_gate_tampering(
+    tamper: object,
+) -> None:
+    runtime = _runtime()
+    fixture = _fixture()
+    profile = replace(
+        fixture["profile"],
+        minimum_positive_postfault_buckets=6,
+        minimum_mean_throughput_retention=0.8,
+    )
+    expected = {
+        "requirements": {
+            "minimum_positive_postfault_buckets": 6,
+            "minimum_mean_throughput_retention": 0.8,
+        },
+        "observations": {
+            "positive_postfault_buckets": 6,
+            "baseline_mean_tps": 200.0,
+            "postfault_mean_tps": 200.0,
+            "mean_throughput_retention": 1.0,
+        },
+        "passed": True,
+        "violations": [],
+    }
+    recorded = {"recovery_gate": copy.deepcopy(expected)}
+    tamper(recorded)
+
+    with pytest.raises(
+        runtime.ProfiledFaultRuntimeError,
+        match="recorded recovery gate differs",
+    ):
+        runtime._verify_recorded_recovery_gate(profile, recorded, expected)
+
+
+def test_legacy_preserved_validation_may_omit_disabled_recovery_gate() -> None:
+    fixture = _fixture()
+    expected = {
+        "requirements": {
+            "minimum_positive_postfault_buckets": 0,
+            "minimum_mean_throughput_retention": 0.0,
+        },
+        "observations": {
+            "positive_postfault_buckets": 1,
+            "baseline_mean_tps": 1.0,
+            "postfault_mean_tps": 0.0,
+            "mean_throughput_retention": 0.0,
+        },
+        "passed": True,
+        "violations": [],
+    }
+
+    _runtime()._verify_recorded_recovery_gate(
+        fixture["profile"],
+        {},
+        expected,
+    )
 
 
 def test_live_postfault_qualification_rejects_missing_q21_at_window_end() -> None:
@@ -937,3 +1111,74 @@ def test_configuration_boundary_poller_emits_exact_validatable_boundary(
         },
         crash_request_ns=CRASH_REQUEST_NS,
     )
+
+
+def test_configuration_boundary_poller_rejects_stale_fault_tree(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(PROFILE_PATH)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    sources = [f"replica-{replica}" for replica in profile.replica_ids]
+    for replica, source in zip(profile.replica_ids, sources):
+        target = {
+            "source_sequence": 1,
+            "source_monotonic_ns": 34_000_000_000,
+            "event_type": "adaptive.configuration_active",
+            "payload": _configuration_payload(replica),
+        }
+        later = copy.deepcopy(target)
+        later["source_sequence"] = 2
+        later["source_monotonic_ns"] = 34_100_000_000
+        later["payload"]["tree_id"] = 0
+        (raw / f"{source}.jsonl").write_text(
+            "".join(
+                json.dumps(event, separators=(",", ":")) + "\n"
+                for event in (target, later)
+            ),
+            encoding="utf-8",
+        )
+    poller = runtime.ConfigurationBoundaryPoller(
+        profile,
+        tmp_path,
+        watermarks={source: -1 for source in sources},
+        offsets={source: 0 for source in sources},
+    )
+
+    assert poller.poll() is None
+
+
+def test_configuration_boundary_poller_accepts_current_stable_tree_zero(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(STABLE_TREE_PROFILE_PATH)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    sources = [f"replica-{replica}" for replica in profile.replica_ids]
+    for replica, source in zip(profile.replica_ids, sources):
+        payload = _configuration_payload(replica)
+        payload["tree_id"] = 0
+        event = {
+            "source_sequence": 1,
+            "source_monotonic_ns": 34_000_000_000,
+            "event_type": "adaptive.configuration_active",
+            "payload": payload,
+        }
+        (raw / f"{source}.jsonl").write_text(
+            json.dumps(event, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    poller = runtime.ConfigurationBoundaryPoller(
+        profile,
+        tmp_path,
+        watermarks={source: -1 for source in sources},
+        offsets={source: 0 for source in sources},
+    )
+
+    boundary = poller.poll()
+
+    assert boundary is not None
+    assert boundary["tree_id"] == 0
+    assert boundary["root_replica"] == 0

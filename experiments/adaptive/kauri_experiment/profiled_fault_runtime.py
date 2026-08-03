@@ -13,6 +13,7 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -55,15 +56,11 @@ INTERNAL1_PROFILE_ID = "n31-f5-q21-internal1-sigkill-shakedown-v1"
 INTERNAL1_PROFILE_SHA256 = (
     "0defdaa9b69c949365eea3b3029da75cee3ea8334f845401103e2f7af8507650"
 )
-INTERNAL1_DIAGNOSTIC_PROFILE_ID = (
-    "n31-f5-q21-internal1-handoff-diagnostic-v1"
-)
+INTERNAL1_DIAGNOSTIC_PROFILE_ID = "n31-f5-q21-internal1-handoff-diagnostic-v1"
 INTERNAL1_DIAGNOSTIC_PROFILE_SHA256 = (
     "daea7057ef840706dfc8d060c1fdcac538a54a23850084b5eb84ca431eab61c6"
 )
-INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_ID = (
-    "n31-f5-q21-internal1-handoff-tail-diagnostic-v2"
-)
+INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_ID = "n31-f5-q21-internal1-handoff-tail-diagnostic-v2"
 INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_SHA256 = (
     "369ba72c9a0ba92d74e128330905e2fcac2254a6e4b1e7e5d1377c418e033482"
 )
@@ -73,9 +70,7 @@ INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_ID = (
 INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_SHA256 = (
     "fca3d8e0b99b6cd7c576e5db2d69c406ba13b3f19af30a2445de4f604bcb9e00"
 )
-INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_ID = (
-    "n31-f5-q21-internal1-repnet2-diagnostic-v4"
-)
+INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_ID = "n31-f5-q21-internal1-repnet2-diagnostic-v4"
 INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_SHA256 = (
     "c61aad2d835f4ffdac79e18a7373196d82d6b03a109009abad15b17966fb4561"
 )
@@ -97,9 +92,7 @@ INTERNAL1_COMMIT_DWELL_DIAGNOSTIC_PROFILE_ID = (
 INTERNAL1_COMMIT_DWELL_DIAGNOSTIC_PROFILE_SHA256 = (
     "c9e8d6385ced8c7d70b78d22d865cea893097f6e75bf71475edbbee45a0ae84f"
 )
-INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE_ID = (
-    "n31-f5-q21-internal1-ack-tail-diagnostic-v8"
-)
+INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE_ID = "n31-f5-q21-internal1-ack-tail-diagnostic-v8"
 INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE_SHA256 = (
     "71f942e69735380216f4906e40d22c4456ee9a3cb3d5afa89c59af4690cc6750"
 )
@@ -139,36 +132,30 @@ INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE_ID = (
 INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE_SHA256 = (
     "0b73b9c3485cf9b3e74d09c68260cad61219d43022c8aa0972f933b54125f6b8"
 )
+INTERNAL1_STABLE_TREE_RECOVERY_DIAGNOSTIC_PROFILE_ID = (
+    "n31-f5-q21-internal1-stable-tree-recovery-diagnostic-v15"
+)
+INTERNAL1_STABLE_TREE_RECOVERY_DIAGNOSTIC_PROFILE_SHA256 = (
+    "5a640ae1c12e6b4fe6a2420dc9efbc95d617388a0a2d0304a334e703392ac471"
+)
 SHIPPED_PROFILES = {
     SHIPPED_PROFILE_ID: SHIPPED_PROFILE_SHA256,
     INTERNAL1_PROFILE_ID: INTERNAL1_PROFILE_SHA256,
     INTERNAL1_DIAGNOSTIC_PROFILE_ID: INTERNAL1_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_MISSING_SIGNER_REPAIR_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_MISSING_SIGNER_REPAIR_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_STAGED_REPAIR_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_STAGED_REPAIR_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_COMMIT_DWELL_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_COMMIT_DWELL_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_PRE_QC_CREDIT_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_PRE_QC_CREDIT_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_CONNECTION_REFRESH_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_CONNECTION_REFRESH_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_CONNECTION_REFRESH_CAPACITY_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_CONNECTION_REFRESH_CAPACITY_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_FRESH_CONNECTION_COALESCING_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_FRESH_CONNECTION_COALESCING_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_FRESH_FIRST_DRAINING_REPAIR_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_FRESH_FIRST_DRAINING_REPAIR_DIAGNOSTIC_PROFILE_SHA256,
-    INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE_ID:
-        INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_ID: INTERNAL1_TAIL_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_ID: INTERNAL1_FORWARDING_TAIL_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_ID: INTERNAL1_REPNET2_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_MISSING_SIGNER_REPAIR_DIAGNOSTIC_PROFILE_ID: INTERNAL1_MISSING_SIGNER_REPAIR_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_STAGED_REPAIR_DIAGNOSTIC_PROFILE_ID: INTERNAL1_STAGED_REPAIR_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_COMMIT_DWELL_DIAGNOSTIC_PROFILE_ID: INTERNAL1_COMMIT_DWELL_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE_ID: INTERNAL1_ACK_TAIL_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_PRE_QC_CREDIT_DIAGNOSTIC_PROFILE_ID: INTERNAL1_PRE_QC_CREDIT_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_CONNECTION_REFRESH_DIAGNOSTIC_PROFILE_ID: INTERNAL1_CONNECTION_REFRESH_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_CONNECTION_REFRESH_CAPACITY_DIAGNOSTIC_PROFILE_ID: INTERNAL1_CONNECTION_REFRESH_CAPACITY_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_FRESH_CONNECTION_COALESCING_DIAGNOSTIC_PROFILE_ID: INTERNAL1_FRESH_CONNECTION_COALESCING_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_FRESH_FIRST_DRAINING_REPAIR_DIAGNOSTIC_PROFILE_ID: INTERNAL1_FRESH_FIRST_DRAINING_REPAIR_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE_ID: INTERNAL1_PEER_IDENTITY_DISPATCH_DIAGNOSTIC_PROFILE_SHA256,
+    INTERNAL1_STABLE_TREE_RECOVERY_DIAGNOSTIC_PROFILE_ID: INTERNAL1_STABLE_TREE_RECOVERY_DIAGNOSTIC_PROFILE_SHA256,
 }
 EXPECTED_EPOCH_ZERO_DIGEST = (
     "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
@@ -227,6 +214,18 @@ class ProfiledFaultRuntimeError(RuntimeError):
 
 class IncompleteProfiledFaultRun(ProfiledFaultRuntimeError):
     """The preserved attempt stopped before the frozen gate was complete."""
+
+
+class RecoveryGateFailure(ProfiledFaultRuntimeError):
+    """The complete source-blind window missed a frozen recovery requirement."""
+
+    def __init__(
+        self,
+        message: str,
+        recovery_gate: dict[str, object],
+    ) -> None:
+        super().__init__(message)
+        self.recovery_gate = recovery_gate
 
 
 def require_shipped_profile(profile: FrozenProfile) -> None:
@@ -1366,6 +1365,87 @@ def require_positive_buckets(
         )
 
 
+def recovery_gate_evidence(
+    profile: FrozenProfile,
+    baseline_rows: Sequence[Mapping[str, object]],
+    postfault_rows: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Evaluate frozen recovery requirements from both complete windows."""
+    if (
+        len(baseline_rows) != profile.baseline_bucket_count
+        or len(postfault_rows) != profile.post_bucket_count
+    ):
+        raise ProfiledFaultRuntimeError(
+            "recovery gate requires both exact complete measurement windows"
+        )
+    baseline_mean = statistics.fmean(float(row["tps"]) for row in baseline_rows)
+    postfault_mean = statistics.fmean(float(row["tps"]) for row in postfault_rows)
+    if not math.isfinite(baseline_mean) or baseline_mean <= 0:
+        raise ProfiledFaultRuntimeError(
+            "recovery gate requires positive finite baseline mean throughput"
+        )
+    if not math.isfinite(postfault_mean) or postfault_mean < 0:
+        raise ProfiledFaultRuntimeError(
+            "recovery gate requires non-negative finite postfault mean throughput"
+        )
+    retention = postfault_mean / baseline_mean
+    positive_postfault_buckets = sum(
+        1 for row in postfault_rows if float(row["tps"]) > 0
+    )
+    violations: list[str] = []
+    if positive_postfault_buckets < profile.minimum_positive_postfault_buckets:
+        violations.append("minimum_positive_postfault_buckets")
+    if retention < profile.minimum_mean_throughput_retention:
+        violations.append("minimum_mean_throughput_retention")
+    return {
+        "requirements": {
+            "minimum_positive_postfault_buckets": (
+                profile.minimum_positive_postfault_buckets
+            ),
+            "minimum_mean_throughput_retention": (
+                profile.minimum_mean_throughput_retention
+            ),
+        },
+        "observations": {
+            "positive_postfault_buckets": positive_postfault_buckets,
+            "baseline_mean_tps": baseline_mean,
+            "postfault_mean_tps": postfault_mean,
+            "mean_throughput_retention": retention,
+        },
+        "passed": not violations,
+        "violations": violations,
+    }
+
+
+def enforce_recovery_gate(
+    profile: FrozenProfile,
+    baseline_rows: Sequence[Mapping[str, object]],
+    postfault_rows: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    evidence = recovery_gate_evidence(profile, baseline_rows, postfault_rows)
+    violations = evidence["violations"]
+    if not violations:
+        return evidence
+    observations = evidence["observations"]
+    requirements = evidence["requirements"]
+    assert isinstance(observations, Mapping)
+    assert isinstance(requirements, Mapping)
+    details: list[str] = []
+    if "minimum_positive_postfault_buckets" in violations:
+        details.append(
+            "positive postfault buckets "
+            f"{observations['positive_postfault_buckets']} are below frozen "
+            f"minimum {requirements['minimum_positive_postfault_buckets']}"
+        )
+    if "minimum_mean_throughput_retention" in violations:
+        details.append(
+            "mean throughput retention "
+            f"{observations['mean_throughput_retention']} is below frozen "
+            f"minimum {requirements['minimum_mean_throughput_retention']}"
+        )
+    raise RecoveryGateFailure("; ".join(details), evidence)
+
+
 def evaluate_complete_postfault_window(
     profile: FrozenProfile,
     streams: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -1415,7 +1495,7 @@ def write_throughput_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> No
 
 
 class ConfigurationBoundaryPoller:
-    """Tightly tail all replica streams for one common T30 activation."""
+    """Tightly tail all replicas for one common current fault-tree view."""
 
     def __init__(
         self,
@@ -1527,8 +1607,20 @@ class ConfigurationBoundaryPoller:
             timestamps = [_timestamp(event) for event in selected]
             if max(timestamps) - min(timestamps) > skew_ns:
                 continue
-            # Close the normal read/poll race before handing the boundary out.
+            # Close the normal read/poll race before handing the boundary out,
+            # then require the selected fault-tree event to remain the latest
+            # exact activation in every source.  Reading from offset zero lets
+            # a long-lived stable tree qualify without accepting a stale view.
             self._consume()
+            if any(
+                _sequence(event)
+                != max(
+                    (_sequence(candidate) for candidate in self.events[source]),
+                    default=-1,
+                )
+                for source, event in zip(self.paths, selected)
+            ):
+                continue
             return {
                 "epoch_number": 0,
                 "tree_id": target_tree,
@@ -1645,7 +1737,7 @@ def assert_boundary_race_free(
             raise ProfiledFaultRuntimeError("crash boundary reference drifted")
         if timestamp >= crash_request_ns:
             raise ProfiledFaultRuntimeError(
-                "crash request does not follow the T30 boundary"
+                "crash request does not follow the exact fault-tree boundary"
             )
 
         referenced = [
@@ -1668,7 +1760,7 @@ def assert_boundary_race_free(
             or payload.get("global_quorum") != profile.quorum
         ):
             raise ProfiledFaultRuntimeError(
-                "crash boundary reference is not the exact canonical T30 event"
+                "crash boundary reference is not the exact canonical fault-tree event"
             )
 
         for event in streams[source]:
@@ -2043,10 +2135,7 @@ def concurrent_cleanup(
     ledger: list[dict[str, object]] = []
     for record in records:
         returncode = record.process.poll()
-        if (
-            record.replica_id == faulted_replica_id
-            and returncode == -signal.SIGKILL
-        ):
+        if record.replica_id == faulted_replica_id and returncode == -signal.SIGKILL:
             classification = "expected_fault"
         elif record.name == MANAGER_SOURCE_ID and sent[record.name] and returncode == 1:
             classification = "expected_cleanup"
@@ -2586,11 +2675,13 @@ def validate_final_streams(
         start_ns=post_start,
         bucket_count=profile.post_bucket_count,
     )
+    recovery_gate = enforce_recovery_gate(profile, baseline_rows, post_rows)
     return {
         "pre_fault_common_commit": pre_common,
         "post_fault_common_commit": post_common,
         "baseline_rows": baseline_rows,
         "postfault_rows": post_rows,
+        "recovery_gate": recovery_gate,
     }
 
 
@@ -2705,6 +2796,26 @@ def _verify_throughput_csv(
         canonical = {field: str(expected[field]) for field in expected_fields}
         if actual != canonical:
             raise ProfiledFaultRuntimeError("throughput CSV differs from raw events")
+
+
+def _verify_recorded_recovery_gate(
+    profile: FrozenProfile,
+    recorded_validation: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> None:
+    strict = (
+        profile.minimum_positive_postfault_buckets > 0
+        or profile.minimum_mean_throughput_retention > 0
+    )
+    if "recovery_gate" not in recorded_validation and not strict:
+        # Runs sealed before the optional gate existed remain admissible when
+        # both frozen requirements default to their disabled zero values.
+        return
+    recorded = recorded_validation.get("recovery_gate")
+    if recorded != expected:
+        raise ProfiledFaultRuntimeError(
+            "recorded recovery gate differs from closed raw evidence"
+        )
 
 
 def validate_preserved_run(run_directory: Path) -> dict[str, object]:
@@ -2835,6 +2946,14 @@ def validate_preserved_run(run_directory: Path) -> dict[str, object]:
     post_mean = statistics.fmean(
         float(row["tps"]) for row in final_audit["postfault_rows"]
     )
+    recovery_gate = final_audit["recovery_gate"]
+    if not isinstance(recovery_gate, Mapping):
+        raise ProfiledFaultRuntimeError("source-blind recovery gate is malformed")
+    _verify_recorded_recovery_gate(
+        profile,
+        recorded_validation,
+        recovery_gate,
+    )
     if (
         recorded_validation.get("baseline_mean_tps") != baseline_mean
         or recorded_validation.get("postfault_mean_tps") != post_mean
@@ -2861,6 +2980,7 @@ def validate_preserved_run(run_directory: Path) -> dict[str, object]:
         "baseline_mean_tps": baseline_mean,
         "postfault_mean_tps": post_mean,
         "throughput_retention": post_mean / baseline_mean,
+        "recovery_gate": dict(recovery_gate),
     }
 
 
@@ -3158,17 +3278,20 @@ def run_once(
             crashed_replica=None,
             health=observer_progress_health,
         )
-        watermarks, source_offsets = event_tail_snapshot(profile, run_directory)
+        boundary_sources = {f"replica-{replica}" for replica in profile.replica_ids}
         boundary_poller = ConfigurationBoundaryPoller(
             profile,
             run_directory,
-            watermarks=watermarks,
-            offsets=source_offsets,
+            watermarks={source: -1 for source in boundary_sources},
+            offsets={source: 0 for source in boundary_sources},
         )
-        update_state("awaiting_fresh_tree_30")
+        update_state("awaiting_current_fault_tree")
         boundary = dict(
             wait_until(
-                "fresh exact common epoch-zero tree-30 boundary",
+                (
+                    "current exact common epoch-zero tree-"
+                    f"{profile.fault.tree_id} boundary"
+                ),
                 boundary_poller.poll,
                 phase_timeout_s=profile.startup_timeout_s,
                 hard_deadline_ns=hard_deadline_ns,
@@ -3460,6 +3583,7 @@ def run_once(
                         post_mean / baseline_mean if baseline_mean > 0 else None
                     ),
                     "throughput_retention_claim": "descriptive_only",
+                    "recovery_gate": final_audit["recovery_gate"],
                     "measurement_windows": manifest["measurement_windows"],
                     "pre_fault_common_commit": final_audit["pre_fault_common_commit"],
                     "post_fault_common_commit": final_audit["post_fault_common_commit"],
@@ -3480,6 +3604,8 @@ def run_once(
                 "error": validation_error,
                 "run_id": run_id,
             }
+            if isinstance(exc, RecoveryGateFailure):
+                validation["recovery_gate"] = exc.recovery_gate
 
     try:
         runtime_artifacts = final_artifact_inventory(

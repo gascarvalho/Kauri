@@ -50,6 +50,8 @@ class FrozenProfile:
     bucket_width_s: int
     baseline_bucket_count: int
     post_bucket_count: int
+    minimum_positive_postfault_buckets: int
+    minimum_mean_throughput_retention: float
     aggregation_timeout_s: float
     leader_progress_timeout_s: float
     leader_activation_grace_s: float
@@ -76,6 +78,15 @@ def _positive_number(value: object, name: str) -> float:
     result = float(value)
     if not math.isfinite(result) or result <= 0:
         _error(f"{name} must be positive and finite")
+    return result
+
+
+def _nonnegative_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _error(f"{name} must be a number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        _error(f"{name} must be non-negative and finite")
     return result
 
 
@@ -224,6 +235,14 @@ def load_frozen_profile(path: Path) -> FrozenProfile:
         doc.get("baseline_bucket_count", 6), "baseline bucket count"
     )
     post_buckets = _integer(doc.get("post_bucket_count", 6), "post bucket count")
+    minimum_positive_postfault_buckets = _integer(
+        doc.get("minimum_positive_postfault_buckets", 0),
+        "minimum positive postfault buckets",
+    )
+    minimum_mean_throughput_retention = _nonnegative_number(
+        doc.get("minimum_mean_throughput_retention", 0.0),
+        "minimum mean throughput retention",
+    )
     activation_delay = _integer(
         doc.get("activation_delay_blocks", 5), "activation delay blocks"
     )
@@ -239,6 +258,11 @@ def load_frozen_profile(path: Path) -> FrozenProfile:
         < 1
     ):
         _error("runtime sizes, buckets, and delays must be positive")
+    if not 0 <= minimum_positive_postfault_buckets <= post_buckets:
+        _error(
+            "minimum positive postfault buckets must be between zero and "
+            "the frozen postfault bucket count"
+        )
     aggregation_timeout = _positive_number(
         doc.get("aggregation_timeout_s", 0.5), "aggregation timeout"
     )
@@ -290,6 +314,8 @@ def load_frozen_profile(path: Path) -> FrozenProfile:
         bucket_width,
         baseline_buckets,
         post_buckets,
+        minimum_positive_postfault_buckets,
+        minimum_mean_throughput_retention,
         aggregation_timeout,
         leader_timeout,
         activation_grace,
