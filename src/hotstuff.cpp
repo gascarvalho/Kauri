@@ -4151,15 +4151,18 @@ namespace hotstuff
         };
 
         const auto lease = proposal_contexts->acquire_open_context(key);
-        const auto active = proposal_contexts->active_configuration();
         const auto *tree = find_exact_runtime_tree(key.configuration);
         const auto generation = find_exact_runtime_generation(
             key.configuration);
+        const bool may_drain_exact_configuration =
+            adaptive_epoch_runtime != nullptr &&
+            adaptive_epoch_runtime->activation.may_drain_exact_context(
+                key.configuration);
         if (!lease.has_value() ||
             lease->generation() != context_generation ||
             lease->tree().root != get_id() ||
             lease->tree().parent.has_value() ||
-            !active.has_value() || *active != key.configuration ||
+            !may_drain_exact_configuration ||
             tree == nullptr ||
             !generation.has_value() || *generation != job->epoch_generation ||
             adaptive_epoch_runtime == nullptr ||
@@ -4190,43 +4193,61 @@ namespace hotstuff
             return;
         }
 
-        const bool had_pending_refresh_batch =
-            !job->pending_pre_quorum_refresh_batch.empty();
+        if (!job->pre_quorum_retry_armed)
+        {
+            std::set<ReplicaID> missing_members;
+            for (const auto member : lease->tree().assigned_subtree)
+                if (member != get_id() &&
+                    before->verified_signers.count(member) == 0 &&
+                    missing_members.insert(member).second)
+                    job->pre_quorum_retry_targets.push_back(member);
+            if (job->pre_quorum_retry_targets.empty())
+            {
+                erase_job();
+                return;
+            }
+            job->pre_quorum_retry_armed = true;
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=pre_qc_retry "
+                "outcome=armed reason=fresh_first root=%u epoch=%u tree=%u "
+                "block=%s verified=%zu quorum=%zu candidates=%zu attempts=%zu "
+                "budget=%zu",
+                static_cast<unsigned>(get_id()),
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.block_hash.to_hex().c_str(),
+                before->verified_signers.size(),
+                *quorum,
+                job->pre_quorum_retry_targets.size(),
+                job->total_send_attempts,
+                job->total_attempt_budget);
+        }
+
         const auto retry_cursor_before = job->pre_quorum_retry_cursor;
         const auto attempts_before = job->total_send_attempts;
         ++job->completed_stages;
         if (!job->pending_pre_quorum_refresh_batch.empty())
             static_cast<void>(
                 broadcast_exact_proposal_pre_quorum_retry(*lease, *job));
-        else if (job->pre_quorum_retry_armed)
+
+        const auto refreshed = proposal_contexts->snapshot(key);
+        if (!refreshed.has_value())
         {
-            const auto missing_votes =
-                *quorum - before->verified_signers.size();
-            const auto remaining_budget =
-                job->total_attempt_budget - job->total_send_attempts;
-            const auto maximum_attempts = std::min(
-                {missing_votes, job->stage_target_limit, remaining_budget});
-            static_cast<void>(
-                reserve_exact_proposal_pre_quorum_refresh(
-                    *lease, *job, maximum_attempts));
+            erase_job();
+            return;
         }
-        else
-            static_cast<void>(broadcast_exact_proposal_fallback(
-                *lease,
-                job->epoch_generation,
-                *job->proposal,
-                job->target_cursor,
-                job->total_send_attempts,
-                job->attempted_targets,
-                job->quorum_observed,
-                job->total_attempt_budget,
-                job->stage_target_limit,
-                job->completed_stages));
-        if (job->quorum_observed)
+        if (refreshed->verified_signers.size() >= *quorum)
         {
+            arm_exact_proposal_repair_tail(*lease);
             job->dispatching = false;
             return;
         }
+        const auto remaining_budget =
+            job->total_attempt_budget - job->total_send_attempts;
+        const auto maximum_attempts = std::min(
+            job->stage_target_limit, remaining_budget);
+        static_cast<void>(reserve_exact_proposal_pre_quorum_refresh(
+            *lease, *job, maximum_attempts));
 
         const auto next_lease =
             proposal_contexts->acquire_open_context(key);
@@ -4258,7 +4279,6 @@ namespace hotstuff
         if (job->pre_quorum_retry_armed)
         {
             const bool no_reservation_progress =
-                !had_pending_refresh_batch &&
                 job->pending_pre_quorum_refresh_batch.empty() &&
                 job->pre_quorum_retry_cursor == retry_cursor_before &&
                 job->total_send_attempts == attempts_before;
@@ -4272,35 +4292,6 @@ namespace hotstuff
                 erase_job();
                 return;
             }
-        }
-        else if (job->target_cursor >=
-                 next_lease->tree().assigned_subtree.size())
-        {
-            std::set<ReplicaID> retry_members;
-            for (const auto member : job->attempted_targets)
-                if (after->verified_signers.count(member) == 0 &&
-                    retry_members.insert(member).second)
-                    job->pre_quorum_retry_targets.push_back(member);
-            if (job->pre_quorum_retry_targets.empty())
-            {
-                erase_job();
-                return;
-            }
-            job->pre_quorum_retry_armed = true;
-            HOTSTUFF_LOG_INFO(
-                "KAURI_PROPOSAL_BROADCAST stage=pre_qc_retry "
-                "outcome=armed root=%u epoch=%u tree=%u block=%s "
-                "verified=%zu quorum=%zu candidates=%zu attempts=%zu "
-                "budget=%zu",
-                static_cast<unsigned>(get_id()),
-                key.configuration.epoch_number,
-                key.configuration.tree_id,
-                key.block_hash.to_hex().c_str(),
-                after->verified_signers.size(),
-                *quorum,
-                job->pre_quorum_retry_targets.size(),
-                job->total_send_attempts,
-                job->total_attempt_budget);
         }
 
         bool rearm_failed = false;
@@ -4350,17 +4341,10 @@ namespace hotstuff
             rearm_failed = true;
         }
 
-        // Failure to rearm must not weaken the previous all-member fallback
-        // liveness boundary.  Drain each not-yet-visited target once; normal
-        // operation remains fanout-capped and every target is still attempted
-        // at most once.
+        // A scheduler failure gets one bounded chance to use replacements that
+        // are already live. It never falls back to a blind send.
         if (!rearm_failed)
             return;
-        if (job->pre_quorum_retry_armed)
-        {
-            erase_job();
-            return;
-        }
         const auto drain_lease =
             proposal_contexts->acquire_open_context(key);
         if (!drain_lease.has_value() ||
@@ -4369,22 +4353,10 @@ namespace hotstuff
             erase_job();
             return;
         }
-        ++job->completed_stages;
-        static_cast<void>(broadcast_exact_proposal_fallback(
-            *drain_lease,
-            job->epoch_generation,
-            *job->proposal,
-            job->target_cursor,
-            job->total_send_attempts,
-            job->attempted_targets,
-            job->quorum_observed,
-            job->total_attempt_budget,
-            std::numeric_limits<std::size_t>::max(),
-            job->completed_stages));
-        if (job->quorum_observed)
-            job->dispatching = false;
-        else
-            erase_job();
+        if (!job->pending_pre_quorum_refresh_batch.empty())
+            static_cast<void>(broadcast_exact_proposal_pre_quorum_retry(
+                *drain_lease, *job));
+        erase_job();
     }
 
     void HotStuffBase::arm_exact_proposal_repair_tail(
@@ -4506,11 +4478,13 @@ namespace hotstuff
         job->dispatching = true;
         job->cancellation = {};
 
-        const auto active = proposal_contexts->active_configuration();
         const auto generation = find_exact_runtime_generation(
             job->key.configuration);
-        if (!active.has_value() ||
-            *active != job->key.configuration ||
+        const bool may_drain_exact_configuration =
+            adaptive_epoch_runtime != nullptr &&
+            adaptive_epoch_runtime->activation.may_drain_exact_context(
+                job->key.configuration);
+        if (!may_drain_exact_configuration ||
             !generation.has_value() ||
             *generation != job->epoch_generation ||
             adaptive_epoch_runtime == nullptr ||
@@ -4698,7 +4672,6 @@ namespace hotstuff
             job.key != lease.key() || lease.tree().root != get_id() ||
             lease.tree().parent.has_value() ||
             !job.pre_quorum_retry_armed ||
-            !job.pending_pre_quorum_refresh_batch.empty() ||
             maximum_attempts == 0)
             return false;
         std::size_t refresh_attempts = 0;
@@ -4743,8 +4716,8 @@ namespace hotstuff
                         : now + job.refresh_observation_window;
                 job.pending_pre_quorum_refresh_batch.push_back(
                     {member, old_connection, observation_deadline});
+                job.attempted_targets.push_back(member);
                 ++refresh_attempts;
-                ++job.total_send_attempts;
                 const bool old_terminated =
                     old_connection != nullptr &&
                     old_connection->is_terminated();
@@ -4754,7 +4727,7 @@ namespace hotstuff
                     "KAURI_PROPOSAL_BROADCAST "
                     "stage=pre_qc_refresh_target_result root=%u target=%u "
                     "epoch=%u tree=%u block=%s stage=%u refresh=%s "
-                    "old_terminated=%u credit=%zu total=%zu budget=%zu",
+                    "old_terminated=%u reserved=%zu total=%zu budget=%zu",
                     static_cast<unsigned>(get_id()),
                     static_cast<unsigned>(member),
                     job.key.configuration.epoch_number,
@@ -4937,7 +4910,26 @@ namespace hotstuff
                         job.total_attempt_budget);
                     continue;
                 }
+                if (job.total_send_attempts >= job.total_attempt_budget)
+                {
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_PROPOSAL_BROADCAST "
+                        "stage=pre_qc_retry_target_result outcome="
+                        "budget_exhausted_no_dispatch root=%u target=%u "
+                        "epoch=%u tree=%u block=%s stage=%u total=%zu "
+                        "budget=%zu",
+                        static_cast<unsigned>(get_id()),
+                        static_cast<unsigned>(pending.target),
+                        job.key.configuration.epoch_number,
+                        job.key.configuration.tree_id,
+                        job.key.block_hash.to_hex().c_str(),
+                        job.completed_stages,
+                        job.total_send_attempts,
+                        job.total_attempt_budget);
+                    continue;
+                }
                 ++send_attempts;
+                ++job.total_send_attempts;
                 const auto deferred_id =
                     is_adaptive_epoch_mode(epoch_protocol_mode)
                         ? pn.send_msg_deferred(
