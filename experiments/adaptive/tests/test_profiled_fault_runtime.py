@@ -1182,3 +1182,200 @@ def test_configuration_boundary_poller_accepts_current_stable_tree_zero(
     assert boundary is not None
     assert boundary["tree_id"] == 0
     assert boundary["root_replica"] == 0
+
+
+def test_replica_overlay_is_actor_only_and_empty_overlay_is_identity() -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(PROFILE_PATH)
+    base_commands = tuple(
+        ("hotstuff-app", "--idx", str(replica_id)) for replica_id in profile.replica_ids
+    )
+    empty = {replica_id: () for replica_id in profile.replica_ids}
+
+    assert (
+        runtime.apply_replica_overlays(profile, base_commands, empty) == base_commands
+    )
+
+    actor_only = dict(empty)
+    actor_only[30] = ("--experiment-false-report-target", "1")
+    overlaid = runtime.apply_replica_overlays(
+        profile,
+        base_commands,
+        actor_only,
+    )
+
+    assert overlaid[30] == (
+        *base_commands[30],
+        "--experiment-false-report-target",
+        "1",
+    )
+    assert all(
+        command == base_commands[replica_id]
+        for replica_id, command in enumerate(overlaid)
+        if replica_id != 30
+    )
+
+
+@pytest.mark.parametrize("corruption", ("missing", "extra", "string"))
+def test_replica_overlay_rejects_membership_or_argv_drift(corruption: str) -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(PROFILE_PATH)
+    commands = tuple(("app", str(value)) for value in profile.replica_ids)
+    overlays: dict[int, object] = {replica_id: () for replica_id in profile.replica_ids}
+    if corruption == "missing":
+        overlays.pop(30)
+    elif corruption == "extra":
+        overlays[31] = ()
+    else:
+        overlays[30] = "--not-an-argv-sequence"
+
+    with pytest.raises(
+        runtime.ProfiledFaultRuntimeError,
+        match="overlay|membership|malformed",
+    ):
+        runtime.apply_replica_overlays(profile, commands, overlays)
+
+
+def test_write_runtime_inputs_default_and_explicit_clean_overlay_are_equivalent(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(PROFILE_PATH)
+    bls = [
+        {"pub": f"bls-pub-{replica}", "sec": f"bls-sec-{replica}"}
+        for replica in profile.replica_ids
+    ]
+    tls = [
+        {
+            "crt": f"tls-crt-{identity}",
+            "sec": f"tls-sec-{identity}",
+            "cid": f"tls-cid-{identity}",
+        }
+        for identity in range(len(profile.replica_ids) + 1)
+    ]
+    issuer = {"pub": "issuer-pub", "sec": "issuer-sec"}
+    instances = {
+        f"replica-{replica}": f"instance-{replica}" for replica in profile.replica_ids
+    }
+    instances[runtime.MANAGER_SOURCE_ID] = "manager-instance"
+    default_directory = tmp_path / "default"
+    explicit_directory = tmp_path / "explicit"
+    for directory in (default_directory, explicit_directory):
+        for child in ("config", "runtime", "raw"):
+            (directory / child).mkdir(parents=True, exist_ok=True)
+        for identity_file in (
+            "bls-identities.txt",
+            "tls-identities.txt",
+            "issuer-identities.txt",
+        ):
+            (directory / "config" / identity_file).write_text(
+                f"synthetic {identity_file}\n",
+                encoding="utf-8",
+            )
+
+    common = {
+        "app_binary": Path("/build/hotstuff-app"),
+        "manager_binary": Path("/build/adaptation-manager"),
+        "bls": bls,
+        "tls": tls,
+        "issuer": issuer,
+        "run_id": "run-n31-clean-equivalence",
+        "source_instances": instances,
+    }
+    default = runtime.write_runtime_inputs(
+        profile,
+        run_directory=default_directory,
+        **common,
+    )
+    explicit = runtime.write_runtime_inputs(
+        profile,
+        run_directory=explicit_directory,
+        replica_overlays={replica_id: () for replica_id in profile.replica_ids},
+        **common,
+    )
+
+    def normalize(value: object, directory: Path) -> object:
+        return json.loads(json.dumps(value).replace(str(directory), "<run-directory>"))
+
+    assert normalize(default[:2], default_directory) == normalize(
+        explicit[:2], explicit_directory
+    )
+    assert [
+        (item["kind"], item["replica_id"], item["path"]) for item in default[2]
+    ] == [(item["kind"], item["replica_id"], item["path"]) for item in explicit[2]]
+    assert normalize(
+        json.loads((default_directory / "runtime/launch-arguments.json").read_text()),
+        default_directory,
+    ) == normalize(
+        json.loads((explicit_directory / "runtime/launch-arguments.json").read_text()),
+        explicit_directory,
+    )
+
+
+def test_configuration_boundary_poller_can_target_tree_zero_on_crash_profile(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(PROFILE_PATH)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    sources = [f"replica-{replica}" for replica in profile.replica_ids]
+    for replica, source in zip(profile.replica_ids, sources, strict=True):
+        payload = _configuration_payload(replica)
+        payload["tree_id"] = 0
+        event = {
+            "source_sequence": 1,
+            "source_monotonic_ns": 34_000_000_000,
+            "event_type": "adaptive.configuration_active",
+            "payload": payload,
+        }
+        (raw / f"{source}.jsonl").write_text(
+            json.dumps(event, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+    boundary = runtime.ConfigurationBoundaryPoller(
+        profile,
+        tmp_path,
+        watermarks={source: -1 for source in sources},
+        offsets={source: 0 for source in sources},
+        target_tree_id=0,
+    ).poll()
+
+    assert boundary is not None
+    assert boundary["tree_id"] == 0
+    assert boundary["root_replica"] == 0
+    assert boundary["members_breadth_first"] == list(range(31))
+
+
+def test_cleanup_without_faulted_replica_never_classifies_expected_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    process = _CleanupProcess(8301)
+    record = runtime.ProcessRecord(
+        name="replica-1",
+        replica_id=1,
+        pid=process.pid,
+        pgid=process.pid,
+        process=process,
+    )
+    monkeypatch.setattr(runtime, "monotonic_raw_ns", lambda: CLEANUP_STARTED_NS)
+    monkeypatch.setattr(runtime.os, "getpgid", lambda pid: pid)
+
+    def killpg(_pgid: int, signal_number: int) -> None:
+        if signal_number == 2:
+            process.returncode = -2
+
+    monkeypatch.setattr(runtime.os, "killpg", killpg)
+
+    ledger, started_ns = runtime.concurrent_cleanup(
+        (record,),
+        faulted_replica_id=None,
+        post_end_ns=POST_END_NS,
+    )
+
+    assert started_ns == CLEANUP_STARTED_NS
+    assert ledger[0]["classification"] == "expected_cleanup"
+    assert ledger[0]["classification"] != "expected_fault"
+    assert ledger[0]["cleanup_started_after_post_window"] is True

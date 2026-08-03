@@ -1085,6 +1085,41 @@ def normalized_manager_argv(command: Sequence[str]) -> list[str]:
     return normalized
 
 
+def apply_replica_overlays(
+    profile: FrozenProfile,
+    commands: Sequence[Sequence[str]],
+    replica_overlays: Mapping[int, Sequence[str]],
+) -> tuple[tuple[str, ...], ...]:
+    """Append exact actor-local arguments without changing base launch order."""
+
+    if len(commands) != len(profile.replica_ids):
+        raise ProfiledFaultRuntimeError(
+            "replica overlays require one base command per replica"
+        )
+    if set(replica_overlays) != set(profile.replica_ids):
+        raise ProfiledFaultRuntimeError(
+            "replica overlays require the exact frozen replica membership"
+        )
+    result: list[tuple[str, ...]] = []
+    for position, replica_id in enumerate(profile.replica_ids):
+        command = commands[position]
+        overlay = replica_overlays[replica_id]
+        if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
+            raise ProfiledFaultRuntimeError(
+                f"base replica command is malformed for replica-{replica_id}"
+            )
+        if isinstance(overlay, (str, bytes)) or not isinstance(overlay, Sequence):
+            raise ProfiledFaultRuntimeError(
+                f"replica overlay is malformed for replica-{replica_id}"
+            )
+        if any(not isinstance(argument, str) or not argument for argument in overlay):
+            raise ProfiledFaultRuntimeError(
+                f"replica overlay contains an invalid argument for replica-{replica_id}"
+            )
+        result.append((*tuple(command), *tuple(overlay)))
+    return tuple(result)
+
+
 def write_runtime_inputs(
     profile: FrozenProfile,
     *,
@@ -1096,6 +1131,7 @@ def write_runtime_inputs(
     issuer: Mapping[str, str],
     run_id: str,
     source_instances: Mapping[str, str],
+    replica_overlays: Mapping[int, Sequence[str]] | None = None,
 ) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...], list[dict[str, object]]]:
     config_directory = run_directory / "config"
     main_config = config_directory / "main.conf"
@@ -1130,6 +1166,12 @@ def write_runtime_inputs(
         app_binary=app_binary,
         config_directory=config_directory,
     )
+    if replica_overlays is not None:
+        replica_commands = apply_replica_overlays(
+            profile,
+            replica_commands,
+            replica_overlays,
+        )
     manager_command = manager_argv(
         profile,
         manager_binary=manager_binary,
@@ -1518,6 +1560,7 @@ class ConfigurationBoundaryPoller:
         *,
         watermarks: Mapping[str, int],
         offsets: Mapping[str, int],
+        target_tree_id: int | None = None,
     ) -> None:
         self.profile = profile
         self.paths = {
@@ -1528,6 +1571,13 @@ class ConfigurationBoundaryPoller:
             raise ProfiledFaultRuntimeError(
                 "configuration poller requires exact source watermarks"
             )
+        if target_tree_id is not None and target_tree_id not in profile.replica_ids:
+            raise ProfiledFaultRuntimeError(
+                "configuration poller target tree is outside membership"
+            )
+        self.target_tree_id = (
+            profile.fault.tree_id if target_tree_id is None else target_tree_id
+        )
         self.watermarks = dict(watermarks)
         self.offsets = dict(offsets)
         self.pending = {source: b"" for source in self.paths}
@@ -1567,7 +1617,7 @@ class ConfigurationBoundaryPoller:
 
     def poll(self) -> dict[str, object] | None:
         self._consume()
-        target_tree = self.profile.fault.tree_id
+        target_tree = self.target_tree_id
         candidates: dict[str, list[dict[str, Any]]] = {}
         for replica in self.profile.replica_ids:
             source = f"replica-{replica}"
@@ -1643,6 +1693,11 @@ class ConfigurationBoundaryPoller:
                 "global_quorum": self.profile.quorum,
                 "members_breadth_first": list(
                     self.profile.epoch0_members_breadth_first
+                    if target_tree == self.profile.fault.tree_id
+                    else (
+                        self.profile.replica_ids[target_tree:]
+                        + self.profile.replica_ids[:target_tree]
+                    )
                 ),
                 "replica_evidence": [
                     {
@@ -2052,7 +2107,7 @@ def wait_for_fixed_postfault_window(
 def concurrent_cleanup(
     records: Sequence[ProcessRecord],
     *,
-    faulted_replica_id: int,
+    faulted_replica_id: int | None,
     post_end_ns: int | None,
 ) -> tuple[list[dict[str, object]], int]:
     cleanup_started_ns = monotonic_raw_ns()
@@ -2153,7 +2208,18 @@ def concurrent_cleanup(
             classification = "expected_fault"
         elif record.name == MANAGER_SOURCE_ID and sent[record.name] and returncode == 1:
             classification = "expected_cleanup"
-        elif record.replica_id >= 0 and sent[record.name] and returncode == 0:
+        elif (
+            record.replica_id >= 0
+            and sent[record.name]
+            and (
+                returncode == 0
+                or (
+                    faulted_replica_id is None
+                    and returncode == -signal.SIGINT
+                    and int(signal.SIGINT) in sent[record.name]
+                )
+            )
+        ):
             classification = "expected_cleanup"
         elif (
             record.replica_id >= 0

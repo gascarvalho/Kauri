@@ -19,9 +19,7 @@ import pytest
 
 
 def _faults() -> ModuleType:
-    return importlib.import_module(
-        "experiments.adaptive.kauri_experiment.faults"
-    )
+    return importlib.import_module("experiments.adaptive.kauri_experiment.faults")
 
 
 def _scenario(faults: ModuleType, **overrides: Any) -> Any:
@@ -85,6 +83,23 @@ def _persistent_omission(
     return action(
         fault_id=fault_id,
         replica_id=replica_id,
+        diagnostic_window=diagnostic_window,
+    )
+
+
+def _direct_vote_omission(
+    faults: ModuleType,
+    *,
+    fault_id: str = "direct-vote-omission-2-to-1",
+    replica_id: int = 2,
+    parent_id: int = 1,
+    diagnostic_window: str = "diagnostic-window-1",
+) -> Any:
+    action = _required_symbol(faults, "StaticPersistentDirectVoteOmission")
+    return action(
+        fault_id=fault_id,
+        replica_id=replica_id,
+        parent_id=parent_id,
         diagnostic_window=diagnostic_window,
     )
 
@@ -379,6 +394,60 @@ def test_static_persistent_omission_action_is_public() -> None:
     assert action.diagnostic_window == "diagnostic-window-1"
 
 
+def test_static_persistent_direct_vote_omission_is_canonical_and_actor_local() -> None:
+    faults = _faults()
+    action = _direct_vote_omission(faults)
+    plan = faults.FaultPlan(
+        context=_diagnostic_scenario(faults, diagnostic_fault_bound=1),
+        seed=1729,
+        actions=(action,),
+    )
+
+    assert action.replica_id == 2
+    assert action.parent_id == 1
+    assert action.diagnostic_window == "diagnostic-window-1"
+    assert json.loads(plan.canonical_json())["actions"] == [
+        {
+            "diagnostic_window": "diagnostic-window-1",
+            "fault_id": "direct-vote-omission-2-to-1",
+            "kind": "static_persistent_direct_vote_omission",
+            "parent_id": 1,
+            "replica_id": 2,
+        }
+    ]
+    assert plan.manager_cli_args() == ()
+    assert plan.replica_cli_args(1) == ()
+    assert plan.replica_cli_args(2) == (
+        "--experiment-byzantine-window",
+        "diagnostic-window-1",
+        "--experiment-omit-outbound-direct-vote",
+    )
+
+
+@pytest.mark.parametrize(
+    ("replica_id", "parent_id", "message"),
+    ((2, 2, "distinct"), (7, 1, "membership|replica"), (2, 7, "membership|replica")),
+)
+def test_direct_vote_omission_requires_distinct_members(
+    replica_id: int,
+    parent_id: int,
+    message: str,
+) -> None:
+    faults = _faults()
+
+    with pytest.raises(ValueError, match=message):
+        action = _direct_vote_omission(
+            faults,
+            replica_id=replica_id,
+            parent_id=parent_id,
+        )
+        faults.FaultPlan(
+            context=_diagnostic_scenario(faults, diagnostic_fault_bound=1),
+            seed=1729,
+            actions=(action,),
+        )
+
+
 def test_static_diagnostic_actions_are_canonical_and_manager_blind() -> None:
     faults = _faults()
     plan = faults.FaultPlan(
@@ -414,9 +483,9 @@ def test_static_diagnostic_actions_are_canonical_and_manager_blind() -> None:
         separators=(",", ":"),
         sort_keys=True,
     )
-    assert plan.sha256 == hashlib.sha256(
-        plan.canonical_json().encode("utf-8")
-    ).hexdigest()
+    assert (
+        plan.sha256 == hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
+    )
 
     # Ground-truth modes and identities remain orchestrator/validator data.
     # The manager observes the resulting authenticated evidence only.
@@ -544,10 +613,7 @@ def test_diagnostic_plan_and_journal_preserve_one_canonical_identity(
     assert [event["source_sequence"] for event in events] == [0, 1]
     assert {event["plan_sha256"] for event in events} == {plan.sha256}
     assert all(event["lifecycle"] == "terminal" for event in events)
-    assert all(
-        event["outcome"] == {"status": "not_reached"}
-        for event in events
-    )
+    assert all(event["outcome"] == {"status": "not_reached"} for event in events)
 
 
 def test_fault_journal_flushes_a_contiguous_readable_lifecycle(
@@ -569,8 +635,7 @@ def test_fault_journal_flushes_a_contiguous_readable_lifecycle(
         )
 
         partial = [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
         ]
         assert len(partial) == 1
         assert partial[0]["source_sequence"] == 0
@@ -585,8 +650,7 @@ def test_fault_journal_flushes_a_contiguous_readable_lifecycle(
         )
 
     events = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
     ]
     assert [event["schema_version"] for event in events] == [1, 1]
     assert [event["source_sequence"] for event in events] == [0, 1]
@@ -635,8 +699,7 @@ def test_fault_journal_rejects_a_non_monotonic_timestamp_without_corruption(
             )
 
     remaining = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
     ]
     assert len(remaining) == 1
     assert remaining[0]["source_sequence"] == 0
@@ -659,17 +722,13 @@ def test_fault_lifecycle_finalizes_every_unstarted_action_once(
         lifecycle.finalize()
 
     events = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
     ]
     assert [event["fault_id"] for event in events] == [
         action.fault_id for action in plan.actions
     ]
     assert all(event["lifecycle"] == "terminal" for event in events)
-    assert all(
-        event["outcome"] == {"status": "not_reached"}
-        for event in events
-    )
+    assert all(event["outcome"] == {"status": "not_reached"} for event in events)
     assert len(events) == len(plan.actions)
 
 
@@ -711,12 +770,9 @@ def test_fault_lifecycle_closes_started_failure_and_untouched_actions(
             lifecycle.finalize()
 
     events = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
     ]
-    terminals = [
-        event for event in events if event["lifecycle"] == "terminal"
-    ]
+    terminals = [event for event in events if event["lifecycle"] == "terminal"]
     assert [event["fault_id"] for event in terminals] == [
         action.fault_id for action in plan.actions
     ]
@@ -724,9 +780,10 @@ def test_fault_lifecycle_closes_started_failure_and_untouched_actions(
         "error": expected_error,
         "status": "failed",
     }
-    assert [
-        event["outcome"]["status"] for event in terminals[1:]
-    ] == ["not_reached", "not_reached"]
+    assert [event["outcome"]["status"] for event in terminals[1:]] == [
+        "not_reached",
+        "not_reached",
+    ]
     assert len(terminals) == len(plan.actions)
 
 
@@ -756,9 +813,7 @@ def test_fault_evidence_binds_plan_journal_and_lifecycle_on_failure(
         action.fault_id for action in plan.actions
     ]
     assert all(event["lifecycle"] == "terminal" for event in events)
-    assert all(
-        event["outcome"]["status"] == "not_reached" for event in events
-    )
+    assert all(event["outcome"]["status"] == "not_reached" for event in events)
     assert {event["plan_sha256"] for event in events} == {plan.sha256}
 
 

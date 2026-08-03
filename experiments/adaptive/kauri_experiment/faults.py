@@ -18,7 +18,6 @@ import time
 from types import TracebackType
 from typing import IO, TypeAlias, TypeVar, cast
 
-
 SCHEMA_VERSION = 1
 FAULT_JOURNAL_SOURCE_ID = "fault-orchestrator"
 
@@ -99,9 +98,7 @@ class StaticAuthenticatedFalseReport:
         if self.reporter_id == self.target_id:
             raise ValueError("false reporter and target must be distinct")
         if self.reported_outcome != "timeout":
-            raise ValueError(
-                "the bounded false-report mode supports only timeout"
-            )
+            raise ValueError("the bounded false-report mode supports only timeout")
         _validate_non_empty_string(
             self.diagnostic_window,
             "diagnostic window",
@@ -125,12 +122,34 @@ class StaticPersistentOmission:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class StaticPersistentDirectVoteOmission:
+    """Omit one replica's direct vote to its exact parent in a frozen window."""
+
+    fault_id: str
+    replica_id: int
+    parent_id: int
+    diagnostic_window: str
+
+    def __post_init__(self) -> None:
+        _validate_fault_id(self.fault_id)
+        _require_integer(self.replica_id, "replica id")
+        _require_integer(self.parent_id, "parent id")
+        if self.replica_id == self.parent_id:
+            raise ValueError("direct-vote omitter and parent must be distinct")
+        _validate_non_empty_string(
+            self.diagnostic_window,
+            "diagnostic window",
+        )
+
+
 FaultAction: TypeAlias = (
     ReplicaGroupSigkill
     | SuccessorBundleAttemptDrop
     | ActivationAckDrop
     | StaticAuthenticatedFalseReport
     | StaticPersistentOmission
+    | StaticPersistentDirectVoteOmission
 )
 _ACTION_TYPES = (
     ReplicaGroupSigkill,
@@ -138,6 +157,7 @@ _ACTION_TYPES = (
     ActivationAckDrop,
     StaticAuthenticatedFalseReport,
     StaticPersistentOmission,
+    StaticPersistentDirectVoteOmission,
 )
 _ActionT = TypeVar("_ActionT", bound=FaultAction)
 
@@ -172,30 +192,22 @@ class ScenarioContext:
         crash_budget = _require_integer(self.crash_budget, "crash budget")
         maximum_crash_budget = len(self.replica_ids) - quorum
         if crash_budget < 0 or crash_budget > maximum_crash_budget:
-            raise ValueError(
-                "crash budget must preserve the configured quorum"
-            )
+            raise ValueError("crash budget must preserve the configured quorum")
 
         retry_limit = _require_integer(
             self.successor_bundle_retry_limit,
             "successor bundle retry limit",
         )
         if retry_limit < 1:
-            raise ValueError(
-                "successor bundle retry limit must be at least one"
-            )
+            raise ValueError("successor bundle retry limit must be at least one")
 
         diagnostic_fault_bound = _require_integer(
             self.diagnostic_fault_bound,
             "diagnostic fault bound",
         )
-        if (
-            diagnostic_fault_bound < 0
-            or diagnostic_fault_bound > crash_budget
-        ):
+        if diagnostic_fault_bound < 0 or diagnostic_fault_bound > crash_budget:
             raise ValueError(
-                "diagnostic fault bound must be within the consensus "
-                "fault budget"
+                "diagnostic fault bound must be within the consensus " "fault budget"
             )
 
 
@@ -220,13 +232,12 @@ class FaultPlan:
         activation_ack_count = 0
         false_reporters: set[int] = set()
         persistent_omitters: set[int] = set()
+        direct_vote_omitters: set[int] = set()
         diagnostic_windows: set[str] = set()
 
         for action in self.actions:
             if type(action) not in _ACTION_TYPES:
-                raise TypeError(
-                    "fault plan contains an unsupported action type"
-                )
+                raise TypeError("fault plan contains an unsupported action type")
 
             fault_id = _validate_fault_id(action.fault_id)
             if fault_id in fault_ids:
@@ -238,17 +249,14 @@ class FaultPlan:
                 self._validate_replica_membership(crash.replica_id)
                 if crash.replica_id in crash_replicas:
                     raise ValueError(
-                        "replica group SIGKILL may target each replica "
-                        "at most once"
+                        "replica group SIGKILL may target each replica " "at most once"
                     )
                 crash_replicas.add(crash.replica_id)
             elif type(action) is SuccessorBundleAttemptDrop:
                 bundle = cast(SuccessorBundleAttemptDrop, action)
                 self._validate_replica_membership(bundle.replica_id)
                 if not (
-                    1
-                    <= bundle.attempt
-                    <= self.context.successor_bundle_retry_limit
+                    1 <= bundle.attempt <= self.context.successor_bundle_retry_limit
                 ):
                     raise ValueError(
                         "successor bundle attempt is outside the "
@@ -262,10 +270,7 @@ class FaultPlan:
                 bundle_controls.add(control)
             elif type(action) is ActivationAckDrop:
                 acknowledgement = cast(ActivationAckDrop, action)
-                if (
-                    acknowledgement.accepted_activation_ordinal
-                    != self.context.quorum
-                ):
+                if acknowledgement.accepted_activation_ordinal != self.context.quorum:
                     raise ValueError(
                         "activation ACK drop must target the "
                         "quorum-completing ordinal"
@@ -276,55 +281,44 @@ class FaultPlan:
                     StaticAuthenticatedFalseReport,
                     action,
                 )
-                self._validate_replica_membership(
-                    false_report.reporter_id
-                )
-                self._validate_replica_membership(
-                    false_report.target_id
-                )
+                self._validate_replica_membership(false_report.reporter_id)
+                self._validate_replica_membership(false_report.target_id)
                 false_reporters.add(false_report.reporter_id)
-                diagnostic_windows.add(
-                    false_report.diagnostic_window
-                )
-            else:
+                diagnostic_windows.add(false_report.diagnostic_window)
+            elif type(action) is StaticPersistentOmission:
                 omission = cast(StaticPersistentOmission, action)
                 self._validate_replica_membership(omission.replica_id)
                 persistent_omitters.add(omission.replica_id)
+                diagnostic_windows.add(omission.diagnostic_window)
+            else:
+                omission = cast(StaticPersistentDirectVoteOmission, action)
+                self._validate_replica_membership(omission.replica_id)
+                self._validate_replica_membership(omission.parent_id)
+                direct_vote_omitters.add(omission.replica_id)
                 diagnostic_windows.add(omission.diagnostic_window)
 
         if len(crash_replicas) > self.context.crash_budget:
             raise ValueError("fault plan exceeds the scenario crash budget")
         if len(bundle_controls) > 1:
-            raise ValueError(
-                "the manager supports one successor bundle drop control"
-            )
+            raise ValueError("the manager supports one successor bundle drop control")
         if activation_ack_count > 1:
+            raise ValueError("the manager supports one activation ACK drop control")
+        omission_identities = persistent_omitters | direct_vote_omitters
+        if false_reporters & omission_identities:
             raise ValueError(
-                "the manager supports one activation ACK drop control"
+                "false-reporter and persistent-omission sets must " "be disjoint"
             )
-        if false_reporters & persistent_omitters:
-            raise ValueError(
-                "false-reporter and persistent-omission sets must "
-                "be disjoint"
-            )
-        diagnostic_identities = false_reporters | persistent_omitters
-        if (
-            len(diagnostic_identities)
-            > self.context.diagnostic_fault_bound
-        ):
-            raise ValueError(
-                "fault plan exceeds the diagnostic fault bound"
-            )
+        if persistent_omitters & direct_vote_omitters:
+            raise ValueError("aggregate and direct-vote omission sets must be disjoint")
+        diagnostic_identities = false_reporters | omission_identities
+        if len(diagnostic_identities) > self.context.diagnostic_fault_bound:
+            raise ValueError("fault plan exceeds the diagnostic fault bound")
         if len(diagnostic_windows) > 1:
-            raise ValueError(
-                "diagnostic fault modes must share one frozen window"
-            )
+            raise ValueError("diagnostic fault modes must share one frozen window")
 
     def _validate_replica_membership(self, replica_id: int) -> None:
         if replica_id not in self.context.replica_ids:
-            raise ValueError(
-                f"replica {replica_id} is outside scenario membership"
-            )
+            raise ValueError(f"replica {replica_id} is outside scenario membership")
 
     def actions_of_type(
         self,
@@ -410,6 +404,22 @@ class FaultPlan:
                         "--experiment-omit-outbound-aggregate",
                     )
                 )
+            elif (
+                type(action) is StaticPersistentDirectVoteOmission
+                and cast(
+                    StaticPersistentDirectVoteOmission,
+                    action,
+                ).replica_id
+                == replica_id
+            ):
+                omission = cast(StaticPersistentDirectVoteOmission, action)
+                arguments.extend(
+                    (
+                        "--experiment-byzantine-window",
+                        omission.diagnostic_window,
+                        "--experiment-omit-outbound-direct-vote",
+                    )
+                )
         return tuple(arguments)
 
     def canonical_json(self) -> str:
@@ -418,18 +428,12 @@ class FaultPlan:
             "crash_budget": self.context.crash_budget,
             "quorum": self.context.quorum,
             "replica_ids": list(self.context.replica_ids),
-            "successor_bundle_retry_limit": (
-                self.context.successor_bundle_retry_limit
-            ),
+            "successor_bundle_retry_limit": (self.context.successor_bundle_retry_limit),
         }
         if self.context.diagnostic_fault_bound:
-            scenario["diagnostic_fault_bound"] = (
-                self.context.diagnostic_fault_bound
-            )
+            scenario["diagnostic_fault_bound"] = self.context.diagnostic_fault_bound
         value = {
-            "actions": [
-                self._canonical_action(action) for action in self.actions
-            ],
+            "actions": [self._canonical_action(action) for action in self.actions],
             "scenario": scenario,
             "schema_version": SCHEMA_VERSION,
             "seed": self.seed,
@@ -491,6 +495,15 @@ class FaultPlan:
                 "diagnostic_window": omission.diagnostic_window,
                 "fault_id": omission.fault_id,
                 "kind": "static_persistent_omission",
+                "replica_id": omission.replica_id,
+            }
+        if type(action) is StaticPersistentDirectVoteOmission:
+            omission = cast(StaticPersistentDirectVoteOmission, action)
+            return {
+                "diagnostic_window": omission.diagnostic_window,
+                "fault_id": omission.fault_id,
+                "kind": "static_persistent_direct_vote_omission",
+                "parent_id": omission.parent_id,
                 "replica_id": omission.replica_id,
             }
         raise TypeError("unsupported fault action type")
@@ -569,10 +582,7 @@ class FaultJournal:
         )
         if timestamp < 0:
             raise ValueError("source monotonic timestamp must be non-negative")
-        if (
-            self._last_monotonic_ns is not None
-            and timestamp < self._last_monotonic_ns
-        ):
+        if self._last_monotonic_ns is not None and timestamp < self._last_monotonic_ns:
             raise ValueError("source monotonic timestamp regressed")
 
         event: dict[str, object] = {
@@ -712,9 +722,7 @@ class FaultEvidence:
         self._plan = plan
         self._monotonic_ns = monotonic_ns
         self._plan_path = self._run_directory / "fault-plan.json"
-        self._journal_path = (
-            self._run_directory / "raw" / "fault-orchestrator.jsonl"
-        )
+        self._journal_path = self._run_directory / "raw" / "fault-orchestrator.jsonl"
         self._journal: FaultJournal | None = None
         self._lifecycle: FaultLifecycle | None = None
         self._used = False
@@ -737,8 +745,7 @@ class FaultEvidence:
                 self._plan_path.unlink()
             except OSError as rollback_error:
                 exc.add_note(
-                    "could not roll back unmatched fault plan: "
-                    f"{rollback_error}"
+                    "could not roll back unmatched fault plan: " f"{rollback_error}"
                 )
             raise
 
