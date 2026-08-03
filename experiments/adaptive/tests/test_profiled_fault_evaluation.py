@@ -806,6 +806,48 @@ def test_connection_refresh_capacity_diagnostic_changes_only_identity_metadata(
     )
 
 
+def test_fresh_connection_coalescing_diagnostic_changes_only_identity_metadata(
+) -> None:
+    api = _api()
+    runtime = _runtime()
+    profiles = Path(__file__).resolve().parents[1] / "profiles"
+    control_path = (
+        profiles
+        / "n31-f5-internal1-connection-refresh-capacity-diagnostic-v11.json"
+    )
+    diagnostic_path = (
+        profiles
+        / "n31-f5-internal1-fresh-connection-coalescing-diagnostic-v12.json"
+    )
+    control_document = json.loads(control_path.read_text(encoding="utf-8"))
+    diagnostic_document = json.loads(
+        diagnostic_path.read_text(encoding="utf-8")
+    )
+    control_fault = control_document.pop("fault")
+    diagnostic_fault = diagnostic_document.pop("fault")
+    control_document.pop("profile_id")
+    diagnostic_document.pop("profile_id")
+    control_fault.pop("fault_id")
+    diagnostic_fault.pop("fault_id")
+
+    assert diagnostic_document == control_document
+    assert diagnostic_fault == control_fault
+
+    diagnostic = api.load_frozen_profile(diagnostic_path)
+    runtime.require_shipped_profile(diagnostic)
+    assert diagnostic.profile_id == (
+        "n31-f5-q21-internal1-fresh-connection-coalescing-diagnostic-v12"
+    )
+    assert diagnostic.fault.fault_id == (
+        "single-internal-replica1-fresh-connection-coalescing-diagnostic"
+    )
+    assert diagnostic.attempt_count == 1
+    assert diagnostic.retry_failed_attempts is False
+    assert diagnostic.profile_sha256 == (
+        "be6fa779f0f6920f50172ff751a6b2523b95e4cc4e116d00fe31e3e3ebd1b42d"
+    )
+
+
 def test_manager_argv_freezes_containment_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:

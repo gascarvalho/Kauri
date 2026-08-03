@@ -73,6 +73,11 @@ INTERNAL1_CONNECTION_REFRESH_CAPACITY_DIAGNOSTIC_PROFILE = (
     / "profiles"
     / "n31-f5-internal1-connection-refresh-capacity-diagnostic-v11.json"
 )
+INTERNAL1_FRESH_CONNECTION_COALESCING_DIAGNOSTIC_PROFILE = (
+    Path(__file__).parents[1]
+    / "profiles"
+    / "n31-f5-internal1-fresh-connection-coalescing-diagnostic-v12.json"
+)
 
 
 def _api():
@@ -375,6 +380,7 @@ def test_transition_request_is_zero_residency_fault_containment() -> None:
         INTERNAL1_PRE_QC_CREDIT_DIAGNOSTIC_PROFILE,
         INTERNAL1_CONNECTION_REFRESH_DIAGNOSTIC_PROFILE,
         INTERNAL1_CONNECTION_REFRESH_CAPACITY_DIAGNOSTIC_PROFILE,
+        INTERNAL1_FRESH_CONNECTION_COALESCING_DIAGNOSTIC_PROFILE,
     ),
 )
 def test_cli_pins_the_exact_shipped_profiles(profile_path: Path) -> None:
