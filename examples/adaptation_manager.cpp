@@ -101,6 +101,8 @@ constexpr std::uint32_t kConvergenceMaximumAttempts = 5;
 constexpr std::uint64_t kConvergenceTicksPerSecond = 10;
 constexpr std::uint64_t kConvergenceDefaultDeadlineTicks = 120;
 constexpr double kConvergenceTimerSeconds = 0.1;
+// Bound isolated-ingress latency while batching a burst at one fixed deadline.
+constexpr double kEvaluationCoalescingSeconds = 0.05;
 // Cover the replica outbox's one-second capped ACK retry backoff and leave
 // one convergence timer interval for scheduling and transport dispatch.
 constexpr double kConvergenceAckDrainSeconds = 1.1;
@@ -1364,6 +1366,11 @@ public:
             [this](salticidae::TimerEvent &) {
                 handle_predecessor_residency_timer();
             });
+        evaluation_timer = salticidae::TimerEvent(
+            event_context_,
+            [this](salticidae::TimerEvent &) {
+                handle_evaluation_timer();
+            });
         register_handlers();
     }
 
@@ -1424,6 +1431,8 @@ public:
 
             if (!begin_current_cycle())
                 fail("manager_cycle_start_failed");
+            else
+                evaluate();
 
             if (!failed_)
             {
@@ -1644,6 +1653,9 @@ private:
 
     bool begin_current_cycle() noexcept
     {
+        cancel_pending_evaluation();
+        last_evaluated_ready_members_.reset();
+        last_evaluated_evidence_cutoff_.reset();
         const auto *policy = request_sequence_.current_policy();
         if (policy == nullptr || !add_cycle_audit_context())
             return false;
@@ -1945,6 +1957,7 @@ private:
 
     void fail(const char *reason) noexcept
     {
+        cancel_pending_evaluation();
         const auto convergence = session_.convergence_status();
         if (convergence.has_value() && !convergence_failure_emitted_)
         {
@@ -1970,6 +1983,7 @@ private:
     void stop_runtime() noexcept
     {
         event_context_.stop();
+        cancel_pending_evaluation();
         convergence_timer.del();
         convergence_ack_drain_timer.del();
         predecessor_residency_timer.del();
@@ -2077,12 +2091,77 @@ private:
         }
     }
 
-    void evaluate()
+    void cancel_pending_evaluation() noexcept
+    {
+        evaluation_timer.del();
+        evaluation_timer_pending_ = false;
+    }
+
+    void schedule_evaluation() noexcept
     {
         if (failed_ || request_sequence_.shutdown_eligible() ||
             predecessor_residency_pending_ ||
-            session_.convergence_status().has_value())
+            session_.convergence_status().has_value() ||
+            evaluation_timer_pending_)
+        {
             return;
+        }
+
+        const auto readiness =
+            session_.ingress().readiness_stats();
+        const auto evidence_cutoff =
+            session_.ingress().ledger().high_watermark();
+        if (last_evaluated_ready_members_.has_value() &&
+            last_evaluated_evidence_cutoff_.has_value() &&
+            *last_evaluated_ready_members_ == readiness.ready_members &&
+            *last_evaluated_evidence_cutoff_ == evidence_cutoff)
+        {
+            return;
+        }
+
+        try
+        {
+            evaluation_timer_pending_ = true;
+            evaluation_timer.add(kEvaluationCoalescingSeconds);
+        }
+        catch (...)
+        {
+            evaluation_timer_pending_ = false;
+            fail("manager_evaluation_timer_schedule_failed");
+        }
+    }
+
+    void handle_evaluation_timer() noexcept
+    {
+        if (!evaluation_timer_pending_)
+            return;
+        evaluation_timer_pending_ = false;
+        try
+        {
+            evaluate();
+        }
+        catch (...)
+        {
+            fail("manager_evaluation_timer_failed");
+        }
+    }
+
+    void evaluate()
+    {
+        if (failed_ || request_sequence_.shutdown_eligible() ||
+            predecessor_residency_pending_)
+            return;
+        if (session_.convergence_status().has_value())
+        {
+            cancel_pending_evaluation();
+            return;
+        }
+        const auto readiness =
+            session_.ingress().readiness_stats();
+        const auto evidence_cutoff =
+            session_.ingress().ledger().high_watermark();
+        last_evaluated_ready_members_ = readiness.ready_members;
+        last_evaluated_evidence_cutoff_ = evidence_cutoff;
         refresh_cycle_audit();
         const auto status = session_.evaluate();
         refresh_cycle_audit();
@@ -2115,6 +2194,7 @@ private:
         }
         try
         {
+            cancel_pending_evaluation();
             const auto output_path = transition_bundle_output_path(
                 *request, *bundle, session_);
             write_exclusive_bundle(
@@ -2249,6 +2329,7 @@ private:
 
     void begin_convergence_ack_drain() noexcept
     {
+        cancel_pending_evaluation();
         convergence_timer.del();
         convergence_ack_drain_timer.del();
         refresh_cycle_audit();
@@ -2518,8 +2599,7 @@ private:
             fail("manager_ingress_unhealthy");
             return;
         }
-        if (!predecessor_residency_pending_)
-            evaluate();
+        schedule_evaluation();
     }
 
     void register_handlers()
@@ -2870,9 +2950,12 @@ private:
     salticidae::TimerEvent convergence_timer;
     salticidae::TimerEvent convergence_ack_drain_timer;
     salticidae::TimerEvent predecessor_residency_timer;
+    salticidae::TimerEvent evaluation_timer;
     std::chrono::steady_clock::time_point
         predecessor_residency_deadline_{};
     std::uint64_t convergence_tick_{0};
+    std::optional<std::size_t> last_evaluated_ready_members_;
+    std::optional<std::uint64_t> last_evaluated_evidence_cutoff_;
     std::size_t emitted_score_trajectory_{0};
     std::size_t emitted_accepted_observations_{0};
     std::size_t emitted_session_terminals_{0};
@@ -2883,6 +2966,7 @@ private:
     bool session_stopped_{false};
     bool convergence_failure_emitted_{false};
     bool predecessor_residency_pending_{false};
+    bool evaluation_timer_pending_{false};
     bool experiment_bundle_drop_consumed_{false};
     bool experiment_activation_ack_drop_consumed_{false};
     bool failed_{false};

@@ -1035,6 +1035,128 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager coalesces ingress evaluation at the latest bounded watermark",
+    "[adaptive-v2][manager][evaluation][coalescing][timer][wiring]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+
+    CHECK(numeric_constant(
+              raw_manager, "kEvaluationCoalescingSeconds") ==
+          Approx(0.05));
+    CHECK(manager.find("evaluation_timer") != std::string::npos);
+    CHECK(manager.find("evaluation_timer_pending_") !=
+          std::string::npos);
+
+    const auto schedule = function_body(
+        manager, "void schedule_evaluation() noexcept");
+    const auto fire = function_body(
+        manager, "void handle_evaluation_timer() noexcept");
+    const auto evaluate = function_body(manager, "void evaluate()");
+    const auto ingest = function_body(manager, "void ingest(");
+    REQUIRE_FALSE(schedule.empty());
+    REQUIRE_FALSE(fire.empty());
+    REQUIRE_FALSE(evaluate.empty());
+    REQUIRE_FALSE(ingest.empty());
+
+    CHECK(contains_in_order(
+        schedule,
+        {"evaluation_timer_pending_",
+         "return",
+         "readiness_stats()",
+         "ledger().high_watermark()",
+         "last_evaluated_ready_members_",
+         "last_evaluated_evidence_cutoff_",
+         "return",
+         "evaluation_timer_pending_ = true",
+         "evaluation_timer.add(",
+         "kEvaluationCoalescingSeconds"}));
+    CHECK(count_occurrences(
+              schedule, "evaluation_timer.add(") == 1);
+    CHECK(schedule.find("evaluation_timer.del()") ==
+          std::string::npos);
+
+    CHECK(contains_in_order(
+        fire,
+        {"evaluation_timer_pending_ = false", "evaluate()"}));
+    CHECK(fire.find("evaluation_timer.add(") == std::string::npos);
+    CHECK(fire.find("ledger().high_watermark()") ==
+          std::string::npos);
+    CHECK(contains_in_order(
+        evaluate,
+        {"readiness_stats()",
+         "ledger().high_watermark()",
+         "last_evaluated_ready_members_",
+         "last_evaluated_evidence_cutoff_",
+         "session_.evaluate()"}));
+
+    CHECK(contains_in_order(
+        ingest,
+        {"operation(",
+         "emit_new_accepted_observations()",
+         "result.status",
+         "schedule_evaluation()"}));
+    CHECK(ingest.find("evaluate()") == std::string::npos);
+    CHECK(count_occurrences(
+              ingest, "schedule_evaluation()") == 1);
+}
+
+TEST_CASE(
+    "manager cancels coalesced evaluation across lifecycle boundaries",
+    "[adaptive-v2][manager][evaluation][coalescing][cleanup][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    const auto cancel = function_body(
+        manager, "void cancel_pending_evaluation() noexcept");
+    const auto fail = function_body(
+        manager, "void fail(const char *reason) noexcept");
+    const auto stop = function_body(
+        manager, "void stop_runtime() noexcept");
+    const auto begin_cycle = function_body(
+        manager, "bool begin_current_cycle() noexcept");
+    const auto drain = function_body(
+        manager, "void begin_convergence_ack_drain() noexcept");
+    const auto evaluate = function_body(manager, "void evaluate()");
+    const auto run = function_body(manager, "int run()");
+    REQUIRE_FALSE(cancel.empty());
+    REQUIRE_FALSE(fail.empty());
+    REQUIRE_FALSE(stop.empty());
+    REQUIRE_FALSE(begin_cycle.empty());
+    REQUIRE_FALSE(drain.empty());
+    REQUIRE_FALSE(evaluate.empty());
+    REQUIRE_FALSE(run.empty());
+
+    CHECK(contains_in_order(
+        cancel,
+        {"evaluation_timer.del()",
+         "evaluation_timer_pending_ = false"}));
+    CHECK(fail.find("cancel_pending_evaluation()") !=
+          std::string::npos);
+    CHECK(stop.find("cancel_pending_evaluation()") !=
+          std::string::npos);
+    CHECK(fail.find("evaluate()") == std::string::npos);
+    CHECK(stop.find("evaluate()") == std::string::npos);
+    CHECK(contains_in_order(
+        begin_cycle,
+        {"cancel_pending_evaluation()",
+         "last_evaluated_ready_members_.reset()",
+         "last_evaluated_evidence_cutoff_.reset()",
+         "session_.begin_cycle("}));
+    CHECK(contains_in_order(
+        evaluate,
+        {"cancel_pending_evaluation()",
+         "session_.start_convergence("}));
+    CHECK(drain.find("cancel_pending_evaluation()") !=
+          std::string::npos);
+    CHECK(drain.find("evaluate()") == std::string::npos);
+
+    CHECK(contains_in_order(
+        run,
+        {"begin_current_cycle()", "evaluate()"}));
+}
+
+TEST_CASE(
     "recurring manager delays each rotated predecessor by its explicit residency",
     "[adaptive-v2][manager][session][residency][timer][wiring]")
 {
@@ -1181,12 +1303,13 @@ TEST_CASE(
     const auto ingest_complete = ingest.find(
         "request_sequence_.shutdown_eligible()");
     const auto ingest_operation = ingest.find("operation(");
-    const auto ingest_evaluate = ingest.find("evaluate()");
+    const auto ingest_schedule = ingest.find("schedule_evaluation()");
     REQUIRE(ingest_complete != std::string::npos);
     REQUIRE(ingest_operation != std::string::npos);
-    REQUIRE(ingest_evaluate != std::string::npos);
+    REQUIRE(ingest_schedule != std::string::npos);
     CHECK(ingest_complete < ingest_operation);
-    CHECK(ingest_complete < ingest_evaluate);
+    CHECK(ingest_complete < ingest_schedule);
+    CHECK(ingest.find("evaluate()") == std::string::npos);
 
     const auto evaluate_complete = evaluate.find(
         "request_sequence_.shutdown_eligible()");

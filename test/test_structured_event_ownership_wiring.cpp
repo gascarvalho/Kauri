@@ -680,15 +680,16 @@ TEST_CASE(
             "emit_new_accepted_observations()", operation);
         const auto status_check = ingest.find(
             "result.status", operation);
-        const auto controller_evaluate = ingest.find(
-            "evaluate()", audit_suffix);
+        const auto controller_schedule = ingest.find(
+            "schedule_evaluation()", audit_suffix);
         REQUIRE(operation != std::string::npos);
         REQUIRE(audit_suffix != std::string::npos);
         REQUIRE(status_check != std::string::npos);
-        REQUIRE(controller_evaluate != std::string::npos);
+        REQUIRE(controller_schedule != std::string::npos);
         CHECK(operation < audit_suffix);
         CHECK(audit_suffix < status_check);
-        CHECK(audit_suffix < controller_evaluate);
+        CHECK(audit_suffix < controller_schedule);
+        CHECK(ingest.find("evaluate()") == std::string::npos);
 
         CHECK(manager.find("ingest(\"lifecycle\"") !=
               std::string::npos);
