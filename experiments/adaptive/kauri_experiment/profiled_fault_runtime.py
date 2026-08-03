@@ -574,6 +574,21 @@ def occupied_ports(ports: Iterable[int]) -> tuple[int, ...]:
     return tuple(occupied)
 
 
+def listening_ports(ports: Iterable[int]) -> tuple[int, ...]:
+    listening: list[int] = []
+    for port in ports:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.1)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                listening.append(port)
+        except OSError:
+            pass
+        finally:
+            probe.close()
+    return tuple(listening)
+
+
 def epoch_zero_witness(
     profile: FrozenProfile, epoch_profile_digest_binary: Path
 ) -> dict[str, object]:
@@ -1227,6 +1242,10 @@ def _commit_key(event: Mapping[str, Any]) -> tuple[object, ...]:
     return fields
 
 
+def _shared_commit_key(event: Mapping[str, Any]) -> tuple[object, ...]:
+    return _commit_key(event)[:4]
+
+
 def find_common_commit(
     profile: FrozenProfile,
     streams: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -1242,7 +1261,7 @@ def find_common_commit(
         for event in streams[f"replica-{replica}"]:
             if event.get("event_type") != "block.commit_observed":
                 continue
-            key = _commit_key(event)
+            key = _shared_commit_key(event)
             timestamp = _timestamp(event)
             previous = values.get(key)
             values[key] = timestamp if previous is None else min(previous, timestamp)
@@ -1250,7 +1269,8 @@ def find_common_commit(
     for event in streams[observer]:
         if event.get("event_type") != "block.committed":
             continue
-        key = _commit_key(event)
+        observer_key = _commit_key(event)
+        key = observer_key[:4]
         timestamp = _timestamp(event)
         if before_ns is not None and timestamp >= before_ns:
             continue
@@ -1269,7 +1289,7 @@ def find_common_commit(
             "block_hash": key[1],
             "parent_hash": key[2],
             "transaction_count": key[3],
-            "commit_batch_index": key[4],
+            "observer_commit_batch_index": observer_key[4],
             "observer_monotonic_ns": timestamp,
             "common_monotonic_ns": max(timestamp, *exact_times),
             "witnesses": list(witnesses),
@@ -1297,11 +1317,12 @@ def throughput_rows(
         if not start_ns <= timestamp < end_ns:
             continue
         key = _commit_key(event)
-        if key in seen:
+        identity = key[:2]
+        if identity in seen:
             raise ProfiledFaultRuntimeError(
                 "duplicate authoritative commit in throughput window"
             )
-        seen.add(key)
+        seen.add(identity)
         index = (timestamp - start_ns) // width_ns
         transactions[index] += int(key[3])
         commits[index] += 1
@@ -2015,6 +2036,16 @@ def concurrent_cleanup(
             classification = "expected_cleanup"
         elif record.replica_id >= 0 and sent[record.name] and returncode == 0:
             classification = "expected_cleanup"
+        elif (
+            record.replica_id >= 0
+            and returncode == -signal.SIGKILL
+            and post_end_ns is not None
+            and cleanup_started_ns >= post_end_ns
+            and int(signal.SIGINT) in sent[record.name]
+            and int(signal.SIGTERM) in sent[record.name]
+            and int(signal.SIGKILL) in sent[record.name]
+        ):
+            classification = "expected_forced_cleanup"
         else:
             classification = "unexpected_exit"
         ledger.append(
@@ -2039,12 +2070,12 @@ def concurrent_cleanup(
 def wait_ports_clear(ports: Sequence[int], timeout_s: float = 5.0) -> None:
     deadline = time.monotonic() + timeout_s
     while True:
-        occupied = occupied_ports(ports)
-        if not occupied:
+        listening = listening_ports(ports)
+        if not listening:
             return
         if time.monotonic() >= deadline:
             raise ProfiledFaultRuntimeError(
-                f"owned listeners remained after cleanup: {list(occupied)}"
+                f"owned listeners remained after cleanup: {list(listening)}"
             )
         time.sleep(0.05)
 
@@ -2273,6 +2304,9 @@ def validate_final_streams(
             "replica" if source.startswith("replica-") else "adaptation_manager"
         )
         previous_timestamp: int | None = None
+        pending_commit_witnesses: dict[
+            tuple[object, ...], tuple[tuple[object, ...], int]
+        ] = {}
         for expected_sequence, event in enumerate(events, 1):
             if set(event) != EVENT_ENVELOPE_FIELDS:
                 raise ProfiledFaultRuntimeError(
@@ -2359,9 +2393,38 @@ def validate_final_streams(
             height = int(key[0])
             block_hash = _digest(key[1], "commit block hash")
             _digest(key[2], "commit parent hash")
+            identity = key[:2]
+            local_metadata = key[2:]
             hashes_by_height.setdefault(height, set()).add(block_hash)
             heights_by_hash.setdefault(block_hash, set()).add(height)
-            metadata_by_height_hash.setdefault((height, block_hash), set()).add(key[2:])
+            metadata_by_height_hash.setdefault((height, block_hash), set()).add(
+                key[2:4]
+            )
+            if event_type == "block.commit_observed":
+                if identity in pending_commit_witnesses:
+                    raise ProfiledFaultRuntimeError(
+                        "duplicate pending same-source commit witness"
+                    )
+                pending_commit_witnesses[identity] = (
+                    local_metadata,
+                    _sequence(event),
+                )
+                continue
+            witness = pending_commit_witnesses.get(identity)
+            if witness is None:
+                raise ProfiledFaultRuntimeError(
+                    "rich commit lacks a preceding same-source commit witness"
+                )
+            witness_metadata, witness_sequence = witness
+            if witness_metadata != local_metadata:
+                raise ProfiledFaultRuntimeError(
+                    "same-source commit metadata disagreement"
+                )
+            if witness_sequence >= _sequence(event):
+                raise ProfiledFaultRuntimeError(
+                    "rich commit lacks a preceding same-source commit witness"
+                )
+            del pending_commit_witnesses[identity]
             if event_type == "block.committed":
                 proof = payload.get("decision_proof")
                 if (
@@ -2390,11 +2453,11 @@ def validate_final_streams(
                         "designated observer flag disagrees with source"
                     )
                 if is_observer:
-                    if key in authoritative_keys:
+                    if identity in authoritative_keys:
                         raise ProfiledFaultRuntimeError(
                             "duplicate authoritative commit identity"
                         )
-                    authoritative_keys.add(key)
+                    authoritative_keys.add(identity)
     if set(ready_timestamps) != expected_sources:
         raise ProfiledFaultRuntimeError(
             "every exact source requires exactly one process.ready "
@@ -2705,7 +2768,12 @@ def validate_preserved_run(run_directory: Path) -> dict[str, object]:
     for item in cleanup:
         if (
             not isinstance(item, Mapping)
-            or item.get("classification") not in {"expected_fault", "expected_cleanup"}
+            or item.get("classification")
+            not in {
+                "expected_fault",
+                "expected_cleanup",
+                "expected_forced_cleanup",
+            }
             or item.get("cleanup_errors") != []
         ):
             raise ProfiledFaultRuntimeError("cleanup ledger contains a failure")

@@ -210,3 +210,58 @@ def test_cleanup_classifies_the_profile_selected_fault_replica(
     )
 
     assert ledger[0]["classification"] == "expected_fault"
+
+
+def test_cleanup_records_post_window_sigkill_as_forced_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    process = _Process(8401)
+    record = runtime.ProcessRecord(
+        "replica-2", 2, process.pid, process.pid, process
+    )
+    monkeypatch.setattr(runtime, "monotonic_raw_ns", lambda: 90_000_000_000)
+    clock = iter(range(0, 100_000, 20))
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: float(next(clock)))
+    monkeypatch.setattr(runtime.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runtime.os, "getpgid", lambda pid: pid)
+
+    def killpg(_pgid: int, signum: int) -> None:
+        if signum == signal.SIGKILL:
+            process.returncode = -signal.SIGKILL
+
+    monkeypatch.setattr(runtime.os, "killpg", killpg)
+
+    ledger, _ = runtime.concurrent_cleanup(
+        (record,),
+        faulted_replica_id=1,
+        post_end_ns=80_000_000_000,
+    )
+
+    assert ledger[0]["classification"] == "expected_forced_cleanup"
+    assert ledger[0]["signals_sent"] == [
+        int(signal.SIGINT),
+        int(signal.SIGTERM),
+        int(signal.SIGKILL),
+    ]
+    assert ledger[0]["cleanup_errors"] == []
+
+
+def test_listening_ports_does_not_use_bind_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+
+    class _Probe:
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def connect_ex(self, address: tuple[str, int]) -> int:
+            return 0 if address[1] == 25100 else 61
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(runtime.socket, "socket", lambda *_args: _Probe())
+
+    assert runtime.listening_ports((25100, 25101)) == (25100,)

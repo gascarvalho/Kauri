@@ -136,6 +136,14 @@ def _fixture() -> dict[str, Any]:
             streams,
             instances,
             observer,
+            timestamp - 1,
+            "block.commit_observed",
+            payload,
+        )
+        _append_event(
+            streams,
+            instances,
+            observer,
             timestamp,
             "block.committed",
             {
@@ -153,6 +161,8 @@ def _fixture() -> dict[str, Any]:
 
     witnesses = evaluation.postfault_witnesses(profile)
     for replica in witnesses:
+        if replica == profile.authoritative_observer:
+            continue
         _append_event(
             streams,
             instances,
@@ -182,6 +192,14 @@ def _fixture() -> dict[str, Any]:
             streams,
             instances,
             observer,
+            timestamp - 1,
+            "block.commit_observed",
+            payload,
+        )
+        _append_event(
+            streams,
+            instances,
+            observer,
             timestamp,
             "block.committed",
             {
@@ -198,6 +216,8 @@ def _fixture() -> dict[str, Any]:
         )
 
     for replica in witnesses:
+        if replica == profile.authoritative_observer:
+            continue
         _append_event(
             streams,
             instances,
@@ -280,6 +300,71 @@ def test_validate_final_streams_accepts_exact_rich_n31_evidence(
     assert len(verdict["postfault_rows"]) == 6
     assert all(row["tps"] == 200 for row in verdict["baseline_rows"])
     assert all(row["tps"] == 200 for row in verdict["postfault_rows"])
+
+
+def test_validate_final_streams_accepts_replica_local_commit_batch_indexes(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    for event in fixture["streams"]["replica-1"]:
+        if event["event_type"] == "block.commit_observed":
+            event["payload"]["commit_batch_index"] = 0
+
+    verdict = _validate(fixture, tmp_path)
+
+    assert verdict["pre_fault_common_commit"]["block_height"] == 105
+    assert verdict["post_fault_common_commit"]["block_height"] == 205
+    assert verdict["pre_fault_common_commit"]["observer_commit_batch_index"] == 105
+    assert "commit_batch_index" not in verdict["pre_fault_common_commit"]
+
+
+def test_validate_final_streams_rejects_same_source_commit_metadata_mismatch(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    observer = f"replica-{fixture['profile'].authoritative_observer}"
+    witness = next(
+        event
+        for event in fixture["streams"][observer]
+        if event["event_type"] == "block.commit_observed"
+        and event["payload"]["block_height"] == 100
+    )
+    witness["payload"]["commit_batch_index"] += 1
+
+    with pytest.raises(
+        _runtime().ProfiledFaultRuntimeError,
+        match="same-source commit metadata",
+    ):
+        _validate(fixture, tmp_path)
+
+
+def test_validate_final_streams_rejects_reversed_same_source_commit_order(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    observer = f"replica-{fixture['profile'].authoritative_observer}"
+    events = fixture["streams"][observer]
+    witness_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "block.commit_observed"
+        and event["payload"]["block_height"] == 100
+    )
+    committed_index = witness_index + 1
+    events[witness_index], events[committed_index] = (
+        events[committed_index],
+        events[witness_index],
+    )
+    events[witness_index]["source_monotonic_ns"] = BASELINE_START_NS
+    events[committed_index]["source_monotonic_ns"] = BASELINE_START_NS + 1
+    for sequence, event in enumerate(events, 1):
+        event["source_sequence"] = sequence
+
+    with pytest.raises(
+        _runtime().ProfiledFaultRuntimeError,
+        match="preceding same-source commit witness",
+    ):
+        _validate(fixture, tmp_path)
 
 
 def test_validate_final_streams_accepts_measured_zero_postfault_bucket(
@@ -528,6 +613,63 @@ def test_validate_final_streams_rejects_cross_replica_height_conflict(
     with pytest.raises(
         _runtime().ProfiledFaultRuntimeError,
         match="same-height hash conflict",
+    ):
+        _validate(fixture, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("parent_hash", "e" * 64), ("transaction_count", 999)),
+)
+def test_validate_final_streams_rejects_shared_commit_metadata_disagreement(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    fixture = _fixture()
+    event = next(
+        event
+        for event in fixture["streams"]["replica-1"]
+        if event["event_type"] == "block.commit_observed"
+    )
+    event["payload"][field] = value
+
+    with pytest.raises(
+        _runtime().ProfiledFaultRuntimeError,
+        match="rich commit metadata disagreement",
+    ):
+        _validate(fixture, tmp_path)
+
+
+def test_validate_final_streams_rejects_authoritative_duplicate_with_new_batch(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()
+    observer = f"replica-{fixture['profile'].authoritative_observer}"
+    events = fixture["streams"][observer]
+    witness_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "block.commit_observed"
+        and event["payload"]["block_height"] == 100
+    )
+    committed_index = witness_index + 1
+    duplicate_witness = copy.deepcopy(events[witness_index])
+    duplicate_commit = copy.deepcopy(events[committed_index])
+    duplicate_witness["source_monotonic_ns"] = BASELINE_START_NS + 1
+    duplicate_commit["source_monotonic_ns"] = BASELINE_START_NS + 2
+    duplicate_witness["payload"]["commit_batch_index"] += 1
+    duplicate_commit["payload"]["commit_batch_index"] += 1
+    events[committed_index + 1 : committed_index + 1] = [
+        duplicate_witness,
+        duplicate_commit,
+    ]
+    for sequence, event in enumerate(events, 1):
+        event["source_sequence"] = sequence
+
+    with pytest.raises(
+        _runtime().ProfiledFaultRuntimeError,
+        match="duplicate authoritative commit identity",
     ):
         _validate(fixture, tmp_path)
 
