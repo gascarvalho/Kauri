@@ -1,4 +1,4 @@
-"""One-attempt runtime and preserved-evidence validator for the v5 PQAR pilot.
+"""One-attempt runtime and preserved-evidence validator for the v6 PQAR pilot.
 
 Audit classification consumes only raw replica logs.  Manager events are used
 for process ownership only and never as diagnostic observations.  The fixed
@@ -93,7 +93,7 @@ _MANIFEST_FIELDS = {
     "runtime_error",
 }
 _LOG_OFFSET_FIELDS = {"path", "sha256", "start_offset", "terminal_offset"}
-_ONE_SHOT_LEDGER_FILENAME = "pqar-v5-one-shot-ledger.json"
+_ONE_SHOT_LEDGER_FILENAME = "pqar-v6-one-shot-ledger.json"
 _ONE_SHOT_LEDGER_FIELDS = {
     "schema_version",
     "scenario",
@@ -1273,7 +1273,7 @@ def _load_source_blind_preserved_profiles(
         or runtime_profile.profile_id != profile.runtime_profile_id
         or runtime_profile.profile_sha256 != profile.runtime_profile_sha256
     ):
-        _error("preserved runtime profile differs from the canonical v5 binding")
+        _error("preserved runtime profile differs from the canonical v6 binding")
     return profile, runtime_profile
 
 
@@ -2107,13 +2107,13 @@ def _one_shot_ledger_path(sequence_directory: Path) -> Path:
 def _create_sequence_directory(
     results_root: Path, *, profile: FrozenPqarProfile
 ) -> Path:
-    """Consume the frozen v5 results root and allocate one empty parent."""
+    """Consume the frozen v6 results root and allocate one empty parent."""
 
     if (
         profile.profile_id != SHIPPED_PROFILE_ID
         or profile.profile_sha256 != SHIPPED_PROFILE_SHA256
     ):
-        _error("one-shot allocation requires the canonical shipped v5 profile")
+        _error("one-shot allocation requires the canonical shipped v6 profile")
     root = results_root.resolve()
     root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -2121,11 +2121,11 @@ def _create_sequence_directory(
         _fsync_directory(root.parent)
     except FileExistsError as error:
         raise N31PostQcAuditRuntimeError(
-            "frozen v5 results root is already spent by a prior allocation"
+            "frozen v6 results root is already spent by a prior allocation"
         ) from error
     except OSError as error:
         raise N31PostQcAuditRuntimeError(
-            "could not exclusively allocate the frozen v5 results root"
+            "could not exclusively allocate the frozen v6 results root"
         ) from error
     os.chmod(root, 0o700)
 
@@ -2148,16 +2148,16 @@ def _create_sequence_directory(
         _fsync_directory(root)
     except FileExistsError as error:
         raise N31PostQcAuditRuntimeError(
-            "frozen v5 results root is already spent by a concurrent allocation"
+            "frozen v6 results root is already spent by a concurrent allocation"
         ) from error
     except OSError as error:
         raise N31PostQcAuditRuntimeError(
-            "could not persist the frozen v5 one-shot allocation ledger"
+            "could not persist the frozen v6 one-shot allocation ledger"
         ) from error
 
     try:
         if {path.resolve() for path in root.iterdir()} != {ledger_path.resolve()}:
-            _error("frozen v5 results root gained an unexpected allocation sibling")
+            _error("frozen v6 results root gained an unexpected allocation sibling")
         candidate.mkdir(mode=0o700)
         _fsync_directory(root)
     except (OSError, N31PostQcAuditRuntimeError) as error:
@@ -2460,7 +2460,7 @@ def validate_pilot_sequence(
         except N31PostQcAuditError as error:
             raise N31PostQcAuditRuntimeError(
                 "result-recorded child profile is absent or not the canonical "
-                "shipped v5 profile"
+                "shipped v6 profile"
             ) from error
         if (
             child_profile.profile_id != SHIPPED_PROFILE_ID

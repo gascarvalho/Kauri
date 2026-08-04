@@ -16,7 +16,7 @@ import pytest
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit as pqar
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit_runtime as runner
 
-PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v5.json"
+PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v6.json"
 BLOCK = "b" * 64
 FINGERPRINT = "d" * 64
 QC_PUBLISHED_NS = 1_120_000_000
@@ -1105,7 +1105,7 @@ def test_sequence_validator_rejects_noncanonical_child_profile(
     )
     with pytest.raises(
         runner.N31PostQcAuditRuntimeError,
-        match="canonical shipped v5 profile",
+        match="canonical shipped v6 profile",
     ):
         runner.validate_pilot_sequence(sequence, trusted_provenance=trusted)
 
@@ -1794,12 +1794,13 @@ def _cli():
     return importlib.import_module("experiments.adaptive.run_n31_post_qc_audit")
 
 
-def test_cli_defaults_select_prospective_v5() -> None:
+def test_cli_defaults_select_prospective_v6() -> None:
     cli = _cli()
-    assert cli.DEFAULT_PROFILE.name == "n31-f5-post-qc-audit-v5.json"
-    assert cli.DEFAULT_RESULTS_ROOT.name == "n31-f5-post-qc-audit-v5"
+    assert cli.DEFAULT_PROFILE.name == "n31-f5-post-qc-audit-v6.json"
+    assert cli.DEFAULT_RESULTS_ROOT.name == "n31-f5-post-qc-audit-v6"
+    assert runner._ONE_SHOT_LEDGER_FILENAME == "pqar-v6-one-shot-ledger.json"
     assert cli.DEFAULT_RESULTS_ROOT == (
-        cli.REPOSITORY / "results" / "n31-f5-post-qc-audit-v5"
+        cli.REPOSITORY / "results" / "n31-f5-post-qc-audit-v6"
     )
 
 
@@ -1916,7 +1917,7 @@ def test_cli_run_rejects_results_root_override_before_launch(
     )
     output = json.loads(capsys.readouterr().err)
     assert output["verdict"] == "REJECT"
-    assert "canonical frozen v5 results root" in output["error"]
+    assert "canonical frozen v6 results root" in output["error"]
     assert not trusted_path.exists()
 
 

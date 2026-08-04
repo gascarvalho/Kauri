@@ -64,12 +64,12 @@ from experiments.adaptive.kauri_experiment.profiled_fault_evaluation import (  #
 )
 
 DEFAULT_CAMPAIGN_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v3.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v4.json"
 )
 DEFAULT_AUDIT_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v5.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v6.json"
 )
-DEFAULT_RESULTS_PARENT = REPOSITORY / "results/n31-post-qc-audit-campaign-v3"
+DEFAULT_RESULTS_PARENT = REPOSITORY / "results/n31-post-qc-audit-campaign-v4"
 
 
 class N31PostQcAuditCampaignRunError(RuntimeError):
@@ -257,7 +257,7 @@ def _pilot_gate(
         or not isinstance(pilot_result.get("evidence_seal_sha256"), str)
     ):
         raise N31PostQcAuditCampaignRunError(
-            "campaign requires one sealed aggregate-PASS v5 pilot"
+            "campaign requires one sealed aggregate-PASS v6 pilot"
         )
     return {
         "schema_version": 1,
@@ -379,7 +379,6 @@ def run_campaign(
     epoch_profile_digest_binary: Path,
     build_directory: Path,
     build_provenance_path: Path,
-    prepare_build: Callable[..., Any] | None = None,
     derive_provenance: Callable[..., TrustedProvenance] | None = None,
     preflight: Callable[..., Mapping[str, Any]] | None = None,
     validate_pilot: Callable[..., Mapping[str, Any]] | None = None,
@@ -406,7 +405,6 @@ def run_campaign(
         repository=repository,
         audit_profile_path=audit_profile_path,
     )
-    prepare_build = prepare_build or runtime.prepare_exact_revision_build
     derive_provenance = derive_provenance or derive_trusted_provenance
     preflight = preflight or audit_runtime.preflight
     validate_pilot = validate_pilot or audit_runtime.validate_pilot_sequence
@@ -417,7 +415,7 @@ def run_campaign(
         )
     if not callable(classify_source_blind):
         raise N31PostQcAuditCampaignRunError(
-            "v5 runtime lacks classify_preserved_run_source_blind; refusing "
+            "v6 runtime lacks classify_preserved_run_source_blind; refusing "
             "to launch a campaign without an arm-free preserved-run extractor"
         )
     if campaign_root.resolve().exists():
@@ -426,8 +424,9 @@ def run_campaign(
             f"{campaign_root.resolve()}"
         )
 
-    # Validate the excluded pilot first; then make exactly one clean build,
-    # provenance derivation, and preflight for the campaign itself.
+    # The excluded pilot owns the only clean build.  Reuse those exact bytes:
+    # first revalidate its sealed result, then prove that the current repository,
+    # build receipt, and binaries remain byte-identical before preflight.
     pilot_result = validate_pilot(
         pilot_sequence_directory,
         trusted_provenance=trusted_provenance,
@@ -438,7 +437,6 @@ def run_campaign(
         pilot_result=pilot_result,
         trusted_provenance=trusted_provenance,
     )
-    prepare_build(repository=repository, build_directory=build_directory)
     current_provenance = derive_provenance(
         repository=repository,
         app_binary=app_binary.resolve(),
@@ -844,7 +842,7 @@ def _default_campaign_root(repository: Path, revision: str) -> Path:
     return (
         repository
         / DEFAULT_RESULTS_PARENT.relative_to(REPOSITORY)
-        / f"{revision[:8]}-seed{CAMPAIGN_ORDER_SEED}-campaign-v3"
+        / f"{revision[:8]}-seed{CAMPAIGN_ORDER_SEED}-campaign-v4"
     )
 
 
@@ -912,7 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if arguments.pilot_sequence is None:
             raise N31PostQcAuditCampaignRunError(
-                "run requires --pilot-sequence for the excluded sealed v5 gate"
+                "run requires --pilot-sequence for the excluded sealed v6 gate"
             )
         build_directory = arguments.build_directory.resolve()
         summary_path = run_campaign(

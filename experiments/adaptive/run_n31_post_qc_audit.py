@@ -31,9 +31,9 @@ DEFAULT_PROFILE = (
     / "experiments"
     / "adaptive"
     / "profiles"
-    / "n31-f5-post-qc-audit-v5.json"
+    / "n31-f5-post-qc-audit-v6.json"
 )
-DEFAULT_RESULTS_ROOT = REPOSITORY / "results" / "n31-f5-post-qc-audit-v5"
+DEFAULT_RESULTS_ROOT = REPOSITORY / "results" / "n31-f5-post-qc-audit-v6"
 
 
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -142,7 +142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             and args.results_root.resolve() != DEFAULT_RESULTS_ROOT.resolve()
         ):
             raise audit_runtime.N31PostQcAuditRuntimeError(
-                "run requires the canonical frozen v5 results root: "
+                "run requires the canonical frozen v6 results root: "
                 f"{DEFAULT_RESULTS_ROOT.resolve()}"
             )
         values = _runtime_arguments(args)

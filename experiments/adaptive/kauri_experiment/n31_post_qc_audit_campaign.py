@@ -1,6 +1,6 @@
 """Frozen repetition and evidence contracts for the N=31 PQAR campaign.
 
-The module is deliberately split from the live v5 runtime.  It fixes the
+The module is deliberately split from the live v6 runtime.  It fixes the
 balanced 90-slot order, joins source-blind observations to declared arms only
 after every child has been observed, and rebuilds campaign statistics from
 sealed evidence.  Experimental outcomes never change the schedule or the
@@ -47,11 +47,11 @@ from .profiled_fault_evaluation import (
     load_frozen_profile as load_runtime_profile,
 )
 
-CAMPAIGN_PROFILE_ID = "n31-f5-q21-post-qc-audit-campaign-v3"
+CAMPAIGN_PROFILE_ID = "n31-f5-q21-post-qc-audit-campaign-v4"
 CAMPAIGN_PROFILE_SHA256 = (
-    "153d2e8ca457df3db19e866ae4e767cb1d41f104790a3269dba8826b8b0fffbb"
+    "b8a489b22e5e3368d7cbbc6663198e3b14ff34834c1524f08f7cc373a20b873c"
 )
-CAMPAIGN_SCENARIO = "n31-post-qc-audit-repetition-campaign-v3"
+CAMPAIGN_SCENARIO = "n31-post-qc-audit-repetition-campaign-v4"
 CAMPAIGN_ORDER_SEED = 41_719
 SOURCE_BLIND_ORDER_ALGORITHM = "sha256-ranked-sealed-child-identity-v1"
 SOURCE_BLIND_ISOLATION = "random-opaque-v1"
@@ -104,6 +104,26 @@ _FORBIDDEN_BLIND_KEYS = frozenset(
         "verdict",
     }
 )
+_ARTIFACT_HANDOFF = {
+    "qualifying_build": "single_exact_clean_build_in_v6_pilot",
+    "campaign_rebuild": False,
+    "pre_allocation_check": "exact_trusted_provenance_equality",
+    "per_attempt_check": "exact_trusted_provenance_equality",
+    "continuity_window": "qualifying_pilot_receipt_through_final_campaign_attempt",
+    "intervening_mutation": "forbidden",
+    "build_reproducibility_claim": "none",
+}
+_CAMPAIGN_V3_DISCLOSURE = {
+    "profile_id": "n31-f5-q21-post-qc-audit-campaign-v3",
+    "profile_sha256": (
+        "153d2e8ca457df3db19e866ae4e767cb1d41f104790a3269dba8826b8b0fffbb"
+    ),
+    "canonical_root_allocated": False,
+    "campaign_attempts_started": 0,
+    "campaign_outcomes_observed": 0,
+    "rejection_phase": "before_canonical_root_allocation",
+    "rejection_reason": "second_clean_build_trusted_provenance_mismatch",
+}
 
 
 class N31PostQcAuditCampaignError(ValueError):
@@ -229,6 +249,13 @@ def load_frozen_campaign_profile(path: Path) -> FrozenCampaignProfile:
         _error("campaign profile bytes differ from the shipped frozen SHA-256")
     value = _json_value(payload, "campaign profile")
     profile = _mapping(value, "campaign profile")
+    pilot_gate = _mapping(profile.get("pilot_gate"), "campaign pilot gate")
+    artifact_handoff = _mapping(
+        profile.get("artifact_handoff"), "campaign artifact handoff"
+    )
+    campaign_v3_disclosure = _mapping(
+        profile.get("campaign_v3_disclosure"), "campaign-v3 disclosure"
+    )
     audit = _mapping(profile.get("audit_profile"), "bound audit profile")
     runtime = _mapping(profile.get("runtime_profile"), "bound runtime profile")
     source_blind = _mapping(profile.get("source_blind_policy"), "source-blind policy")
@@ -268,6 +295,9 @@ def load_frozen_campaign_profile(path: Path) -> FrozenCampaignProfile:
         or profile.get("automatic_retries") != 0
         or profile.get("replacement_policy") != "none"
         or profile.get("outcome_scanning") is not False
+        or pilot_gate.get("same_trusted_provenance") is not True
+        or dict(artifact_handoff) != _ARTIFACT_HANDOFF
+        or dict(campaign_v3_disclosure) != _CAMPAIGN_V3_DISCLOSURE
         or tuple(arm_names) != ARM_NAMES
         or metrics != TIMING_METRICS_NS
         or audit.get("profile_id") != SHIPPED_PROFILE_ID
@@ -1126,7 +1156,7 @@ def validate_n31_pqar_campaign(
             validate_pilot_sequence = audit_runtime.validate_pilot_sequence
     if not callable(classify_preserved_run_source_blind):
         _error(
-            "v5 runtime lacks classify_preserved_run_source_blind; campaign "
+            "v6 runtime lacks classify_preserved_run_source_blind; campaign "
             "validation refuses a truth-aware fallback"
         )
     assert callable(validate_preserved_run)

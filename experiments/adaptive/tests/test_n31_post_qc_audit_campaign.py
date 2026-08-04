@@ -32,7 +32,7 @@ from experiments.adaptive.kauri_experiment.n31_post_qc_audit_campaign import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 PROFILE_PATH = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v3.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v4.json"
 )
 V1_PROFILE_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v1.json"
@@ -40,7 +40,30 @@ V1_PROFILE_PATH = (
 V2_PROFILE_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v2.json"
 )
+V3_PROFILE_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v3.json"
+)
 REVISION = "a" * 40
+ARTIFACT_HANDOFF = {
+    "qualifying_build": "single_exact_clean_build_in_v6_pilot",
+    "campaign_rebuild": False,
+    "pre_allocation_check": "exact_trusted_provenance_equality",
+    "per_attempt_check": "exact_trusted_provenance_equality",
+    "continuity_window": "qualifying_pilot_receipt_through_final_campaign_attempt",
+    "intervening_mutation": "forbidden",
+    "build_reproducibility_claim": "none",
+}
+CAMPAIGN_V3_DISCLOSURE = {
+    "profile_id": "n31-f5-q21-post-qc-audit-campaign-v3",
+    "profile_sha256": (
+        "153d2e8ca457df3db19e866ae4e767cb1d41f104790a3269dba8826b8b0fffbb"
+    ),
+    "canonical_root_allocated": False,
+    "campaign_attempts_started": 0,
+    "campaign_outcomes_observed": 0,
+    "rejection_phase": "before_canonical_root_allocation",
+    "rejection_reason": "second_clean_build_trusted_provenance_mismatch",
+}
 
 
 def _profile():
@@ -119,20 +142,23 @@ def test_campaign_profile_is_bound_to_exact_shipped_bytes(tmp_path: Path) -> Non
     assert profile.profile_id == CAMPAIGN_PROFILE_ID
     assert profile.order_seed == 41_719
     assert profile.audit_profile_sha256 == (
-        "847883f4547776f2f6642b7be9fc02045d918a733711f7e7a3450dcbeb67673a"
+        "d8eac9e892a61d42ecb5d6e2501bb7f6db63dc46b302e3b8d0c922e70b9ad88a"
     )
-    assert json.loads(PROFILE_PATH.read_text(encoding="utf-8"))[
-        "interpretation_scope"
-    ].endswith(
-        "audit-v5 is an outcome-informed correction aligning exact target-side "
-        "omission ground truth with the frozen post-baseline lifecycle rather "
-        "than reporter-local arming"
+    raw = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    assert raw["artifact_handoff"] == ARTIFACT_HANDOFF
+    assert raw["campaign_v3_disclosure"] == CAMPAIGN_V3_DISCLOSURE
+    assert raw["interpretation_scope"].endswith(
+        "campaign-v4 reuses the exact qualifying pilot build and forbids prepare "
+        "or relink before canonical-root allocation"
     )
     assert hashlib.sha256(V1_PROFILE_PATH.read_bytes()).hexdigest() == (
         "f904cb118d95ea975578b85e79b0ffb7dfcc3f0e6d87dfccb8859feb0488ea25"
     )
     assert hashlib.sha256(V2_PROFILE_PATH.read_bytes()).hexdigest() == (
         "acc1191e467901af1743d6930f4e7a36ca6f7ac45dcb6df698a39e668eab996d"
+    )
+    assert hashlib.sha256(V3_PROFILE_PATH.read_bytes()).hexdigest() == (
+        "153d2e8ca457df3db19e866ae4e767cb1d41f104790a3269dba8826b8b0fffbb"
     )
 
     changed = tmp_path / "changed.json"
@@ -141,7 +167,22 @@ def test_campaign_profile_is_bound_to_exact_shipped_bytes(tmp_path: Path) -> Non
         load_frozen_campaign_profile(changed)
 
 
-@pytest.mark.parametrize("published", (V1_PROFILE_PATH, V2_PROFILE_PATH))
+def test_campaign_v4_differs_from_v3_only_in_the_approved_contract_fields() -> None:
+    v3 = json.loads(V3_PROFILE_PATH.read_text(encoding="utf-8"))
+    normalized_v4 = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+
+    assert normalized_v4.pop("artifact_handoff") == ARTIFACT_HANDOFF
+    assert normalized_v4.pop("campaign_v3_disclosure") == CAMPAIGN_V3_DISCLOSURE
+    normalized_v4["profile_id"] = v3["profile_id"]
+    normalized_v4["audit_profile"] = v3["audit_profile"]
+    normalized_v4["interpretation_scope"] = v3["interpretation_scope"]
+
+    assert normalized_v4 == v3
+
+
+@pytest.mark.parametrize(
+    "published", (V1_PROFILE_PATH, V2_PROFILE_PATH, V3_PROFILE_PATH)
+)
 def test_published_campaign_profiles_are_preserved_but_not_reused(
     published: Path,
 ) -> None:

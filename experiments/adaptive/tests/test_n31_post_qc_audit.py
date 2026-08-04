@@ -12,7 +12,7 @@ import pytest
 
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit as pqar
 
-PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v5.json"
+PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v6.json"
 V2_PROFILE_PATH = (
     Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v2.json"
 )
@@ -21,6 +21,9 @@ V3_PROFILE_PATH = (
 )
 V4_PROFILE_PATH = (
     Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v4.json"
+)
+V5_PROFILE_PATH = (
+    Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v5.json"
 )
 EPOCH_DIGEST = "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
 BLOCK = "b" * 64
@@ -51,7 +54,7 @@ def _identity(block: str = BLOCK, *, root_marker: bool = False) -> str:
     return (
         "reporter=0 target=5 root=30 epoch=0 tree=30 "
         f"epoch_digest={EPOCH_DIGEST} block={block} generation=7 {context}"
-        "window=n31-epoch0-tree30-post-qc-audit-v5"
+        "window=n31-epoch0-tree30-post-qc-audit-v6"
     )
 
 
@@ -185,6 +188,9 @@ def test_profile_and_execution_order_are_frozen(
     assert hashlib.sha256(V4_PROFILE_PATH.read_bytes()).hexdigest() == (
         "e05948c2eb0ae0eee7df78b5f9f603ce754ab560a5ac9bffabbf84d104b21a99"
     )
+    assert hashlib.sha256(V5_PROFILE_PATH.read_bytes()).hexdigest() == (
+        "847883f4547776f2f6642b7be9fc02045d918a733711f7e7a3450dcbeb67673a"
+    )
     assert (
         json.loads(PROFILE_PATH.read_text(encoding="utf-8"))["evidence_policy"][
             "later_commit"
@@ -195,7 +201,7 @@ def test_profile_and_execution_order_are_frozen(
         json.loads(PROFILE_PATH.read_text(encoding="utf-8"))["evidence_policy"][
             "failure_stop_rule"
         ]
-        == "no_v6_without_independent_method_review_or_explicit_redesign"
+        == "no_v7_without_explicit_author_approval_and_independent_method_review"
     )
     assert profile.arm(pqar.ARM_OMISSION).omit_outbound_aggregate is False
 
@@ -208,6 +214,22 @@ def test_published_v3_profile_is_preserved_but_not_reused() -> None:
 def test_spent_v4_profile_is_preserved_but_not_reused() -> None:
     with pytest.raises(pqar.N31PostQcAuditError, match="profile bytes"):
         pqar.load_frozen_profile(V4_PROFILE_PATH)
+
+
+def test_spent_v5_profile_is_preserved_but_not_reused() -> None:
+    with pytest.raises(pqar.N31PostQcAuditError, match="profile bytes"):
+        pqar.load_frozen_profile(V5_PROFILE_PATH)
+
+
+def test_v6_profile_only_changes_approved_v5_contract_fields() -> None:
+    v5 = json.loads(V5_PROFILE_PATH.read_text(encoding="utf-8"))
+    v6 = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    v6["profile_id"] = v5["profile_id"]
+    v6["diagnostic_window"] = v5["diagnostic_window"]
+    v6["evidence_policy"]["failure_stop_rule"] = v5["evidence_policy"][
+        "failure_stop_rule"
+    ]
+    assert v6 == v5
 
 
 def test_profile_byte_tampering_is_rejected(tmp_path: Path) -> None:

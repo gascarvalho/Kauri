@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import re
 from typing import Any
@@ -31,23 +32,23 @@ from experiments.adaptive.kauri_experiment.profiled_fault_archive import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 CAMPAIGN_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v3.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v4.json"
 )
 AUDIT_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v5.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v6.json"
 )
 
 
-def test_campaign_cli_defaults_select_prospective_v3_and_v5() -> None:
+def test_campaign_cli_defaults_select_prospective_v4_and_v6() -> None:
     revision = "a" * 40
 
     assert runner.DEFAULT_CAMPAIGN_PROFILE == CAMPAIGN_PROFILE
     assert runner.DEFAULT_AUDIT_PROFILE == AUDIT_PROFILE
     assert runner.DEFAULT_RESULTS_PARENT == (
-        REPOSITORY / "results/n31-post-qc-audit-campaign-v3"
+        REPOSITORY / "results/n31-post-qc-audit-campaign-v4"
     )
     assert runner._default_campaign_root(REPOSITORY, revision) == (
-        runner.DEFAULT_RESULTS_PARENT / "aaaaaaaa-seed41719-campaign-v3"
+        runner.DEFAULT_RESULTS_PARENT / "aaaaaaaa-seed41719-campaign-v4"
     )
 
 
@@ -76,6 +77,63 @@ def _trusted(tmp_path: Path) -> TrustedProvenance:
         build_provenance_document_sha256="c" * 64,
         binaries=binaries,
     )
+
+
+_PROVENANCE_MUTATIONS = (
+    "revision",
+    "repository",
+    "build_directory",
+    "build_provenance_file_sha256",
+    "build_provenance_document_sha256",
+    *(
+        f"binary:{name}:{field}"
+        for name in ("app", "epoch_profile_digest", "keygen", "manager", "tls_keygen")
+        for field in ("path", "size_bytes", "sha256")
+    ),
+)
+
+
+def _mismatched_provenance(
+    trusted: TrustedProvenance,
+    tmp_path: Path,
+    mutation: str,
+) -> TrustedProvenance:
+    if mutation == "revision":
+        return replace(trusted, revision="e" * 40)
+    if mutation == "repository":
+        return replace(
+            trusted, repository=str((tmp_path / "other-repository").resolve())
+        )
+    if mutation == "build_directory":
+        return replace(
+            trusted,
+            build_directory=str((tmp_path / "other-build").resolve()),
+        )
+    if mutation == "build_provenance_file_sha256":
+        return replace(trusted, build_provenance_file_sha256="f" * 64)
+    if mutation == "build_provenance_document_sha256":
+        return replace(trusted, build_provenance_document_sha256="f" * 64)
+
+    _, binary_name, field = mutation.split(":", maxsplit=2)
+    index = next(
+        index
+        for index, binary in enumerate(trusted.binaries)
+        if binary.name == binary_name
+    )
+    binary = trusted.binaries[index]
+    if field == "path":
+        changed = replace(
+            binary,
+            path=str((tmp_path / "other-bin" / binary_name).resolve()),
+        )
+    elif field == "size_bytes":
+        changed = replace(binary, size_bytes=binary.size_bytes + 1)
+    else:
+        assert field == "sha256"
+        changed = replace(binary, sha256="f" * 64)
+    binaries = list(trusted.binaries)
+    binaries[index] = changed
+    return replace(trusted, binaries=tuple(binaries))
 
 
 def _pilot_result(trusted: TrustedProvenance) -> dict[str, object]:
@@ -167,7 +225,7 @@ def _execute_mock_campaign(
     blind_contexts: list[dict[str, object]] = []
     child_outcomes: dict[str, str] = {}
     child_arms: dict[str, str] = {}
-    build_calls: list[dict[str, Any]] = []
+    provenance_calls: list[dict[str, Any]] = []
     preflight_calls: list[dict[str, Any]] = []
     pilot_calls: list[tuple[Path, TrustedProvenance]] = []
     events: list[str] = []
@@ -176,10 +234,11 @@ def _execute_mock_campaign(
     if expected_blind_calls is None:
         expected_blind_calls = raise_at - 1 if raise_at is not None else 90
 
-    def prepare_build(**kwargs: Any) -> None:
-        build_calls.append(kwargs)
+    def reject_prepare_or_relink(**_kwargs: Any) -> None:
+        pytest.fail("campaign must reuse the qualifying pilot build")
 
-    def derive_provenance(**_kwargs: Any) -> TrustedProvenance:
+    def derive_provenance(**kwargs: Any) -> TrustedProvenance:
+        provenance_calls.append(kwargs)
         return trusted
 
     def preflight(**kwargs: Any) -> dict[str, object]:
@@ -286,6 +345,11 @@ def _execute_mock_campaign(
         return real_summarize(*args, **kwargs)
 
     monkeypatch.setattr(runner, "summarize_n31_pqar_campaign", guarded_summarize)
+    monkeypatch.setattr(
+        runner.runtime,
+        "prepare_exact_revision_build",
+        reject_prepare_or_relink,
+    )
     error: runner.N31PostQcAuditCampaignInterrupted | None = None
     summary_path: Path | None = None
     try:
@@ -293,7 +357,6 @@ def _execute_mock_campaign(
             **_campaign_arguments(
                 tmp_path, trusted=trusted, campaign_root=campaign_root
             ),
-            prepare_build=prepare_build,
             derive_provenance=derive_provenance,
             preflight=preflight,
             validate_pilot=validate_pilot,
@@ -316,7 +379,7 @@ def _execute_mock_campaign(
         "blind_contexts": blind_contexts,
         "child_outcomes": child_outcomes,
         "child_arms": child_arms,
-        "build_calls": build_calls,
+        "provenance_calls": provenance_calls,
         "preflight_calls": preflight_calls,
         "pilot_calls": pilot_calls,
         "events": events,
@@ -337,7 +400,7 @@ def test_runner_seals_intent_before_slot_one_and_never_branches_on_outcomes(
     summary = json.loads(result["summary_path"].read_text(encoding="utf-8"))
 
     assert result["error"] is None
-    assert len(result["build_calls"]) == 1
+    assert len(result["provenance_calls"]) == 1
     assert len(result["preflight_calls"]) == 1
     assert result["pilot_calls"] == [(tmp_path / "sealed-pilot", result["trusted"])]
     assert [arm for arm, _ in result["run_calls"]] == [
@@ -394,6 +457,77 @@ def test_runner_seals_intent_before_slot_one_and_never_branches_on_outcomes(
     )
     verify_evidence_seal(root / "intent")
     verify_evidence_seal(root)
+
+
+def test_campaign_reuses_qualifying_pilot_build_without_prepare_or_relink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _execute_mock_campaign(
+        tmp_path,
+        monkeypatch,
+        outcomes=("PASS",) * 90,
+    )
+
+    assert result["error"] is None
+    assert len(result["provenance_calls"]) == 1
+
+
+@pytest.mark.parametrize("mutation", _PROVENANCE_MUTATIONS)
+def test_each_current_provenance_mismatch_rejects_before_root_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    trusted = _trusted(tmp_path)
+    current = _mismatched_provenance(trusted, tmp_path, mutation)
+    root = tmp_path / "campaign"
+    calls: list[str] = []
+
+    def reject_prepare_or_relink(**_kwargs: Any) -> None:
+        pytest.fail("campaign must not prepare or relink after the pilot")
+
+    def validate_pilot(
+        _sequence_directory: Path,
+        *,
+        trusted_provenance: TrustedProvenance,
+    ) -> dict[str, object]:
+        assert trusted_provenance is trusted
+        calls.append("pilot")
+        return _pilot_result(trusted)
+
+    def derive_provenance(**_kwargs: Any) -> TrustedProvenance:
+        calls.append("provenance")
+        return current
+
+    def forbidden(name: str):
+        def callback(*_args: Any, **_kwargs: Any) -> Any:
+            calls.append(name)
+            raise AssertionError(f"{name} must not be called")
+
+        return callback
+
+    monkeypatch.setattr(
+        runner.runtime,
+        "prepare_exact_revision_build",
+        reject_prepare_or_relink,
+    )
+    monkeypatch.setattr(runner, "_allocate_campaign_root", forbidden("allocate"))
+    with pytest.raises(
+        runner.N31PostQcAuditCampaignRunError,
+        match="differs from the qualifying pilot receipt",
+    ):
+        runner.run_campaign(
+            **_campaign_arguments(tmp_path, trusted=trusted, campaign_root=root),
+            derive_provenance=derive_provenance,
+            preflight=forbidden("preflight"),
+            validate_pilot=validate_pilot,
+            run_once=forbidden("run_once"),
+            classify_source_blind=lambda path, *, trusted_provenance: {},
+            validate_after_seal=False,
+        )
+
+    assert calls == ["pilot", "provenance"]
+    assert not root.exists()
 
 
 def test_source_blind_call_counter_cannot_recover_the_frozen_slot_schedule(
@@ -492,6 +626,59 @@ def test_raised_error_stops_without_retry_and_accounts_untouched_suffix(
     }
     assert len(list((root / "starts").iterdir())) == 4
     assert len(list((root / "executions").iterdir())) == 90
+    verify_evidence_seal(root)
+
+
+def test_mid_run_provenance_drift_spends_slot_and_rejects_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drift = runner.audit_runtime.N31PostQcAuditRuntimeError(
+        "per-arm binaries or build provenance changed after preflight"
+    )
+    result = _execute_mock_campaign(
+        tmp_path,
+        monkeypatch,
+        outcomes=("PASS",) * 90,
+        raise_at=4,
+        raised_error=drift,
+    )
+    root = result["campaign_root"]
+    summary = json.loads((root / "campaign-summary.json").read_text(encoding="utf-8"))
+    executions = [
+        json.loads(
+            (root / "executions" / f"slot-{ordinal:03d}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for ordinal in range(1, 91)
+    ]
+
+    assert result["error"] is not None
+    assert result["error"].__cause__ is drift
+    assert [record["launch_status"] for record in executions[:4]] == [
+        "returned",
+        "returned",
+        "returned",
+        "raised",
+    ]
+    assert executions[3]["exception"] == (
+        "N31PostQcAuditRuntimeError: "
+        "per-arm binaries or build provenance changed after preflight"
+    )
+    assert {record["launch_status"] for record in executions[4:]} == {"not_started"}
+    assert len(list((root / "starts").iterdir())) == 4
+    assert summary["campaign_acceptance"] == "REJECTED"
+    assert summary["figure_eligible"] is False
+    assert summary["outcome_counts"] == {
+        "PASS": 3,
+        "FAIL": 0,
+        "INCOMPLETE": 87,
+    }
+    assert summary["invocation_status_counts"] == {
+        "returned": 3,
+        "raised": 1,
+        "not_started": 86,
+    }
     verify_evidence_seal(root)
 
 
@@ -992,7 +1179,6 @@ def test_preexisting_campaign_root_rejects_before_pilot_build_or_preflight(
     ):
         runner.run_campaign(
             **_campaign_arguments(tmp_path, trusted=trusted, campaign_root=root),
-            prepare_build=forbidden("build"),
             derive_provenance=forbidden("provenance"),
             preflight=forbidden("preflight"),
             validate_pilot=forbidden("pilot"),

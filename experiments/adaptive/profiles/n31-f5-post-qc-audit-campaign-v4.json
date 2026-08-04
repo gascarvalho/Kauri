@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "profile_id": "n31-f5-q21-post-qc-audit-campaign-v4",
+  "frozen": true,
+  "campaign_order_seed": 41719,
+  "order_algorithm": "sha256-ranked-all-six-permutations-v1",
+  "cycles": 5,
+  "permutations_per_cycle": 6,
+  "slots_per_permutation": 3,
+  "scheduled_permutation_blocks": 30,
+  "scheduled_attempts": 90,
+  "attempts_per_arm": 30,
+  "attempts_per_ordinal_position_per_arm": 10,
+  "automatic_retries": 0,
+  "replacement_policy": "none",
+  "outcome_scanning": false,
+  "execution": {
+    "mode": "fixed_sequential",
+    "fresh_processes_per_attempt": true,
+    "one_shot_campaign_root": true,
+    "resume": false,
+    "continue_after_returned_outcome": [
+      "PASS",
+      "FAIL",
+      "INCOMPLETE"
+    ],
+    "stop_after_raised_exception": true
+  },
+  "pilot_gate": {
+    "required_verdict": "PASS",
+    "required_kind": "fresh-three-arm-pilot",
+    "same_revision": true,
+    "same_trusted_provenance": true,
+    "same_audit_profile": true,
+    "same_runtime_profile": true,
+    "figure_eligible": false
+  },
+  "artifact_handoff": {
+    "qualifying_build": "single_exact_clean_build_in_v6_pilot",
+    "campaign_rebuild": false,
+    "pre_allocation_check": "exact_trusted_provenance_equality",
+    "per_attempt_check": "exact_trusted_provenance_equality",
+    "continuity_window": "qualifying_pilot_receipt_through_final_campaign_attempt",
+    "intervening_mutation": "forbidden",
+    "build_reproducibility_claim": "none"
+  },
+  "campaign_v3_disclosure": {
+    "profile_id": "n31-f5-q21-post-qc-audit-campaign-v3",
+    "profile_sha256": "153d2e8ca457df3db19e866ae4e767cb1d41f104790a3269dba8826b8b0fffbb",
+    "canonical_root_allocated": false,
+    "campaign_attempts_started": 0,
+    "campaign_outcomes_observed": 0,
+    "rejection_phase": "before_canonical_root_allocation",
+    "rejection_reason": "second_clean_build_trusted_provenance_mismatch"
+  },
+  "audit_profile": {
+    "path": "experiments/adaptive/profiles/n31-f5-post-qc-audit-v6.json",
+    "profile_id": "n31-f5-q21-post-qc-audit-v6",
+    "sha256": "d8eac9e892a61d42ecb5d6e2501bb7f6db63dc46b302e3b8d0c922e70b9ad88a"
+  },
+  "runtime_profile": {
+    "path": "experiments/adaptive/profiles/n31-f5-internal1-crash-shakedown-v1.json",
+    "profile_id": "n31-f5-q21-internal1-sigkill-shakedown-v1",
+    "sha256": "0defdaa9b69c949365eea3b3029da75cee3ea8334f845401103e2f7af8507650"
+  },
+  "arms": [
+    {
+      "name": "static_authenticated_false_report",
+      "expected_source_blind_classification": "false_reporter"
+    },
+    {
+      "name": "static_persistent_direct_vote_omission",
+      "expected_source_blind_classification": "omission_compatible"
+    },
+    {
+      "name": "static_authenticated_sham",
+      "expected_source_blind_classification": "sham"
+    }
+  ],
+  "source_blind_policy": {
+    "observe_all_children_before_truth_join": true,
+    "classifier_accepts_arm": false,
+    "extraction_order": "sha256-ranked-sealed-child-identity-v1",
+    "isolated_child_basename": "random-opaque-v1",
+    "unclassified_column": true
+  },
+  "acceptance_policy": {
+    "integrity_independent_of_outcomes": true,
+    "require_all_scheduled_invocations": true,
+    "require_all_sealed_children": true,
+    "require_exact_directory_membership": true,
+    "preserve_fixed_denominators": true
+  },
+  "statistics": {
+    "confidence_level": "0.95",
+    "binomial_interval": "two-sided-clopper-pearson-exact",
+    "binomial_denominator_per_arm": 30,
+    "median_interval": "two-sided-exact-sign-test-order-statistic",
+    "complete_n30_median_interval_order_statistics": [
+      10,
+      21
+    ]
+  },
+  "timing_metrics_ns": [
+    "qc_to_deadline_slack_ns",
+    "target_to_deadline_slack_ns",
+    "relay_to_root_latency_ns",
+    "root_verification_latency_ns",
+    "qc_to_audit_latency_ns",
+    "expiry_to_later_commit_latency_ns"
+  ],
+  "figure_policy": {
+    "campaign_acceptance_required": "ACCEPTED",
+    "pilot_eligible": false,
+    "mixed_outcomes_eligible": true,
+    "output_location": "outside_sealed_campaign_root"
+  },
+  "interpretation_scope": "same-host descriptive timings; Bernoulli trials only approximate independent identical repetitions; omission-compatible is not culprit identification; expiry-to-later-commit is fixed-Q21 common-witness observation time, not necessarily authoritative observer commit time; audit-v6 is a prospective v5-equivalent freeze with an explicit v7 stop gate; campaign-v4 reuses the exact qualifying pilot build and forbids prepare or relink before canonical-root allocation"
+}
