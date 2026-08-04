@@ -125,6 +125,7 @@ class FaultWindowContract(_Document):
     schedule_slack_s: int
     drain_margin_s: int
     hard_timeout_s: int
+    transition_observation_bound_rule: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +436,9 @@ def _fault_window(slot: FactorialSlot) -> FaultWindowContract:
         schedule_slack_s=slot.common_timers.schedule_slack_s,
         drain_margin_s=slot.common_timers.drain_margin_s,
         hard_timeout_s=slot.common_timers.hard_timeout_s,
+        transition_observation_bound_rule=(
+            slot.common_timers.transition_observation_bound_rule
+        ),
     )
 
 
@@ -723,7 +727,13 @@ def _replica_argv_templates(
     structured_events: StructuredEventContract,
 ) -> tuple[ReplicaProcessSpec, ...]:
     actors = ",".join(map(str, slot.byzantine_actor_ids))
-    window_id = f"{slot.block_id}-rotating-omission-v1"
+    window_suffix = {
+        "rotating_intermittent_omission_v1": "rotating-omission-v1",
+        "persistent_selected_omission_v1": "persistent-omission-v1",
+    }.get(slot.byzantine.mode)
+    if window_suffix is None:
+        raise FactorialManifestError("unknown Byzantine omission mode")
+    window_id = f"{slot.block_id}-{window_suffix}"
     result: list[ReplicaProcessSpec] = []
     for replica_id in range(slot.replica_count):
         argv = (
@@ -954,7 +964,7 @@ def materialize_replica_argv(
     start = shared_raw_clock_anchor_ns + start_offset
     end = start + duration
     if start > _MAXIMUM_MONOTONIC_NS or end > _MAXIMUM_MONOTONIC_NS:
-        raise FactorialManifestError("materialized rotating window exceeds uint64")
+        raise FactorialManifestError("materialized Byzantine window exceeds uint64")
     clock_arguments = (
         "--experiment-byzantine-window-start-monotonic-ns",
         str(start),

@@ -56,6 +56,9 @@ from .factorial_manifest import (
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
     FROZEN_PLAN_SHA256,
+    LEGACY_MANIFEST_ID,
+    LEGACY_MANIFEST_SHA256,
+    LEGACY_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -88,9 +91,15 @@ REPLICA_EVENTS_PATTERN = "raw/replica-{replica_id}.jsonl"
 REPLICA_STDERR_PATTERN = "raw/process/replica-{replica_id}.stderr.log"
 EXCLUDED_SMOKE_SLOT_ID = "smoke-n7-f2-PS"
 FROZEN_RUNTIME_SHA256 = (
-    "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
+    "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
 )
 FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "2be6930b5770b5bbe4991673675a1f1d8443d3526c388b744b601c59e9216a37"
+)
+LEGACY_RUNTIME_SHA256 = (
+    "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
+)
+LEGACY_SMOKE_RUNTIME_SHA256 = (
     "cf73c4e4ec7df8fbca29421c5897bafca7a2fa6e5f08afc571d014b8d66ebdae"
 )
 
@@ -148,7 +157,7 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _REDACTION = re.compile(r"hmac-sha256:([A-Za-z0-9_.-]{1,64}):([0-9a-f]{64})")
 _FAULT_MARKER = re.compile(
-    r"(?:^|\s)KAURI_FAULT fault=rotating_intermittent_omission_v1 "
+    r"(?:^|\s)KAURI_FAULT fault=([a-z0-9_]+) "
     r"proposal_epoch=(\d+) proposal_tree=(\d+) "
     r"proposal_epoch_digest=([0-9a-f]{64}) "
     r"proposal_block_hash=([0-9a-f]{64}) window=([^\s]+) "
@@ -186,6 +195,38 @@ class _Incomplete(FactorialValidationError):
 
 class _Reject(FactorialValidationError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenArtifactIdentity:
+    manifest_id: str
+    manifest_sha256: str
+    plan_sha256: str
+    runtime_sha256: str
+    smoke_runtime_sha256: str
+
+
+def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
+    identities = {
+        LEGACY_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=LEGACY_MANIFEST_ID,
+            manifest_sha256=LEGACY_MANIFEST_SHA256,
+            plan_sha256=LEGACY_PLAN_SHA256,
+            runtime_sha256=LEGACY_RUNTIME_SHA256,
+            smoke_runtime_sha256=LEGACY_SMOKE_RUNTIME_SHA256,
+        ),
+        FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=FROZEN_MANIFEST_ID,
+            manifest_sha256=FROZEN_MANIFEST_SHA256,
+            plan_sha256=FROZEN_PLAN_SHA256,
+            runtime_sha256=FROZEN_RUNTIME_SHA256,
+            smoke_runtime_sha256=FROZEN_SMOKE_RUNTIME_SHA256,
+        ),
+    }
+    identity = identities.get(manifest_id)
+    if identity is None:
+        _fail("manifest ID is not a known frozen SHAPE25 artifact identity")
+    return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +278,7 @@ class ReplicaScore:
 class FaultMarker:
     source_replica: int
     line_number: int
+    fault_mode: str
     epoch_number: int
     tree_id: int
     epoch_digest: str
@@ -386,6 +428,25 @@ class _EvidenceRecord:
 
 def _fail(message: str) -> None:
     raise _Reject(message)
+
+
+def _effective_omission_contract(
+    manifest: FrozenFactorialManifest,
+    expected: _ExpectedSlot,
+) -> tuple[str, int]:
+    window_suffix = {
+        "rotating_intermittent_omission_v1": "rotating-omission-v1",
+        "persistent_selected_omission_v1": "persistent-omission-v1",
+    }.get(manifest.byzantine.mode)
+    if window_suffix is None:
+        _fail("manifest Byzantine omission mode is unknown")
+    max_omissions = (
+        len(expected.actor_ids)
+        if expected.slot_id == EXCLUDED_SMOKE_SLOT_ID
+        and manifest.byzantine.mode == "persistent_selected_omission_v1"
+        else manifest.byzantine.max_omissions_per_proposal
+    )
+    return f"{expected.block_id}-{window_suffix}", max_omissions
 
 
 def _incomplete(message: str) -> None:
@@ -1377,7 +1438,11 @@ def _load_static_contracts(
 ) -> tuple[FrozenFactorialManifest, dict[str, Any], dict[str, Any], _ExpectedSlot, str]:
     manifest_payload = _read_bytes(slot_root, MANIFEST_FILENAME)
     assert manifest_payload is not None
-    if _sha256(manifest_payload) != FROZEN_MANIFEST_SHA256:
+    manifest_document = _parse_json_bytes(manifest_payload, MANIFEST_FILENAME)
+    identity = _frozen_artifact_identity(
+        _string(manifest_document.get("manifest_id"), "manifest.manifest_id")
+    )
+    if _sha256(manifest_payload) != identity.manifest_sha256:
         _fail("manifest.json does not have the exact frozen byte identity")
     try:
         manifest = load_frozen_manifest_bytes(manifest_payload)
@@ -1408,12 +1473,15 @@ def _load_static_contracts(
     loaded_plan = _read_json(slot_root, PLAN_FILENAME)
     assert loaded_plan is not None
     plan, plan_payload = loaded_plan
-    if _sha256(plan_payload) != FROZEN_PLAN_SHA256:
+    if _sha256(plan_payload) != identity.plan_sha256:
         _fail("plan.json does not have the exact frozen plan identity")
-    if plan.get("manifest_id") != FROZEN_MANIFEST_ID or plan.get("manifest_sha256") != FROZEN_MANIFEST_SHA256:
+    if (
+        plan.get("manifest_id") != identity.manifest_id
+        or plan.get("manifest_sha256") != identity.manifest_sha256
+    ):
         _fail("plan.json is not bound to the frozen manifest")
     if (
-        plan.get("plan_id") != f"{FROZEN_MANIFEST_ID}-plan-v1"
+        plan.get("plan_id") != f"{identity.manifest_id}-plan-v1"
         or plan.get("schema_version") != 1
         or plan.get("slot_count") != EXPECTED_SLOT_COUNT
         or plan.get("automatic_retries") != 0
@@ -1431,7 +1499,7 @@ def _load_static_contracts(
         loaded_runtime = _read_json(slot_root, RUNTIME_FILENAME)
         assert loaded_runtime is not None
         runtime, runtime_payload = loaded_runtime
-        if _sha256(runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
+        if _sha256(runtime_payload) != identity.smoke_runtime_sha256:
             _fail("runtime.json drifted from the exact frozen N=7 smoke identity")
         _validate_runtime_slot(runtime, expected, manifest)
         return manifest, plan, runtime, expected, _sha256(runtime_payload)
@@ -1500,14 +1568,14 @@ def _load_static_contracts(
     assert loaded_runtime is not None
     runtime, runtime_payload = loaded_runtime
     runtime_sha256 = _sha256(runtime_payload)
-    if runtime_sha256 != FROZEN_RUNTIME_SHA256:
+    if runtime_sha256 != identity.runtime_sha256:
         _fail("runtime.json drifted from the exact frozen campaign identity")
     if (
         runtime.get("schema_version") != 1
-        or runtime.get("runtime_id") != f"{FROZEN_MANIFEST_ID}-runtime-v1"
-        or runtime.get("manifest_id") != FROZEN_MANIFEST_ID
-        or runtime.get("manifest_sha256") != FROZEN_MANIFEST_SHA256
-        or runtime.get("source_plan_sha256") != FROZEN_PLAN_SHA256
+        or runtime.get("runtime_id") != f"{identity.manifest_id}-runtime-v1"
+        or runtime.get("manifest_id") != identity.manifest_id
+        or runtime.get("manifest_sha256") != identity.manifest_sha256
+        or runtime.get("source_plan_sha256") != identity.plan_sha256
         or runtime.get("slot_count") != EXPECTED_SLOT_COUNT
         or runtime.get("execution_mode") != "fixed_sequential"
         or runtime.get("automatic_retries") != 0
@@ -1599,6 +1667,29 @@ def _validate_runtime_slot(
         "latency_percentile_basis_points": manifest.responsiveness_policy.latency_percentile_basis_points,
     }:
         _fail("runtime responsiveness policy drifted")
+    fault_window = _mapping(runtime.get("fault_window"), "runtime fault_window")
+    expected_fault_window = {
+        "clock": "CLOCK_MONOTONIC_RAW",
+        "bound_rule": "prelaunch_anchor_plus_offset_inclusive_start_exclusive_end",
+        "shared_anchor_per_slot": True,
+        "anchor_phase": "sample_once_immediately_before_slot_launch",
+        "start_after_prelaunch_anchor_s": (
+            manifest.byzantine.start_after_prelaunch_anchor_s
+        ),
+        "duration_s": manifest.byzantine.duration_s,
+        "transition_convergence_deadline_s": (
+            manifest.common_timers.transition_convergence_deadline_s
+        ),
+        "schedule_slack_s": manifest.common_timers.schedule_slack_s,
+        "drain_margin_s": manifest.common_timers.drain_margin_s,
+        "hard_timeout_s": manifest.common_timers.hard_timeout_s,
+    }
+    if manifest.manifest_id == FROZEN_MANIFEST_ID:
+        expected_fault_window["transition_observation_bound_rule"] = (
+            "shared_slot_hard_deadline_until_manager_selection_v1"
+        )
+    if dict(fault_window) != expected_fault_window:
+        _fail("runtime fault-window clock/bound contract drifted")
     shape = _mapping(runtime.get("shape_invocation"), "shape_invocation")
     if (
         shape.get("selector_version") != SELECTOR_VERSION
@@ -1747,6 +1838,9 @@ def _validate_runtime_slot(
     if len(replica_templates) != expected.replica_count:
         _fail("runtime replica templates do not cover exact membership")
     expected_actors = ",".join(map(str, expected.actor_ids))
+    expected_window, expected_max_omissions = _effective_omission_contract(
+        manifest, expected
+    )
     for replica_id, raw in enumerate(replica_templates):
         item = _mapping(raw, f"runtime replica template {replica_id}")
         if item.get("replica_id") != replica_id:
@@ -1757,11 +1851,14 @@ def _validate_runtime_slot(
         )
         options = {argv[index]: argv[index + 1] for index in range(len(argv) - 1) if argv[index].startswith("--")}
         if (
-            options.get("--experiment-rotating-omission-actors") != expected_actors
+            options.get("--experiment-byzantine-mode") != manifest.byzantine.mode
+            or options.get("--experiment-byzantine-window") != expected_window
+            or options.get("--experiment-rotating-omission-actors")
+            != expected_actors
             or options.get("--experiment-rotating-omission-context-limit")
             != str(manifest.byzantine.maximum_rotating_contexts)
             or options.get("--experiment-byzantine-max-omissions-per-proposal")
-            != str(manifest.byzantine.max_omissions_per_proposal)
+            != str(expected_max_omissions)
         ):
             _fail("runtime replica omission actor/cap contract drifted")
 
@@ -2703,7 +2800,7 @@ def _fault_markers(
     paths_by_replica: Mapping[int, Sequence[str]],
 ) -> tuple[FaultMarker, ...]:
     markers: list[FaultMarker] = []
-    seen: set[tuple[int, int, str, str, int, str]] = set()
+    seen: set[tuple[str, int, int, str, str, int, str]] = set()
     for replica_id, paths in paths_by_replica.items():
         for relative in paths:
             path = _safe_file(slot_root, relative)
@@ -2730,21 +2827,23 @@ def _fault_markers(
                         marker = FaultMarker(
                             source_replica=replica_id,
                             line_number=line_number,
-                            epoch_number=int(match.group(1)),
-                            tree_id=int(match.group(2)),
-                            epoch_digest=match.group(3),
-                            block_hash=match.group(4),
-                            window=match.group(5),
-                            window_start_ns=int(match.group(6)),
-                            window_end_ns=int(match.group(7)),
-                            actor=int(match.group(8)),
-                            action=match.group(9),
-                            monotonic_ns=int(match.group(10)),
+                            fault_mode=match.group(1),
+                            epoch_number=int(match.group(2)),
+                            tree_id=int(match.group(3)),
+                            epoch_digest=match.group(4),
+                            block_hash=match.group(5),
+                            window=match.group(6),
+                            window_start_ns=int(match.group(7)),
+                            window_end_ns=int(match.group(8)),
+                            actor=int(match.group(9)),
+                            action=match.group(10),
+                            monotonic_ns=int(match.group(11)),
                             raw_line_sha256=_sha256(raw),
                         )
                         if marker.action == "capacity_exhausted":
                             _fail(f"{relative}:{line_number} exhausted omission context capacity")
                         identity = (
+                            marker.fault_mode,
                             marker.epoch_number,
                             marker.tree_id,
                             marker.epoch_digest,
@@ -2782,11 +2881,118 @@ def _adaptive_proposal_identity(event: _NativeEvent) -> tuple[int, int, str, str
         raise
 
 
+def _validate_fault_marker_schedule(
+    markers: Sequence[FaultMarker],
+    *,
+    actor_ids: Sequence[int],
+    fault_mode: str,
+    max_omissions_per_proposal: int,
+) -> None:
+    actors = tuple(sorted(actor_ids))
+    actor_set = set(actors)
+    if fault_mode not in {
+        "rotating_intermittent_omission_v1",
+        "persistent_selected_omission_v1",
+    }:
+        _fail("fault causality mode is not a known omission schedule")
+    if not 1 <= max_omissions_per_proposal <= len(actors):
+        _fail("fault causality proposal bound is outside the selected actor set")
+    markers_by_proposal: dict[
+        tuple[int, int, str, str], list[FaultMarker]
+    ] = defaultdict(list)
+    for marker in markers:
+        if marker.fault_mode != fault_mode or marker.actor not in actor_set:
+            _fail("fault marker mode/actor differs from the frozen schedule")
+        if marker.action == "forward":
+            _fail("fault marker cannot claim a no-op forward action")
+        markers_by_proposal[
+            (
+                marker.epoch_number,
+                marker.tree_id,
+                marker.epoch_digest,
+                marker.block_hash,
+            )
+        ].append(marker)
+    for proposal, proposal_markers in markers_by_proposal.items():
+        proposal_actors = [marker.actor for marker in proposal_markers]
+        if (
+            len(proposal_markers) > max_omissions_per_proposal
+            or len(set(proposal_actors)) != len(proposal_actors)
+        ):
+            _fail(f"fault proposal exceeds its independent omission bound: {proposal}")
+
+
+def _validate_persistent_interior_proposals(
+    markers: Sequence[FaultMarker],
+    *,
+    actor_ids: Sequence[int],
+    phase_windows: Mapping[str, tuple[int, int, int]],
+    phase_configurations: Sequence[
+        tuple[str, int, str, Mapping[int, Tree]]
+    ],
+) -> None:
+    """Require complete persistent actor/action sets away from clock edges."""
+
+    actors = frozenset(actor_ids)
+    grouped: dict[tuple[int, int, str, str], list[FaultMarker]] = defaultdict(list)
+    for marker in markers:
+        grouped[
+            (
+                marker.epoch_number,
+                marker.tree_id,
+                marker.epoch_digest,
+                marker.block_hash,
+            )
+        ].append(marker)
+    for phase, epoch_number, epoch_digest, trees in phase_configurations:
+        start_ns, end_ns, bucket_count = phase_windows[phase]
+        span_ns = end_ns - start_ns
+        if bucket_count <= 2 or span_ns <= 0 or span_ns % bucket_count:
+            _fail(f"{phase} cannot derive its frozen interior bucket boundary")
+        bucket_width_ns = span_ns // bucket_count
+        interior_start = start_ns + bucket_width_ns
+        interior_end = end_ns - bucket_width_ns
+        represented = 0
+        for (epoch, tree_id, digest, _), proposal_markers in grouped.items():
+            if epoch != epoch_number or digest != epoch_digest or not any(
+                interior_start <= marker.monotonic_ns < interior_end
+                for marker in proposal_markers
+            ):
+                continue
+            tree = trees.get(tree_id)
+            if tree is None:
+                _fail(f"{phase} persistent proposal references an unknown tree")
+            leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+            expected: dict[int, str] = {}
+            for actor in actors:
+                if actor not in tree.members:
+                    _fail(f"{phase} persistent actor is absent from its proposal tree")
+                position = tree.members.index(actor)
+                if position == 0:
+                    continue
+                expected[actor] = (
+                    "omit_aggregate" if position < leaf_start else "omit_direct_vote"
+                )
+            actual = {marker.actor: marker.action for marker in proposal_markers}
+            if actual != expected:
+                _fail(
+                    f"{phase} persistent interior proposal actor/action set is "
+                    "not the exact selected non-root set"
+                )
+            represented += 1
+        if represented == 0:
+            _incomplete(
+                f"{phase} lacks a complete persistent proposal in its frozen interior"
+            )
+
+
 def validate_fault_causality(
     *,
     markers: Sequence[FaultMarker],
     replica_events: Mapping[int, Sequence[_NativeEvent]],
     actor_ids: Sequence[int],
+    fault_mode: str,
+    max_omissions_per_proposal: int,
     initial_epoch_digest: str,
     initial_trees: Sequence[Tree],
     window_id: str,
@@ -2810,6 +3016,12 @@ def validate_fault_causality(
     actors = tuple(sorted(actor_ids))
     if not markers:
         _incomplete("native logs contain no KAURI_FAULT proposal markers")
+    _validate_fault_marker_schedule(
+        markers,
+        actor_ids=actors,
+        fault_mode=fault_mode,
+        max_omissions_per_proposal=max_omissions_per_proposal,
+    )
     proposals_by_replica: dict[int, set[tuple[int, int, str, str, int]]] = {}
     for replica_id, events in replica_events.items():
         proposals_by_replica[replica_id] = {
@@ -2832,6 +3044,17 @@ def validate_fault_causality(
         and epoch2_phase[0] < epoch2_phase[1] <= window_end_ns
     ):
         _fail("fault causality phase windows are outside their exact live bounds")
+    if fault_mode == "persistent_selected_omission_v1":
+        _validate_persistent_interior_proposals(
+            markers,
+            actor_ids=actors,
+            phase_windows=phase_windows,
+            phase_configurations=(
+                ("fault_evidence", 0, initial_epoch_digest, tree_by_id),
+                ("epoch1_stable", 1, epoch1_digest, epoch1_tree_by_id),
+                ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
+            ),
+        )
     outstanding: dict[str, _EvidenceRecord] = {}
     for record in accepted_epoch0:
         if not baseline_cutoff < record.ingestion_sequence <= current_cutoff:
@@ -2859,7 +3082,8 @@ def validate_fault_causality(
     epoch2_leaf_actors: set[int] = set()
     for marker in markers:
         if (
-            marker.window != window_id
+            marker.fault_mode != fault_mode
+            or marker.window != window_id
             or marker.window_start_ns != window_start_ns
             or marker.window_end_ns != window_end_ns
             or marker.actor != marker.source_replica
@@ -2867,15 +3091,16 @@ def validate_fault_causality(
             or not window_start_ns <= marker.monotonic_ns < window_end_ns
         ):
             _fail("fault marker is not bound to the exact slot actor/window")
-        _, selected = fnv1a_rotating_actor(
-            actors,
-            epoch_number=marker.epoch_number,
-            tree_id=marker.tree_id,
-            epoch_digest=marker.epoch_digest,
-            block_hash=marker.block_hash,
-        )
-        if selected != marker.actor:
-            _fail("fault marker actor differs from independent FNV rotation")
+        if fault_mode == "rotating_intermittent_omission_v1":
+            _, selected = fnv1a_rotating_actor(
+                actors,
+                epoch_number=marker.epoch_number,
+                tree_id=marker.tree_id,
+                epoch_digest=marker.epoch_digest,
+                block_hash=marker.block_hash,
+            )
+            if selected != marker.actor:
+                _fail("fault marker actor differs from independent FNV rotation")
         identity = (
             marker.epoch_number,
             marker.tree_id,
@@ -3012,11 +3237,13 @@ def _validate_slot_receipt(
     document: Mapping[str, Any],
     *,
     slot_root: Path,
+    manifest: FrozenFactorialManifest,
     expected: _ExpectedSlot,
     runtime: Mapping[str, Any],
     runtime_sha256: str,
     authorization_bytes: bytes,
 ) -> tuple[int, int, int, Path, Path]:
+    identity = _frozen_artifact_identity(manifest.manifest_id)
     _fields(
         document,
         {
@@ -3043,8 +3270,8 @@ def _validate_slot_receipt(
         document["schema_version"] != 1
         or document["slot_id"] != expected.slot_id
         or document["runtime_artifact_id"] != runtime.get("artifact_id")
-        or document["manifest_sha256"] != FROZEN_MANIFEST_SHA256
-        or document["plan_sha256"] != FROZEN_PLAN_SHA256
+        or document["manifest_sha256"] != identity.manifest_sha256
+        or document["plan_sha256"] != identity.plan_sha256
         or document["runtime_sha256"] != runtime_sha256
         or document["execution_ordinal"] != expected.execution_ordinal
         or document["attempt_ordinal"] != 1
@@ -3379,11 +3606,13 @@ def _validate_outcome(
 def _validate_execution_authorization(
     slot_root: Path,
     *,
+    manifest: FrozenFactorialManifest,
     expected: _ExpectedSlot,
     plan: Mapping[str, Any],
     runtime_sha256: str,
     campaign_member: bool,
 ) -> tuple[dict[str, Any], bytes]:
+    identity = _frozen_artifact_identity(manifest.manifest_id)
     loaded = _read_json(slot_root, AUTHORIZATION_FILENAME)
     assert loaded is not None
     document, payload = loaded
@@ -3416,8 +3645,8 @@ def _validate_execution_authorization(
         "authorization build provenance digest",
     )
     if dict(static_hashes) != {
-        MANIFEST_FILENAME: FROZEN_MANIFEST_SHA256,
-        PLAN_FILENAME: FROZEN_PLAN_SHA256,
+        MANIFEST_FILENAME: identity.manifest_sha256,
+        PLAN_FILENAME: identity.plan_sha256,
         RUNTIME_FILENAME: runtime_sha256,
     }:
         _fail("execution authorization is not bound to the exact static artifacts")
@@ -4513,6 +4742,29 @@ def _command_identity(payload: Mapping[str, Any], label: str) -> dict[str, Any]:
     return result
 
 
+def _validate_transition_terminal_deadline(
+    *,
+    shape_ns: int,
+    terminal_ns: int,
+    observation_bound_rule: str,
+    convergence_deadline_s: int,
+) -> None:
+    """Apply the post-selection deadline only to the v2 clock contract."""
+
+    if observation_bound_rule == "phase_deadline_v1":
+        return
+    if observation_bound_rule != (
+        "shared_slot_hard_deadline_until_manager_selection_v1"
+    ):
+        _fail("transition observation bound rule is unknown")
+    if (
+        convergence_deadline_s <= 0
+        or not shape_ns <= terminal_ns
+        <= shape_ns + convergence_deadline_s * _NANOSECONDS_PER_SECOND
+    ):
+        _fail("manager convergence exceeded its post-selection deadline")
+
+
 def _validate_native_transitions(
     *,
     manager_events: Sequence[_NativeEvent],
@@ -4521,6 +4773,8 @@ def _validate_native_transitions(
     initial_epoch_digest: str,
     expected: _ExpectedSlot,
     expected_activation_delay: int,
+    expected_convergence_deadline_s: int,
+    transition_observation_bound_rule: str,
     cutoff_times: Mapping[str, int],
 ) -> None:
     if len(bundles) != 2:
@@ -4643,6 +4897,21 @@ def _validate_native_transitions(
                 and candidate.payload.get("cycle_ordinal") == cycle
             ),
             None,
+        )
+        shape_events = [
+            candidate
+            for candidate in manager_events
+            if candidate.event_type == "adaptive_v2_shape_decision"
+            and candidate.payload.get("cycle_ordinal") == cycle
+        ]
+        if len(shape_events) != 1:
+            _fail("manager convergence start boundary is absent or duplicated")
+        shape_event = shape_events[0]
+        _validate_transition_terminal_deadline(
+            shape_ns=shape_event.monotonic_ns,
+            terminal_ns=event.monotonic_ns,
+            observation_bound_rule=transition_observation_bound_rule,
+            convergence_deadline_s=expected_convergence_deadline_s,
         )
         if (
             payload["cycle_ordinal"] != cycle
@@ -4925,6 +5194,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         manifest, plan, runtime, expected, runtime_sha256 = _load_static_contracts(slot_root)
         authorization, authorization_bytes = _validate_execution_authorization(
             slot_root,
+            manifest=manifest,
             expected=expected,
             plan=plan,
             runtime_sha256=runtime_sha256,
@@ -4942,6 +5212,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         ) = _validate_slot_receipt(
             receipt,
             slot_root=slot_root,
+            manifest=manifest,
             expected=expected,
             runtime=runtime,
             runtime_sha256=runtime_sha256,
@@ -5104,6 +5375,12 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             initial_epoch_digest=initial_epoch_digest,
             expected=expected,
             expected_activation_delay=manifest.common_timers.activation_delay_blocks,
+            expected_convergence_deadline_s=(
+                manifest.common_timers.transition_convergence_deadline_s
+            ),
+            transition_observation_bound_rule=(
+                manifest.common_timers.transition_observation_bound_rule
+            ),
             cutoff_times=cutoff_times,
         )
 
@@ -5129,13 +5406,18 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         if len(cycle0_snapshots) != 1:
             _fail("cycle-0 evidence snapshot is absent or duplicated")
         cycle0_snapshot = cycle0_snapshots[0].payload
+        expected_window, expected_max_omissions = _effective_omission_contract(
+            manifest, expected
+        )
         validate_fault_causality(
             markers=markers,
             replica_events=replica_events,
             actor_ids=expected.actor_ids,
+            fault_mode=manifest.byzantine.mode,
+            max_omissions_per_proposal=expected_max_omissions,
             initial_epoch_digest=initial_epoch_digest,
             initial_trees=initial_trees,
-            window_id=f"{expected.block_id}-rotating-omission-v1",
+            window_id=expected_window,
             window_start_ns=window_start_ns,
             window_end_ns=window_end_ns,
             epoch1_command_ns=cutoff_times["epoch1_command"],
@@ -5416,6 +5698,7 @@ def _headline_effects(
 def _validate_campaign_execution_ledger(
     root: Path,
     *,
+    manifest: FrozenFactorialManifest,
     plan: Mapping[str, Any],
     runtime: Mapping[str, Any],
     expected_slots: Sequence[_ExpectedSlot],
@@ -5425,6 +5708,7 @@ def _validate_campaign_execution_ledger(
 ) -> int:
     """Replay the exact sequential no-retry campaign lifecycle."""
 
+    identity = _frozen_artifact_identity(manifest.manifest_id)
     loaded_authorization = _read_json(root, CAMPAIGN_AUTHORIZATION_FILENAME)
     loaded_contract = _read_json(root, CAMPAIGN_CONTRACT_FILENAME)
     assert loaded_authorization is not None and loaded_contract is not None
@@ -5486,9 +5770,9 @@ def _validate_campaign_execution_ledger(
             )
         )
         != {
-            MANIFEST_FILENAME: FROZEN_MANIFEST_SHA256,
-            PLAN_FILENAME: FROZEN_PLAN_SHA256,
-            RUNTIME_FILENAME: FROZEN_RUNTIME_SHA256,
+            MANIFEST_FILENAME: identity.manifest_sha256,
+            PLAN_FILENAME: identity.plan_sha256,
+            RUNTIME_FILENAME: identity.runtime_sha256,
         }
         or authorization["automatic_retries"] != 0
         or authorization["replacement_policy"] != "none"
@@ -5520,10 +5804,10 @@ def _validate_campaign_execution_ledger(
     expected_contract = {
         "schema_version": 1,
         "campaign_id": _string(runtime.get("runtime_id"), "campaign runtime ID"),
-        "manifest_id": FROZEN_MANIFEST_ID,
-        "manifest_sha256": FROZEN_MANIFEST_SHA256,
-        "plan_sha256": FROZEN_PLAN_SHA256,
-        "runtime_sha256": FROZEN_RUNTIME_SHA256,
+        "manifest_id": identity.manifest_id,
+        "manifest_sha256": identity.manifest_sha256,
+        "plan_sha256": identity.plan_sha256,
+        "runtime_sha256": identity.runtime_sha256,
         "authorization_id": authorization["authorization_id"],
         "authorization_sha256": _sha256(authorization_bytes),
         "kauri_revision": revision,
@@ -5636,9 +5920,9 @@ def _validate_campaign_execution_ledger(
         expected_common = {
             "schema_version": 1,
             "campaign_id": runtime["runtime_id"],
-            "manifest_sha256": FROZEN_MANIFEST_SHA256,
-            "source_plan_sha256": FROZEN_PLAN_SHA256,
-            "runtime_sha256": FROZEN_RUNTIME_SHA256,
+            "manifest_sha256": identity.manifest_sha256,
+            "source_plan_sha256": identity.plan_sha256,
+            "runtime_sha256": identity.runtime_sha256,
             "contract_sha256": contract_sha256,
             "authorization_id": authorization["authorization_id"],
             "authorization_sha256": _sha256(authorization_bytes),
@@ -5889,6 +6173,7 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
         figure_eligible = outcome == "PASS" and effects is not None
         _validate_campaign_execution_ledger(
             root,
+            manifest=manifest,
             plan=plan,
             runtime=runtime,
             expected_slots=expected_slots,

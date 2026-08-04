@@ -31,6 +31,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
+)
+LEGACY_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
 )
 
@@ -242,7 +245,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v1/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v2/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -254,7 +257,7 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
     manifest = _manifest()
     plan = build_factorial_plan(manifest)
 
-    assert manifest.byzantine.mode == "rotating_intermittent_omission_v1"
+    assert manifest.byzantine.mode == "persistent_selected_omission_v1"
     assert manifest.byzantine.actor_count == 3
     assert manifest.byzantine.actor_count_rule == "fixed_3_bounded_by_derived_f"
     assert manifest.byzantine.actor_selection == (
@@ -264,9 +267,7 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
         "ascii_csv_membership_nul_decimal_q_nul_decimal_scientific_"
         "seed_nul_decimal_replica_id_v1"
     )
-    assert manifest.byzantine.actor_rotation == (
-        "fnv1a64_be_epoch_tree_epoch_digest_block_hash_" "modulo_sorted_actors_v1"
-    )
+    assert manifest.byzantine.actor_schedule == "all_selected_actors_per_proposal_v1"
     assert manifest.byzantine.maximum_rotating_contexts == 100_000
     assert manifest.byzantine.actions.as_document() == {
         "internal": "omit_aggregate",
@@ -275,7 +276,7 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
     }
     assert manifest.byzantine.start_after_prelaunch_anchor_s == 150
     assert manifest.byzantine.duration_s == 300
-    assert manifest.byzantine.max_omissions_per_proposal == 1
+    assert manifest.byzantine.max_omissions_per_proposal == 3
 
     actors_by_block: dict[str, tuple[int, ...]] = {}
     for slot in plan.slots:
@@ -297,6 +298,9 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
             "schedule_slack_s": 30,
             "startup_timeout_s": 120,
             "transition_convergence_deadline_s": 20,
+            "transition_observation_bound_rule": (
+                "shared_slot_hard_deadline_until_manager_selection_v1"
+            ),
         }
         assert slot.common_timers.aggregation_timeout_ms == 500
         assert slot.common_timers.leader_progress_timeout_ms == 20_000
@@ -540,7 +544,7 @@ def test_manifest_preserves_not_started_slots() -> None:
 
 
 def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:
-    manifest = _manifest()
+    manifest = load_frozen_manifest(LEGACY_MANIFEST_PATH)
 
     for vector in manifest.byzantine.actor_rotation_vectors:
         assert rotating_omission_actor(
@@ -551,7 +555,7 @@ def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:
             block_hash=vector.block_hash,
         ) == (vector.fnv1a64, vector.selected_actor)
 
-    document = _mutable_document()
+    document = json.loads(LEGACY_MANIFEST_PATH.read_bytes())
     document["byzantine"]["actor_rotation_vectors"][0][  # type: ignore[index]
         "selected_actor"
     ] = 1

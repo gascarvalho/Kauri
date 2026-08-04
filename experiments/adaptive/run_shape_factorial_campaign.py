@@ -30,9 +30,14 @@ from experiments.adaptive.kauri_experiment.factorial_execution import (  # noqa:
     verify_evidence_preflight,
 )
 from experiments.adaptive.kauri_experiment.factorial_manifest import (  # noqa: E402
+    FROZEN_MANIFEST_ID,
+    FROZEN_MANIFEST_SHA256,
+    FROZEN_PLAN_SHA256,
+    LEGACY_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
     FactorialSlot,
+    FrozenFactorialManifest,
     build_factorial_plan,
     load_frozen_manifest,
 )
@@ -44,6 +49,8 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (  # noqa: E
     runtime_preflight,
 )
 from experiments.adaptive.kauri_experiment.factorial_validation import (  # noqa: E402
+    FROZEN_RUNTIME_SHA256,
+    FROZEN_SMOKE_RUNTIME_SHA256,
     SlotValidationResult,
     validate_campaign,
     validate_slot,
@@ -54,10 +61,9 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v1.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v2.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
-SMOKE_RESULTS_RELATIVE = Path("results/shape-placement-factorial-v1-smoke")
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
 CAMPAIGN_AUTHORIZATION_FILENAME = "campaign-authorization.json"
 CAMPAIGN_CONTRACT_FILENAME = "campaign-execution-contract.json"
@@ -180,11 +186,57 @@ def _static_artifacts(
     }
 
 
+def _resolve_result_roots(
+    arguments: argparse.Namespace,
+    *,
+    manifest_id: str,
+    results_root: str,
+) -> tuple[Path, Path, Path, Path, Path]:
+    repository = arguments.repository.resolve()
+    campaign_root = (
+        arguments.campaign_results_root.absolute()
+        if arguments.campaign_results_root is not None
+        else repository / results_root
+    )
+    manifest_suffix = manifest_id.removeprefix("shape-placement-factorial-")
+    smoke_results_relative = Path(
+        f"results/shape-placement-factorial-{manifest_suffix}-smoke"
+    )
+    smoke_root = (
+        arguments.smoke_results_root.absolute()
+        if arguments.smoke_results_root is not None
+        else repository / smoke_results_relative
+    )
+    expected_campaign_root = (repository / results_root).absolute()
+    expected_smoke_root = (repository / smoke_results_relative).absolute()
+    if campaign_root.is_symlink():
+        raise FactorialExecutionError("campaign results root must not be a symlink")
+    if smoke_root.is_symlink():
+        raise FactorialExecutionError("smoke results root must not be a symlink")
+    return (
+        repository,
+        campaign_root,
+        smoke_root,
+        expected_campaign_root,
+        expected_smoke_root,
+    )
+
+
 def _paths(
     arguments: argparse.Namespace,
     runtime: FactorialRuntimePlan,
 ) -> tuple[Path, Path, Path, Path, Path]:
-    repository = arguments.repository.resolve()
+    (
+        repository,
+        campaign_root,
+        smoke_root,
+        expected_campaign_root,
+        expected_smoke_root,
+    ) = _resolve_result_roots(
+        arguments,
+        manifest_id=runtime.manifest_id,
+        results_root=runtime.results_root,
+    )
     build_directory = (
         arguments.build_directory.resolve()
         if arguments.build_directory is not None
@@ -195,24 +247,8 @@ def _paths(
         if arguments.build_provenance is not None
         else build_directory / BUILD_PROVENANCE_FILENAME
     )
-    campaign_root = (
-        arguments.campaign_results_root.absolute()
-        if arguments.campaign_results_root is not None
-        else repository / runtime.results_root
-    )
-    smoke_root = (
-        arguments.smoke_results_root.absolute()
-        if arguments.smoke_results_root is not None
-        else repository / SMOKE_RESULTS_RELATIVE
-    )
-    expected_campaign_root = (repository / runtime.results_root).absolute()
-    expected_smoke_root = (repository / SMOKE_RESULTS_RELATIVE).absolute()
     expected_build_directory = (repository / "build-adaptive").resolve()
     expected_build_provenance = expected_build_directory / BUILD_PROVENANCE_FILENAME
-    if campaign_root.is_symlink():
-        raise FactorialExecutionError("campaign results root must not be a symlink")
-    if smoke_root.is_symlink():
-        raise FactorialExecutionError("smoke results root must not be a symlink")
     if build_directory != expected_build_directory:
         raise FactorialExecutionError(
             f"build directory must be exact: {expected_build_directory}"
@@ -221,6 +257,34 @@ def _paths(
         raise FactorialExecutionError(
             f"build provenance path must be exact: {expected_build_provenance}"
         )
+    if campaign_root != expected_campaign_root:
+        raise FactorialExecutionError(
+            f"campaign results root must be exact: {expected_campaign_root}"
+        )
+    if smoke_root != expected_smoke_root:
+        raise FactorialExecutionError(
+            f"smoke results root must be exact: {expected_smoke_root}"
+        )
+    return repository, build_directory, build_provenance, campaign_root, smoke_root
+
+
+def _validation_roots(
+    arguments: argparse.Namespace,
+    manifest: FrozenFactorialManifest,
+) -> tuple[Path, Path]:
+    """Resolve preserved roots without deriving a new plan or runtime."""
+
+    (
+        _,
+        campaign_root,
+        smoke_root,
+        expected_campaign_root,
+        expected_smoke_root,
+    ) = _resolve_result_roots(
+        arguments,
+        manifest_id=manifest.manifest_id,
+        results_root=manifest.results_root,
+    )
     if (
         arguments.command != "validate-campaign"
         and campaign_root != expected_campaign_root
@@ -232,7 +296,31 @@ def _paths(
         raise FactorialExecutionError(
             f"smoke results root must be exact: {expected_smoke_root}"
         )
-    return repository, build_directory, build_provenance, campaign_root, smoke_root
+    return campaign_root, smoke_root
+
+
+def _require_frozen_v2_artifacts(
+    manifest: FrozenFactorialManifest,
+    plan: FactorialPlan,
+    runtime: FactorialRuntimePlan,
+) -> bytes:
+    """Fail before any result claim if producer bytes drift from v2."""
+
+    if (
+        manifest.manifest_id != FROZEN_MANIFEST_ID
+        or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
+    ):
+        raise FactorialExecutionError("campaign production requires exact frozen v2")
+    if plan.plan_sha256 != FROZEN_PLAN_SHA256:
+        raise FactorialExecutionError(
+            "campaign plan bytes differ from the exact frozen v2 identity"
+        )
+    payload = canonical_runtime_bytes(runtime)
+    if _sha256(payload) != FROZEN_RUNTIME_SHA256:
+        raise FactorialExecutionError(
+            "campaign runtime bytes differ from the exact frozen v2 identity"
+        )
+    return payload
 
 
 def _slot_by_runtime_order(
@@ -368,6 +456,7 @@ def _require_validated_smoke(
     *,
     expected_revision: str,
     expected_build_provenance: Mapping[str, object],
+    expected_static_artifacts_sha256: Mapping[str, str],
 ) -> SlotValidationResult:
     slot_root = smoke_root / "smoke-n7-f2-PS"
     result = validate_slot(slot_root)
@@ -394,6 +483,13 @@ def _require_validated_smoke(
         raise FactorialExecutionError(
             "campaign launch requires the passing N=7 smoke from this exact "
             "revision and build provenance"
+        )
+    if authorization.get("static_artifacts_sha256") != dict(
+        expected_static_artifacts_sha256
+    ):
+        raise FactorialExecutionError(
+            "campaign launch requires the passing N=7 smoke from the exact "
+            "frozen static artifacts"
         )
     return result
 
@@ -590,12 +686,17 @@ def _run_smoke(
     smoke_root: Path,
 ) -> tuple[int, dict[str, object]]:
     _require_authorization_input(arguments)
-    _require_fresh_result_root(smoke_root, "smoke")
     smoke = build_n7_ps_smoke_slot(plan.slots[0])
+    smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
+    if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
+        raise FactorialExecutionError(
+            "smoke runtime bytes differ from the exact frozen v2 identity"
+        )
+    _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
         arguments.manifest.resolve(),
         plan,
-        _direct_runtime_bytes(smoke.runtime),
+        smoke_runtime_payload,
     )
     preflight = _preflight(
         smoke.slot,
@@ -659,12 +760,13 @@ def _run_campaign(
     build_provenance: Path,
     campaign_root: Path,
     smoke_root: Path,
+    runtime_payload: bytes,
 ) -> tuple[int, dict[str, object]]:
     _require_authorization_input(arguments)
     _require_fresh_result_root(campaign_root, "campaign")
     ordered = _slot_by_runtime_order(plan, runtime)
     artifacts = _static_artifacts(
-        arguments.manifest.resolve(), plan, canonical_runtime_bytes(runtime)
+        arguments.manifest.resolve(), plan, runtime_payload
     )
 
     first_preflight = _preflight(
@@ -679,6 +781,11 @@ def _run_campaign(
         smoke_root,
         expected_revision=first_preflight.revision,
         expected_build_provenance=first_preflight.build_provenance,
+        expected_static_artifacts_sha256={
+            "manifest.json": FROZEN_MANIFEST_SHA256,
+            "plan.json": FROZEN_PLAN_SHA256,
+            "runtime.json": FROZEN_SMOKE_RUNTIME_SHA256,
+        },
     )
     authorization_payload, authorization = _authorization_receipt(
         arguments,
@@ -847,32 +954,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         manifest_path = arguments.manifest.resolve()
         manifest = load_frozen_manifest(manifest_path)
-        plan = build_factorial_plan(manifest)
-        runtime = build_factorial_runtime(plan)
-        repository, build_directory, build_provenance, campaign_root, smoke_root = (
-            _paths(arguments, runtime)
-        )
-        if arguments.command == "plan":
-            print(canonical_runtime_bytes(runtime).decode("ascii"), end="")
-            return 0
-        if arguments.command == "validate-smoke":
-            result = validate_slot(smoke_root / "smoke-n7-f2-PS")
-            _emit(
-                {
-                    "command": "validate-smoke",
-                    "slot_directory": str(smoke_root / "smoke-n7-f2-PS"),
-                    "validation": asdict(result),
-                    "figure_eligible": False,
-                },
-                stream=sys.stdout,
-            )
-            return 0 if (
-                result.outcome == "PASS"
-                and result.integrity_valid
-                and not result.campaign_member
-                and not result.figure_eligible
-            ) else 1
-        if arguments.command == "validate-campaign":
+        if arguments.command in {"validate-smoke", "validate-campaign"}:
+            campaign_root, smoke_root = _validation_roots(arguments, manifest)
+            if arguments.command == "validate-smoke":
+                result = validate_slot(smoke_root / "smoke-n7-f2-PS")
+                _emit(
+                    {
+                        "command": "validate-smoke",
+                        "slot_directory": str(smoke_root / "smoke-n7-f2-PS"),
+                        "validation": asdict(result),
+                        "figure_eligible": False,
+                    },
+                    stream=sys.stdout,
+                )
+                return 0 if (
+                    result.outcome == "PASS"
+                    and result.integrity_valid
+                    and not result.campaign_member
+                    and not result.figure_eligible
+                ) else 1
             result = validate_campaign(campaign_root)
             ledger_path = campaign_root / CAMPAIGN_LEDGER_FILENAME
             ledger_sha256 = (
@@ -893,6 +993,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if (
                 result.outcome == "PASS" and result.figure_eligible
             ) else 1
+        if manifest.manifest_id == LEGACY_MANIFEST_ID:
+            raise FactorialExecutionError(
+                "shape-placement-factorial-v1 is validation-only; plan, preflight, "
+                "smoke, and run require shape-placement-factorial-v2"
+            )
+        plan = build_factorial_plan(manifest)
+        runtime = build_factorial_runtime(plan)
+        runtime_payload = _require_frozen_v2_artifacts(manifest, plan, runtime)
+        repository, build_directory, build_provenance, campaign_root, smoke_root = (
+            _paths(arguments, runtime)
+        )
+        if arguments.command == "plan":
+            print(runtime_payload.decode("ascii"), end="")
+            return 0
         if arguments.command == "preflight":
             pure = runtime_preflight(
                 runtime,
@@ -929,6 +1043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 build_provenance=build_provenance,
                 campaign_root=campaign_root,
                 smoke_root=smoke_root,
+                runtime_payload=runtime_payload,
             )
         _emit(result, stream=sys.stdout)
         return code

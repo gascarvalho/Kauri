@@ -1434,8 +1434,6 @@ def _wait_until(
             records,
             expected_clean_exits=expected_clean_exits,
         )
-        if result is not None:
-            return result
         now = raw_now_ns()
         if now >= hard_deadline_ns:
             raise IncompleteFactorialSlot(
@@ -1443,7 +1441,27 @@ def _wait_until(
             )
         if now >= phase_deadline_ns:
             raise IncompleteFactorialSlot(f"timed out waiting for {description}")
+        if result is not None:
+            return result
         sleep(poll_interval_s)
+
+
+def _remaining_hard_deadline_s(
+    hard_deadline_ns: int,
+    raw_now_ns: Callable[[], int],
+) -> float:
+    """Return the only sound bound while manager selection is still pending.
+
+    The native convergence deadline starts after a successor has been selected;
+    it is not an evidence-accumulation deadline.  Until the shape decision marks
+    that boundary, the observer therefore uses the already-frozen per-slot hard
+    deadline instead of inventing an earlier clock.
+    """
+
+    return max(
+        0.0,
+        (hard_deadline_ns - raw_now_ns()) / NANOSECONDS_PER_SECOND,
+    )
 
 
 def _event_payload(event: _Event) -> Mapping[str, Any]:
@@ -1628,6 +1646,14 @@ def observe_slot_phases(
 ) -> dict[str, object]:
     """Observe only native cutoffs accepted by the independent validator."""
 
+    observation_bound_rule = spec.fault_window.transition_observation_bound_rule
+    if observation_bound_rule not in {
+        "phase_deadline_v1",
+        "shared_slot_hard_deadline_until_manager_selection_v1",
+    }:
+        raise FactorialExecutionError(
+            "transition observer has an unknown manager-selection clock bound"
+        )
     expected_clean_exits: set[str] = set()
 
     def streams() -> dict[str, tuple[_Event, ...]]:
@@ -1810,7 +1836,23 @@ def observe_slot_phases(
     stable_events: dict[int, tuple[_Event, Mapping[str, object], int]] = {}
     phase_configurations: dict[int, tuple[int, str]] = {}
     for cycle, epoch in ((0, 1), (1, 2)):
-        def transition_ready() -> tuple[_Event, _Event, _Event] | None:
+        def manager_selection() -> _Event | None:
+            current = streams()
+            terminal = _successful_manager_terminal(
+                current,
+                cycle_ordinal=cycle,
+            )
+            if terminal is not None and cycle == 1:
+                expected_clean_exits.add("adaptive-manager")
+            return _single_manager_event(
+                current,
+                event_type="adaptive_v2_shape_decision",
+                cycle_ordinal=cycle,
+            )
+
+        def transition_ready(
+            selected_shape: _Event | None = None,
+        ) -> tuple[_Event, _Event, _Event] | None:
             current = streams()
             command = replica_barrier("epoch.command_committed", epoch)
             activation = replica_barrier("epoch.activated", epoch)
@@ -1825,6 +1867,10 @@ def observe_slot_phases(
             )
             if terminal is not None and cycle == 1:
                 expected_clean_exits.add("adaptive-manager")
+            if selected_shape is not None and shape != selected_shape:
+                raise FactorialExecutionError(
+                    f"epoch-{epoch} manager selection identity changed"
+                )
             if command is None or activation is None or shape is None or terminal is None:
                 return None
             if cycle == 0 and command.timestamp_ns < fault_evidence_end:
@@ -1833,18 +1879,56 @@ def observe_slot_phases(
                 )
             return command, activation, shape
 
-        command, activation, shape = _wait_until(
-            f"exact epoch-{epoch} command, shape decision, terminal, and activation",
-            transition_ready,
-            phase_timeout_s=spec.fault_window.transition_convergence_deadline_s
-            + spec.fault_window.schedule_slack_s,
-            hard_deadline_ns=hard_deadline_ns,
-            records=records,
-            raw_now_ns=raw_now_ns,
-            sleep=sleep,
-            poll_interval_s=poll_interval_s,
-            expected_clean_exits=expected_clean_exits,
-        )
+        if observation_bound_rule == (
+            "shared_slot_hard_deadline_until_manager_selection_v1"
+        ):
+            shape = _wait_until(
+                f"manager shape selection for epoch-{epoch}",
+                manager_selection,
+                phase_timeout_s=_remaining_hard_deadline_s(
+                    hard_deadline_ns, raw_now_ns
+                ),
+                hard_deadline_ns=hard_deadline_ns,
+                records=records,
+                raw_now_ns=raw_now_ns,
+                sleep=sleep,
+                poll_interval_s=poll_interval_s,
+                expected_clean_exits=expected_clean_exits,
+            )
+            if not isinstance(shape, _Event):
+                raise FactorialExecutionError(
+                    f"epoch-{epoch} manager selection is malformed"
+                )
+            command, activation, _ = _wait_until(
+                f"exact epoch-{epoch} command, terminal, and activation "
+                "after manager selection",
+                lambda: transition_ready(shape),
+                phase_timeout_s=(
+                    spec.fault_window.transition_convergence_deadline_s
+                    + spec.fault_window.schedule_slack_s
+                ),
+                hard_deadline_ns=hard_deadline_ns,
+                records=records,
+                raw_now_ns=raw_now_ns,
+                sleep=sleep,
+                poll_interval_s=poll_interval_s,
+                expected_clean_exits=expected_clean_exits,
+            )
+        else:
+            command, activation, shape = _wait_until(
+                f"exact epoch-{epoch} command, shape decision, terminal, and activation",
+                transition_ready,
+                phase_timeout_s=(
+                    spec.fault_window.transition_convergence_deadline_s
+                    + spec.fault_window.schedule_slack_s
+                ),
+                hard_deadline_ns=hard_deadline_ns,
+                records=records,
+                raw_now_ns=raw_now_ns,
+                sleep=sleep,
+                poll_interval_s=poll_interval_s,
+                expected_clean_exits=expected_clean_exits,
+            )
         transition_events[epoch] = (command, activation, shape)
         activation_configuration = _event_payload(activation).get("configuration")
         if not isinstance(activation_configuration, Mapping):
@@ -2809,7 +2893,7 @@ def build_n7_ps_smoke_slot(
     peer_base: int = 45_100,
     client_base: int = 46_100,
     manager_port: int = 47_100,
-    result_path: str = "results/shape-placement-factorial-v1-smoke/smoke-n7-f2-PS",
+    result_path: str = "results/shape-placement-factorial-v2-smoke/smoke-n7-f2-PS",
 ) -> N7SmokeSlot:
     """Derive the excluded N=7, f=2, k=2, fanout-two PS smoke."""
 
@@ -2851,6 +2935,11 @@ def build_n7_ps_smoke_slot(
             actor_count=len(actors),
             actor_count_rule="min_3_derived_f_smoke_only",
             actor_selection_vectors=(),
+            max_omissions_per_proposal=(
+                len(actors)
+                if template.byzantine.mode == "persistent_selected_omission_v1"
+                else 1
+            ),
         ),
         byzantine_actor_ids=actors,
         ports=PortAllocation(

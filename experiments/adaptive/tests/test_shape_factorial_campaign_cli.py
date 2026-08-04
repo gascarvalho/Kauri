@@ -13,6 +13,10 @@ import pytest
 from experiments.adaptive import run_shape_factorial_campaign as cli
 from experiments.adaptive.kauri_experiment import factorial_execution
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
+    FROZEN_MANIFEST_SHA256,
+    FROZEN_PLAN_SHA256,
+    LEGACY_MANIFEST_SHA256,
+    LEGACY_PLAN_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
 )
@@ -21,12 +25,17 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
 )
 from experiments.adaptive.kauri_experiment.factorial_validation import (
     CampaignValidationResult,
+    FROZEN_SMOKE_RUNTIME_SHA256,
+    LEGACY_SMOKE_RUNTIME_SHA256,
     SlotValidationResult,
 )
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
+LEGACY_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
+)
 REVISION = "a" * 40
 
 
@@ -135,6 +144,122 @@ def _slot_validation(
     )
 
 
+@pytest.mark.parametrize("command", ("plan", "preflight", "smoke", "run"))
+def test_legacy_manifest_is_validation_only_before_any_result_claim(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    arguments = [
+        command,
+        "--manifest",
+        str(LEGACY_MANIFEST),
+        "--repository",
+        str(repository),
+    ]
+    if command in {"smoke", "run"}:
+        arguments.extend(("--approval-reference", "must remain unused"))
+
+    assert cli.main(arguments) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert refusal == {
+        "reason": (
+            "shape-placement-factorial-v1 is validation-only; "
+            "plan, preflight, smoke, and run require shape-placement-factorial-v2"
+        ),
+        "status": "REJECT",
+    }
+    assert not (repository / "results/shape-placement-factorial-v1").exists()
+    assert not (repository / "results/shape-placement-factorial-v1-smoke").exists()
+
+
+def test_legacy_validate_smoke_uses_preserved_artifacts_without_rederiving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    observed: list[Path] = []
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("legacy validation must not derive a new plan or runtime")
+
+    monkeypatch.setattr(cli, "build_factorial_plan", forbidden)
+    monkeypatch.setattr(cli, "build_factorial_runtime", forbidden)
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: observed.append(path)
+        or SlotValidationResult(
+            slot_id=path.name,
+            outcome="INCOMPLETE",
+            reason=(
+                "timed out waiting for exact epoch-1 command, shape decision, "
+                "terminal, and activation"
+            ),
+            integrity_valid=False,
+            campaign_member=False,
+        ),
+    )
+
+    assert cli.main(
+        [
+            "validate-smoke",
+            "--manifest",
+            str(LEGACY_MANIFEST),
+            "--repository",
+            str(repository),
+        ]
+    ) == 1
+    output = json.loads(capsys.readouterr().out)
+
+    assert observed == [
+        repository
+        / "results/shape-placement-factorial-v1-smoke/smoke-n7-f2-PS"
+    ]
+    assert output["validation"]["outcome"] == "INCOMPLETE"
+    assert output["validation"]["reason"].startswith("timed out waiting")
+    assert "identity" not in output["validation"]["reason"]
+    assert not repository.exists()
+
+
+def test_legacy_validate_campaign_uses_preserved_artifacts_without_rederiving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    observed: list[Path] = []
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("legacy validation must not derive a new plan or runtime")
+
+    monkeypatch.setattr(cli, "build_factorial_plan", forbidden)
+    monkeypatch.setattr(cli, "build_factorial_runtime", forbidden)
+    monkeypatch.setattr(
+        cli,
+        "validate_campaign",
+        lambda path: observed.append(path) or _campaign_validation(),
+    )
+
+    assert cli.main(
+        [
+            "validate-campaign",
+            "--manifest",
+            str(LEGACY_MANIFEST),
+            "--repository",
+            str(repository),
+        ]
+    ) == 1
+    output = json.loads(capsys.readouterr().out)
+
+    assert observed == [repository / "results/shape-placement-factorial-v1"]
+    assert output["validation"]["outcome"] == "INCOMPLETE"
+    assert not repository.exists()
+
+
 def test_run_requires_explicit_authorization_before_any_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -161,7 +286,59 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v1").exists()
+    assert not (repository / "results/shape-placement-factorial-v2").exists()
+
+
+def test_campaign_runtime_identity_drift_rejects_before_result_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    monkeypatch.setattr(cli, "canonical_runtime_bytes", lambda _runtime: b"{}\n")
+
+    assert cli.main(
+        [
+            "run",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "must remain unused",
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert "campaign runtime bytes differ" in refusal["reason"]
+    assert not (repository / "results/shape-placement-factorial-v2").exists()
+
+
+def test_smoke_runtime_identity_drift_rejects_before_result_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    monkeypatch.setattr(cli, "_direct_runtime_bytes", lambda _runtime: b"{}\n")
+
+    assert cli.main(
+        [
+            "smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "must remain unused",
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert "smoke runtime bytes differ" in refusal["reason"]
+    assert not (
+        repository / "results/shape-placement-factorial-v2-smoke"
+    ).exists()
 
 
 def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
@@ -196,7 +373,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v1-smoke"
+        repository / "results/shape-placement-factorial-v2-smoke"
     ).exists()
 
 
@@ -256,7 +433,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v1-smoke"
+        / "results/shape-placement-factorial-v2-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"
@@ -383,8 +560,18 @@ def test_campaign_smoke_gate_binds_exact_revision_and_build(
     slot_root = smoke_root / "smoke-n7-f2-PS"
     (slot_root / "runtime").mkdir(parents=True)
     build_provenance = {"schema_version": 1, "revision": REVISION}
+    expected_static_hashes = {
+        "manifest.json": FROZEN_MANIFEST_SHA256,
+        "plan.json": FROZEN_PLAN_SHA256,
+        "runtime.json": FROZEN_SMOKE_RUNTIME_SHA256,
+    }
     (slot_root / "execution-authorization.json").write_bytes(
-        cli._canonical_json_bytes({"kauri_revision": REVISION})
+        cli._canonical_json_bytes(
+            {
+                "kauri_revision": REVISION,
+                "static_artifacts_sha256": expected_static_hashes,
+            }
+        )
     )
     (slot_root / "runtime/exact-build-provenance.json").write_bytes(
         cli._canonical_json_bytes(build_provenance)
@@ -401,6 +588,7 @@ def test_campaign_smoke_gate_binds_exact_revision_and_build(
         smoke_root,
         expected_revision=REVISION,
         expected_build_provenance=build_provenance,
+        expected_static_artifacts_sha256=expected_static_hashes,
     )
 
     assert result.outcome == "PASS"
@@ -412,6 +600,30 @@ def test_campaign_smoke_gate_binds_exact_revision_and_build(
             smoke_root,
             expected_revision="b" * 40,
             expected_build_provenance=build_provenance,
+            expected_static_artifacts_sha256=expected_static_hashes,
+        )
+
+    (slot_root / "execution-authorization.json").write_bytes(
+        cli._canonical_json_bytes(
+            {
+                "kauri_revision": REVISION,
+                "static_artifacts_sha256": {
+                    "manifest.json": LEGACY_MANIFEST_SHA256,
+                    "plan.json": LEGACY_PLAN_SHA256,
+                    "runtime.json": LEGACY_SMOKE_RUNTIME_SHA256,
+                },
+            }
+        )
+    )
+    with pytest.raises(
+        factorial_execution.FactorialExecutionError,
+        match="frozen static artifacts",
+    ):
+        cli._require_validated_smoke(
+            smoke_root,
+            expected_revision=REVISION,
+            expected_build_provenance=build_provenance,
+            expected_static_artifacts_sha256=expected_static_hashes,
         )
 
 

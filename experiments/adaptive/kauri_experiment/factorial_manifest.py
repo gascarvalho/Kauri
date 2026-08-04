@@ -10,14 +10,23 @@ import json
 from pathlib import Path
 from typing import Any
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v1"
-FROZEN_MANIFEST_SHA256 = (
+LEGACY_MANIFEST_ID = "shape-placement-factorial-v1"
+LEGACY_MANIFEST_SHA256 = (
     "58ebd0cc8ceb5ae4dc5981e9475747ea4b2a5b63fe334bfa6a44f552b8495542"
 )
-FROZEN_SEMANTIC_SHA256 = (
+LEGACY_SEMANTIC_SHA256 = (
     "3ca6665ec108c8547b8d483ca509a25ae93be037595e9059276422c28cf77687"
 )
-FROZEN_PLAN_SHA256 = "e5e1acf5228446795810e8f2ad0ef2f9af25203a2a213a2a427b218f19907fb1"
+LEGACY_PLAN_SHA256 = "e5e1acf5228446795810e8f2ad0ef2f9af25203a2a213a2a427b218f19907fb1"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v2"
+FROZEN_MANIFEST_SHA256 = (
+    "ef1133f2d3b5204bdb8fd4be5ebd4990801b77e2aafa3b6a03cc5c262a40a8fd"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "5d10ff2498fb265b19c3990df87e06db212687d9a55585b37545b4dbeb2f96c9"
+)
+FROZEN_PLAN_SHA256 = "b17fb3fa654d44080ad52e01b24aeed8c38726e33149229d0f6e540dc7f97516"
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
 EXPECTED_CANDIDATE_FANOUTS = (2, 3, 5)
@@ -81,7 +90,7 @@ class ByzantineContract(_Document):
     actor_selection_preimage: str
     actor_selection_inputs: tuple[str, ...]
     actor_selection_vectors: tuple[ActorSelectionVector, ...]
-    actor_rotation: str
+    actor_schedule: str
     actor_rotation_vectors: tuple[ActorRotationVector, ...]
     maximum_rotating_contexts: int
     start_after_prelaunch_anchor_s: int
@@ -126,6 +135,7 @@ class CommonTimers(_Document):
     drain_margin_s: int
     startup_timeout_s: int
     hard_timeout_s: int
+    transition_observation_bound_rule: str = "phase_deadline_v1"
 
     @property
     def aggregation_timeout_ms(self) -> int:
@@ -489,6 +499,10 @@ def rotating_omission_actor(
 
 
 def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
+    manifest_id = document.get("manifest_id")
+    if manifest_id not in {LEGACY_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+        _error("manifest ID is not a known frozen SHAPE25 contract")
+    persistent = manifest_id == FROZEN_MANIFEST_ID
     replica_counts = tuple(
         _integer(item, f"replica_counts[{index}]")
         for index, item in enumerate(
@@ -551,7 +565,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         _error("responsiveness policy values are outside fixed bounds")
     if 1_000_000 // 3 <= maximum_timeout_rate_ppm:
         _error(
-            "rotating actor expected timeout share must strictly exceed the "
+            "selected actor expected timeout share must strictly exceed the "
             "frozen timeout threshold for every replica count"
         )
 
@@ -587,6 +601,19 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if any(3 > (replica_count - 1) // 3 for replica_count in replica_counts):
         _error("fixed campaign actor count must not exceed derived f")
+    expected_mode = (
+        "persistent_selected_omission_v1"
+        if persistent
+        else "rotating_intermittent_omission_v1"
+    )
+    if byzantine.get("mode") != expected_mode:
+        _error(f"{manifest_id} requires Byzantine mode {expected_mode}")
+    if byzantine.get("actions") != {
+        "root": "normal",
+        "internal": "omit_aggregate",
+        "leaf": "omit_direct_vote",
+    }:
+        _error("Byzantine actions must match the role-aware omission contract")
     selection_vectors = _array(
         byzantine.get("actor_selection_vectors"),
         "byzantine.actor_selection_vectors",
@@ -616,10 +643,23 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             "selected_actor_ids": list(expected_selected),
         }:
             _error("actor selection vector disagrees with the SHA-256 ranking")
-    if byzantine.get("actor_rotation") != (
-        "fnv1a64_be_epoch_tree_epoch_digest_block_hash_" "modulo_sorted_actors_v1"
-    ):
-        _error("actor rotation must name the exact native FNV-1a contract")
+    expected_actor_schedule = (
+        "all_selected_actors_per_proposal_v1"
+        if persistent
+        else (
+            "fnv1a64_be_epoch_tree_epoch_digest_block_hash_"
+            "modulo_sorted_actors_v1"
+        )
+    )
+    actor_schedule = byzantine.get(
+        "actor_schedule" if persistent else "actor_rotation"
+    )
+    if actor_schedule != expected_actor_schedule:
+        _error("actor schedule must name the exact native omission contract")
+    if persistent and "actor_rotation" in byzantine:
+        _error("persistent omission must not be mislabeled as actor rotation")
+    if not persistent and "actor_schedule" in byzantine:
+        _error("legacy rotating omission must retain its frozen schema")
     if (
         _integer(
             byzantine.get("maximum_rotating_contexts"),
@@ -628,12 +668,17 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         != 100_000
     ):
         _error("rotating context capacity must equal the frozen bound")
+    if persistent and "actor_rotation_vectors" in byzantine:
+        _error("persistent omission must not carry legacy rotation vectors")
     vectors = _array(
-        byzantine.get("actor_rotation_vectors"),
+        byzantine.get("actor_rotation_vectors", []),
         "byzantine.actor_rotation_vectors",
     )
-    if len(vectors) != 3:
-        _error("actor rotation requires the three frozen cross-language vectors")
+    if len(vectors) != (0 if persistent else 3):
+        _error(
+            "persistent omission has no rotation vectors; rotating omission "
+            "requires the three frozen cross-language vectors"
+        )
     for index, raw_vector in enumerate(vectors):
         vector = _mapping(raw_vector, f"actor rotation vector {index}")
         computed_hash, computed_actor = rotating_omission_actor(
@@ -648,6 +693,18 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             or vector.get("selected_actor") != computed_actor
         ):
             _error("actor rotation vector disagrees with the FNV-1a reference")
+    expected_max_omissions = 3 if persistent else 1
+    if (
+        _integer(
+            byzantine.get("max_omissions_per_proposal"),
+            "byzantine.max_omissions_per_proposal",
+        )
+        != expected_max_omissions
+    ):
+        _error(
+            "maximum omissions per proposal must equal the frozen actor "
+            "schedule cardinality"
+        )
 
     global_worst_candidate_depth = max(
         tree_depth(replica_count, fanout)
@@ -683,6 +740,19 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         timers.get("startup_timeout_s"), "timers.startup_timeout_s"
     )
     hard_timeout_s = _integer(timers.get("hard_timeout_s"), "timers.hard_timeout_s")
+    observation_bound_rule = timers.get(
+        "transition_observation_bound_rule", "phase_deadline_v1"
+    )
+    expected_observation_bound_rule = (
+        "shared_slot_hard_deadline_until_manager_selection_v1"
+        if persistent
+        else "phase_deadline_v1"
+    )
+    if observation_bound_rule != expected_observation_bound_rule:
+        _error(
+            "transition observation must use the frozen manager-selection "
+            "clock boundary"
+        )
     convergence_deadline_s = _integer(
         timers.get("transition_convergence_deadline_s"),
         "timers.transition_convergence_deadline_s",
@@ -817,7 +887,10 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         _error("all terminal and unstarted slot outcomes must be preserved")
 
     semantic_sha256 = hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
-    if semantic_sha256 != FROZEN_SEMANTIC_SHA256:
+    expected_semantic_sha256 = (
+        FROZEN_SEMANTIC_SHA256 if persistent else LEGACY_SEMANTIC_SHA256
+    )
+    if semantic_sha256 != expected_semantic_sha256:
         _error("manifest differs from the frozen semantic contract")
 
 
@@ -940,7 +1013,9 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
                 )
                 for vector in byzantine["actor_selection_vectors"]
             ),
-            actor_rotation=byzantine["actor_rotation"],
+            actor_schedule=byzantine.get(
+                "actor_schedule", byzantine.get("actor_rotation")
+            ),
             actor_rotation_vectors=tuple(
                 ActorRotationVector(
                     epoch_number=vector["epoch_number"],
@@ -951,7 +1026,7 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
                     fnv1a64=vector["fnv1a64"],
                     selected_actor=vector["selected_actor"],
                 )
-                for vector in byzantine["actor_rotation_vectors"]
+                for vector in byzantine.get("actor_rotation_vectors", [])
             ),
             maximum_rotating_contexts=byzantine["maximum_rotating_contexts"],
             start_after_prelaunch_anchor_s=window["start_after_prelaunch_anchor_s"],
@@ -999,7 +1074,11 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
 
 def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
     manifest = parse_manifest_bytes(payload)
-    if manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256:
+    expected_sha256 = {
+        LEGACY_MANIFEST_ID: LEGACY_MANIFEST_SHA256,
+        FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
+    }.get(manifest.manifest_id)
+    if manifest.manifest_sha256 != expected_sha256:
         _error("input does not match the exact frozen manifest bytes")
     return manifest
 

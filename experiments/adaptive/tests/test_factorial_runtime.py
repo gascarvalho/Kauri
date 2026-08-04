@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import inspect
 import json
 from pathlib import Path
@@ -26,10 +27,13 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     materialize_replica_argv,
     runtime_preflight,
 )
+from experiments.adaptive.kauri_experiment.factorial_validation import (
+    FROZEN_RUNTIME_SHA256,
+)
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
 )
 
 
@@ -388,6 +392,9 @@ def test_prelaunch_fault_window_is_mechanically_feasible(frozen_plan) -> None:
         )
         assert spec.fault_window.duration_s >= minimum_duration
         assert spec.fault_window.schedule_slack_s >= 30
+        assert spec.fault_window.transition_observation_bound_rule == (
+            "shared_slot_hard_deadline_until_manager_selection_v1"
+        )
         assert timers.hard_timeout_s >= (
             spec.fault_window.start_after_prelaunch_anchor_s
             + spec.fault_window.duration_s
@@ -434,6 +441,9 @@ def test_replica_argv_materialization_uses_one_shared_raw_clock_anchor(
             slot_directory / f"raw/replica-{process.replica_id}.jsonl"
         )
         assert _option(argv, "--experiment-byzantine-mode") == slot.byzantine.mode
+        assert _option(argv, "--experiment-byzantine-window") == (
+            f"{slot.block_id}-persistent-omission-v1"
+        )
         assert _option(argv, "--experiment-rotating-omission-actors") == ",".join(
             map(str, slot.byzantine_actor_ids)
         )
@@ -541,6 +551,7 @@ def test_campaign_runtime_is_execution_ordered_and_cannot_launch(
 
     encoded = canonical_runtime_bytes(runtime_plan)
     assert encoded == canonical_runtime_bytes(build_factorial_runtime(frozen_plan))
+    assert hashlib.sha256(encoded).hexdigest() == FROZEN_RUNTIME_SHA256
     document = json.loads(encoded)
     assert document["slot_count"] == len(frozen_plan.slots)
     assert "selected_fanout" not in document

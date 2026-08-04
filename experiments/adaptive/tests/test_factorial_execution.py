@@ -21,6 +21,9 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     build_factorial_runtime,
     canonical_runtime_bytes,
 )
+from experiments.adaptive.kauri_experiment.factorial_validation import (
+    FROZEN_SMOKE_RUNTIME_SHA256,
+)
 from experiments.adaptive.kauri_experiment.processes import (
     CleanupOutcome,
     ProcessRecord,
@@ -28,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
 
 
 @pytest.fixture(scope="module")
@@ -165,6 +168,7 @@ def _campaign_static_artifacts() -> tuple[Any, Any, dict[str, bytes]]:
 
 def test_n7_smoke_is_excluded_ps_fanout_two_with_k_two(template_slot) -> None:
     smoke = execution.build_n7_ps_smoke_slot(template_slot)
+    runtime_payload = execution._canonical_json_bytes(smoke.runtime.as_document())
 
     assert smoke.slot.replica_count == 7
     assert smoke.slot.f == 2
@@ -174,8 +178,14 @@ def test_n7_smoke_is_excluded_ps_fanout_two_with_k_two(template_slot) -> None:
     assert smoke.slot.placement_adaptation is True
     assert smoke.slot.shape_adaptation is True
     assert len(smoke.slot.byzantine_actor_ids) == min(3, smoke.slot.f) == 2
+    assert smoke.slot.byzantine.max_omissions_per_proposal == 2
     assert all(actor >= smoke.slot.q for actor in smoke.slot.byzantine_actor_ids)
     assert smoke.runtime.actor_ids == smoke.slot.byzantine_actor_ids
+    assert hashlib.sha256(runtime_payload).hexdigest() == FROZEN_SMOKE_RUNTIME_SHA256
+    for process in smoke.runtime.replica_argv_templates:
+        argv = process.argv
+        option = "--experiment-byzantine-max-omissions-per-proposal"
+        assert argv[argv.index(option) + 1] == "2"
     manager = smoke.runtime.manager_argv_template.argv
     assert manager[manager.index("--required-nonresponsive") + 1] == "2"
     assert smoke.campaign_member is False
@@ -534,6 +544,167 @@ def test_observer_baseline_timeout_covers_remaining_prefault_delay(
     assert baseline_timeout_s == (
         spec.fault_window.start_after_prelaunch_anchor_s
         - 2
+        + spec.fault_window.schedule_slack_s
+    )
+
+
+def test_observer_does_not_apply_convergence_deadline_before_manager_selection(
+    tmp_path: Path,
+    template_slot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = execution.build_slot_runtime(template_slot)
+    anchor_ns = execution.NANOSECONDS_PER_SECOND
+    hard_deadline_ns = anchor_ns + (
+        spec.fault_window.hard_timeout_s * execution.NANOSECONDS_PER_SECOND
+    )
+    now_ns = anchor_ns + 2 * execution.NANOSECONDS_PER_SECOND
+    transition_timeout_s: float | None = None
+
+    class StopAtTransition(RuntimeError):
+        pass
+
+    baseline_event = execution._Event(
+        source=spec.structured_events.commit_observer_id,
+        relative_path=spec.structured_events.replica_output_relative_paths[0],
+        line_number=1,
+        value={
+            "source_sequence": 1,
+            "source_monotonic_ns": anchor_ns
+            + (spec.fault_window.start_after_prelaunch_anchor_s - 1)
+            * execution.NANOSECONDS_PER_SECOND,
+            "event_type": "block.committed",
+            "payload": {},
+        },
+        line_sha256="11" * 32,
+    )
+    baseline_common = {
+        "identity": {
+            "decision_proof": {
+                "epoch_number": 0,
+                "epoch_digest": "22" * 32,
+            }
+        }
+    }
+
+    def wait_until(
+        description: str,
+        _predicate: Any,
+        *,
+        phase_timeout_s: float,
+        **_kwargs: Any,
+    ) -> object:
+        nonlocal now_ns, transition_timeout_s
+        if description.startswith("all "):
+            return anchor_ns + execution.NANOSECONDS_PER_SECOND
+        if description.startswith("fixed pre-fault baseline"):
+            return baseline_event, baseline_common
+        if description.startswith("fixed fault-evidence window"):
+            now_ns = anchor_ns + 255 * execution.NANOSECONDS_PER_SECOND
+            return True
+        transition_timeout_s = phase_timeout_s
+        raise StopAtTransition
+
+    monkeypatch.setattr(execution, "_wait_until", wait_until)
+    with pytest.raises(StopAtTransition):
+        execution.observe_slot_phases(
+            spec,
+            tmp_path,
+            (),
+            shared_raw_clock_anchor_ns=anchor_ns,
+            hard_deadline_ns=hard_deadline_ns,
+            raw_now_ns=lambda: now_ns,
+            sleep=lambda _seconds: None,
+        )
+
+    assert transition_timeout_s == 245
+    assert transition_timeout_s > (
+        spec.fault_window.transition_convergence_deadline_s
+        + spec.fault_window.schedule_slack_s
+    )
+
+
+def test_observer_caps_post_selection_barrier_at_convergence_plus_slack(
+    tmp_path: Path,
+    template_slot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = execution.build_slot_runtime(template_slot)
+    anchor_ns = execution.NANOSECONDS_PER_SECOND
+    now_ns = anchor_ns + 255 * execution.NANOSECONDS_PER_SECOND
+    observed_timeout_s: float | None = None
+    baseline_event = execution._Event(
+        source=spec.structured_events.commit_observer_id,
+        relative_path=spec.structured_events.replica_output_relative_paths[0],
+        line_number=1,
+        value={
+            "source_sequence": 1,
+            "source_monotonic_ns": anchor_ns
+            + (spec.fault_window.start_after_prelaunch_anchor_s - 1)
+            * execution.NANOSECONDS_PER_SECOND,
+            "event_type": "block.committed",
+            "payload": {},
+        },
+        line_sha256="11" * 32,
+    )
+    shape_event = execution._Event(
+        source="adaptive-manager",
+        relative_path=spec.structured_events.manager_output_relative_path,
+        line_number=1,
+        value={
+            "source_sequence": 1,
+            "source_monotonic_ns": now_ns,
+            "event_type": "adaptive_v2_shape_decision",
+            "payload": {"cycle_ordinal": 0},
+        },
+        line_sha256="33" * 32,
+    )
+
+    class StopAfterSelection(RuntimeError):
+        pass
+
+    def wait_until(
+        description: str,
+        _predicate: Any,
+        *,
+        phase_timeout_s: float,
+        **_kwargs: Any,
+    ) -> object:
+        nonlocal observed_timeout_s
+        if description.startswith("all "):
+            return anchor_ns + execution.NANOSECONDS_PER_SECOND
+        if description.startswith("fixed pre-fault baseline"):
+            return baseline_event, {
+                "identity": {
+                    "decision_proof": {
+                        "epoch_number": 0,
+                        "epoch_digest": "22" * 32,
+                    }
+                }
+            }
+        if description.startswith("fixed fault-evidence window"):
+            return True
+        if description.startswith("manager shape selection for epoch-1"):
+            return shape_event
+        observed_timeout_s = phase_timeout_s
+        raise StopAfterSelection
+
+    monkeypatch.setattr(execution, "_wait_until", wait_until)
+    with pytest.raises(StopAfterSelection):
+        execution.observe_slot_phases(
+            spec,
+            tmp_path,
+            (),
+            shared_raw_clock_anchor_ns=anchor_ns,
+            hard_deadline_ns=anchor_ns
+            + spec.fault_window.hard_timeout_s
+            * execution.NANOSECONDS_PER_SECOND,
+            raw_now_ns=lambda: now_ns,
+            sleep=lambda _seconds: None,
+        )
+
+    assert observed_timeout_s == (
+        spec.fault_window.transition_convergence_deadline_s
         + spec.fault_window.schedule_slack_s
     )
 
@@ -1103,6 +1274,69 @@ def test_cycle2_native_terminal_authorizes_only_zero_manager_exit(
     clean_manager.returncode = 0
     with pytest.raises(execution.IncompleteFactorialSlot, match="adaptive-manager=0"):
         execution._assert_process_health((record,), expected_clean_exits=())
+
+
+@pytest.mark.parametrize(
+    ("now_ns", "accepted"),
+    ((999, True), (1_000, False), (1_001, False)),
+)
+def test_wait_until_enforces_the_hard_deadline_before_accepting_success(
+    now_ns: int,
+    accepted: bool,
+) -> None:
+    arguments = dict(
+        description="strict hard-bound result",
+        predicate=lambda: "ready",
+        phase_timeout_s=10,
+        hard_deadline_ns=1_000,
+        records=(),
+        raw_now_ns=lambda: now_ns,
+        sleep=lambda _seconds: None,
+        poll_interval_s=0,
+    )
+
+    if accepted:
+        assert execution._wait_until(**arguments) == "ready"
+    else:
+        with pytest.raises(
+            execution.IncompleteFactorialSlot,
+            match="hard deadline expired",
+        ):
+            execution._wait_until(**arguments)
+
+
+@pytest.mark.parametrize(
+    ("result_now_ns", "accepted"),
+    (
+        (execution.NANOSECONDS_PER_SECOND - 1, True),
+        (execution.NANOSECONDS_PER_SECOND, False),
+        (execution.NANOSECONDS_PER_SECOND + 1, False),
+    ),
+)
+def test_wait_until_enforces_the_phase_deadline_before_accepting_success(
+    result_now_ns: int,
+    accepted: bool,
+) -> None:
+    clock = iter((0, result_now_ns))
+    arguments = dict(
+        description="strict phase-bound result",
+        predicate=lambda: "ready",
+        phase_timeout_s=1,
+        hard_deadline_ns=10 * execution.NANOSECONDS_PER_SECOND,
+        records=(),
+        raw_now_ns=lambda: next(clock),
+        sleep=lambda _seconds: None,
+        poll_interval_s=0,
+    )
+
+    if accepted:
+        assert execution._wait_until(**arguments) == "ready"
+    else:
+        with pytest.raises(
+            execution.IncompleteFactorialSlot,
+            match="timed out waiting",
+        ):
+            execution._wait_until(**arguments)
 
 
 def test_epoch2_stable_and_drain_must_finish_strictly_before_fault_end(

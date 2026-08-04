@@ -42,6 +42,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
+)
+LEGACY_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
 )
 
@@ -192,7 +195,8 @@ def test_actor_and_fnv_vectors_recompute_without_runtime_decision_code() -> None
             manifest.byzantine.actor_count,
             vector.scientific_seed,
         ) == vector.selected_actor_ids
-    for vector in manifest.byzantine.actor_rotation_vectors:
+    legacy = load_frozen_manifest(LEGACY_MANIFEST_PATH)
+    for vector in legacy.byzantine.actor_rotation_vectors:
         assert fnv1a_rotating_actor(
             vector.sorted_actor_ids,
             epoch_number=vector.epoch_number,
@@ -450,7 +454,7 @@ def test_capacity_or_skipped_fault_marker_fails_closed(tmp_path: Path, line: str
         validation._fault_markers(tmp_path, {0: ("replica.log",)})
 
 
-def test_causal_gate_requires_every_actor_to_omit_while_physically_internal() -> None:
+def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> None:
     replica_count = 13
     actors = (9, 10, 12)
     epoch_digest = "22" * 32
@@ -520,6 +524,7 @@ def test_causal_gate_requires_every_actor_to_omit_while_physically_internal() ->
                 FaultMarker(
                     source_replica=actor,
                     line_number=len(markers) + 1,
+                    fault_mode="rotating_intermittent_omission_v1",
                     epoch_number=0,
                     tree_id=tree_id,
                     epoch_digest=epoch_digest,
@@ -585,6 +590,7 @@ def test_causal_gate_requires_every_actor_to_omit_while_physically_internal() ->
             FaultMarker(
                 source_replica=actor,
                 line_number=len(markers) + 1,
+                fault_mode="rotating_intermittent_omission_v1",
                 epoch_number=1,
                 tree_id=epoch1_tree_id,
                 epoch_digest=epoch1_digest,
@@ -627,6 +633,7 @@ def test_causal_gate_requires_every_actor_to_omit_while_physically_internal() ->
             FaultMarker(
                 source_replica=actor,
                 line_number=len(markers) + 1,
+                fault_mode="rotating_intermittent_omission_v1",
                 epoch_number=2,
                 tree_id=epoch2_tree_id,
                 epoch_digest=epoch2_digest,
@@ -667,6 +674,8 @@ def test_causal_gate_requires_every_actor_to_omit_while_physically_internal() ->
     arguments = dict(
         replica_events=events,
         actor_ids=actors,
+        fault_mode="rotating_intermittent_omission_v1",
+        max_omissions_per_proposal=1,
         initial_epoch_digest=epoch_digest,
         initial_trees=trees,
         window_id="w",
@@ -740,6 +749,163 @@ def test_causal_gate_requires_every_actor_to_omit_while_physically_internal() ->
         validate_fault_causality(
             markers=markers,
             **{**arguments, "accepted_epoch0": wrong_reporter},
+        )
+
+    persistent_markers = tuple(
+        replace(marker, fault_mode="persistent_selected_omission_v1")
+        for marker in markers
+    )
+    persistent_windows = {
+        phase: (start, end, 6)
+        for phase, (start, end, _bucket_count) in phase_windows.items()
+    }
+    with pytest.raises(
+        FactorialValidationError,
+        match="persistent interior proposal actor/action set",
+    ):
+        validate_fault_causality(
+            markers=persistent_markers,
+            **{
+                **arguments,
+                "fault_mode": "persistent_selected_omission_v1",
+                "max_omissions_per_proposal": 3,
+                "phase_windows": persistent_windows,
+            },
+        )
+
+
+def test_persistent_fault_schedule_bounds_selected_actors_per_proposal() -> None:
+    actors = (9, 10, 12)
+    markers = tuple(
+        FaultMarker(
+            source_replica=actor,
+            line_number=index,
+            fault_mode="persistent_selected_omission_v1",
+            epoch_number=0,
+            tree_id=4,
+            epoch_digest="11" * 32,
+            block_hash="22" * 32,
+            window="persistent-window",
+            window_start_ns=100,
+            window_end_ns=1_000,
+            actor=actor,
+            action="omit_aggregate",
+            monotonic_ns=200 + index,
+            raw_line_sha256=f"{index:064x}",
+        )
+        for index, actor in enumerate(actors, start=1)
+    )
+
+    validation._validate_fault_marker_schedule(
+        markers,
+        actor_ids=actors,
+        fault_mode="persistent_selected_omission_v1",
+        max_omissions_per_proposal=3,
+    )
+
+    validation._validate_fault_marker_schedule(
+        markers[:-1],
+        actor_ids=actors,
+        fault_mode="persistent_selected_omission_v1",
+        max_omissions_per_proposal=3,
+    )
+    with pytest.raises(FactorialValidationError, match="mode/actor"):
+        validation._validate_fault_marker_schedule(
+            (replace(markers[0], actor=8, source_replica=8),),
+            actor_ids=actors,
+            fault_mode="persistent_selected_omission_v1",
+            max_omissions_per_proposal=3,
+        )
+    with pytest.raises(FactorialValidationError, match="no-op forward"):
+        validation._validate_fault_marker_schedule(
+            (replace(markers[0], action="forward"),),
+            actor_ids=actors,
+            fault_mode="persistent_selected_omission_v1",
+            max_omissions_per_proposal=3,
+        )
+    with pytest.raises(FactorialValidationError, match="omission bound"):
+        validation._validate_fault_marker_schedule(
+            (*markers, replace(markers[0], line_number=99)),
+            actor_ids=actors,
+            fault_mode="persistent_selected_omission_v1",
+            max_omissions_per_proposal=3,
+        )
+
+
+def test_persistent_interior_proposal_accepts_exact_non_root_actor_actions() -> None:
+    actors = (1, 2, 9)
+    tree = Tree(
+        tree_id=4,
+        fanout=5,
+        pipeline_stretch=2,
+        members=tuple(range(13)),
+        wait_exempt=actors,
+    )
+    phase_windows = {
+        "fault_evidence": (100, 700, 6),
+        "epoch1_stable": (800, 1_400, 6),
+        "epoch2_stable": (1_500, 2_100, 6),
+    }
+    markers: list[FaultMarker] = []
+    actions = {1: "omit_aggregate", 2: "omit_aggregate", 9: "omit_direct_vote"}
+    for epoch, digest, timestamp in (
+        (0, "11" * 32, 300),
+        (1, "22" * 32, 1_000),
+        (2, "33" * 32, 1_700),
+    ):
+        for actor in actors:
+            markers.append(
+                FaultMarker(
+                    source_replica=actor,
+                    line_number=len(markers) + 1,
+                    fault_mode="persistent_selected_omission_v1",
+                    epoch_number=epoch,
+                    tree_id=tree.tree_id,
+                    epoch_digest=digest,
+                    block_hash=f"{epoch + 1:064x}",
+                    window="persistent-window",
+                    window_start_ns=100,
+                    window_end_ns=2_100,
+                    actor=actor,
+                    action=actions[actor],
+                    monotonic_ns=timestamp + actor,
+                    raw_line_sha256=f"{len(markers) + 1:064x}",
+                )
+            )
+
+    validation._validate_persistent_interior_proposals(
+        markers,
+        actor_ids=actors,
+        phase_windows=phase_windows,
+        phase_configurations=(
+            ("fault_evidence", 0, "11" * 32, {tree.tree_id: tree}),
+            ("epoch1_stable", 1, "22" * 32, {tree.tree_id: tree}),
+            ("epoch2_stable", 2, "33" * 32, {tree.tree_id: tree}),
+        ),
+    )
+
+
+@pytest.mark.parametrize("elapsed_s", (21, 50))
+def test_post_selection_deadline_is_v2_only_for_legacy_compatibility(
+    elapsed_s: int,
+) -> None:
+    shape_ns = 100 * validation._NANOSECONDS_PER_SECOND
+    terminal_ns = shape_ns + elapsed_s * validation._NANOSECONDS_PER_SECOND
+
+    validation._validate_transition_terminal_deadline(
+        shape_ns=shape_ns,
+        terminal_ns=terminal_ns,
+        observation_bound_rule="phase_deadline_v1",
+        convergence_deadline_s=20,
+    )
+    with pytest.raises(FactorialValidationError, match="post-selection deadline"):
+        validation._validate_transition_terminal_deadline(
+            shape_ns=shape_ns,
+            terminal_ns=terminal_ns,
+            observation_bound_rule=(
+                "shared_slot_hard_deadline_until_manager_selection_v1"
+            ),
+            convergence_deadline_s=20,
         )
 
 
@@ -1382,6 +1548,7 @@ def test_smoke_slot_authorization_must_match_the_claimed_root_envelope(
 
     document, payload = validation._validate_execution_authorization(
         slot_root,
+        manifest=manifest,
         expected=expected,
         plan=json.loads(plan.canonical_bytes),
         runtime_sha256=hashlib.sha256(runtime_bytes).hexdigest(),
@@ -1394,6 +1561,7 @@ def test_smoke_slot_authorization_must_match_the_claimed_root_envelope(
     with pytest.raises(FactorialValidationError, match="smoke root authorization"):
         validation._validate_execution_authorization(
             slot_root,
+            manifest=manifest,
             expected=expected,
             plan=json.loads(plan.canonical_bytes),
             runtime_sha256=hashlib.sha256(runtime_bytes).hexdigest(),
@@ -1431,6 +1599,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
     validated = validation._validate_slot_receipt(
         receipt,
         slot_root=recovered_slot,
+        manifest=load_frozen_manifest(MANIFEST_PATH),
         expected=expected,
         runtime=runtime,
         runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
@@ -1519,6 +1688,27 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
+def test_v2_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+    tmp_path: Path,
+) -> None:
+    recovered, _, receipt, expected, runtime, authorization = (
+        _relocated_receipt_fixture(tmp_path)
+    )
+    receipt["manifest_sha256"] = validation.LEGACY_MANIFEST_SHA256
+    receipt["plan_sha256"] = validation.LEGACY_PLAN_SHA256
+
+    with pytest.raises(FactorialValidationError, match="receipt identity"):
+        validation._validate_slot_receipt(
+            receipt,
+            slot_root=recovered,
+            manifest=load_frozen_manifest(MANIFEST_PATH),
+            expected=expected,
+            runtime=runtime,
+            runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
+            authorization_bytes=authorization,
+        )
+
+
 def test_build_evidence_rejects_extra_and_symlink_entries(tmp_path: Path) -> None:
     (
         recovered_slot,
@@ -1594,6 +1784,7 @@ def test_relocated_receipt_rejects_authorization_tamper_and_identity_symlink(
         validation._validate_slot_receipt(
             receipt,
             slot_root=recovered,
+            manifest=load_frozen_manifest(MANIFEST_PATH),
             expected=expected,
             runtime=runtime,
             runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
@@ -1609,6 +1800,7 @@ def test_relocated_receipt_rejects_authorization_tamper_and_identity_symlink(
         validation._validate_slot_receipt(
             receipt,
             slot_root=recovered,
+            manifest=load_frozen_manifest(MANIFEST_PATH),
             expected=expected,
             runtime=runtime,
             runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
@@ -2051,6 +2243,7 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
     summary_path.write_bytes(_canonical(summary))
     assert validation._validate_campaign_execution_ledger(
         root,
+        manifest=manifest,
         plan=json.loads(canonical_plan_bytes(plan)),
         runtime=runtime,
         expected_slots=expected_slots,
@@ -2063,6 +2256,7 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
     with pytest.raises(FactorialValidationError, match="campaign-execution-summary"):
         validation._validate_campaign_execution_ledger(
             root,
+            manifest=manifest,
             plan=json.loads(canonical_plan_bytes(plan)),
             runtime=runtime,
             expected_slots=expected_slots,
@@ -2103,6 +2297,7 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
     with pytest.raises(FactorialValidationError, match="continued after"):
         validation._validate_campaign_execution_ledger(
             root,
+            manifest=manifest,
             plan=json.loads(canonical_plan_bytes(plan)),
             runtime=runtime,
             expected_slots=expected_slots,
