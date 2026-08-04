@@ -88,6 +88,8 @@ public:
         ReplicaID target) noexcept;
     bool consume_outbound_aggregate(
         const ExperimentByzantineContext &context);
+    bool consume_outbound_aggregate_marker(
+        const ExperimentByzantineContext &context) noexcept;
     ExperimentDirectVoteDisposition consume_outbound_direct_vote(
         const ExperimentByzantineContext &context);
     bool outbound_direct_vote_omitted(

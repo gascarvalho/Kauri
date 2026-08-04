@@ -23,6 +23,10 @@ struct PendingExactContribution
     ExactContributionEnvelope envelope;
     PeerId authenticated_source;
     uint256_t fingerprint;
+    // CLOCK_MONOTONIC_RAW observation captured after authenticated wire
+    // decoding and before worker verification. Experiment-only observers may
+    // consume it; normal consensus ordering never depends on this field.
+    std::uint64_t received_ns{0};
 };
 
 struct PendingExactContributionBufferLimits

@@ -357,6 +357,118 @@ parse_experiment_byzantine_options(
     return options;
 }
 
+std::optional<hotstuff::ExperimentPostQcAuditOptions>
+parse_experiment_post_qc_audit_options(
+    const std::string &protocol_mode,
+    std::size_t replica_count,
+    const std::string &raw_configuration,
+    const std::string &diagnostic_window,
+    const std::string &raw_reporter,
+    const std::string &raw_target,
+    const std::string &raw_root,
+    bool forge_missing_claim,
+    int deadline_ms,
+    int retention_ms,
+    int context_limit)
+{
+    const bool requested = !raw_configuration.empty() ||
+        !diagnostic_window.empty() || !raw_reporter.empty() ||
+        !raw_target.empty() || !raw_root.empty() ||
+        forge_missing_claim || deadline_ms != 0 ||
+        retention_ms != 0 || context_limit != 0;
+    if (!requested)
+        return std::nullopt;
+    if (protocol_mode != "adaptive_v2")
+        throw HotStuffError(
+            "experiment post-QC audit requires adaptive-v2");
+    if (raw_configuration.empty() || diagnostic_window.empty() ||
+        raw_reporter.empty() || raw_target.empty() || raw_root.empty())
+        throw HotStuffError(
+            "experiment post-QC audit configuration, window, reporter, "
+            "target, and root are required");
+    if (diagnostic_window.size() >
+            hotstuff::kExperimentPostQcAuditMaximumWindowBytes ||
+        !std::all_of(
+            diagnostic_window.begin(),
+            diagnostic_window.end(),
+            [](unsigned char character)
+            {
+                return std::isalnum(character) != 0 ||
+                       character == '-' || character == '_' ||
+                       character == '.';
+            }))
+        throw HotStuffError(
+            "experiment post-QC audit window must be a safe identifier");
+    if (deadline_ms != static_cast<int>(
+            hotstuff::kExperimentPostQcAuditDeadlineMs) ||
+        retention_ms != static_cast<int>(
+            hotstuff::kExperimentPostQcAuditRetentionMs) ||
+        context_limit != static_cast<int>(
+            hotstuff::kExperimentPostQcAuditContextLimit))
+        throw HotStuffError(
+            "experiment post-QC audit requires deadline 150 ms, "
+            "retention 250 ms, and context limit 1");
+
+    const auto configuration_parts =
+        trim_all(split(raw_configuration, ":"));
+    if (configuration_parts.size() != 3)
+        throw HotStuffError(
+            "experiment post-QC audit configuration must use "
+            "epoch:tree:digest");
+    const auto epoch = parse_adaptive_v2_unsigned<std::uint32_t>(
+        configuration_parts[0],
+        "experiment post-QC audit epoch",
+        false);
+    const auto tree = parse_adaptive_v2_unsigned<std::uint32_t>(
+        configuration_parts[1],
+        "experiment post-QC audit tree",
+        false);
+    if (configuration_parts[2].size() != 64 ||
+        !std::all_of(
+            configuration_parts[2].begin(),
+            configuration_parts[2].end(),
+            [](unsigned char character)
+            {
+                return std::isxdigit(character) != 0;
+            }))
+        throw HotStuffError(
+            "experiment post-QC audit digest is invalid");
+
+    const auto reporter = parse_adaptive_v2_unsigned<ReplicaID>(
+        raw_reporter,
+        "experiment post-QC audit reporter",
+        false);
+    const auto target = parse_adaptive_v2_unsigned<ReplicaID>(
+        raw_target,
+        "experiment post-QC audit target",
+        false);
+    const auto root = parse_adaptive_v2_unsigned<ReplicaID>(
+        raw_root,
+        "experiment post-QC audit root",
+        false);
+    if (reporter >= replica_count || target >= replica_count ||
+        root >= replica_count || reporter == target || reporter == root ||
+        target == root)
+        throw HotStuffError(
+            "experiment post-QC audit replica identities are invalid");
+
+    hotstuff::ExperimentPostQcAuditOptions options;
+    options.enabled = true;
+    options.configuration = hotstuff::ConfigurationId{
+        epoch,
+        tree,
+        uint256_t(hotstuff::from_hex(configuration_parts[2]))};
+    options.diagnostic_window = diagnostic_window;
+    options.reporter = reporter;
+    options.target = target;
+    options.root = root;
+    options.forge_missing_claim = forge_missing_claim;
+    options.deadline_ms = static_cast<std::uint64_t>(deadline_ms);
+    options.retention_ms = static_cast<std::uint64_t>(retention_ms);
+    options.maximum_contexts = static_cast<std::size_t>(context_limit);
+    return options;
+}
+
 hotstuff::PubKeySecp256k1 parse_adaptive_v2_issuer_public_key(
     const std::string &issuer_public_key_hex)
 {
@@ -611,6 +723,24 @@ int main(int argc, char **argv)
         Config::OptValFlag::create(false);
     auto opt_experiment_byzantine_context_limit =
         Config::OptValInt::create(0);
+    auto opt_experiment_post_qc_audit_configuration =
+        Config::OptValStr::create("");
+    auto opt_experiment_post_qc_audit_window =
+        Config::OptValStr::create("");
+    auto opt_experiment_post_qc_audit_reporter =
+        Config::OptValStr::create("");
+    auto opt_experiment_post_qc_audit_target =
+        Config::OptValStr::create("");
+    auto opt_experiment_post_qc_audit_root =
+        Config::OptValStr::create("");
+    auto opt_experiment_post_qc_audit_forge_missing_claim =
+        Config::OptValFlag::create(false);
+    auto opt_experiment_post_qc_audit_deadline_ms =
+        Config::OptValInt::create(0);
+    auto opt_experiment_post_qc_audit_retention_ms =
+        Config::OptValInt::create(0);
+    auto opt_experiment_post_qc_audit_context_limit =
+        Config::OptValInt::create(0);
 
     config.add_opt("block-size", opt_blk_size, Config::SET_VAL);
     config.add_opt("client-ip", opt_client_ip, Config::SET_VAL);
@@ -786,6 +916,60 @@ int main(int argc, char **argv)
         Config::SET_VAL,
         -1,
         "maximum exact proposal contexts affected by the fault");
+    config.add_opt(
+        "experiment-post-qc-audit-configuration",
+        opt_experiment_post_qc_audit_configuration,
+        Config::SET_VAL,
+        -1,
+        "exact epoch:tree:digest for the experiment-only post-QC audit");
+    config.add_opt(
+        "experiment-post-qc-audit-window",
+        opt_experiment_post_qc_audit_window,
+        Config::SET_VAL,
+        -1,
+        "frozen experiment-only post-QC audit window identity");
+    config.add_opt(
+        "experiment-post-qc-audit-reporter",
+        opt_experiment_post_qc_audit_reporter,
+        Config::SET_VAL,
+        -1,
+        "exact post-QC audit reporter replica");
+    config.add_opt(
+        "experiment-post-qc-audit-target",
+        opt_experiment_post_qc_audit_target,
+        Config::SET_VAL,
+        -1,
+        "exact post-QC audit target replica");
+    config.add_opt(
+        "experiment-post-qc-audit-root",
+        opt_experiment_post_qc_audit_root,
+        Config::SET_VAL,
+        -1,
+        "exact post-QC audit root replica");
+    config.add_opt(
+        "experiment-post-qc-audit-forge-missing-claim",
+        opt_experiment_post_qc_audit_forge_missing_claim,
+        Config::SWITCH_ON,
+        -1,
+        "forge one experiment-only missing-target claim");
+    config.add_opt(
+        "experiment-post-qc-audit-deadline-ms",
+        opt_experiment_post_qc_audit_deadline_ms,
+        Config::SET_VAL,
+        -1,
+        "frozen post-QC audit deadline (must be 150)");
+    config.add_opt(
+        "experiment-post-qc-audit-retention-ms",
+        opt_experiment_post_qc_audit_retention_ms,
+        Config::SET_VAL,
+        -1,
+        "frozen root post-QC retention (must be 250)");
+    config.add_opt(
+        "experiment-post-qc-audit-context-limit",
+        opt_experiment_post_qc_audit_context_limit,
+        Config::SET_VAL,
+        -1,
+        "post-QC audit exact-context limit (must be 1)");
 
     EventContext ec;
     config.parse(argc, argv);
@@ -857,6 +1041,19 @@ int main(int argc, char **argv)
             opt_experiment_omit_outbound_aggregate->get(),
             opt_experiment_omit_outbound_direct_vote->get(),
             opt_experiment_byzantine_context_limit->get());
+    const auto experiment_post_qc_audit_options =
+        parse_experiment_post_qc_audit_options(
+            opt_epoch_protocol_mode->get(),
+            replicas.size(),
+            opt_experiment_post_qc_audit_configuration->get(),
+            opt_experiment_post_qc_audit_window->get(),
+            opt_experiment_post_qc_audit_reporter->get(),
+            opt_experiment_post_qc_audit_target->get(),
+            opt_experiment_post_qc_audit_root->get(),
+            opt_experiment_post_qc_audit_forge_missing_claim->get(),
+            opt_experiment_post_qc_audit_deadline_ms->get(),
+            opt_experiment_post_qc_audit_retention_ms->get(),
+            opt_experiment_post_qc_audit_context_limit->get());
     const auto adaptive_v2_manager_pin = parse_adaptive_v2_manager_pin(
         opt_epoch_protocol_mode->get(),
         opt_epoch_manager_address->get(),
@@ -1008,6 +1205,9 @@ int main(int argc, char **argv)
     if (experiment_byzantine_options.has_value())
         papp->configure_experiment_byzantine_faults(
             *experiment_byzantine_options);
+    if (experiment_post_qc_audit_options.has_value())
+        papp->configure_experiment_post_qc_audit(
+            *experiment_post_qc_audit_options);
     if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
     {
         if (!adaptive_v2_pre_vote_config.has_value())

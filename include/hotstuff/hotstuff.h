@@ -39,6 +39,7 @@
 #include "hotstuff/epoch_live_binding.h"
 #include "hotstuff/epoch_runtime_wiring.h"
 #include "hotstuff/experiment_byzantine_adapter.h"
+#include "hotstuff/experiment_post_qc_audit.h"
 #include "hotstuff/pending_exact_contribution_buffer.h"
 #include "hotstuff/proposal_admission.h"
 #include "hotstuff/structured_event.h"
@@ -926,6 +927,21 @@ namespace hotstuff
         bool postponed_parse(HotStuffCore *hsc) noexcept;
     };
 
+    /** Dedicated experiment-only PQAR wire message. */
+    struct MsgExperimentPostQcAuditRelay
+    {
+        static const opcode_t opcode = 0x1F;
+        DataStream serialized;
+        ExperimentPostQcAuditRelay relay;
+        std::size_t wire_bytes{0};
+        MsgExperimentPostQcAuditRelay(
+            const ExperimentPostQcAuditRelay &relay);
+        MsgExperimentPostQcAuditRelay(DataStream &&stream)
+            : serialized(std::move(stream)),
+              wire_bytes(serialized.size()) {}
+        bool postponed_parse(HotStuffCore *hsc) noexcept;
+    };
+
     using promise::promise_t;
 
     class HotStuffBase;
@@ -1087,6 +1103,12 @@ namespace hotstuff
             adaptive_v2_response_evidence;
         std::unique_ptr<ExperimentByzantineAdapter>
             experiment_byzantine_adapter;
+        std::unique_ptr<ExperimentPostQcAudit>
+            experiment_post_qc_audit;
+        AggregationScheduler::Cancellation
+            experiment_post_qc_audit_deadline_cancellation;
+        AggregationScheduler::Cancellation
+            experiment_post_qc_audit_expiry_cancellation;
         std::string experiment_diagnostic_window;
         // Experiment-only ordering state. The configured adapter bound is
         // copied before startup and caps this exact-proposal map.
@@ -1327,6 +1349,9 @@ namespace hotstuff
         void install_adaptive_epoch_handlers();
         void install_adaptive_consensus_handlers();
         void install_adaptive_v2_definition_handlers();
+        void experiment_post_qc_audit_relay_handler(
+            MsgExperimentPostQcAuditRelay &&message,
+            const Net::conn_t &connection);
         void adaptive_definition_request_handler(
             MsgEpochDefinitionRequest &&message,
             const Net::conn_t &conn);
@@ -1377,6 +1402,32 @@ namespace hotstuff
             const ProposalKey &key,
             std::size_t recorded_evidence,
             bool evidence_queued_before_commit) noexcept;
+        void arm_experiment_post_qc_audit(
+            const ProposalContextLease &lease) noexcept;
+        void synchronize_experiment_post_qc_audit(
+            const ProposalContextLease &lease,
+            ReplicaID authenticated_sender,
+            std::uint64_t arrival_ns) noexcept;
+        bool observe_experiment_post_qc_audit_terminal_vote(
+            const Vote &vote,
+            ReplicaID authenticated_sender,
+            std::uint64_t arrival_ns);
+        void dispatch_experiment_post_qc_audit_deadline() noexcept;
+        void prepare_experiment_post_qc_audit_root(
+            const ProposalContextLease &lease,
+            const QuorumCert &verified_qc) noexcept;
+        void activate_experiment_post_qc_audit_root(
+            const ProposalKey &key) noexcept;
+        void expire_experiment_post_qc_audit_root() noexcept;
+        void emit_experiment_post_qc_audit_target(
+            const ExperimentPostQcAuditTargetObservation &observation)
+            const noexcept;
+        void emit_experiment_post_qc_audit_root_prepared(
+            const ExperimentPostQcAuditRootSnapshot &snapshot)
+            const noexcept;
+        void emit_experiment_post_qc_audit_root_snapshot(
+            const ExperimentPostQcAuditRootSnapshot &snapshot)
+            const noexcept;
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
             const std::vector<ProposalKey> &committed_keys) const;
@@ -1419,7 +1470,8 @@ namespace hotstuff
         void buffer_or_dispatch_exact_contribution(
             ExactContributionKind kind,
             ExactContributionEnvelope envelope,
-            PeerId authenticated_source);
+            PeerId authenticated_source,
+            std::uint64_t received_ns = 0);
         void dispatch_exact_contribution(
             PendingExactContribution contribution);
         void drain_pending_exact_contributions(const ProposalKey &key);
@@ -1432,7 +1484,8 @@ namespace hotstuff
         void continue_exact_contribution(
             const ProposalContextLease &lease,
             ExactContributionKind kind,
-            const ExactContributionEnvelope &contribution);
+            const ExactContributionEnvelope &contribution,
+            std::uint64_t received_ns);
         void record_exact_latency(
             const ProposalContextLease &lease,
             ReplicaID child);
@@ -1661,6 +1714,8 @@ namespace hotstuff
         void set_aggregation_timeout(double timeout_seconds);
         void configure_experiment_byzantine_faults(
             ExperimentByzantineOptions options);
+        void configure_experiment_post_qc_audit(
+            ExperimentPostQcAuditOptions options);
         /**
          * Pin adaptive-v2 authorization and resource bounds before startup.
          * Until this is configured, adaptive-v2 proposal voting fails closed.

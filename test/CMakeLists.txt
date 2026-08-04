@@ -177,6 +177,16 @@ set_tests_properties(
     LABELS "unit;adaptive;experiment;byzantine;intentional-red"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_experiment_post_qc_audit
+    test_experiment_post_qc_audit.cpp)
+target_compile_definitions(
+    test_experiment_post_qc_audit PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_experiment_post_qc_audit PROPERTIES
+    LABELS "unit;adaptive;experiment;post-qc-audit;intentional-red"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_evidence_ingress
     test_evidence_ingress.cpp)
 target_compile_definitions(

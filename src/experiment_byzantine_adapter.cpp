@@ -119,6 +119,7 @@ struct ExperimentByzantineAdapter::State
         ContextLess>
         false_reports;
     std::set<ExperimentByzantineContext, ContextLess> omissions;
+    std::set<ExperimentByzantineContext, ContextLess> omission_markers;
     std::set<ExperimentByzantineContext, ContextLess>
         direct_vote_omissions;
 };
@@ -231,6 +232,14 @@ bool ExperimentByzantineAdapter::consume_outbound_aggregate(
         state_->options.maximum_omission_contexts)
         return false;
     return state_->omissions.insert(context).second;
+}
+
+bool ExperimentByzantineAdapter::consume_outbound_aggregate_marker(
+    const ExperimentByzantineContext &context) noexcept
+{
+    if (state_->omissions.find(context) == state_->omissions.end())
+        return false;
+    return state_->omission_markers.insert(context).second;
 }
 
 ExperimentDirectVoteDisposition

@@ -62,6 +62,52 @@ namespace hotstuff
         constexpr auto adaptive_v2_reporting_maximum_retry_delay =
             std::chrono::seconds(1);
 
+        std::string experiment_audit_signers(
+            const std::set<ReplicaID> &signers)
+        {
+            if (signers.empty())
+                return "-";
+            std::ostringstream output;
+            bool first = true;
+            for (const auto signer : signers)
+            {
+                if (!first)
+                    output << ',';
+                first = false;
+                output << static_cast<unsigned>(signer);
+            }
+            return output.str();
+        }
+
+        uint256_t experiment_audit_certificate_fingerprint(
+            const bytearray_t &serialized)
+        {
+            if (serialized.empty())
+                return uint256_t{};
+            return DataStream(serialized).get_hash();
+        }
+
+        bool experiment_audit_qc_unchanged(
+            const QuorumCert *certificate,
+            const ExperimentPostQcAuditRootSnapshot &snapshot) noexcept
+        {
+            if (certificate == nullptr ||
+                certificate->get_proposal_key() != snapshot.proposal)
+                return false;
+            try
+            {
+                DataStream serialized;
+                const_cast<QuorumCert *>(certificate)->serialize(
+                    serialized);
+                return static_cast<bytearray_t>(serialized) ==
+                       snapshot.frozen_qc;
+            }
+            catch (...)
+            {
+                return false;
+            }
+        }
+
         bool signer_sets_overlap(
             const std::set<ReplicaID> &left,
             const std::set<ReplicaID> &right)
@@ -855,9 +901,11 @@ namespace hotstuff
     public:
         ExactContributionEffects(
             std::shared_ptr<ExactRuntimeAccess> access,
-            PeerId source_peer)
+            PeerId source_peer,
+            std::uint64_t received_ns)
             : access_(std::move(access)),
-              source_peer_(std::move(source_peer))
+              source_peer_(std::move(source_peer)),
+              received_ns_(received_ns)
         {}
 
         promise_t start_worker_verification(
@@ -867,8 +915,72 @@ namespace hotstuff
             auto runtime = access_->acquire();
             if (!runtime.has_value())
                 return resolved(false);
-            return runtime->owner().verify_exact_contribution(
+            auto &owner = runtime->owner();
+            auto verification = owner.verify_exact_contribution(
                 kind, contribution);
+            if (kind != ExactContributionKind::direct_vote ||
+                contribution.direct_vote == nullptr ||
+                contribution.direct_vote->cert == nullptr ||
+                owner.experiment_post_qc_audit == nullptr)
+                return verification;
+            const auto generation = owner.find_exact_runtime_generation(
+                contribution.message_key.configuration);
+            if (!generation.has_value())
+                return verification;
+            bool audit_started = false;
+            try
+            {
+                audit_started = owner.experiment_post_qc_audit
+                    ->begin_target_verification(
+                        contribution.message_key,
+                        *generation,
+                        contribution.authenticated_sender,
+                        ExperimentPostQcAuditTargetPhase::open,
+                        received_ns_);
+            }
+            catch (...)
+            {
+                audit_started = false;
+            }
+            if (!audit_started)
+                return verification;
+            const auto vote = contribution.direct_vote;
+            const auto sender = contribution.authenticated_sender;
+            const auto key = contribution.message_key;
+            const auto received_ns = received_ns_;
+            const auto access = access_;
+            return verification.then(
+                [access,
+                 vote,
+                 sender,
+                 key,
+                 generation = *generation,
+                 received_ns](bool verified)
+                {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return false;
+                    auto &owner = runtime->owner();
+                    try
+                    {
+                        const auto observation =
+                            owner.experiment_post_qc_audit
+                                ->complete_target_verification(
+                                    key,
+                                    generation,
+                                    sender,
+                                    owner.config,
+                                    *vote->cert,
+                                    verified);
+                        if (observation.has_value())
+                            owner.emit_experiment_post_qc_audit_target(
+                                *observation);
+                    }
+                    catch (...)
+                    {
+                    }
+                    return verified;
+                });
         }
 
         promise_t start_block_delivery(
@@ -891,7 +1003,7 @@ namespace hotstuff
                 throw std::runtime_error(
                     "exact contribution runtime is unavailable");
             runtime->owner().continue_exact_contribution(
-                lease, kind, contribution);
+                lease, kind, contribution, received_ns_);
         }
 
     private:
@@ -904,6 +1016,7 @@ namespace hotstuff
 
         std::shared_ptr<ExactRuntimeAccess> access_;
         PeerId source_peer_;
+        std::uint64_t received_ns_{0};
     };
 
     struct HotStuffBase::AdaptiveEpochRuntime final
@@ -1309,11 +1422,24 @@ namespace hotstuff
                     MsgVote message{DataStream(body)};
                     if (!message.postponed_parse(&owner))
                         return;
+                    if (!validate_authenticated_vote(
+                            owner.config,
+                            peer.source_peer,
+                            message.vote))
+                        return;
+                    const auto received_ns =
+                        adaptive_evidence_monotonic_now_ns();
+                    if (owner.observe_experiment_post_qc_audit_terminal_vote(
+                            message.vote,
+                            *peer.replica_id,
+                            received_ns))
+                        return;
                     owner.buffer_or_dispatch_exact_contribution(
                         ExactContributionKind::direct_vote,
                         make_exact_direct_envelope(
                             message.vote, *peer.replica_id),
-                        peer.source_peer);
+                        peer.source_peer,
+                        received_ns);
                 }
                 catch (...)
                 {}
@@ -1335,7 +1461,8 @@ namespace hotstuff
                         ExactContributionKind::aggregate_relay,
                         make_exact_relay_envelope(
                             message.vote, *peer.replica_id),
-                        peer.source_peer);
+                        peer.source_peer,
+                        adaptive_evidence_monotonic_now_ns());
                 }
                 catch (...)
                 {}
@@ -1446,6 +1573,33 @@ namespace hotstuff
 
             this->vote = std::move(vote);
             this->serialized = std::move(serialized);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    const opcode_t MsgExperimentPostQcAuditRelay::opcode;
+    MsgExperimentPostQcAuditRelay::MsgExperimentPostQcAuditRelay(
+        const ExperimentPostQcAuditRelay &relay)
+    {
+        relay.serialize(serialized);
+        wire_bytes = serialized.size();
+    }
+
+    bool MsgExperimentPostQcAuditRelay::postponed_parse(
+        HotStuffCore *hsc) noexcept
+    {
+        try
+        {
+            DataStream input(serialized);
+            ExperimentPostQcAuditRelay parsed;
+            if (!parsed.parse(input, hsc))
+                return false;
+            relay = std::move(parsed);
+            serialized = std::move(input);
             return true;
         }
         catch (...)
@@ -2915,7 +3069,8 @@ namespace hotstuff
     void HotStuffBase::buffer_or_dispatch_exact_contribution(
         ExactContributionKind kind,
         ExactContributionEnvelope envelope,
-        PeerId authenticated_source)
+        PeerId authenticated_source,
+        std::uint64_t received_ns)
     {
         const auto metadata = exact_context_metadata(envelope.message_key);
         if (!metadata.has_value() ||
@@ -2932,7 +3087,8 @@ namespace hotstuff
             kind,
             std::move(envelope),
             std::move(authenticated_source),
-            std::move(fingerprint)};
+            std::move(fingerprint),
+            received_ns};
         const auto status = proposal_contexts->context_status(metadata->key);
         if (status == ProposalContextStatus::admitted_open)
         {
@@ -2954,7 +3110,8 @@ namespace hotstuff
     {
         auto effects = std::make_shared<ExactContributionEffects>(
             exact_runtime_access,
-            contribution.authenticated_source);
+            contribution.authenticated_source,
+            contribution.received_ns);
         ExactVoteHandlerCoordinator coordinator(
             proposal_contexts, effects);
         if (contribution.kind == ExactContributionKind::direct_vote)
@@ -2979,6 +3136,18 @@ namespace hotstuff
         const ProposalKey &key,
         bool preserve_scheduled_vote_fallback)
     {
+        if (experiment_post_qc_audit != nullptr)
+        {
+            const auto generation =
+                find_exact_runtime_generation(key.configuration);
+            if (generation.has_value())
+                static_cast<void>(
+                    experiment_post_qc_audit
+                        ->close_reporter_context(
+                            key,
+                            *generation,
+                            adaptive_evidence_monotonic_now_ns()));
+        }
         discard_exact_forwarding_retries(key);
         discard_exact_fallbacks(
             key, preserve_scheduled_vote_fallback);
@@ -3104,35 +3273,41 @@ namespace hotstuff
                         experiment_diagnostic_window}))
             return true;
 
+        const ExperimentByzantineContext omission_context{
+            lease.key(), experiment_diagnostic_window};
         if (experiment_byzantine_adapter != nullptr &&
             experiment_byzantine_adapter->consume_outbound_aggregate(
-                ExperimentByzantineContext{
-                    lease.key(),
-                    experiment_diagnostic_window}))
+                omission_context))
         {
-            const auto marker_monotonic_ns =
-                experiment_fault_marker_monotonic_now_ns();
-            if (marker_monotonic_ns.has_value())
-                HOTSTUFF_LOG_INFO(
-                    "KAURI_FAULT aggregate_omitted replica=%u parent=%u "
-                    "epoch=%u tree=%u block=%s window=%s monotonic_ns=%llu",
-                    get_id(),
-                    *lease.tree().parent,
-                    lease.key().configuration.epoch_number,
-                    lease.key().configuration.tree_id,
-                    lease.key().block_hash.to_hex().c_str(),
-                    experiment_diagnostic_window.c_str(),
-                    static_cast<unsigned long long>(
-                        *marker_monotonic_ns));
-            else
-                HOTSTUFF_LOG_WARN(
-                    "KAURI_FAULT marker_skipped marker=aggregate_omitted "
-                    "replica=%u epoch=%u tree=%u block=%s "
-                    "reason=event_clock_unavailable",
-                    get_id(),
-                    lease.key().configuration.epoch_number,
-                    lease.key().configuration.tree_id,
-                    lease.key().block_hash.to_hex().c_str());
+            if (experiment_byzantine_adapter
+                    ->consume_outbound_aggregate_marker(omission_context))
+            {
+                const auto marker_monotonic_ns =
+                    experiment_fault_marker_monotonic_now_ns();
+                if (marker_monotonic_ns.has_value())
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_FAULT aggregate_omitted replica=%u parent=%u "
+                        "epoch=%u tree=%u block=%s window=%s "
+                        "monotonic_ns=%llu",
+                        get_id(),
+                        *lease.tree().parent,
+                        lease.key().configuration.epoch_number,
+                        lease.key().configuration.tree_id,
+                        lease.key().block_hash.to_hex().c_str(),
+                        experiment_diagnostic_window.c_str(),
+                        static_cast<unsigned long long>(
+                            *marker_monotonic_ns));
+                else
+                    HOTSTUFF_LOG_WARN(
+                        "KAURI_FAULT marker_skipped "
+                        "marker=aggregate_omitted replica=%u epoch=%u "
+                        "tree=%u block=%s "
+                        "reason=event_clock_unavailable",
+                        get_id(),
+                        lease.key().configuration.epoch_number,
+                        lease.key().configuration.tree_id,
+                        lease.key().block_hash.to_hex().c_str());
+            }
             return true;
         }
 
@@ -3496,6 +3671,20 @@ namespace hotstuff
         const auto transition = proposal_contexts->transition(lease, event);
         if (transition != ProposalTransitionResult::retained_open)
         {
+            if (transition ==
+                    ProposalTransitionResult::terminal_closed &&
+                experiment_post_qc_audit != nullptr)
+            {
+                const auto generation = find_exact_runtime_generation(
+                    lease.key().configuration);
+                if (generation.has_value())
+                    static_cast<void>(
+                        experiment_post_qc_audit
+                            ->close_reporter_context(
+                                lease.key(),
+                                *generation,
+                                adaptive_evidence_monotonic_now_ns()));
+            }
             discard_exact_forwarding_retries(
                 lease.key(), lease.generation());
             return;
@@ -5637,7 +5826,8 @@ namespace hotstuff
     void HotStuffBase::continue_exact_contribution(
         const ProposalContextLease &lease,
         ExactContributionKind kind,
-        const ExactContributionEnvelope &contribution)
+        const ExactContributionEnvelope &contribution,
+        std::uint64_t received_ns)
     {
         if (!proposal_contexts->revalidate(lease))
             return;
@@ -5720,6 +5910,13 @@ namespace hotstuff
                 }
             return;
         }
+
+        synchronize_experiment_post_qc_audit(
+            lease,
+            contribution.authenticated_sender,
+            received_ns == 0
+                ? adaptive_evidence_monotonic_now_ns()
+                : received_ns);
 
         try
         {
@@ -5944,6 +6141,7 @@ namespace hotstuff
                     *lease,
                     ProposalContextEvent::root_qc_published);
             }
+            activate_experiment_post_qc_audit_root(key);
         }
     }
 
@@ -5962,6 +6160,8 @@ namespace hotstuff
             final_qc->compute();
             if (!final_qc->verify(config))
                 return;
+            prepare_experiment_post_qc_audit_root(
+                lease, *final_qc);
             if (proposal_contexts->claim_root_qc_progress(lease))
                 pmaker->record_verified_progress(
                     lease.key().configuration,
@@ -5994,6 +6194,7 @@ namespace hotstuff
             }
             proposal_contexts->transition(
                 lease, ProposalContextEvent::root_qc_published);
+            activate_experiment_post_qc_audit_root(lease.key());
             drain_ready_piped_qcs();
             return;
         }
@@ -6061,6 +6262,8 @@ namespace hotstuff
             return;
         for (const auto child : lease->tree().direct_children)
             proposal_contexts->record_latency_start(*lease, child);
+
+        arm_experiment_post_qc_audit(*lease);
 
         if (adaptive_v2_response_evidence == nullptr ||
             lease->tree().direct_children.empty())
@@ -8123,6 +8326,9 @@ namespace hotstuff
         static_assert(
             MsgAdaptiveV2ConvergenceObservationAck::opcode == 0x1E,
             "adaptive-v2 convergence ACK opcode must stay registered");
+        static_assert(
+            MsgExperimentPostQcAuditRelay::opcode == 0x1F,
+            "experiment post-QC audit opcode must stay distinct");
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_v2_epoch_change_bundle_handler,
             this, _1, _2));
@@ -8134,6 +8340,9 @@ namespace hotstuff
             this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::adaptive_definition_reply_handler,
+            this, _1, _2));
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::experiment_post_qc_audit_relay_handler,
             this, _1, _2));
     }
 
@@ -8900,38 +9109,42 @@ namespace hotstuff
                                 lease.key(),
                                 experiment_diagnostic_window}))
                     return true;
+                const ExperimentByzantineContext omission_context{
+                    lease.key(), experiment_diagnostic_window};
                 if (experiment_byzantine_adapter != nullptr &&
                     experiment_byzantine_adapter
-                        ->consume_outbound_aggregate(
-                            ExperimentByzantineContext{
-                                lease.key(),
-                                experiment_diagnostic_window}))
+                        ->consume_outbound_aggregate(omission_context))
                 {
-                    const auto marker_monotonic_ns =
-                        experiment_fault_marker_monotonic_now_ns();
-                    if (marker_monotonic_ns.has_value())
-                        HOTSTUFF_LOG_INFO(
-                            "KAURI_FAULT aggregate_omitted replica=%u "
-                            "parent=%u epoch=%u tree=%u block=%s window=%s "
-                            "monotonic_ns=%llu",
-                            get_id(),
-                            lease.tree().parent.value_or(get_id()),
-                            lease.key().configuration.epoch_number,
-                            lease.key().configuration.tree_id,
-                            lease.key().block_hash.to_hex().c_str(),
-                            experiment_diagnostic_window.c_str(),
-                            static_cast<unsigned long long>(
-                                *marker_monotonic_ns));
-                    else
-                        HOTSTUFF_LOG_WARN(
-                            "KAURI_FAULT marker_skipped "
-                            "marker=aggregate_omitted replica=%u epoch=%u "
-                            "tree=%u block=%s "
-                            "reason=event_clock_unavailable",
-                            get_id(),
-                            lease.key().configuration.epoch_number,
-                            lease.key().configuration.tree_id,
-                            lease.key().block_hash.to_hex().c_str());
+                    if (experiment_byzantine_adapter
+                            ->consume_outbound_aggregate_marker(
+                                omission_context))
+                    {
+                        const auto marker_monotonic_ns =
+                            experiment_fault_marker_monotonic_now_ns();
+                        if (marker_monotonic_ns.has_value())
+                            HOTSTUFF_LOG_INFO(
+                                "KAURI_FAULT aggregate_omitted replica=%u "
+                                "parent=%u epoch=%u tree=%u block=%s "
+                                "window=%s monotonic_ns=%llu",
+                                get_id(),
+                                lease.tree().parent.value_or(get_id()),
+                                lease.key().configuration.epoch_number,
+                                lease.key().configuration.tree_id,
+                                lease.key().block_hash.to_hex().c_str(),
+                                experiment_diagnostic_window.c_str(),
+                                static_cast<unsigned long long>(
+                                    *marker_monotonic_ns));
+                        else
+                            HOTSTUFF_LOG_WARN(
+                                "KAURI_FAULT marker_skipped "
+                                "marker=aggregate_omitted replica=%u "
+                                "epoch=%u tree=%u block=%s "
+                                "reason=event_clock_unavailable",
+                                get_id(),
+                                lease.key().configuration.epoch_number,
+                                lease.key().configuration.tree_id,
+                                lease.key().block_hash.to_hex().c_str());
+                    }
                     return true;
                 }
                 auto retained = claim.certificate == nullptr
@@ -9043,6 +9256,641 @@ namespace hotstuff
             false_timeout_context_bound;
         experiment_diagnostic_window = std::move(diagnostic_window);
         experiment_byzantine_adapter = std::move(adapter);
+    }
+
+    void HotStuffBase::configure_experiment_post_qc_audit(
+        ExperimentPostQcAuditOptions options)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            throw std::logic_error(
+                "post-QC audit requires adaptive-v2");
+        if (proposal_contexts->active_configuration().has_value())
+            throw std::logic_error(
+                "post-QC audit must be configured before startup");
+        if (!options.enabled)
+            throw std::invalid_argument(
+                "post-QC audit configuration is disabled");
+        experiment_post_qc_audit =
+            std::make_unique<ExperimentPostQcAudit>(
+                std::move(options), get_id());
+    }
+
+    void HotStuffBase::emit_experiment_post_qc_audit_target(
+        const ExperimentPostQcAuditTargetObservation &observation)
+        const noexcept
+    {
+        if (experiment_post_qc_audit == nullptr)
+            return;
+        try
+        {
+            const auto &options =
+                experiment_post_qc_audit->options();
+            const auto signers =
+                experiment_audit_signers(observation.signers);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_AUDIT target_verified phase=%s reporter=%u "
+                "target=%u root=%u epoch=%u tree=%u epoch_digest=%s "
+                "block=%s generation=%llu window=%s armed_ns=%llu "
+                "deadline_ns=%llu arrival_ns=%llu signers=%s",
+                to_string(observation.phase),
+                static_cast<unsigned>(options.reporter),
+                static_cast<unsigned>(options.target),
+                static_cast<unsigned>(options.root),
+                observation.proposal.configuration.epoch_number,
+                observation.proposal.configuration.tree_id,
+                observation.proposal.configuration.epoch_digest
+                    .to_hex().c_str(),
+                observation.proposal.block_hash.to_hex().c_str(),
+                static_cast<unsigned long long>(
+                    observation.generation),
+                options.diagnostic_window.c_str(),
+                static_cast<unsigned long long>(
+                    observation.armed_ns),
+                static_cast<unsigned long long>(
+                    observation.deadline_ns),
+                static_cast<unsigned long long>(
+                    observation.arrival_ns),
+                signers.c_str());
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void HotStuffBase::emit_experiment_post_qc_audit_root_prepared(
+        const ExperimentPostQcAuditRootSnapshot &snapshot)
+        const noexcept
+    {
+        if (experiment_post_qc_audit == nullptr)
+            return;
+        try
+        {
+            const auto &options =
+                experiment_post_qc_audit->options();
+            const auto signers =
+                experiment_audit_signers(snapshot.qc_signers);
+            const auto fingerprint =
+                experiment_audit_certificate_fingerprint(
+                    snapshot.frozen_qc);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_AUDIT root_prepared phase=pre_qc reporter=%u "
+                "target=%u root=%u epoch=%u tree=%u epoch_digest=%s "
+                "block=%s generation=%llu window=%s prepared_ns=%llu "
+                "qc_signers=%s qc_fingerprint=%s",
+                static_cast<unsigned>(options.reporter),
+                static_cast<unsigned>(options.target),
+                static_cast<unsigned>(options.root),
+                snapshot.proposal.configuration.epoch_number,
+                snapshot.proposal.configuration.tree_id,
+                snapshot.proposal.configuration.epoch_digest
+                    .to_hex().c_str(),
+                snapshot.proposal.block_hash.to_hex().c_str(),
+                static_cast<unsigned long long>(snapshot.generation),
+                options.diagnostic_window.c_str(),
+                static_cast<unsigned long long>(snapshot.prepared_ns),
+                signers.c_str(),
+                fingerprint.to_hex().c_str());
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void HotStuffBase::emit_experiment_post_qc_audit_root_snapshot(
+        const ExperimentPostQcAuditRootSnapshot &snapshot)
+        const noexcept
+    {
+        if (experiment_post_qc_audit == nullptr)
+            return;
+        try
+        {
+            const auto &options =
+                experiment_post_qc_audit->options();
+            const auto signers =
+                experiment_audit_signers(snapshot.qc_signers);
+            const auto fingerprint =
+                experiment_audit_certificate_fingerprint(
+                    snapshot.frozen_qc);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_AUDIT root_snapshot phase=post_qc reporter=%u "
+                "target=%u root=%u epoch=%u tree=%u epoch_digest=%s "
+                "block=%s generation=%llu window=%s prepared_ns=%llu "
+                "qc_published_ns=%llu retention_deadline_ns=%llu "
+                "qc_signers=%s qc_fingerprint=%s "
+                "consensus_context=terminal qc_unchanged=1",
+                static_cast<unsigned>(options.reporter),
+                static_cast<unsigned>(options.target),
+                static_cast<unsigned>(options.root),
+                snapshot.proposal.configuration.epoch_number,
+                snapshot.proposal.configuration.tree_id,
+                snapshot.proposal.configuration.epoch_digest
+                    .to_hex().c_str(),
+                snapshot.proposal.block_hash.to_hex().c_str(),
+                static_cast<unsigned long long>(snapshot.generation),
+                options.diagnostic_window.c_str(),
+                static_cast<unsigned long long>(snapshot.prepared_ns),
+                static_cast<unsigned long long>(snapshot.published_ns),
+                static_cast<unsigned long long>(snapshot.expiry_ns),
+                signers.c_str(),
+                fingerprint.to_hex().c_str());
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void HotStuffBase::arm_experiment_post_qc_audit(
+        const ProposalContextLease &lease) noexcept
+    {
+        if (experiment_post_qc_audit == nullptr ||
+            !experiment_post_qc_audit->is_reporter() ||
+            aggregation_scheduler == nullptr ||
+            experiment_post_qc_audit->diagnostics().reporter_armed)
+            return;
+        try
+        {
+            const auto generation = find_exact_runtime_generation(
+                lease.key().configuration);
+            auto accumulator =
+                proposal_contexts->clone_accumulator(lease);
+            const auto armed_ns =
+                adaptive_evidence_monotonic_now_ns();
+            if (!generation.has_value() || accumulator == nullptr ||
+                armed_ns == 0 ||
+                !experiment_post_qc_audit->arm_reporter(
+                    lease.key(),
+                    *generation,
+                    lease.tree(),
+                    *accumulator,
+                    armed_ns))
+                return;
+            const auto delay = std::chrono::duration_cast<
+                AggregationScheduler::Duration>(
+                std::chrono::milliseconds(
+                    kExperimentPostQcAuditDeadlineMs));
+            const auto now = aggregation_scheduler->monotonic_now();
+            if (delay <= AggregationScheduler::Duration::zero() ||
+                now > AggregationScheduler::Duration::max() - delay)
+                return;
+            const auto access = exact_runtime_access;
+            experiment_post_qc_audit_deadline_cancellation =
+                schedule_at_or_after_deadline(
+                    *aggregation_scheduler,
+                    now + delay,
+                    [access]()
+                    {
+                        auto runtime = access->acquire();
+                        if (runtime.has_value())
+                            runtime->owner()
+                                .dispatch_experiment_post_qc_audit_deadline();
+                    },
+                    [access]()
+                    {
+                        auto runtime = access->acquire();
+                        if (runtime.has_value())
+                            HOTSTUFF_LOG_WARN(
+                                "KAURI_AUDIT deadline_schedule_failed "
+                                "reporter=%u",
+                                static_cast<unsigned>(
+                                    runtime->owner().get_id()));
+                    });
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void HotStuffBase::synchronize_experiment_post_qc_audit(
+        const ProposalContextLease &lease,
+        ReplicaID authenticated_sender,
+        std::uint64_t arrival_ns) noexcept
+    {
+        if (experiment_post_qc_audit == nullptr ||
+            !experiment_post_qc_audit->is_reporter())
+            return;
+        try
+        {
+            const auto generation = find_exact_runtime_generation(
+                lease.key().configuration);
+            auto accumulator =
+                proposal_contexts->clone_accumulator(lease);
+            if (!generation.has_value() || accumulator == nullptr)
+                return;
+            const auto observation = experiment_post_qc_audit
+                ->synchronize_reporter_accumulator(
+                    lease.key(),
+                    *generation,
+                    *accumulator,
+                    authenticated_sender,
+                    arrival_ns);
+            if (observation.has_value())
+                emit_experiment_post_qc_audit_target(*observation);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    bool HotStuffBase::observe_experiment_post_qc_audit_terminal_vote(
+        const Vote &vote,
+        ReplicaID authenticated_sender,
+        std::uint64_t arrival_ns)
+    {
+        if (experiment_post_qc_audit == nullptr || vote.cert == nullptr ||
+            proposal_contexts->context_status(vote.key()) !=
+                ProposalContextStatus::terminal_closed)
+            return false;
+        const auto generation = find_exact_runtime_generation(
+            vote.configuration());
+        if (!generation.has_value())
+            return false;
+        bool started = false;
+        try
+        {
+            started = experiment_post_qc_audit
+                ->begin_target_verification(
+                    vote.key(),
+                    *generation,
+                    authenticated_sender,
+                    ExperimentPostQcAuditTargetPhase::post_close,
+                    arrival_ns);
+        }
+        catch (...)
+        {
+            return false;
+        }
+        if (!started)
+            return false;
+
+        const auto access = exact_runtime_access;
+        const auto retained_vote = std::make_shared<const Vote>(vote);
+        try
+        {
+            retained_vote->cert
+                ->verify(config.get_pubkey(authenticated_sender), vpool)
+                .then(
+                    [access,
+                     retained_vote,
+                     authenticated_sender,
+                     generation = *generation](bool verified)
+                    {
+                        auto runtime = access->acquire();
+                        if (!runtime.has_value())
+                            return;
+                        auto &owner = runtime->owner();
+                        try
+                        {
+                            const auto observation =
+                                owner.experiment_post_qc_audit
+                                    ->complete_target_verification(
+                                        retained_vote->key(),
+                                        generation,
+                                        authenticated_sender,
+                                        owner.config,
+                                        *retained_vote->cert,
+                                        verified);
+                            if (observation.has_value())
+                                owner.emit_experiment_post_qc_audit_target(
+                                    *observation);
+                        }
+                        catch (...)
+                        {
+                        }
+                    });
+        }
+        catch (...)
+        {
+            static_cast<void>(experiment_post_qc_audit
+                ->complete_target_verification(
+                    vote.key(),
+                    *generation,
+                    authenticated_sender,
+                    config,
+                    *vote.cert,
+                    false));
+        }
+        return true;
+    }
+
+    void HotStuffBase::dispatch_experiment_post_qc_audit_deadline()
+        noexcept
+    {
+        if (experiment_post_qc_audit == nullptr)
+            return;
+        try
+        {
+            const auto now = adaptive_evidence_monotonic_now_ns();
+            const auto claim = experiment_post_qc_audit
+                ->consume_reporter_deadline(now);
+            if (!claim.has_value())
+                return;
+            claim->relay.certificate->compute();
+            if (!claim->relay.certificate->verify(config))
+            {
+                static_cast<void>(
+                    experiment_post_qc_audit
+                        ->complete_reporter_relay(false));
+                return;
+            }
+            const auto &relay = claim->relay;
+            const auto signers =
+                experiment_audit_signers(claim->signers);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_AUDIT missing_claim claim=missing_target reporter=%u "
+                "target=%u root=%u epoch=%u tree=%u epoch_digest=%s "
+                "block=%s generation=%llu window=%s armed_ns=%llu "
+                "deadline_ns=%llu emitted_ns=%llu signers=%s",
+                static_cast<unsigned>(relay.reporter),
+                static_cast<unsigned>(relay.target),
+                static_cast<unsigned>(relay.root),
+                relay.proposal.configuration.epoch_number,
+                relay.proposal.configuration.tree_id,
+                relay.proposal.configuration.epoch_digest
+                    .to_hex().c_str(),
+                relay.proposal.block_hash.to_hex().c_str(),
+                static_cast<unsigned long long>(relay.generation),
+                relay.diagnostic_window.c_str(),
+                static_cast<unsigned long long>(relay.armed_ns),
+                static_cast<unsigned long long>(relay.deadline_ns),
+                static_cast<unsigned long long>(relay.emitted_ns),
+                signers.c_str());
+
+            MsgExperimentPostQcAuditRelay message(relay);
+            const auto wire_bytes = message.wire_bytes;
+            const auto root_peer = config.get_peer_id(relay.root);
+            const bool sent = !root_peer.is_null() &&
+                pn.send_msg(message, root_peer);
+            const auto sent_ns = adaptive_evidence_monotonic_now_ns();
+            static_cast<void>(experiment_post_qc_audit
+                ->complete_reporter_relay(sent));
+            if (sent)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_AUDIT relay_sent reporter=%u target=%u "
+                    "root=%u epoch=%u tree=%u epoch_digest=%s block=%s "
+                    "generation=%llu window=%s deadline_ns=%llu "
+                    "sent_ns=%llu signers=%s wire_bytes=%zu",
+                    static_cast<unsigned>(relay.reporter),
+                    static_cast<unsigned>(relay.target),
+                    static_cast<unsigned>(relay.root),
+                    relay.proposal.configuration.epoch_number,
+                    relay.proposal.configuration.tree_id,
+                    relay.proposal.configuration.epoch_digest
+                        .to_hex().c_str(),
+                    relay.proposal.block_hash.to_hex().c_str(),
+                    static_cast<unsigned long long>(relay.generation),
+                    relay.diagnostic_window.c_str(),
+                    static_cast<unsigned long long>(relay.deadline_ns),
+                    static_cast<unsigned long long>(sent_ns),
+                    signers.c_str(),
+                    wire_bytes);
+        }
+        catch (...)
+        {
+            static_cast<void>(experiment_post_qc_audit
+                ->complete_reporter_relay(false));
+        }
+    }
+
+    void HotStuffBase::prepare_experiment_post_qc_audit_root(
+        const ProposalContextLease &lease,
+        const QuorumCert &verified_qc) noexcept
+    {
+        if (experiment_post_qc_audit == nullptr ||
+            !experiment_post_qc_audit->is_root())
+            return;
+        try
+        {
+            const auto generation = find_exact_runtime_generation(
+                lease.key().configuration);
+            const auto frozen_global_quorum =
+                proposal_contexts->frozen_global_quorum(lease);
+            const auto prepared_ns =
+                adaptive_evidence_monotonic_now_ns();
+            if (!generation.has_value() ||
+                !frozen_global_quorum.has_value() || prepared_ns == 0)
+                return;
+            const auto snapshot = experiment_post_qc_audit->prepare_root(
+                lease.key(),
+                *generation,
+                lease.tree(),
+                verified_qc,
+                *frozen_global_quorum,
+                prepared_ns);
+            if (snapshot.has_value())
+                emit_experiment_post_qc_audit_root_prepared(*snapshot);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void HotStuffBase::activate_experiment_post_qc_audit_root(
+        const ProposalKey &key) noexcept
+    {
+        if (experiment_post_qc_audit == nullptr ||
+            !experiment_post_qc_audit->is_root() ||
+            aggregation_scheduler == nullptr)
+            return;
+        try
+        {
+            const auto prepared =
+                experiment_post_qc_audit->root_snapshot();
+            const auto block = storage->find_blk(key.block_hash);
+            const auto published_ns =
+                adaptive_evidence_monotonic_now_ns();
+            const bool terminal =
+                proposal_contexts->context_status(key) ==
+                ProposalContextStatus::terminal_closed;
+            if (!prepared.has_value() || prepared->proposal != key ||
+                block == nullptr || block->self_qc == nullptr ||
+                !experiment_post_qc_audit->activate_root(
+                    key,
+                    prepared->generation,
+                    *block->self_qc,
+                    published_ns,
+                    terminal))
+                return;
+            const auto activated =
+                experiment_post_qc_audit->root_snapshot();
+            if (!activated.has_value())
+                return;
+            emit_experiment_post_qc_audit_root_snapshot(*activated);
+
+            const auto delay = std::chrono::duration_cast<
+                AggregationScheduler::Duration>(
+                std::chrono::milliseconds(
+                    kExperimentPostQcAuditRetentionMs));
+            const auto now = aggregation_scheduler->monotonic_now();
+            if (delay <= AggregationScheduler::Duration::zero() ||
+                now > AggregationScheduler::Duration::max() - delay)
+                return;
+            const auto access = exact_runtime_access;
+            experiment_post_qc_audit_expiry_cancellation =
+                schedule_at_or_after_deadline(
+                    *aggregation_scheduler,
+                    now + delay,
+                    [access]()
+                    {
+                        auto runtime = access->acquire();
+                        if (runtime.has_value())
+                            runtime->owner()
+                                .expire_experiment_post_qc_audit_root();
+                    });
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void HotStuffBase::expire_experiment_post_qc_audit_root()
+        noexcept
+    {
+        if (experiment_post_qc_audit == nullptr)
+            return;
+        static_cast<void>(experiment_post_qc_audit->expire(
+            adaptive_evidence_monotonic_now_ns()));
+    }
+
+    void HotStuffBase::experiment_post_qc_audit_relay_handler(
+        MsgExperimentPostQcAuditRelay &&message,
+        const Net::conn_t &connection)
+    {
+        if (experiment_post_qc_audit == nullptr ||
+            !experiment_post_qc_audit->is_root() ||
+            connection == nullptr)
+            return;
+        const auto peer = connection->get_peer_id();
+        const auto authenticated = peer_id_map.find(peer);
+        if (peer.is_null() || authenticated == peer_id_map.end() ||
+            !message.postponed_parse(this))
+            return;
+        const auto received_ns =
+            adaptive_evidence_monotonic_now_ns();
+        std::optional<ExperimentPostQcAuditRootVerification> request;
+        try
+        {
+            request = experiment_post_qc_audit
+                ->begin_root_verification(
+                    message.relay,
+                    authenticated->second,
+                    received_ns);
+        }
+        catch (...)
+        {
+            return;
+        }
+        if (!request.has_value() ||
+            request->relay.certificate == nullptr)
+            return;
+
+        const auto access = exact_runtime_access;
+        const auto wire_bytes = message.wire_bytes;
+        auto retained = std::make_shared<
+            const ExperimentPostQcAuditRootVerification>(
+                std::move(*request));
+        try
+        {
+            retained->relay.certificate->verify(config, vpool).then(
+                [access, retained, wire_bytes](bool verified)
+                {
+                auto runtime = access->acquire();
+                if (!runtime.has_value())
+                    return;
+                auto &owner = runtime->owner();
+                const auto verified_ns =
+                    adaptive_evidence_monotonic_now_ns();
+                const bool terminal = owner.proposal_contexts
+                    ->context_status(retained->relay.proposal) ==
+                    ProposalContextStatus::terminal_closed;
+                const auto block = owner.storage->find_blk(
+                    retained->relay.proposal.block_hash);
+                const bool qc_unchanged =
+                    experiment_audit_qc_unchanged(
+                        block == nullptr
+                            ? nullptr
+                            : block->self_qc.get(),
+                        retained->root_snapshot);
+                const bool accepted = owner.experiment_post_qc_audit
+                    ->complete_root_verification(
+                        retained->relay.proposal,
+                        retained->relay.generation,
+                        verified_ns,
+                        verified,
+                        terminal,
+                        qc_unchanged);
+                if (!accepted)
+                    return;
+                const auto &options =
+                    owner.experiment_post_qc_audit->options();
+                const auto audit_signers =
+                    experiment_audit_signers(
+                        retained->audit_signers);
+                const auto qc_signers =
+                    experiment_audit_signers(
+                        retained->root_snapshot.qc_signers);
+                const auto qc_fingerprint =
+                    experiment_audit_certificate_fingerprint(
+                        retained->root_snapshot.frozen_qc);
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_AUDIT root_witness phase=post_qc "
+                    "reporter=%u target=%u root=%u epoch=%u tree=%u "
+                    "epoch_digest=%s block=%s generation=%llu window=%s "
+                    "prepared_ns=%llu qc_published_ns=%llu "
+                    "received_ns=%llu verified_ns=%llu "
+                    "retention_deadline_ns=%llu deadline_ns=%llu "
+                    "signers=%s qc_signers=%s wire_bytes=%zu "
+                    "qc_fingerprint=%s consensus_context=terminal "
+                    "qc_unchanged=1",
+                    static_cast<unsigned>(options.reporter),
+                    static_cast<unsigned>(options.target),
+                    static_cast<unsigned>(options.root),
+                    retained->relay.proposal.configuration.epoch_number,
+                    retained->relay.proposal.configuration.tree_id,
+                    retained->relay.proposal.configuration.epoch_digest
+                        .to_hex().c_str(),
+                    retained->relay.proposal.block_hash.to_hex().c_str(),
+                    static_cast<unsigned long long>(
+                        retained->relay.generation),
+                    retained->relay.diagnostic_window.c_str(),
+                    static_cast<unsigned long long>(
+                        retained->root_snapshot.prepared_ns),
+                    static_cast<unsigned long long>(
+                        retained->root_snapshot.published_ns),
+                    static_cast<unsigned long long>(
+                        retained->received_ns),
+                    static_cast<unsigned long long>(verified_ns),
+                    static_cast<unsigned long long>(
+                        retained->root_snapshot.expiry_ns),
+                    static_cast<unsigned long long>(
+                        retained->relay.deadline_ns),
+                    audit_signers.c_str(),
+                    qc_signers.c_str(),
+                    wire_bytes,
+                    qc_fingerprint.to_hex().c_str());
+                });
+        }
+        catch (...)
+        {
+            const bool terminal = proposal_contexts->context_status(
+                retained->relay.proposal) ==
+                ProposalContextStatus::terminal_closed;
+            const auto block = storage->find_blk(
+                retained->relay.proposal.block_hash);
+            const auto verified_ns =
+                adaptive_evidence_monotonic_now_ns();
+            static_cast<void>(experiment_post_qc_audit
+                ->complete_root_verification(
+                    retained->relay.proposal,
+                    retained->relay.generation,
+                    verified_ns,
+                    false,
+                    terminal,
+                    experiment_audit_qc_unchanged(
+                        block == nullptr
+                            ? nullptr
+                            : block->self_qc.get(),
+                        retained->root_snapshot)));
+        }
     }
 
     void HotStuffBase::set_tree_period(size_t nblocks)
@@ -9217,6 +10065,10 @@ namespace hotstuff
                 static_cast<unsigned>(recorded));
         if (!recorded)
             return;
+        synchronize_experiment_post_qc_audit(
+            *lease,
+            get_id(),
+            adaptive_evidence_monotonic_now_ns());
         if (consume_experiment_outbound_direct_vote(
                 lease->key(), lease->tree()))
         {
@@ -9602,6 +10454,10 @@ namespace hotstuff
                         *vote.cert,
                         std::move(forwarding_candidate)))
                     return;
+                owner.synchronize_experiment_post_qc_audit(
+                    *lease,
+                    owner.get_id(),
+                    adaptive_evidence_monotonic_now_ns());
                 if (owner.consume_experiment_outbound_direct_vote(
                         lease->key(), lease->tree()))
                 {
@@ -10615,6 +11471,17 @@ namespace hotstuff
     HotStuffBase::~HotStuffBase()
     {
         pmaker->shutdown();
+        try
+        {
+            if (experiment_post_qc_audit_deadline_cancellation)
+                experiment_post_qc_audit_deadline_cancellation();
+            if (experiment_post_qc_audit_expiry_cancellation)
+                experiment_post_qc_audit_expiry_cancellation();
+        }
+        catch (...)
+        {}
+        experiment_post_qc_audit_deadline_cancellation = {};
+        experiment_post_qc_audit_expiry_cancellation = {};
         cancel_adaptive_v2_reporting_flush();
         reset_committed_epoch_definition_recovery();
         epoch_live_binding = nullptr;
