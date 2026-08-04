@@ -387,6 +387,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 5:
             type = StructuredEventType::evidence_observation_accepted;
             return true;
+        case 6:
+            type = StructuredEventType::adaptive_v2_shape_decision;
+            return true;
         default:
             return false;
     }
@@ -486,6 +489,39 @@ const char *reputation_outcome_name(
             return "response";
         case SimpleReputationOutcome::timeout:
             return "timeout";
+    }
+    return nullptr;
+}
+
+const char *shape_status_name(ShapeV1Status status) noexcept
+{
+    switch (status)
+    {
+        case ShapeV1Status::selected:
+            return "selected";
+        case ShapeV1Status::invalid_input:
+            return "invalid_input";
+        case ShapeV1Status::no_feasible_candidate:
+            return "no_feasible_candidate";
+    }
+    return nullptr;
+}
+
+const char *shape_rejection_name(
+    ShapeV1CandidateRejection rejection) noexcept
+{
+    switch (rejection)
+    {
+        case ShapeV1CandidateRejection::none:
+            return "none";
+        case ShapeV1CandidateRejection::fanout_out_of_range:
+            return "fanout_out_of_range";
+        case ShapeV1CandidateRejection::wait_exempt_would_influence:
+            return "wait_exempt_would_influence";
+        case ShapeV1CandidateRejection::missing_influential_evidence:
+            return "missing_influential_evidence";
+        case ShapeV1CandidateRejection::score_overflow:
+            return "score_overflow";
     }
     return nullptr;
 }
@@ -908,6 +944,19 @@ bool valid_manager_session_terminal_payload(
     return false;
 }
 
+bool valid_shape_decision_payload(
+    const AdaptiveV2ShapeDecisionStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    return config.source.kind ==
+            StructuredEventSourceKind::adaptation_manager &&
+        !event.transition_artifact_id.empty() &&
+        valid_utf8(event.transition_artifact_id) &&
+        event.transition_artifact_id.size() <=
+            config.limits.maximum_identity_bytes &&
+        valid_shape_decision_record(event.decision);
+}
+
 bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                          const StructuredEventConfig &config) noexcept
 {
@@ -947,6 +996,11 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                     EvidenceObservationAcceptedStructuredEvent>(
                         payload),
                 config.source.kind);
+        case 6:
+            return valid_shape_decision_payload(
+                std::get<AdaptiveV2ShapeDecisionStructuredEvent>(
+                    payload),
+                config);
         default:
             return false;
     }
@@ -1362,6 +1416,79 @@ void append_evidence_snapshot_payload(
     builder.append("]}");
 }
 
+void append_shape_decision_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2ShapeDecisionStructuredEvent &event)
+{
+    const auto &decision = event.decision;
+    builder.append("{\"cycle_ordinal\":");
+    builder.append_integer(event.cycle_ordinal);
+    builder.append(",\"transition_artifact_id\":");
+    builder.append_escaped(event.transition_artifact_id);
+    builder.append(",\"decision\":{\"schema_version\":");
+    builder.append_integer(decision.schema_version);
+    builder.append(",\"status\":");
+    builder.append_escaped(shape_status_name(decision.status));
+    builder.append(",\"selector_version\":");
+    builder.append_escaped(decision.selector_version);
+    builder.append(",\"tie_rule\":");
+    builder.append_escaped(decision.tie_rule);
+    builder.append(",\"epoch_number\":");
+    builder.append_integer(decision.epoch_number);
+    builder.append(",\"epoch_digest\":");
+    builder.append_escaped(decision.epoch_digest.to_hex());
+    builder.append(",\"current_topology_digest\":");
+    builder.append_escaped(decision.current_topology_digest.to_hex());
+    builder.append(",\"evidence_cutoff\":");
+    builder.append_integer(decision.evidence_cutoff);
+    builder.append(",\"evidence_digest\":");
+    builder.append_escaped(decision.evidence_digest.to_hex());
+    builder.append(",\"predecessor_tree_count\":");
+    builder.append_integer(decision.predecessor_tree_count);
+    builder.append(",\"tree_count\":");
+    builder.append_integer(decision.tree_count);
+    builder.append(",\"fixed_pipeline_stretch\":");
+    builder.append_integer(decision.fixed_pipeline_stretch);
+    builder.append(",\"deterministic_seed\":");
+    builder.append_integer(decision.deterministic_seed);
+    builder.append(",\"current_fanout\":");
+    builder.append_integer(decision.current_fanout);
+    builder.append(",\"selected_fanout\":");
+    builder.append_integer(decision.selected_fanout);
+    builder.append(",\"applied_fanout\":");
+    builder.append_integer(decision.applied_fanout);
+    builder.append(",\"reference_tree_rule\":");
+    builder.append_escaped(decision.reference_tree_rule);
+    builder.append(",\"candidates\":[");
+    bool first = true;
+    for (const auto &candidate : decision.candidates)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append("{\"fanout\":");
+        builder.append_integer(candidate.fanout);
+        builder.append(",\"rejection\":");
+        builder.append_escaped(
+            shape_rejection_name(candidate.rejection));
+        builder.append(",\"depth\":");
+        builder.append_integer(candidate.depth);
+        builder.append(",\"risk\":");
+        builder.append_integer(candidate.risk);
+        builder.append(",\"latency\":");
+        builder.append_integer(candidate.latency);
+        builder.append(",\"churn\":");
+        builder.append_integer(candidate.churn);
+        builder.append(",\"switch_threshold_satisfied\":");
+        builder.append(
+            candidate.switch_threshold_satisfied ? "true" : "false");
+        builder.append('}');
+        first = false;
+    }
+    builder.append("],\"decision_digest\":");
+    builder.append_escaped(decision.decision_digest.to_hex());
+    builder.append("}}");
+}
+
 void append_convergence_identity(
     JsonLineBuilder &builder,
     const AdaptiveV2EpochChangeIdentity &identity)
@@ -1685,6 +1812,11 @@ std::string serialize_audit_event(
                 std::get<
                     EvidenceObservationAcceptedStructuredEvent>(
                         event));
+            break;
+        case 6:
+            append_shape_decision_payload(
+                builder,
+                std::get<AdaptiveV2ShapeDecisionStructuredEvent>(event));
             break;
         default:
             throw std::bad_variant_access{};
@@ -2077,6 +2209,33 @@ std::string serialize_adaptive_v2_evidence_snapshot_payload(
     }
 }
 
+std::string serialize_adaptive_v2_shape_decision_payload(
+    const AdaptiveV2ShapeDecisionStructuredEvent &event,
+    std::size_t maximum_bytes)
+{
+    StructuredEventConfig validation_config;
+    validation_config.source.kind =
+        StructuredEventSourceKind::adaptation_manager;
+    validation_config.limits.maximum_identity_bytes = maximum_bytes;
+    if (maximum_bytes == 0 ||
+        !valid_shape_decision_payload(event, validation_config))
+    {
+        throw std::invalid_argument(
+            "invalid adaptive-v2 shape decision payload");
+    }
+    try
+    {
+        JsonLineBuilder builder(maximum_bytes);
+        append_shape_decision_payload(builder, event);
+        return builder.finish_value();
+    }
+    catch (const LineLimitExceeded &)
+    {
+        throw std::length_error(
+            "adaptive-v2 shape decision payload exceeds its bound");
+    }
+}
+
 StructuredEventType structured_event_type(
     const StructuredEventPayload &payload) noexcept
 {
@@ -2153,6 +2312,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2_session_terminal";
         case StructuredEventType::evidence_observation_accepted:
             return "evidence.observation_accepted";
+        case StructuredEventType::adaptive_v2_shape_decision:
+            return "adaptive_v2_shape_decision";
         default:
             break;
     }

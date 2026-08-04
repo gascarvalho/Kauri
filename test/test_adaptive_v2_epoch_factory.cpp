@@ -160,9 +160,13 @@ std::size_t first_leaf_index(
 }
 
 AdaptiveV2SelectionResult successful_selection(
-    const EpochDefinition &current)
+    const EpochDefinition &current,
+    std::vector<ReplicaID> selected_replicas = {0, 1})
 {
     const auto members = membership();
+    std::sort(selected_replicas.begin(), selected_replicas.end());
+    const std::set<ReplicaID> selected(
+        selected_replicas.begin(), selected_replicas.end());
     const AdaptationEpochId epoch{
         current.epoch_number(), current.epoch_digest()};
     std::vector<AcceptedEvidenceRecord> records;
@@ -184,7 +188,7 @@ AdaptiveV2SelectionResult successful_selection(
             observation.deadline_duration_us = 100;
             observation.reporter_sequence = sequence + 1;
             observation.reporter_monotonic_ns = (sequence + 1) * 1'000;
-            if (target < 2)
+            if (selected.count(target) != 0)
             {
                 observation.outcome = ResponseOutcome::timeout;
                 observation.response_duration_us = 0;
@@ -224,7 +228,7 @@ AdaptiveV2SelectionResult successful_selection(
         7,
         2,
         5,
-        2,
+        static_cast<std::uint32_t>(selected_replicas.size()),
         3,
         2,
         2,
@@ -233,7 +237,7 @@ AdaptiveV2SelectionResult successful_selection(
     result.snapshot =
         std::make_unique<hotstuff::AdaptationSnapshot>(
             std::move(snapshot));
-    for (const auto target : {ReplicaID{0}, ReplicaID{1}})
+    for (const auto target : selected_replicas)
     {
         AdaptiveV2CandidateAudit audit;
         audit.replica_id = target;
@@ -251,8 +255,16 @@ AdaptiveV2SelectionResult successful_selection(
         audit.guarded_eligible = true;
         result.eligible_candidates.push_back(std::move(audit));
     }
-    result.selected_replicas = {0, 1};
-    result.eligible_roots = {2, 3, 4, 5, 6};
+    result.selected_replicas = selected_replicas;
+    for (const auto &entry : result.snapshot->ranking())
+    {
+        if (selected.count(entry.replica_id) == 0 &&
+            entry.classification == ResponsivenessClass::responsive &&
+            result.eligible_roots.size() < 5)
+        {
+            result.eligible_roots.push_back(entry.replica_id);
+        }
+    }
     return result;
 }
 
@@ -629,6 +641,84 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "factory keeps quorum fixed while a smaller fault set leaves root choice",
+    "[adaptive-v2][epoch-factory][minority][roots]")
+{
+    Fixture fixture;
+    fixture.selection = successful_selection(
+        *fixture.current, {ReplicaID{6}});
+
+    const auto result = fixture.build();
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    CHECK(fixture.selection.metadata.fault_threshold == 2);
+    CHECK(fixture.selection.metadata.quorum == 5);
+    CHECK(fixture.selection.metadata.required_nonresponsive == 1);
+    CHECK(fixture.selection.selected_replicas ==
+          std::vector<ReplicaID>{6});
+    REQUIRE(result.bundle->definition().trees.size() == 5);
+    for (const auto &candidate : result.bundle->definition().trees)
+    {
+        CHECK(candidate.wait_exempt_leaves ==
+              std::vector<ReplicaID>{6});
+        CHECK(candidate.members_breadth_first.front() != 6);
+    }
+}
+
+TEST_CASE(
+    "containment preserves a responsive baseline root below the top Q",
+    "[adaptive-v2][epoch-factory][containment][roots][n7]")
+{
+    Fixture fixture;
+    fixture.selection = successful_selection(
+        *fixture.current, {ReplicaID{6}});
+    REQUIRE(fixture.selection.eligible_roots ==
+            std::vector<ReplicaID>{0, 1, 2, 3, 4});
+    const auto outside_top_q = std::find_if(
+        fixture.selection.snapshot->ranking().begin(),
+        fixture.selection.snapshot->ranking().end(),
+        [](const auto &entry) { return entry.replica_id == 5; });
+    REQUIRE(outside_top_q !=
+            fixture.selection.snapshot->ranking().end());
+    REQUIRE(outside_top_q->rank >=
+            fixture.selection.metadata.quorum);
+    REQUIRE(outside_top_q->classification ==
+            ResponsivenessClass::responsive);
+    REQUIRE(outside_top_q->eligible);
+
+    hotstuff::AdaptiveV2TransitionPolicy policy;
+    policy.intent = TreePolicyKind::fault_containment;
+    policy.containment_baseline_roots = {
+        BaselineRoot{0, 0},
+        BaselineRoot{1, 1},
+        BaselineRoot{2, 2},
+        BaselineRoot{3, 3},
+        BaselineRoot{4, 5}};
+    const auto result = hotstuff::build_adaptive_v2_successor_bundle(
+        *fixture.current,
+        fixture.selection,
+        policy,
+        fixture.placement,
+        5,
+        kIssuerId,
+        fixture.key,
+        fixture.limits);
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    CHECK(bundle_roots(*result.bundle) ==
+          std::vector<ReplicaID>{0, 1, 2, 3, 5});
+    CHECK(result.bundle->definition().trees.size() ==
+          fixture.selection.metadata.quorum);
+    for (const auto &candidate : result.bundle->definition().trees)
+    {
+        CHECK(candidate.wait_exempt_leaves ==
+              std::vector<ReplicaID>{6});
+    }
+}
+
+TEST_CASE(
     "factory bundle round trips without changing membership or identity",
     "[adaptive-v2][epoch-factory][bundle][roundtrip]")
 {
@@ -756,8 +846,8 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "factory accepts consensus-inherited constraints only for optimization",
-    "[adaptive-v2][epoch-factory][inheritance][optimization][n7]")
+    "factory accepts exact consensus-inherited constraints for either intent",
+    "[adaptive-v2][epoch-factory][inheritance][recurring][n7]")
 {
     InheritedFixture fixture;
     const auto result = fixture.build();
@@ -777,11 +867,18 @@ TEST_CASE(
               std::vector<ReplicaID>{0, 1});
     }
 
-    const auto rejected_containment =
+    const auto recurring_containment =
         fixture.build(TreePolicyKind::fault_containment);
-    CHECK(rejected_containment.status ==
-          AdaptiveV2EpochFactoryStatus::invalid_selection);
-    CHECK(rejected_containment.bundle == nullptr);
+    REQUIRE(recurring_containment);
+    REQUIRE(recurring_containment.bundle != nullptr);
+    CHECK(bundle_roots(*recurring_containment.bundle) ==
+          std::vector<ReplicaID>{2, 3, 4, 5, 6});
+    for (const auto &candidate :
+         recurring_containment.bundle->definition().trees)
+    {
+        CHECK(candidate.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+    }
 }
 
 TEST_CASE(

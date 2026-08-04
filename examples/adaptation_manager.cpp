@@ -133,6 +133,7 @@ struct ExperimentBundleAttempt
 struct TransitionRequest
 {
     AdaptiveV2TransitionPolicy policy;
+    bool resolve_containment_roots_from_predecessor{false};
     std::string evidence_window_rule;
     std::string transition_artifact_id;
     std::string declared_bundle_path;
@@ -140,6 +141,7 @@ struct TransitionRequest
     std::uint32_t predecessor_epoch_number{0};
     std::uint32_t successor_epoch_number{0};
     std::uint32_t minimum_predecessor_residency_ms{0};
+    std::uint32_t minimum_post_baseline_observation_ms{0};
     std::string bundle_output;
     std::string evidence_snapshot_output;
 };
@@ -150,6 +152,7 @@ struct CycleAuditContext
     std::uint64_t activation_generation{0};
     std::uint64_t baseline_evidence_cutoff{0};
     std::uint64_t current_evidence_cutoff{0};
+    bool shape_decision_emitted{false};
     bool evidence_snapshot_emitted{false};
 };
 
@@ -162,11 +165,24 @@ struct ManagerOptions
     std::vector<ReplicaEndpoint> replicas;
     std::vector<ReplicaID> membership;
     AdaptiveV2ManagerRuntimeShape runtime_shape;
+    std::uint32_t required_nonresponsive{0};
     hotstuff::EpochChangeIssuerId issuer_id{0};
     PrivKeySecp256k1 issuer_private_key;
     std::uint64_t activation_delay_blocks{5};
     std::uint64_t convergence_deadline_ticks{
         kConvergenceDefaultDeadlineTicks};
+    hotstuff::AdaptationPolicy responsiveness_policy{
+        hotstuff::kAdaptationSchemaVersion,
+        "adaptive-v2-controller-responsiveness-v1",
+        32,
+        2,
+        750'000,
+        250'000,
+        2,
+        5'000};
+    std::vector<std::uint32_t> shape_candidate_fanouts{2, 3, 5};
+    std::uint64_t shape_deterministic_seed{kSnapshotSeed};
+    bool shape_adaptation_enabled{false};
     std::vector<TransitionRequest> transition_requests;
     std::string structured_event_run_id;
     std::string structured_event_source_instance;
@@ -209,10 +225,13 @@ public:
     TransitionJsonParser(
         const std::string &text,
         std::uint32_t replica_count,
-        std::uint32_t tree_count)
+        std::uint32_t tree_count,
+        bool default_apply_shape_selection)
         : text_(text),
           replica_count_(replica_count),
-          tree_count_(tree_count)
+          tree_count_(tree_count),
+          default_apply_shape_selection_(
+              default_apply_shape_selection)
     {
         if (text_.empty() ||
             text_.size() > kMaximumTransitionRequestBytes)
@@ -233,6 +252,10 @@ public:
         std::optional<std::uint32_t> predecessor_epoch_number;
         std::optional<std::uint32_t> successor_epoch_number;
         std::optional<std::uint32_t> minimum_predecessor_residency_ms;
+        std::optional<std::uint32_t>
+            minimum_post_baseline_observation_ms;
+        std::optional<bool> apply_shape_selection;
+        std::optional<std::string> containment_baseline_root_source;
         std::optional<std::vector<hotstuff::BaselineRoot>> baseline_roots;
 
         expect('{');
@@ -268,6 +291,25 @@ public:
                 assign_once(
                     minimum_predecessor_residency_ms,
                     parse_u32(),
+                    key);
+            }
+            else if (key == "minimum_post_baseline_observation_ms")
+            {
+                assign_once(
+                    minimum_post_baseline_observation_ms,
+                    parse_u32(),
+                    key);
+            }
+            else if (key == "apply_shape_selection")
+            {
+                assign_once(
+                    apply_shape_selection, parse_bool(), key);
+            }
+            else if (key == "containment_baseline_root_source")
+            {
+                assign_once(
+                    containment_baseline_root_source,
+                    parse_string(),
                     key);
             }
             else if (key == "policy_parameters")
@@ -323,6 +365,12 @@ public:
         {
             fail("minimum_predecessor_residency_ms exceeds bound");
         }
+        if (minimum_post_baseline_observation_ms.value_or(0) >
+            kMaximumPredecessorResidencyMs)
+        {
+            fail(
+                "minimum_post_baseline_observation_ms exceeds bound");
+        }
 
         const auto artifact_prefix =
             std::string{"transitions/"} +
@@ -336,20 +384,40 @@ public:
 
         if (*policy_intent == "fault_containment")
         {
-            validate_containment_roots(*baseline_roots);
             request.policy.intent = TreePolicyKind::fault_containment;
-            request.policy.containment_baseline_roots =
-                std::move(*baseline_roots);
+            if (containment_baseline_root_source.has_value())
+            {
+                if (*containment_baseline_root_source !=
+                        "live_predecessor_roots" ||
+                    !baseline_roots->empty())
+                {
+                    fail("unsupported containment baseline root source");
+                }
+                request.resolve_containment_roots_from_predecessor = true;
+            }
+            else
+            {
+                validate_containment_roots(*baseline_roots);
+                request.policy.containment_baseline_roots =
+                    std::move(*baseline_roots);
+            }
         }
         else if (*policy_intent == "performance_optimization")
         {
-            if (!baseline_roots->empty())
+            if (!baseline_roots->empty() ||
+                containment_baseline_root_source.has_value())
+            {
                 fail("optimization policy parameters must be empty");
+            }
             request.policy.intent =
                 TreePolicyKind::performance_optimization;
         }
         else
             fail("unsupported policy_intent");
+
+        request.policy.apply_shape_selection =
+            apply_shape_selection.value_or(
+                default_apply_shape_selection_);
 
         request.evidence_window_rule =
             std::move(*evidence_window_rule);
@@ -363,6 +431,8 @@ public:
         request.successor_epoch_number = *successor_epoch_number;
         request.minimum_predecessor_residency_ms =
             *minimum_predecessor_residency_ms;
+        request.minimum_post_baseline_observation_ms =
+            minimum_post_baseline_observation_ms.value_or(0);
         return request;
     }
 
@@ -488,6 +558,22 @@ private:
             "transition request integer", false);
     }
 
+    bool parse_bool()
+    {
+        skip_whitespace();
+        if (text_.compare(position_, 4, "true") == 0)
+        {
+            position_ += 4;
+            return true;
+        }
+        if (text_.compare(position_, 5, "false") == 0)
+        {
+            position_ += 5;
+            return false;
+        }
+        fail("expected boolean");
+    }
+
     std::vector<hotstuff::BaselineRoot> parse_policy_parameters()
     {
         std::vector<hotstuff::BaselineRoot> roots;
@@ -578,17 +664,20 @@ private:
     const std::string &text_;
     std::uint32_t replica_count_{0};
     std::uint32_t tree_count_{0};
+    bool default_apply_shape_selection_{false};
     std::size_t position_{0};
 };
 
 TransitionRequest parse_transition_request(
     const std::string &text,
-    const AdaptiveV2ManagerRuntimeShape &runtime_shape)
+    const AdaptiveV2ManagerRuntimeShape &runtime_shape,
+    bool default_apply_shape_selection)
 {
     return TransitionJsonParser(
         text,
         runtime_shape.quorum.replica_count,
-        runtime_shape.tree_shape.tree_count)
+        runtime_shape.tree_shape.tree_count,
+        default_apply_shape_selection)
         .parse();
 }
 
@@ -617,6 +706,44 @@ ExperimentBundleAttempt parse_experiment_bundle_attempt(
             "experiment bundle attempt is outside convergence bounds");
     }
     return {static_cast<ReplicaID>(recipient), attempt};
+}
+
+std::vector<std::uint32_t> parse_shape_candidate_fanouts(
+    const std::string &text)
+{
+    if (text.empty() || text.back() == ',')
+    {
+        throw std::invalid_argument(
+            "shape candidate fanouts must use canonical CSV");
+    }
+    std::vector<std::uint32_t> fanouts;
+    std::set<std::uint32_t> unique;
+    std::size_t begin = 0;
+    while (begin < text.size())
+    {
+        const auto separator = text.find(',', begin);
+        const auto end = separator == std::string::npos
+            ? text.size()
+            : separator;
+        const auto fanout = parse_unsigned<std::uint32_t>(
+            text.substr(begin, end - begin),
+            "shape candidate fanout", true);
+        if (fanout > 255 || !unique.insert(fanout).second)
+        {
+            throw std::invalid_argument(
+                "shape candidate fanouts must be unique uint8 values");
+        }
+        fanouts.push_back(fanout);
+        if (separator == std::string::npos)
+            break;
+        begin = separator + 1;
+    }
+    if (fanouts.empty() || fanouts.size() > 255)
+    {
+        throw std::invalid_argument(
+            "shape candidate fanouts must be nonempty and bounded");
+    }
+    return fanouts;
 }
 
 bytearray_t parse_hex(
@@ -687,24 +814,15 @@ AdaptiveV2ManagerControllerConfig manager_controller_config(
 {
     AdaptiveV2ManagerControllerConfig config;
     config.selection.required_nonresponsive =
-        options.runtime_shape.required_nonresponsive;
+        options.required_nonresponsive;
     config.selection.minimum_score_drop =
         options.runtime_shape.minimum_score_drop;
     config.selection.minimum_timeouts_per_reporter =
         kTimeoutsPerReporter;
     config.selection.maximum_post_baseline_timeout_attempts =
         options.runtime_shape.maximum_post_baseline_timeout_attempts;
-    config.selection.responsiveness_policy.policy_version =
-        "adaptive-v2-controller-responsiveness-v1";
-    config.selection.responsiveness_policy.attempt_window = 32;
-    config.selection.responsiveness_policy.minimum_attempts = 2;
-    config.selection.responsiveness_policy.minimum_response_rate_ppm =
-        750'000;
-    config.selection.responsiveness_policy.maximum_timeout_rate_ppm =
-        250'000;
-    config.selection.responsiveness_policy.trailing_timeout_streak = 2;
-    config.selection.responsiveness_policy
-        .latency_percentile_basis_points = 5'000;
+    config.selection.responsiveness_policy =
+        options.responsiveness_policy;
     config.selection.snapshot_seed = kSnapshotSeed;
     config.reputation_limits.maximum_audit_updates =
         options.runtime_shape.ingress_limits.evidence_store
@@ -718,6 +836,14 @@ AdaptiveV2ManagerControllerConfig manager_controller_config(
     config.issuer_id = options.issuer_id;
     config.issuer_private_key = options.issuer_private_key;
     config.bundle_limits = options.runtime_shape.bundle_limits;
+    config.shape_selection.candidate_fanouts =
+        options.shape_candidate_fanouts;
+    config.shape_selection.fixed_pipeline_stretch =
+        options.runtime_shape.tree_shape.pipeline_stretch;
+    config.shape_selection.deterministic_seed =
+        options.shape_deterministic_seed;
+    config.shape_adaptation_enabled =
+        options.shape_adaptation_enabled;
     return config;
 }
 
@@ -1023,8 +1149,30 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_activation_delay = Config::OptValStr::create("5");
     auto opt_convergence_deadline_seconds =
         Config::OptValStr::create("12");
+    auto opt_required_nonresponsive = Config::OptValStr::create();
+    auto opt_responsiveness_policy_version =
+        Config::OptValStr::create(
+            "adaptive-v2-controller-responsiveness-v1");
+    auto opt_responsiveness_attempt_window =
+        Config::OptValStr::create("32");
+    auto opt_responsiveness_minimum_attempts =
+        Config::OptValStr::create("2");
+    auto opt_responsiveness_minimum_response_rate_ppm =
+        Config::OptValStr::create("750000");
+    auto opt_responsiveness_maximum_timeout_rate_ppm =
+        Config::OptValStr::create("250000");
+    auto opt_responsiveness_trailing_timeout_streak =
+        Config::OptValStr::create("2");
+    auto opt_responsiveness_latency_percentile_basis_points =
+        Config::OptValStr::create("5000");
     auto opt_tree_fanout = Config::OptValStr::create("2");
     auto opt_pipeline_stretch = Config::OptValStr::create("2");
+    auto opt_shape_candidate_fanouts =
+        Config::OptValStr::create("2,3,5");
+    auto opt_shape_deterministic_seed =
+        Config::OptValStr::create("41719");
+    auto opt_shape_adaptation_enabled =
+        Config::OptValFlag::create(false);
     auto opt_transition_requests = Config::OptValStrVec::create();
     auto opt_bundle_outputs = Config::OptValStrVec::create();
     auto opt_structured_event_run_id = Config::OptValStr::create();
@@ -1052,9 +1200,53 @@ ManagerOptions parse_options(int argc, char **argv)
         opt_convergence_deadline_seconds,
         Config::SET_VAL);
     config.add_opt(
+        "required-nonresponsive",
+        opt_required_nonresponsive,
+        Config::SET_VAL);
+    config.add_opt(
+        "responsiveness-policy-version",
+        opt_responsiveness_policy_version,
+        Config::SET_VAL);
+    config.add_opt(
+        "responsiveness-attempt-window",
+        opt_responsiveness_attempt_window,
+        Config::SET_VAL);
+    config.add_opt(
+        "responsiveness-minimum-attempts",
+        opt_responsiveness_minimum_attempts,
+        Config::SET_VAL);
+    config.add_opt(
+        "responsiveness-minimum-response-rate-ppm",
+        opt_responsiveness_minimum_response_rate_ppm,
+        Config::SET_VAL);
+    config.add_opt(
+        "responsiveness-maximum-timeout-rate-ppm",
+        opt_responsiveness_maximum_timeout_rate_ppm,
+        Config::SET_VAL);
+    config.add_opt(
+        "responsiveness-trailing-timeout-streak",
+        opt_responsiveness_trailing_timeout_streak,
+        Config::SET_VAL);
+    config.add_opt(
+        "responsiveness-latency-percentile-basis-points",
+        opt_responsiveness_latency_percentile_basis_points,
+        Config::SET_VAL);
+    config.add_opt(
         "tree-fanout", opt_tree_fanout, Config::SET_VAL);
     config.add_opt(
         "pipeline-stretch", opt_pipeline_stretch, Config::SET_VAL);
+    config.add_opt(
+        "shape-candidate-fanouts",
+        opt_shape_candidate_fanouts,
+        Config::SET_VAL);
+    config.add_opt(
+        "shape-deterministic-seed",
+        opt_shape_deterministic_seed,
+        Config::SET_VAL);
+    config.add_opt(
+        "shape-adaptation-enabled",
+        opt_shape_adaptation_enabled,
+        Config::SWITCH_ON);
     config.add_opt(
         "transition-request", opt_transition_requests, Config::APPEND);
     config.add_opt(
@@ -1126,6 +1318,60 @@ ManagerOptions parse_options(int argc, char **argv)
     options.convergence_deadline_ticks =
         convergence_deadline_seconds * kConvergenceTicksPerSecond;
 
+    options.responsiveness_policy.policy_version =
+        opt_responsiveness_policy_version->get();
+    options.responsiveness_policy.attempt_window =
+        parse_unsigned<std::uint32_t>(
+            opt_responsiveness_attempt_window->get(),
+            "responsiveness attempt window",
+            true);
+    options.responsiveness_policy.minimum_attempts =
+        parse_unsigned<std::uint32_t>(
+            opt_responsiveness_minimum_attempts->get(),
+            "responsiveness minimum attempts",
+            true);
+    options.responsiveness_policy.minimum_response_rate_ppm =
+        parse_unsigned<hotstuff::RatePpm>(
+            opt_responsiveness_minimum_response_rate_ppm->get(),
+            "responsiveness minimum response rate ppm",
+            false);
+    options.responsiveness_policy.maximum_timeout_rate_ppm =
+        parse_unsigned<hotstuff::RatePpm>(
+            opt_responsiveness_maximum_timeout_rate_ppm->get(),
+            "responsiveness maximum timeout rate ppm",
+            false);
+    options.responsiveness_policy.trailing_timeout_streak =
+        parse_unsigned<std::uint32_t>(
+            opt_responsiveness_trailing_timeout_streak->get(),
+            "responsiveness trailing timeout streak",
+            true);
+    options.responsiveness_policy.latency_percentile_basis_points =
+        parse_unsigned<std::uint16_t>(
+            opt_responsiveness_latency_percentile_basis_points->get(),
+            "responsiveness latency percentile basis points",
+            true);
+    const auto &responsiveness = options.responsiveness_policy;
+    if (responsiveness.policy_version.empty() ||
+        responsiveness.policy_version.size() >
+            hotstuff::kMaximumAdaptationPolicyVersionBytes ||
+        responsiveness.attempt_window >
+            hotstuff::kMaximumAdaptationAttemptWindow ||
+        responsiveness.minimum_attempts >
+            responsiveness.attempt_window ||
+        responsiveness.trailing_timeout_streak < 2 ||
+        responsiveness.trailing_timeout_streak >
+            responsiveness.attempt_window ||
+        responsiveness.minimum_response_rate_ppm >
+            hotstuff::kRatePpmScale ||
+        responsiveness.maximum_timeout_rate_ppm >
+            hotstuff::kRatePpmScale ||
+        responsiveness.latency_percentile_basis_points >
+            hotstuff::kPercentileBasisPointScale)
+    {
+        throw std::invalid_argument(
+            "responsiveness policy values are out of bounds");
+    }
+
     for (const auto &raw : opt_replicas->get())
         options.replicas.push_back(parse_replica_endpoint(raw));
     std::sort(
@@ -1169,6 +1415,35 @@ ManagerOptions parse_options(int argc, char **argv)
             "replicas and topology must define a bounded contiguous N=3f+1 adaptive-v2 manager shape");
     }
     options.runtime_shape = *runtime_shape;
+    options.required_nonresponsive =
+        opt_required_nonresponsive->get().empty()
+            ? options.runtime_shape.required_nonresponsive
+            : parse_unsigned<std::uint32_t>(
+                  opt_required_nonresponsive->get(),
+                  "required nonresponsive", true);
+    if (options.required_nonresponsive >
+        options.runtime_shape.quorum.fault_threshold)
+    {
+        throw std::invalid_argument(
+            "required nonresponsive must not exceed the derived fault threshold");
+    }
+    options.shape_candidate_fanouts =
+        parse_shape_candidate_fanouts(
+            opt_shape_candidate_fanouts->get());
+    options.shape_deterministic_seed =
+        parse_unsigned<std::uint64_t>(
+            opt_shape_deterministic_seed->get(),
+            "shape deterministic seed", false);
+    if (std::find(
+            options.shape_candidate_fanouts.begin(),
+            options.shape_candidate_fanouts.end(),
+            tree_fanout) == options.shape_candidate_fanouts.end())
+    {
+        throw std::invalid_argument(
+            "shape candidate fanouts must contain the initial fanout");
+    }
+    options.shape_adaptation_enabled =
+        opt_shape_adaptation_enabled->get();
 
     const auto &raw_transition_requests =
         opt_transition_requests->get();
@@ -1189,7 +1464,9 @@ ManagerOptions parse_options(int argc, char **argv)
          ++index)
     {
         auto request = parse_transition_request(
-            raw_transition_requests[index], options.runtime_shape);
+            raw_transition_requests[index],
+            options.runtime_shape,
+            options.shape_adaptation_enabled);
         request.bundle_output = bundle_outputs[index];
         if (request.bundle_output.size() >=
             request.declared_bundle_path.size())
@@ -1365,6 +1642,11 @@ public:
             event_context_,
             [this](salticidae::TimerEvent &) {
                 handle_predecessor_residency_timer();
+            });
+        post_baseline_observation_timer = salticidae::TimerEvent(
+            event_context_,
+            [this](salticidae::TimerEvent &) {
+                handle_post_baseline_observation_timer();
             });
         evaluation_timer = salticidae::TimerEvent(
             event_context_,
@@ -1593,18 +1875,22 @@ private:
     }
 
     bool transition_policy_matches_current_roots(
-        const TransitionRequest &request) const noexcept
+        const AdaptiveV2TransitionPolicy &policy) const noexcept
     {
-        if (request.policy.intent !=
+        if (policy.intent !=
             TreePolicyKind::fault_containment)
         {
-            return request.policy.containment_baseline_roots.empty();
+            return policy.containment_baseline_roots.empty();
         }
 
         const auto &trees =
             session_.ingress().current_epoch().trees();
-        for (const auto &root :
-             request.policy.containment_baseline_roots)
+        if (policy.containment_baseline_roots.size() !=
+            options_.runtime_shape.tree_shape.tree_count)
+        {
+            return false;
+        }
+        for (const auto &root : policy.containment_baseline_roots)
         {
             const auto tree = std::find_if(
                 trees.begin(), trees.end(),
@@ -1622,13 +1908,67 @@ private:
         return true;
     }
 
-    bool add_cycle_audit_context() noexcept
+    std::optional<AdaptiveV2TransitionPolicy>
+    resolved_transition_policy(
+        const TransitionRequest &request) const noexcept
     {
-        const auto *request = current_transition_request();
-        if (request == nullptr ||
-            request->predecessor_epoch_number !=
-                session_.ingress().current_epoch().epoch_number() ||
-            !transition_policy_matches_current_roots(*request))
+        try
+        {
+            auto resolved = request.policy;
+            if (request.resolve_containment_roots_from_predecessor)
+            {
+                if (resolved.intent != TreePolicyKind::fault_containment ||
+                    !resolved.containment_baseline_roots.empty())
+                {
+                    return std::nullopt;
+                }
+                const auto tree_count =
+                    options_.runtime_shape.tree_shape.tree_count;
+                std::vector<std::optional<ReplicaID>> roots(tree_count);
+                for (const auto &tree :
+                     session_.ingress().current_epoch().trees())
+                {
+                    if (tree.tree_id >= tree_count)
+                        continue;
+                    if (tree.members_breadth_first.empty() ||
+                        roots[tree.tree_id].has_value())
+                    {
+                        return std::nullopt;
+                    }
+                    roots[tree.tree_id] =
+                        tree.members_breadth_first.front();
+                }
+                std::set<ReplicaID> unique_roots;
+                for (std::uint32_t tree_id = 0;
+                     tree_id < tree_count;
+                     ++tree_id)
+                {
+                    if (!roots[tree_id].has_value() ||
+                        !unique_roots.insert(*roots[tree_id]).second)
+                    {
+                        return std::nullopt;
+                    }
+                    resolved.containment_baseline_roots.push_back(
+                        hotstuff::BaselineRoot{
+                            tree_id, *roots[tree_id]});
+                }
+            }
+            return transition_policy_matches_current_roots(resolved)
+                ? std::optional<AdaptiveV2TransitionPolicy>{
+                      std::move(resolved)}
+                : std::nullopt;
+        }
+        catch (...)
+        {
+            return std::nullopt;
+        }
+    }
+
+    bool add_cycle_audit_context(
+        const TransitionRequest &request) noexcept
+    {
+        if (request.predecessor_epoch_number !=
+            session_.ingress().current_epoch().epoch_number())
         {
             return false;
         }
@@ -1639,7 +1979,7 @@ private:
             if (activation_generation == 0)
                 return false;
             cycle_audits_.push_back(CycleAuditContext{
-                request->transition_artifact_id,
+                request.transition_artifact_id,
                 activation_generation,
                 0,
                 0});
@@ -1656,8 +1996,17 @@ private:
         cancel_pending_evaluation();
         last_evaluated_ready_members_.reset();
         last_evaluated_evidence_cutoff_.reset();
-        const auto *policy = request_sequence_.current_policy();
-        if (policy == nullptr || !add_cycle_audit_context())
+        const auto *request = current_transition_request();
+        const auto *sequence_policy = request_sequence_.current_policy();
+        if (request == nullptr || sequence_policy == nullptr ||
+            sequence_policy->intent != request->policy.intent ||
+            sequence_policy->apply_shape_selection !=
+                request->policy.apply_shape_selection)
+        {
+            return false;
+        }
+        auto policy = resolved_transition_policy(*request);
+        if (!policy.has_value() || !add_cycle_audit_context(*request))
             return false;
         if (!session_.begin_cycle(*policy))
         {
@@ -1669,6 +2018,75 @@ private:
         convergence_failure_emitted_ = false;
         refresh_cycle_audit();
         return true;
+    }
+
+    bool schedule_post_baseline_observation(
+        const TransitionRequest &request) noexcept
+    {
+        if (post_baseline_observation_pending_)
+            return false;
+        const auto audit = session_.controller_audit();
+        if (!audit.has_value() || !audit->baseline_frozen)
+            return false;
+        if (request.minimum_post_baseline_observation_ms == 0)
+        {
+            schedule_post_baseline_evaluation();
+            return true;
+        }
+
+        try
+        {
+            post_baseline_observation_deadline_ =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(
+                    request.minimum_post_baseline_observation_ms);
+            post_baseline_observation_pending_ = true;
+            post_baseline_observation_timer.add(
+                static_cast<double>(
+                    request.minimum_post_baseline_observation_ms) /
+                1000.0);
+            return true;
+        }
+        catch (...)
+        {
+            post_baseline_observation_pending_ = false;
+            post_baseline_observation_timer.del();
+            return false;
+        }
+    }
+
+    void schedule_post_baseline_evaluation() noexcept
+    {
+        last_evaluated_ready_members_.reset();
+        last_evaluated_evidence_cutoff_.reset();
+        schedule_evaluation();
+    }
+
+    void handle_post_baseline_observation_timer() noexcept
+    {
+        if (!post_baseline_observation_pending_ || failed_)
+            return;
+
+        try
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < post_baseline_observation_deadline_)
+            {
+                post_baseline_observation_timer.add(
+                    std::chrono::duration<double>(
+                        post_baseline_observation_deadline_ - now)
+                        .count());
+                return;
+            }
+
+            post_baseline_observation_pending_ = false;
+            evaluate();
+        }
+        catch (...)
+        {
+            post_baseline_observation_pending_ = false;
+            fail("post_baseline_observation_timer_failed");
+        }
     }
 
     bool schedule_current_predecessor_residency() noexcept
@@ -1749,6 +2167,66 @@ private:
             audit->baseline_cutoff;
         cycle_audits_.back().current_evidence_cutoff =
             audit->current_cutoff;
+    }
+
+    void emit_shape_decision(
+        const TransitionRequest &request,
+        const hotstuff::AdaptiveV2EpochChangeBundle &bundle)
+    {
+        if (cycle_audits_.empty() ||
+            request_sequence_.cursor() != cycle_audits_.size() - 1)
+        {
+            throw std::logic_error(
+                "shape decision has no exact cycle audit context");
+        }
+
+        auto &cycle = cycle_audits_.back();
+        const auto controller = session_.controller_audit();
+        if (cycle.shape_decision_emitted ||
+            cycle.transition_artifact_id !=
+                request.transition_artifact_id ||
+            !controller.has_value() ||
+            !controller->shape_decision.has_value())
+        {
+            throw std::logic_error(
+                "shape decision was duplicated, absent, or rebound");
+        }
+
+        const auto &decision = *controller->shape_decision;
+        const auto &predecessor = session_.ingress().current_epoch();
+        const auto &successor = bundle.definition();
+        if (decision.epoch_number != predecessor.epoch_number() ||
+            decision.epoch_digest != predecessor.epoch_digest() ||
+            decision.evidence_cutoff != cycle.current_evidence_cutoff ||
+            decision.predecessor_tree_count !=
+                predecessor.trees().size() ||
+            decision.tree_count != successor.trees.size() ||
+            !std::all_of(
+                successor.trees.begin(), successor.trees.end(),
+                [&decision](const auto &tree) {
+                    return tree.fanout == decision.applied_fanout &&
+                        tree.pipeline_stretch ==
+                            decision.fixed_pipeline_stretch;
+                }))
+        {
+            throw std::logic_error(
+                "shape decision does not bind the successor topology");
+        }
+
+        hotstuff::AdaptiveV2ShapeDecisionStructuredEvent event;
+        event.cycle_ordinal = request_sequence_.cursor();
+        event.transition_artifact_id =
+            request.transition_artifact_id;
+        event.decision = decision;
+        structured_event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{std::move(event)});
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+        {
+            throw std::runtime_error(
+                "shape decision audit drain failed");
+        }
+        cycle.shape_decision_emitted = true;
     }
 
     void emit_evidence_snapshot(
@@ -1958,6 +2436,7 @@ private:
     void fail(const char *reason) noexcept
     {
         cancel_pending_evaluation();
+        cancel_post_baseline_observation();
         const auto convergence = session_.convergence_status();
         if (convergence.has_value() && !convergence_failure_emitted_)
         {
@@ -1988,6 +2467,7 @@ private:
         convergence_ack_drain_timer.del();
         predecessor_residency_timer.del();
         predecessor_residency_pending_ = false;
+        cancel_post_baseline_observation();
         if (network_stop_required_ && !network_stopped_)
         {
             network_stopped_ = true;
@@ -2097,10 +2577,17 @@ private:
         evaluation_timer_pending_ = false;
     }
 
+    void cancel_post_baseline_observation() noexcept
+    {
+        post_baseline_observation_timer.del();
+        post_baseline_observation_pending_ = false;
+    }
+
     void schedule_evaluation() noexcept
     {
         if (failed_ || request_sequence_.shutdown_eligible() ||
             predecessor_residency_pending_ ||
+            post_baseline_observation_pending_ ||
             session_.convergence_status().has_value() ||
             evaluation_timer_pending_)
         {
@@ -2149,7 +2636,8 @@ private:
     void evaluate()
     {
         if (failed_ || request_sequence_.shutdown_eligible() ||
-            predecessor_residency_pending_)
+            predecessor_residency_pending_ ||
+            post_baseline_observation_pending_)
             return;
         if (session_.convergence_status().has_value())
         {
@@ -2181,6 +2669,17 @@ private:
             fail("controller_unhealthy");
             return;
         }
+        if (status ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen)
+        {
+            const auto *request = current_transition_request();
+            if (request == nullptr ||
+                !schedule_post_baseline_observation(*request))
+            {
+                fail("post_baseline_observation_schedule_failed");
+            }
+            return;
+        }
         if (status != AdaptiveV2ManagerControllerStatus::successor_ready &&
             status != AdaptiveV2ManagerControllerStatus::already_ready)
             return;
@@ -2199,6 +2698,7 @@ private:
                 *request, *bundle, session_);
             write_exclusive_bundle(
                 output_path, bundle->canonical_bytes());
+            emit_shape_decision(*request, *bundle);
             emit_evidence_snapshot(*request, *bundle);
             if (!session_.start_convergence(convergence_tick_))
                 throw std::runtime_error(
@@ -2950,9 +3450,12 @@ private:
     salticidae::TimerEvent convergence_timer;
     salticidae::TimerEvent convergence_ack_drain_timer;
     salticidae::TimerEvent predecessor_residency_timer;
+    salticidae::TimerEvent post_baseline_observation_timer;
     salticidae::TimerEvent evaluation_timer;
     std::chrono::steady_clock::time_point
         predecessor_residency_deadline_{};
+    std::chrono::steady_clock::time_point
+        post_baseline_observation_deadline_{};
     std::uint64_t convergence_tick_{0};
     std::optional<std::size_t> last_evaluated_ready_members_;
     std::optional<std::uint64_t> last_evaluated_evidence_cutoff_;
@@ -2966,6 +3469,7 @@ private:
     bool session_stopped_{false};
     bool convergence_failure_emitted_{false};
     bool predecessor_residency_pending_{false};
+    bool post_baseline_observation_pending_{false};
     bool evaluation_timer_pending_{false};
     bool experiment_bundle_drop_consumed_{false};
     bool experiment_activation_ack_drop_consumed_{false};

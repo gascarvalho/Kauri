@@ -11,6 +11,7 @@
 
 #include "hotstuff/adaptive_v2_epoch_factory.h"
 #include "hotstuff/adaptive_v2_manager_ingress.h"
+#include "hotstuff/adaptive_v2_shape_selection.h"
 
 namespace hotstuff
 {
@@ -26,6 +27,8 @@ struct AdaptiveV2ManagerControllerConfig
     EpochChangeBundleLimits bundle_limits;
     // Keep new defaulted fields after the original positional aggregate shape.
     AdaptiveV2TransitionPolicy transition_policy;
+    ShapeV1Config shape_selection;
+    bool shape_adaptation_enabled{false};
 };
 
 enum class AdaptiveV2ManagerControllerStatus : std::uint8_t
@@ -72,6 +75,7 @@ public:
     const std::vector<EvidenceReputationAuditUpdate> &
     score_trajectory() const noexcept;
     const AdaptiveV2EpochChangeBundle *successor_bundle() const noexcept;
+    const ShapeDecisionRecord *shape_decision() const noexcept;
 
     std::uint64_t baseline_cutoff() const noexcept;
     std::uint64_t current_cutoff() const noexcept;

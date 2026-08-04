@@ -27,6 +27,8 @@ struct AdaptiveV2TransitionPolicy
 {
     TreePolicyKind intent{TreePolicyKind::performance_optimization};
     std::vector<BaselineRoot> containment_baseline_roots;
+    /** Apply the already-audited shape-v1 choice for this transition only. */
+    bool apply_shape_selection{false};
 };
 
 enum class AdaptiveV2EpochFactoryStatus : std::uint8_t

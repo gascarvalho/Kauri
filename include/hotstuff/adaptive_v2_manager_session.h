@@ -79,7 +79,9 @@ struct AdaptiveV2ManagerControllerAuditSnapshot
 {
     std::uint64_t baseline_cutoff{0};
     std::uint64_t current_cutoff{0};
+    bool baseline_frozen{false};
     std::vector<EvidenceReputationAuditUpdate> score_trajectory;
+    std::optional<ShapeDecisionRecord> shape_decision;
 };
 
 struct AdaptiveV2ManagerConvergenceAuditSnapshot

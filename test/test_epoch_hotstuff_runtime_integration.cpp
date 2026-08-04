@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -192,6 +193,49 @@ EpochDefinitionInput rooted_epoch_v2_input(
             2,
             2,
             std::move(members)});
+    }
+    input.epoch_digest.reset();
+    return input;
+}
+
+EpochDefinitionInput shaped_epoch_v2_input(
+    std::uint32_t epoch_number,
+    const std::vector<ReplicaID> &roots,
+    std::uint32_t fanout,
+    std::uint32_t pipeline_stretch,
+    const std::vector<ReplicaID> &wait_exempt,
+    const uint256_t &previous = {})
+{
+    auto input = epoch_v2_input(epoch_number, previous);
+    std::set<ReplicaID> optional(
+        wait_exempt.begin(), wait_exempt.end());
+    if (optional.size() != wait_exempt.size())
+        throw std::logic_error("fixture wait-exempt set is duplicated");
+
+    input.trees.clear();
+    for (std::size_t index = 0; index < roots.size(); ++index)
+    {
+        std::vector<ReplicaID> members;
+        members.push_back(roots[index]);
+        for (const auto replica : membership())
+        {
+            if (replica != roots[index] && optional.count(replica) == 0)
+                members.push_back(replica);
+        }
+        members.insert(
+            members.end(), wait_exempt.begin(), wait_exempt.end());
+        if (members.size() != membership().size() ||
+            optional.count(roots[index]) != 0)
+        {
+            throw std::logic_error(
+                "fixture root/wait-exempt membership is invalid");
+        }
+        input.trees.push_back(EpochTreeDefinition{
+            static_cast<std::uint32_t>(index),
+            fanout,
+            pipeline_stretch,
+            std::move(members),
+            wait_exempt});
     }
     input.epoch_digest.reset();
     return input;
@@ -540,12 +584,18 @@ struct V2Harness
     static const EpochDefinition &stage_successor(
         EpochStore &store,
         const EpochDefinition &active,
-        const std::vector<ReplicaID> &successor_roots)
+        const std::vector<ReplicaID> &successor_roots,
+        std::uint32_t successor_fanout,
+        std::uint32_t successor_pipeline_stretch,
+        const std::vector<ReplicaID> &successor_wait_exempt)
     {
         const auto staged = store.stage_available_v2(
-            rooted_epoch_v2_input(
+            shaped_epoch_v2_input(
                 active.epoch_number() + 1,
                 successor_roots,
+                successor_fanout,
+                successor_pipeline_stretch,
+                successor_wait_exempt,
                 active.epoch_digest()),
             active);
         if (staged.definition == nullptr)
@@ -572,9 +622,18 @@ struct V2Harness
 
     explicit V2Harness(
         EpochDefinitionInput initial = epoch_v2_input(0),
-        std::vector<ReplicaID> successor_roots = {2, 3})
+        std::vector<ReplicaID> successor_roots = {2, 3},
+        std::uint32_t successor_fanout = 2,
+        std::uint32_t successor_pipeline_stretch = 2,
+        std::vector<ReplicaID> successor_wait_exempt = {})
         : epoch0(store.stage(std::move(initial), validation_context(0))),
-          epoch1(stage_successor(store, epoch0, successor_roots)),
+          epoch1(stage_successor(
+              store,
+              epoch0,
+              successor_roots,
+              successor_fanout,
+              successor_pipeline_stretch,
+              successor_wait_exempt)),
           activation(
               store,
               epoch0,
@@ -1625,6 +1684,208 @@ TEST_CASE("accepted adaptive bodies enter native continuations exactly once",
               AuthenticatedEpochPeer::replica(6))
               .permission == EpochConsensusPermission::rejected_identity);
     CHECK(harness.continuations.relays.size() == 1);
+}
+
+TEST_CASE(
+    "shape change preserves an f5 draining context across committed f2 activation",
+    "[shape25][adaptive-v2][epoch-live-binding][draining][f5-to-f2]")
+{
+    constexpr std::uint64_t commit_height = 90;
+    constexpr std::uint64_t delay = 3;
+    const std::vector<ReplicaID> roots{1, 2, 3, 4, 0};
+    const std::vector<ReplicaID> wait_exempt{5, 6};
+    const auto quorum = derive_byzantine_quorum(membership().size());
+    REQUIRE(quorum.has_value());
+    REQUIRE(quorum->quorum == 5);
+
+    V2Harness harness(
+        shaped_epoch_v2_input(0, roots, 5, 2, wait_exempt),
+        roots,
+        2,
+        2,
+        wait_exempt);
+    REQUIRE(harness.epoch0.trees().size() == quorum->quorum);
+    REQUIRE(harness.epoch1.trees().size() == quorum->quorum);
+    for (const auto &tree : harness.epoch0.trees())
+    {
+        CHECK(tree.fanout == 5);
+        CHECK(tree.pipeline_stretch == 2);
+        CHECK(tree.wait_exempt_leaves == wait_exempt);
+    }
+    for (const auto &tree : harness.epoch1.trees())
+    {
+        CHECK(tree.fanout == 2);
+        CHECK(tree.pipeline_stretch == 2);
+        CHECK(tree.wait_exempt_leaves == wait_exempt);
+    }
+
+    const auto predecessor = harness.activation.active_effect();
+    REQUIRE(predecessor.definition == &harness.epoch0);
+    const auto *predecessor_tree = harness.store.find_tree(
+        predecessor.configuration.epoch_number,
+        predecessor.configuration.tree_id);
+    REQUIRE(predecessor_tree != nullptr);
+    const ProposalKey predecessor_key{
+        predecessor.configuration, digest("shape25-f5-draining")};
+    const auto predecessor_metadata =
+        make_exact_proposal_context_metadata(
+            predecessor_key,
+            0,
+            *predecessor_tree,
+            quorum->quorum);
+    REQUIRE(predecessor_metadata.has_value());
+    auto predecessor_lease =
+        harness.contexts.admit_remote(*predecessor_metadata);
+    REQUIRE(predecessor_lease.has_value());
+    const auto predecessor_timer =
+        harness.contexts.arm_timer(*predecessor_lease);
+    REQUIRE(predecessor_timer != 0);
+
+    const auto exact_partition = [](const ProposalTreeSnapshot &tree) {
+        const std::set<ReplicaID> assigned(
+            tree.assigned_subtree.begin(), tree.assigned_subtree.end());
+        std::set<ReplicaID> partition = tree.required_subtree;
+        for (const auto replica : tree.optional_subtree)
+            CHECK(partition.insert(replica).second);
+        CHECK(partition == assigned);
+        const std::set<ReplicaID> children(
+            tree.direct_children.begin(), tree.direct_children.end());
+        CHECK(children.size() == tree.direct_children.size());
+        std::set<ReplicaID> child_members;
+        for (const auto &[child, subtree] : tree.child_subtrees)
+        {
+            CHECK(children.count(child) == 1);
+            for (const auto replica : subtree)
+                CHECK(child_members.insert(replica).second);
+        }
+        child_members.insert(tree.local_replica);
+        CHECK(child_members == assigned);
+    };
+    exact_partition(predecessor_lease->tree());
+    CHECK(predecessor_lease->tree().fanout == 5);
+    CHECK(predecessor_lease->tree().pipeline_stretch == 2);
+    CHECK(predecessor_lease->tree().direct_children ==
+          std::vector<ReplicaID>{6});
+    CHECK(predecessor_lease->tree().required_subtree ==
+          std::set<ReplicaID>{0});
+    CHECK(predecessor_lease->tree().optional_subtree ==
+          std::set<ReplicaID>{6});
+    CHECK(harness.contexts.frozen_global_quorum(*predecessor_lease) ==
+          std::optional<std::size_t>{quorum->quorum});
+
+    REQUIRE(harness.adapter.prepare_committed_v2(harness.epoch1) ==
+            EpochIngressError::none);
+    REQUIRE(harness.activation.record_committed_v2(
+                harness.command(delay), commit_height)
+                .disposition == ActivationRecordDisposition::recorded);
+    REQUIRE(harness.binding.on_v2_post_block_commit(
+                commit_height + delay,
+                harness.epoch0.epoch_digest())
+                .transition == ActivationTransition::activated);
+
+    const auto successor = harness.activation.active_effect();
+    REQUIRE(successor.definition == &harness.epoch1);
+    REQUIRE(successor.configuration != predecessor.configuration);
+    REQUIRE(harness.contexts.revalidate(*predecessor_lease));
+    const auto frozen = harness.contexts.snapshot(predecessor_key);
+    REQUIRE(frozen.has_value());
+    CHECK(frozen->timer_generation == predecessor_timer);
+    CHECK(predecessor_lease->tree().fanout == 5);
+    CHECK(predecessor_lease->tree().direct_children ==
+          std::vector<ReplicaID>{6});
+
+    const auto *successor_tree = harness.store.find_tree(
+        successor.configuration.epoch_number,
+        successor.configuration.tree_id);
+    REQUIRE(successor_tree != nullptr);
+    const ProposalKey successor_key{
+        successor.configuration, digest("shape25-f2-new")};
+    const auto successor_metadata = make_exact_proposal_context_metadata(
+        successor_key, 0, *successor_tree, quorum->quorum);
+    REQUIRE(successor_metadata.has_value());
+    auto successor_lease =
+        harness.contexts.admit_remote(*successor_metadata);
+    REQUIRE(successor_lease.has_value());
+    const auto successor_timer =
+        harness.contexts.arm_timer(*successor_lease);
+    REQUIRE(successor_timer != 0);
+    REQUIRE(successor_timer != predecessor_timer);
+    exact_partition(successor_lease->tree());
+    CHECK(successor_lease->tree().fanout == 2);
+    CHECK(successor_lease->tree().pipeline_stretch == 2);
+    CHECK(successor_lease->tree().direct_children ==
+          std::vector<ReplicaID>{3, 4});
+    CHECK(successor_lease->tree().required_subtree ==
+          std::set<ReplicaID>{0, 3, 4});
+    CHECK(successor_lease->tree().optional_subtree.empty());
+    CHECK(harness.contexts.frozen_global_quorum(*successor_lease) ==
+          std::optional<std::size_t>{quorum->quorum});
+
+    bool predecessor_timeout_bound_to_f5 = false;
+    REQUIRE(harness.contexts.dispatch_timer(
+        predecessor_key,
+        predecessor_timer,
+        [&](const ProposalContextLease &lease) {
+            predecessor_timeout_bound_to_f5 =
+                lease.key().configuration ==
+                    predecessor.configuration &&
+                lease.tree().fanout == 5 &&
+                lease.tree().pipeline_stretch == 2 &&
+                lease.tree().direct_children ==
+                    std::vector<ReplicaID>{6};
+            CHECK(harness.contexts.transition(
+                      lease,
+                      ProposalContextEvent::aggregation_timeout) ==
+                  ProposalTransitionResult::retained_open);
+        }));
+    CHECK(predecessor_timeout_bound_to_f5);
+    const auto after_timeout = harness.contexts.snapshot(predecessor_key);
+    REQUIRE(after_timeout.has_value());
+    CHECK(after_timeout->timer_generation == 0);
+    CHECK(after_timeout->pass_through);
+    CHECK(after_timeout->phase == ProposalContextPhase::delta_open);
+    CHECK(harness.contexts.snapshot(successor_key)->timer_generation ==
+          successor_timer);
+
+    auto late_vote = envelope(
+        predecessor,
+        EpochConsensusWireKind::vote,
+        6,
+        {0xF5, 0xF2},
+        "shape25-f5-draining");
+    late_vote.protocol_mode = EpochProtocolMode::adaptive_v2;
+    late_vote.block_hash = predecessor_key.block_hash;
+    late_vote.proposer = predecessor_lease->tree().root;
+    const auto accepted_late = harness.binding.handle_vote(
+        consensus_message<MsgVote>(late_vote),
+        AuthenticatedEpochPeer::replica(6));
+    CHECK(accepted_late.error == EpochIngressError::none);
+    CHECK(accepted_late.permission ==
+          EpochConsensusPermission::accept_contribution);
+    REQUIRE(harness.continuations.votes.size() == 1);
+
+    REQUIRE(harness.contexts.record_local_signer(*predecessor_lease));
+    REQUIRE(harness.contexts.record_verified_direct(
+        *predecessor_lease, 6, 6));
+    REQUIRE(harness.contexts.mark_forwarded_signers(
+        *predecessor_lease, std::set<ReplicaID>{0, 6}));
+    CHECK(harness.contexts.transition(
+              *predecessor_lease,
+              ProposalContextEvent::late_contribution_forwarded) ==
+          ProposalTransitionResult::terminal_closed);
+
+    late_vote.body = {0xF5, 0xF3};
+    CHECK(harness.binding.handle_vote(
+              consensus_message<MsgVote>(late_vote),
+              AuthenticatedEpochPeer::replica(6))
+              .permission == EpochConsensusPermission::rejected_identity);
+    CHECK(harness.continuations.votes.size() == 1);
+    CHECK(harness.contexts.context_status(successor_key) ==
+          ProposalContextStatus::admitted_open);
+    CHECK(harness.contexts.snapshot(successor_key)->timer_generation ==
+          successor_timer);
+    REQUIRE(harness.contexts.close(
+        successor_key, ProposalContextEvent::proposal_aborted));
 }
 
 TEST_CASE("boundary contributions retain the draining epoch generation",

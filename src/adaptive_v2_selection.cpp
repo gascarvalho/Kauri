@@ -46,10 +46,11 @@ ValidatedSelectionInputs validate_inputs(
         throw std::invalid_argument(
             "adaptive-v2 selection requires exact N=3f+1 with f>0");
     }
-    if (config.required_nonresponsive != quorum->fault_threshold)
+    if (config.required_nonresponsive == 0 ||
+        config.required_nonresponsive > quorum->fault_threshold)
     {
         throw std::invalid_argument(
-            "adaptive-v2 selection must select exactly derived f");
+            "adaptive-v2 selection target must be within the derived fault bound");
     }
     if (config.minimum_score_drop == 0 ||
         config.minimum_timeouts_per_reporter == 0 ||
@@ -767,6 +768,8 @@ struct AdaptiveV2ByzantineSelection::State
                     selected.find(entry.replica_id) == selected.end())
                 {
                     output.eligible_roots.push_back(entry.replica_id);
+                    if (output.eligible_roots.size() == quorum.quorum)
+                        break;
                 }
             }
             if (output.eligible_roots.size() < quorum.quorum)
@@ -837,7 +840,8 @@ struct AdaptiveV2ByzantineSelection::State
                 if (constrained.count(entry.replica_id) == 0 &&
                     entry.classification ==
                         ResponsivenessClass::responsive &&
-                    entry.eligible)
+                    entry.eligible &&
+                    output.eligible_roots.size() < quorum.quorum)
                 {
                     output.eligible_roots.push_back(entry.replica_id);
                 }

@@ -517,6 +517,8 @@ bool AdaptiveV2ManagerSession::begin_cycle(
         auto frozen_policy = policy;
         auto controller_config = state.config.controller;
         controller_config.transition_policy = frozen_policy;
+        controller_config.shape_adaptation_enabled =
+            frozen_policy.apply_shape_selection;
         auto controller =
             std::make_unique<AdaptiveV2ManagerController>(
                 state.ingress, std::move(controller_config));
@@ -758,8 +760,15 @@ AdaptiveV2ManagerSession::controller_audit() const noexcept
             state.controller->baseline_cutoff();
         snapshot.current_cutoff =
             state.controller->current_cutoff();
+        snapshot.baseline_frozen =
+            state.controller->baseline_frozen();
         snapshot.score_trajectory =
             state.controller->score_trajectory();
+        if (const auto *const decision =
+                state.controller->shape_decision())
+        {
+            snapshot.shape_decision = *decision;
+        }
         return snapshot;
     }
     catch (...)

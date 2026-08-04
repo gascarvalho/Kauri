@@ -451,7 +451,13 @@ struct has_bounded_execution_audit<
                      ->current_cutoff),
         decltype(std::declval<const Session &>()
                      .controller_audit()
+                     ->baseline_frozen),
+        decltype(std::declval<const Session &>()
+                     .controller_audit()
                      ->score_trajectory.size()),
+        decltype(std::declval<const Session &>()
+                     .controller_audit()
+                     ->shape_decision.has_value()),
         decltype(std::declval<const Session &>()
                      .convergence_audit()
                      .has_value()),
@@ -505,8 +511,12 @@ const auto &terminal_value(const Value &value)
 
 struct Fixture
 {
-    AdaptiveV2ManagerSession session{
-        kMembers, epoch_zero(), session_config()};
+    explicit Fixture(
+        AdaptiveV2ManagerSessionConfig config = session_config())
+        : session(kMembers, epoch_zero(), std::move(config))
+    {}
+
+    AdaptiveV2ManagerSession session;
     std::array<std::uint64_t, 7> readiness_sequences{};
     std::array<std::uint64_t, 7> lifecycle_sequences{};
     std::array<std::uint64_t, 7> evidence_sequences{};
@@ -637,9 +647,10 @@ struct Fixture
         }
     }
 
-    void persistent_timeouts()
+    void persistent_timeouts(
+        const std::array<ReplicaID, 2> &targets = {0, 1})
     {
-        for (const auto target : {ReplicaID{0}, ReplicaID{1}})
+        for (const auto target : targets)
         {
             for (std::size_t reporter = 0; reporter < 3; ++reporter)
             {
@@ -677,7 +688,8 @@ struct Fixture
     AdaptiveV2EpochChangeIdentity prepare_convergence(
         const AdaptiveV2TransitionPolicy &policy,
         std::uint64_t command_height,
-        std::uint64_t logical_start_tick)
+        std::uint64_t logical_start_tick,
+        const std::array<ReplicaID, 2> &containment_targets = {0, 1})
     {
         REQUIRE(session.begin_cycle(policy));
         CHECK(session.evaluate() ==
@@ -694,7 +706,7 @@ struct Fixture
         REQUIRE(session.evaluate() ==
                 AdaptiveV2ManagerControllerStatus::baseline_frozen);
         if (policy.intent == TreePolicyKind::fault_containment)
-            persistent_timeouts();
+            persistent_timeouts(containment_targets);
         else
             responsive_optimization_suffix();
         REQUIRE(session.evaluate() ==
@@ -1415,12 +1427,18 @@ void verify_bounded_execution_audit_contract()
 
         const auto controller = read_only.controller_audit();
         REQUIRE(controller.has_value());
+        CHECK(controller->baseline_frozen);
         CHECK(controller->baseline_cutoff > 0);
         CHECK(controller->current_cutoff >= controller->baseline_cutoff);
         CHECK_FALSE(controller->score_trajectory.empty());
         CHECK(controller->score_trajectory.size() <=
               session_config().controller.reputation_limits
                   .maximum_audit_updates);
+        REQUIRE(controller->shape_decision.has_value());
+        CHECK(hotstuff::valid_shape_decision_record(
+            *controller->shape_decision));
+        CHECK(controller->shape_decision->evidence_cutoff ==
+              controller->current_cutoff);
 
         auto convergence = read_only.convergence_audit();
         REQUIRE(convergence.has_value());
@@ -1773,6 +1791,100 @@ TEST_CASE(
     CHECK_FALSE(below_quorum.session.consume_ready_and_rotate());
     CHECK(below_quorum.session.ingress().current_epoch().epoch_number() == 0);
     CHECK(below_quorum.session.terminal_records().empty());
+}
+
+TEST_CASE(
+    "session audit exposes the exact first responsive baseline freeze",
+    "[adaptive-v2][manager-session][baseline-hold][audit][n7]")
+{
+    Fixture fixture;
+    auto &session = fixture.session;
+    REQUIRE(session.begin_cycle(containment_policy()));
+
+    auto audit = session.controller_audit();
+    REQUIRE(audit.has_value());
+    CHECK_FALSE(audit->baseline_frozen);
+    CHECK(audit->baseline_cutoff == 0);
+    CHECK(session.evaluate() ==
+          AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+
+    fixture.ready_all();
+    fixture.responsive_baseline();
+    audit = session.controller_audit();
+    REQUIRE(audit.has_value());
+    CHECK_FALSE(audit->baseline_frozen);
+    CHECK(audit->baseline_cutoff == 0);
+    CHECK(session.successor_bundle() == nullptr);
+
+    REQUIRE(session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    audit = session.controller_audit();
+    REQUIRE(audit.has_value());
+    CHECK(audit->baseline_frozen);
+    CHECK(audit->baseline_cutoff > 0);
+    CHECK(audit->current_cutoff == audit->baseline_cutoff);
+    CHECK(session.successor_bundle() == nullptr);
+
+    CHECK(session.evaluate() ==
+          AdaptiveV2ManagerControllerStatus::awaiting_guarded_selection);
+    CHECK(session.successor_bundle() == nullptr);
+}
+
+TEST_CASE(
+    "each transition policy independently controls shape application",
+    "[adaptive-v2][manager-session][shape25][shape-factor][n7]")
+{
+    auto disabled_config = session_config();
+    disabled_config.controller.shape_adaptation_enabled = true;
+    disabled_config.controller.shape_selection.candidate_fanouts =
+        {5, 2, 3, 5};
+    Fixture disabled(std::move(disabled_config));
+    auto disabled_policy = containment_policy();
+    disabled_policy.apply_shape_selection = false;
+    static_cast<void>(disabled.prepare_convergence(
+        disabled_policy, 1'700, 170, {5, 6}));
+
+    const auto disabled_audit = disabled.session.controller_audit();
+    REQUIRE(disabled_audit.has_value());
+    REQUIRE(disabled_audit->shape_decision.has_value());
+    const auto &disabled_decision = *disabled_audit->shape_decision;
+    REQUIRE(disabled_decision.selected_fanout !=
+            disabled_decision.current_fanout);
+    CHECK(disabled_decision.applied_fanout ==
+          disabled_decision.current_fanout);
+    REQUIRE(disabled.session.successor_bundle() != nullptr);
+    for (const auto &tree :
+         disabled.session.successor_bundle()->definition().trees)
+    {
+        CHECK(tree.fanout == disabled_decision.current_fanout);
+    }
+
+    auto enabled_config = session_config();
+    enabled_config.controller.shape_adaptation_enabled = false;
+    enabled_config.controller.shape_selection.candidate_fanouts =
+        {5, 2, 3, 5};
+    Fixture enabled(std::move(enabled_config));
+    auto enabled_policy = containment_policy();
+    enabled_policy.apply_shape_selection = true;
+    static_cast<void>(enabled.prepare_convergence(
+        enabled_policy, 1'701, 171, {5, 6}));
+
+    const auto enabled_audit = enabled.session.controller_audit();
+    REQUIRE(enabled_audit.has_value());
+    REQUIRE(enabled_audit->shape_decision.has_value());
+    const auto &enabled_decision = *enabled_audit->shape_decision;
+    CHECK(enabled_decision.selected_fanout ==
+          disabled_decision.selected_fanout);
+    CHECK(enabled_decision.current_fanout ==
+          disabled_decision.current_fanout);
+    CHECK(enabled_decision.applied_fanout ==
+          enabled_decision.selected_fanout);
+    REQUIRE(enabled.session.successor_bundle() != nullptr);
+    for (const auto &tree :
+         enabled.session.successor_bundle()->definition().trees)
+    {
+        CHECK(tree.fanout == enabled_decision.selected_fanout);
+    }
 }
 
 TEST_CASE(

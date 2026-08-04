@@ -242,9 +242,12 @@ struct Fixture
 
     explicit Fixture(
         std::uint64_t activation_delay_blocks = 5,
-        std::size_t maximum_audit_updates = 4096)
+        std::size_t maximum_audit_updates = 4096,
+        std::uint32_t required_nonresponsive = 2)
         : config(controller_config(key, activation_delay_blocks))
     {
+        config.selection.required_nonresponsive =
+            required_nonresponsive;
         config.reputation_limits.maximum_audit_updates =
             maximum_audit_updates;
         controller = std::make_unique<AdaptiveV2ManagerController>(
@@ -519,12 +522,16 @@ void rotate_to_exact_epoch_one(
     fixture.config.transition_policy.intent = policy;
     if (policy == TreePolicyKind::fault_containment)
     {
-        fixture.config.transition_policy.containment_baseline_roots = {
-            BaselineRoot{0, 0},
-            BaselineRoot{1, 1},
-            BaselineRoot{2, 2},
-            BaselineRoot{3, 3},
-            BaselineRoot{4, 4}};
+        fixture.config.transition_policy
+            .containment_baseline_roots.clear();
+        for (const auto &tree : fixture.ingress.current_epoch().trees())
+        {
+            REQUIRE_FALSE(tree.members_breadth_first.empty());
+            fixture.config.transition_policy
+                .containment_baseline_roots.push_back(BaselineRoot{
+                    tree.tree_id,
+                    tree.members_breadth_first.front()});
+        }
     }
     else
     {
@@ -850,11 +857,12 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "explicit optimization policy freezes a fresh E1 Q5 survivor baseline",
+    "recurring policies inherit an exact E1 containment set",
     "[adaptive-v2][manager-controller][baseline][transition-policy][n7]"
     "[live-feasibility][intentional-red]")
 {
-    SECTION("fault containment still requires a pre-fault baseline")
+    SECTION(
+        "fault containment preserves current roots without fresh actor evidence")
     {
         Fixture containment;
         rotate_to_exact_epoch_one(
@@ -862,11 +870,73 @@ TEST_CASE(
         ready_live_survivors(containment);
         record_live_survivor_baseline(containment);
 
-        CHECK(containment.controller->evaluate() ==
-              AdaptiveV2ManagerControllerStatus::
-                  awaiting_responsive_baseline);
-        CHECK_FALSE(containment.controller->baseline_frozen());
-        CHECK(containment.controller->successor_bundle() == nullptr);
+        REQUIRE(containment.controller->evaluate() ==
+                AdaptiveV2ManagerControllerStatus::baseline_frozen);
+        REQUIRE(containment.controller->baseline_audit_snapshot() !=
+                nullptr);
+        for (const auto actor : std::vector<ReplicaID>{0, 1})
+        {
+            const auto *entry = ranking_entry(
+                *containment.controller->baseline_audit_snapshot(),
+                actor);
+            REQUIRE(entry != nullptr);
+            CHECK(entry->classification ==
+                  ResponsivenessClass::insufficient_evidence);
+            CHECK_FALSE(entry->eligible);
+        }
+
+        record_ranked_live_survivor_suffix(containment);
+        REQUIRE(containment.controller->evaluate() ==
+                AdaptiveV2ManagerControllerStatus::successor_ready);
+        REQUIRE(containment.controller->selection_audit() != nullptr);
+        const auto &selection =
+            *containment.controller->selection_audit();
+        CHECK(selection.constraint_basis ==
+              AdaptiveV2SelectionConstraintBasis::
+                  inherited_consensus_wait_exempt);
+        CHECK(selection.metadata.replica_count == 7);
+        CHECK(selection.metadata.fault_threshold == 2);
+        CHECK(selection.metadata.quorum == 5);
+        CHECK(selection.metadata.required_nonresponsive == 2);
+        CHECK(selection.selected_replicas ==
+              std::vector<ReplicaID>{0, 1});
+        CHECK(selection.eligible_candidates.empty());
+        CHECK(selection.eligible_roots ==
+              std::vector<ReplicaID>{6, 5, 4, 3, 2});
+        CHECK(std::all_of(
+            containment.ingress.ledger().accepted().begin(),
+            containment.ingress.ledger().accepted().end(),
+            [](const auto &record) {
+                return record.observation.observed_replica_id >= 2 &&
+                       record.observation.outcome ==
+                           ResponseOutcome::on_time;
+            }));
+
+        REQUIRE(containment.controller->successor_bundle() != nullptr);
+        const auto &definition =
+            containment.controller->successor_bundle()->definition();
+        CHECK(definition.membership_digest ==
+              containment.ingress.current_epoch().membership_digest());
+        CHECK(successor_roots(*containment.controller) ==
+              std::vector<ReplicaID>{2, 3, 4, 5, 6});
+        for (const auto &tree : definition.trees)
+        {
+            CHECK(tree.wait_exempt_leaves ==
+                  std::vector<ReplicaID>{0, 1});
+            const auto leaf_start = first_leaf_index(
+                tree.members_breadth_first.size(), tree.fanout);
+            for (const auto actor : std::vector<ReplicaID>{0, 1})
+            {
+                const auto position = std::find(
+                    tree.members_breadth_first.begin(),
+                    tree.members_breadth_first.end(),
+                    actor);
+                REQUIRE(position != tree.members_breadth_first.end());
+                CHECK(static_cast<std::size_t>(std::distance(
+                          tree.members_breadth_first.begin(),
+                          position)) >= leaf_start);
+            }
+        }
     }
 
     SECTION(
@@ -999,24 +1069,28 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "optimization rejects malformed predecessor containment sets",
+    "recurring policies reject malformed predecessor containment sets",
     "[adaptive-v2][manager-controller][inheritance][fail-closed][n7]")
 {
-    for (const auto inherited_shape :
-         std::vector<InheritedEpochShape>{
-             InheritedEpochShape::undersized,
-             InheritedEpochShape::inconsistent})
+    for (const auto policy :
+         std::vector<TreePolicyKind>{
+             TreePolicyKind::fault_containment,
+             TreePolicyKind::performance_optimization})
     {
-        Fixture fixture;
-        rotate_to_exact_epoch_one(
-            fixture,
-            TreePolicyKind::performance_optimization,
-            inherited_shape);
-        CHECK_FALSE(fixture.controller->healthy());
-        CHECK(fixture.controller->evaluate() ==
-              AdaptiveV2ManagerControllerStatus::unhealthy);
-        CHECK(fixture.controller->successor_bundle() == nullptr);
-        CHECK(fixture.controller->selection_audit() == nullptr);
+        for (const auto inherited_shape :
+             std::vector<InheritedEpochShape>{
+                 InheritedEpochShape::undersized,
+                 InheritedEpochShape::inconsistent})
+        {
+            Fixture fixture;
+            rotate_to_exact_epoch_one(
+                fixture, policy, inherited_shape);
+            CHECK_FALSE(fixture.controller->healthy());
+            CHECK(fixture.controller->evaluate() ==
+                  AdaptiveV2ManagerControllerStatus::unhealthy);
+            CHECK(fixture.controller->successor_bundle() == nullptr);
+            CHECK(fixture.controller->selection_audit() == nullptr);
+        }
     }
 }
 
@@ -1142,6 +1216,37 @@ TEST_CASE(
           canonical_bytes);
     CHECK(fixture.controller->current_cutoff() == successor_cutoff);
     CHECK(fixture.controller->healthy());
+}
+
+TEST_CASE(
+    "controller contains a configured minority without changing quorum",
+    "[adaptive-v2][manager-controller][minority][roots]")
+{
+    Fixture fixture(5, 4096, 1);
+    fixture.freeze_baseline();
+
+    fixture.persistent_timeouts(6, 3);
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+
+    const auto *selection = fixture.controller->selection_audit();
+    REQUIRE(selection != nullptr);
+    CHECK(selection->metadata.fault_threshold == 2);
+    CHECK(selection->metadata.quorum == 5);
+    CHECK(selection->metadata.required_nonresponsive == 1);
+    CHECK(selection->selected_replicas ==
+          std::vector<ReplicaID>{6});
+    CHECK(selection->eligible_roots.size() == 5);
+
+    const auto *bundle = fixture.controller->successor_bundle();
+    REQUIRE(bundle != nullptr);
+    REQUIRE(bundle->definition().trees.size() == 5);
+    for (const auto &tree : bundle->definition().trees)
+    {
+        CHECK(tree.wait_exempt_leaves ==
+              std::vector<ReplicaID>{6});
+        CHECK(tree.members_breadth_first.front() != 6);
+    }
 }
 
 TEST_CASE(
@@ -1285,4 +1390,118 @@ TEST_CASE(
     CHECK(successor_roots(*fixture.controller) ==
           std::vector<ReplicaID>{2, 3, 4, 5, 6});
     check_controller_bundle_authority(fixture);
+}
+
+TEST_CASE(
+    "controller maps a production N-tree predecessor to a Q-tree successor",
+    "[shape25][adaptive-v2][manager-controller][shape-v1][n7]")
+{
+    Fixture fixture;
+    fixture.freeze_baseline();
+    fixture.persistent_timeouts(5);
+    fixture.persistent_timeouts(6);
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->shape_decision() != nullptr);
+    const auto decision = *fixture.controller->shape_decision();
+    CHECK(decision.evidence_cutoff ==
+          fixture.controller->current_cutoff());
+    CHECK(decision.selected_fanout == 5);
+    CHECK(decision.applied_fanout == 2);
+    CHECK(decision.fixed_pipeline_stretch == 2);
+    CHECK(fixture.ingress.current_epoch().trees().size() == 7);
+    CHECK(decision.predecessor_tree_count == 7);
+    CHECK(decision.tree_count ==
+          fixture.ingress.quorum_metadata().quorum);
+    CHECK(decision.reference_tree_rule ==
+          hotstuff::kShapeV1ReferenceTreeRule);
+    CHECK(hotstuff::valid_shape_decision_record(decision));
+
+    const auto *bundle = fixture.controller->successor_bundle();
+    REQUIRE(bundle != nullptr);
+    CHECK(bundle->definition().trees.size() ==
+          fixture.ingress.quorum_metadata().quorum);
+    for (const auto &tree : bundle->definition().trees)
+    {
+        CHECK(tree.fanout == decision.current_fanout);
+        CHECK(tree.pipeline_stretch == 2);
+        CHECK(tree.wait_exempt_leaves ==
+              std::vector<ReplicaID>{5, 6});
+    }
+
+    fixture.record(2, 0, ResponseOutcome::on_time, "after-shape-cutoff");
+    CHECK(fixture.controller->evaluate() ==
+          AdaptiveV2ManagerControllerStatus::already_ready);
+    REQUIRE(fixture.controller->shape_decision() != nullptr);
+    CHECK(fixture.controller->shape_decision()->decision_digest ==
+          decision.decision_digest);
+    CHECK(fixture.controller->shape_decision()->evidence_cutoff ==
+          decision.evidence_cutoff);
+}
+
+TEST_CASE(
+    "shape factor controls application without entering shape-v1",
+    "[shape25][adaptive-v2][manager-controller][shape-factor][n7]")
+{
+    Fixture fixture;
+    fixture.controller.reset();
+    fixture.config.shape_adaptation_enabled = true;
+    fixture.config.shape_selection.candidate_fanouts = {5, 2, 3, 5};
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+    fixture.freeze_baseline();
+    fixture.persistent_timeouts(5);
+    fixture.persistent_timeouts(6);
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->shape_decision() != nullptr);
+    const auto &decision = *fixture.controller->shape_decision();
+    CHECK(decision.selected_fanout == 5);
+    CHECK(decision.applied_fanout == decision.selected_fanout);
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    for (const auto &tree :
+         fixture.controller->successor_bundle()->definition().trees)
+    {
+        CHECK(tree.fanout == decision.selected_fanout);
+        CHECK(tree.pipeline_stretch == 2);
+    }
+}
+
+TEST_CASE(
+    "later shape cycle derives current fanout from the exact epoch",
+    "[shape25][adaptive-v2][manager-controller][shape-v1][recurring][n7]")
+{
+    Fixture fixture;
+    fixture.config.placement.shape.fanout = 5;
+    fixture.config.shape_selection.deterministic_seed =
+        kSnapshotSeed + 12;
+    rotate_to_exact_epoch_one(
+        fixture, TreePolicyKind::performance_optimization);
+    ready_live_survivors(fixture);
+    record_live_survivor_baseline(fixture);
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    record_ranked_live_survivor_suffix(fixture);
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->shape_decision() != nullptr);
+    const auto &decision = *fixture.controller->shape_decision();
+    CHECK(fixture.config.placement.shape.fanout == 5);
+    CHECK(decision.current_fanout == 2);
+    CHECK(decision.applied_fanout == 2);
+    CHECK(decision.predecessor_tree_count == 5);
+    CHECK(decision.tree_count == 5);
+    CHECK(decision.deterministic_seed == kSnapshotSeed + 12);
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    for (const auto &tree :
+         fixture.controller->successor_bundle()->definition().trees)
+    {
+        CHECK(tree.fanout == 2);
+        CHECK(tree.pipeline_stretch ==
+              fixture.config.placement.shape.pipeline_stretch);
+    }
 }

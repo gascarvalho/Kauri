@@ -499,6 +499,58 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager passes the validated scientific seed into shape-v1",
+    "[shape25][adaptive-v2][manager][shape-v1][seed][configuration]")
+{
+    const auto manager = source("examples/adaptation_manager.cpp");
+    const auto compact = without_whitespace(manager);
+
+    CHECK(manager.find("shape-deterministic-seed") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "options.shape_deterministic_seed="
+              "parse_unsigned<std::uint64_t>("
+              "opt_shape_deterministic_seed->get(),"
+              "\"shapedeterministicseed\",false)") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "config.shape_selection.deterministic_seed="
+              "options.shape_deterministic_seed") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "config.shape_selection.deterministic_seed="
+              "kSnapshotSeed") == std::string::npos);
+}
+
+TEST_CASE(
+    "manager bounds the adaptation target without changing derived quorum",
+    "[shape25][adaptive-v2][manager][minority][configuration]")
+{
+    const auto manager = source("examples/adaptation_manager.cpp");
+    const auto compact = without_whitespace(manager);
+
+    CHECK(manager.find("required-nonresponsive") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "options.required_nonresponsive="
+              "opt_required_nonresponsive->get().empty()?"
+              "options.runtime_shape.required_nonresponsive:") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "options.required_nonresponsive>"
+              "options.runtime_shape.quorum.fault_threshold") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "config.selection.required_nonresponsive="
+              "options.required_nonresponsive") !=
+          std::string::npos);
+    CHECK(compact.find(
+              "config.selection.required_nonresponsive="
+              "options.runtime_shape.quorum.quorum") ==
+          std::string::npos);
+}
+
+TEST_CASE(
     "manager drops the ACK for the Q completing accepted activation",
     "[adaptive-v2][convergence][manager][ack][loss][deterministic]")
 {
@@ -856,17 +908,25 @@ TEST_CASE(
     CHECK(contains_in_order(
         root_validation,
         {"current_epoch().trees()",
+         "containment_baseline_roots.size()",
          "candidate.tree_id == root.tree_id",
          "tree->members_breadth_first.front()",
          "root.replica_id"}));
-    CHECK(root_validation.find(
-              "containment_baseline_roots.size()") ==
-          std::string::npos);
+    const auto resolved_policy = function_body(
+        manager, "resolved_transition_policy(");
+    REQUIRE_FALSE(resolved_policy.empty());
+    CHECK(contains_in_order(
+        resolved_policy,
+        {"resolve_containment_roots_from_predecessor",
+         "session_.ingress().current_epoch().trees()",
+         "tree.tree_id >= tree_count",
+         "unique_roots.insert",
+         "resolved.containment_baseline_roots.push_back",
+         "transition_policy_matches_current_roots(resolved)"}));
     const auto cycle_context = function_body(
-        manager, "bool add_cycle_audit_context()");
+        manager, "bool add_cycle_audit_context(");
     REQUIRE_FALSE(cycle_context.empty());
-    CHECK(cycle_context.find(
-              "transition_policy_matches_current_roots(") !=
+    CHECK(cycle_context.find("predecessor_epoch_number") !=
           std::string::npos);
 
     const auto header = code_without_comments_or_literals(
@@ -1270,7 +1330,8 @@ TEST_CASE(
          "emit_new_session_terminals()"}));
     CHECK(contains_in_order(
         begin_cycle,
-        {"add_cycle_audit_context()",
+        {"resolved_transition_policy(",
+         "add_cycle_audit_context(",
          "session_.begin_cycle(",
          "cycle_audits_.pop_back()"}));
     CHECK(contains_in_order(
@@ -1282,6 +1343,106 @@ TEST_CASE(
          "drive_convergence()",
          "session_.due_deliveries(",
          "convergence_timer.add("}));
+}
+
+TEST_CASE(
+    "manager freezes baseline before a bounded observation hold",
+    "[adaptive-v2][manager][session][baseline-hold][timer][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    REQUIRE(owns_manager_session(manager));
+
+    CHECK(manager.find("minimum_post_baseline_observation_ms") !=
+          std::string::npos);
+    CHECK(manager.find("post_baseline_observation_timer") !=
+          std::string::npos);
+    CHECK(manager.find("post_baseline_observation_pending_") !=
+          std::string::npos);
+
+    const auto begin = function_body(
+        manager, "bool begin_current_cycle() noexcept");
+    REQUIRE_FALSE(begin.empty());
+    CHECK(begin.find("schedule_post_baseline_observation(") ==
+          std::string::npos);
+
+    const auto schedule = function_body(
+        manager,
+        "bool schedule_post_baseline_observation(");
+    REQUIRE_FALSE(schedule.empty());
+    CHECK(contains_in_order(
+        schedule,
+        {"session_.controller_audit()",
+         "baseline_frozen",
+         "minimum_post_baseline_observation_ms",
+         "steady_clock::now()",
+         "post_baseline_observation_pending_ = true",
+         "post_baseline_observation_timer.add("}));
+    CHECK(contains_in_order(
+        schedule,
+        {"minimum_post_baseline_observation_ms == 0",
+         "schedule_post_baseline_evaluation()",
+         "return true",
+         "steady_clock::now()"}));
+
+    const auto follow_up = function_body(
+        manager,
+        "void schedule_post_baseline_evaluation() noexcept");
+    REQUIRE_FALSE(follow_up.empty());
+    CHECK(contains_in_order(
+        follow_up,
+        {"last_evaluated_ready_members_.reset()",
+         "last_evaluated_evidence_cutoff_.reset()",
+         "schedule_evaluation()"}));
+
+    const auto fire = function_body(
+        manager,
+        "void handle_post_baseline_observation_timer() noexcept");
+    REQUIRE_FALSE(fire.empty());
+    CHECK(contains_in_order(
+        fire,
+        {"now < post_baseline_observation_deadline_",
+         "post_baseline_observation_timer.add(",
+         "return",
+         "post_baseline_observation_pending_ = false",
+         "evaluate()"}));
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    const auto coalesce = function_body(
+        manager, "void schedule_evaluation() noexcept");
+    REQUIRE_FALSE(evaluate.empty());
+    REQUIRE_FALSE(coalesce.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"session_.evaluate()",
+         "AdaptiveV2ManagerControllerStatus::baseline_frozen",
+         "schedule_post_baseline_observation("}));
+    CHECK(count_occurrences(
+              manager,
+              "schedule_post_baseline_observation(") == 2);
+    CHECK(evaluate.find("post_baseline_observation_pending_") !=
+          std::string::npos);
+    CHECK(coalesce.find("post_baseline_observation_pending_") !=
+          std::string::npos);
+
+    const auto session_header = code_without_comments_or_literals(
+        source("include/hotstuff/adaptive_v2_manager_session.h"));
+    const auto session_source = code_without_comments_or_literals(
+        source("src/adaptive_v2_manager_session.cpp"));
+    CHECK(session_header.find("bool baseline_frozen{false}") !=
+          std::string::npos);
+    const auto audit = function_body(
+        session_source,
+        "AdaptiveV2ManagerSession::controller_audit() const noexcept");
+    REQUIRE_FALSE(audit.empty());
+    CHECK(audit.find(
+              "state.controller->baseline_frozen()") !=
+          std::string::npos);
+
+    const auto stop = function_body(manager, "void stop_runtime()");
+    REQUIRE_FALSE(stop.empty());
+    CHECK(stop.find("cancel_post_baseline_observation()") !=
+          std::string::npos);
 }
 
 TEST_CASE(

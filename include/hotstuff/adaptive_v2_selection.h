@@ -21,6 +21,7 @@ constexpr std::uint32_t kAdaptiveV2SelectionSchemaVersion = 1;
 struct AdaptiveV2SelectionConfig
 {
     std::uint32_t schema_version{kAdaptiveV2SelectionSchemaVersion};
+    /** Adaptation target count in [1, f]; this never changes consensus f/Q. */
     std::uint32_t required_nonresponsive{0};
     std::uint32_t minimum_score_drop{1};
     std::uint32_t minimum_timeouts_per_reporter{1};
@@ -165,8 +166,9 @@ public:
      * Rank fresh responsive roots while preserving an exact constraint set
      * already authorized by the consensus-ordered predecessor epoch.
      *
-     * The inherited input must contain exactly configured f unique members.
-     * All Q unconstrained replicas must be responsive in the accepted suffix
+     * The inherited input must contain exactly the configured bounded target
+     * count of unique members. At least Q unconstrained replicas must be
+     * responsive in the accepted suffix
      * `(baseline_cutoff, evidence_cutoff]` under the configured snapshot
      * policy. An exact timeout-to-late transition crossing the baseline is
      * validated against the full accepted prefix, then excluded: it is not a

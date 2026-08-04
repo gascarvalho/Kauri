@@ -741,6 +741,39 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "a bounded minority target leaves a real choice among responsive roots",
+    "[adaptive-v2][selection][minority][roots]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    auto config = selection_config();
+    config.required_nonresponsive = 1;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    fixture.persistent_timeouts(6, {0, 1, 2}, 2);
+    const auto result =
+        selector.select_through(fixture.ledger->high_watermark());
+
+    REQUIRE(result.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(result.selected_replicas == std::vector<ReplicaID>{6});
+    CHECK(result.metadata.required_nonresponsive == 1);
+    CHECK(result.metadata.fault_threshold == 2);
+    CHECK(result.metadata.quorum == 5);
+    CHECK(result.eligible_roots.size() == 5);
+    CHECK(std::find(
+              result.eligible_roots.begin(),
+              result.eligible_roots.end(),
+              ReplicaID{6}) == result.eligible_roots.end());
+    CHECK(result.snapshot->ranking().size() == 7);
+}
+
+TEST_CASE(
     "optimization inherits exact constraints and ranks only fresh live roots",
     "[adaptive-v2][selection][inheritance][optimization][n7]")
 {
@@ -867,6 +900,42 @@ TEST_CASE(
                    ResponseOutcome::on_time;
         }));
     CHECK(selector.healthy());
+}
+
+TEST_CASE(
+    "optimization chooses Q roots when fewer than f leaves are constrained",
+    "[adaptive-v2][selection][inheritance][minority][roots]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    auto config = selection_config();
+    config.required_nonresponsive = 1;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    for (const auto target : fixture.members)
+    {
+        fixture.on_time(
+            static_cast<ReplicaID>((target + 1U) % kReplicaCount),
+            target,
+            static_cast<std::uint64_t>(10 + target));
+    }
+    const auto result = selector.rank_inheriting_constraints_through(
+        fixture.ledger->high_watermark(), {ReplicaID{6}});
+
+    REQUIRE(result.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(result.selected_replicas == std::vector<ReplicaID>{6});
+    CHECK(result.metadata.required_nonresponsive == 1);
+    CHECK(result.eligible_roots.size() == 5);
+    CHECK(std::find(
+              result.eligible_roots.begin(),
+              result.eligible_roots.end(),
+              ReplicaID{6}) == result.eligible_roots.end());
 }
 
 TEST_CASE(
@@ -1107,10 +1176,23 @@ TEST_CASE(
             std::invalid_argument);
     }
 
-    SECTION("the required selection count is the derived f")
+    SECTION("the required selection count cannot be zero")
     {
         auto config = selection_config();
-        config.required_nonresponsive = 1;
+        config.required_nonresponsive = 0;
+        REQUIRE_THROWS_AS(
+            AdaptiveV2ByzantineSelection(
+                *fixture.ledger,
+                fixture.members,
+                fixture.epoch,
+                config),
+            std::invalid_argument);
+    }
+
+    SECTION("the required selection count cannot exceed derived f")
+    {
+        auto config = selection_config();
+        config.required_nonresponsive = 3;
         REQUIRE_THROWS_AS(
             AdaptiveV2ByzantineSelection(
                 *fixture.ledger,

@@ -1159,6 +1159,7 @@ namespace hotstuff
             }
         };
         friend class ExperimentFalseTimeoutFenceTestAccess;
+        friend class ExperimentByzantineRuntimeIntegrationTestAccess;
         std::size_t maximum_experiment_false_timeout_contexts{0};
         std::map<ProposalKey, ExperimentFalseTimeoutState>
             experiment_false_timeout_states;
@@ -1574,6 +1575,9 @@ namespace hotstuff
             std::uint32_t first_live_epoch) noexcept;
         void cancel_all_exact_fallbacks() noexcept;
         bool consume_experiment_outbound_direct_vote(
+            const ProposalKey &key,
+            const ProposalTreeSnapshot &tree);
+        bool consume_experiment_outbound_aggregate(
             const ProposalKey &key,
             const ProposalTreeSnapshot &tree);
         bool forward_exact_direct(

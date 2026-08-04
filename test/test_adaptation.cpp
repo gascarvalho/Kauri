@@ -644,6 +644,55 @@ TEST_CASE("one timeout followed by late remains one healthy attempt",
     CHECK(result.reasons.empty());
 }
 
+TEST_CASE(
+    "shape25 policy detects a one-in-ten rotating omission share",
+    "[r09][adaptation][shape25][rotating-omission][n31]")
+{
+    const auto epoch = epoch_id(31, "shape25-rotating-omission");
+    RecordBuilder builder(epoch);
+    for (std::uint32_t attempt = 0; attempt < 128; ++attempt)
+    {
+        if (attempt % 10 == 0)
+            builder.add_timeout(0);
+        else
+            builder.add_on_time(0, 40);
+        builder.add_on_time(1, 40);
+    }
+
+    AdaptationPolicy policy;
+    policy.policy_version = "shape25-sensitive-responsiveness-v1";
+    policy.attempt_window = 128;
+    policy.minimum_attempts = 32;
+    policy.minimum_response_rate_ppm = 950'000;
+    policy.maximum_timeout_rate_ppm = 50'000;
+    policy.trailing_timeout_streak = 2;
+    policy.latency_percentile_basis_points = 5'000;
+
+    const auto value = snapshot(
+        {0, 1}, epoch, builder.records(), builder.cutoff(), policy);
+    const auto &actor = result_for(value, 0);
+    const auto &healthy = result_for(value, 1);
+
+    CHECK(actor.attempt_count == 128);
+    CHECK(actor.timeout_count == 13);
+    CHECK(actor.response_rate_ppm == 898'437);
+    CHECK(actor.timeout_rate_ppm == 101'562);
+    CHECK(actor.classification == ResponsivenessClass::nonresponsive);
+    CHECK_FALSE(actor.eligible);
+    CHECK(has_reason(
+        actor,
+        ResponsivenessReason::response_rate_below_minimum));
+    CHECK(has_reason(
+        actor,
+        ResponsivenessReason::timeout_rate_above_maximum));
+
+    CHECK(healthy.attempt_count == 128);
+    CHECK(healthy.response_rate_ppm == 1'000'000);
+    CHECK(healthy.timeout_rate_ppm == 0);
+    CHECK(healthy.classification == ResponsivenessClass::responsive);
+    CHECK(healthy.eligible);
+}
+
 TEST_CASE("a late completion recovers a persistent trailing miss streak",
           "[r09][adaptation][streak][recovery][intentional-red]")
 {

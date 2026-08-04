@@ -1,0 +1,180 @@
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "catch.hpp"
+#include "hotstuff/hotstuff.h"
+#include "hotstuff/liveness.h"
+
+namespace hotstuff
+{
+
+class ExperimentByzantineRuntimeIntegrationTestAccess final
+{
+public:
+    static bool consume_direct_vote(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        const ProposalTreeSnapshot &tree)
+    {
+        return runtime.consume_experiment_outbound_direct_vote(key, tree);
+    }
+
+    static bool consume_aggregate(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        const ProposalTreeSnapshot &tree)
+    {
+        return runtime.consume_experiment_outbound_aggregate(key, tree);
+    }
+};
+
+} // namespace hotstuff
+
+namespace
+{
+
+using namespace hotstuff;
+
+class TestHotStuff final : public HotStuffNoSig
+{
+public:
+    using HotStuffNoSig::HotStuffNoSig;
+
+protected:
+    void state_machine_execute(const Finality &) override {}
+};
+
+uint256_t digest(const std::string &label)
+{
+    return DataStream(label).get_hash();
+}
+
+ExperimentByzantineOptions rotating_options(
+    ReplicaID local_replica,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr)
+{
+    ExperimentByzantineOptions options;
+    options.enabled = true;
+    options.diagnostic_window = "native-runtime-window";
+    options.rotating_omission = ExperimentRotatingOmissionOptions{
+        "rotating_intermittent_omission_v1",
+        local_replica,
+        7,
+        {1, 3},
+        2,
+        1,
+        std::numeric_limits<std::uint64_t>::max(),
+        1,
+        100'000};
+    if (markers != nullptr)
+    {
+        options.omission_marker_emitter =
+            [markers](const ExperimentOmissionMarker &marker)
+            { markers->push_back(marker); };
+    }
+    return options;
+}
+
+ProposalKey selected_proposal(
+    ReplicaID actor,
+    const std::string &label)
+{
+    ExperimentByzantineAdapter selector(rotating_options(1));
+    const ConfigurationId configuration{7, 3, digest("native-epoch")};
+    for (std::uint32_t index = 0; index < 10'000; ++index)
+    {
+        const ProposalKey candidate{
+            configuration,
+            digest(label + "-" + std::to_string(index))};
+        if (selector.rotating_omission_actor(candidate) ==
+            std::optional<ReplicaID>{actor})
+        {
+            return candidate;
+        }
+    }
+    throw std::runtime_error("could not derive selected proposal");
+}
+
+ProposalTreeSnapshot tree(
+    ExperimentReplicaRole role,
+    ReplicaID local_replica = 1)
+{
+    ProposalTreeSnapshot snapshot;
+    snapshot.local_replica = local_replica;
+    snapshot.root = role == ExperimentReplicaRole::root
+                        ? local_replica
+                        : ReplicaID{0};
+    if (role != ExperimentReplicaRole::root)
+        snapshot.parent = 0;
+    if (role == ExperimentReplicaRole::internal)
+        snapshot.direct_children = {2, 4};
+    snapshot.fanout = 2;
+    snapshot.pipeline_stretch = 2;
+    return snapshot;
+}
+
+TEST_CASE(
+    "native HotStuff outbound hooks enforce rotating omission roles",
+    "[adaptive-v2][experiment][byzantine][rotating][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    std::vector<ExperimentOmissionMarker> markers;
+    runtime.configure_experiment_byzantine_faults(
+        rotating_options(1, &markers));
+
+    const auto internal_key = selected_proposal(1, "native-internal");
+    const auto internal = tree(ExperimentReplicaRole::internal);
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime, internal_key, internal));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime, internal_key, internal));
+
+    const auto leaf_key = selected_proposal(1, "native-leaf");
+    const auto leaf = tree(ExperimentReplicaRole::leaf);
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+        runtime, leaf_key, leaf));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+        runtime, leaf_key, leaf));
+
+    const auto root_key = selected_proposal(1, "native-root");
+    const auto root = tree(ExperimentReplicaRole::root);
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+            runtime, root_key, root));
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime, root_key, root));
+
+    const auto nonselected_key = selected_proposal(3, "native-nonselected");
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime, nonselected_key, internal));
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+            runtime, nonselected_key, leaf));
+
+    REQUIRE(markers.size() == 2);
+    CHECK(markers[0].proposal == internal_key);
+    CHECK(markers[0].action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(markers[0].monotonic_ns > 0);
+    CHECK(markers[1].proposal == leaf_key);
+    CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
+    CHECK(markers[1].monotonic_ns > 0);
+}
+
+} // namespace

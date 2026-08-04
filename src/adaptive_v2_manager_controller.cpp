@@ -176,6 +176,7 @@ BaselineSnapshotStatus validate_baseline_snapshot(
     const AdaptationPolicy &policy,
     std::uint64_t seed,
     TreePolicyKind transition_intent,
+    bool inherit_consensus_wait_exempt,
     std::size_t required_responsive)
 {
     if (snapshot.schema_version() != kAdaptationSchemaVersion ||
@@ -217,20 +218,24 @@ BaselineSnapshotStatus validate_baseline_snapshot(
     switch (transition_intent)
     {
     case TreePolicyKind::fault_containment:
+        if (inherit_consensus_wait_exempt)
+            break;
         return responsive == membership.size()
                    ? BaselineSnapshotStatus::responsive
                    : BaselineSnapshotStatus::incomplete;
     case TreePolicyKind::performance_optimization:
-        if (required_responsive == 0 ||
-            required_responsive > membership.size())
-        {
-            return BaselineSnapshotStatus::invalid;
-        }
-        return responsive >= required_responsive
-                   ? BaselineSnapshotStatus::responsive
-                   : BaselineSnapshotStatus::incomplete;
+        break;
+    default:
+        return BaselineSnapshotStatus::invalid;
     }
-    return BaselineSnapshotStatus::invalid;
+    if (required_responsive == 0 ||
+        required_responsive > membership.size())
+    {
+        return BaselineSnapshotStatus::invalid;
+    }
+    return responsive >= required_responsive
+               ? BaselineSnapshotStatus::responsive
+               : BaselineSnapshotStatus::incomplete;
 }
 
 } // namespace
@@ -255,7 +260,6 @@ struct AdaptiveV2ManagerController::State
         switch (config.transition_policy.intent)
         {
         case TreePolicyKind::fault_containment:
-            break;
         case TreePolicyKind::performance_optimization:
         {
             const auto inherited = consensus_inherited_wait_exempt(
@@ -327,6 +331,7 @@ struct AdaptiveV2ManagerController::State
             config.selection.responsiveness_policy,
             config.selection.snapshot_seed,
             config.transition_policy.intent,
+            inherit_consensus_wait_exempt,
             static_cast<std::size_t>(
                 ingress.quorum_metadata().quorum));
         if (baseline == BaselineSnapshotStatus::invalid)
@@ -354,11 +359,76 @@ struct AdaptiveV2ManagerController::State
         if (factory_attempted)
             return fail_closed();
         factory_attempted = true;
+
+        if (latest_selection == nullptr ||
+            latest_selection->snapshot == nullptr)
+        {
+            return fail_closed();
+        }
+        const auto &snapshot = *latest_selection->snapshot;
+        if (snapshot.epoch() != epoch ||
+            snapshot.evidence_cutoff() !=
+                latest_selection->metadata.evidence_cutoff ||
+            snapshot.evidence_cutoff() != selector.current_cutoff())
+        {
+            return fail_closed();
+        }
+
+        ShapeV1Input shape_input;
+        shape_input.epoch_number =
+            ingress.current_epoch().epoch_number();
+        shape_input.epoch_digest =
+            ingress.current_epoch().epoch_digest();
+        shape_input.current_trees =
+            ingress.current_epoch().trees();
+        shape_input.evidence_cutoff = snapshot.evidence_cutoff();
+        shape_input.candidate_fanouts =
+            config.shape_selection.candidate_fanouts;
+        shape_input.tree_count = config.placement.shape.tree_count;
+        shape_input.fixed_pipeline_stretch =
+            config.shape_selection.fixed_pipeline_stretch;
+        shape_input.deterministic_seed =
+            config.shape_selection.deterministic_seed;
+        shape_input.selector_version =
+            config.shape_selection.selector_version;
+        shape_input.tie_rule = config.shape_selection.tie_rule;
+        shape_input.reference_tree_rule =
+            config.shape_selection.reference_tree_rule;
+        shape_input.evidence.reserve(snapshot.ranking().size());
+        for (const auto &entry : snapshot.ranking())
+        {
+            shape_input.evidence.push_back(ShapeV1ReplicaEvidence{
+                entry.replica_id,
+                entry.classification,
+                entry.attempt_count,
+                entry.timeout_rate_ppm,
+                entry.latency_percentile_us});
+        }
+
+        auto decision = select_shape_v1(shape_input);
+        if (decision.status != ShapeV1Status::selected ||
+            !finalize_shape_v1_application(
+                decision, config.shape_adaptation_enabled))
+        {
+            return fail_closed();
+        }
+        auto placement = config.placement;
+        placement.shape.fanout = decision.current_fanout;
+        if (placement.shape.tree_count != decision.tree_count ||
+            placement.shape.pipeline_stretch !=
+                decision.fixed_pipeline_stretch)
+        {
+            return fail_closed();
+        }
+        placement.shape.fanout = decision.applied_fanout;
+        shape_decision = std::make_unique<ShapeDecisionRecord>(
+            std::move(decision));
+
         auto built = build_adaptive_v2_successor_bundle(
             ingress.current_epoch(),
             *latest_selection,
             config.transition_policy,
-            config.placement,
+            placement,
             config.activation_delay_blocks,
             config.issuer_id,
             config.issuer_private_key,
@@ -384,8 +454,6 @@ struct AdaptiveV2ManagerController::State
         switch (config.transition_policy.intent)
         {
         case TreePolicyKind::fault_containment:
-            selected = selector.select_through(cutoff);
-            break;
         case TreePolicyKind::performance_optimization:
             selected = inherit_consensus_wait_exempt
                            ? selector
@@ -433,6 +501,7 @@ struct AdaptiveV2ManagerController::State
     std::unique_ptr<AdaptationSnapshot> baseline_snapshot;
     std::unique_ptr<AdaptiveV2SelectionResult> latest_selection;
     std::unique_ptr<const AdaptiveV2EpochChangeBundle> successor;
+    std::unique_ptr<ShapeDecisionRecord> shape_decision;
     std::vector<ReplicaID> inherited_wait_exempt;
     bool inherit_consensus_wait_exempt{false};
     std::uint64_t last_baseline_examined_cutoff{0};
@@ -495,6 +564,12 @@ const AdaptiveV2EpochChangeBundle *
 AdaptiveV2ManagerController::successor_bundle() const noexcept
 {
     return state_->successor.get();
+}
+
+const ShapeDecisionRecord *
+AdaptiveV2ManagerController::shape_decision() const noexcept
+{
+    return state_->shape_decision.get();
 }
 
 std::uint64_t

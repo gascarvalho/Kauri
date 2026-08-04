@@ -6,9 +6,12 @@
 #define HOTSTUFF_EXPERIMENT_BYZANTINE_ADAPTER_H_INCLUDED
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "hotstuff/configuration.h"
 
@@ -28,6 +31,48 @@ enum class ExperimentDirectVoteDisposition
     omit_repeat
 };
 
+enum class ExperimentReplicaRole
+{
+    root,
+    internal,
+    leaf
+};
+
+enum class ExperimentOmissionAction
+{
+    forward,
+    omit_aggregate,
+    omit_direct_vote,
+    capacity_exhausted
+};
+
+struct ExperimentRotatingOmissionOptions final
+{
+    std::string mode;
+    ReplicaID local_replica{0};
+    std::size_t replica_count{0};
+    std::vector<ReplicaID> actor_ids;
+    std::size_t expected_actor_count{0};
+    std::uint64_t window_start_monotonic_ns{0};
+    std::uint64_t window_end_monotonic_ns{0};
+    std::size_t max_omissions_per_proposal{0};
+    std::size_t maximum_contexts{0};
+};
+
+struct ExperimentOmissionMarker final
+{
+    ProposalKey proposal;
+    std::string diagnostic_window;
+    ReplicaID actor{0};
+    ExperimentOmissionAction action{ExperimentOmissionAction::forward};
+    std::uint64_t window_start_monotonic_ns{0};
+    std::uint64_t window_end_monotonic_ns{0};
+    std::uint64_t monotonic_ns{0};
+};
+
+std::string format_experiment_omission_marker(
+    const ExperimentOmissionMarker &marker);
+
 struct ExperimentByzantineOptions final
 {
     bool enabled{false};
@@ -40,6 +85,9 @@ struct ExperimentByzantineOptions final
     std::size_t maximum_false_report_contexts{0};
     std::size_t maximum_omission_contexts{0};
     std::size_t maximum_direct_vote_omission_contexts{0};
+    std::optional<ExperimentRotatingOmissionOptions> rotating_omission;
+    std::function<void(const ExperimentOmissionMarker &)>
+        omission_marker_emitter;
 };
 
 /**
@@ -87,13 +135,20 @@ public:
         const ExperimentByzantineContext &context,
         ReplicaID target) noexcept;
     bool consume_outbound_aggregate(
-        const ExperimentByzantineContext &context);
+        const ExperimentByzantineContext &context,
+        ExperimentReplicaRole role = ExperimentReplicaRole::internal,
+        std::uint64_t monotonic_ns = 0);
     bool consume_outbound_aggregate_marker(
         const ExperimentByzantineContext &context) noexcept;
     ExperimentDirectVoteDisposition consume_outbound_direct_vote(
-        const ExperimentByzantineContext &context);
+        const ExperimentByzantineContext &context,
+        ExperimentReplicaRole role = ExperimentReplicaRole::leaf,
+        std::uint64_t monotonic_ns = 0);
     bool outbound_direct_vote_omitted(
         const ExperimentByzantineContext &context) const noexcept;
+    std::optional<ReplicaID> rotating_omission_actor(
+        const ProposalKey &proposal) const;
+    bool rotating_omission_enabled() const noexcept;
 
 private:
     struct State;

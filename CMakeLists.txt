@@ -184,6 +184,7 @@ add_library(hotstuff
     src/adaptive_v2_response_evidence.cpp
     src/adaptive_v2_readiness_wire.cpp
     src/adaptive_v2_selection.cpp
+    src/adaptive_v2_shape_selection.cpp
     src/aggregation.cpp
     src/util.cpp
     src/block_delivery.cpp

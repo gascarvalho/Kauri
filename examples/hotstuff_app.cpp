@@ -217,30 +217,43 @@ parse_experiment_byzantine_options(
     const std::string &protocol_mode,
     ReplicaID local_replica,
     std::size_t replica_count,
+    const std::string &fault_mode,
     const std::string &raw_configuration,
     const std::string &raw_additional_omission_configuration,
     const std::string &diagnostic_window,
     const std::string &raw_false_report_target,
     bool omit_outbound_aggregate,
     bool omit_outbound_direct_vote,
-    int context_limit)
+    int context_limit,
+    const std::string &raw_rotating_omission_actors,
+    const std::string &raw_window_start_monotonic_ns,
+    const std::string &raw_window_end_monotonic_ns,
+    int max_omissions_per_proposal,
+    int maximum_rotating_contexts)
 {
+    const bool rotating_argument_present =
+        !raw_rotating_omission_actors.empty() ||
+        !raw_window_start_monotonic_ns.empty() ||
+        !raw_window_end_monotonic_ns.empty() ||
+        max_omissions_per_proposal != 0 ||
+        maximum_rotating_contexts != 0;
     const bool requested =
+        !fault_mode.empty() ||
         !raw_configuration.empty() ||
         !raw_additional_omission_configuration.empty() ||
         !diagnostic_window.empty() ||
         !raw_false_report_target.empty() ||
         omit_outbound_aggregate ||
         omit_outbound_direct_vote ||
-        context_limit != 0;
+        context_limit != 0 || rotating_argument_present;
     if (!requested)
         return std::nullopt;
     if (protocol_mode != "adaptive_v2")
         throw HotStuffError(
             "experiment Byzantine faults require adaptive-v2");
-    if (raw_configuration.empty() || diagnostic_window.empty())
+    if (diagnostic_window.empty())
         throw HotStuffError(
-            "experiment Byzantine configuration and window are required");
+            "experiment Byzantine window is required");
     if (diagnostic_window.size() > 128 ||
         !std::all_of(
             diagnostic_window.begin(),
@@ -253,16 +266,40 @@ parse_experiment_byzantine_options(
             }))
         throw HotStuffError(
             "experiment Byzantine window must be a safe identifier");
-    if (context_limit <= 0)
-        throw HotStuffError(
-            "experiment Byzantine context limit must be positive");
+    const bool rotating_mode = !fault_mode.empty();
     const auto fault_mode_count =
         static_cast<unsigned>(!raw_false_report_target.empty()) +
         static_cast<unsigned>(omit_outbound_aggregate) +
-        static_cast<unsigned>(omit_outbound_direct_vote);
+        static_cast<unsigned>(omit_outbound_direct_vote) +
+        static_cast<unsigned>(rotating_mode);
     if (fault_mode_count != 1)
         throw HotStuffError(
             "select exactly one experiment Byzantine fault mode");
+    if (rotating_mode)
+    {
+        if (fault_mode != "rotating_intermittent_omission_v1")
+            throw HotStuffError(
+                "unsupported experiment Byzantine mode");
+        if (!raw_configuration.empty() ||
+            !raw_additional_omission_configuration.empty() ||
+            context_limit != 0)
+            throw HotStuffError(
+                "rotating omission does not accept static configuration "
+                "or a context limit");
+    }
+    else
+    {
+        if (rotating_argument_present)
+            throw HotStuffError(
+                "rotating omission arguments require an experiment "
+                "Byzantine mode");
+        if (raw_configuration.empty())
+            throw HotStuffError(
+                "experiment Byzantine configuration is required");
+        if (context_limit <= 0)
+            throw HotStuffError(
+                "experiment Byzantine context limit must be positive");
+    }
     if (omit_outbound_direct_vote &&
         !raw_additional_omission_configuration.empty())
         throw HotStuffError(
@@ -306,6 +343,50 @@ parse_experiment_byzantine_options(
 
     hotstuff::ExperimentByzantineOptions options;
     options.enabled = true;
+    options.diagnostic_window = diagnostic_window;
+    if (rotating_mode)
+    {
+        if (raw_rotating_omission_actors.empty() ||
+            raw_window_start_monotonic_ns.empty() ||
+            raw_window_end_monotonic_ns.empty() ||
+            max_omissions_per_proposal != 1 ||
+            maximum_rotating_contexts <= 0)
+            throw HotStuffError(
+                "rotating omission requires actors, an exact monotonic "
+                "window, and one omission per proposal");
+        const auto quorum =
+            hotstuff::derive_byzantine_quorum(replica_count);
+        if (!quorum.has_value())
+            throw HotStuffError(
+                "rotating omission requires a valid Byzantine membership");
+        std::vector<ReplicaID> actors;
+        for (const auto &raw_actor :
+             trim_all(split(raw_rotating_omission_actors, ",")))
+            actors.push_back(parse_adaptive_v2_unsigned<ReplicaID>(
+                raw_actor,
+                "experiment rotating omission actor",
+                false));
+        const auto actor_count = actors.size();
+        options.rotating_omission =
+            hotstuff::ExperimentRotatingOmissionOptions{
+                fault_mode,
+                local_replica,
+                replica_count,
+                std::move(actors),
+                actor_count,
+                parse_adaptive_v2_unsigned<std::uint64_t>(
+                    raw_window_start_monotonic_ns,
+                    "experiment Byzantine window start",
+                    true),
+                parse_adaptive_v2_unsigned<std::uint64_t>(
+                    raw_window_end_monotonic_ns,
+                    "experiment Byzantine window end",
+                    true),
+                static_cast<std::size_t>(max_omissions_per_proposal),
+                static_cast<std::size_t>(maximum_rotating_contexts)};
+        return options;
+    }
+
     options.configuration = parse_configuration(
         raw_configuration,
         "experiment Byzantine configuration");
@@ -327,7 +408,6 @@ parse_experiment_byzantine_options(
                 "use a distinct tree");
         options.additional_omission_configuration = additional;
     }
-    options.diagnostic_window = diagnostic_window;
     if (!raw_false_report_target.empty())
     {
         const auto target =
@@ -711,6 +791,8 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_experiment_byzantine_configuration =
         Config::OptValStr::create("");
+    auto opt_experiment_byzantine_mode =
+        Config::OptValStr::create("");
     auto opt_experiment_omission_additional_configuration =
         Config::OptValStr::create("");
     auto opt_experiment_byzantine_window =
@@ -722,6 +804,16 @@ int main(int argc, char **argv)
     auto opt_experiment_omit_outbound_direct_vote =
         Config::OptValFlag::create(false);
     auto opt_experiment_byzantine_context_limit =
+        Config::OptValInt::create(0);
+    auto opt_experiment_rotating_omission_actors =
+        Config::OptValStr::create("");
+    auto opt_experiment_byzantine_window_start_monotonic_ns =
+        Config::OptValStr::create("");
+    auto opt_experiment_byzantine_window_end_monotonic_ns =
+        Config::OptValStr::create("");
+    auto opt_experiment_byzantine_max_omissions_per_proposal =
+        Config::OptValInt::create(0);
+    auto opt_experiment_rotating_omission_context_limit =
         Config::OptValInt::create(0);
     auto opt_experiment_post_qc_audit_configuration =
         Config::OptValStr::create("");
@@ -875,6 +967,12 @@ int main(int argc, char **argv)
         -1,
         "exact instance ID of the designated commit observer");
     config.add_opt(
+        "experiment-byzantine-mode",
+        opt_experiment_byzantine_mode,
+        Config::SET_VAL,
+        -1,
+        "exact experiment-only Byzantine fault mode");
+    config.add_opt(
         "experiment-byzantine-configuration",
         opt_experiment_byzantine_configuration,
         Config::SET_VAL,
@@ -916,6 +1014,36 @@ int main(int argc, char **argv)
         Config::SET_VAL,
         -1,
         "maximum exact proposal contexts affected by the fault");
+    config.add_opt(
+        "experiment-rotating-omission-actors",
+        opt_experiment_rotating_omission_actors,
+        Config::SET_VAL,
+        -1,
+        "comma-separated rotating omission actor replica IDs");
+    config.add_opt(
+        "experiment-byzantine-window-start-monotonic-ns",
+        opt_experiment_byzantine_window_start_monotonic_ns,
+        Config::SET_VAL,
+        -1,
+        "inclusive rotating omission window start on CLOCK_MONOTONIC_RAW");
+    config.add_opt(
+        "experiment-byzantine-window-end-monotonic-ns",
+        opt_experiment_byzantine_window_end_monotonic_ns,
+        Config::SET_VAL,
+        -1,
+        "exclusive rotating omission window end on CLOCK_MONOTONIC_RAW");
+    config.add_opt(
+        "experiment-byzantine-max-omissions-per-proposal",
+        opt_experiment_byzantine_max_omissions_per_proposal,
+        Config::SET_VAL,
+        -1,
+        "rotating omission bound, fixed at one per proposal");
+    config.add_opt(
+        "experiment-rotating-omission-context-limit",
+        opt_experiment_rotating_omission_context_limit,
+        Config::SET_VAL,
+        -1,
+        "maximum retained exact rotating omission proposal contexts");
     config.add_opt(
         "experiment-post-qc-audit-configuration",
         opt_experiment_post_qc_audit_configuration,
@@ -1034,13 +1162,19 @@ int main(int argc, char **argv)
             opt_epoch_protocol_mode->get(),
             static_cast<ReplicaID>(idx),
             replicas.size(),
+            opt_experiment_byzantine_mode->get(),
             opt_experiment_byzantine_configuration->get(),
             opt_experiment_omission_additional_configuration->get(),
             opt_experiment_byzantine_window->get(),
             opt_experiment_false_report_target->get(),
             opt_experiment_omit_outbound_aggregate->get(),
             opt_experiment_omit_outbound_direct_vote->get(),
-            opt_experiment_byzantine_context_limit->get());
+            opt_experiment_byzantine_context_limit->get(),
+            opt_experiment_rotating_omission_actors->get(),
+            opt_experiment_byzantine_window_start_monotonic_ns->get(),
+            opt_experiment_byzantine_window_end_monotonic_ns->get(),
+            opt_experiment_byzantine_max_omissions_per_proposal->get(),
+            opt_experiment_rotating_omission_context_limit->get());
     const auto experiment_post_qc_audit_options =
         parse_experiment_post_qc_audit_options(
             opt_epoch_protocol_mode->get(),

@@ -70,7 +70,8 @@ bool exact_selection_metadata(
     return metadata.replica_count == quorum.replica_count &&
            metadata.fault_threshold == quorum.fault_threshold &&
            metadata.quorum == quorum.quorum &&
-           metadata.required_nonresponsive == quorum.fault_threshold &&
+           metadata.required_nonresponsive != 0 &&
+           metadata.required_nonresponsive <= quorum.fault_threshold &&
            metadata.required_qualifying_reporters ==
                quorum.fault_threshold + 1U &&
            metadata.minimum_timeouts_per_reporter != 0 &&
@@ -96,7 +97,8 @@ bool valid_guarded_candidates(
     const std::set<ReplicaID> &membership,
     const ByzantineQuorum &quorum)
 {
-    if (selection.eligible_candidates.size() < quorum.fault_threshold)
+    if (selection.eligible_candidates.size() <
+        selection.metadata.required_nonresponsive)
         return false;
 
     std::set<ReplicaID> candidate_ids;
@@ -139,7 +141,7 @@ bool valid_guarded_candidates(
     }
 
     for (std::size_t index = 0;
-         index < quorum.fault_threshold;
+         index < selection.metadata.required_nonresponsive;
          ++index)
     {
         if (selection.eligible_candidates[index].replica_id !=
@@ -189,7 +191,8 @@ ConsensusConstraints current_consensus_constraints(
         return {ConsensusConstraintStatus::empty, {}};
     }
 
-    if (canonical.size() != quorum.fault_threshold ||
+    if (canonical.empty() ||
+        canonical.size() > quorum.fault_threshold ||
         !std::is_sorted(canonical.begin(), canonical.end()) ||
         std::adjacent_find(canonical.begin(), canonical.end()) !=
             canonical.end())
@@ -241,7 +244,8 @@ AdaptiveV2EpochFactoryStatus validate_selection(
     if (selection.status != AdaptiveV2SelectionStatus::selected ||
         selection.snapshot == nullptr ||
         !exact_selection_metadata(selection, quorum) ||
-        selection.selected_replicas.size() != quorum.fault_threshold)
+        selection.selected_replicas.size() !=
+            selection.metadata.required_nonresponsive)
     {
         return AdaptiveV2EpochFactoryStatus::invalid_selection;
     }
@@ -285,9 +289,7 @@ AdaptiveV2EpochFactoryStatus validate_selection(
     case AdaptiveV2SelectionConstraintBasis::
         inherited_consensus_wait_exempt:
     {
-        if (transition_policy.intent !=
-                TreePolicyKind::performance_optimization ||
-            !selection.eligible_candidates.empty() ||
+        if (!selection.eligible_candidates.empty() ||
             current_constraints.status !=
                 ConsensusConstraintStatus::exact)
         {
@@ -350,7 +352,8 @@ AdaptiveV2EpochFactoryStatus validate_selection(
         {
             return AdaptiveV2EpochFactoryStatus::root_mismatch;
         }
-        snapshot_roots.push_back(entry.replica_id);
+        if (snapshot_roots.size() < quorum.quorum)
+            snapshot_roots.push_back(entry.replica_id);
     }
 
     if (selection.constraint_basis ==
@@ -513,7 +516,6 @@ bool exact_containment_placement(
     const TreePlacementInput &input,
     const AdaptationSnapshot &snapshot,
     const std::vector<ReplicaID> &membership,
-    const std::vector<ReplicaID> &roots,
     const std::vector<ReplicaID> &selected)
 {
     const auto baselines = canonical_baseline_roots(
@@ -535,7 +537,15 @@ bool exact_containment_placement(
 
     const std::set<ReplicaID> member_set(
         membership.begin(), membership.end());
-    const std::set<ReplicaID> eligible(roots.begin(), roots.end());
+    std::vector<ReplicaID> eligible_roots;
+    eligible_roots.reserve(snapshot.ranking().size());
+    for (const auto &entry : snapshot.ranking())
+    {
+        if (entry.eligible)
+            eligible_roots.push_back(entry.replica_id);
+    }
+    const std::set<ReplicaID> eligible(
+        eligible_roots.begin(), eligible_roots.end());
     std::vector<bool> preserve(baselines->size(), false);
     std::set<ReplicaID> reserved;
     for (std::size_t tree = 0; tree < baselines->size(); ++tree)
@@ -570,10 +580,12 @@ bool exact_containment_placement(
             }
 
             const auto replacement = std::find_if(
-                roots.begin(), roots.end(), [&chosen](ReplicaID candidate) {
+                eligible_roots.begin(),
+                eligible_roots.end(),
+                [&chosen](ReplicaID candidate) {
                     return chosen.count(candidate) == 0;
                 });
-            if (replacement == roots.end())
+            if (replacement == eligible_roots.end())
                 return false;
             expected = *replacement;
             chosen.insert(expected);
@@ -772,7 +784,6 @@ AdaptiveV2EpochFactoryResult build_validated(
                   placement_input,
                   *selection.snapshot,
                   *current_members,
-                  roots,
                   selected)
             : exact_optimized_placement(
                   *placement,

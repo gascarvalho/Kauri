@@ -177,6 +177,13 @@ set_tests_properties(
     LABELS "unit;adaptive;experiment;byzantine;intentional-red"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_experiment_byzantine_runtime_integration
+    test_experiment_byzantine_runtime_integration.cpp)
+set_tests_properties(
+    test_experiment_byzantine_runtime_integration PROPERTIES
+    LABELS "unit;adaptive;experiment;byzantine;runtime-integration"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_experiment_post_qc_audit
     test_experiment_post_qc_audit.cpp)
 target_compile_definitions(
@@ -236,6 +243,16 @@ add_kauri_catch_test(
 set_tests_properties(
     test_adaptive_v2_selection PROPERTIES
     LABELS "unit;adaptive;selection;byzantine-guard;n7"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_adaptive_v2_shape_selection
+    test_adaptive_v2_shape_selection.cpp)
+target_compile_definitions(
+    test_adaptive_v2_shape_selection PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+set_tests_properties(
+    test_adaptive_v2_shape_selection PROPERTIES
+    LABELS "unit;adaptive;shape-selection;shape25"
     TIMEOUT 10)
 add_kauri_catch_test(
     test_adaptive_v2_epoch_factory

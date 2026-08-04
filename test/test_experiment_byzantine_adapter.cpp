@@ -1,13 +1,17 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "catch.hpp"
 #include "hotstuff/configuration.h"
@@ -192,8 +196,13 @@ using hotstuff::ExperimentByzantineContext;
 using hotstuff::ExperimentByzantineOptions;
 using hotstuff::ExperimentDirectVoteDisposition;
 using hotstuff::ExperimentFalseTimeoutFenceTestAccess;
+using hotstuff::ExperimentOmissionAction;
+using hotstuff::ExperimentOmissionMarker;
+using hotstuff::ExperimentReplicaRole;
+using hotstuff::ExperimentRotatingOmissionOptions;
 using hotstuff::ProposalKey;
 using hotstuff::ReplicaID;
+using hotstuff::format_experiment_omission_marker;
 using hotstuff::uint256_t;
 
 uint256_t digest(const std::string &label)
@@ -248,6 +257,97 @@ ExperimentByzantineOptions direct_vote_omission_options()
     options.omit_outbound_direct_vote = true;
     options.maximum_direct_vote_omission_contexts = 2;
     return options;
+}
+
+ExperimentByzantineOptions rotating_omission_options(
+    ReplicaID local_replica,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr,
+    std::vector<std::string> *encoded_markers = nullptr)
+{
+    ExperimentByzantineOptions options;
+    options.enabled = true;
+    options.diagnostic_window = "factorial-window-1";
+    options.rotating_omission = ExperimentRotatingOmissionOptions{
+        "rotating_intermittent_omission_v1",
+        local_replica,
+        7,
+        {1, 3},
+        2,
+        100,
+        200,
+        1,
+        100'000};
+    if (markers != nullptr || encoded_markers != nullptr)
+        options.omission_marker_emitter =
+            [markers, encoded_markers](
+                const ExperimentOmissionMarker &marker)
+            {
+                if (markers != nullptr)
+                    markers->push_back(marker);
+                if (encoded_markers != nullptr)
+                    encoded_markers->push_back(
+                        format_experiment_omission_marker(marker));
+            };
+    return options;
+}
+
+ExperimentByzantineContext selected_context(
+    const ExperimentByzantineAdapter &adapter,
+    ReplicaID selected_actor,
+    const std::string &label)
+{
+    for (std::uint32_t index = 0; index < 10'000; ++index)
+    {
+        const auto candidate = context(
+            label + "-" + std::to_string(index),
+            configuration(),
+            "factorial-window-1");
+        if (adapter.rotating_omission_actor(candidate.proposal) ==
+            std::optional<ReplicaID>{selected_actor})
+            return candidate;
+    }
+    throw std::runtime_error("could not find selected actor context");
+}
+
+std::map<std::string, std::string> parse_marker_fields(
+    const std::string &encoded)
+{
+    const std::vector<std::string> expected_order{
+        "fault",
+        "proposal_epoch",
+        "proposal_tree",
+        "proposal_epoch_digest",
+        "proposal_block_hash",
+        "window",
+        "window_start_monotonic_ns",
+        "window_end_monotonic_ns",
+        "actor",
+        "action",
+        "monotonic_ns"};
+    std::istringstream input(encoded);
+    std::map<std::string, std::string> fields;
+    std::string token;
+    if (!(input >> token) || token != "KAURI_FAULT")
+        throw std::invalid_argument("missing KAURI_FAULT marker prefix");
+    while (input >> token)
+    {
+        const auto separator = token.find('=');
+        if (separator == std::string::npos || separator == 0 ||
+            separator + 1 == token.size())
+            throw std::invalid_argument("malformed marker field");
+        const auto key = token.substr(0, separator);
+        if (fields.size() >= expected_order.size() ||
+            key != expected_order[fields.size()])
+            throw std::invalid_argument("unexpected marker field order");
+        if (!fields.emplace(
+                key,
+                token.substr(separator + 1))
+                 .second)
+            throw std::invalid_argument("duplicate marker field");
+    }
+    if (fields.size() != expected_order.size())
+        throw std::invalid_argument("incomplete marker fields");
+    return fields;
 }
 
 std::string source(const std::string &relative_path)
@@ -419,6 +519,14 @@ TEST_CASE(
     "persistent omitter consumes one aggregate per exact bounded context",
     "[adaptive-v2][experiment][byzantine][omission]")
 {
+    ExperimentByzantineAdapter role_guard(
+        aggregate_omission_options());
+    const auto guarded = context("aggregate-role-guard");
+    CHECK_FALSE(role_guard.consume_outbound_aggregate(
+        guarded, ExperimentReplicaRole::root));
+    CHECK(role_guard.consume_outbound_aggregate(
+        guarded, ExperimentReplicaRole::internal));
+
     ExperimentByzantineAdapter adapter(aggregate_omission_options());
     const auto first = context("omission-first");
     const auto second = context("omission-second");
@@ -465,7 +573,15 @@ TEST_CASE(
     // The additional tree is independently exact; it does not wait for the
     // primary tree to be omitted first.
     CHECK(adapter.consume_outbound_aggregate(followup));
+    CHECK(adapter.consume_outbound_aggregate_marker(followup));
+    CHECK_FALSE(adapter.consume_outbound_aggregate_marker(followup));
+    // A retry remains consumed without spending another bounded context or
+    // emitting another marker, so the primary tree can still be selected.
+    CHECK(adapter.consume_outbound_aggregate(followup));
+    CHECK_FALSE(adapter.consume_outbound_aggregate_marker(followup));
     CHECK(adapter.consume_outbound_aggregate(primary));
+    CHECK(adapter.consume_outbound_aggregate_marker(primary));
+    CHECK_FALSE(adapter.consume_outbound_aggregate_marker(primary));
 
     // Aggregate omission is the adapter's only configured fault mode.
     CHECK_FALSE(adapter.arm_false_report(primary, 4));
@@ -508,6 +624,20 @@ TEST_CASE(
     "direct-vote omission is exact bounded and persistent across retries",
     "[adaptive-v2][experiment][byzantine][direct-vote][ordering]")
 {
+    ExperimentByzantineAdapter role_guard(
+        direct_vote_omission_options());
+    const auto guarded = context("direct-role-guard");
+    CHECK(
+        role_guard.consume_outbound_direct_vote(
+            guarded, ExperimentReplicaRole::internal) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(role_guard.outbound_direct_vote_omitted(guarded));
+    CHECK(
+        role_guard.consume_outbound_direct_vote(
+            guarded, ExperimentReplicaRole::leaf) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(role_guard.outbound_direct_vote_omitted(guarded));
+
     ExperimentByzantineAdapter adapter(direct_vote_omission_options());
     const auto first = context("direct-first");
     const auto second = context("direct-second");
@@ -581,6 +711,380 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "direct-vote omission forwards non-leaves and omits a leaf once",
+    "[adaptive-v2][experiment][byzantine][direct-vote][role]")
+{
+    ExperimentByzantineAdapter adapter(direct_vote_omission_options());
+    const auto root = context("static-root");
+    const auto internal = context("static-internal");
+    const auto leaf = context("static-leaf");
+
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            root, ExperimentReplicaRole::root, 1) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            internal, ExperimentReplicaRole::internal, 1) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 1) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 2) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+}
+
+TEST_CASE(
+    "rotating omission configuration is exact bounded and mutually exclusive",
+    "[adaptive-v2][experiment][byzantine][rotating][validation]")
+{
+    auto wrong_mode = rotating_omission_options(1);
+    wrong_mode.rotating_omission->mode = "other";
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(wrong_mode),
+        std::invalid_argument);
+
+    auto count_mismatch = rotating_omission_options(1);
+    count_mismatch.rotating_omission->expected_actor_count = 3;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(count_mismatch),
+        std::invalid_argument);
+
+    auto bounded_minority = rotating_omission_options(1);
+    bounded_minority.rotating_omission->actor_ids = {1};
+    bounded_minority.rotating_omission->expected_actor_count = 1;
+    CHECK_NOTHROW(ExperimentByzantineAdapter(bounded_minority));
+
+    auto derived_count_mismatch = rotating_omission_options(1);
+    derived_count_mismatch.rotating_omission->actor_ids = {1, 3, 5};
+    derived_count_mismatch.rotating_omission->expected_actor_count = 3;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(derived_count_mismatch),
+        std::invalid_argument);
+
+    auto duplicate = rotating_omission_options(1);
+    duplicate.rotating_omission->actor_ids = {1, 1};
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(duplicate),
+        std::invalid_argument);
+
+    auto out_of_range = rotating_omission_options(1);
+    out_of_range.rotating_omission->actor_ids = {1, 7};
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(out_of_range),
+        std::invalid_argument);
+
+    auto zero_start = rotating_omission_options(1);
+    zero_start.rotating_omission->window_start_monotonic_ns = 0;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(zero_start),
+        std::invalid_argument);
+
+    auto inverted_window = rotating_omission_options(1);
+    inverted_window.rotating_omission->window_end_monotonic_ns = 100;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(inverted_window),
+        std::invalid_argument);
+
+    auto multiple_omissions = rotating_omission_options(1);
+    multiple_omissions.rotating_omission->max_omissions_per_proposal = 2;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(multiple_omissions),
+        std::invalid_argument);
+
+    auto zero_context_bound = rotating_omission_options(1);
+    zero_context_bound.rotating_omission->maximum_contexts = 0;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(zero_context_bound),
+        std::invalid_argument);
+
+    auto ambiguous = rotating_omission_options(1);
+    ambiguous.omit_outbound_aggregate = true;
+    ambiguous.maximum_omission_contexts = 1;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(ambiguous),
+        std::invalid_argument);
+}
+
+TEST_CASE(
+    "rotating actor selection matches frozen cross-language FNV-1a vectors",
+    "[adaptive-v2][experiment][byzantine][rotating][fnv1a]")
+{
+    struct Vector
+    {
+        std::uint32_t epoch;
+        std::uint32_t tree;
+        const char *epoch_digest;
+        const char *block_hash;
+        std::vector<ReplicaID> actors;
+        ReplicaID selected;
+    };
+    const std::vector<Vector> vectors{
+        {0,
+         0,
+         "0000000000000000000000000000000000000000000000000000000000000000",
+         "0000000000000000000000000000000000000000000000000000000000000000",
+         {1, 3},
+         3},
+        {7,
+         3,
+         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+         "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+         {1, 3},
+         3},
+        {0xffff'ffff,
+         0x1020'3040,
+         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+         "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+         {2, 5, 8, 11},
+         5},
+    };
+
+    for (const auto &vector : vectors)
+    {
+        auto options = rotating_omission_options(vector.actors.front());
+        options.rotating_omission->replica_count =
+            vector.actors.size() == 2 ? 7 : 13;
+        options.rotating_omission->actor_ids = vector.actors;
+        options.rotating_omission->expected_actor_count =
+            vector.actors.size();
+        ExperimentByzantineAdapter adapter(std::move(options));
+        const ProposalKey proposal{
+            ConfigurationId{
+                vector.epoch,
+                vector.tree,
+                uint256_t(hotstuff::from_hex(vector.epoch_digest))},
+            uint256_t(hotstuff::from_hex(vector.block_hash))};
+        CHECK(adapter.rotating_omission_actor(proposal) ==
+              std::optional<ReplicaID>{vector.selected});
+    }
+}
+
+TEST_CASE(
+    "proposal-context rotation is deterministic and independent of input order",
+    "[adaptive-v2][experiment][byzantine][rotating][selection]")
+{
+    auto reversed = rotating_omission_options(1);
+    reversed.rotating_omission->actor_ids = {3, 1};
+    ExperimentByzantineAdapter first(rotating_omission_options(1));
+    ExperimentByzantineAdapter second(reversed);
+    std::vector<ReplicaID> observed;
+
+    for (std::uint32_t index = 0; index < 128; ++index)
+    {
+        const auto proposal = context(
+            "rotation-" + std::to_string(index)).proposal;
+        const auto first_actor = first.rotating_omission_actor(proposal);
+        const auto second_actor = second.rotating_omission_actor(proposal);
+        REQUIRE(first_actor.has_value());
+        CHECK(first_actor == second_actor);
+        observed.push_back(*first_actor);
+    }
+    CHECK(std::find(observed.begin(), observed.end(), ReplicaID{1}) !=
+          observed.end());
+    CHECK(std::find(observed.begin(), observed.end(), ReplicaID{3}) !=
+          observed.end());
+}
+
+TEST_CASE(
+    "rotating omission obeys window role selection retry and marker contracts",
+    "[adaptive-v2][experiment][byzantine][rotating][behavior]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    ExperimentByzantineAdapter actor_one(
+        rotating_omission_options(1, &markers, &encoded_markers));
+
+    ExperimentByzantineAdapter exact_window(
+        rotating_omission_options(1));
+    const auto exact = selected_context(exact_window, 1, "exact-window");
+    auto wrong_window = exact;
+    wrong_window.diagnostic_window = "other-window";
+    CHECK(
+        exact_window.consume_outbound_direct_vote(
+            wrong_window, ExperimentReplicaRole::leaf, 150) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK(
+        exact_window.consume_outbound_direct_vote(
+            exact, ExperimentReplicaRole::leaf, 150) ==
+        ExperimentDirectVoteDisposition::omit_first);
+
+    const auto before = selected_context(actor_one, 1, "before");
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            before, ExperimentReplicaRole::leaf, 99) ==
+        ExperimentDirectVoteDisposition::forward);
+    // The first exact-key decision is stable even after the window opens.
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            before, ExperimentReplicaRole::leaf, 150) ==
+        ExperimentDirectVoteDisposition::forward);
+
+    const auto after = selected_context(actor_one, 1, "after");
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            after, ExperimentReplicaRole::leaf, 200) ==
+        ExperimentDirectVoteDisposition::forward);
+
+    const auto root = selected_context(actor_one, 1, "root");
+    CHECK_FALSE(actor_one.consume_outbound_aggregate(
+        root, ExperimentReplicaRole::root, 150));
+    // A retry through another seam cannot turn the cached root decision into
+    // an omission.
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            root, ExperimentReplicaRole::leaf, 151) ==
+        ExperimentDirectVoteDisposition::forward);
+
+    const auto internal = selected_context(actor_one, 1, "internal");
+    CHECK(actor_one.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 100));
+    REQUIRE(markers.size() == 1);
+    REQUIRE(encoded_markers.size() == 1);
+    CHECK(actor_one.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 101));
+    CHECK(markers.size() == 1);
+    CHECK(encoded_markers.size() == 1);
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            internal, ExperimentReplicaRole::leaf, 102) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(actor_one.outbound_direct_vote_omitted(internal));
+    CHECK(markers.size() == 1);
+    CHECK(encoded_markers.size() == 1);
+
+    const auto leaf = selected_context(actor_one, 1, "leaf");
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 160) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    REQUIRE(markers.size() == 2);
+    REQUIRE(encoded_markers.size() == 2);
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 161) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+    CHECK(markers.size() == 2);
+    CHECK(encoded_markers.size() == 2);
+    CHECK(actor_one.outbound_direct_vote_omitted(leaf));
+    CHECK_FALSE(actor_one.consume_outbound_aggregate(
+        leaf, ExperimentReplicaRole::internal, 162));
+    CHECK(markers.size() == 2);
+    CHECK(encoded_markers.size() == 2);
+
+    CHECK(markers[0].proposal == internal.proposal);
+    CHECK(markers[0].diagnostic_window == "factorial-window-1");
+    CHECK(markers[0].actor == 1);
+    CHECK(markers[0].action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(markers[0].window_start_monotonic_ns == 100);
+    CHECK(markers[0].window_end_monotonic_ns == 200);
+    CHECK(markers[0].monotonic_ns == 100);
+    CHECK(markers[1].proposal == leaf.proposal);
+    CHECK(markers[1].actor == 1);
+    CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
+    CHECK(markers[1].monotonic_ns == 160);
+    CHECK(markers[0].monotonic_ns < markers[1].monotonic_ns);
+    CHECK(markers[0].monotonic_ns >=
+          markers[0].window_start_monotonic_ns);
+    CHECK(markers[1].monotonic_ns < markers[1].window_end_monotonic_ns);
+
+    const auto aggregate_fields =
+        parse_marker_fields(encoded_markers[0]);
+    CHECK(
+        aggregate_fields.at("fault") ==
+        "rotating_intermittent_omission_v1");
+    CHECK(aggregate_fields.at("proposal_epoch") == "7");
+    CHECK(aggregate_fields.at("proposal_tree") == "3");
+    CHECK(
+        aggregate_fields.at("proposal_epoch_digest") ==
+        hotstuff::get_hex(internal.proposal.configuration.epoch_digest));
+    CHECK(
+        aggregate_fields.at("proposal_block_hash") ==
+        hotstuff::get_hex(internal.proposal.block_hash));
+    CHECK(aggregate_fields.at("window") == "factorial-window-1");
+    CHECK(aggregate_fields.at("window_start_monotonic_ns") == "100");
+    CHECK(aggregate_fields.at("window_end_monotonic_ns") == "200");
+    CHECK(aggregate_fields.at("actor") == "1");
+    CHECK(aggregate_fields.at("action") == "omit_aggregate");
+    CHECK(aggregate_fields.at("monotonic_ns") == "100");
+
+    const auto direct_fields = parse_marker_fields(encoded_markers[1]);
+    CHECK(direct_fields.at("proposal_epoch") == "7");
+    CHECK(direct_fields.at("proposal_tree") == "3");
+    CHECK(
+        direct_fields.at("proposal_epoch_digest") ==
+        hotstuff::get_hex(leaf.proposal.configuration.epoch_digest));
+    CHECK(
+        direct_fields.at("proposal_block_hash") ==
+        hotstuff::get_hex(leaf.proposal.block_hash));
+    CHECK(direct_fields.at("action") == "omit_direct_vote");
+    CHECK(direct_fields.at("monotonic_ns") == "160");
+}
+
+TEST_CASE(
+    "rotating omission leaves every nonselected actor correct",
+    "[adaptive-v2][experiment][byzantine][rotating][nonselected]")
+{
+    ExperimentByzantineAdapter selector(rotating_omission_options(1));
+    const auto selected = selected_context(selector, 1, "nonselected");
+    ExperimentByzantineAdapter nonselected(rotating_omission_options(3));
+
+    REQUIRE(nonselected.rotating_omission_actor(selected.proposal) ==
+            std::optional<ReplicaID>{1});
+    CHECK_FALSE(nonselected.consume_outbound_aggregate(
+        selected, ExperimentReplicaRole::internal, 150));
+    CHECK(
+        nonselected.consume_outbound_direct_vote(
+            selected, ExperimentReplicaRole::leaf, 150) ==
+        ExperimentDirectVoteDisposition::forward);
+}
+
+TEST_CASE(
+    "rotating context exhaustion forwards and emits one terminal marker",
+    "[adaptive-v2][experiment][byzantine][rotating][capacity]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    auto options =
+        rotating_omission_options(1, &markers, &encoded_markers);
+    options.rotating_omission->maximum_contexts = 1;
+    ExperimentByzantineAdapter adapter(std::move(options));
+
+    const auto retained = selected_context(adapter, 1, "retained");
+    REQUIRE(adapter.consume_outbound_aggregate(
+        retained, ExperimentReplicaRole::internal, 150));
+    CHECK(adapter.consume_outbound_aggregate(
+        retained, ExperimentReplicaRole::internal, 151));
+
+    const auto exhausted = selected_context(adapter, 1, "exhausted");
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            exhausted, ExperimentReplicaRole::leaf, 152) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            exhausted, ExperimentReplicaRole::leaf, 153) ==
+        ExperimentDirectVoteDisposition::forward);
+    const auto later = selected_context(adapter, 1, "later");
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        later, ExperimentReplicaRole::internal, 154));
+
+    REQUIRE(markers.size() == 2);
+    REQUIRE(encoded_markers.size() == 2);
+    CHECK(markers[0].action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(markers[1].proposal == exhausted.proposal);
+    CHECK(markers[1].action ==
+          ExperimentOmissionAction::capacity_exhausted);
+    CHECK(markers[1].monotonic_ns == 152);
+    const auto fields = parse_marker_fields(encoded_markers[1]);
+    CHECK(fields.at("action") == "capacity_exhausted");
+    CHECK(fields.at("monotonic_ns") == "152");
+}
+
+TEST_CASE(
     "experiment marker raw clock is available and positive",
     "[adaptive-v2][experiment][byzantine][clock]")
 {
@@ -634,6 +1138,9 @@ TEST_CASE(
     CHECK(
         manager.find("experiment-omit-outbound-direct-vote") ==
         std::string::npos);
+    CHECK(
+        manager.find("rotating_intermittent_omission_v1") ==
+        std::string::npos);
 }
 
 TEST_CASE(
@@ -649,6 +1156,9 @@ TEST_CASE(
     CHECK(
         declarations.find(
             "opt_experiment_byzantine_configuration") !=
+        std::string::npos);
+    CHECK(
+        declarations.find("opt_experiment_byzantine_mode") !=
         std::string::npos);
     CHECK(
         declarations.find(
@@ -675,6 +1185,26 @@ TEST_CASE(
             "opt_experiment_byzantine_context_limit") !=
         std::string::npos);
     CHECK(
+        declarations.find(
+            "opt_experiment_rotating_omission_actors") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
+            "opt_experiment_byzantine_window_start_monotonic_ns") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
+            "opt_experiment_byzantine_window_end_monotonic_ns") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
+            "opt_experiment_byzantine_max_omissions_per_proposal") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
+            "opt_experiment_rotating_omission_context_limit") !=
+        std::string::npos);
+    CHECK(
         declarations.find("Config::OptValStr::create(\"\")") !=
         std::string::npos);
     CHECK(
@@ -684,6 +1214,9 @@ TEST_CASE(
         declarations.find("Config::OptValInt::create(0)") !=
         std::string::npos);
 
+    CHECK(
+        application.find("\"experiment-byzantine-mode\"") !=
+        std::string::npos);
     CHECK(
         application.find("\"experiment-byzantine-configuration\"") !=
         std::string::npos);
@@ -707,6 +1240,26 @@ TEST_CASE(
     CHECK(
         application.find("\"experiment-byzantine-context-limit\"") !=
         std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-rotating-omission-actors\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-byzantine-window-start-monotonic-ns\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-byzantine-window-end-monotonic-ns\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-byzantine-max-omissions-per-proposal\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-rotating-omission-context-limit\"") !=
+        std::string::npos);
 
     const auto parser = source_slice(
         application,
@@ -716,6 +1269,12 @@ TEST_CASE(
         parser.find("bool omit_outbound_direct_vote") !=
         std::string::npos);
     CHECK(parser.find("fault_mode_count != 1") != std::string::npos);
+    CHECK(
+        parser.find("rotating_intermittent_omission_v1") !=
+        std::string::npos);
+    CHECK(
+        parser.find("derive_byzantine_quorum(replica_count)") !=
+        std::string::npos);
     CHECK(
         parser.find(
             "direct-vote omission does not accept an additional ") !=
@@ -949,29 +1508,36 @@ TEST_CASE(
         implementation,
         "void HotStuffBase::rebuild_aggregation_timeout_coordinator",
         "void HotStuffBase::set_aggregation_timeout");
+    const auto outbound_hook = source_slice(
+        implementation,
+        "bool HotStuffBase::consume_experiment_outbound_aggregate",
+        "bool HotStuffBase::send_exact_relay");
 
     const auto consume =
-        coordinator.find("consume_outbound_aggregate");
+        outbound_hook.find("consume_outbound_aggregate");
     const auto audit =
-        coordinator.find("KAURI_FAULT aggregate_omitted");
+        outbound_hook.find("KAURI_FAULT aggregate_omitted");
     const auto marker_clock =
-        coordinator.find("experiment_fault_marker_monotonic_now_ns");
+        outbound_hook.find("experiment_fault_marker_monotonic_now_ns");
+    const auto hook = coordinator.find(
+        "consume_experiment_outbound_aggregate");
     const auto transport = coordinator.find("send_exact_relay");
     const auto retry =
         coordinator.find("schedule_exact_forwarding_retry");
     REQUIRE(consume != std::string::npos);
     REQUIRE(audit != std::string::npos);
     REQUIRE(marker_clock != std::string::npos);
+    REQUIRE(hook != std::string::npos);
     REQUIRE(transport != std::string::npos);
     REQUIRE(retry != std::string::npos);
     CHECK(consume < audit);
     CHECK(consume < marker_clock);
     CHECK(marker_clock < audit);
-    CHECK(audit < transport);
+    CHECK(hook < transport);
     CHECK(transport < retry);
 
     const auto omitted_branch =
-        coordinator.substr(consume, transport - consume);
+        outbound_hook.substr(consume);
     CHECK(omitted_branch.find("return true") != std::string::npos);
     CHECK(
         omitted_branch.find("monotonic_ns=%llu") !=
@@ -1028,18 +1594,11 @@ TEST_CASE(
         "bool HotStuffBase::send_exact_relay",
         "void HotStuffBase::schedule_exact_forwarding_retry");
     const auto relay_consume =
-        relay.find("consume_outbound_aggregate");
-    const auto relay_marker_clock =
-        relay.find("experiment_fault_marker_monotonic_now_ns");
-    const auto relay_audit =
-        relay.find("KAURI_FAULT aggregate_omitted");
+        relay.find("consume_experiment_outbound_aggregate");
+    const auto relay_transport = relay.find("VoteRelay relay");
     REQUIRE(relay_consume != std::string::npos);
-    REQUIRE(relay_marker_clock != std::string::npos);
-    REQUIRE(relay_audit != std::string::npos);
-    CHECK(relay_consume < relay_marker_clock);
-    CHECK(relay_marker_clock < relay_audit);
-    CHECK(relay.find("window=%s") != std::string::npos);
-    CHECK(relay.find("monotonic_ns=%llu") != std::string::npos);
+    REQUIRE(relay_transport != std::string::npos);
+    CHECK(relay_consume < relay_transport);
 
     const auto timeout_application = source_slice(
         aggregation,

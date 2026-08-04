@@ -187,6 +187,19 @@ struct AdaptiveV2EvidenceSnapshotStructuredEvent
     std::vector<ReplicaID> eligible_ranking;
 };
 
+/** Canonical manager-owned audit for one pure shape-v1 decision. */
+struct AdaptiveV2ShapeDecisionStructuredEvent
+{
+    std::uint64_t cycle_ordinal{0};
+    std::string transition_artifact_id;
+    ShapeDecisionRecord decision;
+};
+
+/** Canonical JSON object containing every independently scored candidate. */
+std::string serialize_adaptive_v2_shape_decision_payload(
+    const AdaptiveV2ShapeDecisionStructuredEvent &event,
+    std::size_t maximum_bytes);
+
 /** Canonical JSON object shared by the audit event and immutable artifact. */
 std::string serialize_adaptive_v2_evidence_snapshot_payload(
     const AdaptiveV2EvidenceSnapshotStructuredEvent &event,
@@ -226,7 +239,8 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV2ConvergenceStructuredEvent,
     AdaptiveV2EvidenceSnapshotStructuredEvent,
     AdaptiveV2ManagerSessionTerminalStructuredEvent,
-    EvidenceObservationAcceptedStructuredEvent>;
+    EvidenceObservationAcceptedStructuredEvent,
+    AdaptiveV2ShapeDecisionStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -324,6 +338,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_evidence_snapshot,
     adaptive_v2_session_terminal,
     evidence_observation_accepted,
+    adaptive_v2_shape_decision,
 };
 
 StructuredEventType structured_event_type(

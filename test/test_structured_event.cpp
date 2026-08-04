@@ -528,6 +528,7 @@ using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ManagerCycleOutcome;
 using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
 using hotstuff::AdaptiveV2ManagerSessionTerminalStructuredEvent;
+using hotstuff::AdaptiveV2ShapeDecisionStructuredEvent;
 using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AuditStructuredEventEmitter;
 using hotstuff::AuditStructuredEventPayload;
@@ -552,6 +553,9 @@ using hotstuff::ReplicaID;
 using hotstuff::ResponseObservation;
 using hotstuff::ResponseOutcome;
 using hotstuff::SimpleReputationOutcome;
+using hotstuff::ShapeV1CandidateRejection;
+using hotstuff::ShapeV1CandidateScore;
+using hotstuff::ShapeV1Status;
 using hotstuff::StructuredEventClock;
 using hotstuff::StructuredEventConfig;
 using hotstuff::StructuredEventCursor;
@@ -779,6 +783,44 @@ AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event()
             std::nullopt}};
     event.eligible_ranking = {2, 3, 4, 5, 6};
     return event;
+}
+
+AdaptiveV2ShapeDecisionStructuredEvent shape_decision_event()
+{
+    hotstuff::ShapeDecisionRecord decision;
+    decision.status = ShapeV1Status::selected;
+    decision.selector_version = hotstuff::kShapeV1SelectorVersion;
+    decision.tie_rule = hotstuff::kShapeV1TieRule;
+    decision.epoch_number = 7;
+    decision.epoch_digest = digest("shape-decision-epoch");
+    decision.current_topology_digest =
+        digest("shape-decision-topology");
+    decision.evidence_cutoff = 52;
+    decision.evidence_digest = digest("shape-decision-evidence");
+    decision.predecessor_tree_count = 7;
+    decision.tree_count = 5;
+    decision.fixed_pipeline_stretch = 2;
+    decision.deterministic_seed = 41'719;
+    decision.current_fanout = 2;
+    decision.selected_fanout = 5;
+    decision.applied_fanout = 5;
+    decision.reference_tree_rule =
+        hotstuff::kShapeV1ReferenceTreeRule;
+    decision.candidates = {
+        ShapeV1CandidateScore{
+            2, ShapeV1CandidateRejection::none,
+            2, 900'000, 800, 0, false},
+        ShapeV1CandidateScore{
+            3, ShapeV1CandidateRejection::missing_influential_evidence,
+            2, 0, 0, 0, false},
+        ShapeV1CandidateScore{
+            5, ShapeV1CandidateRejection::none,
+            2, 600'000, 700, 20, true}};
+    decision.decision_digest =
+        hotstuff::compute_shape_decision_digest(decision);
+    REQUIRE(hotstuff::valid_shape_decision_record(decision));
+    return AdaptiveV2ShapeDecisionStructuredEvent{
+        3, "e7-to-e8-shape", std::move(decision)};
 }
 
 AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event(
@@ -1817,8 +1859,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 6,
-        "the audit capability also admits full accepted observations");
+        std::variant_size<AuditStructuredEventPayload>::value == 7,
+        "the audit capability also admits shape decisions");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -1839,6 +1881,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<5, AuditStructuredEventPayload>,
             EvidenceObservationAcceptedStructuredEvent>::value,
         "the sixth audit payload is one full accepted observation");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<6, AuditStructuredEventPayload>,
+            AdaptiveV2ShapeDecisionStructuredEvent>::value,
+        "the seventh audit payload is the pure shape decision");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -1882,11 +1929,83 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
     CHECK(std::string(
               hotstuff::structured_event_type_name(terminal_type)) ==
           "adaptive_v2_session_terminal");
+
+    const auto shape_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{shape_decision_event()});
+    CHECK(shape_type ==
+          StructuredEventType::adaptive_v2_shape_decision);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(shape_type)) ==
+          "adaptive_v2_shape_decision");
 }
 
 TEST_CASE("AE01 serializes exact command and accepted reputation identities",
           "[adaptive-v2][structured-event][audit][ndjson]")
 {
+    SECTION("shape decision contains the complete recomputable record")
+    {
+        const auto event = shape_decision_event();
+        const auto &decision = event.decision;
+        REQUIRE(decision.decision_digest ==
+                hotstuff::compute_shape_decision_digest(decision));
+
+        const auto payload =
+            hotstuff::serialize_adaptive_v2_shape_decision_payload(
+                event, 64 * 1024);
+        const auto expected =
+            "{\"cycle_ordinal\":3,"
+            "\"transition_artifact_id\":\"e7-to-e8-shape\","
+            "\"decision\":{\"schema_version\":1,"
+            "\"status\":\"selected\","
+            "\"selector_version\":\"shape-v1\","
+            "\"tie_rule\":\"lower-latency-risk-churn-current-canonical-v1\","
+            "\"epoch_number\":7,"
+            "\"epoch_digest\":\"" +
+            decision.epoch_digest.to_hex() + "\","
+            "\"current_topology_digest\":\"" +
+            decision.current_topology_digest.to_hex() + "\","
+            "\"evidence_cutoff\":52,"
+            "\"evidence_digest\":\"" +
+            decision.evidence_digest.to_hex() + "\","
+            "\"predecessor_tree_count\":7,"
+            "\"tree_count\":5,"
+            "\"fixed_pipeline_stretch\":2,"
+            "\"deterministic_seed\":41719,"
+            "\"current_fanout\":2,"
+            "\"selected_fanout\":5,"
+            "\"applied_fanout\":5,"
+            "\"reference_tree_rule\":\"lowest-tree-id-prefix-q-v1\","
+            "\"candidates\":[{\"fanout\":2,"
+            "\"rejection\":\"none\","
+            "\"depth\":2,"
+            "\"risk\":900000,\"latency\":800,\"churn\":0,"
+            "\"switch_threshold_satisfied\":false},{"
+            "\"fanout\":3,"
+            "\"rejection\":\"missing_influential_evidence\","
+            "\"depth\":2,"
+            "\"risk\":0,\"latency\":0,\"churn\":0,"
+            "\"switch_threshold_satisfied\":false},{"
+            "\"fanout\":5,\"rejection\":\"none\","
+            "\"depth\":2,"
+            "\"risk\":600000,\"latency\":700,\"churn\":20,"
+            "\"switch_threshold_satisfied\":true}],"
+            "\"decision_digest\":\"" +
+            decision.decision_digest.to_hex() + "\"}}";
+        CHECK(payload == expected);
+
+        FakeClock clock({6999});
+        MemoryOutput output;
+        StructuredEventSink sink(
+            manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+        CHECK(sink.health().healthy);
+        CHECK(rendered(output).find(
+                  "\"event_type\":\"adaptive_v2_shape_decision\","
+                  "\"payload\":" + expected) !=
+              std::string::npos);
+    }
+
     SECTION("committed command includes the consensus block and schedule")
     {
         const auto event = epoch_command_event();
