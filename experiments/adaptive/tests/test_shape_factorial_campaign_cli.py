@@ -1,0 +1,746 @@
+"""Safe CLI-driver tests for the one-shot SHAPE25 campaign."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from experiments.adaptive import run_shape_factorial_campaign as cli
+from experiments.adaptive.kauri_experiment import factorial_execution
+from experiments.adaptive.kauri_experiment.factorial_manifest import (
+    build_factorial_plan,
+    load_frozen_manifest,
+)
+from experiments.adaptive.kauri_experiment.factorial_runtime import (
+    build_factorial_runtime,
+)
+from experiments.adaptive.kauri_experiment.factorial_validation import (
+    CampaignValidationResult,
+    SlotValidationResult,
+)
+
+
+REPOSITORY = Path(__file__).resolve().parents[3]
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
+REVISION = "a" * 40
+
+
+def _fake_build_provenance(
+    repository: Path,
+    build_directory: Path,
+    revision: str,
+) -> dict[str, object]:
+    binary_paths = {
+        "app": build_directory / "examples/hotstuff-app",
+        "manager": build_directory / "examples/adaptation-manager",
+        "keygen": build_directory / "hotstuff-keygen",
+        "tls_keygen": build_directory / "hotstuff-tls-keygen",
+        "epoch_profile_digest": build_directory / "examples/epoch-profile-digest",
+    }
+    metadata_paths = {
+        name: build_directory / "metadata" / name
+        for name in (
+            "adaptation_manager_link",
+            "cmake_cache",
+            "compile_commands",
+            "epoch_profile_digest_link",
+            "hotstuff_app_link",
+            "hotstuff_keygen_link",
+            "hotstuff_tls_keygen_link",
+        )
+    }
+    for name, path in {**binary_paths, **metadata_paths}.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(f"{name}\n".encode())
+
+    def row(path: Path) -> dict[str, object]:
+        payload = path.read_bytes()
+        return {
+            "path": str(path.resolve()),
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    return {
+        "schema_version": 1,
+        "revision": revision,
+        "repository": str(repository),
+        "binaries": {name: row(path) for name, path in binary_paths.items()},
+        "build_metadata": {
+            name: row(path) for name, path in metadata_paths.items()
+        },
+    }
+
+
+@pytest.fixture(scope="module")
+def frozen_contract():
+    plan = build_factorial_plan(load_frozen_manifest(MANIFEST))
+    return plan, build_factorial_runtime(plan)
+
+
+def _preflight(slot, *, result_root: Path, revision: str = REVISION, **kwargs: Any):
+    repository = kwargs["repository"].resolve()
+    build_directory = kwargs["build_directory"].resolve()
+    binaries = factorial_execution.ExecutionBinaries(
+        app=build_directory / "examples/hotstuff-app",
+        manager=build_directory / "examples/adaptation-manager",
+        keygen=build_directory / "hotstuff-keygen",
+        tls_keygen=build_directory / "hotstuff-tls-keygen",
+    )
+    return factorial_execution.ExecutionPreflight(
+        revision=revision,
+        repository=repository,
+        build_directory=build_directory,
+        result_root=result_root.resolve(),
+        slot_directory=result_root.resolve() / slot.slot_id,
+        free_bytes=100_000_000_000,
+        binaries=binaries,
+        build_provenance=_fake_build_provenance(
+            repository,
+            build_directory,
+            revision,
+        ),
+    )
+
+
+def _campaign_validation(outcome: str = "INCOMPLETE") -> CampaignValidationResult:
+    return CampaignValidationResult(
+        outcome=outcome,
+        reason=None if outcome == "PASS" else "prespecified slots remain",
+        slots=(),
+        parameter_coverage=(),
+        headline_effects=None,
+        figure_eligible=False,
+    )
+
+
+def _slot_validation(
+    slot_id: str,
+    *,
+    outcome: str,
+    campaign_member: bool,
+) -> SlotValidationResult:
+    return SlotValidationResult(
+        slot_id=slot_id,
+        outcome=outcome,
+        reason=None if outcome == "PASS" else "preserved incomplete attempt",
+        integrity_valid=outcome == "PASS",
+        campaign_member=campaign_member,
+    )
+
+
+def test_run_requires_explicit_authorization_before_any_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("execute_slot_once must not be called without authorization")
+
+    monkeypatch.setattr(cli, "execute_slot_once", forbidden)
+
+    assert cli.main(
+        [
+            "run",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert refusal["status"] == "REJECT"
+    assert "approval-reference" in refusal["reason"]
+    assert not (repository / "results/shape-placement-factorial-v1").exists()
+
+
+def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    receipt = tmp_path / "invalid-authorization.json"
+    receipt.write_bytes(cli._canonical_json_bytes({}))
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("invalid authorization must not publish or launch")
+
+    monkeypatch.setattr(cli, "preserve_build_evidence", forbidden)
+    monkeypatch.setattr(cli, "execute_slot_once", forbidden)
+
+    assert cli.main(
+        [
+            "smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--authorization-receipt",
+            str(receipt),
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert refusal["status"] == "REJECT"
+    assert "schema drifted" in refusal["reason"]
+    assert not (
+        repository / "results/shape-placement-factorial-v1-smoke"
+    ).exists()
+
+
+def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    observed: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+
+    def execute(slot, spec, **kwargs: Any):
+        observed["slot"] = slot
+        observed["spec"] = spec
+        observed["campaign_member"] = kwargs["campaign_member"]
+        observed["authorization"] = json.loads(kwargs["authorization_receipt"])
+        return factorial_execution.SlotExecutionResult(
+            slot_directory=kwargs["preflight"].slot_directory,
+            outcome="PASS",
+            reason=None,
+            launch_count=slot.replica_count + 1,
+            phase_cutoffs={},
+            cleanup_ledger=(),
+        )
+
+    monkeypatch.setattr(cli, "execute_slot_once", execute)
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: _slot_validation(
+            path.name, outcome="PASS", campaign_member=False
+        ),
+    )
+
+    assert cli.main(
+        [
+            "smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "test thesis-author approval",
+            "--approved-utc",
+            "2026-08-04T00:00:00+00:00",
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert observed["slot"].replica_count == 7
+    assert observed["slot"].initial_fanout == 2
+    assert observed["slot"].arm_code == "PS"
+    assert observed["campaign_member"] is False
+    assert observed["authorization"]["scope"] == "excluded_n7_smoke"
+    assert observed["authorization"]["slot_ids"] == ["smoke-n7-f2-PS"]
+    assert observed["authorization"]["kauri_revision"] == REVISION
+    assert (
+        repository
+        / "results/shape-placement-factorial-v1-smoke"
+        / cli.SMOKE_AUTHORIZATION_FILENAME
+    ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
+    assert result["validation"]["outcome"] == "PASS"
+    assert result["campaign_member"] is False
+    assert result["figure_eligible"] is False
+
+
+def test_smoke_accepts_an_existing_exact_authorization_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    frozen_contract,
+) -> None:
+    plan, _ = frozen_contract
+    repository = tmp_path / "Kauri"
+    smoke = factorial_execution.build_n7_ps_smoke_slot(plan.slots[0])
+    artifacts = {
+        "manifest.json": MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": cli._direct_runtime_bytes(smoke.runtime),
+    }
+    receipt = factorial_execution.build_execution_authorization_receipt(
+        scope="excluded_n7_smoke",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-04T00:00:00+00:00",
+        kauri_revision=REVISION,
+        slot_ids=(smoke.slot.slot_id,),
+        static_artifacts=artifacts,
+        build_provenance_sha256=hashlib.sha256(
+            cli._canonical_json_bytes(
+                _fake_build_provenance(
+                    repository.resolve(),
+                    repository.resolve() / "build-adaptive",
+                    REVISION,
+                )
+            )
+        ).hexdigest(),
+    )
+    receipt_path = tmp_path / "smoke-authorization.json"
+    receipt_path.write_bytes(receipt)
+    observed: dict[str, bytes] = {}
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+
+    def execute(slot, spec, **kwargs: Any):
+        observed["receipt"] = kwargs["authorization_receipt"]
+        return factorial_execution.SlotExecutionResult(
+            slot_directory=kwargs["preflight"].slot_directory,
+            outcome="PASS",
+            reason=None,
+            launch_count=slot.replica_count + 1,
+            phase_cutoffs={},
+            cleanup_ledger=(),
+        )
+
+    monkeypatch.setattr(cli, "execute_slot_once", execute)
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: _slot_validation(
+            path.name, outcome="PASS", campaign_member=False
+        ),
+    )
+
+    assert cli.main(
+        [
+            "smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--authorization-receipt",
+            str(receipt_path),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert observed["receipt"] == receipt
+
+
+def test_campaign_requires_independently_passing_excluded_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    monkeypatch.setattr(
+        cli,
+        "_require_validated_smoke",
+        lambda _root, **_kwargs: (_ for _ in ()).throw(
+            factorial_execution.FactorialExecutionError(
+                "canonical excluded N=7 smoke did not independently validate PASS"
+            )
+        ),
+    )
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("launch must not start before the smoke gate")
+
+    monkeypatch.setattr(cli, "execute_slot_once", forbidden)
+
+    assert cli.main(
+        [
+            "run",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "test thesis-author approval",
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert refusal["status"] == "REJECT"
+    assert "N=7 smoke" in refusal["reason"]
+
+
+def test_campaign_smoke_gate_binds_exact_revision_and_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke_root = tmp_path / "smoke"
+    slot_root = smoke_root / "smoke-n7-f2-PS"
+    (slot_root / "runtime").mkdir(parents=True)
+    build_provenance = {"schema_version": 1, "revision": REVISION}
+    (slot_root / "execution-authorization.json").write_bytes(
+        cli._canonical_json_bytes({"kauri_revision": REVISION})
+    )
+    (slot_root / "runtime/exact-build-provenance.json").write_bytes(
+        cli._canonical_json_bytes(build_provenance)
+    )
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: _slot_validation(
+            path.name, outcome="PASS", campaign_member=False
+        ),
+    )
+
+    result = cli._require_validated_smoke(
+        smoke_root,
+        expected_revision=REVISION,
+        expected_build_provenance=build_provenance,
+    )
+
+    assert result.outcome == "PASS"
+    with pytest.raises(
+        factorial_execution.FactorialExecutionError,
+        match="exact revision and build",
+    ):
+        cli._require_validated_smoke(
+            smoke_root,
+            expected_revision="b" * 40,
+            expected_build_provenance=build_provenance,
+        )
+
+
+def test_campaign_uses_exact_execution_order_and_stops_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    frozen_contract,
+) -> None:
+    _, runtime = frozen_contract
+    repository = tmp_path / "Kauri"
+    executed: list[str] = []
+    validations: dict[str, str] = {}
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+    monkeypatch.setattr(
+        cli, "_require_validated_smoke", lambda _root, **_kwargs: None
+    )
+
+    def execute(slot, spec, **kwargs: Any):
+        executed.append(slot.slot_id)
+        outcome = "PASS" if len(executed) == 1 else "INCOMPLETE"
+        validations[slot.slot_id] = outcome
+        if outcome == "PASS":
+            kwargs["preflight"].slot_directory.mkdir()
+            (kwargs["preflight"].slot_directory / "execution-authorization.json").write_bytes(
+                kwargs["authorization_receipt"]
+            )
+        return factorial_execution.SlotExecutionResult(
+            slot_directory=kwargs["preflight"].slot_directory,
+            outcome=outcome,
+            reason=None if outcome == "PASS" else "synthetic preserved failure",
+            launch_count=slot.replica_count + 1,
+            phase_cutoffs={} if outcome == "PASS" else None,
+            cleanup_ledger=(),
+        )
+
+    monkeypatch.setattr(cli, "execute_slot_once", execute)
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: _slot_validation(
+            path.name,
+            outcome=validations[path.name],
+            campaign_member=True,
+        ),
+    )
+    def validate_after_summary(root: Path) -> CampaignValidationResult:
+        summary_path = root / cli.CAMPAIGN_SUMMARY_FILENAME
+        assert summary_path.is_file()
+        summary = json.loads(summary_path.read_bytes())
+        assert summary_path.read_bytes() == cli._canonical_json_bytes(summary)
+        assert "independent_campaign_outcome" not in summary
+        return _campaign_validation()
+
+    monkeypatch.setattr(cli, "validate_campaign", validate_after_summary)
+
+    assert cli.main(
+        [
+            "run",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "test thesis-author approval",
+            "--approved-utc",
+            "2026-08-04T00:00:00+00:00",
+        ]
+    ) == 1
+    result = json.loads(capsys.readouterr().out)
+    root = repository / runtime.results_root
+    ledger = [
+        json.loads(line)
+        for line in (root / cli.CAMPAIGN_LEDGER_FILENAME).read_text().splitlines()
+    ]
+    summary = json.loads((root / cli.CAMPAIGN_SUMMARY_FILENAME).read_text())
+
+    assert executed == [runtime.slots[0].slot_id, runtime.slots[1].slot_id]
+    assert [row["state"] for row in ledger] == [
+        "STARTED",
+        "TERMINAL",
+        "STARTED",
+        "TERMINAL",
+    ]
+    assert [row["execution_ordinal"] for row in ledger] == [1, 1, 2, 2]
+    assert all(row["attempt_ordinal"] == 1 for row in ledger)
+    assert all(row["automatic_retries"] == 0 for row in ledger)
+    assert all(row["replacement_policy"] == "none" for row in ledger)
+    assert ledger[-1]["validation"]["outcome"] == "INCOMPLETE"
+    assert summary["attempted_slot_count"] == 2
+    assert summary["next_execution_ordinal"] == 3
+    assert summary["execution_complete"] is False
+    assert result["attempted_slot_count"] == 2
+    assert "without retry or replacement" in result["stopped_reason"]
+
+@pytest.mark.parametrize(
+    ("drift", "reason_fragment"),
+    (
+        ("revision", "revision drifted without launch"),
+        ("build", "build provenance drifted without launch"),
+    ),
+)
+def test_campaign_does_not_launch_next_slot_after_preflight_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    frozen_contract,
+    drift: str,
+    reason_fragment: str,
+) -> None:
+    _, runtime = frozen_contract
+    repository = tmp_path / "Kauri"
+    preflight_count = 0
+    executed: list[str] = []
+    monkeypatch.setattr(
+        cli, "_require_validated_smoke", lambda _root, **_kwargs: None
+    )
+
+    def drifting_preflight(slot, **kwargs: Any):
+        nonlocal preflight_count
+        preflight_count += 1
+        result = _preflight(slot, revision=REVISION, **kwargs)
+        if preflight_count == 1:
+            return result
+        if drift == "revision":
+            return replace(result, revision="b" * 40)
+        return replace(
+            result,
+            build_provenance={**result.build_provenance, "drift": True},
+        )
+
+    monkeypatch.setattr(cli, "_preflight", drifting_preflight)
+
+    def execute(slot, spec, **kwargs: Any):
+        executed.append(slot.slot_id)
+        kwargs["preflight"].slot_directory.mkdir()
+        (kwargs["preflight"].slot_directory / "execution-authorization.json").write_bytes(
+            kwargs["authorization_receipt"]
+        )
+        return factorial_execution.SlotExecutionResult(
+            slot_directory=kwargs["preflight"].slot_directory,
+            outcome="PASS",
+            reason=None,
+            launch_count=slot.replica_count + 1,
+            phase_cutoffs={},
+            cleanup_ledger=(),
+        )
+
+    monkeypatch.setattr(cli, "execute_slot_once", execute)
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: _slot_validation(
+            path.name, outcome="PASS", campaign_member=True
+        ),
+    )
+    monkeypatch.setattr(cli, "validate_campaign", lambda _root: _campaign_validation())
+
+    assert cli.main(
+        [
+            "run",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "test thesis-author approval",
+            "--approved-utc",
+            "2026-08-04T00:00:00+00:00",
+        ]
+    ) == 1
+    result = json.loads(capsys.readouterr().out)
+
+    assert executed == [runtime.slots[0].slot_id]
+    assert result["attempted_slot_count"] == 1
+    assert reason_fragment in result["stopped_reason"]
+
+
+def test_validate_campaign_uses_only_the_independent_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    frozen_contract,
+) -> None:
+    _, runtime = frozen_contract
+    repository = tmp_path / "Kauri"
+    root = repository / runtime.results_root
+    calls: list[Path] = []
+    validation = CampaignValidationResult(
+        outcome="PASS",
+        reason=None,
+        slots=(),
+        parameter_coverage=(),
+        headline_effects=None,
+        figure_eligible=True,
+    )
+
+    def independent_validator(path: Path) -> CampaignValidationResult:
+        calls.append(path)
+        return validation
+
+    monkeypatch.setattr(cli, "validate_campaign", independent_validator)
+
+    assert cli.main(
+        [
+            "validate-campaign",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+        ]
+    ) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert calls == [root]
+    assert output["validation"]["outcome"] == "PASS"
+    assert output["figure_eligible"] is True
+    assert output["ledger_sha256"] is None
+
+
+def test_validation_commands_accept_explicit_relocated_roots_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    relocated_campaign = tmp_path / "archive" / "campaign"
+    relocated_smoke = tmp_path / "archive" / "smoke"
+    campaign_calls: list[Path] = []
+    smoke_calls: list[Path] = []
+    monkeypatch.setattr(
+        cli,
+        "validate_campaign",
+        lambda path: campaign_calls.append(path)
+        or CampaignValidationResult(
+            outcome="PASS",
+            reason=None,
+            slots=(),
+            parameter_coverage=(),
+            headline_effects=None,
+            figure_eligible=True,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: smoke_calls.append(path)
+        or _slot_validation(path.name, outcome="PASS", campaign_member=False),
+    )
+
+    assert cli.main(
+        [
+            "validate-campaign",
+            "--manifest",
+            str(MANIFEST),
+            "--campaign-results-root",
+            str(relocated_campaign),
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert cli.main(
+        [
+            "validate-smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--smoke-results-root",
+            str(relocated_smoke),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert campaign_calls == [relocated_campaign.resolve()]
+    assert smoke_calls == [
+        relocated_smoke.resolve() / "smoke-n7-f2-PS"
+    ]
+    assert not relocated_campaign.exists()
+    assert not relocated_smoke.exists()
+
+
+@pytest.mark.parametrize(
+    ("command", "root_flag"),
+    (
+        ("validate-campaign", "--campaign-results-root"),
+        ("validate-smoke", "--smoke-results-root"),
+    ),
+)
+def test_validation_rejects_a_symlink_result_root(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    root_flag: str,
+) -> None:
+    real_root = tmp_path / "archive" / "real"
+    real_root.mkdir(parents=True)
+    linked_root = tmp_path / "archive" / "linked"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    assert cli.main(
+        [
+            command,
+            "--manifest",
+            str(MANIFEST),
+            root_flag,
+            str(linked_root),
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert refusal["status"] == "REJECT"
+    assert "must not be a symlink" in refusal["reason"]
+
+
+def test_run_still_rejects_relocated_result_root(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    relocated = tmp_path / "archive" / "campaign"
+    assert cli.main(
+        [
+            "run",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--campaign-results-root",
+            str(relocated),
+            "--approval-reference",
+            "test approval",
+        ]
+    ) == 2
+    reason = json.loads(capsys.readouterr().err)["reason"]
+    assert "campaign results root must be exact" in reason
