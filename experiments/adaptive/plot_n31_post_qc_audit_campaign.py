@@ -74,7 +74,7 @@ METRIC_LABELS = {
     "relay_to_root_latency_ns": "Relay-to-root latency",
     "root_verification_latency_ns": "Root-verification latency",
     "qc_to_audit_latency_ns": "QC-to-audit latency",
-    "expiry_to_later_commit_latency_ns": "Expiry-to-later-commit latency",
+    "expiry_to_later_commit_latency_ns": "Expiry-to-Q21 observation latency",
 }
 ARM_COLORS = ("#2563eb", "#dc2626", "#0f766e")
 ARM_MARKERS = ("o", "s", "^")

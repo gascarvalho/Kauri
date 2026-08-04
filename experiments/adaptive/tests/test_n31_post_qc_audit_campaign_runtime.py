@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from experiments.adaptive import run_n31_post_qc_audit_campaign as runner
+from experiments.adaptive.kauri_experiment import n31_post_qc_audit as pqar
 from experiments.adaptive.kauri_experiment import profiled_fault_runtime as runtime
 from experiments.adaptive.kauri_experiment.n31_post_qc_audit_campaign import (
     CAMPAIGN_PROFILE_SHA256,
@@ -30,11 +31,24 @@ from experiments.adaptive.kauri_experiment.profiled_fault_archive import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 CAMPAIGN_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v1.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v2.json"
 )
 AUDIT_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v3.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v4.json"
 )
+
+
+def test_campaign_cli_defaults_select_prospective_v2_and_v4() -> None:
+    revision = "a" * 40
+
+    assert runner.DEFAULT_CAMPAIGN_PROFILE == CAMPAIGN_PROFILE
+    assert runner.DEFAULT_AUDIT_PROFILE == AUDIT_PROFILE
+    assert runner.DEFAULT_RESULTS_PARENT == (
+        REPOSITORY / "results/n31-post-qc-audit-campaign-v2"
+    )
+    assert runner._default_campaign_root(REPOSITORY, revision) == (
+        runner.DEFAULT_RESULTS_PARENT / "aaaaaaaa-seed41719-campaign-v2"
+    )
 
 
 def _trusted(tmp_path: Path) -> TrustedProvenance:
@@ -67,13 +81,11 @@ def _trusted(tmp_path: Path) -> TrustedProvenance:
 def _pilot_result(trusted: TrustedProvenance) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "scenario": "n31-post-qc-audit-v3",
+        "scenario": pqar.SCENARIO,
         "kind": "fresh-three-arm-pilot",
         "verdict": "PASS",
         "preflight_revision": trusted.revision,
-        "preflight_profile_sha256": (
-            "84039370562a7846efdc5d09e66b1096a6e6252fd1b6b49fe42fd7299800cff5"
-        ),
+        "preflight_profile_sha256": pqar.SHIPPED_PROFILE_SHA256,
         "evidence_tree_sha256": "d" * 64,
         "evidence_seal_sha256": "e" * 64,
         "figure_eligible": False,
@@ -83,14 +95,12 @@ def _pilot_result(trusted: TrustedProvenance) -> dict[str, object]:
 def _preflight(trusted: TrustedProvenance) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "scenario": "n31-post-qc-audit-v3",
+        "scenario": pqar.SCENARIO,
         "verdict": "PASS",
         "revision": trusted.revision,
         "audit_profile": {
-            "profile_id": "n31-f5-q21-post-qc-audit-v3",
-            "sha256": (
-                "84039370562a7846efdc5d09e66b1096a6e6252fd1b6b49fe42fd7299800cff5"
-            ),
+            "profile_id": pqar.SHIPPED_PROFILE_ID,
+            "sha256": pqar.SHIPPED_PROFILE_SHA256,
         },
         "runtime_profile": {
             "profile_id": "n31-f5-q21-internal1-sigkill-shakedown-v1",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,9 @@ import pytest
 from experiments.adaptive.kauri_experiment.n31_post_qc_audit_campaign import (
     ARM_NAMES,
     ATTEMPTS_PER_ARM,
+    CAMPAIGN_PROFILE_ID,
     CAMPAIGN_PROFILE_SHA256,
+    CAMPAIGN_SCENARIO,
     CLASSIFICATION_NAMES,
     N31PostQcAuditCampaignError,
     SCHEDULED_ATTEMPTS,
@@ -29,6 +32,9 @@ from experiments.adaptive.kauri_experiment.n31_post_qc_audit_campaign import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 PROFILE_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v2.json"
+)
+V1_PROFILE_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v1.json"
 )
 REVISION = "a" * 40
@@ -65,7 +71,7 @@ def _records_and_observations(
         records.append(
             {
                 "schema_version": 1,
-                "scenario": "n31-post-qc-audit-repetition-campaign-v1-slot-execution",
+                "scenario": f"{CAMPAIGN_SCENARIO}-slot-execution",
                 **deepcopy(slot),
                 "launch_status": "returned",
                 "started_utc": "2026-08-04T10:00:00+00:00",
@@ -83,7 +89,7 @@ def _records_and_observations(
         observations.append(
             {
                 "schema_version": 1,
-                "scenario": "n31-post-qc-audit-repetition-campaign-v1-blind-observation",
+                "scenario": f"{CAMPAIGN_SCENARIO}-blind-observation",
                 "ordinal": ordinal,
                 "run_directory": run_directory,
                 "observation": {
@@ -107,15 +113,30 @@ def test_campaign_profile_is_bound_to_exact_shipped_bytes(tmp_path: Path) -> Non
         CAMPAIGN_PROFILE_SHA256
     )
     assert profile.profile_sha256 == CAMPAIGN_PROFILE_SHA256
+    assert profile.profile_id == CAMPAIGN_PROFILE_ID
     assert profile.order_seed == 41_719
     assert profile.audit_profile_sha256 == (
-        "84039370562a7846efdc5d09e66b1096a6e6252fd1b6b49fe42fd7299800cff5"
+        "e05948c2eb0ae0eee7df78b5f9f603ce754ab560a5ac9bffabbf84d104b21a99"
+    )
+    assert json.loads(PROFILE_PATH.read_text(encoding="utf-8"))[
+        "interpretation_scope"
+    ].endswith(
+        "expiry-to-later-commit is fixed-Q21 common-witness observation time, "
+        "not necessarily authoritative observer commit time"
+    )
+    assert hashlib.sha256(V1_PROFILE_PATH.read_bytes()).hexdigest() == (
+        "f904cb118d95ea975578b85e79b0ffb7dfcc3f0e6d87dfccb8859feb0488ea25"
     )
 
     changed = tmp_path / "changed.json"
     changed.write_bytes(PROFILE_PATH.read_bytes() + b"\n")
     with pytest.raises(N31PostQcAuditCampaignError, match="profile bytes"):
         load_frozen_campaign_profile(changed)
+
+
+def test_published_campaign_v1_profile_is_preserved_but_not_reused() -> None:
+    with pytest.raises(N31PostQcAuditCampaignError, match="profile bytes"):
+        load_frozen_campaign_profile(V1_PROFILE_PATH)
 
 
 def test_source_blind_rank_uses_only_sealed_child_identity() -> None:

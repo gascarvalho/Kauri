@@ -1,6 +1,6 @@
 """Frozen repetition and evidence contracts for the N=31 PQAR campaign.
 
-The module is deliberately split from the live v3 runtime.  It fixes the
+The module is deliberately split from the live v4 runtime.  It fixes the
 balanced 90-slot order, joins source-blind observations to declared arms only
 after every child has been observed, and rebuilds campaign statistics from
 sealed evidence.  Experimental outcomes never change the schedule or the
@@ -47,11 +47,11 @@ from .profiled_fault_evaluation import (
     load_frozen_profile as load_runtime_profile,
 )
 
-CAMPAIGN_PROFILE_ID = "n31-f5-q21-post-qc-audit-campaign-v1"
+CAMPAIGN_PROFILE_ID = "n31-f5-q21-post-qc-audit-campaign-v2"
 CAMPAIGN_PROFILE_SHA256 = (
-    "f904cb118d95ea975578b85e79b0ffb7dfcc3f0e6d87dfccb8859feb0488ea25"
+    "acc1191e467901af1743d6930f4e7a36ca6f7ac45dcb6df698a39e668eab996d"
 )
-CAMPAIGN_SCENARIO = "n31-post-qc-audit-repetition-campaign-v1"
+CAMPAIGN_SCENARIO = "n31-post-qc-audit-repetition-campaign-v2"
 CAMPAIGN_ORDER_SEED = 41_719
 SOURCE_BLIND_ORDER_ALGORITHM = "sha256-ranked-sealed-child-identity-v1"
 SOURCE_BLIND_ISOLATION = "random-opaque-v1"
@@ -1126,7 +1126,7 @@ def validate_n31_pqar_campaign(
             validate_pilot_sequence = audit_runtime.validate_pilot_sequence
     if not callable(classify_preserved_run_source_blind):
         _error(
-            "v3 runtime lacks classify_preserved_run_source_blind; campaign "
+            "v4 runtime lacks classify_preserved_run_source_blind; campaign "
             "validation refuses a truth-aware fallback"
         )
     assert callable(validate_preserved_run)

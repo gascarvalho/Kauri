@@ -16,7 +16,7 @@ import pytest
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit as pqar
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit_runtime as runner
 
-PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v3.json"
+PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v4.json"
 BLOCK = "b" * 64
 FINGERPRINT = "d" * 64
 QC_PUBLISHED_NS = 1_120_000_000
@@ -237,6 +237,201 @@ def test_independent_root_qc_uses_root_context_not_runtime_generation(
             {"replica-30": [event]},
             classification,
         )
+
+
+def _v3_selected_after_expiry_commits(
+    classification: pqar.SourceBlindClassification,
+) -> tuple[list[dict[str, object]], dict[str, tuple[str, ...]], str, int]:
+    """Reproduce the v3 ordering that treated the selected block as later."""
+
+    baseline = "a" * 64
+    first_descendant = "c" * 64
+    second_descendant = "e" * 64
+    first_descendant_ns = classification.audit_expiry_ns + 130_000_000
+    commits = [
+        {
+            "block_hash": baseline,
+            "common_monotonic_ns": 800_000_000,
+        },
+        {
+            "block_hash": classification.identity.block,
+            "common_monotonic_ns": classification.audit_expiry_ns + 10_000_000,
+        },
+        {
+            "block_hash": first_descendant,
+            "common_monotonic_ns": first_descendant_ns,
+        },
+        {
+            "block_hash": second_descendant,
+            "common_monotonic_ns": first_descendant_ns + 10_000_000,
+        },
+    ]
+    ancestry = {
+        classification.identity.block: (classification.identity.block, baseline),
+        first_descendant: (
+            first_descendant,
+            classification.identity.block,
+            baseline,
+        ),
+        second_descendant: (
+            second_descendant,
+            first_descendant,
+            classification.identity.block,
+            baseline,
+        ),
+    }
+    return commits, ancestry, first_descendant, first_descendant_ns
+
+
+def test_truth_aware_later_evidence_skips_selected_block_after_expiry(
+    profile: pqar.FrozenPqarProfile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classification = _classification(profile)
+    commits, ancestry, first_descendant, first_descendant_ns = (
+        _v3_selected_after_expiry_commits(classification)
+    )
+    observer = 1
+    monkeypatch.setattr(runner, "_common_commits", lambda *_args: tuple(commits))
+    monkeypatch.setattr(
+        runner,
+        "_observer_ancestry",
+        lambda *_args, descendant, **_kwargs: ancestry[descendant],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_independent_root_qc_ns",
+        lambda *_args: QC_PUBLISHED_NS - 500,
+    )
+
+    evidence = runner._derive_consensus_evidence(
+        profile,
+        SimpleNamespace(authoritative_observer=observer),
+        {f"replica-{observer}": []},
+        classification,
+        ready_barrier_ns=700_000_000,
+        clean_boundary_ns=800_000_000,
+    )
+
+    assert evidence.later_block == first_descendant
+    assert evidence.later_commit_ns == first_descendant_ns
+    assert evidence.later_ancestry[0] == first_descendant
+
+
+def test_source_blind_later_latency_skips_selected_block_after_expiry(
+    profile: pqar.FrozenPqarProfile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classification = _classification(profile)
+    commits, ancestry, _first_descendant, first_descendant_ns = (
+        _v3_selected_after_expiry_commits(classification)
+    )
+    monkeypatch.setattr(runner, "_common_commits", lambda *_args: tuple(commits))
+    monkeypatch.setattr(
+        runner,
+        "_observer_ancestry",
+        lambda *_args, descendant, **_kwargs: ancestry[descendant],
+    )
+
+    assert runner._source_blind_later_commit_latency_ns(
+        profile,
+        SimpleNamespace(authoritative_observer=1),
+        {},
+        classification,
+    ) == (first_descendant_ns - classification.audit_expiry_ns)
+
+
+def test_selected_block_alone_after_expiry_is_not_later_evidence(
+    profile: pqar.FrozenPqarProfile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classification = _classification(profile)
+    commits, ancestry, _first_descendant, _first_descendant_ns = (
+        _v3_selected_after_expiry_commits(classification)
+    )
+    selected_only = tuple(commits[:2])
+    runtime_profile = SimpleNamespace(authoritative_observer=1)
+    monkeypatch.setattr(runner, "_common_commits", lambda *_args: selected_only)
+    monkeypatch.setattr(
+        runner,
+        "_observer_ancestry",
+        lambda *_args, descendant, **_kwargs: ancestry[descendant],
+    )
+
+    with pytest.raises(
+        runner.N31PostQcAuditRuntimeError,
+        match="common observation of a distinct descendant is absent",
+    ):
+        runner._derive_consensus_evidence(
+            profile,
+            runtime_profile,
+            {"replica-1": []},
+            classification,
+            ready_barrier_ns=700_000_000,
+            clean_boundary_ns=800_000_000,
+        )
+    assert (
+        runner._source_blind_later_commit_latency_ns(
+            profile,
+            runtime_profile,
+            {},
+            classification,
+        )
+        is None
+    )
+
+
+def test_unrelated_post_expiry_fork_is_not_later_evidence(
+    profile: pqar.FrozenPqarProfile,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classification = _classification(profile)
+    baseline = "a" * 64
+    fork = "f" * 64
+    commits = (
+        {"block_hash": baseline, "common_monotonic_ns": 800_000_000},
+        {
+            "block_hash": classification.identity.block,
+            "common_monotonic_ns": classification.audit_expiry_ns + 10_000_000,
+        },
+        {
+            "block_hash": fork,
+            "common_monotonic_ns": classification.audit_expiry_ns + 20_000_000,
+        },
+    )
+    ancestry = {
+        classification.identity.block: (classification.identity.block, baseline),
+        fork: (fork, "9" * 64),
+    }
+    runtime_profile = SimpleNamespace(authoritative_observer=1)
+    monkeypatch.setattr(runner, "_common_commits", lambda *_args: commits)
+    monkeypatch.setattr(
+        runner,
+        "_observer_ancestry",
+        lambda *_args, descendant, **_kwargs: ancestry[descendant],
+    )
+
+    with pytest.raises(
+        runner.N31PostQcAuditRuntimeError,
+        match="common observation of a distinct descendant is absent",
+    ):
+        runner._derive_consensus_evidence(
+            profile,
+            runtime_profile,
+            {"replica-1": []},
+            classification,
+            ready_barrier_ns=700_000_000,
+            clean_boundary_ns=800_000_000,
+        )
+    assert (
+        runner._source_blind_later_commit_latency_ns(
+            profile,
+            runtime_profile,
+            {},
+            classification,
+        )
+        is None
+    )
 
 
 def _aggregate_marker(profile: pqar.FrozenPqarProfile) -> str:
@@ -853,7 +1048,7 @@ def test_sequence_validator_rejects_noncanonical_child_profile(
     )
     with pytest.raises(
         runner.N31PostQcAuditRuntimeError,
-        match="canonical shipped v3 profile",
+        match="canonical shipped v4 profile",
     ):
         runner.validate_pilot_sequence(sequence, trusted_provenance=trusted)
 
@@ -1542,12 +1737,12 @@ def _cli():
     return importlib.import_module("experiments.adaptive.run_n31_post_qc_audit")
 
 
-def test_cli_defaults_select_prospective_v3() -> None:
+def test_cli_defaults_select_prospective_v4() -> None:
     cli = _cli()
-    assert cli.DEFAULT_PROFILE.name == "n31-f5-post-qc-audit-v3.json"
-    assert cli.DEFAULT_RESULTS_ROOT.name == "n31-f5-post-qc-audit-v3"
+    assert cli.DEFAULT_PROFILE.name == "n31-f5-post-qc-audit-v4.json"
+    assert cli.DEFAULT_RESULTS_ROOT.name == "n31-f5-post-qc-audit-v4"
     assert cli.DEFAULT_RESULTS_ROOT == (
-        cli.REPOSITORY / "results" / "n31-f5-post-qc-audit-v3"
+        cli.REPOSITORY / "results" / "n31-f5-post-qc-audit-v4"
     )
 
 
@@ -1664,7 +1859,7 @@ def test_cli_run_rejects_results_root_override_before_launch(
     )
     output = json.loads(capsys.readouterr().err)
     assert output["verdict"] == "REJECT"
-    assert "canonical frozen v3 results root" in output["error"]
+    assert "canonical frozen v4 results root" in output["error"]
     assert not trusted_path.exists()
 
 

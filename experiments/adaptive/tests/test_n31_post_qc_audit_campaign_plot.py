@@ -14,6 +14,7 @@ import pytest
 
 from experiments.adaptive.kauri_experiment.n31_post_qc_audit_campaign import (
     ARM_NAMES,
+    CAMPAIGN_PROFILE_ID,
     CAMPAIGN_SCENARIO,
     CLASSIFICATION_NAMES,
     N31PostQcAuditCampaignError,
@@ -145,7 +146,7 @@ def _accepted_summary(*, mixed: bool = False) -> dict[str, Any]:
         "schema_version": 1,
         "scenario": CAMPAIGN_SCENARIO,
         "campaign_profile": {
-            "profile_id": "n31-f5-q21-post-qc-audit-campaign-v1",
+            "profile_id": CAMPAIGN_PROFILE_ID,
             "sha256": SHA256,
         },
         "kauri_revision": REVISION,

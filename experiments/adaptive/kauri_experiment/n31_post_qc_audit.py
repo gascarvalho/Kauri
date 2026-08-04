@@ -21,11 +21,11 @@ class N31PostQcAuditError(ValueError):
     """Raised when the frozen contract or evidence is incomplete or invalid."""
 
 
-SHIPPED_PROFILE_ID = "n31-f5-q21-post-qc-audit-v3"
+SHIPPED_PROFILE_ID = "n31-f5-q21-post-qc-audit-v4"
 SHIPPED_PROFILE_SHA256 = (
-    "84039370562a7846efdc5d09e66b1096a6e6252fd1b6b49fe42fd7299800cff5"
+    "e05948c2eb0ae0eee7df78b5f9f603ce754ab560a5ac9bffabbf84d104b21a99"
 )
-SCENARIO = "n31-post-qc-audit-v3"
+SCENARIO = "n31-post-qc-audit-v4"
 ARM_FALSE_REPORT = "static_authenticated_false_report"
 ARM_OMISSION = "static_persistent_direct_vote_omission"
 ARM_SHAM = "static_authenticated_sham"
@@ -488,7 +488,7 @@ def load_frozen_profile(path: Path) -> FrozenPqarProfile:
     if seed != 41_719 or not isinstance(window, str) or not _WINDOW.fullmatch(window):
         _error("snapshot seed or diagnostic window drifted")
     if (
-        window != "n31-epoch0-tree30-post-qc-audit-v3"
+        window != "n31-epoch0-tree30-post-qc-audit-v4"
         or raw.get("marker_clock") != "CLOCK_MONOTONIC_RAW"
         or raw.get("clock_scope") != "single_host_shared_kernel"
         or raw.get("fault_lifecycle_start")
@@ -555,7 +555,7 @@ def load_frozen_profile(path: Path) -> FrozenPqarProfile:
     if dict(policy) != {
         "clean_baseline": "fixed_Q21_before_matching_action",
         "root_qc": "exact_25_signer_complement_before_audit_witness_or_sham_expiry",
-        "later_commit": "fixed_Q21_preserved_ancestry_after_audit_expiry",
+        "later_commit": "fixed_Q21_common_observation_of_distinct_descendant_after_audit_expiry",
         "pilot_ceiling": "harness_validation_only",
         "figure_eligibility": "never_for_single_attempt_pilot",
         "non_inclusion_claim": "omission_compatible_only",
@@ -1151,12 +1151,12 @@ def validate_consensus_evidence(
     classification: SourceBlindClassification,
     evidence: ConsensusEvidence,
 ) -> None:
-    """Bind the audit to a clean Q21 baseline, terminal QC, and later ancestry."""
+    """Bind the audit to a clean Q21 baseline, terminal QC, and later observation."""
 
     if evidence.baseline_witnesses != profile.commit_witnesses:
         _error("clean baseline lacks the fixed Q21 witness set")
     if evidence.later_witnesses != profile.commit_witnesses:
-        _error("later commit lacks the fixed Q21 witness set")
+        _error("later common observation lacks the fixed Q21 witness set")
     if evidence.baseline_commit_ns >= min(
         marker.timestamp_ns for marker in classification.markers
     ):
@@ -1181,11 +1181,11 @@ def validate_consensus_evidence(
     elif len(post_qc) != 1 or evidence.root_qc_ns > post_qc[0].timestamp_ns:
         _error("post-QC witness is absent or precedes the terminal QC")
     if evidence.later_commit_ns <= classification.audit_expiry_ns:
-        _error("later Q21 commit does not occur after audit expiry")
+        _error("later fixed-Q21 common observation does not follow audit expiry")
     if classification.identity.block not in evidence.later_ancestry:
-        _error("later Q21 commit does not preserve selected-block ancestry")
+        _error("later fixed-Q21 common observation is not a selected descendant")
     if evidence.later_block == evidence.selected_block:
-        _error("later commit must be distinct from the selected proposal")
+        _error("later fixed-Q21 common observation must be a distinct descendant")
     if any(
         value != 0
         for value in (
@@ -1264,7 +1264,7 @@ def validate_pilot(
         consensus.later_commit_ns - classification.audit_expiry_ns
     )
     if expiry_to_later_commit_latency_ns <= 0:
-        _error("validated later commit does not follow audit expiry")
+        _error("validated later fixed-Q21 common observation does not follow expiry")
     return PqarValidation(
         verdict="PASS",
         source_blind_classification=classification.classification,

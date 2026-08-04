@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import inspect
 import json
 from pathlib import Path
@@ -11,9 +12,12 @@ import pytest
 
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit as pqar
 
-PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v3.json"
+PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v4.json"
 V2_PROFILE_PATH = (
     Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v2.json"
+)
+V3_PROFILE_PATH = (
+    Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v3.json"
 )
 EPOCH_DIGEST = "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
 BLOCK = "b" * 64
@@ -44,7 +48,7 @@ def _identity(block: str = BLOCK, *, root_marker: bool = False) -> str:
     return (
         "reporter=0 target=5 root=30 epoch=0 tree=30 "
         f"epoch_digest={EPOCH_DIGEST} block={block} generation=7 {context}"
-        "window=n31-epoch0-tree30-post-qc-audit-v3"
+        "window=n31-epoch0-tree30-post-qc-audit-v4"
     )
 
 
@@ -172,7 +176,21 @@ def test_profile_and_execution_order_are_frozen(
     assert not set(profile.expected_qc_signers) & set(profile.reporter_subtree)
     assert profile.clock_scope == "single_host_shared_kernel"
     assert V2_PROFILE_PATH.exists()
+    assert hashlib.sha256(V3_PROFILE_PATH.read_bytes()).hexdigest() == (
+        "84039370562a7846efdc5d09e66b1096a6e6252fd1b6b49fe42fd7299800cff5"
+    )
+    assert (
+        json.loads(PROFILE_PATH.read_text(encoding="utf-8"))["evidence_policy"][
+            "later_commit"
+        ]
+        == "fixed_Q21_common_observation_of_distinct_descendant_after_audit_expiry"
+    )
     assert profile.arm(pqar.ARM_OMISSION).omit_outbound_aggregate is False
+
+
+def test_published_v3_profile_is_preserved_but_not_reused() -> None:
+    with pytest.raises(pqar.N31PostQcAuditError, match="profile bytes"):
+        pqar.load_frozen_profile(V3_PROFILE_PATH)
 
 
 def test_profile_byte_tampering_is_rejected(tmp_path: Path) -> None:
@@ -479,3 +497,18 @@ def test_duplicate_commit_bucket_and_independent_qc_skew_are_rejected(
     )
     with pytest.raises(pqar.N31PostQcAuditError, match="skew bound"):
         pqar.validate_consensus_evidence(profile, classification, too_old)
+
+
+def test_consensus_gate_retains_distinct_descendant_requirement(
+    profile: pqar.FrozenPqarProfile,
+) -> None:
+    classification = _classify(profile, _logs(pqar.ARM_SHAM))
+    selected_as_later = replace(
+        _consensus(profile),
+        later_block=BLOCK,
+        later_commit_ns=RETENTION_NS + 1,
+        later_ancestry=(BLOCK, BASELINE),
+    )
+
+    with pytest.raises(pqar.N31PostQcAuditError, match="distinct descendant"):
+        pqar.validate_consensus_evidence(profile, classification, selected_as_later)

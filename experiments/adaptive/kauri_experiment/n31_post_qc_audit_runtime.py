@@ -1,4 +1,4 @@
-"""One-attempt runtime and preserved-evidence validator for the v3 PQAR pilot.
+"""One-attempt runtime and preserved-evidence validator for the v4 PQAR pilot.
 
 Audit classification consumes only raw replica logs.  Manager events are used
 for process ownership only and never as diagnostic observations.  The fixed
@@ -93,7 +93,7 @@ _MANIFEST_FIELDS = {
     "runtime_error",
 }
 _LOG_OFFSET_FIELDS = {"path", "sha256", "start_offset", "terminal_offset"}
-_ONE_SHOT_LEDGER_FILENAME = "pqar-v3-one-shot-ledger.json"
+_ONE_SHOT_LEDGER_FILENAME = "pqar-v4-one-shot-ledger.json"
 _ONE_SHOT_LEDGER_FIELDS = {
     "schema_version",
     "scenario",
@@ -896,13 +896,18 @@ def _source_blind_later_commit_latency_ns(
 ) -> int | None:
     candidates: list[int] = []
     for commit in _common_commits(profile, runtime_profile, streams):
+        # This is the fixed-Q21 common-observation boundary: the maximum of
+        # the authoritative commit time and all fixed witness observations.
         timestamp = int(commit["common_monotonic_ns"])
         if timestamp <= classification.audit_expiry_ns:
+            continue
+        block = str(commit["block_hash"])
+        if block == classification.identity.block:
             continue
         ancestry = _observer_ancestry(
             runtime_profile,
             streams,
-            descendant=str(commit["block_hash"]),
+            descendant=block,
         )
         if classification.identity.block in ancestry:
             candidates.append(timestamp)
@@ -1041,17 +1046,22 @@ def _derive_consensus_evidence(
     baseline = matching_baselines[0]
     later_candidates: list[tuple[dict[str, object], tuple[str, ...]]] = []
     for commit in commits:
+        # common_monotonic_ns proves a fixed-Q21 common observation, not that
+        # the authoritative observer itself first committed after expiry.
         if int(commit["common_monotonic_ns"]) <= classification.audit_expiry_ns:
+            continue
+        block = str(commit["block_hash"])
+        if block == classification.identity.block:
             continue
         ancestry = _observer_ancestry(
             runtime_profile,
             streams,
-            descendant=str(commit["block_hash"]),
+            descendant=block,
         )
         if classification.identity.block in ancestry:
             later_candidates.append((commit, ancestry))
     if not later_candidates:
-        _error("later fixed-Q21 commit preserving selected ancestry is absent")
+        _error("later fixed-Q21 common observation of a distinct descendant is absent")
     later, ancestry = min(
         later_candidates, key=lambda item: int(item[0]["common_monotonic_ns"])
     )
@@ -1255,7 +1265,7 @@ def _load_source_blind_preserved_profiles(
         or runtime_profile.profile_id != profile.runtime_profile_id
         or runtime_profile.profile_sha256 != profile.runtime_profile_sha256
     ):
-        _error("preserved runtime profile differs from the canonical v3 binding")
+        _error("preserved runtime profile differs from the canonical v4 binding")
     return profile, runtime_profile
 
 
@@ -1852,12 +1862,12 @@ def run_once(
                     clean_boundary_ns=clean_boundary_ns,
                 )
             except N31PostQcAuditRuntimeError as error:
-                if "later fixed-Q21 commit" in str(error):
+                if "later fixed-Q21 common observation" in str(error):
                     return None
                 raise
 
         consensus = runtime.wait_until(
-            "later fixed-Q21 commit preserving selected ancestry",
+            "later fixed-Q21 common observation of a distinct descendant",
             later_evidence,
             phase_timeout_s=runtime_profile.startup_timeout_s,
             hard_deadline_ns=hard_deadline_ns,
@@ -1866,7 +1876,7 @@ def run_once(
             poll_interval_s=0.01,
         )
         if not isinstance(consensus, ConsensusEvidence):
-            _error("later consensus evidence is malformed")
+            _error("later fixed-Q21 common-observation evidence is malformed")
         live_result = validate_pilot(
             profile,
             _audit_only_logs(_live_log_slices(run_directory, profile, start_offsets)),
@@ -2088,13 +2098,13 @@ def _one_shot_ledger_path(sequence_directory: Path) -> Path:
 def _create_sequence_directory(
     results_root: Path, *, profile: FrozenPqarProfile
 ) -> Path:
-    """Consume the frozen v3 results root and allocate one empty parent."""
+    """Consume the frozen v4 results root and allocate one empty parent."""
 
     if (
         profile.profile_id != SHIPPED_PROFILE_ID
         or profile.profile_sha256 != SHIPPED_PROFILE_SHA256
     ):
-        _error("one-shot allocation requires the canonical shipped v3 profile")
+        _error("one-shot allocation requires the canonical shipped v4 profile")
     root = results_root.resolve()
     root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -2102,11 +2112,11 @@ def _create_sequence_directory(
         _fsync_directory(root.parent)
     except FileExistsError as error:
         raise N31PostQcAuditRuntimeError(
-            "frozen v3 results root is already spent by a prior allocation"
+            "frozen v4 results root is already spent by a prior allocation"
         ) from error
     except OSError as error:
         raise N31PostQcAuditRuntimeError(
-            "could not exclusively allocate the frozen v3 results root"
+            "could not exclusively allocate the frozen v4 results root"
         ) from error
     os.chmod(root, 0o700)
 
@@ -2129,16 +2139,16 @@ def _create_sequence_directory(
         _fsync_directory(root)
     except FileExistsError as error:
         raise N31PostQcAuditRuntimeError(
-            "frozen v3 results root is already spent by a concurrent allocation"
+            "frozen v4 results root is already spent by a concurrent allocation"
         ) from error
     except OSError as error:
         raise N31PostQcAuditRuntimeError(
-            "could not persist the frozen v3 one-shot allocation ledger"
+            "could not persist the frozen v4 one-shot allocation ledger"
         ) from error
 
     try:
         if {path.resolve() for path in root.iterdir()} != {ledger_path.resolve()}:
-            _error("frozen v3 results root gained an unexpected allocation sibling")
+            _error("frozen v4 results root gained an unexpected allocation sibling")
         candidate.mkdir(mode=0o700)
         _fsync_directory(root)
     except (OSError, N31PostQcAuditRuntimeError) as error:
@@ -2441,7 +2451,7 @@ def validate_pilot_sequence(
         except N31PostQcAuditError as error:
             raise N31PostQcAuditRuntimeError(
                 "result-recorded child profile is absent or not the canonical "
-                "shipped v3 profile"
+                "shipped v4 profile"
             ) from error
         if (
             child_profile.profile_id != SHIPPED_PROFILE_ID

@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "profile_id": "n31-f5-q21-post-qc-audit-campaign-v2",
+  "frozen": true,
+  "campaign_order_seed": 41719,
+  "order_algorithm": "sha256-ranked-all-six-permutations-v1",
+  "cycles": 5,
+  "permutations_per_cycle": 6,
+  "slots_per_permutation": 3,
+  "scheduled_permutation_blocks": 30,
+  "scheduled_attempts": 90,
+  "attempts_per_arm": 30,
+  "attempts_per_ordinal_position_per_arm": 10,
+  "automatic_retries": 0,
+  "replacement_policy": "none",
+  "outcome_scanning": false,
+  "execution": {
+    "mode": "fixed_sequential",
+    "fresh_processes_per_attempt": true,
+    "one_shot_campaign_root": true,
+    "resume": false,
+    "continue_after_returned_outcome": [
+      "PASS",
+      "FAIL",
+      "INCOMPLETE"
+    ],
+    "stop_after_raised_exception": true
+  },
+  "pilot_gate": {
+    "required_verdict": "PASS",
+    "required_kind": "fresh-three-arm-pilot",
+    "same_revision": true,
+    "same_trusted_provenance": true,
+    "same_audit_profile": true,
+    "same_runtime_profile": true,
+    "figure_eligible": false
+  },
+  "audit_profile": {
+    "path": "experiments/adaptive/profiles/n31-f5-post-qc-audit-v4.json",
+    "profile_id": "n31-f5-q21-post-qc-audit-v4",
+    "sha256": "e05948c2eb0ae0eee7df78b5f9f603ce754ab560a5ac9bffabbf84d104b21a99"
+  },
+  "runtime_profile": {
+    "path": "experiments/adaptive/profiles/n31-f5-internal1-crash-shakedown-v1.json",
+    "profile_id": "n31-f5-q21-internal1-sigkill-shakedown-v1",
+    "sha256": "0defdaa9b69c949365eea3b3029da75cee3ea8334f845401103e2f7af8507650"
+  },
+  "arms": [
+    {
+      "name": "static_authenticated_false_report",
+      "expected_source_blind_classification": "false_reporter"
+    },
+    {
+      "name": "static_persistent_direct_vote_omission",
+      "expected_source_blind_classification": "omission_compatible"
+    },
+    {
+      "name": "static_authenticated_sham",
+      "expected_source_blind_classification": "sham"
+    }
+  ],
+  "source_blind_policy": {
+    "observe_all_children_before_truth_join": true,
+    "classifier_accepts_arm": false,
+    "extraction_order": "sha256-ranked-sealed-child-identity-v1",
+    "isolated_child_basename": "random-opaque-v1",
+    "unclassified_column": true
+  },
+  "acceptance_policy": {
+    "integrity_independent_of_outcomes": true,
+    "require_all_scheduled_invocations": true,
+    "require_all_sealed_children": true,
+    "require_exact_directory_membership": true,
+    "preserve_fixed_denominators": true
+  },
+  "statistics": {
+    "confidence_level": "0.95",
+    "binomial_interval": "two-sided-clopper-pearson-exact",
+    "binomial_denominator_per_arm": 30,
+    "median_interval": "two-sided-exact-sign-test-order-statistic",
+    "complete_n30_median_interval_order_statistics": [
+      10,
+      21
+    ]
+  },
+  "timing_metrics_ns": [
+    "qc_to_deadline_slack_ns",
+    "target_to_deadline_slack_ns",
+    "relay_to_root_latency_ns",
+    "root_verification_latency_ns",
+    "qc_to_audit_latency_ns",
+    "expiry_to_later_commit_latency_ns"
+  ],
+  "figure_policy": {
+    "campaign_acceptance_required": "ACCEPTED",
+    "pilot_eligible": false,
+    "mixed_outcomes_eligible": true,
+    "output_location": "outside_sealed_campaign_root"
+  },
+  "interpretation_scope": "same-host descriptive timings; Bernoulli trials only approximate independent identical repetitions; omission-compatible is not culprit identification; expiry-to-later-commit is fixed-Q21 common-witness observation time, not necessarily authoritative observer commit time"
+}
