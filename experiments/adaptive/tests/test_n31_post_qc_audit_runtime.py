@@ -16,11 +16,12 @@ import pytest
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit as pqar
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit_runtime as runner
 
-PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v4.json"
+PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v5.json"
 BLOCK = "b" * 64
 FINGERPRINT = "d" * 64
 QC_PUBLISHED_NS = 1_120_000_000
 ROOT_CONTEXT_GENERATION = 11
+CLEAN_BOUNDARY_NS = 800_000_000
 
 
 @pytest.fixture(scope="module")
@@ -441,10 +442,13 @@ def _aggregate_marker(profile: pqar.FrozenPqarProfile) -> str:
     )
 
 
-def _direct_marker(profile: pqar.FrozenPqarProfile) -> str:
+def _direct_marker(
+    profile: pqar.FrozenPqarProfile, *, monotonic_ns: int = 1_050_000_000
+) -> str:
     return (
         "KAURI_FAULT direct_vote_omitted replica=5 parent=0 epoch=0 tree=30 "
-        f"block={BLOCK} window={profile.diagnostic_window} monotonic_ns=1050000000"
+        f"block={BLOCK} window={profile.diagnostic_window} "
+        f"monotonic_ns={monotonic_ns}"
     )
 
 
@@ -456,6 +460,7 @@ def test_common_aggregate_omission_marker_is_exact(
         profile,
         _classification(profile),
         arm=arm,
+        clean_boundary_ns=CLEAN_BOUNDARY_NS,
         replica_logs={0: _aggregate_marker(profile), 5: ""},
     )
     with pytest.raises(runner.N31PostQcAuditRuntimeError, match="count or source"):
@@ -463,6 +468,7 @@ def test_common_aggregate_omission_marker_is_exact(
             profile,
             _classification(profile),
             arm=arm,
+            clean_boundary_ns=CLEAN_BOUNDARY_NS,
             replica_logs={0: "", 5: ""},
         )
 
@@ -474,8 +480,58 @@ def test_omission_allows_closed_partial_context_without_aggregate_marker(
         profile,
         _classification(profile),
         arm=pqar.ARM_OMISSION,
+        clean_boundary_ns=CLEAN_BOUNDARY_NS,
         replica_logs={0: "", 5: _direct_marker(profile)},
     )
+
+
+@pytest.mark.parametrize(
+    "marker_ns",
+    (1_000_000_000 - 13_126_958, 1_150_000_000),
+)
+def test_omission_accepts_pre_arm_marker_through_claim_deadline(
+    profile: pqar.FrozenPqarProfile,
+    marker_ns: int,
+) -> None:
+    runner._validate_native_ground_truth_marker(
+        profile,
+        _classification(profile),
+        arm=pqar.ARM_OMISSION,
+        clean_boundary_ns=CLEAN_BOUNDARY_NS,
+        replica_logs={
+            0: "",
+            5: _direct_marker(profile, monotonic_ns=marker_ns),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("clean_boundary_ns", "marker_ns"),
+    (
+        (CLEAN_BOUNDARY_NS, CLEAN_BOUNDARY_NS - 1),
+        (CLEAN_BOUNDARY_NS, CLEAN_BOUNDARY_NS),
+        (CLEAN_BOUNDARY_NS, 1_150_000_001),
+    ),
+)
+def test_omission_rejects_marker_outside_clean_to_deadline_interval(
+    profile: pqar.FrozenPqarProfile,
+    clean_boundary_ns: int,
+    marker_ns: int,
+) -> None:
+    with pytest.raises(
+        runner.N31PostQcAuditRuntimeError,
+        match="identity or timing drifted",
+    ):
+        runner._validate_native_ground_truth_marker(
+            profile,
+            _classification(profile),
+            arm=pqar.ARM_OMISSION,
+            clean_boundary_ns=clean_boundary_ns,
+            replica_logs={
+                0: "",
+                5: _direct_marker(profile, monotonic_ns=marker_ns),
+            },
+        )
 
 
 def test_omission_rejects_any_unrelated_aggregate_omission_marker(
@@ -486,6 +542,7 @@ def test_omission_rejects_any_unrelated_aggregate_omission_marker(
             profile,
             _classification(profile),
             arm=pqar.ARM_OMISSION,
+            clean_boundary_ns=CLEAN_BOUNDARY_NS,
             replica_logs={
                 0: _aggregate_marker(profile),
                 5: _direct_marker(profile),
@@ -1048,7 +1105,7 @@ def test_sequence_validator_rejects_noncanonical_child_profile(
     )
     with pytest.raises(
         runner.N31PostQcAuditRuntimeError,
-        match="canonical shipped v4 profile",
+        match="canonical shipped v5 profile",
     ):
         runner.validate_pilot_sequence(sequence, trusted_provenance=trusted)
 
@@ -1737,12 +1794,12 @@ def _cli():
     return importlib.import_module("experiments.adaptive.run_n31_post_qc_audit")
 
 
-def test_cli_defaults_select_prospective_v4() -> None:
+def test_cli_defaults_select_prospective_v5() -> None:
     cli = _cli()
-    assert cli.DEFAULT_PROFILE.name == "n31-f5-post-qc-audit-v4.json"
-    assert cli.DEFAULT_RESULTS_ROOT.name == "n31-f5-post-qc-audit-v4"
+    assert cli.DEFAULT_PROFILE.name == "n31-f5-post-qc-audit-v5.json"
+    assert cli.DEFAULT_RESULTS_ROOT.name == "n31-f5-post-qc-audit-v5"
     assert cli.DEFAULT_RESULTS_ROOT == (
-        cli.REPOSITORY / "results" / "n31-f5-post-qc-audit-v4"
+        cli.REPOSITORY / "results" / "n31-f5-post-qc-audit-v5"
     )
 
 
@@ -1859,7 +1916,7 @@ def test_cli_run_rejects_results_root_override_before_launch(
     )
     output = json.loads(capsys.readouterr().err)
     assert output["verdict"] == "REJECT"
-    assert "canonical frozen v4 results root" in output["error"]
+    assert "canonical frozen v5 results root" in output["error"]
     assert not trusted_path.exists()
 
 

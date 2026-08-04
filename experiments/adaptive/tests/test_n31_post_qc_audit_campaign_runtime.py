@@ -31,23 +31,23 @@ from experiments.adaptive.kauri_experiment.profiled_fault_archive import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 CAMPAIGN_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v2.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v3.json"
 )
 AUDIT_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v4.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v5.json"
 )
 
 
-def test_campaign_cli_defaults_select_prospective_v2_and_v4() -> None:
+def test_campaign_cli_defaults_select_prospective_v3_and_v5() -> None:
     revision = "a" * 40
 
     assert runner.DEFAULT_CAMPAIGN_PROFILE == CAMPAIGN_PROFILE
     assert runner.DEFAULT_AUDIT_PROFILE == AUDIT_PROFILE
     assert runner.DEFAULT_RESULTS_PARENT == (
-        REPOSITORY / "results/n31-post-qc-audit-campaign-v2"
+        REPOSITORY / "results/n31-post-qc-audit-campaign-v3"
     )
     assert runner._default_campaign_root(REPOSITORY, revision) == (
-        runner.DEFAULT_RESULTS_PARENT / "aaaaaaaa-seed41719-campaign-v2"
+        runner.DEFAULT_RESULTS_PARENT / "aaaaaaaa-seed41719-campaign-v3"
     )
 
 

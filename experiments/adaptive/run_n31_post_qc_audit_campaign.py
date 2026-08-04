@@ -64,12 +64,12 @@ from experiments.adaptive.kauri_experiment.profiled_fault_evaluation import (  #
 )
 
 DEFAULT_CAMPAIGN_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v2.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v3.json"
 )
 DEFAULT_AUDIT_PROFILE = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v4.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-v5.json"
 )
-DEFAULT_RESULTS_PARENT = REPOSITORY / "results/n31-post-qc-audit-campaign-v2"
+DEFAULT_RESULTS_PARENT = REPOSITORY / "results/n31-post-qc-audit-campaign-v3"
 
 
 class N31PostQcAuditCampaignRunError(RuntimeError):
@@ -257,7 +257,7 @@ def _pilot_gate(
         or not isinstance(pilot_result.get("evidence_seal_sha256"), str)
     ):
         raise N31PostQcAuditCampaignRunError(
-            "campaign requires one sealed aggregate-PASS v4 pilot"
+            "campaign requires one sealed aggregate-PASS v5 pilot"
         )
     return {
         "schema_version": 1,
@@ -417,7 +417,7 @@ def run_campaign(
         )
     if not callable(classify_source_blind):
         raise N31PostQcAuditCampaignRunError(
-            "v4 runtime lacks classify_preserved_run_source_blind; refusing "
+            "v5 runtime lacks classify_preserved_run_source_blind; refusing "
             "to launch a campaign without an arm-free preserved-run extractor"
         )
     if campaign_root.resolve().exists():
@@ -844,7 +844,7 @@ def _default_campaign_root(repository: Path, revision: str) -> Path:
     return (
         repository
         / DEFAULT_RESULTS_PARENT.relative_to(REPOSITORY)
-        / f"{revision[:8]}-seed{CAMPAIGN_ORDER_SEED}-campaign-v2"
+        / f"{revision[:8]}-seed{CAMPAIGN_ORDER_SEED}-campaign-v3"
     )
 
 
@@ -912,7 +912,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if arguments.pilot_sequence is None:
             raise N31PostQcAuditCampaignRunError(
-                "run requires --pilot-sequence for the excluded sealed v4 gate"
+                "run requires --pilot-sequence for the excluded sealed v5 gate"
             )
         build_directory = arguments.build_directory.resolve()
         summary_path = run_campaign(

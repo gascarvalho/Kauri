@@ -21,11 +21,11 @@ class N31PostQcAuditError(ValueError):
     """Raised when the frozen contract or evidence is incomplete or invalid."""
 
 
-SHIPPED_PROFILE_ID = "n31-f5-q21-post-qc-audit-v4"
+SHIPPED_PROFILE_ID = "n31-f5-q21-post-qc-audit-v5"
 SHIPPED_PROFILE_SHA256 = (
-    "e05948c2eb0ae0eee7df78b5f9f603ce754ab560a5ac9bffabbf84d104b21a99"
+    "847883f4547776f2f6642b7be9fc02045d918a733711f7e7a3450dcbeb67673a"
 )
-SCENARIO = "n31-post-qc-audit-v4"
+SCENARIO = "n31-post-qc-audit-v5"
 ARM_FALSE_REPORT = "static_authenticated_false_report"
 ARM_OMISSION = "static_persistent_direct_vote_omission"
 ARM_SHAM = "static_authenticated_sham"
@@ -129,6 +129,7 @@ _POLICY_FIELDS = {
     "pilot_ceiling",
     "figure_eligibility",
     "non_inclusion_claim",
+    "failure_stop_rule",
 }
 _RUNTIME_FIELDS = {"path", "profile_id", "sha256"}
 
@@ -488,7 +489,7 @@ def load_frozen_profile(path: Path) -> FrozenPqarProfile:
     if seed != 41_719 or not isinstance(window, str) or not _WINDOW.fullmatch(window):
         _error("snapshot seed or diagnostic window drifted")
     if (
-        window != "n31-epoch0-tree30-post-qc-audit-v4"
+        window != "n31-epoch0-tree30-post-qc-audit-v5"
         or raw.get("marker_clock") != "CLOCK_MONOTONIC_RAW"
         or raw.get("clock_scope") != "single_host_shared_kernel"
         or raw.get("fault_lifecycle_start")
@@ -559,6 +560,9 @@ def load_frozen_profile(path: Path) -> FrozenPqarProfile:
         "pilot_ceiling": "harness_validation_only",
         "figure_eligibility": "never_for_single_attempt_pilot",
         "non_inclusion_claim": "omission_compatible_only",
+        "failure_stop_rule": (
+            "no_v6_without_independent_method_review_or_explicit_redesign"
+        ),
     }:
         _error("evidence policy drifted")
     runtime = _mapping(raw.get("runtime_profile"), "runtime profile")

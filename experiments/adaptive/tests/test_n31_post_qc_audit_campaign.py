@@ -32,10 +32,13 @@ from experiments.adaptive.kauri_experiment.n31_post_qc_audit_campaign import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 PROFILE_PATH = (
-    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v2.json"
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v3.json"
 )
 V1_PROFILE_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v1.json"
+)
+V2_PROFILE_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/n31-f5-post-qc-audit-campaign-v2.json"
 )
 REVISION = "a" * 40
 
@@ -116,16 +119,20 @@ def test_campaign_profile_is_bound_to_exact_shipped_bytes(tmp_path: Path) -> Non
     assert profile.profile_id == CAMPAIGN_PROFILE_ID
     assert profile.order_seed == 41_719
     assert profile.audit_profile_sha256 == (
-        "e05948c2eb0ae0eee7df78b5f9f603ce754ab560a5ac9bffabbf84d104b21a99"
+        "847883f4547776f2f6642b7be9fc02045d918a733711f7e7a3450dcbeb67673a"
     )
     assert json.loads(PROFILE_PATH.read_text(encoding="utf-8"))[
         "interpretation_scope"
     ].endswith(
-        "expiry-to-later-commit is fixed-Q21 common-witness observation time, "
-        "not necessarily authoritative observer commit time"
+        "audit-v5 is an outcome-informed correction aligning exact target-side "
+        "omission ground truth with the frozen post-baseline lifecycle rather "
+        "than reporter-local arming"
     )
     assert hashlib.sha256(V1_PROFILE_PATH.read_bytes()).hexdigest() == (
         "f904cb118d95ea975578b85e79b0ffb7dfcc3f0e6d87dfccb8859feb0488ea25"
+    )
+    assert hashlib.sha256(V2_PROFILE_PATH.read_bytes()).hexdigest() == (
+        "acc1191e467901af1743d6930f4e7a36ca6f7ac45dcb6df698a39e668eab996d"
     )
 
     changed = tmp_path / "changed.json"
@@ -134,9 +141,12 @@ def test_campaign_profile_is_bound_to_exact_shipped_bytes(tmp_path: Path) -> Non
         load_frozen_campaign_profile(changed)
 
 
-def test_published_campaign_v1_profile_is_preserved_but_not_reused() -> None:
+@pytest.mark.parametrize("published", (V1_PROFILE_PATH, V2_PROFILE_PATH))
+def test_published_campaign_profiles_are_preserved_but_not_reused(
+    published: Path,
+) -> None:
     with pytest.raises(N31PostQcAuditCampaignError, match="profile bytes"):
-        load_frozen_campaign_profile(V1_PROFILE_PATH)
+        load_frozen_campaign_profile(published)
 
 
 def test_source_blind_rank_uses_only_sealed_child_identity() -> None:

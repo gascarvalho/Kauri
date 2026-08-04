@@ -1,4 +1,4 @@
-"""One-attempt runtime and preserved-evidence validator for the v4 PQAR pilot.
+"""One-attempt runtime and preserved-evidence validator for the v5 PQAR pilot.
 
 Audit classification consumes only raw replica logs.  Manager events are used
 for process ownership only and never as diagnostic observations.  The fixed
@@ -93,7 +93,7 @@ _MANIFEST_FIELDS = {
     "runtime_error",
 }
 _LOG_OFFSET_FIELDS = {"path", "sha256", "start_offset", "terminal_offset"}
-_ONE_SHOT_LEDGER_FILENAME = "pqar-v4-one-shot-ledger.json"
+_ONE_SHOT_LEDGER_FILENAME = "pqar-v5-one-shot-ledger.json"
 _ONE_SHOT_LEDGER_FIELDS = {
     "schema_version",
     "scenario",
@@ -620,6 +620,7 @@ def _validate_native_ground_truth_marker(
     classification: SourceBlindClassification,
     *,
     arm: str,
+    clean_boundary_ns: int,
     replica_logs: Mapping[int, str],
 ) -> None:
     aggregate_lines = [
@@ -703,7 +704,10 @@ def _validate_native_ground_truth_marker(
         or tokens.get("tree") != str(profile.tree_id)
         or tokens.get("block") != classification.identity.block
         or tokens.get("window") != profile.diagnostic_window
-        or marker_ns <= classification.armed_ns
+        # The target and reporter select this exact context independently.  The
+        # target's real omission may therefore precede reporter-local arming;
+        # the common clean boundary is the causal lower bound shared by both.
+        or marker_ns <= clean_boundary_ns
         or marker_ns > int(classification.deadline_ns or 0)
     ):
         _error("omission ground-truth marker identity or timing drifted")
@@ -1217,7 +1221,11 @@ def _raw_validation(
         classification=classification,
     )
     _validate_native_ground_truth_marker(
-        profile, classification, arm=arm, replica_logs=replica_logs
+        profile,
+        classification,
+        arm=arm,
+        clean_boundary_ns=clean_boundary_ns,
+        replica_logs=replica_logs,
     )
     streams = runtime.event_streams(
         runtime_profile, run_directory, include_manager=True, allow_partial=False
@@ -1265,7 +1273,7 @@ def _load_source_blind_preserved_profiles(
         or runtime_profile.profile_id != profile.runtime_profile_id
         or runtime_profile.profile_sha256 != profile.runtime_profile_sha256
     ):
-        _error("preserved runtime profile differs from the canonical v4 binding")
+        _error("preserved runtime profile differs from the canonical v5 binding")
     return profile, runtime_profile
 
 
@@ -1838,6 +1846,7 @@ def run_once(
             profile,
             classification,
             arm=arm,
+            clean_boundary_ns=clean_boundary_ns,
             replica_logs=live_logs,
         )
         update_state(
@@ -2098,13 +2107,13 @@ def _one_shot_ledger_path(sequence_directory: Path) -> Path:
 def _create_sequence_directory(
     results_root: Path, *, profile: FrozenPqarProfile
 ) -> Path:
-    """Consume the frozen v4 results root and allocate one empty parent."""
+    """Consume the frozen v5 results root and allocate one empty parent."""
 
     if (
         profile.profile_id != SHIPPED_PROFILE_ID
         or profile.profile_sha256 != SHIPPED_PROFILE_SHA256
     ):
-        _error("one-shot allocation requires the canonical shipped v4 profile")
+        _error("one-shot allocation requires the canonical shipped v5 profile")
     root = results_root.resolve()
     root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -2112,11 +2121,11 @@ def _create_sequence_directory(
         _fsync_directory(root.parent)
     except FileExistsError as error:
         raise N31PostQcAuditRuntimeError(
-            "frozen v4 results root is already spent by a prior allocation"
+            "frozen v5 results root is already spent by a prior allocation"
         ) from error
     except OSError as error:
         raise N31PostQcAuditRuntimeError(
-            "could not exclusively allocate the frozen v4 results root"
+            "could not exclusively allocate the frozen v5 results root"
         ) from error
     os.chmod(root, 0o700)
 
@@ -2139,16 +2148,16 @@ def _create_sequence_directory(
         _fsync_directory(root)
     except FileExistsError as error:
         raise N31PostQcAuditRuntimeError(
-            "frozen v4 results root is already spent by a concurrent allocation"
+            "frozen v5 results root is already spent by a concurrent allocation"
         ) from error
     except OSError as error:
         raise N31PostQcAuditRuntimeError(
-            "could not persist the frozen v4 one-shot allocation ledger"
+            "could not persist the frozen v5 one-shot allocation ledger"
         ) from error
 
     try:
         if {path.resolve() for path in root.iterdir()} != {ledger_path.resolve()}:
-            _error("frozen v4 results root gained an unexpected allocation sibling")
+            _error("frozen v5 results root gained an unexpected allocation sibling")
         candidate.mkdir(mode=0o700)
         _fsync_directory(root)
     except (OSError, N31PostQcAuditRuntimeError) as error:
@@ -2451,7 +2460,7 @@ def validate_pilot_sequence(
         except N31PostQcAuditError as error:
             raise N31PostQcAuditRuntimeError(
                 "result-recorded child profile is absent or not the canonical "
-                "shipped v4 profile"
+                "shipped v5 profile"
             ) from error
         if (
             child_profile.profile_id != SHIPPED_PROFILE_ID
