@@ -11,7 +11,10 @@ import pytest
 
 from experiments.adaptive.kauri_experiment import n31_post_qc_audit as pqar
 
-PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v2.json"
+PROFILE_PATH = Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v3.json"
+V2_PROFILE_PATH = (
+    Path(__file__).parents[1] / "profiles" / "n31-f5-post-qc-audit-v2.json"
+)
 EPOCH_DIGEST = "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
 BLOCK = "b" * 64
 BASELINE = "a" * 64
@@ -28,6 +31,7 @@ QC_PUBLISHED_NS = 1_120_000_000
 RETENTION_NS = 1_370_000_000
 RECEIVED_NS = 1_160_000_000
 VERIFIED_NS = 1_161_000_000
+ROOT_CONTEXT_GENERATION = 11
 
 
 @pytest.fixture(scope="module")
@@ -35,17 +39,19 @@ def profile() -> pqar.FrozenPqarProfile:
     return pqar.load_frozen_profile(PROFILE_PATH)
 
 
-def _identity(block: str = BLOCK) -> str:
+def _identity(block: str = BLOCK, *, root_marker: bool = False) -> str:
+    context = f"context_generation={ROOT_CONTEXT_GENERATION} " if root_marker else ""
     return (
         "reporter=0 target=5 root=30 epoch=0 tree=30 "
-        f"epoch_digest={EPOCH_DIGEST} block={block} generation=7 "
-        "window=n31-epoch0-tree30-post-qc-audit-v2"
+        f"epoch_digest={EPOCH_DIGEST} block={block} generation=7 {context}"
+        "window=n31-epoch0-tree30-post-qc-audit-v3"
     )
 
 
 def _prepared(block: str = BLOCK, fingerprint: str = QC_FINGERPRINT) -> str:
     return (
-        f"KAURI_AUDIT root_prepared phase=pre_qc {_identity(block)} "
+        f"KAURI_AUDIT root_prepared phase=pre_qc "
+        f"{_identity(block, root_marker=True)} "
         f"prepared_ns={PREPARED_NS} qc_signers={QC_SIGNERS} "
         f"qc_fingerprint={fingerprint}"
     )
@@ -53,7 +59,8 @@ def _prepared(block: str = BLOCK, fingerprint: str = QC_FINGERPRINT) -> str:
 
 def _snapshot(block: str = BLOCK, fingerprint: str = QC_FINGERPRINT) -> str:
     return (
-        f"KAURI_AUDIT root_snapshot phase=post_qc {_identity(block)} "
+        f"KAURI_AUDIT root_snapshot phase=post_qc "
+        f"{_identity(block, root_marker=True)} "
         f"prepared_ns={PREPARED_NS} qc_published_ns={QC_PUBLISHED_NS} "
         f"retention_deadline_ns={RETENTION_NS} qc_signers={QC_SIGNERS} "
         f"qc_fingerprint={fingerprint} consensus_context=terminal qc_unchanged=1"
@@ -90,7 +97,8 @@ def _witness(
     fingerprint: str = QC_FINGERPRINT,
 ) -> str:
     return (
-        f"KAURI_AUDIT root_witness phase=post_qc {_identity()} "
+        f"KAURI_AUDIT root_witness phase=post_qc "
+        f"{_identity(root_marker=True)} "
         f"prepared_ns={PREPARED_NS} qc_published_ns={QC_PUBLISHED_NS} "
         f"received_ns={RECEIVED_NS} verified_ns={VERIFIED_NS} "
         f"retention_deadline_ns={RETENTION_NS} deadline_ns={DEADLINE_NS} "
@@ -163,6 +171,8 @@ def test_profile_and_execution_order_are_frozen(
     assert profile.expected_qc_signers == QC_SIGNER_IDS
     assert not set(profile.expected_qc_signers) & set(profile.reporter_subtree)
     assert profile.clock_scope == "single_host_shared_kernel"
+    assert V2_PROFILE_PATH.exists()
+    assert profile.arm(pqar.ARM_OMISSION).omit_outbound_aggregate is False
 
 
 def test_profile_byte_tampering_is_rejected(tmp_path: Path) -> None:
@@ -189,12 +199,14 @@ def test_launch_contract_uses_exact_arm_scoping(
     )
     omission_args = contracts[pqar.ARM_OMISSION]["replica_arguments"]
     assert "--experiment-omit-outbound-direct-vote" in omission_args["5"]
+    assert "--experiment-omit-outbound-aggregate" not in omission_args["0"]
     assert all(
         "--experiment-omit-outbound-direct-vote" not in args
         for replica, args in omission_args.items()
         if replica != "5"
     )
-    for contract in contracts.values():
+    for arm in (pqar.ARM_FALSE_REPORT, pqar.ARM_SHAM):
+        contract = contracts[arm]
         assert (
             "--experiment-omit-outbound-aggregate" in contract["replica_arguments"]["0"]
         )
@@ -219,6 +231,7 @@ def test_source_blind_classification_precedes_ground_truth(
     assert result.classification == expected
     assert result.witness_signers == witnesses
     assert result.audit_expiry_ns == QC_PUBLISHED_NS + 250_000_000
+    assert result.root_context_generation == ROOT_CONTEXT_GENERATION
     assert result.frozen_qc_hash_before == result.frozen_qc_hash_after
     pqar.validate_ground_truth(profile, arm=arm, classification=result)
 
@@ -304,6 +317,23 @@ def test_qc_branch_inclusion_and_fingerprint_mutation_are_rejected(
     wrong_fingerprint[30] = "\n".join([_prepared(), _snapshot(), witness])
     with pytest.raises(pqar.N31PostQcAuditError, match="mutated the QC"):
         _classify(profile, wrong_fingerprint)
+
+
+def test_root_context_generation_is_distinct_and_consistent(
+    profile: pqar.FrozenPqarProfile,
+) -> None:
+    result = _classify(profile, _logs(pqar.ARM_SHAM))
+    assert result.identity.generation == 7
+    assert result.root_context_generation == ROOT_CONTEXT_GENERATION
+
+    mismatched = _logs(pqar.ARM_SHAM)
+    mismatched[30] = mismatched[30].replace(
+        f"context_generation={ROOT_CONTEXT_GENERATION}",
+        f"context_generation={ROOT_CONTEXT_GENERATION + 1}",
+        1,
+    )
+    with pytest.raises(pqar.N31PostQcAuditError, match="context generation"):
+        _classify(profile, mismatched)
 
 
 def test_relay_after_root_receipt_is_rejected(profile: pqar.FrozenPqarProfile) -> None:

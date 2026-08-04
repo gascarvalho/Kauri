@@ -21,11 +21,11 @@ class N31PostQcAuditError(ValueError):
     """Raised when the frozen contract or evidence is incomplete or invalid."""
 
 
-SHIPPED_PROFILE_ID = "n31-f5-q21-post-qc-audit-v2"
+SHIPPED_PROFILE_ID = "n31-f5-q21-post-qc-audit-v3"
 SHIPPED_PROFILE_SHA256 = (
-    "53f5758aff73df08bad3d29dfe111c4dcbc915f4bdda79cc56eb52b23b70e7df"
+    "84039370562a7846efdc5d09e66b1096a6e6252fd1b6b49fe42fd7299800cff5"
 )
-SCENARIO = "n31-post-qc-audit-v2"
+SCENARIO = "n31-post-qc-audit-v3"
 ARM_FALSE_REPORT = "static_authenticated_false_report"
 ARM_OMISSION = "static_persistent_direct_vote_omission"
 ARM_SHAM = "static_authenticated_sham"
@@ -275,6 +275,7 @@ class SourceBlindClassification:
     frozen_qc_signers_after: tuple[int, ...]
     frozen_qc_hash_before: str
     frozen_qc_hash_after: str
+    root_context_generation: int
     markers: tuple[AuditMarker, ...]
 
 
@@ -325,6 +326,7 @@ class PqarValidation:
     frozen_qc_signers_after: tuple[int, ...]
     frozen_qc_hash_before: str
     frozen_qc_hash_after: str
+    root_context_generation: int
     later_commit_ns: int
     expiry_to_later_commit_latency_ns: int
     unique_commit_buckets: tuple[tuple[int, str, int], ...]
@@ -400,7 +402,7 @@ def _parse_arms(value: object) -> tuple[PqarArm, ...]:
             "n31-pqar-direct-vote-omission-5-to-0",
             5,
             False,
-            True,
+            False,
             True,
             "omission_compatible",
             OMISSION_WITNESS_SIGNERS,
@@ -486,7 +488,7 @@ def load_frozen_profile(path: Path) -> FrozenPqarProfile:
     if seed != 41_719 or not isinstance(window, str) or not _WINDOW.fullmatch(window):
         _error("snapshot seed or diagnostic window drifted")
     if (
-        window != "n31-epoch0-tree30-post-qc-audit-v2"
+        window != "n31-epoch0-tree30-post-qc-audit-v3"
         or raw.get("marker_clock") != "CLOCK_MONOTONIC_RAW"
         or raw.get("clock_scope") != "single_host_shared_kernel"
         or raw.get("fault_lifecycle_start")
@@ -688,6 +690,11 @@ _IDENTITY_FIELD_ORDER = (
     "generation",
     "window",
 )
+_ROOT_IDENTITY_FIELD_ORDER = (
+    *_IDENTITY_FIELD_ORDER[:-1],
+    "context_generation",
+    "window",
+)
 _MARKER_FIELD_ORDER = {
     "missing_claim": (
         "claim",
@@ -714,14 +721,14 @@ _MARKER_FIELD_ORDER = {
     ),
     "root_prepared": (
         "phase",
-        *_IDENTITY_FIELD_ORDER,
+        *_ROOT_IDENTITY_FIELD_ORDER,
         "prepared_ns",
         "qc_signers",
         "qc_fingerprint",
     ),
     "root_snapshot": (
         "phase",
-        *_IDENTITY_FIELD_ORDER,
+        *_ROOT_IDENTITY_FIELD_ORDER,
         "prepared_ns",
         "qc_published_ns",
         "retention_deadline_ns",
@@ -732,7 +739,7 @@ _MARKER_FIELD_ORDER = {
     ),
     "root_witness": (
         "phase",
-        *_IDENTITY_FIELD_ORDER,
+        *_ROOT_IDENTITY_FIELD_ORDER,
         "prepared_ns",
         "qc_published_ns",
         "received_ns",
@@ -816,6 +823,7 @@ def _parse_marker_line(source_replica: int, line: str) -> AuditMarker | None:
     if "signers" in fields:
         _parse_signers(fields["signers"], f"{kind} signers")
     if kind in {"root_prepared", "root_snapshot", "root_witness"}:
+        _parse_uint(fields["context_generation"], "root context generation")
         _parse_signers(fields["qc_signers"], "root QC signers")
     if kind in {"root_prepared", "root_snapshot", "root_witness"}:
         _hex256(fields["qc_fingerprint"], "QC fingerprint")
@@ -918,6 +926,13 @@ def classify_source_blind(
         for marker in prepared_markers + snapshots + witnesses
     ):
         _error("root audit marker came from the wrong replica log")
+    root_context_generations = {
+        _parse_uint(marker.fields["context_generation"], "root context generation")
+        for marker in prepared_markers + snapshots + witnesses
+    }
+    if len(root_context_generations) != 1 or next(iter(root_context_generations)) <= 0:
+        _error("root audit markers do not share one positive context generation")
+    root_context_generation = next(iter(root_context_generations))
     if len(targets) > 1 or any(
         marker.fields["phase"] not in {"open", "post_close"} for marker in targets
     ):
@@ -1111,6 +1126,7 @@ def classify_source_blind(
         frozen_qc_signers_after=qc_signers,
         frozen_qc_hash_before=pre_qc_fingerprint,
         frozen_qc_hash_after=post_qc_fingerprint,
+        root_context_generation=root_context_generation,
         markers=markers,
     )
 
@@ -1277,6 +1293,7 @@ def validate_pilot(
         frozen_qc_signers_after=classification.frozen_qc_signers_after,
         frozen_qc_hash_before=classification.frozen_qc_hash_before,
         frozen_qc_hash_after=classification.frozen_qc_hash_after,
+        root_context_generation=classification.root_context_generation,
         later_commit_ns=consensus.later_commit_ns,
         expiry_to_later_commit_latency_ns=expiry_to_later_commit_latency_ns,
         unique_commit_buckets=consensus.unique_commit_buckets,

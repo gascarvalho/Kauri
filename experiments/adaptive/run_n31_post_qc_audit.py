@@ -31,9 +31,9 @@ DEFAULT_PROFILE = (
     / "experiments"
     / "adaptive"
     / "profiles"
-    / "n31-f5-post-qc-audit-v2.json"
+    / "n31-f5-post-qc-audit-v3.json"
 )
-DEFAULT_RESULTS_ROOT = REPOSITORY / "results" / "n31-f5-post-qc-audit-v2"
+DEFAULT_RESULTS_ROOT = REPOSITORY / "results" / "n31-f5-post-qc-audit-v3"
 
 
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -137,6 +137,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit(result)
             return 0 if result["verdict"] == "PASS" else 1
 
+        if (
+            args.command == "run"
+            and args.results_root.resolve() != DEFAULT_RESULTS_ROOT.resolve()
+        ):
+            raise audit_runtime.N31PostQcAuditRuntimeError(
+                "run requires the canonical frozen v3 results root: "
+                f"{DEFAULT_RESULTS_ROOT.resolve()}"
+            )
         values = _runtime_arguments(args)
         trusted_path = _trusted_path(args, forbidden=args.results_root)
         if args.command == "preflight":

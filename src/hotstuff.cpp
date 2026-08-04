@@ -9335,7 +9335,8 @@ namespace hotstuff
             HOTSTUFF_LOG_INFO(
                 "KAURI_AUDIT root_prepared phase=pre_qc reporter=%u "
                 "target=%u root=%u epoch=%u tree=%u epoch_digest=%s "
-                "block=%s generation=%llu window=%s prepared_ns=%llu "
+                "block=%s generation=%llu context_generation=%llu "
+                "window=%s prepared_ns=%llu "
                 "qc_signers=%s qc_fingerprint=%s",
                 static_cast<unsigned>(options.reporter),
                 static_cast<unsigned>(options.target),
@@ -9346,6 +9347,8 @@ namespace hotstuff
                     .to_hex().c_str(),
                 snapshot.proposal.block_hash.to_hex().c_str(),
                 static_cast<unsigned long long>(snapshot.generation),
+                static_cast<unsigned long long>(
+                    snapshot.context_generation),
                 options.diagnostic_window.c_str(),
                 static_cast<unsigned long long>(snapshot.prepared_ns),
                 signers.c_str(),
@@ -9374,7 +9377,8 @@ namespace hotstuff
             HOTSTUFF_LOG_INFO(
                 "KAURI_AUDIT root_snapshot phase=post_qc reporter=%u "
                 "target=%u root=%u epoch=%u tree=%u epoch_digest=%s "
-                "block=%s generation=%llu window=%s prepared_ns=%llu "
+                "block=%s generation=%llu context_generation=%llu "
+                "window=%s prepared_ns=%llu "
                 "qc_published_ns=%llu retention_deadline_ns=%llu "
                 "qc_signers=%s qc_fingerprint=%s "
                 "consensus_context=terminal qc_unchanged=1",
@@ -9387,6 +9391,8 @@ namespace hotstuff
                     .to_hex().c_str(),
                 snapshot.proposal.block_hash.to_hex().c_str(),
                 static_cast<unsigned long long>(snapshot.generation),
+                static_cast<unsigned long long>(
+                    snapshot.context_generation),
                 options.diagnostic_window.c_str(),
                 static_cast<unsigned long long>(snapshot.prepared_ns),
                 static_cast<unsigned long long>(snapshot.published_ns),
@@ -9672,6 +9678,7 @@ namespace hotstuff
             const auto snapshot = experiment_post_qc_audit->prepare_root(
                 lease.key(),
                 *generation,
+                lease.generation(),
                 lease.tree(),
                 verified_qc,
                 *frozen_global_quorum,
@@ -9834,7 +9841,8 @@ namespace hotstuff
                 HOTSTUFF_LOG_INFO(
                     "KAURI_AUDIT root_witness phase=post_qc "
                     "reporter=%u target=%u root=%u epoch=%u tree=%u "
-                    "epoch_digest=%s block=%s generation=%llu window=%s "
+                    "epoch_digest=%s block=%s generation=%llu "
+                    "context_generation=%llu window=%s "
                     "prepared_ns=%llu qc_published_ns=%llu "
                     "received_ns=%llu verified_ns=%llu "
                     "retention_deadline_ns=%llu deadline_ns=%llu "
@@ -9851,6 +9859,8 @@ namespace hotstuff
                     retained->relay.proposal.block_hash.to_hex().c_str(),
                     static_cast<unsigned long long>(
                         retained->relay.generation),
+                    static_cast<unsigned long long>(
+                        retained->root_snapshot.context_generation),
                     retained->relay.diagnostic_window.c_str(),
                     static_cast<unsigned long long>(
                         retained->root_snapshot.prepared_ns),

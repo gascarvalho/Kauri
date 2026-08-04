@@ -103,7 +103,11 @@ struct ExperimentPostQcAuditMissingClaim final
 struct ExperimentPostQcAuditRootSnapshot final
 {
     ProposalKey proposal;
+    // Configuration-runtime generation retained for correlation with the
+    // reporter's wire identity.
     std::uint64_t generation{0};
+    // Root-local exact proposal-context generation captured from the lease.
+    std::uint64_t context_generation{0};
     std::uint64_t prepared_ns{0};
     std::uint64_t published_ns{0};
     std::uint64_t expiry_ns{0};
@@ -226,6 +230,7 @@ public:
     std::optional<ExperimentPostQcAuditRootSnapshot> prepare_root(
         const ProposalKey &proposal,
         std::uint64_t generation,
+        std::uint64_t context_generation,
         const ProposalTreeSnapshot &tree,
         const QuorumCert &verified_qc,
         std::size_t frozen_global_quorum,

@@ -28,6 +28,7 @@ constexpr ReplicaID kReporter = 0;
 constexpr ReplicaID kTarget = 5;
 constexpr ReplicaID kRoot = 30;
 constexpr std::uint64_t kGeneration = 41;
+constexpr std::uint64_t kContextGeneration = 73;
 constexpr std::uint64_t kArmedNs = 1'000'000'000;
 constexpr std::uint64_t kDeadlineNs =
     kArmedNs + kExperimentPostQcAuditDeadlineMs * 1'000'000;
@@ -179,7 +180,13 @@ void prepare_and_activate_root(ExperimentPostQcAudit &root,
 {
     auto qc = aggregate(core, {kRoot, 1, 2});
     const auto prepared = root.prepare_root(
-        proposal(), kGeneration, root_tree(), *qc, 3, kPreparedNs);
+        proposal(),
+        kGeneration,
+        kContextGeneration,
+        root_tree(),
+        *qc,
+        3,
+        kPreparedNs);
     REQUIRE(prepared.has_value());
     CHECK(prepared->published_ns == 0);
     CHECK(prepared->expiry_ns == 0);
@@ -218,6 +225,19 @@ std::string function_body(const std::string &source,
     }
     FAIL("unterminated function body for " << signature);
     return {};
+}
+
+std::string without_whitespace(std::string source)
+{
+    source.erase(
+        std::remove_if(
+            source.begin(),
+            source.end(),
+            [](unsigned char character) {
+                return std::isspace(character) != 0;
+            }),
+        source.end());
+    return source;
 }
 
 std::size_t certificate_bitmap_offset(
@@ -295,6 +315,7 @@ TEST_CASE("disabled and enabled audit paths preserve consensus-owned QC bytes")
     REQUIRE(root.prepare_root(
         proposal(),
         kGeneration,
+        kContextGeneration,
         root_tree(),
         *published_qc,
         3,
@@ -493,7 +514,13 @@ TEST_CASE("root activates only after terminal QC publication")
     ExperimentPostQcAudit root(options(), kRoot);
     auto qc = aggregate(core, {kRoot, 1, 2});
     const auto prepared = root.prepare_root(
-        proposal(), kGeneration, root_tree(), *qc, 3, kPreparedNs);
+        proposal(),
+        kGeneration,
+        kContextGeneration,
+        root_tree(),
+        *qc,
+        3,
+        kPreparedNs);
     REQUIRE(prepared.has_value());
     CHECK_FALSE(root.activate_root(
         proposal(), kGeneration, *qc, kPublishedNs, false));
@@ -515,14 +542,26 @@ TEST_CASE("root preparation requires a disjoint in-tree frozen quorum")
     {
         auto qc = aggregate(core, {kRoot, 1});
         CHECK_FALSE(root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 3, kPreparedNs)
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            3,
+            kPreparedNs)
                         .has_value());
     }
     SECTION("overlaps reporter subtree")
     {
         auto qc = aggregate(core, {kRoot, kReporter, 1});
         CHECK_FALSE(root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 3, kPreparedNs)
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            3,
+            kPreparedNs)
                         .has_value());
     }
     SECTION("contains signer outside exact root membership")
@@ -535,14 +574,26 @@ TEST_CASE("root preparation requires a disjoint in-tree frozen quorum")
             tree.assigned_subtree.end());
         auto qc = aggregate(core, {kRoot, 1, 2});
         CHECK_FALSE(root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 3, kPreparedNs)
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            3,
+            kPreparedNs)
                         .has_value());
     }
     SECTION("exact quorum boundary is accepted")
     {
         auto qc = aggregate(core, {kRoot, 1, 2});
         CHECK(root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 3, kPreparedNs)
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            3,
+            kPreparedNs)
                   .has_value());
     }
 }
@@ -563,7 +614,13 @@ TEST_CASE("N31 1-5-25 root geometry anchors complement-Q25 evidence")
     {
         auto qc = aggregate(core, complement);
         const auto prepared = root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 21, kPreparedNs);
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            21,
+            kPreparedNs);
         REQUIRE(prepared.has_value());
         CHECK(prepared->qc_signers.size() == 25);
         CHECK(prepared->reporter_subtree ==
@@ -575,7 +632,13 @@ TEST_CASE("N31 1-5-25 root geometry anchors complement-Q25 evidence")
         q20.resize(20);
         auto qc = aggregate(core, q20);
         CHECK_FALSE(root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 21, kPreparedNs)
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            21,
+            kPreparedNs)
                         .has_value());
     }
     SECTION("Q25 with reporter overlap")
@@ -584,7 +647,13 @@ TEST_CASE("N31 1-5-25 root geometry anchors complement-Q25 evidence")
         overlapping.back() = kReporter;
         auto qc = aggregate(core, overlapping);
         CHECK_FALSE(root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 21, kPreparedNs)
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            21,
+            kPreparedNs)
                         .has_value());
     }
     SECTION("Q25 contains signer outside frozen root membership")
@@ -597,7 +666,13 @@ TEST_CASE("N31 1-5-25 root geometry anchors complement-Q25 evidence")
             tree.assigned_subtree.end());
         auto qc = aggregate(core, complement);
         CHECK_FALSE(root.prepare_root(
-            proposal(), kGeneration, tree, *qc, 21, kPreparedNs)
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            tree,
+            *qc,
+            21,
+            kPreparedNs)
                         .has_value());
     }
 }
@@ -610,6 +685,7 @@ TEST_CASE("sham snapshot rejects changed published QC bytes")
     REQUIRE(root.prepare_root(
         proposal(),
         kGeneration,
+        kContextGeneration,
         root_tree(),
         *frozen_qc,
         3,
@@ -630,6 +706,7 @@ TEST_CASE("root rejects publication outside reporter deadline chronology")
     REQUIRE(root.prepare_root(
         proposal(),
         kGeneration,
+        kContextGeneration,
         root_tree(),
         *qc,
         3,
@@ -929,6 +1006,9 @@ TEST_CASE("dedicated path stays isolated from consensus and MsgRelay")
     const auto activation = function_body(
         source,
         "void HotStuffBase::activate_experiment_post_qc_audit_root(");
+    const auto prepared_marker = function_body(
+        source,
+        "void HotStuffBase::emit_experiment_post_qc_audit_root_prepared(");
     const auto snapshot_marker = function_body(
         source,
         "void HotStuffBase::emit_experiment_post_qc_audit_root_snapshot(");
@@ -944,12 +1024,32 @@ TEST_CASE("dedicated path stays isolated from consensus and MsgRelay")
           std::string::npos);
     CHECK(preparation.find("frozen_global_quorum(lease)") !=
           std::string::npos);
+    CHECK(without_whitespace(preparation).find(
+              "lease.key(),*generation,lease.generation(),lease.tree()") !=
+          std::string::npos);
     CHECK(activation.find("block->self_qc == nullptr") <
           activation.find("->activate_root("));
     CHECK(activation.find("*block->self_qc") !=
           std::string::npos);
     CHECK(snapshot_marker.find("qc_unchanged=1") !=
           std::string::npos);
+    CHECK(prepared_marker.find(
+              "generation=%llu context_generation=%llu") !=
+          std::string::npos);
+    CHECK(prepared_marker.find("snapshot.generation") <
+          prepared_marker.find("snapshot.context_generation"));
+    CHECK(snapshot_marker.find(
+              "generation=%llu context_generation=%llu") !=
+          std::string::npos);
+    CHECK(snapshot_marker.find("snapshot.generation") <
+          snapshot_marker.find("snapshot.context_generation"));
+    CHECK(handler.find("generation=%llu \"") <
+          handler.find("context_generation=%llu"));
+    CHECK(handler.find("context_generation=%llu") !=
+          std::string::npos);
+    CHECK(handler.find("retained->relay.generation") <
+          handler.find(
+              "retained->root_snapshot.context_generation"));
     CHECK(handler.find("verified_ns") <
           handler.find("complete_root_verification("));
     CHECK(source.find(
@@ -975,6 +1075,50 @@ TEST_CASE("post-QC audit marker tokens stay parseable")
     CHECK(std::string(to_string(
               ExperimentPostQcAuditTargetPhase::post_close)) ==
           "post_close");
+}
+
+TEST_CASE("root snapshot preserves its exact proposal-context generation")
+{
+    BlsTestCore core(31);
+    ExperimentPostQcAudit root(options(), kRoot);
+    auto qc = aggregate(core, {kRoot, 1, 2});
+
+    SECTION("zero proposal-context generation is rejected")
+    {
+        CHECK_FALSE(root.prepare_root(
+            proposal(),
+            kGeneration,
+            0,
+            root_tree(),
+            *qc,
+            3,
+            kPreparedNs).has_value());
+    }
+
+    SECTION("distinct identities survive root verification")
+    {
+        const auto prepared = root.prepare_root(
+            proposal(),
+            kGeneration,
+            kContextGeneration,
+            root_tree(),
+            *qc,
+            3,
+            kPreparedNs);
+        REQUIRE(prepared.has_value());
+        CHECK(prepared->generation == kGeneration);
+        CHECK(prepared->context_generation == kContextGeneration);
+        REQUIRE(root.activate_root(
+            proposal(), kGeneration, *qc, kPublishedNs, true));
+
+        auto value = relay(core, {kReporter, 6, 7});
+        const auto request = root.begin_root_verification(
+            value, kReporter, kReceivedNs);
+        REQUIRE(request.has_value());
+        CHECK(request->root_snapshot.generation == kGeneration);
+        CHECK(request->root_snapshot.context_generation ==
+              kContextGeneration);
+    }
 }
 
 } // namespace

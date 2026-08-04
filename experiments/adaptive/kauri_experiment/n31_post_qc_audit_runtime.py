@@ -1,9 +1,10 @@
-"""One-attempt runtime and preserved-evidence validator for the v2 PQAR pilot.
+"""One-attempt runtime and preserved-evidence validator for the v3 PQAR pilot.
 
 Audit classification consumes only raw replica logs.  Manager events are used
 for process ownership only and never as diagnostic observations.  The fixed
-pilot order is sham, false-report, omission; every arm runs once and outcomes
-cannot select, replace, or retry an arm.
+pilot order is sham, false-report, omission.  Returned outcomes cannot select,
+replace, or retry an arm; an in-process exception spends its arm, seals the
+partial parent as INCOMPLETE, and stops without attempting later arms.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from dataclasses import asdict
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -26,6 +28,8 @@ from .n31_post_qc_audit import (
     ARM_SHAM,
     PILOT_EXECUTION_ORDER,
     SCENARIO,
+    SHIPPED_PROFILE_ID,
+    SHIPPED_PROFILE_SHA256,
     ConsensusEvidence,
     FrozenPqarProfile,
     N31PostQcAuditError,
@@ -64,6 +68,7 @@ class N31PostQcAuditRuntimeError(RuntimeError):
 
 
 _HEX_256 = re.compile(r"^[0-9a-f]{64}$")
+_RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*-[0-9a-f]{8}$")
 _MANIFEST_FIELDS = {
     "schema_version",
     "scenario",
@@ -88,6 +93,18 @@ _MANIFEST_FIELDS = {
     "runtime_error",
 }
 _LOG_OFFSET_FIELDS = {"path", "sha256", "start_offset", "terminal_offset"}
+_ONE_SHOT_LEDGER_FILENAME = "pqar-v3-one-shot-ledger.json"
+_ONE_SHOT_LEDGER_FIELDS = {
+    "schema_version",
+    "scenario",
+    "kind",
+    "profile_id",
+    "profile_sha256",
+    "results_root",
+    "sequence_directory",
+    "allocated_utc",
+    "state",
+}
 
 
 def _error(message: str) -> None:
@@ -349,10 +366,40 @@ def _validate_manifest(
     return arm
 
 
-def _verify_preserved_provenance(
+def _validate_source_blind_manifest(
+    manifest: Mapping[str, object],
+    *,
+    run_directory: Path,
+    profile: FrozenPqarProfile,
+    runtime_profile: FrozenProfile,
+) -> None:
+    """Validate only arm-neutral child identity and execution policy fields."""
+
+    if set(manifest) != _MANIFEST_FIELDS:
+        _error("manifest schema drifted")
+    run_id = manifest.get("run_id")
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("scenario") != SCENARIO
+        or not isinstance(run_id, str)
+        or _RUN_ID.fullmatch(run_id) is None
+        or manifest.get("profile")
+        != {"profile_id": profile.profile_id, "sha256": profile.profile_sha256}
+        or manifest.get("runtime_profile")
+        != {
+            "profile_id": runtime_profile.profile_id,
+            "sha256": runtime_profile.profile_sha256,
+        }
+        or manifest.get("attempt") != 1
+        or manifest.get("retry_policy") != "none"
+        or manifest.get("outcome_scanning") is not False
+    ):
+        _error("manifest identity, attempt, or no-scan policy drifted")
+
+
+def _verify_preserved_build_provenance(
     run_directory: Path,
     manifest: Mapping[str, object],
-    profile: FrozenPqarProfile,
     trusted: TrustedProvenance,
 ) -> None:
     preflight_record = manifest.get("preflight")
@@ -394,14 +441,14 @@ def _verify_preserved_provenance(
     ):
         _error("copied build provenance differs from the external receipt")
 
-    contract = build_launch_contract(profile, arm=str(manifest["arm"]))
-    if (
-        _read_json_object(
-            run_directory / "runtime" / "launch-contract.json", "launch contract"
-        )
-        != contract
-    ):
-        _error("preserved launch contract drifted")
+
+def _verify_preserved_launch_membership(
+    run_directory: Path,
+    profile: FrozenPqarProfile,
+    trusted: TrustedProvenance,
+) -> list[list[object]]:
+    """Bind every source log to a trusted executable without reading its overlay."""
+
     launch = _read_json_object(
         run_directory / "runtime" / "launch-arguments.json", "launch arguments"
     )
@@ -418,18 +465,23 @@ def _verify_preserved_provenance(
         or len(replicas) != len(profile.replica_ids)
     ):
         _error("manager or replica launch membership drifted")
-    overlays = contract["replica_arguments"]
-    assert isinstance(overlays, Mapping)
+    checked: list[list[object]] = []
     for replica, command in zip(profile.replica_ids, replicas, strict=True):
-        overlay = overlays[str(replica)]
         if (
             not isinstance(command, list)
             or not command
             or command[0] != trusted.binary("app").path
-            or not isinstance(overlay, list)
-            or command[-len(overlay) :] != overlay
         ):
             _error(f"replica-{replica} actual launch argv drifted")
+        checked.append(command)
+    return checked
+
+
+def _verify_runtime_artifact_inventory(
+    run_directory: Path,
+    manifest: Mapping[str, object],
+) -> None:
+    """Verify every sealed runtime artifact named by the child manifest."""
 
     artifacts = manifest.get("runtime_artifacts")
     if not isinstance(artifacts, list) or not artifacts:
@@ -464,6 +516,33 @@ def _verify_preserved_provenance(
     }
     if not required <= seen:
         _error("runtime artifact inventory omits a provenance-critical file")
+
+
+def _verify_preserved_provenance(
+    run_directory: Path,
+    manifest: Mapping[str, object],
+    profile: FrozenPqarProfile,
+    trusted: TrustedProvenance,
+) -> None:
+    _verify_preserved_build_provenance(run_directory, manifest, trusted)
+    replica_commands = _verify_preserved_launch_membership(
+        run_directory, profile, trusted
+    )
+    contract = build_launch_contract(profile, arm=str(manifest["arm"]))
+    if (
+        _read_json_object(
+            run_directory / "runtime" / "launch-contract.json", "launch contract"
+        )
+        != contract
+    ):
+        _error("preserved launch contract drifted")
+    overlays = contract["replica_arguments"]
+    assert isinstance(overlays, Mapping)
+    for replica, command in zip(profile.replica_ids, replica_commands, strict=True):
+        overlay = overlays[str(replica)]
+        if not isinstance(overlay, list) or command[-len(overlay) :] != overlay:
+            _error(f"replica-{replica} actual launch argv drifted")
+    _verify_runtime_artifact_inventory(run_directory, manifest)
 
 
 def _validated_log_slices(
@@ -557,8 +636,7 @@ def _validate_native_ground_truth_marker(
     expected_aggregate_count = 0 if arm == ARM_OMISSION else 1
     if (
         aggregate_lines != reporter_lines
-        or (arm == ARM_OMISSION and len(aggregate_lines) > 1)
-        or (arm != ARM_OMISSION and len(aggregate_lines) != expected_aggregate_count)
+        or len(aggregate_lines) != expected_aggregate_count
     ):
         _error("aggregate omission marker count or source drifted")
     if aggregate_lines:
@@ -652,6 +730,11 @@ def _validate_structured_sources(
         _error("structured evidence lacks the exact 31 replicas and manager")
     if set(instances) != expected:
         _error("manifest source-instance membership is not exact")
+    instance_values = tuple(instances.values())
+    if any(not isinstance(value, str) or not value for value in instance_values) or len(
+        set(instance_values)
+    ) != len(instance_values):
+        _error("manifest source-instance identities are malformed or reused")
     ready: list[int] = []
     for source in sorted(expected):
         events = streams[source]
@@ -750,6 +833,23 @@ def _common_commits(
     return tuple(results)
 
 
+def _validate_source_blind_clean_boundary(
+    profile: FrozenPqarProfile,
+    runtime_profile: FrozenProfile,
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    ready_barrier_ns: int,
+    clean_boundary_ns: int,
+) -> None:
+    matches = [
+        commit
+        for commit in _common_commits(profile, runtime_profile, streams)
+        if int(commit["common_monotonic_ns"]) == clean_boundary_ns
+    ]
+    if clean_boundary_ns <= ready_barrier_ns or len(matches) != 1:
+        _error("recorded clean boundary is not one post-ready fixed-Q21 commit")
+
+
 def _observer_ancestry(
     runtime_profile: FrozenProfile,
     streams: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -786,6 +886,29 @@ def _observer_ancestry(
             _error("observer ancestry order is non-monotonic")
         current = parent
     return tuple(chain)
+
+
+def _source_blind_later_commit_latency_ns(
+    profile: FrozenPqarProfile,
+    runtime_profile: FrozenProfile,
+    streams: Mapping[str, Sequence[Mapping[str, Any]]],
+    classification: SourceBlindClassification,
+) -> int | None:
+    candidates: list[int] = []
+    for commit in _common_commits(profile, runtime_profile, streams):
+        timestamp = int(commit["common_monotonic_ns"])
+        if timestamp <= classification.audit_expiry_ns:
+            continue
+        ancestry = _observer_ancestry(
+            runtime_profile,
+            streams,
+            descendant=str(commit["block_hash"]),
+        )
+        if classification.identity.block in ancestry:
+            candidates.append(timestamp)
+    if not candidates:
+        return None
+    return min(candidates) - classification.audit_expiry_ns
 
 
 _ROOT_QC_PAYLOAD_FIELDS = {
@@ -837,7 +960,8 @@ def _independent_root_qc_ns(
             or accepted != sorted(set(accepted))
             or tuple(accepted) != classification.qc_signers
             or len(accepted) < profile.quorum
-            or payload.get("context_generation") != classification.identity.generation
+            or payload.get("context_generation")
+            != classification.root_context_generation
             or payload.get("observer_replica") != profile.root_id
             or payload.get("wait_exempt_signers") != []
             or payload.get("root_signer_count") != len(accepted)
@@ -1001,6 +1125,7 @@ def _validation_document(run_id: str, result: PqarValidation) -> dict[str, objec
             "frozen_qc_signers_after": list(result.frozen_qc_signers_after),
             "frozen_qc_hash_before": result.frozen_qc_hash_before,
             "frozen_qc_hash_after": result.frozen_qc_hash_after,
+            "root_context_generation": result.root_context_generation,
             "later_commit_ns": result.later_commit_ns,
             "expiry_to_later_commit_latency_ns": (
                 result.expiry_to_later_commit_latency_ns
@@ -1106,6 +1231,267 @@ def _raw_validation(
         consensus=consensus,
     )
     return _validation_document(run_directory.name, result)
+
+
+def _load_source_blind_preserved_profiles(
+    run_directory: Path,
+) -> tuple[FrozenPqarProfile, FrozenProfile]:
+    try:
+        profile = load_frozen_profile(run_directory / "profile.json")
+        runtime_profile = load_runtime_profile(run_directory / "runtime-profile.json")
+        runtime.require_shipped_profile(runtime_profile)
+    except (
+        OSError,
+        N31PostQcAuditError,
+        ProfiledFaultEvaluationError,
+        runtime.ProfiledFaultRuntimeError,
+    ) as error:
+        raise N31PostQcAuditRuntimeError(
+            f"preserved profile binding rejected: {error}"
+        ) from error
+    if (
+        profile.profile_id != SHIPPED_PROFILE_ID
+        or profile.profile_sha256 != SHIPPED_PROFILE_SHA256
+        or runtime_profile.profile_id != profile.runtime_profile_id
+        or runtime_profile.profile_sha256 != profile.runtime_profile_sha256
+    ):
+        _error("preserved runtime profile differs from the canonical v3 binding")
+    return profile, runtime_profile
+
+
+def _source_blind_observation(
+    *,
+    run_directory: Path,
+    profile: FrozenPqarProfile,
+    runtime_profile: FrozenProfile,
+    manifest: Mapping[str, object],
+    trusted_provenance: TrustedProvenance,
+    seal: object,
+    classification: SourceBlindClassification | None,
+    unclassified_reason: str | None,
+    clean_boundary_ns: int,
+    ready_barrier_ns: int,
+    expiry_to_later_commit_latency_ns: int | None,
+) -> dict[str, object]:
+    def delta(end: int | None, start: int | None) -> int | None:
+        return None if end is None or start is None else end - start
+
+    if classification is None:
+        predicted = "unclassified"
+        identity: dict[str, object] | None = None
+        witness_signers: list[int] = []
+        qc_signers: list[int] = []
+        qc_fingerprint: str | None = None
+        root_context_generation: int | None = None
+        armed_ns = None
+        deadline_ns = None
+        target_arrival_ns = None
+        claim_ns = None
+        relay_sent_ns = None
+        qc_published_ns = None
+        root_received_ns = None
+        root_verified_ns = None
+        audit_expiry_ns = None
+        qc_to_audit_latency_ns = None
+        relay_wire_bytes = None
+        root_wire_bytes = None
+    else:
+        predicted = classification.classification
+        identity = asdict(classification.identity)
+        witness_signers = list(classification.witness_signers)
+        qc_signers = list(classification.qc_signers)
+        qc_fingerprint = classification.frozen_qc_hash_after
+        root_context_generation = classification.root_context_generation
+        armed_ns = classification.armed_ns
+        deadline_ns = classification.deadline_ns
+        target_arrival_ns = classification.target_arrival_ns
+        claim_ns = classification.claim_ns
+        relay_sent_ns = classification.relay_sent_ns
+        qc_published_ns = classification.qc_published_ns
+        root_received_ns = classification.root_received_ns
+        root_verified_ns = classification.root_verified_ns
+        audit_expiry_ns = classification.audit_expiry_ns
+        qc_to_audit_latency_ns = classification.qc_to_audit_latency_ns
+        relay_wire_bytes = classification.relay_wire_bytes
+        root_wire_bytes = classification.root_wire_bytes
+
+    metrics_ns = {
+        "qc_to_deadline_slack_ns": delta(deadline_ns, qc_published_ns),
+        "target_to_deadline_slack_ns": delta(deadline_ns, target_arrival_ns),
+        "relay_to_root_latency_ns": delta(root_received_ns, relay_sent_ns),
+        "root_verification_latency_ns": delta(root_verified_ns, root_received_ns),
+        "qc_to_audit_latency_ns": qc_to_audit_latency_ns,
+        "expiry_to_later_commit_latency_ns": (expiry_to_later_commit_latency_ns),
+    }
+    timing = {
+        "ready_barrier_ns": ready_barrier_ns,
+        "clean_boundary_ns": clean_boundary_ns,
+        "armed_ns": armed_ns,
+        "deadline_ns": deadline_ns,
+        "target_arrival_ns": target_arrival_ns,
+        "claim_ns": claim_ns,
+        "relay_sent_ns": relay_sent_ns,
+        "qc_published_ns": qc_published_ns,
+        "root_received_ns": root_received_ns,
+        "root_verified_ns": root_verified_ns,
+        "audit_expiry_ns": audit_expiry_ns,
+        **metrics_ns,
+    }
+    child = {
+        "path": str(run_directory),
+        "run_id": manifest["run_id"],
+        "kauri_revision": trusted_provenance.revision,
+        "trusted_provenance_sha256": trusted_provenance.sha256,
+        "evidence_tree_sha256": getattr(seal, "tree_sha256"),
+        "evidence_seal_sha256": getattr(seal, "seal_sha256"),
+        "profile_binding": {
+            "profile_id": profile.profile_id,
+            "sha256": profile.profile_sha256,
+        },
+        "runtime_profile_binding": {
+            "profile_id": runtime_profile.profile_id,
+            "sha256": runtime_profile.profile_sha256,
+        },
+        "log_offset_binding_sha256": _canonical_document_sha256(
+            manifest["log_offsets"]
+        ),
+        "source_instance_binding_sha256": _canonical_document_sha256(
+            manifest["source_instances"]
+        ),
+        "replica_log_count": len(profile.replica_ids),
+        "structured_source_count": len(profile.replica_ids) + 1,
+    }
+    return {
+        "schema_version": 1,
+        "scenario": SCENARIO,
+        "kind": "preserved-source-blind-classification",
+        "classification": predicted,
+        "predicted_classification": predicted,
+        "unclassified_reason": unclassified_reason,
+        "identity": identity,
+        "root_context_generation": root_context_generation,
+        "witness_signers": witness_signers,
+        "qc_signers": qc_signers,
+        "qc_fingerprint": qc_fingerprint,
+        "metrics_ns": metrics_ns,
+        "timing": timing,
+        "wire_bytes": {
+            "relay": relay_wire_bytes,
+            "root": root_wire_bytes,
+        },
+        "child": child,
+        "evidence_ceiling": "campaign_observation_only",
+        "figure_eligible": False,
+    }
+
+
+def classify_preserved_run_source_blind(
+    run_directory: Path,
+    *,
+    trusted_provenance: TrustedProvenance,
+) -> dict[str, object]:
+    """Extract one sealed child observation without consulting ground truth."""
+
+    if type(trusted_provenance) is not TrustedProvenance:
+        _error("source-blind extraction requires external trusted provenance")
+    if run_directory.is_symlink():
+        _error("source-blind child path must not be a symlink")
+    run_directory = run_directory.resolve()
+    try:
+        seal = verify_evidence_seal(run_directory)
+    except EvidenceSealError as error:
+        raise N31PostQcAuditRuntimeError(f"evidence seal rejected: {error}") from error
+    profile, runtime_profile = _load_source_blind_preserved_profiles(run_directory)
+    manifest = _read_json_object(run_directory / "manifest.json", "manifest")
+    _validate_source_blind_manifest(
+        manifest,
+        run_directory=run_directory,
+        profile=profile,
+        runtime_profile=runtime_profile,
+    )
+    if manifest.get("kauri_revision") != trusted_provenance.revision:
+        _error("manifest revision differs from trusted provenance")
+    try:
+        _verify_preserved_build_provenance(run_directory, manifest, trusted_provenance)
+        _verify_preserved_launch_membership(run_directory, profile, trusted_provenance)
+        _verify_runtime_artifact_inventory(run_directory, manifest)
+    except OSError as error:
+        raise N31PostQcAuditRuntimeError(
+            f"preserved runtime provenance is unreadable: {error}"
+        ) from error
+    try:
+        replica_logs = _validated_log_slices(run_directory, manifest, profile)
+        streams = runtime.event_streams(
+            runtime_profile,
+            run_directory,
+            include_manager=True,
+            allow_partial=False,
+        )
+    except (OSError, UnicodeDecodeError, runtime.ProfiledFaultRuntimeError) as error:
+        raise N31PostQcAuditRuntimeError(
+            f"preserved raw source integrity rejected: {error}"
+        ) from error
+    ready_barrier_ns = manifest.get("ready_barrier_ns")
+    clean_boundary_ns = manifest.get("clean_boundary_ns")
+    if (
+        type(ready_barrier_ns) is not int
+        or ready_barrier_ns <= 0
+        or type(clean_boundary_ns) is not int
+        or clean_boundary_ns <= ready_barrier_ns
+    ):
+        _error("manifest ready/clean boundary is malformed")
+    if _validate_structured_sources(profile, streams, manifest) != ready_barrier_ns:
+        _error("manifest ready barrier differs from raw structured evidence")
+    _validate_source_blind_clean_boundary(
+        profile,
+        runtime_profile,
+        streams,
+        ready_barrier_ns=ready_barrier_ns,
+        clean_boundary_ns=clean_boundary_ns,
+    )
+
+    blind_logs = _audit_only_logs(replica_logs)
+    try:
+        classification = classify_source_blind(
+            profile.source_blind_contract(),
+            blind_logs,
+            clean_boundary_ns=clean_boundary_ns,
+        )
+    except N31PostQcAuditError as error:
+        return _source_blind_observation(
+            run_directory=run_directory,
+            profile=profile,
+            runtime_profile=runtime_profile,
+            manifest=manifest,
+            trusted_provenance=trusted_provenance,
+            seal=seal,
+            classification=None,
+            unclassified_reason=str(error),
+            clean_boundary_ns=clean_boundary_ns,
+            ready_barrier_ns=ready_barrier_ns,
+            expiry_to_later_commit_latency_ns=None,
+        )
+    if type(classification) is not SourceBlindClassification:
+        _error("source-blind classifier returned an invalid result")
+    later_latency = _source_blind_later_commit_latency_ns(
+        profile,
+        runtime_profile,
+        streams,
+        classification,
+    )
+    return _source_blind_observation(
+        run_directory=run_directory,
+        profile=profile,
+        runtime_profile=runtime_profile,
+        manifest=manifest,
+        trusted_provenance=trusted_provenance,
+        seal=seal,
+        classification=classification,
+        unclassified_reason=None,
+        clean_boundary_ns=clean_boundary_ns,
+        ready_barrier_ns=ready_barrier_ns,
+        expiry_to_later_commit_latency_ns=later_latency,
+    )
 
 
 def validate_preserved_run(
@@ -1685,6 +2071,85 @@ def run_once(
     return run_directory, verdict
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _one_shot_ledger_path(sequence_directory: Path) -> Path:
+    return sequence_directory.resolve().parent / _ONE_SHOT_LEDGER_FILENAME
+
+
+def _create_sequence_directory(
+    results_root: Path, *, profile: FrozenPqarProfile
+) -> Path:
+    """Consume the frozen v3 results root and allocate one empty parent."""
+
+    if (
+        profile.profile_id != SHIPPED_PROFILE_ID
+        or profile.profile_sha256 != SHIPPED_PROFILE_SHA256
+    ):
+        _error("one-shot allocation requires the canonical shipped v3 profile")
+    root = results_root.resolve()
+    root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.mkdir(mode=0o700)
+        _fsync_directory(root.parent)
+    except FileExistsError as error:
+        raise N31PostQcAuditRuntimeError(
+            "frozen v3 results root is already spent by a prior allocation"
+        ) from error
+    except OSError as error:
+        raise N31PostQcAuditRuntimeError(
+            "could not exclusively allocate the frozen v3 results root"
+        ) from error
+    os.chmod(root, 0o700)
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidate = root / f"sequence-{stamp}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    ledger = {
+        "schema_version": 1,
+        "scenario": SCENARIO,
+        "kind": "filesystem-exclusive-one-shot-allocation",
+        "profile_id": profile.profile_id,
+        "profile_sha256": profile.profile_sha256,
+        "results_root": str(root),
+        "sequence_directory": candidate.name,
+        "allocated_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "state": "allocated",
+    }
+    ledger_path = root / _ONE_SHOT_LEDGER_FILENAME
+    try:
+        runtime.write_json_exclusive(ledger_path, ledger, mode=0o400)
+        _fsync_directory(root)
+    except FileExistsError as error:
+        raise N31PostQcAuditRuntimeError(
+            "frozen v3 results root is already spent by a concurrent allocation"
+        ) from error
+    except OSError as error:
+        raise N31PostQcAuditRuntimeError(
+            "could not persist the frozen v3 one-shot allocation ledger"
+        ) from error
+
+    try:
+        if {path.resolve() for path in root.iterdir()} != {ledger_path.resolve()}:
+            _error("frozen v3 results root gained an unexpected allocation sibling")
+        candidate.mkdir(mode=0o700)
+        _fsync_directory(root)
+    except (OSError, N31PostQcAuditRuntimeError) as error:
+        raise N31PostQcAuditRuntimeError(
+            "one-shot allocation was consumed but its sequence parent was not created"
+        ) from error
+    if any(candidate.iterdir()):  # pragma: no cover - mkdir is atomic and empty
+        _error("new sequence directory unexpectedly contains scaffolding")
+    return candidate
+
+
 def run_pilot_sequence(
     *,
     audit_profile_path: Path,
@@ -1700,30 +2165,42 @@ def run_pilot_sequence(
     build_directory: Path,
     build_provenance_path: Path,
 ) -> tuple[Path, tuple[dict[str, str], ...]]:
-    """Run the fresh fixed three-arm order once, independent of outcomes."""
+    """Attempt the fixed order once, sealing and stopping on an exception."""
 
     profile, runtime_profile, _runtime_path = _load_bound_profiles(
         audit_profile_path.resolve(), repository.resolve()
     )
     _checked_preflight(profile, runtime_profile, frozen_preflight, trusted_provenance)
-    sequence_directory = runtime.create_run_directory(results_root.resolve())
+    sequence_directory = _create_sequence_directory(results_root, profile=profile)
     results: list[dict[str, str]] = []
+    spent_arms: list[str] = []
+    interrupted_arm: str | None = None
+    sequence_error: Exception | None = None
     for arm in PILOT_EXECUTION_ORDER:
-        run_directory, verdict = run_once(
-            audit_profile_path=audit_profile_path,
-            arm=arm,
-            trusted_provenance=trusted_provenance,
-            frozen_preflight=frozen_preflight,
-            repository=repository,
-            results_root=sequence_directory,
-            app_binary=app_binary,
-            manager_binary=manager_binary,
-            keygen_binary=keygen_binary,
-            tls_keygen_binary=tls_keygen_binary,
-            epoch_profile_digest_binary=epoch_profile_digest_binary,
-            build_directory=build_directory,
-            build_provenance_path=build_provenance_path,
-        )
+        spent_arms.append(arm)
+        try:
+            run_directory, verdict = run_once(
+                audit_profile_path=audit_profile_path,
+                arm=arm,
+                trusted_provenance=trusted_provenance,
+                frozen_preflight=frozen_preflight,
+                repository=repository,
+                results_root=sequence_directory,
+                app_binary=app_binary,
+                manager_binary=manager_binary,
+                keygen_binary=keygen_binary,
+                tls_keygen_binary=tls_keygen_binary,
+                epoch_profile_digest_binary=epoch_profile_digest_binary,
+                build_directory=build_directory,
+                build_provenance_path=build_provenance_path,
+            )
+            run_directory = run_directory.resolve()
+            if run_directory.parent != sequence_directory:
+                _error("arm attempt escaped its one-shot sequence parent")
+        except Exception as error:  # noqa: BLE001 - preserve any ordinary rejection
+            interrupted_arm = arm
+            sequence_error = error
+            break
         results.append(
             {
                 "arm": arm,
@@ -1731,6 +2208,22 @@ def run_pilot_sequence(
                 "verdict": verdict,
             }
         )
+    try:
+        observed_directories = sorted(
+            (path.resolve() for path in sequence_directory.iterdir() if path.is_dir()),
+            key=str,
+        )
+    except OSError as error:
+        raise N31PostQcAuditRuntimeError(
+            "cannot preserve observed one-shot attempt directories"
+        ) from error
+    execution_complete = sequence_error is None
+    runtime_error = (
+        None
+        if sequence_error is None
+        else f"{type(sequence_error).__name__}: {sequence_error}"
+    )
+    ledger_path = _one_shot_ledger_path(sequence_directory)
     receipt = {
         "schema_version": 1,
         "scenario": SCENARIO,
@@ -1741,6 +2234,12 @@ def run_pilot_sequence(
         "outcome_scanning": False,
         "preflight_revision": trusted_provenance.revision,
         "preflight_profile_sha256": profile.profile_sha256,
+        "one_shot_ledger_sha256": runtime.sha256_file(ledger_path),
+        "execution_complete": execution_complete,
+        "spent_arms": spent_arms,
+        "interrupted_arm": interrupted_arm,
+        "runtime_error": runtime_error,
+        "observed_run_directories": [str(path) for path in observed_directories],
         "results": results,
         "evidence_ceiling": "harness_validation_only",
         "figure_eligible": False,
@@ -1753,8 +2252,60 @@ def run_pilot_sequence(
         raise N31PostQcAuditRuntimeError(
             f"global pilot sequence could not be sealed: {error}"
         ) from error
+    if sequence_error is not None:
+        raise N31PostQcAuditRuntimeError(
+            "one-shot pilot stopped at "
+            f"{interrupted_arm}; preserved sealed parent {sequence_directory} "
+            f"as INCOMPLETE: {runtime_error}"
+        ) from sequence_error
     validate_pilot_sequence(sequence_directory, trusted_provenance=trusted_provenance)
     return sequence_directory, tuple(results)
+
+
+def _validate_one_shot_ledger(
+    sequence_directory: Path, receipt: Mapping[str, object]
+) -> None:
+    root = sequence_directory.parent
+    ledger_path = _one_shot_ledger_path(sequence_directory)
+    if ledger_path.is_symlink() or not ledger_path.is_file():
+        _error("one-shot allocation ledger is absent or not a regular file")
+    expected_digest = receipt.get("one_shot_ledger_sha256")
+    if (
+        not isinstance(expected_digest, str)
+        or _HEX_256.fullmatch(expected_digest) is None
+        or runtime.sha256_file(ledger_path) != expected_digest
+    ):
+        _error("one-shot allocation ledger differs from the sealed sequence receipt")
+    ledger = _read_json_object(ledger_path, "one-shot allocation ledger")
+    allocated_utc = ledger.get("allocated_utc")
+    try:
+        allocated = dt.datetime.fromisoformat(str(allocated_utc))
+    except ValueError as error:
+        raise N31PostQcAuditRuntimeError(
+            "one-shot allocation timestamp is malformed"
+        ) from error
+    if (
+        set(ledger) != _ONE_SHOT_LEDGER_FIELDS
+        or ledger.get("schema_version") != 1
+        or ledger.get("scenario") != SCENARIO
+        or ledger.get("kind") != "filesystem-exclusive-one-shot-allocation"
+        or ledger.get("profile_id") != SHIPPED_PROFILE_ID
+        or ledger.get("profile_sha256") != SHIPPED_PROFILE_SHA256
+        or ledger.get("results_root") != str(root)
+        or ledger.get("sequence_directory") != sequence_directory.name
+        or not isinstance(allocated_utc, str)
+        or allocated.tzinfo is None
+        or ledger.get("state") != "allocated"
+    ):
+        _error("one-shot allocation ledger identity or state drifted")
+    try:
+        siblings = {path.resolve() for path in root.iterdir()}
+    except OSError as error:
+        raise N31PostQcAuditRuntimeError(
+            "cannot inspect one-shot results-root siblings"
+        ) from error
+    if siblings != {ledger_path.resolve(), sequence_directory.resolve()}:
+        _error("one-shot results root contains an unexpected sibling")
 
 
 def validate_pilot_sequence(
@@ -1762,7 +2313,7 @@ def validate_pilot_sequence(
     *,
     trusted_provenance: TrustedProvenance,
 ) -> dict[str, object]:
-    """Verify the sealed fixed-order sequence and all three sealed attempts."""
+    """Verify a sealed complete or structurally preserved incomplete sequence."""
 
     if type(trusted_provenance) is not TrustedProvenance:
         _error("sequence validation requires exact trusted provenance")
@@ -1786,11 +2337,20 @@ def validate_pilot_sequence(
         "outcome_scanning",
         "preflight_revision",
         "preflight_profile_sha256",
+        "one_shot_ledger_sha256",
+        "execution_complete",
+        "spent_arms",
+        "interrupted_arm",
+        "runtime_error",
+        "observed_run_directories",
         "results",
         "evidence_ceiling",
         "figure_eligible",
     }
     results = receipt.get("results")
+    spent_arms = receipt.get("spent_arms")
+    observed_values = receipt.get("observed_run_directories")
+    execution_complete = receipt.get("execution_complete")
     if (
         set(receipt) != expected_fields
         or receipt.get("schema_version") != 1
@@ -1801,15 +2361,64 @@ def validate_pilot_sequence(
         or receipt.get("automatic_retries") != 0
         or receipt.get("outcome_scanning") is not False
         or receipt.get("preflight_revision") != trusted_provenance.revision
+        or receipt.get("preflight_profile_sha256") != SHIPPED_PROFILE_SHA256
         or receipt.get("evidence_ceiling") != "harness_validation_only"
         or receipt.get("figure_eligible") is not False
         or not isinstance(results, list)
-        or len(results) != 3
+        or not isinstance(spent_arms, list)
+        or not isinstance(observed_values, list)
+        or not isinstance(execution_complete, bool)
     ):
         _error("pilot sequence receipt drifted from the fixed fresh-run contract")
+    if (
+        any(not isinstance(arm, str) for arm in spent_arms)
+        or spent_arms != list(PILOT_EXECUTION_ORDER[: len(spent_arms)])
+        or not spent_arms
+    ):
+        _error("pilot sequence spent-arm prefix is malformed")
+    interrupted_arm = receipt.get("interrupted_arm")
+    runtime_error = receipt.get("runtime_error")
+    if execution_complete:
+        if (
+            spent_arms != list(PILOT_EXECUTION_ORDER)
+            or interrupted_arm is not None
+            or runtime_error is not None
+            or len(results) != len(PILOT_EXECUTION_ORDER)
+        ):
+            _error("completed pilot sequence has an incomplete execution record")
+        expected_result_arms = tuple(PILOT_EXECUTION_ORDER)
+    else:
+        if (
+            interrupted_arm != spent_arms[-1]
+            or not isinstance(runtime_error, str)
+            or not runtime_error
+            or len(results) != len(spent_arms) - 1
+        ):
+            _error("incomplete pilot sequence lacks one exact interrupted arm")
+        expected_result_arms = tuple(spent_arms[:-1])
+    _validate_one_shot_ledger(sequence_directory, receipt)
+
+    observed_directories: list[Path] = []
+    for value in observed_values:
+        if not isinstance(value, str):
+            _error("observed run directory is malformed")
+        path = Path(value).resolve()
+        if path.parent != sequence_directory or path in observed_directories:
+            _error("observed run directory escaped or duplicated its sequence")
+        observed_directories.append(path)
+    if observed_directories != sorted(observed_directories, key=str):
+        _error("observed run directories are not canonical")
+    if execution_complete and len(observed_directories) != len(PILOT_EXECUTION_ORDER):
+        _error("completed sequence lacks exactly three observed directories")
+    if not execution_complete and len(observed_directories) not in {
+        len(results),
+        len(results) + 1,
+    }:
+        _error("interrupted sequence has an impossible attempt-directory count")
+
     expected_directories: set[Path] = set()
     validated: list[dict[str, object]] = []
-    for expected_arm, record in zip(PILOT_EXECUTION_ORDER, results, strict=True):
+    for expected_arm, record in zip(expected_result_arms, results, strict=True):
         if not isinstance(record, Mapping) or set(record) != {
             "arm",
             "run_directory",
@@ -1827,6 +2436,22 @@ def validate_pilot_sequence(
         ):
             _error("pilot sequence arm order or run-directory scope drifted")
         expected_directories.add(run_directory)
+        try:
+            child_profile = load_frozen_profile(run_directory / "profile.json")
+        except N31PostQcAuditError as error:
+            raise N31PostQcAuditRuntimeError(
+                "result-recorded child profile is absent or not the canonical "
+                "shipped v3 profile"
+            ) from error
+        if (
+            child_profile.profile_id != SHIPPED_PROFILE_ID
+            or child_profile.profile_sha256 != SHIPPED_PROFILE_SHA256
+            or child_profile.profile_sha256 != receipt.get("preflight_profile_sha256")
+        ):
+            _error(
+                "result-recorded child profile identity/hash differs from parent "
+                "preflight"
+            )
         result = validate_preserved_run(
             run_directory, trusted_provenance=trusted_provenance
         )
@@ -1836,11 +2461,50 @@ def validate_pilot_sequence(
     actual_directories = {
         path.resolve() for path in sequence_directory.iterdir() if path.is_dir()
     }
-    if actual_directories != expected_directories:
+    if actual_directories != set(observed_directories):
         _error("global sequence contains an extra or missing attempt directory")
+    if not expected_directories.issubset(actual_directories):
+        _error("pilot results reference an unobserved attempt directory")
+    unvalidated_interrupted: list[dict[str, str]] = []
+    for run_directory in sorted(
+        actual_directories - expected_directories,
+        key=str,
+    ):
+        profile_binding = "unavailable_or_invalid"
+        try:
+            child_profile = load_frozen_profile(run_directory / "profile.json")
+        except N31PostQcAuditError:
+            pass
+        else:
+            if (
+                child_profile.profile_id == SHIPPED_PROFILE_ID
+                and child_profile.profile_sha256 == SHIPPED_PROFILE_SHA256
+                and child_profile.profile_sha256
+                == receipt.get("preflight_profile_sha256")
+            ):
+                profile_binding = "canonical"
+        unvalidated_interrupted.append(
+            {
+                "run_directory": str(run_directory),
+                "reason": "interrupted_before_result_record",
+                "profile_binding": profile_binding,
+            }
+        )
+    verdicts = [result.get("verdict") for result in validated]
+    aggregate_verdict = (
+        "INCOMPLETE"
+        if not execution_complete
+        else (
+            "PASS"
+            if all(verdict == "PASS" for verdict in verdicts)
+            else "INCOMPLETE" if "INCOMPLETE" in verdicts else "FAIL"
+        )
+    )
     return {
         **receipt,
+        "verdict": aggregate_verdict,
         "validated_results": validated,
+        "unvalidated_interrupted_directories": unvalidated_interrupted,
         "sequence_directory": str(sequence_directory),
         "evidence_tree_sha256": seal.tree_sha256,
         "evidence_seal_sha256": seal.seal_sha256,
@@ -1909,6 +2573,7 @@ __all__ = (
     "N31PostQcAuditRuntimeError",
     "TrustedBinary",
     "TrustedProvenance",
+    "classify_preserved_run_source_blind",
     "derive_trusted_provenance",
     "load_trusted_provenance",
     "preflight",

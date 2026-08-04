@@ -664,6 +664,7 @@ std::optional<ExperimentPostQcAuditRootSnapshot>
 ExperimentPostQcAudit::prepare_root(
     const ProposalKey &proposal,
     std::uint64_t generation,
+    std::uint64_t context_generation,
     const ProposalTreeSnapshot &tree,
     const QuorumCert &verified_qc,
     std::size_t frozen_global_quorum,
@@ -673,6 +674,7 @@ ExperimentPostQcAudit::prepare_root(
         proposal.configuration != state_->options.configuration ||
         tree.local_replica != state_->options.root ||
         tree.root != state_->options.root || tree.parent.has_value() ||
+        generation == 0 || context_generation == 0 ||
         frozen_global_quorum == 0 || prepared_ns == 0 ||
         verified_qc.get_proposal_key() != proposal ||
         !signer_set_is_canonical(verified_qc))
@@ -688,6 +690,7 @@ ExperimentPostQcAudit::prepare_root(
     {
         snapshot.proposal = proposal;
         snapshot.generation = generation;
+        snapshot.context_generation = context_generation;
         snapshot.prepared_ns = prepared_ns;
         snapshot.reporter_subtree = reporter_branch->second;
         snapshot.reporter_subtree.insert(state_->options.reporter);
