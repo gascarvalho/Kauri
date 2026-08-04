@@ -188,11 +188,11 @@ namespace hotstuff
             return monotonic_ns;
         }
 
-        std::uint64_t rotating_omission_monotonic_now_ns(
+        std::uint64_t scheduled_omission_monotonic_now_ns(
             const ExperimentByzantineAdapter *adapter) noexcept
         {
             return adapter != nullptr &&
-                           adapter->rotating_omission_enabled()
+                           adapter->scheduled_omission_enabled()
                        ? adaptive_evidence_monotonic_now_ns()
                        : 0;
         }
@@ -3236,8 +3236,8 @@ namespace hotstuff
             !tree.parent.has_value() || !tree.direct_children.empty())
             return false;
 
-        const auto rotating_monotonic_ns =
-            rotating_omission_monotonic_now_ns(
+        const auto scheduled_monotonic_ns =
+            scheduled_omission_monotonic_now_ns(
                 experiment_byzantine_adapter.get());
         const auto disposition = experiment_byzantine_adapter
                                      ->consume_outbound_direct_vote(
@@ -3245,13 +3245,13 @@ namespace hotstuff
                 key,
                 experiment_diagnostic_window},
             ExperimentReplicaRole::leaf,
-            rotating_monotonic_ns);
+            scheduled_monotonic_ns);
         if (disposition == ExperimentDirectVoteDisposition::forward)
             return false;
         if (disposition ==
             ExperimentDirectVoteDisposition::omit_repeat)
             return true;
-        if (experiment_byzantine_adapter->rotating_omission_enabled())
+        if (experiment_byzantine_adapter->scheduled_omission_enabled())
             return true;
 
         const auto marker_monotonic_ns =
@@ -3288,7 +3288,7 @@ namespace hotstuff
         const ExperimentByzantineContext context{
             key, experiment_diagnostic_window};
         const auto omission_monotonic_ns =
-            rotating_omission_monotonic_now_ns(
+            scheduled_omission_monotonic_now_ns(
                 experiment_byzantine_adapter.get());
         if (!experiment_byzantine_adapter->consume_outbound_aggregate(
                 context,
@@ -9255,7 +9255,7 @@ namespace hotstuff
         if (options.rotating_omission.has_value() &&
             options.rotating_omission->local_replica != get_id())
             throw std::invalid_argument(
-                "rotating omission local replica does not match runtime");
+                "scheduled omission local replica does not match runtime");
         const auto false_timeout_context_bound =
             options.false_report_target.has_value()
                 ? options.maximum_false_report_contexts

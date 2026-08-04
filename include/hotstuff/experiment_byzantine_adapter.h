@@ -63,6 +63,7 @@ struct ExperimentOmissionMarker final
 {
     ProposalKey proposal;
     std::string diagnostic_window;
+    std::string fault_mode;
     ReplicaID actor{0};
     ExperimentOmissionAction action{ExperimentOmissionAction::forward};
     std::uint64_t window_start_monotonic_ns{0};
@@ -149,6 +150,7 @@ public:
     std::optional<ReplicaID> rotating_omission_actor(
         const ProposalKey &proposal) const;
     bool rotating_omission_enabled() const noexcept;
+    bool scheduled_omission_enabled() const noexcept;
 
 private:
     struct State;

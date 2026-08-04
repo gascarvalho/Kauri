@@ -50,6 +50,24 @@ bool exact_omission_context(
 
 constexpr const char *kRotatingOmissionMode =
     "rotating_intermittent_omission_v1";
+constexpr const char *kPersistentOmissionMode =
+    "persistent_selected_omission_v1";
+
+bool is_rotating_omission_mode(const std::string &mode) noexcept
+{
+    return mode == kRotatingOmissionMode;
+}
+
+bool is_persistent_omission_mode(const std::string &mode) noexcept
+{
+    return mode == kPersistentOmissionMode;
+}
+
+bool is_scheduled_omission_mode(const std::string &mode) noexcept
+{
+    return is_rotating_omission_mode(mode) ||
+           is_persistent_omission_mode(mode);
+}
 
 const char *omission_action_name(ExperimentOmissionAction action) noexcept
 {
@@ -105,7 +123,7 @@ std::string format_experiment_omission_marker(
 {
     std::ostringstream encoded;
     encoded << "KAURI_FAULT"
-            << " fault=" << kRotatingOmissionMode
+            << " fault=" << marker.fault_mode
             << " proposal_epoch="
             << marker.proposal.configuration.epoch_number
             << " proposal_tree="
@@ -133,7 +151,7 @@ struct ExperimentByzantineAdapter::State
         bool timeout_consumed{false};
     };
 
-    struct RotatingDecisionState
+    struct ScheduledDecisionState
     {
         ExperimentOmissionAction action{ExperimentOmissionAction::forward};
         bool marker_emitted{false};
@@ -197,55 +215,60 @@ struct ExperimentByzantineAdapter::State
         }
         if (options.rotating_omission.has_value())
         {
-            auto &rotating = *options.rotating_omission;
-            if (rotating.mode != kRotatingOmissionMode)
+            auto &scheduled = *options.rotating_omission;
+            if (!is_scheduled_omission_mode(scheduled.mode))
                 throw std::invalid_argument(
-                    "unsupported rotating omission mode");
+                    "unsupported scheduled omission mode");
             if (options.additional_omission_configuration.has_value() ||
                 options.maximum_false_report_contexts != 0 ||
                 options.maximum_omission_contexts != 0 ||
                 options.maximum_direct_vote_omission_contexts != 0)
                 throw std::invalid_argument(
-                    "rotating omission cannot be combined with static "
+                    "scheduled omission cannot be combined with static "
                     "fault configuration");
-            if (rotating.replica_count == 0 ||
-                rotating.local_replica >= rotating.replica_count)
+            if (scheduled.replica_count == 0 ||
+                scheduled.local_replica >= scheduled.replica_count)
                 throw std::invalid_argument(
-                    "rotating omission requires an in-range local replica");
+                    "scheduled omission requires an in-range local replica");
             const auto quorum =
-                derive_byzantine_quorum(rotating.replica_count);
-            if (!quorum.has_value() || rotating.expected_actor_count == 0 ||
-                rotating.expected_actor_count > quorum->fault_threshold ||
-                rotating.actor_ids.size() != rotating.expected_actor_count)
+                derive_byzantine_quorum(scheduled.replica_count);
+            if (!quorum.has_value() || scheduled.expected_actor_count == 0 ||
+                scheduled.expected_actor_count > quorum->fault_threshold ||
+                scheduled.actor_ids.size() != scheduled.expected_actor_count)
                 throw std::invalid_argument(
-                    "rotating omission actor count must be within the "
+                    "scheduled omission actor count must be within the "
                     "derived fault threshold");
-            std::sort(rotating.actor_ids.begin(), rotating.actor_ids.end());
+            std::sort(scheduled.actor_ids.begin(), scheduled.actor_ids.end());
             if (std::adjacent_find(
-                    rotating.actor_ids.begin(), rotating.actor_ids.end()) !=
-                rotating.actor_ids.end())
+                    scheduled.actor_ids.begin(), scheduled.actor_ids.end()) !=
+                scheduled.actor_ids.end())
                 throw std::invalid_argument(
-                    "rotating omission actors must be unique");
+                    "scheduled omission actors must be unique");
             if (std::any_of(
-                    rotating.actor_ids.begin(),
-                    rotating.actor_ids.end(),
-                    [&rotating](ReplicaID actor)
-                    { return actor >= rotating.replica_count; }))
+                    scheduled.actor_ids.begin(),
+                    scheduled.actor_ids.end(),
+                    [&scheduled](ReplicaID actor)
+                    { return actor >= scheduled.replica_count; }))
                 throw std::invalid_argument(
-                    "rotating omission actor is outside membership");
-            if (rotating.window_start_monotonic_ns == 0 ||
-                rotating.window_end_monotonic_ns <=
-                    rotating.window_start_monotonic_ns)
+                    "scheduled omission actor is outside membership");
+            if (scheduled.window_start_monotonic_ns == 0 ||
+                scheduled.window_end_monotonic_ns <=
+                    scheduled.window_start_monotonic_ns)
                 throw std::invalid_argument(
-                    "rotating omission window must be a non-empty future "
+                    "scheduled omission window must be a non-empty future "
                     "monotonic interval");
-            if (rotating.max_omissions_per_proposal != 1)
+            const auto expected_maximum_omissions =
+                is_rotating_omission_mode(scheduled.mode)
+                    ? std::size_t{1}
+                    : scheduled.expected_actor_count;
+            if (scheduled.max_omissions_per_proposal !=
+                expected_maximum_omissions)
                 throw std::invalid_argument(
-                    "rotating omission permits exactly one omission per "
-                    "proposal");
-            if (rotating.maximum_contexts == 0)
+                    "scheduled omission maximum must match its actor "
+                    "schedule");
+            if (scheduled.maximum_contexts == 0)
                 throw std::invalid_argument(
-                    "rotating omission context bound must be positive");
+                    "scheduled omission context bound must be positive");
         }
     }
 
@@ -254,68 +277,82 @@ struct ExperimentByzantineAdapter::State
     {
         if (!options.enabled || !options.rotating_omission.has_value())
             return std::nullopt;
-        const auto &actors = options.rotating_omission->actor_ids;
+        const auto &scheduled = *options.rotating_omission;
+        if (!is_rotating_omission_mode(scheduled.mode))
+            return std::nullopt;
+        const auto &actors = scheduled.actor_ids;
         return actors[proposal_actor_index(proposal, actors.size())];
     }
 
-    RotatingDecisionState *rotating_decision(
+    bool local_actor_selected(const ProposalKey &proposal) const
+    {
+        const auto &scheduled = *options.rotating_omission;
+        if (is_persistent_omission_mode(scheduled.mode))
+            return std::binary_search(
+                scheduled.actor_ids.begin(),
+                scheduled.actor_ids.end(),
+                scheduled.local_replica);
+        return rotating_actor(proposal) ==
+               std::optional<ReplicaID>{scheduled.local_replica};
+    }
+
+    ScheduledDecisionState *scheduled_decision(
         const ExperimentByzantineContext &context,
         ExperimentReplicaRole role,
         std::uint64_t monotonic_ns)
     {
-        const auto found = rotating_decisions.find(context.proposal);
-        if (found != rotating_decisions.end())
+        const auto found = scheduled_decisions.find(context.proposal);
+        if (found != scheduled_decisions.end())
             return &found->second;
 
-        const auto &rotating = *options.rotating_omission;
-        if (rotating_decisions.size() >= rotating.maximum_contexts)
+        const auto &scheduled = *options.rotating_omission;
+        if (scheduled_decisions.size() >= scheduled.maximum_contexts)
         {
-            emit_rotating_capacity_marker(context, monotonic_ns);
+            emit_scheduled_capacity_marker(context, monotonic_ns);
             return nullptr;
         }
 
         ExperimentOmissionAction action = ExperimentOmissionAction::forward;
-        const auto selected_actor = rotating_actor(context.proposal);
-        if (monotonic_ns >= rotating.window_start_monotonic_ns &&
-            monotonic_ns < rotating.window_end_monotonic_ns &&
-            selected_actor ==
-                std::optional<ReplicaID>{rotating.local_replica})
+        if (monotonic_ns >= scheduled.window_start_monotonic_ns &&
+            monotonic_ns < scheduled.window_end_monotonic_ns &&
+            local_actor_selected(context.proposal))
         {
             if (role == ExperimentReplicaRole::internal)
                 action = ExperimentOmissionAction::omit_aggregate;
             else if (role == ExperimentReplicaRole::leaf)
                 action = ExperimentOmissionAction::omit_direct_vote;
         }
-        return &rotating_decisions
+        return &scheduled_decisions
                     .emplace(
                         context.proposal,
-                        RotatingDecisionState{action, false, false})
+                        ScheduledDecisionState{action, false, false})
                     .first->second;
     }
 
-    void emit_rotating_capacity_marker(
+    void emit_scheduled_capacity_marker(
         const ExperimentByzantineContext &context,
         std::uint64_t monotonic_ns)
     {
-        if (rotating_capacity_marker_emitted)
+        if (scheduled_capacity_marker_emitted)
             return;
-        rotating_capacity_marker_emitted = true;
+        scheduled_capacity_marker_emitted = true;
         if (!options.omission_marker_emitter)
             return;
-        const auto &rotating = *options.rotating_omission;
+        const auto &scheduled = *options.rotating_omission;
         options.omission_marker_emitter(ExperimentOmissionMarker{
             context.proposal,
             context.diagnostic_window,
-            rotating.local_replica,
+            scheduled.mode,
+            scheduled.local_replica,
             ExperimentOmissionAction::capacity_exhausted,
-            rotating.window_start_monotonic_ns,
-            rotating.window_end_monotonic_ns,
+            scheduled.window_start_monotonic_ns,
+            scheduled.window_end_monotonic_ns,
             monotonic_ns});
     }
 
-    void emit_rotating_marker(
+    void emit_scheduled_marker(
         const ExperimentByzantineContext &context,
-        RotatingDecisionState &decision,
+        ScheduledDecisionState &decision,
         std::uint64_t monotonic_ns)
     {
         if (decision.marker_emitted)
@@ -323,14 +360,15 @@ struct ExperimentByzantineAdapter::State
         decision.marker_emitted = true;
         if (!options.omission_marker_emitter)
             return;
-        const auto &rotating = *options.rotating_omission;
+        const auto &scheduled = *options.rotating_omission;
         options.omission_marker_emitter(ExperimentOmissionMarker{
             context.proposal,
             context.diagnostic_window,
-            rotating.local_replica,
+            scheduled.mode,
+            scheduled.local_replica,
             decision.action,
-            rotating.window_start_monotonic_ns,
-            rotating.window_end_monotonic_ns,
+            scheduled.window_start_monotonic_ns,
+            scheduled.window_end_monotonic_ns,
             monotonic_ns});
     }
 
@@ -344,8 +382,8 @@ struct ExperimentByzantineAdapter::State
     std::set<ExperimentByzantineContext, ContextLess> omission_markers;
     std::set<ExperimentByzantineContext, ContextLess>
         direct_vote_omissions;
-    std::map<ProposalKey, RotatingDecisionState> rotating_decisions;
-    bool rotating_capacity_marker_emitted{false};
+    std::map<ProposalKey, ScheduledDecisionState> scheduled_decisions;
+    bool scheduled_capacity_marker_emitted{false};
 };
 
 ExperimentByzantineAdapter::ExperimentByzantineAdapter(
@@ -455,11 +493,11 @@ bool ExperimentByzantineAdapter::consume_outbound_aggregate(
             context.diagnostic_window != state_->options.diagnostic_window)
             return false;
         auto *decision =
-            state_->rotating_decision(context, role, monotonic_ns);
+            state_->scheduled_decision(context, role, monotonic_ns);
         if (decision == nullptr ||
             decision->action != ExperimentOmissionAction::omit_aggregate)
             return false;
-        state_->emit_rotating_marker(context, *decision, monotonic_ns);
+        state_->emit_scheduled_marker(context, *decision, monotonic_ns);
         return true;
     }
     if (!state_->options.omit_outbound_aggregate ||
@@ -494,14 +532,14 @@ ExperimentByzantineAdapter::consume_outbound_direct_vote(
             context.diagnostic_window != state_->options.diagnostic_window)
             return ExperimentDirectVoteDisposition::forward;
         auto *decision =
-            state_->rotating_decision(context, role, monotonic_ns);
+            state_->scheduled_decision(context, role, monotonic_ns);
         if (decision == nullptr ||
             decision->action != ExperimentOmissionAction::omit_direct_vote)
             return ExperimentDirectVoteDisposition::forward;
         if (decision->direct_vote_omitted)
             return ExperimentDirectVoteDisposition::omit_repeat;
         decision->direct_vote_omitted = true;
-        state_->emit_rotating_marker(context, *decision, monotonic_ns);
+        state_->emit_scheduled_marker(context, *decision, monotonic_ns);
         return ExperimentDirectVoteDisposition::omit_first;
     }
     if (!state_->options.omit_outbound_direct_vote ||
@@ -522,9 +560,10 @@ ExperimentByzantineAdapter::consume_outbound_direct_vote(
 bool ExperimentByzantineAdapter::outbound_direct_vote_omitted(
     const ExperimentByzantineContext &context) const noexcept
 {
-    const auto rotating = state_->rotating_decisions.find(context.proposal);
-    if (rotating != state_->rotating_decisions.end() &&
-        rotating->second.direct_vote_omitted)
+    const auto scheduled =
+        state_->scheduled_decisions.find(context.proposal);
+    if (scheduled != state_->scheduled_decisions.end() &&
+        scheduled->second.direct_vote_omitted)
         return true;
     return state_->direct_vote_omissions.find(context) !=
            state_->direct_vote_omissions.end();
@@ -540,7 +579,17 @@ ExperimentByzantineAdapter::rotating_omission_actor(
 bool ExperimentByzantineAdapter::rotating_omission_enabled() const noexcept
 {
     return state_->options.enabled &&
-           state_->options.rotating_omission.has_value();
+           state_->options.rotating_omission.has_value() &&
+           is_rotating_omission_mode(
+               state_->options.rotating_omission->mode);
+}
+
+bool ExperimentByzantineAdapter::scheduled_omission_enabled() const noexcept
+{
+    return state_->options.enabled &&
+           state_->options.rotating_omission.has_value() &&
+           is_scheduled_omission_mode(
+               state_->options.rotating_omission->mode);
 }
 
 } // namespace hotstuff

@@ -231,7 +231,7 @@ parse_experiment_byzantine_options(
     int max_omissions_per_proposal,
     int maximum_rotating_contexts)
 {
-    const bool rotating_argument_present =
+    const bool scheduled_argument_present =
         !raw_rotating_omission_actors.empty() ||
         !raw_window_start_monotonic_ns.empty() ||
         !raw_window_end_monotonic_ns.empty() ||
@@ -245,7 +245,7 @@ parse_experiment_byzantine_options(
         !raw_false_report_target.empty() ||
         omit_outbound_aggregate ||
         omit_outbound_direct_vote ||
-        context_limit != 0 || rotating_argument_present;
+        context_limit != 0 || scheduled_argument_present;
     if (!requested)
         return std::nullopt;
     if (protocol_mode != "adaptive_v2")
@@ -266,32 +266,33 @@ parse_experiment_byzantine_options(
             }))
         throw HotStuffError(
             "experiment Byzantine window must be a safe identifier");
-    const bool rotating_mode = !fault_mode.empty();
+    const bool scheduled_mode = !fault_mode.empty();
     const auto fault_mode_count =
         static_cast<unsigned>(!raw_false_report_target.empty()) +
         static_cast<unsigned>(omit_outbound_aggregate) +
         static_cast<unsigned>(omit_outbound_direct_vote) +
-        static_cast<unsigned>(rotating_mode);
+        static_cast<unsigned>(scheduled_mode);
     if (fault_mode_count != 1)
         throw HotStuffError(
             "select exactly one experiment Byzantine fault mode");
-    if (rotating_mode)
+    if (scheduled_mode)
     {
-        if (fault_mode != "rotating_intermittent_omission_v1")
+        if (fault_mode != "rotating_intermittent_omission_v1" &&
+            fault_mode != "persistent_selected_omission_v1")
             throw HotStuffError(
                 "unsupported experiment Byzantine mode");
         if (!raw_configuration.empty() ||
             !raw_additional_omission_configuration.empty() ||
             context_limit != 0)
             throw HotStuffError(
-                "rotating omission does not accept static configuration "
+                "scheduled omission does not accept static configuration "
                 "or a context limit");
     }
     else
     {
-        if (rotating_argument_present)
+        if (scheduled_argument_present)
             throw HotStuffError(
-                "rotating omission arguments require an experiment "
+                "scheduled omission arguments require an experiment "
                 "Byzantine mode");
         if (raw_configuration.empty())
             throw HotStuffError(
@@ -344,29 +345,37 @@ parse_experiment_byzantine_options(
     hotstuff::ExperimentByzantineOptions options;
     options.enabled = true;
     options.diagnostic_window = diagnostic_window;
-    if (rotating_mode)
+    if (scheduled_mode)
     {
         if (raw_rotating_omission_actors.empty() ||
             raw_window_start_monotonic_ns.empty() ||
             raw_window_end_monotonic_ns.empty() ||
-            max_omissions_per_proposal != 1 ||
             maximum_rotating_contexts <= 0)
             throw HotStuffError(
-                "rotating omission requires actors, an exact monotonic "
-                "window, and one omission per proposal");
+                "scheduled omission requires actors and an exact monotonic "
+                "window");
         const auto quorum =
             hotstuff::derive_byzantine_quorum(replica_count);
         if (!quorum.has_value())
             throw HotStuffError(
-                "rotating omission requires a valid Byzantine membership");
+                "scheduled omission requires a valid Byzantine membership");
         std::vector<ReplicaID> actors;
         for (const auto &raw_actor :
              trim_all(split(raw_rotating_omission_actors, ",")))
             actors.push_back(parse_adaptive_v2_unsigned<ReplicaID>(
                 raw_actor,
-                "experiment rotating omission actor",
+                "experiment scheduled omission actor",
                 false));
         const auto actor_count = actors.size();
+        const auto expected_maximum_omissions =
+            fault_mode == "rotating_intermittent_omission_v1"
+                ? std::size_t{1}
+                : actor_count;
+        if (max_omissions_per_proposal <= 0 ||
+            static_cast<std::size_t>(max_omissions_per_proposal) !=
+                expected_maximum_omissions)
+            throw HotStuffError(
+                "scheduled omission maximum must match its actor schedule");
         options.rotating_omission =
             hotstuff::ExperimentRotatingOmissionOptions{
                 fault_mode,
@@ -1019,31 +1028,31 @@ int main(int argc, char **argv)
         opt_experiment_rotating_omission_actors,
         Config::SET_VAL,
         -1,
-        "comma-separated rotating omission actor replica IDs");
+        "comma-separated scheduled omission actor replica IDs");
     config.add_opt(
         "experiment-byzantine-window-start-monotonic-ns",
         opt_experiment_byzantine_window_start_monotonic_ns,
         Config::SET_VAL,
         -1,
-        "inclusive rotating omission window start on CLOCK_MONOTONIC_RAW");
+        "inclusive scheduled omission window start on CLOCK_MONOTONIC_RAW");
     config.add_opt(
         "experiment-byzantine-window-end-monotonic-ns",
         opt_experiment_byzantine_window_end_monotonic_ns,
         Config::SET_VAL,
         -1,
-        "exclusive rotating omission window end on CLOCK_MONOTONIC_RAW");
+        "exclusive scheduled omission window end on CLOCK_MONOTONIC_RAW");
     config.add_opt(
         "experiment-byzantine-max-omissions-per-proposal",
         opt_experiment_byzantine_max_omissions_per_proposal,
         Config::SET_VAL,
         -1,
-        "rotating omission bound, fixed at one per proposal");
+        "scheduled omission bound per proposal");
     config.add_opt(
         "experiment-rotating-omission-context-limit",
         opt_experiment_rotating_omission_context_limit,
         Config::SET_VAL,
         -1,
-        "maximum retained exact rotating omission proposal contexts");
+        "maximum retained exact scheduled omission proposal contexts");
     config.add_opt(
         "experiment-post-qc-audit-configuration",
         opt_experiment_post_qc_audit_configuration,

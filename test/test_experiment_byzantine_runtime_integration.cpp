@@ -79,6 +79,18 @@ ExperimentByzantineOptions rotating_options(
     return options;
 }
 
+ExperimentByzantineOptions persistent_options(
+    ReplicaID local_replica,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr)
+{
+    auto options = rotating_options(local_replica, markers);
+    options.rotating_omission->mode =
+        "persistent_selected_omission_v1";
+    options.rotating_omission->max_omissions_per_proposal =
+        options.rotating_omission->actor_ids.size();
+    return options;
+}
+
 ProposalKey selected_proposal(
     ReplicaID actor,
     const std::string &label)
@@ -173,6 +185,54 @@ TEST_CASE(
     CHECK(markers[0].action == ExperimentOmissionAction::omit_aggregate);
     CHECK(markers[0].monotonic_ns > 0);
     CHECK(markers[1].proposal == leaf_key);
+    CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
+    CHECK(markers[1].monotonic_ns > 0);
+}
+
+TEST_CASE(
+    "native HotStuff outbound hooks provide persistent omission clock",
+    "[adaptive-v2][experiment][byzantine][persistent][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    std::vector<ExperimentOmissionMarker> markers;
+    runtime.configure_experiment_byzantine_faults(
+        persistent_options(1, &markers));
+
+    const ConfigurationId configuration{7, 3, digest("persistent-epoch")};
+    const ProposalKey internal_key{
+        configuration, digest("persistent-internal")};
+    const ProposalKey leaf_key{
+        configuration, digest("persistent-leaf")};
+    const ProposalKey root_key{
+        configuration, digest("persistent-root")};
+    const auto internal = tree(ExperimentReplicaRole::internal);
+    const auto leaf = tree(ExperimentReplicaRole::leaf);
+    const auto root = tree(ExperimentReplicaRole::root);
+
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime, internal_key, internal));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+        runtime, leaf_key, leaf));
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime, root_key, root));
+
+    REQUIRE(markers.size() == 2);
+    CHECK(markers[0].fault_mode == "persistent_selected_omission_v1");
+    CHECK(markers[0].action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(markers[0].monotonic_ns > 0);
+    CHECK(markers[1].fault_mode == "persistent_selected_omission_v1");
     CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
     CHECK(markers[1].monotonic_ns > 0);
 }

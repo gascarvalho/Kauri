@@ -291,6 +291,20 @@ ExperimentByzantineOptions rotating_omission_options(
     return options;
 }
 
+ExperimentByzantineOptions persistent_omission_options(
+    ReplicaID local_replica,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr,
+    std::vector<std::string> *encoded_markers = nullptr)
+{
+    auto options = rotating_omission_options(
+        local_replica, markers, encoded_markers);
+    options.rotating_omission->mode =
+        "persistent_selected_omission_v1";
+    options.rotating_omission->max_omissions_per_proposal =
+        options.rotating_omission->actor_ids.size();
+    return options;
+}
+
 ExperimentByzantineContext selected_context(
     const ExperimentByzantineAdapter &adapter,
     ReplicaID selected_actor,
@@ -1085,6 +1099,138 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "persistent omission requires the exact selected minority bound",
+    "[adaptive-v2][experiment][byzantine][persistent][validation]")
+{
+    CHECK_NOTHROW(
+        ExperimentByzantineAdapter(persistent_omission_options(1)));
+    CHECK_NOTHROW(
+        ExperimentByzantineAdapter(persistent_omission_options(2)));
+
+    ExperimentByzantineAdapter mode_contract(
+        persistent_omission_options(1));
+    CHECK(mode_contract.scheduled_omission_enabled());
+    CHECK_FALSE(mode_contract.rotating_omission_enabled());
+    CHECK_FALSE(mode_contract.rotating_omission_actor(
+        context("persistent-mode-contract").proposal).has_value());
+
+    auto below_actor_count = persistent_omission_options(1);
+    below_actor_count.rotating_omission->max_omissions_per_proposal = 1;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(below_actor_count),
+        std::invalid_argument);
+
+    auto above_actor_count = persistent_omission_options(1);
+    above_actor_count.rotating_omission->max_omissions_per_proposal = 3;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(above_actor_count),
+        std::invalid_argument);
+
+    auto above_fault_threshold = persistent_omission_options(1);
+    above_fault_threshold.rotating_omission->actor_ids = {1, 3, 5};
+    above_fault_threshold.rotating_omission->expected_actor_count = 3;
+    above_fault_threshold.rotating_omission->max_omissions_per_proposal = 3;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(above_fault_threshold),
+        std::invalid_argument);
+}
+
+TEST_CASE(
+    "persistent selected actors omit every eligible proposal and others forward",
+    "[adaptive-v2][experiment][byzantine][persistent][behavior]")
+{
+    std::vector<ExperimentOmissionMarker> actor_one_markers;
+    std::vector<std::string> actor_one_encoded;
+    ExperimentByzantineAdapter actor_one(persistent_omission_options(
+        1, &actor_one_markers, &actor_one_encoded));
+    ExperimentByzantineAdapter actor_three(persistent_omission_options(3));
+    ExperimentByzantineAdapter nonselected(persistent_omission_options(2));
+
+    const auto internal = context(
+        "persistent-internal", configuration(), "factorial-window-1");
+    CHECK(actor_one.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 100));
+    CHECK(actor_three.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 100));
+    CHECK_FALSE(nonselected.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 100));
+    CHECK(actor_one.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 101));
+
+    const auto root = context(
+        "persistent-root", configuration(), "factorial-window-1");
+    CHECK_FALSE(actor_one.consume_outbound_aggregate(
+        root, ExperimentReplicaRole::root, 102));
+    CHECK_FALSE(actor_three.consume_outbound_aggregate(
+        root, ExperimentReplicaRole::root, 102));
+
+    const auto leaf = context(
+        "persistent-leaf", configuration(), "factorial-window-1");
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 150) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(
+        actor_three.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 150) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(
+        nonselected.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 150) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK(
+        actor_one.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 151) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+
+    const auto before = context(
+        "persistent-before", configuration(), "factorial-window-1");
+    const auto after = context(
+        "persistent-after", configuration(), "factorial-window-1");
+    CHECK_FALSE(actor_one.consume_outbound_aggregate(
+        before, ExperimentReplicaRole::internal, 99));
+    CHECK_FALSE(actor_one.consume_outbound_aggregate(
+        after, ExperimentReplicaRole::internal, 200));
+
+    REQUIRE(actor_one_markers.size() == 2);
+    REQUIRE(actor_one_encoded.size() == 2);
+    CHECK(
+        actor_one_markers[0].fault_mode ==
+        "persistent_selected_omission_v1");
+    CHECK(
+        actor_one_markers[1].fault_mode ==
+        "persistent_selected_omission_v1");
+    CHECK(
+        parse_marker_fields(actor_one_encoded[0]).at("fault") ==
+        "persistent_selected_omission_v1");
+    CHECK(
+        parse_marker_fields(actor_one_encoded[1]).at("fault") ==
+        "persistent_selected_omission_v1");
+}
+
+TEST_CASE(
+    "persistent omission keeps configurations distinct when later trees arrive first",
+    "[adaptive-v2][experiment][byzantine][persistent][configuration]")
+{
+    ExperimentByzantineAdapter adapter(persistent_omission_options(1));
+    const auto shared_block = digest("shared-persistent-block");
+    const auto epoch_digest = digest("shared-persistent-epoch");
+    const ExperimentByzantineContext later_tree{
+        ProposalKey{ConfigurationId{8, 5, epoch_digest}, shared_block},
+        "factorial-window-1"};
+    const ExperimentByzantineContext primary_tree{
+        ProposalKey{ConfigurationId{8, 2, epoch_digest}, shared_block},
+        "factorial-window-1"};
+
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        later_tree, ExperimentReplicaRole::root, 150));
+    CHECK(adapter.consume_outbound_aggregate(
+        primary_tree, ExperimentReplicaRole::internal, 151));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        later_tree, ExperimentReplicaRole::root, 152));
+}
+
+TEST_CASE(
     "experiment marker raw clock is available and positive",
     "[adaptive-v2][experiment][byzantine][clock]")
 {
@@ -1271,6 +1417,9 @@ TEST_CASE(
     CHECK(parser.find("fault_mode_count != 1") != std::string::npos);
     CHECK(
         parser.find("rotating_intermittent_omission_v1") !=
+        std::string::npos);
+    CHECK(
+        parser.find("persistent_selected_omission_v1") !=
         std::string::npos);
     CHECK(
         parser.find("derive_byzantine_quorum(replica_count)") !=
