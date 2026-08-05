@@ -939,6 +939,80 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "inherited optimization waits for every unconstrained replica",
+    "[adaptive-v2][selection][inheritance][minority][complete-evidence][n7]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    auto config = selection_config();
+    config.required_nonresponsive = 1;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    const auto baseline_cutoff = selector.current_cutoff();
+    const auto baseline_trajectory_size =
+        selector.score_trajectory().size();
+
+    for (const auto target :
+         std::vector<ReplicaID>{0, 1, 2, 3, 4})
+    {
+        fixture.on_time(
+            static_cast<ReplicaID>(target + 1U),
+            target,
+            static_cast<std::uint64_t>(10 + target));
+    }
+    const auto incomplete_cutoff = fixture.ledger->high_watermark();
+    const auto incomplete =
+        selector.rank_inheriting_constraints_through(
+            incomplete_cutoff, {ReplicaID{6}});
+
+    REQUIRE(incomplete.snapshot != nullptr);
+    REQUIRE(incomplete.status ==
+            AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    CHECK(incomplete.selected_replicas.empty());
+    CHECK(incomplete.eligible_roots.empty());
+    CHECK(std::count_if(
+              incomplete.snapshot->ranking().begin(),
+              incomplete.snapshot->ranking().end(),
+              [](const auto &entry) { return entry.eligible; }) == 5);
+    const auto missing = std::find_if(
+        incomplete.snapshot->ranking().begin(),
+        incomplete.snapshot->ranking().end(),
+        [](const auto &entry) { return entry.replica_id == 5; });
+    REQUIRE(missing != incomplete.snapshot->ranking().end());
+    CHECK(missing->classification ==
+          ResponsivenessClass::insufficient_evidence);
+    CHECK_FALSE(missing->eligible);
+    CHECK(selector.current_cutoff() == baseline_cutoff);
+    CHECK(selector.score_trajectory().size() ==
+          baseline_trajectory_size);
+    CHECK(selector.healthy());
+
+    fixture.on_time(0, 5, 15);
+    const auto complete_cutoff = fixture.ledger->high_watermark();
+    const auto complete =
+        selector.rank_inheriting_constraints_through(
+            complete_cutoff, {ReplicaID{6}});
+
+    REQUIRE(complete.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(complete.selected_replicas ==
+          std::vector<ReplicaID>{6});
+    CHECK(complete.eligible_roots ==
+          std::vector<ReplicaID>{0, 1, 2, 3, 4});
+    CHECK(complete.metadata.fault_threshold == 2);
+    CHECK(complete.metadata.quorum == 5);
+    CHECK(complete.metadata.required_nonresponsive == 1);
+    CHECK(selector.current_cutoff() == complete_cutoff);
+    CHECK(selector.score_trajectory().size() ==
+          baseline_trajectory_size + 6);
+    CHECK(selector.healthy());
+}
+
+TEST_CASE(
     "inherited optimization excludes an exactly correlated cross-baseline late",
     "[adaptive-v2][selection][inheritance][optimization][late][n7]")
 {

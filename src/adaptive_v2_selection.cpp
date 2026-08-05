@@ -815,6 +815,7 @@ struct AdaptiveV2ByzantineSelection::State
             std::set<ReplicaID> ranked;
             output.eligible_roots.reserve(quorum.quorum);
             const auto &ranking = output.snapshot->ranking();
+            bool every_unconstrained_replica_is_eligible = true;
             if (ranking.size() != membership.size())
             {
                 healthy = false;
@@ -837,16 +838,23 @@ struct AdaptiveV2ByzantineSelection::State
                     output.eligible_roots.clear();
                     return output;
                 }
-                if (constrained.count(entry.replica_id) == 0 &&
-                    entry.classification ==
-                        ResponsivenessClass::responsive &&
-                    entry.eligible &&
-                    output.eligible_roots.size() < quorum.quorum)
+                if (constrained.count(entry.replica_id) != 0)
+                    continue;
+
+                if (entry.classification !=
+                        ResponsivenessClass::responsive ||
+                    !entry.eligible)
+                {
+                    every_unconstrained_replica_is_eligible = false;
+                    continue;
+                }
+                if (output.eligible_roots.size() < quorum.quorum)
                 {
                     output.eligible_roots.push_back(entry.replica_id);
                 }
             }
-            if (output.eligible_roots.size() != quorum.quorum)
+            if (!every_unconstrained_replica_is_eligible ||
+                output.eligible_roots.size() != quorum.quorum)
             {
                 output.selected_replicas.clear();
                 output.eligible_roots.clear();

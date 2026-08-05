@@ -167,8 +167,8 @@ public:
      * already authorized by the consensus-ordered predecessor epoch.
      *
      * The inherited input must contain exactly the configured bounded target
-     * count of unique members. At least Q unconstrained replicas must be
-     * responsive in the accepted suffix
+     * count of unique members. Every unconstrained replica must be responsive
+     * and eligible in the accepted suffix
      * `(baseline_cutoff, evidence_cutoff]` under the configured snapshot
      * policy. An exact timeout-to-late transition crossing the baseline is
      * validated against the full accepted prefix, then excluded: it is not a
