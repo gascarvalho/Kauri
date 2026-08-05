@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -38,7 +39,19 @@ struct BoundAttempt
     ResponseAttemptHandle handle;
     bool timeout_eligible{false};
     bool timeout_recorded{false};
+    bool response_recorded{false};
     bool late_reservation{false};
+};
+
+struct BoundDeadline
+{
+    std::uint64_t generation{0};
+    bool consensus_context_closed{false};
+    bool fired{false};
+    bool dispatching{false};
+    bool delivery_failed{false};
+    std::size_t pending_evidence_acceptances{0};
+    EvidenceDeadlineCancellation cancellation;
 };
 
 struct PreparedAttempt
@@ -156,6 +169,21 @@ std::size_t active_late_reservations(
         }));
 }
 
+bool has_unanswered_required_child(
+    const std::map<ChildAttemptKey,
+                   BoundAttempt,
+                   ChildAttemptKeyLess> &handles,
+    const ProposalKey &proposal) noexcept
+{
+    return std::any_of(
+        handles.begin(), handles.end(), [&proposal](const auto &entry) {
+            return entry.first.proposal == proposal &&
+                   entry.second.timeout_eligible &&
+                   !entry.second.timeout_recorded &&
+                   !entry.second.response_recorded;
+        });
+}
+
 } // namespace
 
 struct AdaptiveV2ResponseEvidenceBridge::State
@@ -185,10 +213,28 @@ struct AdaptiveV2ResponseEvidenceBridge::State
     RetainedFactQueue retained_facts;
     RetainedFactQueue late_compensations;
     std::map<ChildAttemptKey, BoundAttempt, ChildAttemptKeyLess> handles;
+    std::map<ProposalKey, BoundDeadline> deadlines;
+    EvidenceDeadlineScheduler deadline_scheduler;
+    EvidenceDeadlineResultCallback deadline_result_callback;
     EvidenceTransportCallback transport;
     EvidenceRetryScheduler retry_scheduler;
     EvidenceRetryCancellation retry_cancellation;
+    // Scheduler cancellations are user-supplied and may throw without
+    // actually releasing a retained callback. Expiring this token before
+    // shutdown makes every such late callback a no-op before it touches the
+    // bridge object.
+    std::shared_ptr<const bool> callback_lifetime{
+        std::make_shared<const bool>(true)};
     std::uint64_t armed_attempts{0};
+    std::uint64_t armed_deadlines{0};
+    std::uint64_t fired_deadlines{0};
+    std::uint64_t completed_deadlines{0};
+    std::uint64_t closed_contexts_retained{0};
+    std::uint64_t deadline_schedule_failures{0};
+    std::uint64_t deadline_callback_failures{0};
+    std::uint64_t deadline_delivery_failures{0};
+    std::uint64_t deadline_cancellations{0};
+    std::uint64_t deadline_cancellation_failures{0};
     std::uint64_t response_facts{0};
     std::uint64_t timeout_facts{0};
     std::uint64_t timeout_missing_handles{0};
@@ -203,8 +249,11 @@ struct AdaptiveV2ResponseEvidenceBridge::State
     std::uint64_t enqueue_failures{0};
     std::uint64_t retry_schedules{0};
     std::uint64_t retry_schedule_failures{0};
+    std::uint64_t last_deadline_generation{0};
     bool retry_scheduled{false};
+    bool terminal_delivery_failure{false};
     bool healthy{true};
+    bool stopped{false};
 };
 
 AdaptiveV2ResponseEvidenceBridge::AdaptiveV2ResponseEvidenceBridge(
@@ -215,10 +264,7 @@ AdaptiveV2ResponseEvidenceBridge::AdaptiveV2ResponseEvidenceBridge(
 
 AdaptiveV2ResponseEvidenceBridge::~AdaptiveV2ResponseEvidenceBridge()
 {
-    unbind_transport();
-    unbind_retry_scheduler();
-    state_->tracker.shutdown();
-    state_->reporter.shutdown();
+    shutdown();
 }
 
 bool AdaptiveV2ResponseEvidenceBridge::arm(
@@ -227,6 +273,11 @@ bool AdaptiveV2ResponseEvidenceBridge::arm(
     std::uint64_t start_monotonic_ns,
     std::uint64_t deadline_duration_us) noexcept
 {
+    if (state_->stopped)
+    {
+        increment(state_->rejected_operations);
+        return false;
+    }
     if (start_monotonic_ns == 0 || deadline_duration_us == 0)
     {
         increment(state_->rejected_operations);
@@ -352,6 +403,7 @@ bool AdaptiveV2ResponseEvidenceBridge::arm(
                     *handle,
                     attempt.timeout_eligible,
                     false,
+                    false,
                     attempt.timeout_eligible});
             if (!inserted.second)
                 throw std::runtime_error("response handle insert failed");
@@ -371,6 +423,314 @@ bool AdaptiveV2ResponseEvidenceBridge::arm(
     }
 }
 
+bool AdaptiveV2ResponseEvidenceBridge::arm_with_deadline(
+    const ProposalKey &proposal,
+    const ProposalTreeSnapshot &tree,
+    std::uint64_t start_monotonic_ns,
+    std::uint64_t deadline_duration_us) noexcept
+{
+    if (state_->terminal_delivery_failure)
+    {
+        increment(state_->rejected_operations);
+        state_->healthy = false;
+        notify_deadline_result(
+            proposal, EvidenceDeadlineResult::failed);
+        return false;
+    }
+    const bool already_armed = std::any_of(
+        state_->handles.begin(),
+        state_->handles.end(),
+        [&proposal](const auto &entry) {
+            return entry.first.proposal == proposal;
+        });
+    if (!arm(
+            proposal,
+            tree,
+            start_monotonic_ns,
+            deadline_duration_us))
+    {
+        // A rejected duplicate must not leave an earlier exact deadline
+        // alive after reporting this proposal failed. Otherwise that timer
+        // could later report success for the same failed fence.
+        static_cast<void>(retire(proposal));
+        notify_deadline_result(
+            proposal, EvidenceDeadlineResult::failed);
+        return false;
+    }
+    if (already_armed)
+    {
+        if (state_->deadlines.find(proposal) !=
+            state_->deadlines.end())
+            return true;
+        increment(state_->rejected_operations);
+        state_->healthy = false;
+        static_cast<void>(retire(proposal));
+        notify_deadline_result(
+            proposal, EvidenceDeadlineResult::failed);
+        return false;
+    }
+    if (schedule_deadline(proposal, deadline_duration_us))
+        return true;
+    static_cast<void>(retire(proposal));
+    return false;
+}
+
+bool AdaptiveV2ResponseEvidenceBridge::schedule_deadline(
+    const ProposalKey &proposal,
+    std::uint64_t deadline_duration_us) noexcept
+{
+    if (state_->stopped || !state_->deadline_scheduler ||
+        deadline_duration_us == 0 ||
+        state_->deadlines.size() >= state_->limits.maximum_handles ||
+        state_->last_deadline_generation ==
+            std::numeric_limits<std::uint64_t>::max())
+    {
+        increment(state_->deadline_schedule_failures);
+        state_->healthy = false;
+        notify_deadline_result(
+            proposal, EvidenceDeadlineResult::failed);
+        return false;
+    }
+    if (state_->deadlines.find(proposal) != state_->deadlines.end())
+        return true;
+
+    const auto generation = state_->last_deadline_generation + 1;
+    bool generation_inserted = false;
+    try
+    {
+        const auto inserted = state_->deadlines.emplace(
+            proposal,
+            BoundDeadline{generation});
+        if (!inserted.second)
+        {
+            increment(state_->deadline_schedule_failures);
+            state_->healthy = false;
+            notify_deadline_result(
+                proposal, EvidenceDeadlineResult::failed);
+            return false;
+        }
+        generation_inserted = true;
+        state_->last_deadline_generation = generation;
+
+        const std::weak_ptr<const bool> lifetime =
+            state_->callback_lifetime;
+        auto cancellation = state_->deadline_scheduler(
+            proposal,
+            deadline_duration_us,
+            [this, lifetime, proposal, generation](
+                std::uint64_t now_ns) {
+                if (lifetime.expired())
+                    return;
+                dispatch_deadline(proposal, generation, now_ns);
+            },
+            [this, lifetime, proposal, generation] {
+                if (lifetime.expired())
+                    return;
+                fail_deadline(proposal, generation);
+            });
+        auto found = state_->deadlines.find(proposal);
+        if (!cancellation || found == state_->deadlines.end() ||
+            found->second.generation != generation)
+        {
+            if (cancellation)
+            {
+                try
+                {
+                    cancellation();
+                }
+                catch (...)
+                {
+                    increment(
+                        state_->deadline_cancellation_failures);
+                    state_->healthy = false;
+                }
+            }
+            if (found != state_->deadlines.end() &&
+                found->second.generation == generation)
+                fail_deadline(proposal, generation);
+            // If the entry disappeared, a scheduler callback already
+            // diagnosed and retired this generation synchronously.
+            return false;
+        }
+        found->second.cancellation = std::move(cancellation);
+        increment(state_->armed_deadlines);
+        return true;
+    }
+    catch (...)
+    {
+        const auto found = state_->deadlines.find(proposal);
+        if (found != state_->deadlines.end() &&
+            found->second.generation == generation)
+            fail_deadline(proposal, generation);
+        else if (!generation_inserted)
+        {
+            increment(state_->deadline_schedule_failures);
+            state_->healthy = false;
+            notify_deadline_result(
+                proposal, EvidenceDeadlineResult::failed);
+        }
+        return false;
+    }
+}
+
+void AdaptiveV2ResponseEvidenceBridge::dispatch_deadline(
+    const ProposalKey &proposal,
+    std::uint64_t generation,
+    std::uint64_t timeout_monotonic_ns) noexcept
+{
+    const auto found = state_->deadlines.find(proposal);
+    if (found == state_->deadlines.end() ||
+        found->second.generation != generation)
+        return;
+
+    found->second.fired = true;
+    found->second.dispatching = true;
+    found->second.cancellation = {};
+    increment(state_->fired_deadlines);
+
+    if (timeout_monotonic_ns == 0)
+    {
+        increment(state_->deadline_callback_failures);
+        state_->healthy = false;
+        found->second.dispatching = false;
+        fail_deadline_delivery(proposal, generation);
+        return;
+    }
+
+    std::set<ReplicaID> unanswered_required_children;
+    try
+    {
+        for (const auto &entry : state_->handles)
+            if (entry.first.proposal == proposal &&
+                entry.second.timeout_eligible &&
+                !entry.second.timeout_recorded &&
+                !entry.second.response_recorded)
+                unanswered_required_children.insert(entry.first.child);
+    }
+    catch (...)
+    {
+        increment(state_->deadline_callback_failures);
+        state_->healthy = false;
+        const auto active = state_->deadlines.find(proposal);
+        if (active != state_->deadlines.end() &&
+            active->second.generation == generation)
+            active->second.dispatching = false;
+        fail_deadline_delivery(proposal, generation);
+        return;
+    }
+
+    const auto recorded = record_timeouts_impl(
+        proposal,
+        unanswered_required_children,
+        timeout_monotonic_ns,
+        true);
+    const auto active = state_->deadlines.find(proposal);
+    if (active == state_->deadlines.end() ||
+        active->second.generation != generation)
+        return;
+    active->second.dispatching = false;
+    if (recorded != unanswered_required_children.size() ||
+        active->second.delivery_failed)
+    {
+        fail_deadline_delivery(proposal, generation);
+        return;
+    }
+    finalize_ready_deadlines();
+}
+
+void AdaptiveV2ResponseEvidenceBridge::fail_deadline(
+    const ProposalKey &proposal,
+    std::uint64_t generation) noexcept
+{
+    const auto found = state_->deadlines.find(proposal);
+    if (found == state_->deadlines.end() ||
+        found->second.generation != generation)
+        return;
+    increment(state_->deadline_schedule_failures);
+    state_->healthy = false;
+    static_cast<void>(retire(proposal));
+    notify_deadline_result(
+        proposal, EvidenceDeadlineResult::failed);
+}
+
+void AdaptiveV2ResponseEvidenceBridge::complete_deadline(
+    const ProposalKey &proposal,
+    std::uint64_t generation) noexcept
+{
+    auto found = state_->deadlines.find(proposal);
+    if (found == state_->deadlines.end() ||
+        found->second.generation != generation ||
+        found->second.dispatching || found->second.delivery_failed ||
+        found->second.pending_evidence_acceptances != 0)
+        return;
+    const bool closed_without_unanswered =
+        found->second.consensus_context_closed &&
+        !has_unanswered_required_child(state_->handles, proposal);
+    if (!closed_without_unanswered)
+        return;
+
+    auto cancellation = std::move(found->second.cancellation);
+    if (cancellation)
+    {
+        try
+        {
+            cancellation();
+            increment(state_->deadline_cancellations);
+        }
+        catch (...)
+        {
+            increment(state_->deadline_cancellation_failures);
+            state_->healthy = false;
+            fail_deadline_delivery(proposal, generation);
+            return;
+        }
+        found = state_->deadlines.find(proposal);
+        if (found == state_->deadlines.end() ||
+            found->second.generation != generation)
+            return;
+    }
+    const bool consensus_context_closed =
+        found->second.consensus_context_closed;
+    state_->deadlines.erase(found);
+    increment(state_->completed_deadlines);
+    if (consensus_context_closed)
+        static_cast<void>(retire(proposal));
+    notify_deadline_result(
+        proposal, EvidenceDeadlineResult::evidence_accepted);
+}
+
+void AdaptiveV2ResponseEvidenceBridge::fail_deadline_delivery(
+    const ProposalKey &proposal,
+    std::uint64_t generation) noexcept
+{
+    const auto found = state_->deadlines.find(proposal);
+    if (found == state_->deadlines.end() ||
+        found->second.generation != generation)
+        return;
+    increment(state_->deadline_delivery_failures);
+    state_->healthy = false;
+    static_cast<void>(retire(proposal));
+    notify_deadline_result(
+        proposal, EvidenceDeadlineResult::failed);
+}
+
+void AdaptiveV2ResponseEvidenceBridge::notify_deadline_result(
+    const ProposalKey &proposal,
+    EvidenceDeadlineResult result) noexcept
+{
+    if (!state_->deadline_result_callback)
+        return;
+    try
+    {
+        state_->deadline_result_callback(proposal, result);
+    }
+    catch (...)
+    {
+        increment(state_->deadline_callback_failures);
+        state_->healthy = false;
+    }
+}
+
 bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
     const ProposalKey &proposal,
     ReplicaID authenticated_sender,
@@ -378,7 +738,7 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
     const std::set<ReplicaID> &canonical_verified_signers,
     std::uint64_t response_monotonic_ns) noexcept
 {
-    const auto found = state_->handles.find(
+    auto found = state_->handles.find(
         ChildAttemptKey{proposal, authenticated_sender});
     if (found == state_->handles.end() ||
         found->second.handle.key.expected_message_type != message_type)
@@ -392,6 +752,14 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
         // Give a bound transport and the reporter FIFO the first chance to
         // release retention before the tracker state can advance.
         static_cast<void>(flush());
+        found = state_->handles.find(
+            ChildAttemptKey{proposal, authenticated_sender});
+        if (found == state_->handles.end() ||
+            found->second.handle.key.expected_message_type != message_type)
+        {
+            increment(state_->rejected_operations);
+            return false;
+        }
         const bool expects_late = found->second.timeout_recorded;
         const bool use_late_reservation =
             expects_late &&
@@ -404,6 +772,8 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
             increment(state_->retention_capacity_failures);
             increment(state_->rejected_operations);
             state_->healthy = false;
+            mark_deadline_delivery_failed(proposal);
+            finalize_ready_deadlines();
             return false;
         }
         if (expects_late &&
@@ -414,6 +784,8 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
             increment(state_->late_compensation_capacity_failures);
             increment(state_->rejected_operations);
             state_->healthy = false;
+            mark_deadline_delivery_failed(proposal);
+            finalize_ready_deadlines();
             return false;
         }
         const std::vector<ReplicaID> signers(
@@ -426,6 +798,8 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
         if (!fact.has_value())
         {
             increment(state_->rejected_operations);
+            mark_deadline_delivery_failed(proposal);
+            finalize_ready_deadlines();
             return false;
         }
         if ((expects_late && fact->outcome != ResponseOutcome::late) ||
@@ -434,8 +808,14 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
         {
             increment(state_->rejected_operations);
             state_->healthy = false;
+            mark_deadline_delivery_failed(proposal);
+            finalize_ready_deadlines();
             return false;
         }
+        // The tracker has irreversibly completed this exact attempt. Keep
+        // the deadline callback idempotent even if an unreachable retention
+        // failure is diagnosed below.
+        found->second.response_recorded = true;
         auto &destination = use_late_reservation
                                 ? state_->late_compensations
                                 : state_->retained_facts;
@@ -449,7 +829,22 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
             else
                 increment(state_->retention_capacity_failures);
             state_->healthy = false;
+            mark_deadline_delivery_failed(proposal);
+            finalize_ready_deadlines();
             return false;
+        }
+        const auto deadline = state_->deadlines.find(proposal);
+        if (deadline != state_->deadlines.end())
+        {
+            if (deadline->second.pending_evidence_acceptances ==
+                std::numeric_limits<std::size_t>::max())
+            {
+                mark_deadline_delivery_failed(proposal);
+                finalize_ready_deadlines();
+                return false;
+            }
+            else
+                ++deadline->second.pending_evidence_acceptances;
         }
         found->second.late_reservation = false;
         increment(state_->response_facts);
@@ -460,6 +855,8 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
     {
         increment(state_->rejected_operations);
         state_->healthy = false;
+        mark_deadline_delivery_failed(proposal);
+        finalize_ready_deadlines();
         return false;
     }
 }
@@ -469,9 +866,37 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
     const std::set<ReplicaID> &exact_missing_direct_children,
     std::uint64_t timeout_monotonic_ns) noexcept
 {
+    return record_timeouts_impl(
+        proposal,
+        exact_missing_direct_children,
+        timeout_monotonic_ns,
+        false);
+}
+
+std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts_impl(
+    const ProposalKey &proposal,
+    const std::set<ReplicaID> &exact_missing_direct_children,
+    std::uint64_t timeout_monotonic_ns,
+    bool produced_by_deadline) noexcept
+{
+    if (produced_by_deadline)
+    {
+        const auto deadline = state_->deadlines.find(proposal);
+        if (deadline == state_->deadlines.end() ||
+            !deadline->second.fired ||
+            !deadline->second.dispatching)
+        {
+            increment(state_->rejected_operations);
+            state_->healthy = false;
+            return 0;
+        }
+    }
     std::size_t recorded = 0;
     for (const auto child : exact_missing_direct_children)
     {
+        // A retry may complete a closed exact deadline and retire its
+        // handles, so flush before taking an iterator into the handle map.
+        static_cast<void>(flush());
         const auto found = state_->handles.find(
             ChildAttemptKey{proposal, child});
         if (found == state_->handles.end())
@@ -484,15 +909,19 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
             increment(state_->timeout_ineligible_attempts);
             continue;
         }
+        if (found->second.timeout_recorded ||
+            found->second.response_recorded)
+            continue;
         try
         {
-            static_cast<void>(flush());
             if (!state_->late_compensations.empty() ||
                 state_->retained_facts.full())
             {
                 increment(state_->retention_capacity_failures);
                 increment(state_->rejected_operations);
                 state_->healthy = false;
+                mark_deadline_delivery_failed(proposal);
+                finalize_ready_deadlines();
                 continue;
             }
             if (!found->second.late_reservation)
@@ -501,6 +930,8 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
                     state_->late_compensation_capacity_failures);
                 increment(state_->rejected_operations);
                 state_->healthy = false;
+                mark_deadline_delivery_failed(proposal);
+                finalize_ready_deadlines();
                 continue;
             }
             auto fact = state_->tracker.record_timeout(
@@ -508,13 +939,30 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
             if (!fact.has_value())
             {
                 increment(state_->timeout_tracker_rejections);
+                mark_deadline_delivery_failed(proposal);
+                finalize_ready_deadlines();
                 continue;
             }
             if (!state_->retained_facts.push(std::move(*fact)))
             {
                 increment(state_->retention_capacity_failures);
                 state_->healthy = false;
+                mark_deadline_delivery_failed(proposal);
+                finalize_ready_deadlines();
                 continue;
+            }
+            const auto deadline = state_->deadlines.find(proposal);
+            if (deadline != state_->deadlines.end())
+            {
+                if (deadline->second.pending_evidence_acceptances ==
+                    std::numeric_limits<std::size_t>::max())
+                {
+                    mark_deadline_delivery_failed(proposal);
+                    finalize_ready_deadlines();
+                    continue;
+                }
+                else
+                    ++deadline->second.pending_evidence_acceptances;
             }
             found->second.timeout_recorded = true;
             ++recorded;
@@ -526,14 +974,71 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
             increment(state_->timeout_exceptions);
             increment(state_->rejected_operations);
             state_->healthy = false;
+            mark_deadline_delivery_failed(proposal);
+            finalize_ready_deadlines();
         }
     }
     return recorded;
 }
 
+bool AdaptiveV2ResponseEvidenceBridge::close_consensus_context(
+    const ProposalKey &proposal) noexcept
+{
+    const auto deadline = state_->deadlines.find(proposal);
+    if (deadline == state_->deadlines.end())
+    {
+        static_cast<void>(retire(proposal));
+        return false;
+    }
+    if (!deadline->second.fired &&
+        !has_unanswered_required_child(state_->handles, proposal) &&
+        deadline->second.pending_evidence_acceptances == 0)
+    {
+        static_cast<void>(retire(proposal));
+        return false;
+    }
+    if (!deadline->second.consensus_context_closed)
+    {
+        deadline->second.consensus_context_closed = true;
+        increment(state_->closed_contexts_retained);
+    }
+    finalize_ready_deadlines();
+    return true;
+}
+
+bool AdaptiveV2ResponseEvidenceBridge::should_defer_commit_report(
+    const ProposalKey &proposal) const noexcept
+{
+    const auto deadline = state_->deadlines.find(proposal);
+    return deadline != state_->deadlines.end() &&
+           !deadline->second.delivery_failed &&
+           (deadline->second.fired ||
+            deadline->second.pending_evidence_acceptances != 0 ||
+            has_unanswered_required_child(state_->handles, proposal));
+}
+
 std::size_t AdaptiveV2ResponseEvidenceBridge::retire(
     const ProposalKey &proposal) noexcept
 {
+    const auto deadline = state_->deadlines.find(proposal);
+    if (deadline != state_->deadlines.end())
+    {
+        auto cancellation = std::move(deadline->second.cancellation);
+        state_->deadlines.erase(deadline);
+        if (cancellation)
+        {
+            try
+            {
+                cancellation();
+                increment(state_->deadline_cancellations);
+            }
+            catch (...)
+            {
+                increment(state_->deadline_cancellation_failures);
+                state_->healthy = false;
+            }
+        }
+    }
     const auto tracker_retired = state_->tracker.retire(proposal);
     const auto handles_retired = erase_proposal_handles(
         state_->handles, proposal);
@@ -542,6 +1047,73 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::retire(
     for (std::size_t index = 0; index < handles_retired; ++index)
         increment(state_->retired_attempts);
     return handles_retired;
+}
+
+void AdaptiveV2ResponseEvidenceBridge::shutdown() noexcept
+{
+    if (state_->stopped)
+        return;
+    state_->stopped = true;
+    state_->callback_lifetime.reset();
+    while (!state_->deadlines.empty())
+    {
+        const auto proposal = state_->deadlines.begin()->first;
+        const auto generation =
+            state_->deadlines.begin()->second.generation;
+        fail_deadline_delivery(proposal, generation);
+    }
+    while (!state_->handles.empty())
+        static_cast<void>(retire(state_->handles.begin()->first.proposal));
+    state_->deadline_scheduler = {};
+    unbind_transport();
+    unbind_retry_scheduler();
+    state_->tracker.shutdown();
+    state_->reporter.shutdown();
+}
+
+void AdaptiveV2ResponseEvidenceBridge::bind_deadline_scheduler(
+    EvidenceDeadlineScheduler scheduler)
+{
+    if (!scheduler)
+        throw std::invalid_argument(
+            "adaptive-v2 evidence deadline scheduler must be callable");
+    if (state_->stopped)
+        throw std::logic_error(
+            "adaptive-v2 evidence bridge is stopped");
+    if (!state_->deadlines.empty())
+        throw std::logic_error(
+            "adaptive-v2 evidence deadlines are active");
+    state_->deadline_scheduler = std::move(scheduler);
+}
+
+void AdaptiveV2ResponseEvidenceBridge::unbind_deadline_scheduler() noexcept
+{
+    while (!state_->deadlines.empty())
+    {
+        const auto proposal = state_->deadlines.begin()->first;
+        const auto generation =
+            state_->deadlines.begin()->second.generation;
+        fail_deadline_delivery(proposal, generation);
+    }
+    state_->deadline_scheduler = {};
+}
+
+void AdaptiveV2ResponseEvidenceBridge::bind_deadline_result_callback(
+    EvidenceDeadlineResultCallback callback)
+{
+    if (!callback)
+        throw std::invalid_argument(
+            "adaptive-v2 evidence deadline result callback must be callable");
+    if (state_->stopped)
+        throw std::logic_error(
+            "adaptive-v2 evidence bridge is stopped");
+    state_->deadline_result_callback = std::move(callback);
+}
+
+void AdaptiveV2ResponseEvidenceBridge::
+unbind_deadline_result_callback() noexcept
+{
+    state_->deadline_result_callback = {};
 }
 
 void AdaptiveV2ResponseEvidenceBridge::bind_retry_scheduler(
@@ -586,13 +1158,20 @@ void AdaptiveV2ResponseEvidenceBridge::schedule_retry() noexcept
     state_->retry_scheduled = true;
     try
     {
+        const std::weak_ptr<const bool> lifetime =
+            state_->callback_lifetime;
         auto cancellation = state_->retry_scheduler(
-            [this] { run_scheduled_retry(); });
+            [this, lifetime] {
+                if (lifetime.expired())
+                    return;
+                run_scheduled_retry();
+            });
         if (!cancellation)
         {
             state_->retry_scheduled = false;
             increment(state_->retry_schedule_failures);
             state_->healthy = false;
+            mark_all_deadline_deliveries_failed();
             return;
         }
         state_->retry_cancellation = std::move(cancellation);
@@ -604,6 +1183,7 @@ void AdaptiveV2ResponseEvidenceBridge::schedule_retry() noexcept
         state_->retry_cancellation = {};
         increment(state_->retry_schedule_failures);
         state_->healthy = false;
+        mark_all_deadline_deliveries_failed();
     }
 }
 
@@ -633,6 +1213,68 @@ void AdaptiveV2ResponseEvidenceBridge::run_scheduled_retry() noexcept
     static_cast<void>(flush());
 }
 
+void AdaptiveV2ResponseEvidenceBridge::acknowledge_accepted_evidence(
+    const ProposalKey &proposal) noexcept
+{
+    const auto deadline = state_->deadlines.find(proposal);
+    if (deadline == state_->deadlines.end() ||
+        deadline->second.pending_evidence_acceptances == 0)
+        return;
+    --deadline->second.pending_evidence_acceptances;
+}
+
+void AdaptiveV2ResponseEvidenceBridge::mark_deadline_delivery_failed(
+    const ProposalKey &proposal) noexcept
+{
+    const auto deadline = state_->deadlines.find(proposal);
+    if (deadline == state_->deadlines.end())
+        return;
+    deadline->second.delivery_failed = true;
+    state_->healthy = false;
+}
+
+void AdaptiveV2ResponseEvidenceBridge::
+mark_all_deadline_deliveries_failed() noexcept
+{
+    state_->terminal_delivery_failure = true;
+    for (auto &entry : state_->deadlines)
+        entry.second.delivery_failed = true;
+    state_->healthy = false;
+}
+
+void AdaptiveV2ResponseEvidenceBridge::finalize_ready_deadlines() noexcept
+{
+    while (true)
+    {
+        auto candidate = state_->deadlines.end();
+        for (auto entry = state_->deadlines.begin();
+             entry != state_->deadlines.end(); ++entry)
+        {
+            if (entry->second.dispatching)
+                continue;
+            const bool closed_without_unanswered =
+                entry->second.consensus_context_closed &&
+                !has_unanswered_required_child(
+                    state_->handles, entry->first);
+            if (entry->second.delivery_failed ||
+                (entry->second.pending_evidence_acceptances == 0 &&
+                 closed_without_unanswered))
+            {
+                candidate = entry;
+                break;
+            }
+        }
+        if (candidate == state_->deadlines.end())
+            return;
+        const auto proposal = candidate->first;
+        const auto generation = candidate->second.generation;
+        if (candidate->second.delivery_failed)
+            fail_deadline_delivery(proposal, generation);
+        else
+            complete_deadline(proposal, generation);
+    }
+}
+
 std::size_t AdaptiveV2ResponseEvidenceBridge::flush() noexcept
 {
     std::size_t accepted = 0;
@@ -652,6 +1294,8 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::flush() noexcept
             {
                 increment(state_->enqueue_failures);
                 state_->healthy = false;
+                mark_all_deadline_deliveries_failed();
+                finalize_ready_deadlines();
                 return accepted;
             }
             source->pop();
@@ -663,6 +1307,12 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::flush() noexcept
             break;
         try
         {
+            const auto *pending = state_->reporter.front();
+            if (pending == nullptr)
+                break;
+            const ProposalKey pending_proposal{
+                pending->envelope.observation.configuration,
+                pending->envelope.observation.block_hash};
             const auto result = state_->reporter.dispatch_one(
                 state_->transport);
             if (!result.has_value())
@@ -673,13 +1323,18 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::flush() noexcept
                 break;
             }
             if (*result != EvidenceTransportResult::accepted)
+            {
+                mark_all_deadline_deliveries_failed();
                 break;
+            }
+            acknowledge_accepted_evidence(pending_proposal);
             ++accepted;
             progressed = true;
         }
         catch (...)
         {
             state_->healthy = false;
+            mark_all_deadline_deliveries_failed();
             break;
         }
         if (!progressed)
@@ -691,6 +1346,7 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::flush() noexcept
     {
         cancel_retry();
     }
+    finalize_ready_deadlines();
     return accepted;
 }
 
@@ -705,6 +1361,7 @@ AdaptiveV2ResponseEvidenceBridge::diagnostics() const noexcept
 {
     AdaptiveV2ResponseEvidenceDiagnostics result;
     result.active_handles = state_->handles.size();
+    result.active_deadlines = state_->deadlines.size();
     result.pending_reports = state_->reporter.pending_size();
     result.retained_facts = state_->retained_facts.size();
     result.retention_capacity = state_->retained_facts.capacity();
@@ -713,6 +1370,21 @@ AdaptiveV2ResponseEvidenceBridge::diagnostics() const noexcept
     result.late_compensation_capacity =
         state_->late_compensations.capacity();
     result.armed_attempts = state_->armed_attempts;
+    result.armed_deadlines = state_->armed_deadlines;
+    result.fired_deadlines = state_->fired_deadlines;
+    result.completed_deadlines = state_->completed_deadlines;
+    result.closed_contexts_retained =
+        state_->closed_contexts_retained;
+    result.deadline_schedule_failures =
+        state_->deadline_schedule_failures;
+    result.deadline_callback_failures =
+        state_->deadline_callback_failures;
+    result.deadline_delivery_failures =
+        state_->deadline_delivery_failures;
+    result.deadline_cancellations =
+        state_->deadline_cancellations;
+    result.deadline_cancellation_failures =
+        state_->deadline_cancellation_failures;
     result.response_facts = state_->response_facts;
     result.timeout_facts = state_->timeout_facts;
     result.timeout_missing_handles =
@@ -736,6 +1408,10 @@ AdaptiveV2ResponseEvidenceBridge::diagnostics() const noexcept
     result.transport_bound = static_cast<bool>(state_->transport);
     result.retry_scheduler_bound =
         static_cast<bool>(state_->retry_scheduler);
+    result.deadline_scheduler_bound =
+        static_cast<bool>(state_->deadline_scheduler);
+    result.deadline_result_callback_bound =
+        static_cast<bool>(state_->deadline_result_callback);
     result.retry_scheduled = state_->retry_scheduled;
     result.healthy = state_->healthy && state_->tracker.healthy() &&
                      state_->reporter.healthy();

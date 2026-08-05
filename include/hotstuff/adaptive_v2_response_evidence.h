@@ -35,12 +35,22 @@ struct AdaptiveV2ResponseEvidenceLimits
 struct AdaptiveV2ResponseEvidenceDiagnostics
 {
     std::size_t active_handles{0};
+    std::size_t active_deadlines{0};
     std::size_t pending_reports{0};
     std::size_t retained_facts{0};
     std::size_t retention_capacity{0};
     std::size_t pending_late_compensations{0};
     std::size_t late_compensation_capacity{0};
     std::uint64_t armed_attempts{0};
+    std::uint64_t armed_deadlines{0};
+    std::uint64_t fired_deadlines{0};
+    std::uint64_t completed_deadlines{0};
+    std::uint64_t closed_contexts_retained{0};
+    std::uint64_t deadline_schedule_failures{0};
+    std::uint64_t deadline_callback_failures{0};
+    std::uint64_t deadline_delivery_failures{0};
+    std::uint64_t deadline_cancellations{0};
+    std::uint64_t deadline_cancellation_failures{0};
     std::uint64_t response_facts{0};
     std::uint64_t timeout_facts{0};
     std::uint64_t timeout_missing_handles{0};
@@ -57,6 +67,8 @@ struct AdaptiveV2ResponseEvidenceDiagnostics
     std::uint64_t retry_schedule_failures{0};
     bool transport_bound{false};
     bool retry_scheduler_bound{false};
+    bool deadline_scheduler_bound{false};
+    bool deadline_result_callback_bound{false};
     bool retry_scheduled{false};
     bool healthy{true};
 };
@@ -65,12 +77,32 @@ using EvidenceRetryCallback = std::function<void()>;
 using EvidenceRetryCancellation = std::function<void()>;
 using EvidenceRetryScheduler = std::function<EvidenceRetryCancellation(
     EvidenceRetryCallback)>;
+using EvidenceDeadlineCallback =
+    std::function<void(std::uint64_t)>;
+using EvidenceDeadlineFailureCallback = std::function<void()>;
+using EvidenceDeadlineCancellation = std::function<void()>;
+using EvidenceDeadlineScheduler =
+    std::function<EvidenceDeadlineCancellation(
+        const ProposalKey &,
+        std::uint64_t,
+        EvidenceDeadlineCallback,
+        EvidenceDeadlineFailureCallback)>;
+enum class EvidenceDeadlineResult : std::uint8_t
+{
+    evidence_accepted = 1,
+    failed,
+};
+using EvidenceDeadlineResultCallback = std::function<void(
+    const ProposalKey &,
+    EvidenceDeadlineResult)>;
 
 /**
  * Event-loop-confined adapter from exact proposal callbacks to immutable
- * response evidence. It owns no timers, network, manager authority, quorum
- * state, or topology decisions. Callers provide explicit monotonic times and
- * only already authenticated, topology-verified signer sets.
+ * response evidence. An injected scheduler may retain only the immutable
+ * attempt identity until its original observation deadline; it never retains
+ * or reopens consensus context. The bridge owns no network, manager authority,
+ * quorum state, or topology decisions. Callers provide explicit monotonic
+ * times and only already authenticated, topology-verified signer sets.
  *
  * A transport result acknowledges only this local outbox delivery attempt.
  * It is not evidence that an adaptation manager accepted the observation.
@@ -100,6 +132,17 @@ public:
         std::uint64_t start_monotonic_ns,
         std::uint64_t deadline_duration_us) noexcept;
 
+    /**
+     * Arm attempts and their observation-only deadline transactionally. This
+     * is the production entry point. Failure cancels and retires the exact
+     * attempt without affecting consensus progress.
+     */
+    bool arm_with_deadline(
+        const ProposalKey &proposal,
+        const ProposalTreeSnapshot &tree,
+        std::uint64_t start_monotonic_ns,
+        std::uint64_t deadline_duration_us) noexcept;
+
     bool record_verified_response(
         const ProposalKey &proposal,
         ReplicaID authenticated_sender,
@@ -112,7 +155,25 @@ public:
         const std::set<ReplicaID> &exact_missing_direct_children,
         std::uint64_t timeout_monotonic_ns) noexcept;
 
+    /**
+     * Mark an authoritative-commit cleanup without discarding its already
+     * armed observations. A fired deadline remains an ordering fence until
+     * this close and every retained evidence fact is accepted. A fully
+     * answered pre-deadline attempt may still cancel and retire immediately.
+     */
+    bool close_consensus_context(const ProposalKey &proposal) noexcept;
+    bool should_defer_commit_report(
+        const ProposalKey &proposal) const noexcept;
+
     std::size_t retire(const ProposalKey &proposal) noexcept;
+    void shutdown() noexcept;
+
+    /** The scheduler must defer both callbacks and return a cancellation. */
+    void bind_deadline_scheduler(EvidenceDeadlineScheduler scheduler);
+    void unbind_deadline_scheduler() noexcept;
+    void bind_deadline_result_callback(
+        EvidenceDeadlineResultCallback callback);
+    void unbind_deadline_result_callback() noexcept;
 
     /**
      * Bind a one-shot event-loop scheduler for retrying temporary transport
@@ -129,6 +190,36 @@ public:
     AdaptiveV2ResponseEvidenceDiagnostics diagnostics() const noexcept;
 
 private:
+    bool schedule_deadline(
+        const ProposalKey &proposal,
+        std::uint64_t deadline_duration_us) noexcept;
+    void dispatch_deadline(
+        const ProposalKey &proposal,
+        std::uint64_t generation,
+        std::uint64_t timeout_monotonic_ns) noexcept;
+    void fail_deadline(
+        const ProposalKey &proposal,
+        std::uint64_t generation) noexcept;
+    std::size_t record_timeouts_impl(
+        const ProposalKey &proposal,
+        const std::set<ReplicaID> &exact_missing_direct_children,
+        std::uint64_t timeout_monotonic_ns,
+        bool produced_by_deadline) noexcept;
+    void acknowledge_accepted_evidence(
+        const ProposalKey &proposal) noexcept;
+    void mark_deadline_delivery_failed(
+        const ProposalKey &proposal) noexcept;
+    void mark_all_deadline_deliveries_failed() noexcept;
+    void finalize_ready_deadlines() noexcept;
+    void complete_deadline(
+        const ProposalKey &proposal,
+        std::uint64_t generation) noexcept;
+    void fail_deadline_delivery(
+        const ProposalKey &proposal,
+        std::uint64_t generation) noexcept;
+    void notify_deadline_result(
+        const ProposalKey &proposal,
+        EvidenceDeadlineResult result) noexcept;
     void schedule_retry() noexcept;
     void cancel_retry() noexcept;
     void run_scheduled_retry() noexcept;

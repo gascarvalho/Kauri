@@ -1335,6 +1335,25 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "tiered responsive-degraded cohort query is diagnostic-only",
+    "[adaptive-v2][experiment][byzantine][tiered][cohort-query]")
+{
+    ExperimentByzantineAdapter tiered(
+        tiered_omission_options(0));
+    CHECK(tiered.is_tiered_responsive_degraded_actor(2));
+    CHECK_FALSE(tiered.is_tiered_responsive_degraded_actor(1));
+    CHECK_FALSE(tiered.is_tiered_responsive_degraded_actor(3));
+
+    ExperimentByzantineAdapter persistent(
+        persistent_omission_options(1));
+    CHECK_FALSE(
+        persistent.is_tiered_responsive_degraded_actor(2));
+
+    ExperimentByzantineAdapter disabled;
+    CHECK_FALSE(disabled.is_tiered_responsive_degraded_actor(2));
+}
+
+TEST_CASE(
     "tiered omission validates disjoint cohorts period and total fault bound",
     "[adaptive-v2][experiment][byzantine][tiered][validation]")
 {

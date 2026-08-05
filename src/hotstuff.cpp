@@ -3153,7 +3153,8 @@ namespace hotstuff
 
     void HotStuffBase::purge_pending_exact_contributions(
         const ProposalKey &key,
-        bool preserve_scheduled_vote_fallback)
+        bool preserve_scheduled_vote_fallback,
+        bool preserve_response_evidence_until_deadline)
     {
         if (experiment_post_qc_audit != nullptr)
         {
@@ -3174,16 +3175,37 @@ namespace hotstuff
         static_cast<void>(pending_exact_contributions.purge(key));
         if (adaptive_v2_response_evidence != nullptr)
         {
+            const bool durable_response_commit =
+                has_durable_adaptive_v2_commit_report(key);
+            const auto false_report =
+                experiment_false_timeout_states.find(key);
+            const bool durable_false_report_commit =
+                false_report != experiment_false_timeout_states.end() &&
+                false_report->second.commit_deferred;
             const bool retain_experiment_evidence =
+                (preserve_response_evidence_until_deadline ||
+                 durable_false_report_commit) &&
                 experiment_byzantine_adapter != nullptr &&
                 experiment_byzantine_adapter
                     ->should_retain_response_evidence(
                         ExperimentByzantineContext{
                             key,
                             experiment_diagnostic_window});
+            // The false-report experiment owns its sole exact deadline and
+            // releases the deliberately deferred commit marker after it
+            // persists that observation. No normal deadline is armed for
+            // this exact proposal.
             if (!retain_experiment_evidence)
-                static_cast<void>(
-                    adaptive_v2_response_evidence->retire(key));
+            {
+                if (preserve_response_evidence_until_deadline ||
+                    durable_response_commit)
+                    static_cast<void>(
+                        adaptive_v2_response_evidence
+                            ->close_consensus_context(key));
+                else
+                    static_cast<void>(
+                        adaptive_v2_response_evidence->retire(key));
+            }
         }
     }
 
@@ -6298,6 +6320,7 @@ namespace hotstuff
 
     void HotStuffBase::start_latency_deadline(const ProposalKey &key)
     {
+        bool normal_evidence_armed = false;
         const auto lease = proposal_contexts->acquire_open_context(key);
         if (!lease.has_value())
             return;
@@ -6317,40 +6340,253 @@ namespace hotstuff
             const auto duration = aggregation_timeout_policy.timeout_for(
                 static_cast<std::uint32_t>(tree->get_level(get_id())),
                 static_cast<std::uint32_t>(tree->get_max_level()));
-            const auto evidence_armed =
-                adaptive_v2_response_evidence->arm(
-                key,
-                lease->tree(),
-                adaptive_evidence_monotonic_now_ns(),
-                adaptive_deadline_duration_us(duration));
-            if (!evidence_armed ||
-                experiment_byzantine_adapter == nullptr)
-                return;
-            for (const auto child : lease->tree().direct_children)
+            std::optional<ReplicaID> false_report_target;
+            if (experiment_byzantine_adapter != nullptr)
             {
-                const ExperimentByzantineContext context{
-                    key,
-                    experiment_diagnostic_window};
-                if (!experiment_byzantine_adapter->arm_false_report(
-                        context, child))
-                    continue;
+                for (const auto child : lease->tree().direct_children)
+                {
+                    const ExperimentByzantineContext context{
+                        key,
+                        experiment_diagnostic_window};
+                    if (experiment_byzantine_adapter->arm_false_report(
+                            context, child))
+                    {
+                        false_report_target = child;
+                        break;
+                    }
+                }
+            }
+
+            const auto start_ns =
+                adaptive_evidence_monotonic_now_ns();
+            const auto deadline_us =
+                adaptive_deadline_duration_us(duration);
+            const auto armed_deadlines_before =
+                false_report_target.has_value()
+                    ? std::uint64_t{0}
+                    : adaptive_v2_response_evidence->diagnostics()
+                          .armed_deadlines;
+            const bool evidence_armed =
+                false_report_target.has_value()
+                    ? adaptive_v2_response_evidence->arm(
+                          key,
+                          lease->tree(),
+                          start_ns,
+                          deadline_us)
+                    : adaptive_v2_response_evidence
+                          ->arm_with_deadline(
+                              key,
+                              lease->tree(),
+                              start_ns,
+                              deadline_us);
+            normal_evidence_armed =
+                evidence_armed && !false_report_target.has_value();
+            if (!evidence_armed)
+            {
+                const auto diagnostics =
+                    adaptive_v2_response_evidence->diagnostics();
+                HOTSTUFF_LOG_WARN(
+                    "[EVIDENCE] Observation deadline arm failed "
+                    "epoch=%u tree=%u block=%.10s "
+                    "schedule_failures=%llu callback_failures=%llu "
+                    "healthy=%u",
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id,
+                    key.block_hash.to_hex().c_str(),
+                    static_cast<unsigned long long>(
+                        diagnostics.deadline_schedule_failures),
+                    static_cast<unsigned long long>(
+                        diagnostics.deadline_callback_failures),
+                    diagnostics.healthy ? 1U : 0U);
+                if (false_report_target.has_value())
+                {
+                    static_cast<void>(
+                        experiment_byzantine_adapter
+                            ->cancel_false_report(
+                                ExperimentByzantineContext{
+                                    key,
+                                    experiment_diagnostic_window},
+                                *false_report_target));
+                    static_cast<void>(
+                        adaptive_v2_response_evidence->retire(key));
+                    suppress_adaptive_v2_lifecycle_reporting(
+                        "false_report_evidence_arm_failed");
+                }
+                return;
+            }
+            if (false_report_target.has_value())
+            {
                 HOTSTUFF_LOG_INFO(
                     "KAURI_FAULT false_report_armed reporter=%u "
                     "target=%u epoch=%u tree=%u block=%s window=%s",
                     get_id(),
-                    child,
+                    *false_report_target,
                     key.configuration.epoch_number,
                     key.configuration.tree_id,
                     key.block_hash.to_hex().c_str(),
                     experiment_diagnostic_window.c_str());
                 schedule_experiment_false_timeout(
-                    key, child, duration);
-                break;
+                    key, *false_report_target, duration);
+            }
+            else
+            {
+                const bool tiered_marker_required =
+                    experiment_byzantine_adapter != nullptr &&
+                    std::any_of(
+                        lease->tree().direct_children.begin(),
+                        lease->tree().direct_children.end(),
+                        [this, &lease](ReplicaID child) {
+                            const auto required =
+                                lease->tree()
+                                    .required_child_subtrees.find(child);
+                            return required !=
+                                       lease->tree()
+                                           .required_child_subtrees.end() &&
+                                   !required->second.empty() &&
+                                   experiment_byzantine_adapter
+                                       ->is_tiered_responsive_degraded_actor(
+                                           child);
+                        });
+                if (!tiered_marker_required)
+                    return;
+                const auto armed_deadlines_after =
+                    adaptive_v2_response_evidence->diagnostics()
+                        .armed_deadlines;
+                if (armed_deadlines_after == armed_deadlines_before)
+                {
+                    // A matching live arm is idempotent. It creates no new
+                    // deadline and therefore must not claim a second raw arm.
+                    HOTSTUFF_LOG_WARN(
+                        "KAURI_EVIDENCE response_attempt_arm_duplicate "
+                        "reporter=%u epoch=%u tree=%u epoch_digest=%s "
+                        "block=%s",
+                        get_id(),
+                        key.configuration.epoch_number,
+                        key.configuration.tree_id,
+                        key.configuration.epoch_digest.to_hex().c_str(),
+                        key.block_hash.to_hex().c_str());
+                    return;
+                }
+
+                constexpr std::uint64_t nanoseconds_per_microsecond =
+                    1000;
+                const auto maximum =
+                    std::numeric_limits<std::uint64_t>::max();
+                const bool invalid_deadline_counter =
+                    armed_deadlines_before == maximum ||
+                    armed_deadlines_after != armed_deadlines_before + 1;
+                const bool duration_overflow =
+                    deadline_us >
+                    maximum / nanoseconds_per_microsecond;
+                const auto deadline_duration_ns = duration_overflow
+                    ? std::uint64_t{0}
+                    : deadline_us * nanoseconds_per_microsecond;
+                const bool absolute_deadline_overflow =
+                    duration_overflow || start_ns == 0 ||
+                    start_ns > maximum - deadline_duration_ns;
+                if (invalid_deadline_counter ||
+                    absolute_deadline_overflow)
+                {
+                    HOTSTUFF_LOG_WARN(
+                        "KAURI_EVIDENCE "
+                        "response_attempt_arm_marker_failed "
+                        "reason=%s reporter=%u epoch=%u tree=%u "
+                        "start_monotonic_ns=%llu "
+                        "deadline_duration_us=%llu",
+                        invalid_deadline_counter
+                            ? "deadline_counter"
+                            : "deadline_overflow",
+                        get_id(),
+                        key.configuration.epoch_number,
+                        key.configuration.tree_id,
+                        static_cast<unsigned long long>(start_ns),
+                        static_cast<unsigned long long>(deadline_us));
+                    static_cast<void>(
+                        adaptive_v2_response_evidence->retire(key));
+                    suppress_adaptive_v2_lifecycle_reporting(
+                        "response_attempt_arm_marker_failed");
+                    return;
+                }
+                const auto absolute_deadline_ns =
+                    start_ns + deadline_duration_ns;
+                for (const auto child :
+                     lease->tree().direct_children)
+                {
+                    if (!experiment_byzantine_adapter
+                             ->is_tiered_responsive_degraded_actor(child))
+                        continue;
+                    const auto required =
+                        lease->tree().required_child_subtrees.find(child);
+                    if (required ==
+                            lease->tree().required_child_subtrees.end() ||
+                        required->second.empty())
+                        continue;
+                    const auto subtree =
+                        lease->tree().child_subtrees.find(child);
+                    if (subtree ==
+                            lease->tree().child_subtrees.end() ||
+                        subtree->second.empty())
+                    {
+                        HOTSTUFF_LOG_WARN(
+                            "KAURI_EVIDENCE "
+                            "response_attempt_arm_marker_failed "
+                            "reason=topology reporter=%u child=%u "
+                            "epoch=%u tree=%u",
+                            get_id(),
+                            child,
+                            key.configuration.epoch_number,
+                            key.configuration.tree_id);
+                        static_cast<void>(
+                            adaptive_v2_response_evidence->retire(key));
+                        suppress_adaptive_v2_lifecycle_reporting(
+                            "response_attempt_arm_marker_failed");
+                        return;
+                    }
+                    const char *expected_message_type =
+                        subtree->second.size() > 1
+                            ? "aggregate_relay"
+                            : "direct_vote";
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_EVIDENCE response_attempt_armed "
+                        "reporter=%u child=%u epoch=%u tree=%u "
+                        "epoch_digest=%s block=%s "
+                        "expected_message_type=%s "
+                        "start_monotonic_ns=%llu "
+                        "deadline_duration_us=%llu "
+                        "absolute_deadline_ns=%llu",
+                        get_id(),
+                        child,
+                        key.configuration.epoch_number,
+                        key.configuration.tree_id,
+                        key.configuration.epoch_digest.to_hex().c_str(),
+                        key.block_hash.to_hex().c_str(),
+                        expected_message_type,
+                        static_cast<unsigned long long>(start_ns),
+                        static_cast<unsigned long long>(deadline_us),
+                        static_cast<unsigned long long>(
+                            absolute_deadline_ns));
+                }
             }
         }
         catch (...)
         {
-            // Evidence is observational and cannot stop proposal progress.
+            // Consensus progress is independent. A successful normal arm
+            // without its raw provenance marker is unusable convergence
+            // evidence, so retire it and suppress its commit notice.
+            if (normal_evidence_armed)
+            {
+                static_cast<void>(
+                    adaptive_v2_response_evidence->retire(key));
+                suppress_adaptive_v2_lifecycle_reporting(
+                    "response_attempt_arm_marker_exception");
+                HOTSTUFF_LOG_WARN(
+                    "KAURI_EVIDENCE "
+                    "response_attempt_arm_marker_failed "
+                    "reason=exception reporter=%u epoch=%u tree=%u",
+                    get_id(),
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id);
+            }
         }
     }
 
@@ -6536,6 +6772,24 @@ namespace hotstuff
         ReplicaID target,
         const char *reason) noexcept
     {
+        const auto pending = experiment_false_timeout_states.find(key);
+        const bool deferred_commit =
+            pending != experiment_false_timeout_states.end() &&
+            pending->second.commit_deferred;
+        if (deferred_commit)
+        {
+            AdaptiveV2DurableCommitReportState suppressed;
+            suppressed.phase =
+                AdaptiveV2DurableCommitPhase::suppressed;
+            suppressed.experiment_false_report = true;
+            suppressed.experiment_false_target = target;
+            static_cast<void>(persist_adaptive_v2_commit_report(
+                key,
+                suppressed,
+                "false_report_cancel_tombstone_capacity_exceeded"));
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "false_report_deferred_commit_cancelled");
+        }
         experiment_false_timeout_states.erase(key);
         try
         {
@@ -6574,14 +6828,56 @@ namespace hotstuff
             const auto target = pending->second.target;
             const auto action = pending->second.complete(
                 evidence_queued_before_commit);
-            experiment_false_timeout_states.erase(pending);
             if (action ==
                 ExperimentFalseTimeoutCompletionAction::
                     no_deferred_commit)
+            {
+                if (!evidence_queued_before_commit)
+                {
+                    AdaptiveV2DurableCommitReportState suppressed;
+                    suppressed.phase =
+                        AdaptiveV2DurableCommitPhase::suppressed;
+                    suppressed.experiment_false_report = true;
+                    suppressed.experiment_false_target = target;
+                    suppressed.experiment_false_recorded_evidence =
+                        recorded_evidence;
+                    static_cast<void>(persist_adaptive_v2_commit_report(
+                        key,
+                        suppressed,
+                        "false_report_precommit_tombstone_capacity_exceeded"));
+                    experiment_false_timeout_states.erase(pending);
+                    HOTSTUFF_LOG_WARN(
+                        "KAURI_FAULT false_report_commit_suppressed "
+                        "reporter=%u target=%u epoch=%u tree=%u block=%s "
+                        "evidence=%zu reason=evidence_not_queued_before_commit",
+                        get_id(),
+                        target,
+                        key.configuration.epoch_number,
+                        key.configuration.tree_id,
+                        key.block_hash.to_hex().c_str(),
+                        recorded_evidence);
+                    mark_adaptive_v2_convergence_evidence_unhealthy(
+                        "false_report_precommit_evidence_not_queued");
+                    return;
+                }
+                experiment_false_timeout_states.erase(pending);
                 return;
+            }
             if (action ==
                 ExperimentFalseTimeoutCompletionAction::fail_closed)
             {
+                AdaptiveV2DurableCommitReportState suppressed;
+                suppressed.phase =
+                    AdaptiveV2DurableCommitPhase::suppressed;
+                suppressed.experiment_false_report = true;
+                suppressed.experiment_false_target = target;
+                suppressed.experiment_false_recorded_evidence =
+                    recorded_evidence;
+                static_cast<void>(persist_adaptive_v2_commit_report(
+                    key,
+                    suppressed,
+                    "false_report_tombstone_capacity_exceeded"));
+                experiment_false_timeout_states.erase(pending);
                 HOTSTUFF_LOG_WARN(
                     "KAURI_FAULT false_report_commit_suppressed reporter=%u "
                     "target=%u epoch=%u tree=%u block=%s evidence=%zu "
@@ -6596,43 +6892,40 @@ namespace hotstuff
                     "false_report_evidence_not_queued_before_commit");
                 return;
             }
-            const ProposalLifecycleFact fact = ProposalCommitted{key};
-            const auto status =
-                adaptive_v2_reporting_outbox != nullptr
-                    ? adaptive_v2_reporting_outbox->enqueue_lifecycle(fact)
-                    : AdaptiveV2ReportingEnqueueStatus::unhealthy;
-            if (status != AdaptiveV2ReportingEnqueueStatus::queued)
+            AdaptiveV2DurableCommitReportState ready;
+            ready.phase =
+                AdaptiveV2DurableCommitPhase::ready_to_enqueue;
+            ready.experiment_false_report = true;
+            ready.experiment_false_target = target;
+            ready.experiment_false_recorded_evidence = recorded_evidence;
+            if (!persist_adaptive_v2_commit_report(
+                    key,
+                    ready,
+                    "false_report_commit_state_capacity_exceeded"))
             {
+                experiment_false_timeout_states.erase(pending);
                 HOTSTUFF_LOG_WARN(
                     "KAURI_FAULT false_report_commit_suppressed reporter=%u "
                     "target=%u epoch=%u tree=%u block=%s evidence=%zu "
-                    "reason=commit_not_queued",
+                    "reason=commit_state_not_retained",
                     get_id(),
                     target,
                     key.configuration.epoch_number,
                     key.configuration.tree_id,
                     key.block_hash.to_hex().c_str(),
                     recorded_evidence);
-                mark_adaptive_v2_convergence_evidence_unhealthy(
-                    "false_report_commit_not_queued");
                 return;
             }
-            schedule_adaptive_v2_reporting_flush(
-                adaptive_v2_evidence_retry_delay);
-            HOTSTUFF_LOG_INFO(
-                "KAURI_FAULT false_report_commit_released reporter=%u "
-                "target=%u epoch=%u tree=%u block=%s evidence=%zu",
-                get_id(),
-                target,
-                key.configuration.epoch_number,
-                key.configuration.tree_id,
-                key.block_hash.to_hex().c_str(),
-                recorded_evidence);
+            experiment_false_timeout_states.erase(pending);
+            static_cast<void>(
+                try_enqueue_adaptive_v2_commit_report(key));
         }
         catch (...)
         {
             // Experiment reporting cannot affect consensus progress.
             experiment_false_timeout_states.erase(key);
+            suppress_adaptive_v2_lifecycle_reporting(
+                "false_report_commit_release_exception");
         }
     }
 
@@ -8288,6 +8581,65 @@ namespace hotstuff
             adaptive_v2_response_evidence =
                 std::make_unique<AdaptiveV2ResponseEvidenceBridge>(
                     get_id());
+            adaptive_v2_response_evidence
+                ->bind_deadline_result_callback(
+                    [access = exact_runtime_access](
+                        const ProposalKey &key,
+                        EvidenceDeadlineResult result) {
+                        auto runtime = access->acquire();
+                        if (!runtime.has_value())
+                            return;
+                        runtime->owner()
+                            .observe_adaptive_v2_response_deadline_result(
+                                key, result);
+                    });
+            adaptive_v2_response_evidence->bind_deadline_scheduler(
+                [this](
+                    const ProposalKey &,
+                    std::uint64_t deadline_duration_us,
+                    EvidenceDeadlineCallback deadline,
+                    EvidenceDeadlineFailureCallback failure) {
+                    constexpr std::uint64_t nanoseconds_per_microsecond =
+                        1000;
+                    const auto maximum_delay = static_cast<std::uint64_t>(
+                        AggregationScheduler::Duration::max().count());
+                    if (deadline_duration_us == 0 ||
+                        deadline_duration_us >
+                            maximum_delay /
+                                nanoseconds_per_microsecond)
+                        return EvidenceDeadlineCancellation{};
+                    const auto delay = AggregationScheduler::Duration(
+                        static_cast<
+                            AggregationScheduler::Duration::rep>(
+                            deadline_duration_us *
+                            nanoseconds_per_microsecond));
+                    const auto now =
+                        aggregation_scheduler->monotonic_now();
+                    if (delay <=
+                            AggregationScheduler::Duration::zero() ||
+                        now >
+                            AggregationScheduler::Duration::max() - delay)
+                        return EvidenceDeadlineCancellation{};
+                    const auto access = exact_runtime_access;
+                    return schedule_at_or_after_deadline(
+                        *aggregation_scheduler,
+                        now + delay,
+                        [access,
+                         deadline = std::move(deadline)]() mutable {
+                            auto runtime = access->acquire();
+                            if (!runtime.has_value())
+                                return;
+                            deadline(
+                                adaptive_evidence_monotonic_now_ns());
+                        },
+                        [access,
+                         failure = std::move(failure)]() mutable {
+                            auto runtime = access->acquire();
+                            if (!runtime.has_value())
+                                return;
+                            failure();
+                        });
+                });
             adaptive_v2_response_evidence->bind_retry_scheduler(
                 [this](EvidenceRetryCallback retry) {
                     const auto access = exact_runtime_access;
@@ -8441,6 +8793,8 @@ namespace hotstuff
             if (adaptive_v2_reporting_outbox->release_terminal(report_id) !=
                 AdaptiveV2ReportingReleaseStatus::released)
                 return;
+            retry_ready_adaptive_v2_runtime_initialized_reports();
+            retry_ready_adaptive_v2_commit_reports();
             enqueue_pending_adaptive_v2_commit_observation();
             enqueue_pending_adaptive_v2_activation_observation();
             schedule_adaptive_v2_reporting_flush(
@@ -8449,7 +8803,7 @@ namespace hotstuff
         else if (transition ==
                  AdaptiveV2ReportingTransitionStatus::failed)
         {
-            mark_adaptive_v2_convergence_evidence_unhealthy(
+            poison_adaptive_v2_reporting(
                 "convergence_observation_permanently_rejected");
         }
     }
@@ -8510,8 +8864,32 @@ namespace hotstuff
         const EvidenceReportEnvelope &report) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            adaptive_v2_reporting_outbox == nullptr)
+            adaptive_v2_reporting_outbox == nullptr ||
+            adaptive_v2_lifecycle_reporting_suppressed)
             return EvidenceTransportResult::permanent_failure;
+
+        const ProposalKey key{
+            report.observation.configuration,
+            report.observation.block_hash};
+        const auto initialized =
+            adaptive_v2_durable_initialization_reports.find(key);
+        if (initialized ==
+                adaptive_v2_durable_initialization_reports.end() ||
+            initialized->second ==
+                AdaptiveV2DurableInitializationPhase::suppressed)
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "evidence_without_runtime_initialization");
+            return EvidenceTransportResult::permanent_failure;
+        }
+        if (initialized->second ==
+                AdaptiveV2DurableInitializationPhase::ready_to_enqueue &&
+            !try_enqueue_adaptive_v2_runtime_initialized_report(key))
+        {
+            return adaptive_v2_lifecycle_reporting_suppressed
+                       ? EvidenceTransportResult::permanent_failure
+                       : EvidenceTransportResult::temporary_failure;
+        }
 
         const auto status =
             adaptive_v2_reporting_outbox->enqueue_evidence(
@@ -8525,6 +8903,8 @@ namespace hotstuff
         if (status ==
             AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
             return EvidenceTransportResult::temporary_failure;
+        suppress_adaptive_v2_lifecycle_reporting(
+            "evidence_enqueue_failed");
         return EvidenceTransportResult::permanent_failure;
     }
 
@@ -8564,44 +8944,154 @@ namespace hotstuff
         const ProposalKey &key) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            adaptive_v2_reporting_outbox == nullptr)
+            adaptive_v2_reporting_outbox == nullptr ||
+            adaptive_v2_lifecycle_reporting_suppressed)
             return;
         try
         {
-            if (adaptive_v2_initialized_lifecycle_reports.size() >=
-                maximum_proposal_view_generation_observations)
-                return;
-            const auto inserted =
-                adaptive_v2_initialized_lifecycle_reports.insert(key);
-            if (!inserted.second)
-                return;
-            const ProposalLifecycleFact fact =
-                NormalProposalRuntimeInitialized{key};
-            if (adaptive_v2_reporting_outbox->enqueue_lifecycle(fact) !=
-                AdaptiveV2ReportingEnqueueStatus::queued)
+            const auto existing =
+                adaptive_v2_durable_initialization_reports.find(key);
+            if (existing !=
+                adaptive_v2_durable_initialization_reports.end())
             {
-                adaptive_v2_initialized_lifecycle_reports.erase(
-                    inserted.first);
+                if (existing->second ==
+                    AdaptiveV2DurableInitializationPhase::ready_to_enqueue)
+                    static_cast<void>(
+                        try_enqueue_adaptive_v2_runtime_initialized_report(
+                            key));
                 return;
             }
-            schedule_adaptive_v2_reporting_flush(
-                adaptive_v2_evidence_retry_delay);
+            if (adaptive_v2_durable_initialization_reports.size() >=
+                maximum_proposal_view_generation_observations)
+            {
+                suppress_adaptive_v2_lifecycle_reporting(
+                    "runtime_initialization_capacity_exceeded");
+                return;
+            }
+            const auto inserted =
+                adaptive_v2_durable_initialization_reports.emplace(
+                    key,
+                    AdaptiveV2DurableInitializationPhase::
+                        ready_to_enqueue);
+            if (!inserted.second)
+                return;
+            static_cast<void>(
+                try_enqueue_adaptive_v2_runtime_initialized_report(key));
         }
         catch (...)
         {
-            // Lifecycle reporting is observational and fail-closed locally.
+            suppress_adaptive_v2_lifecycle_reporting(
+                "runtime_initialization_exception");
+        }
+    }
+
+    bool HotStuffBase::
+    try_enqueue_adaptive_v2_runtime_initialized_report(
+        const ProposalKey &key) noexcept
+    {
+        try
+        {
+            const auto initialized =
+                adaptive_v2_durable_initialization_reports.find(key);
+            if (initialized ==
+                adaptive_v2_durable_initialization_reports.end())
+                return false;
+            if (initialized->second ==
+                AdaptiveV2DurableInitializationPhase::queued)
+                return true;
+            if (initialized->second !=
+                    AdaptiveV2DurableInitializationPhase::
+                        ready_to_enqueue ||
+                adaptive_v2_reporting_outbox == nullptr ||
+                adaptive_v2_lifecycle_reporting_suppressed)
+                return false;
+
+            const ProposalLifecycleFact fact =
+                NormalProposalRuntimeInitialized{key};
+            const auto status =
+                adaptive_v2_reporting_outbox->enqueue_lifecycle(fact);
+            if (status == AdaptiveV2ReportingEnqueueStatus::queued)
+            {
+                initialized->second =
+                    AdaptiveV2DurableInitializationPhase::queued;
+                schedule_adaptive_v2_reporting_flush(
+                    adaptive_v2_evidence_retry_delay);
+                return true;
+            }
+            if (status ==
+                AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
+            {
+                schedule_adaptive_v2_reporting_flush(
+                    adaptive_v2_evidence_retry_delay);
+                return false;
+            }
+            suppress_adaptive_v2_lifecycle_reporting(
+                "runtime_initialization_enqueue_failed");
+            return false;
+        }
+        catch (...)
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "runtime_initialization_enqueue_exception");
+            return false;
+        }
+    }
+
+    void HotStuffBase::
+    retry_ready_adaptive_v2_runtime_initialized_reports() noexcept
+    {
+        while (!adaptive_v2_lifecycle_reporting_suppressed)
+        {
+            auto ready =
+                adaptive_v2_durable_initialization_reports.end();
+            for (auto entry =
+                     adaptive_v2_durable_initialization_reports.begin();
+                 entry !=
+                     adaptive_v2_durable_initialization_reports.end();
+                 ++entry)
+            {
+                if (entry->second ==
+                    AdaptiveV2DurableInitializationPhase::ready_to_enqueue)
+                {
+                    ready = entry;
+                    break;
+                }
+            }
+            if (ready ==
+                adaptive_v2_durable_initialization_reports.end())
+                return;
+            const auto key = ready->first;
+            if (!try_enqueue_adaptive_v2_runtime_initialized_report(key))
+                return;
         }
     }
 
     void HotStuffBase::report_adaptive_v2_committed(
         const std::optional<ProposalKey> &key) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            adaptive_v2_reporting_outbox == nullptr ||
-            !key.has_value())
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
+        const bool exact_authoritative_identity =
+            key.has_value() && pending_adaptive_v2_commit.has_value() &&
+            pending_adaptive_v2_commit->block_hash == key->block_hash &&
+            pending_adaptive_v2_commit->committed_key.has_value() &&
+            *pending_adaptive_v2_commit->committed_key == *key;
+        if (!exact_authoritative_identity)
+        {
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "authoritative_commit_identity_missing_or_mismatched");
+            return;
+        }
+        if (adaptive_v2_reporting_outbox == nullptr)
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "authoritative_commit_outbox_missing");
+            return;
+        }
         try
         {
+            if (adaptive_v2_lifecycle_reporting_suppressed)
+                return;
             const auto pending =
                 experiment_false_timeout_states.find(*key);
             if (pending != experiment_false_timeout_states.end())
@@ -8632,16 +9122,326 @@ namespace hotstuff
                     return;
                 }
             }
-            const ProposalLifecycleFact fact = ProposalCommitted{*key};
-            if (adaptive_v2_reporting_outbox->enqueue_lifecycle(fact) ==
-                AdaptiveV2ReportingEnqueueStatus::queued)
-                schedule_adaptive_v2_reporting_flush(
-                    adaptive_v2_evidence_retry_delay);
+            const auto durable =
+                adaptive_v2_durable_commit_reports.find(*key);
+            if (durable != adaptive_v2_durable_commit_reports.end())
+            {
+                if (durable->second.phase ==
+                    AdaptiveV2DurableCommitPhase::ready_to_enqueue)
+                    static_cast<void>(
+                        try_enqueue_adaptive_v2_commit_report(*key));
+                return;
+            }
+            const bool defer_for_response_evidence =
+                adaptive_v2_response_evidence != nullptr &&
+                adaptive_v2_response_evidence
+                    ->should_defer_commit_report(*key);
+            AdaptiveV2DurableCommitReportState state;
+            state.phase = defer_for_response_evidence
+                ? AdaptiveV2DurableCommitPhase::awaiting_evidence
+                : AdaptiveV2DurableCommitPhase::ready_to_enqueue;
+            if (!persist_adaptive_v2_commit_report(
+                    *key,
+                    state,
+                    "response_commit_state_capacity_exceeded"))
+            {
+                if (defer_for_response_evidence &&
+                    adaptive_v2_response_evidence != nullptr)
+                    static_cast<void>(
+                        adaptive_v2_response_evidence->retire(*key));
+                return;
+            }
+            if (defer_for_response_evidence)
+            {
+                HOTSTUFF_LOG_INFO(
+                    "[EVIDENCE] Commit notice deferred until response "
+                    "deadline epoch=%u tree=%u block=%.10s",
+                    key->configuration.epoch_number,
+                    key->configuration.tree_id,
+                    key->block_hash.to_hex().c_str());
+                return;
+            }
+            static_cast<void>(
+                try_enqueue_adaptive_v2_commit_report(*key));
         }
         catch (...)
         {
-            // Lifecycle reporting is observational and fail-closed locally.
+            suppress_adaptive_v2_lifecycle_reporting(
+                "response_commit_reporting_exception");
         }
+    }
+
+    void HotStuffBase::observe_adaptive_v2_response_deadline_result(
+        const ProposalKey &key,
+        EvidenceDeadlineResult result) noexcept
+    {
+        try
+        {
+            auto durable =
+                adaptive_v2_durable_commit_reports.find(key);
+            if (result == EvidenceDeadlineResult::evidence_accepted)
+            {
+                if (durable ==
+                        adaptive_v2_durable_commit_reports.end() ||
+                    durable->second.phase ==
+                        AdaptiveV2DurableCommitPhase::suppressed)
+                    return;
+                durable->second.phase =
+                    AdaptiveV2DurableCommitPhase::ready_to_enqueue;
+                static_cast<void>(
+                    try_enqueue_adaptive_v2_commit_report(key));
+                return;
+            }
+
+            if (durable != adaptive_v2_durable_commit_reports.end())
+                durable->second.phase =
+                    AdaptiveV2DurableCommitPhase::suppressed;
+            else
+            {
+                AdaptiveV2DurableCommitReportState suppressed;
+                suppressed.phase =
+                    AdaptiveV2DurableCommitPhase::suppressed;
+                static_cast<void>(persist_adaptive_v2_commit_report(
+                    key,
+                    suppressed,
+                    "response_deadline_tombstone_capacity_exceeded"));
+            }
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "response_deadline_evidence_failed");
+        }
+        catch (...)
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "response_deadline_result_exception");
+        }
+    }
+
+    bool HotStuffBase::persist_adaptive_v2_commit_report(
+        const ProposalKey &key,
+        AdaptiveV2DurableCommitReportState state,
+        const char *failure_reason) noexcept
+    {
+        if (adaptive_v2_lifecycle_reporting_suppressed)
+            return false;
+        try
+        {
+            if (adaptive_v2_durable_commit_reports.find(key) !=
+                adaptive_v2_durable_commit_reports.end())
+                return true;
+            if (adaptive_v2_durable_commit_reports.size() >=
+                maximum_proposal_view_generation_observations)
+            {
+                suppress_adaptive_v2_lifecycle_reporting(failure_reason);
+                return false;
+            }
+            const auto inserted =
+                adaptive_v2_durable_commit_reports.emplace(
+                    key, std::move(state));
+            if (!inserted.second)
+            {
+                suppress_adaptive_v2_lifecycle_reporting(failure_reason);
+                return false;
+            }
+            return true;
+        }
+        catch (...)
+        {
+            suppress_adaptive_v2_lifecycle_reporting(failure_reason);
+            return false;
+        }
+    }
+
+    bool HotStuffBase::try_enqueue_adaptive_v2_commit_report(
+        const ProposalKey &key) noexcept
+    {
+        try
+        {
+            const auto durable =
+                adaptive_v2_durable_commit_reports.find(key);
+            if (durable == adaptive_v2_durable_commit_reports.end())
+                return true;
+            if (durable->second.phase !=
+                    AdaptiveV2DurableCommitPhase::ready_to_enqueue ||
+                adaptive_v2_lifecycle_reporting_suppressed)
+                return false;
+            if (adaptive_v2_reporting_outbox == nullptr)
+            {
+                suppress_adaptive_v2_lifecycle_reporting(
+                    "commit_outbox_unavailable");
+                return false;
+            }
+            const auto initialized =
+                adaptive_v2_durable_initialization_reports.find(key);
+            if (initialized ==
+                    adaptive_v2_durable_initialization_reports.end() ||
+                initialized->second ==
+                    AdaptiveV2DurableInitializationPhase::suppressed)
+            {
+                suppress_adaptive_v2_lifecycle_reporting(
+                    "commit_without_runtime_initialization");
+                return false;
+            }
+            if (initialized->second ==
+                    AdaptiveV2DurableInitializationPhase::
+                        ready_to_enqueue &&
+                !try_enqueue_adaptive_v2_runtime_initialized_report(key))
+                return false;
+
+            const ProposalLifecycleFact fact = ProposalCommitted{key};
+            const auto status =
+                adaptive_v2_reporting_outbox->enqueue_lifecycle(fact);
+            if (status == AdaptiveV2ReportingEnqueueStatus::queued)
+            {
+                if (durable->second.experiment_false_report)
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_FAULT false_report_commit_released "
+                        "reporter=%u target=%u epoch=%u tree=%u block=%s "
+                        "evidence=%zu",
+                        get_id(),
+                        durable->second.experiment_false_target,
+                        key.configuration.epoch_number,
+                        key.configuration.tree_id,
+                        key.block_hash.to_hex().c_str(),
+                        durable->second
+                            .experiment_false_recorded_evidence);
+                adaptive_v2_durable_commit_reports.erase(durable);
+                adaptive_v2_durable_initialization_reports.erase(key);
+                schedule_adaptive_v2_reporting_flush(
+                    adaptive_v2_evidence_retry_delay);
+                return true;
+            }
+            if (status ==
+                AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
+            {
+                schedule_adaptive_v2_reporting_flush(
+                    adaptive_v2_evidence_retry_delay);
+                return false;
+            }
+
+            if (durable->second.experiment_false_report)
+                HOTSTUFF_LOG_WARN(
+                    "KAURI_FAULT false_report_commit_suppressed "
+                    "reporter=%u target=%u epoch=%u tree=%u block=%s "
+                    "evidence=%zu reason=commit_not_queued",
+                    get_id(),
+                    durable->second.experiment_false_target,
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id,
+                    key.block_hash.to_hex().c_str(),
+                    durable->second.experiment_false_recorded_evidence);
+            suppress_adaptive_v2_lifecycle_reporting(
+                "commit_enqueue_failed");
+            return false;
+        }
+        catch (...)
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "commit_enqueue_exception");
+            return false;
+        }
+    }
+
+    void HotStuffBase::
+    retry_ready_adaptive_v2_commit_reports() noexcept
+    {
+        while (!adaptive_v2_lifecycle_reporting_suppressed)
+        {
+            auto ready =
+                adaptive_v2_durable_commit_reports.end();
+            for (auto entry =
+                     adaptive_v2_durable_commit_reports.begin();
+                 entry != adaptive_v2_durable_commit_reports.end();
+                 ++entry)
+                if (entry->second.phase ==
+                    AdaptiveV2DurableCommitPhase::ready_to_enqueue)
+                {
+                    ready = entry;
+                    break;
+                }
+            if (ready == adaptive_v2_durable_commit_reports.end())
+                return;
+            const auto key = ready->first;
+            if (!try_enqueue_adaptive_v2_commit_report(key))
+                return;
+        }
+    }
+
+    bool HotStuffBase::has_durable_adaptive_v2_commit_report(
+        const ProposalKey &key) const noexcept
+    {
+        try
+        {
+            const auto found =
+                adaptive_v2_durable_commit_reports.find(key);
+            return found != adaptive_v2_durable_commit_reports.end() &&
+                   found->second.phase !=
+                       AdaptiveV2DurableCommitPhase::suppressed;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool HotStuffBase::has_pending_adaptive_v2_lifecycle_fence()
+        const noexcept
+    {
+        try
+        {
+            const bool pending_initialization = std::any_of(
+                adaptive_v2_durable_initialization_reports.begin(),
+                adaptive_v2_durable_initialization_reports.end(),
+                [](const auto &entry) {
+                    return entry.second ==
+                        AdaptiveV2DurableInitializationPhase::
+                            ready_to_enqueue;
+                });
+            const bool pending_commit = std::any_of(
+                adaptive_v2_durable_commit_reports.begin(),
+                adaptive_v2_durable_commit_reports.end(),
+                [](const auto &entry) {
+                    return entry.second.phase !=
+                        AdaptiveV2DurableCommitPhase::suppressed;
+                });
+            const bool pending_false_report = std::any_of(
+                experiment_false_timeout_states.begin(),
+                experiment_false_timeout_states.end(),
+                [](const auto &entry) {
+                    return entry.second.commit_deferred;
+                });
+            return pending_initialization || pending_commit ||
+                   pending_false_report;
+        }
+        catch (...)
+        {
+            return true;
+        }
+    }
+
+    void HotStuffBase::suppress_adaptive_v2_lifecycle_reporting(
+        const char *reason) noexcept
+    {
+        adaptive_v2_lifecycle_reporting_suppressed = true;
+        for (auto &entry : adaptive_v2_durable_initialization_reports)
+        {
+            if (entry.second !=
+                AdaptiveV2DurableInitializationPhase::queued)
+                entry.second =
+                    AdaptiveV2DurableInitializationPhase::suppressed;
+        }
+        for (auto &entry : adaptive_v2_durable_commit_reports)
+            entry.second.phase =
+                AdaptiveV2DurableCommitPhase::suppressed;
+        mark_adaptive_v2_convergence_evidence_unhealthy(reason);
+    }
+
+    void HotStuffBase::poison_adaptive_v2_reporting(
+        const char *reason) noexcept
+    {
+        suppress_adaptive_v2_lifecycle_reporting(reason);
+        if (adaptive_v2_reporting_outbox != nullptr)
+            adaptive_v2_reporting_outbox->shutdown();
+        cancel_adaptive_v2_reporting_flush();
     }
 
     AdaptiveV2ReportingDeliveryResult
@@ -8790,6 +9590,8 @@ namespace hotstuff
             !authorize_manager_peer(*epoch_manager_peer))
             return;
 
+        retry_ready_adaptive_v2_runtime_initialized_reports();
+        retry_ready_adaptive_v2_commit_reports();
         enqueue_pending_adaptive_v2_commit_observation();
         enqueue_pending_adaptive_v2_activation_observation();
 
@@ -8799,13 +9601,18 @@ namespace hotstuff
             const auto attempt =
                 adaptive_v2_reporting_outbox->begin_delivery(now);
             if (attempt.status ==
-                AdaptiveV2ReportingAttemptStatus::empty ||
+                AdaptiveV2ReportingAttemptStatus::unhealthy)
+            {
+                poison_adaptive_v2_reporting(
+                    "shared_outbox_unhealthy");
+                return;
+            }
+            if (attempt.status ==
+                    AdaptiveV2ReportingAttemptStatus::empty ||
                 attempt.status ==
                     AdaptiveV2ReportingAttemptStatus::already_in_flight ||
                 attempt.status ==
-                    AdaptiveV2ReportingAttemptStatus::stopped ||
-                attempt.status ==
-                    AdaptiveV2ReportingAttemptStatus::unhealthy)
+                    AdaptiveV2ReportingAttemptStatus::stopped)
                 return;
 
             if (attempt.status ==
@@ -8830,11 +9637,27 @@ namespace hotstuff
             if (attempt.status ==
                 AdaptiveV2ReportingAttemptStatus::terminal)
             {
-                if (attempt.report == nullptr ||
-                    adaptive_v2_reporting_outbox->release_terminal(
-                        attempt.report->report_id) !=
-                        AdaptiveV2ReportingReleaseStatus::released)
+                if (attempt.report == nullptr)
+                {
+                    poison_adaptive_v2_reporting(
+                        "shared_outbox_terminal_report_missing");
                     return;
+                }
+                const auto terminal_state =
+                    attempt.report->delivery_state;
+                if (terminal_state ==
+                    AdaptiveV2ReportingDeliveryState::failed)
+                {
+                    poison_adaptive_v2_reporting(
+                        "shared_outbox_terminal_report");
+                    return;
+                }
+                if (adaptive_v2_reporting_outbox->release_terminal(
+                        attempt.report->report_id) !=
+                    AdaptiveV2ReportingReleaseStatus::released)
+                    return;
+                retry_ready_adaptive_v2_runtime_initialized_reports();
+                retry_ready_adaptive_v2_commit_reports();
                 enqueue_pending_adaptive_v2_commit_observation();
                 enqueue_pending_adaptive_v2_activation_observation();
                 continue;
@@ -8858,6 +9681,8 @@ namespace hotstuff
                         report_id) !=
                     AdaptiveV2ReportingReleaseStatus::released)
                     return;
+                retry_ready_adaptive_v2_runtime_initialized_reports();
+                retry_ready_adaptive_v2_commit_reports();
                 enqueue_pending_adaptive_v2_commit_observation();
                 enqueue_pending_adaptive_v2_activation_observation();
                 continue;
@@ -8884,9 +9709,11 @@ namespace hotstuff
             }
             if (transition ==
                 AdaptiveV2ReportingTransitionStatus::failed)
-                static_cast<void>(
-                    adaptive_v2_reporting_outbox->release_terminal(
-                        report_id));
+            {
+                poison_adaptive_v2_reporting(
+                    "shared_outbox_delivery_failed");
+                return;
+            }
             return;
         }
     }
@@ -8911,7 +9738,8 @@ namespace hotstuff
         if (!adaptive_v2_convergence_evidence_healthy ||
             adaptive_v2_commit_observation_enqueued ||
             !adaptive_v2_committed_convergence_identity.has_value() ||
-            adaptive_v2_reporting_outbox == nullptr)
+            adaptive_v2_reporting_outbox == nullptr ||
+            has_pending_adaptive_v2_lifecycle_fence())
             return;
 
         const auto status =
@@ -8942,7 +9770,8 @@ namespace hotstuff
         if (!adaptive_v2_convergence_evidence_healthy ||
             !adaptive_v2_activation_observation_pending ||
             !adaptive_v2_committed_convergence_identity.has_value() ||
-            adaptive_v2_reporting_outbox == nullptr)
+            adaptive_v2_reporting_outbox == nullptr ||
+            has_pending_adaptive_v2_lifecycle_fence())
             return;
 
         enqueue_pending_adaptive_v2_commit_observation();
@@ -10642,16 +11471,58 @@ namespace hotstuff
         }
     }
 
+    bool HotStuffBase::
+    adaptive_v2_runtime_initialization_is_referenced(
+        const ProposalKey &key) const noexcept
+    {
+        if (adaptive_v2_lifecycle_reporting_suppressed)
+            return false;
+        try
+        {
+            const auto commit =
+                adaptive_v2_durable_commit_reports.find(key);
+            if (commit != adaptive_v2_durable_commit_reports.end() &&
+                commit->second.phase !=
+                    AdaptiveV2DurableCommitPhase::suppressed)
+                return true;
+            const auto false_report =
+                experiment_false_timeout_states.find(key);
+            return false_report != experiment_false_timeout_states.end() &&
+                   false_report->second.commit_deferred;
+        }
+        catch (...)
+        {
+            // Retention is safer than erasing a lifecycle predecessor whose
+            // durable successor could not be inspected.
+            return true;
+        }
+    }
+
+    void HotStuffBase::retire_adaptive_v2_runtime_initialized_report(
+        const ProposalKey &key) noexcept
+    {
+        try
+        {
+            if (!adaptive_v2_runtime_initialization_is_referenced(key))
+                adaptive_v2_durable_initialization_reports.erase(key);
+        }
+        catch (...)
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "runtime_initialization_retirement_failed");
+        }
+    }
+
     void HotStuffBase::forget_proposal_view_generation(
         const ProposalKey &key) noexcept
     {
         try
         {
             proposal_view_generations.erase(key);
-            adaptive_v2_initialized_lifecycle_reports.erase(key);
         }
         catch (...)
         {}
+        retire_adaptive_v2_runtime_initialized_report(key);
     }
 
     void HotStuffBase::forget_proposal_view_generations_for_block(
@@ -10667,20 +11538,31 @@ namespace hotstuff
                 else
                     ++observation;
             }
+        }
+        catch (...)
+        {}
+        try
+        {
             for (auto report =
-                     adaptive_v2_initialized_lifecycle_reports.begin();
+                     adaptive_v2_durable_initialization_reports.begin();
                  report !=
-                     adaptive_v2_initialized_lifecycle_reports.end();)
+                     adaptive_v2_durable_initialization_reports.end();)
             {
-                if (report->block_hash == block_hash)
-                    report = adaptive_v2_initialized_lifecycle_reports.erase(
-                        report);
+                if (report->first.block_hash == block_hash &&
+                    !adaptive_v2_runtime_initialization_is_referenced(
+                        report->first))
+                    report =
+                        adaptive_v2_durable_initialization_reports.erase(
+                            report);
                 else
                     ++report;
             }
         }
         catch (...)
-        {}
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "runtime_initialization_block_retirement_failed");
+        }
     }
 
     void HotStuffBase::forget_proposal_view_generations_before_epoch(
@@ -10697,20 +11579,32 @@ namespace hotstuff
                 else
                     ++observation;
             }
+        }
+        catch (...)
+        {}
+        try
+        {
             for (auto report =
-                     adaptive_v2_initialized_lifecycle_reports.begin();
+                     adaptive_v2_durable_initialization_reports.begin();
                  report !=
-                     adaptive_v2_initialized_lifecycle_reports.end();)
+                     adaptive_v2_durable_initialization_reports.end();)
             {
-                if (report->configuration.epoch_number < first_live_epoch)
-                    report = adaptive_v2_initialized_lifecycle_reports.erase(
-                        report);
+                if (report->first.configuration.epoch_number <
+                        first_live_epoch &&
+                    !adaptive_v2_runtime_initialization_is_referenced(
+                        report->first))
+                    report =
+                        adaptive_v2_durable_initialization_reports.erase(
+                            report);
                 else
                     ++report;
             }
         }
         catch (...)
-        {}
+        {
+            suppress_adaptive_v2_lifecycle_reporting(
+                "runtime_initialization_epoch_retirement_failed");
+        }
     }
 
     void HotStuffBase::record_adaptive_commit_marker(
@@ -11009,7 +11903,13 @@ namespace hotstuff
         pending_exact_contributions.purge_block(blk->get_hash());
         for (const auto &key : keys)
         {
-            purge_pending_exact_contributions(key);
+            const bool preserve_authoritative_response_evidence =
+                authoritative_key.has_value() &&
+                key == *authoritative_key;
+            purge_pending_exact_contributions(
+                key,
+                false,
+                preserve_authoritative_response_evidence);
             erase_deferred_epoch_change(key);
             proposal_admission->retire_proposal(key);
             forget_proposal_view_generation(key);
@@ -11237,32 +12137,7 @@ namespace hotstuff
                             "commit_observation_outbox_missing");
                     }
                     else
-                    {
-                        const auto reporting_status =
-                            adaptive_v2_reporting_outbox
-                                ->enqueue_epoch_change_committed(
-                                    identity);
-                        if (reporting_status ==
-                            AdaptiveV2ReportingEnqueueStatus::queued)
-                        {
-                            adaptive_v2_commit_observation_enqueued =
-                                true;
-                            schedule_adaptive_v2_reporting_flush(
-                                adaptive_v2_evidence_retry_delay);
-                        }
-                        else if (reporting_status ==
-                                 AdaptiveV2ReportingEnqueueStatus::
-                                     capacity_exceeded)
-                        {
-                            schedule_adaptive_v2_reporting_flush(
-                                adaptive_v2_evidence_retry_delay);
-                        }
-                        else
-                        {
-                            mark_adaptive_v2_convergence_evidence_unhealthy(
-                                "commit_observation_enqueue_failed");
-                        }
-                    }
+                        enqueue_pending_adaptive_v2_commit_observation();
                 }
 
                 if (recoverable_missing_definition &&
@@ -11526,7 +12401,26 @@ namespace hotstuff
         adaptive_epoch_runtime.reset();
         cancel_all_exact_forwarding_retries();
         cancel_all_exact_fallbacks();
+        const bool unfinished_response_deadline = std::any_of(
+            adaptive_v2_durable_commit_reports.begin(),
+            adaptive_v2_durable_commit_reports.end(),
+            [](const auto &entry) {
+                return entry.second.phase !=
+                    AdaptiveV2DurableCommitPhase::suppressed;
+            });
+        if (unfinished_response_deadline)
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "response_deadline_cancelled_during_shutdown");
+        // ExactRuntimeAccess leases do not own HotStuffBase and cannot start
+        // destruction. The external owner closes this gate, waits for every
+        // in-flight event-loop callback, and only then mutates or destroys the
+        // bridge captured by those callbacks. Timers that wake afterward fail
+        // acquire() without touching bridge state.
         exact_runtime_access->close_and_wait();
+        if (adaptive_v2_response_evidence != nullptr)
+            adaptive_v2_response_evidence->shutdown();
+        adaptive_v2_durable_commit_reports.clear();
+        adaptive_v2_durable_initialization_reports.clear();
         deferred_epoch_definition_recoveries.clear();
         deferred_epoch_change_proposal_count = 0;
         proposal_contexts->shutdown();

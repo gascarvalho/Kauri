@@ -1168,8 +1168,37 @@ namespace hotstuff
         AggregationScheduler::Cancellation
             adaptive_v2_reporting_flush_cancellation;
         bool adaptive_v2_readiness_enqueued{false};
-        std::set<ProposalKey>
-            adaptive_v2_initialized_lifecycle_reports;
+        enum class AdaptiveV2DurableInitializationPhase
+        {
+            ready_to_enqueue,
+            queued,
+            suppressed,
+        };
+        // Initialization must enter the shared FIFO before evidence for the
+        // same exact proposal. Retaining the queued state also deduplicates
+        // repeated initialization callbacks until commit admission.
+        std::map<ProposalKey, AdaptiveV2DurableInitializationPhase>
+            adaptive_v2_durable_initialization_reports;
+        enum class AdaptiveV2DurableCommitPhase
+        {
+            awaiting_evidence,
+            ready_to_enqueue,
+            suppressed,
+        };
+        struct AdaptiveV2DurableCommitReportState
+        {
+            AdaptiveV2DurableCommitPhase phase{
+                AdaptiveV2DurableCommitPhase::awaiting_evidence};
+            bool experiment_false_report{false};
+            ReplicaID experiment_false_target{0};
+            std::size_t experiment_false_recorded_evidence{0};
+        };
+        // Consensus is never delayed. The exact observational commit notice
+        // remains durable until its evidence fence and shared-outbox enqueue
+        // both complete, or until the observation fails closed.
+        std::map<ProposalKey, AdaptiveV2DurableCommitReportState>
+            adaptive_v2_durable_commit_reports;
+        bool adaptive_v2_lifecycle_reporting_suppressed{false};
         enum class ExactForwardingRole
         {
             initial_aggregate,
@@ -1374,6 +1403,26 @@ namespace hotstuff
             const ProposalKey &key) noexcept;
         void report_adaptive_v2_committed(
             const std::optional<ProposalKey> &key) noexcept;
+        bool try_enqueue_adaptive_v2_runtime_initialized_report(
+            const ProposalKey &key) noexcept;
+        void retry_ready_adaptive_v2_runtime_initialized_reports()
+            noexcept;
+        void observe_adaptive_v2_response_deadline_result(
+            const ProposalKey &key,
+            EvidenceDeadlineResult result) noexcept;
+        bool persist_adaptive_v2_commit_report(
+            const ProposalKey &key,
+            AdaptiveV2DurableCommitReportState state,
+            const char *failure_reason) noexcept;
+        bool try_enqueue_adaptive_v2_commit_report(
+            const ProposalKey &key) noexcept;
+        void retry_ready_adaptive_v2_commit_reports() noexcept;
+        bool has_durable_adaptive_v2_commit_report(
+            const ProposalKey &key) const noexcept;
+        bool has_pending_adaptive_v2_lifecycle_fence() const noexcept;
+        void suppress_adaptive_v2_lifecycle_reporting(
+            const char *reason) noexcept;
+        void poison_adaptive_v2_reporting(const char *reason) noexcept;
         AdaptiveV2ReportingDeliveryResult
         transmit_adaptive_v2_report(
             const AdaptiveV2PendingReport &report) noexcept;
@@ -1444,6 +1493,10 @@ namespace hotstuff
             std::uint64_t generation) noexcept;
         std::optional<std::uint64_t> proposal_view_generation(
             const ProposalKey &key) const noexcept;
+        bool adaptive_v2_runtime_initialization_is_referenced(
+            const ProposalKey &key) const noexcept;
+        void retire_adaptive_v2_runtime_initialized_report(
+            const ProposalKey &key) noexcept;
         void forget_proposal_view_generation(
             const ProposalKey &key) noexcept;
         void forget_proposal_view_generations_for_block(
@@ -1478,7 +1531,8 @@ namespace hotstuff
         void drain_pending_exact_contributions(const ProposalKey &key);
         void purge_pending_exact_contributions(
             const ProposalKey &key,
-            bool preserve_scheduled_vote_fallback = false);
+            bool preserve_scheduled_vote_fallback = false,
+            bool preserve_response_evidence_until_deadline = false);
         promise_t deliver_exact_contribution(
             const ProposalKey &key,
             const PeerId &source_peer);

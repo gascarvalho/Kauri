@@ -181,7 +181,7 @@ std::string without_whitespace(const std::string &contents)
 } // namespace
 
 TEST_CASE(
-    "replica emits one commit observation only after authoritative v2 recording",
+    "replica fences commit observation after authoritative v2 recording",
     "[adaptive-v2][convergence][c5][replica][commit][wiring]")
 {
     const auto implementation = code_without_comments_or_literals(
@@ -190,14 +190,18 @@ TEST_CASE(
         implementation, "void HotStuffBase::do_post_block_commit(");
     const auto ordinary_commit = function_body(
         implementation, "void HotStuffBase::do_consensus(");
+    const auto enqueue_pending = function_body(
+        implementation,
+        "void HotStuffBase::enqueue_pending_adaptive_v2_commit_observation(");
     REQUIRE_FALSE(post_commit.empty());
+    REQUIRE_FALSE(enqueue_pending.empty());
 
     CHECK(count_occurrences(
               implementation,
-              "enqueue_epoch_change_committed(") == 1);
+              "enqueue_epoch_change_committed(") == 0);
     CHECK(count_occurrences(
               post_commit,
-              "enqueue_epoch_change_committed(") == 1);
+              "enqueue_convergence_observation(") == 0);
     CHECK(contains_in_order(
         post_commit,
         {"record_committed_v2(",
@@ -213,12 +217,14 @@ TEST_CASE(
          "blk->get_hash()",
          "recorded.record->activation_delay_blocks",
          "recorded.record->activation_height",
-         "enqueue_epoch_change_committed("}));
+         "adaptive_v2_committed_convergence_identity",
+         "enqueue_pending_adaptive_v2_commit_observation("}));
     CHECK(ordinary_commit.find("enqueue_epoch_change_committed(") ==
           std::string::npos);
     CHECK(contains_in_order(
-        post_commit,
-        {"enqueue_epoch_change_committed(",
+        enqueue_pending,
+        {"has_pending_adaptive_v2_lifecycle_fence()",
+         "enqueue_convergence_observation(",
          "AdaptiveV2ReportingEnqueueStatus::queued",
          "schedule_adaptive_v2_reporting_flush("}));
 }

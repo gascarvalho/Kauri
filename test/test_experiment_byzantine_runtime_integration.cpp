@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,160 @@ public:
         const ProposalTreeSnapshot &tree)
     {
         return runtime.consume_experiment_outbound_aggregate(key, tree);
+    }
+
+    static void seed_runtime_initialization(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.adaptive_v2_durable_initialization_reports.insert_or_assign(
+            key,
+            HotStuffBase::AdaptiveV2DurableInitializationPhase::queued);
+    }
+
+    static void seed_view_generation(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::uint64_t generation = 1)
+    {
+        runtime.proposal_view_generations.insert_or_assign(
+            key, generation);
+    }
+
+    static void seed_unsuppressed_commit(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        HotStuffBase::AdaptiveV2DurableCommitReportState state;
+        state.phase =
+            HotStuffBase::AdaptiveV2DurableCommitPhase::awaiting_evidence;
+        runtime.adaptive_v2_durable_commit_reports.insert_or_assign(
+            key, state);
+    }
+
+    static void seed_deferred_false_report(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.experiment_false_timeout_states.insert_or_assign(
+            key,
+            HotStuffBase::ExperimentFalseTimeoutState{7, true, true});
+    }
+
+    static void forget_key(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.forget_proposal_view_generation(key);
+    }
+
+    static void forget_block(
+        HotStuffBase &runtime,
+        const uint256_t &block_hash)
+    {
+        runtime.forget_proposal_view_generations_for_block(block_hash);
+    }
+
+    static void forget_before_epoch(
+        HotStuffBase &runtime,
+        std::uint32_t first_live_epoch)
+    {
+        runtime.forget_proposal_view_generations_before_epoch(
+            first_live_epoch);
+    }
+
+    static bool has_runtime_initialization(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.adaptive_v2_durable_initialization_reports.find(key) !=
+               runtime.adaptive_v2_durable_initialization_reports.end();
+    }
+
+    static bool has_view_generation(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.proposal_view_generations.find(key) !=
+               runtime.proposal_view_generations.end();
+    }
+
+    static std::size_t runtime_initialization_count(
+        const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v2_durable_initialization_reports.size();
+    }
+
+    static std::size_t maximum_runtime_initializations()
+    {
+        return HotStuffBase::maximum_proposal_view_generation_observations;
+    }
+
+    static void report_runtime_initialized(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.report_adaptive_v2_runtime_initialized(key);
+    }
+
+    static void suppress_lifecycle_reporting(HotStuffBase &runtime)
+    {
+        runtime.suppress_adaptive_v2_lifecycle_reporting("test");
+    }
+
+    static AdaptiveV2ReportingOutbox &reset_reporting_outbox(
+        HotStuffBase &runtime,
+        std::size_t maximum_pending_reports = 4)
+    {
+        AdaptiveV2ReportingOutboxConfig config;
+        config.source_replica_id = 1;
+        config.limits.maximum_pending_reports = maximum_pending_reports;
+        config.limits.maximum_pending_payload_bytes = 64 * 1024;
+        config.limits.maximum_delivery_attempts = 3;
+        config.limits.initial_retry_backoff_ns = 1;
+        config.limits.maximum_retry_backoff_ns = 8;
+        runtime.adaptive_v2_reporting_outbox =
+            std::make_unique<AdaptiveV2ReportingOutbox>(config);
+        runtime.adaptive_v2_lifecycle_reporting_suppressed = false;
+        runtime.adaptive_v2_convergence_evidence_healthy = true;
+        runtime.epoch_manager_peer = PeerId(NetAddr(
+            static_cast<std::uint32_t>(0x7f000001),
+            static_cast<std::uint16_t>(19001)));
+        return *runtime.adaptive_v2_reporting_outbox;
+    }
+
+    static void poison_reporting(HotStuffBase &runtime)
+    {
+        runtime.poison_adaptive_v2_reporting("test_terminal_front");
+    }
+
+    static bool lifecycle_reporting_suppressed(
+        const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v2_lifecycle_reporting_suppressed;
+    }
+
+    static bool convergence_evidence_healthy(
+        const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v2_convergence_evidence_healthy;
+    }
+
+    static void seed_pending_commit(
+        HotStuffBase &runtime,
+        const uint256_t &block_hash,
+        std::optional<ProposalKey> committed_key)
+    {
+        runtime.pending_adaptive_v2_commit =
+            HotStuffBase::PendingAdaptiveV2Commit{
+                block_hash, std::move(committed_key), std::nullopt};
+    }
+
+    static void report_committed(
+        HotStuffBase &runtime,
+        std::optional<ProposalKey> committed_key)
+    {
+        runtime.report_adaptive_v2_committed(committed_key);
     }
 };
 
@@ -144,6 +299,197 @@ ProposalTreeSnapshot tree(
     snapshot.fanout = 2;
     snapshot.pipeline_stretch = 2;
     return snapshot;
+}
+
+ProposalKey proposal_key(
+    std::uint32_t epoch,
+    const std::string &configuration_label,
+    const std::string &block_label)
+{
+    return ProposalKey{
+        ConfigurationId{
+            epoch, 0, digest(configuration_label + "-configuration")},
+        digest(block_label)};
+}
+
+TEST_CASE(
+    "native lifecycle retirement is bounded and preserves durable references",
+    "[adaptive-v2][evidence][lifecycle][retirement][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto orphan = proposal_key(1, "orphan", "orphan");
+    Access::seed_runtime_initialization(runtime, orphan);
+    Access::seed_view_generation(runtime, orphan);
+    Access::forget_key(runtime, orphan);
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, orphan));
+    CHECK_FALSE(Access::has_view_generation(runtime, orphan));
+
+    const auto shared_block = "shared-retirement-block";
+    const auto block_orphan = proposal_key(2, "block-orphan", shared_block);
+    const auto block_durable = proposal_key(3, "block-durable", shared_block);
+    for (const auto &key : {block_orphan, block_durable})
+    {
+        Access::seed_runtime_initialization(runtime, key);
+        Access::seed_view_generation(runtime, key);
+    }
+    Access::seed_unsuppressed_commit(runtime, block_durable);
+    Access::forget_block(runtime, block_orphan.block_hash);
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, block_orphan));
+    CHECK(Access::has_runtime_initialization(runtime, block_durable));
+    CHECK_FALSE(Access::has_view_generation(runtime, block_orphan));
+    CHECK_FALSE(Access::has_view_generation(runtime, block_durable));
+
+    const auto epoch_orphan = proposal_key(4, "epoch-orphan", "epoch-orphan");
+    const auto epoch_deferred =
+        proposal_key(4, "epoch-deferred", "epoch-deferred");
+    for (const auto &key : {epoch_orphan, epoch_deferred})
+    {
+        Access::seed_runtime_initialization(runtime, key);
+        Access::seed_view_generation(runtime, key);
+    }
+    Access::seed_deferred_false_report(runtime, epoch_deferred);
+    Access::forget_before_epoch(runtime, 5);
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, epoch_orphan));
+    CHECK(Access::has_runtime_initialization(runtime, epoch_deferred));
+    CHECK_FALSE(Access::has_view_generation(runtime, epoch_orphan));
+    CHECK_FALSE(Access::has_view_generation(runtime, epoch_deferred));
+
+    Access::suppress_lifecycle_reporting(runtime);
+    Access::forget_key(runtime, block_durable);
+    Access::forget_key(runtime, epoch_deferred);
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, block_durable));
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, epoch_deferred));
+}
+
+TEST_CASE(
+    "retired initialization records do not exhaust the bounded reporter",
+    "[adaptive-v2][evidence][lifecycle][capacity][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    for (std::size_t index = 0;
+         index < Access::maximum_runtime_initializations();
+         ++index)
+    {
+        Access::seed_runtime_initialization(
+            runtime,
+            proposal_key(
+                1,
+                "retired-capacity",
+                "retired-capacity-" + std::to_string(index)));
+    }
+    REQUIRE(
+        Access::runtime_initialization_count(runtime) ==
+        Access::maximum_runtime_initializations());
+
+    Access::forget_before_epoch(runtime, 2);
+    CHECK(Access::runtime_initialization_count(runtime) == 0);
+
+    Access::reset_reporting_outbox(runtime);
+    const auto fresh = proposal_key(2, "fresh", "fresh");
+    Access::report_runtime_initialized(runtime, fresh);
+    CHECK(Access::has_runtime_initialization(runtime, fresh));
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+}
+
+TEST_CASE(
+    "missing authoritative commit identity disables convergence only",
+    "[adaptive-v2][evidence][commit][fail-closed][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    auto *outbox = &Access::reset_reporting_outbox(runtime);
+    Access::report_committed(runtime, std::nullopt);
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK(outbox->diagnostics().pending_reports == 0);
+
+    outbox = &Access::reset_reporting_outbox(runtime);
+    const auto expected = proposal_key(7, "expected", "expected");
+    const auto mismatched = proposal_key(7, "mismatched", "mismatched");
+    Access::seed_pending_commit(runtime, expected.block_hash, expected);
+    Access::report_committed(runtime, mismatched);
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK(outbox->diagnostics().pending_reports == 0);
+}
+
+TEST_CASE(
+    "terminal shared reporting poison retains the complete fifo",
+    "[adaptive-v2][evidence][reporting][fail-closed][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    auto &outbox = Access::reset_reporting_outbox(runtime);
+    const ConfigurationId configuration{
+        7, 0, digest("poison-configuration")};
+    REQUIRE(
+        outbox.enqueue_readiness(configuration, 1, 0) ==
+        AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(
+        outbox.enqueue_lifecycle(
+            NormalProposalRuntimeInitialized{
+                ProposalKey{configuration, digest("poison-proposal")}}) ==
+        AdaptiveV2ReportingEnqueueStatus::queued);
+    REQUIRE(outbox.diagnostics().pending_reports == 2);
+
+    Access::poison_reporting(runtime);
+    const auto diagnostics = outbox.diagnostics();
+    CHECK(diagnostics.stopped);
+    CHECK(diagnostics.pending_reports == 2);
+    CHECK(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(outbox.front() != nullptr);
+    CHECK(outbox.front()->stream == AdaptiveV2ReportingStream::readiness);
 }
 
 TEST_CASE(

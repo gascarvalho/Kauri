@@ -427,9 +427,16 @@ TEST_CASE(
     const auto initialized = function_body(
         implementation,
         "void HotStuffBase::report_adaptive_v2_runtime_initialized(");
+    const auto enqueue_initialized = function_body(
+        implementation,
+        "bool HotStuffBase::\n"
+        "    try_enqueue_adaptive_v2_runtime_initialized_report(");
     const auto committed = function_body(
         implementation,
         "void HotStuffBase::report_adaptive_v2_committed(");
+    const auto enqueue_committed = function_body(
+        implementation,
+        "bool HotStuffBase::try_enqueue_adaptive_v2_commit_report(");
     const auto schedule = function_body(
         implementation,
         "void HotStuffBase::schedule_adaptive_v2_reporting_flush(");
@@ -446,7 +453,8 @@ TEST_CASE(
          "adaptive_v2_reporting_outbox",
          "adaptive_v2_reporting_flush_cancellation",
          "adaptive_v2_readiness_enqueued",
-         "adaptive_v2_initialized_lifecycle_reports",
+         "adaptive_v2_durable_initialization_reports",
+         "adaptive_v2_durable_commit_reports",
          "epoch_manager_address"}));
 
     REQUIRE_FALSE(constructor.empty());
@@ -516,23 +524,49 @@ TEST_CASE(
         {"initialize_accumulator(",
          "report_adaptive_v2_runtime_initialized(metadata.key)"}));
     REQUIRE_FALSE(initialized.empty());
-    CHECK(contains_all(
+    CHECK(contains_in_order(
         initialized,
+        {"adaptive_v2_durable_initialization_reports.size()",
+         "maximum_proposal_view_generation_observations",
+         "adaptive_v2_durable_initialization_reports.emplace",
+         "AdaptiveV2DurableInitializationPhase::",
+         "ready_to_enqueue",
+         "try_enqueue_adaptive_v2_runtime_initialized_report"}));
+    REQUIRE_FALSE(enqueue_initialized.empty());
+    CHECK(contains_in_order(
+        enqueue_initialized,
         {"NormalProposalRuntimeInitialized",
          "enqueue_lifecycle",
-         "adaptive_v2_initialized_lifecycle_reports",
+         "AdaptiveV2ReportingEnqueueStatus::queued",
+         "AdaptiveV2DurableInitializationPhase::queued",
          "schedule_adaptive_v2_reporting_flush"}));
+    CHECK(enqueue_initialized.find(
+              "AdaptiveV2ReportingEnqueueStatus::capacity_exceeded") !=
+          std::string::npos);
     REQUIRE_FALSE(consensus.empty());
     CHECK(contains_in_order(
         consensus,
         {"cache_adaptive_v2_commit(blk, keys)",
          "report_adaptive_v2_committed("}));
     REQUIRE_FALSE(committed.empty());
-    CHECK(contains_all(
+    CHECK(contains_in_order(
         committed,
-        {"ProposalCommitted",
+        {"should_defer_commit_report",
+         "persist_adaptive_v2_commit_report",
+         "try_enqueue_adaptive_v2_commit_report"}));
+    REQUIRE_FALSE(enqueue_committed.empty());
+    CHECK(contains_in_order(
+        enqueue_committed,
+        {"try_enqueue_adaptive_v2_runtime_initialized_report",
+         "ProposalCommitted",
          "enqueue_lifecycle",
+         "AdaptiveV2ReportingEnqueueStatus::queued",
+         "adaptive_v2_durable_commit_reports.erase",
+         "adaptive_v2_durable_initialization_reports.erase",
          "schedule_adaptive_v2_reporting_flush"}));
+    CHECK(enqueue_committed.find(
+              "AdaptiveV2ReportingEnqueueStatus::capacity_exceeded") !=
+          std::string::npos);
 
     REQUIRE_FALSE(bind.empty());
     CHECK(bind.find("adaptive_v2_response_evidence->bind_transport(") !=
@@ -2548,4 +2582,89 @@ TEST_CASE("leader timeout rotates adaptively without falling into legacy mutatio
          "legacy_fallback",
          "return",
          "activate_leader_view("}));
+}
+
+TEST_CASE(
+    "adaptive v2 evidence lifecycle failures are globally fail closed",
+    "[adaptive-v2][evidence][lifecycle][fail-closed][wiring]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto poison = function_body(
+        implementation,
+        "void HotStuffBase::poison_adaptive_v2_reporting(");
+    const auto acknowledgement = function_body(
+        implementation,
+        "void HotStuffBase::adaptive_v2_convergence_ack_handler(");
+    const auto flush = function_body(
+        implementation,
+        "void HotStuffBase::flush_adaptive_v2_reporting(");
+    const auto committed = function_body(
+        implementation,
+        "void HotStuffBase::report_adaptive_v2_committed(");
+    const auto deadline = function_body(
+        implementation,
+        "void HotStuffBase::start_latency_deadline(");
+    const auto forget_one = function_body(
+        implementation,
+        "void HotStuffBase::forget_proposal_view_generation(");
+    const auto forget_block = function_body(
+        implementation,
+        "void HotStuffBase::forget_proposal_view_generations_for_block(");
+    const auto forget_epoch = function_body(
+        implementation,
+        "void HotStuffBase::forget_proposal_view_generations_before_epoch(");
+
+    REQUIRE_FALSE(poison.empty());
+    CHECK(contains_in_order(
+        poison,
+        {"suppress_adaptive_v2_lifecycle_reporting(reason)",
+         "adaptive_v2_reporting_outbox->shutdown()",
+         "cancel_adaptive_v2_reporting_flush()"}));
+
+    REQUIRE_FALSE(acknowledgement.empty());
+    CHECK(contains_in_order(
+        acknowledgement,
+        {"AdaptiveV2ReportingTransitionStatus::failed",
+         "poison_adaptive_v2_reporting(",
+         "convergence_observation_permanently_rejected"}));
+
+    REQUIRE_FALSE(flush.empty());
+    CHECK(count_occurrences(
+              flush, "poison_adaptive_v2_reporting(") == 4);
+    CHECK(contains_all(
+        flush,
+        {"shared_outbox_unhealthy",
+         "shared_outbox_terminal_report_missing",
+         "shared_outbox_terminal_report",
+         "shared_outbox_delivery_failed"}));
+
+    REQUIRE_FALSE(committed.empty());
+    CHECK(contains_in_order(
+        committed,
+        {"pending_adaptive_v2_commit.has_value()",
+         "pending_adaptive_v2_commit->committed_key.has_value()",
+         "mark_adaptive_v2_convergence_evidence_unhealthy(",
+         "authoritative_commit_identity_missing_or_mismatched"}));
+
+    REQUIRE_FALSE(deadline.empty());
+    CHECK(contains_in_order(
+        deadline,
+        {"if (!evidence_armed)",
+         "cancel_false_report(",
+         "adaptive_v2_response_evidence->retire(key)",
+         "suppress_adaptive_v2_lifecycle_reporting(",
+         "false_report_evidence_arm_failed"}));
+
+    REQUIRE_FALSE(forget_one.empty());
+    CHECK(forget_one.find(
+              "retire_adaptive_v2_runtime_initialized_report(key)") !=
+          std::string::npos);
+    REQUIRE_FALSE(forget_block.empty());
+    CHECK(forget_block.find(
+              "adaptive_v2_runtime_initialization_is_referenced(") !=
+          std::string::npos);
+    REQUIRE_FALSE(forget_epoch.empty());
+    CHECK(forget_epoch.find(
+              "adaptive_v2_runtime_initialization_is_referenced(") !=
+          std::string::npos);
 }

@@ -167,6 +167,12 @@ public:
         const ProposalKey &proposal) const;
     bool rotating_omission_enabled() const noexcept;
     bool scheduled_omission_enabled() const noexcept;
+    /**
+     * Read-only experiment diagnostic membership. This grants no consensus,
+     * topology, timing, or omission authority.
+     */
+    bool is_tiered_responsive_degraded_actor(
+        ReplicaID replica) const noexcept;
 
 private:
     struct State;

@@ -785,4 +785,18 @@ bool ExperimentByzantineAdapter::scheduled_omission_enabled() const noexcept
                state_->options.rotating_omission->mode);
 }
 
+bool ExperimentByzantineAdapter::
+is_tiered_responsive_degraded_actor(ReplicaID replica) const noexcept
+{
+    if (!state_->options.enabled ||
+        !state_->options.rotating_omission.has_value())
+        return false;
+    const auto &scheduled = *state_->options.rotating_omission;
+    return is_tiered_omission_mode(scheduled.mode) &&
+           std::binary_search(
+               scheduled.responsive_degraded_actor_ids.begin(),
+               scheduled.responsive_degraded_actor_ids.end(),
+               replica);
+}
+
 } // namespace hotstuff
