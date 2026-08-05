@@ -1492,6 +1492,94 @@ def _event_payload(event: _Event) -> Mapping[str, Any]:
     return payload
 
 
+def _epoch_activation_identity(
+    event: _Event,
+) -> tuple[int, int, str, int]:
+    """Parse the exact flat payload emitted for a native epoch activation."""
+
+    payload = _event_payload(event)
+    if set(payload) != {
+        "epoch_number",
+        "tree_id",
+        "epoch_digest",
+        "activation_height",
+    }:
+        raise FactorialExecutionError("epoch activation payload is malformed")
+    epoch_number = payload.get("epoch_number")
+    tree_id = payload.get("tree_id")
+    epoch_digest = payload.get("epoch_digest")
+    activation_height = payload.get("activation_height")
+    if (
+        type(epoch_number) is not int
+        or epoch_number < 0
+        or type(tree_id) is not int
+        or tree_id < 0
+        or not isinstance(epoch_digest, str)
+        or len(epoch_digest) != 64
+        or any(character not in _HEX_DIGITS for character in epoch_digest)
+        or type(activation_height) is not int
+        or activation_height < 1
+    ):
+        raise FactorialExecutionError("epoch activation identity is malformed")
+    return epoch_number, tree_id, epoch_digest, activation_height
+
+
+def _replica_transition_barrier(
+    current: Mapping[str, Sequence[_Event]],
+    *,
+    replica_count: int,
+    event_type: str,
+    epoch: int,
+) -> _Event | None:
+    """Require one identical native transition witness from every replica."""
+
+    selected: list[_Event] = []
+    identities: set[tuple[object, ...]] = set()
+    for replica_id in range(replica_count):
+        candidates: list[_Event] = []
+        for event in current[f"replica-{replica_id}"]:
+            if event.value.get("event_type") != event_type:
+                continue
+            payload = _event_payload(event)
+            if event_type == "epoch.command_committed":
+                if payload.get("successor_epoch_number") != epoch:
+                    continue
+                identity = tuple(
+                    payload.get(key)
+                    for key in (
+                        "payload_digest",
+                        "predecessor_epoch_number",
+                        "predecessor_epoch_digest",
+                        "successor_epoch_number",
+                        "successor_epoch_digest",
+                        "activation_delay_blocks",
+                        "activation_height",
+                    )
+                )
+            elif event_type == "epoch.activated":
+                identity = _epoch_activation_identity(event)
+                if identity[0] != epoch:
+                    continue
+            else:
+                raise FactorialExecutionError(
+                    f"unsupported replica transition barrier: {event_type}"
+                )
+            candidates.append(event)
+            identities.add(identity)
+        if len(candidates) > 1:
+            raise FactorialExecutionError(
+                f"replica-{replica_id} duplicated {event_type} for epoch {epoch}"
+            )
+        if not candidates:
+            return None
+        selected.append(candidates[0])
+    if len(identities) != 1:
+        raise FactorialExecutionError(
+            f"replicas disagree on {event_type} for epoch {epoch}"
+        )
+    return max(selected, key=lambda event: (event.timestamp_ns, event.source))
+
+
 def _commit_key(event: _Event) -> tuple[object, object, object, object]:
     payload = _event_payload(event)
     key = (
@@ -1835,58 +1923,6 @@ def observe_slot_phases(
         clean_exit_authorizer=authorize_clean_exit,
     )
 
-    def replica_barrier(
-        current: Mapping[str, Sequence[_Event]],
-        event_type: str,
-        epoch: int,
-    ) -> _Event | None:
-        selected: list[_Event] = []
-        identities: set[tuple[object, ...]] = set()
-        for replica_id in range(spec.replica_count):
-            candidates: list[_Event] = []
-            for event in current[f"replica-{replica_id}"]:
-                if event.value.get("event_type") != event_type:
-                    continue
-                payload = _event_payload(event)
-                if event_type == "epoch.command_committed":
-                    if payload.get("successor_epoch_number") != epoch:
-                        continue
-                    identity = tuple(
-                        payload.get(key)
-                        for key in (
-                            "payload_digest",
-                            "predecessor_epoch_number",
-                            "predecessor_epoch_digest",
-                            "successor_epoch_number",
-                            "successor_epoch_digest",
-                            "activation_delay_blocks",
-                            "activation_height",
-                        )
-                    )
-                else:
-                    configuration = payload.get("configuration")
-                    if not isinstance(configuration, Mapping) or configuration.get("epoch_number") != epoch:
-                        continue
-                    identity = (
-                        configuration.get("epoch_number"),
-                        configuration.get("epoch_digest"),
-                        payload.get("activation_height"),
-                    )
-                candidates.append(event)
-                identities.add(identity)
-            if len(candidates) > 1:
-                raise FactorialExecutionError(
-                    f"replica-{replica_id} duplicated {event_type} for epoch {epoch}"
-                )
-            if not candidates:
-                return None
-            selected.append(candidates[0])
-        if len(identities) != 1:
-            raise FactorialExecutionError(
-                f"replicas disagree on {event_type} for epoch {epoch}"
-            )
-        return max(selected, key=lambda event: (event.timestamp_ns, event.source))
-
     transition_events: dict[int, tuple[_Event, _Event, _Event]] = {}
     stable_events: dict[int, tuple[_Event, Mapping[str, object], int]] = {}
     phase_configurations: dict[int, tuple[int, str]] = {}
@@ -1903,8 +1939,18 @@ def observe_slot_phases(
             selected_shape: _Event | None = None,
         ) -> tuple[_Event, _Event, _Event] | None:
             current = streams()
-            command = replica_barrier(current, "epoch.command_committed", epoch)
-            activation = replica_barrier(current, "epoch.activated", epoch)
+            command = _replica_transition_barrier(
+                current,
+                replica_count=spec.replica_count,
+                event_type="epoch.command_committed",
+                epoch=epoch,
+            )
+            activation = _replica_transition_barrier(
+                current,
+                replica_count=spec.replica_count,
+                event_type="epoch.activated",
+                epoch=epoch,
+            )
             shape = _single_manager_event(
                 current,
                 event_type="adaptive_v2_shape_decision",
@@ -1980,19 +2026,10 @@ def observe_slot_phases(
                 clean_exit_authorizer=authorize_clean_exit,
             )
         transition_events[epoch] = (command, activation, shape)
-        activation_configuration = _event_payload(activation).get("configuration")
-        if not isinstance(activation_configuration, Mapping):
-            raise FactorialExecutionError(
-                f"epoch-{epoch} activation configuration is malformed"
-            )
-        activated_epoch = activation_configuration.get("epoch_number")
-        activated_digest = activation_configuration.get("epoch_digest")
-        if (
-            activated_epoch != epoch
-            or not isinstance(activated_digest, str)
-            or len(activated_digest) != 64
-            or any(character not in _HEX_DIGITS for character in activated_digest)
-        ):
+        activated_epoch, _, activated_digest, _ = _epoch_activation_identity(
+            activation
+        )
+        if activated_epoch != epoch:
             raise FactorialExecutionError(
                 f"epoch-{epoch} activation identity is malformed"
             )

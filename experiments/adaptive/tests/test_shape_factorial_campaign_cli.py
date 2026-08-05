@@ -32,7 +32,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v4.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v5.json"
+V4_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v4.json"
+)
 V3_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
 )
@@ -152,7 +155,12 @@ def _slot_validation(
 
 @pytest.mark.parametrize(
     ("manifest_path", "version"),
-    ((LEGACY_MANIFEST, "v1"), (V2_MANIFEST, "v2"), (V3_MANIFEST, "v3")),
+    (
+        (LEGACY_MANIFEST, "v1"),
+        (V2_MANIFEST, "v2"),
+        (V3_MANIFEST, "v3"),
+        (V4_MANIFEST, "v4"),
+    ),
 )
 @pytest.mark.parametrize("command", ("plan", "preflight", "smoke", "run"))
 def test_prior_manifest_is_validation_only_before_any_result_claim(
@@ -178,8 +186,8 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1, v2, and v3 are validation-only; "
-            "plan, preflight, smoke, and run require shape-placement-factorial-v4"
+            "shape-placement-factorial-v1, v2, v3, and v4 are validation-only; "
+            "plan, preflight, smoke, and run require shape-placement-factorial-v5"
         ),
         "status": "REJECT",
     }
@@ -191,7 +199,12 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
 @pytest.mark.parametrize(
     ("manifest_path", "version"),
-    ((LEGACY_MANIFEST, "v1"), (V2_MANIFEST, "v2"), (V3_MANIFEST, "v3")),
+    (
+        (LEGACY_MANIFEST, "v1"),
+        (V2_MANIFEST, "v2"),
+        (V3_MANIFEST, "v3"),
+        (V4_MANIFEST, "v4"),
+    ),
 )
 def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
     manifest_path: Path,
@@ -247,7 +260,12 @@ def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
 
 @pytest.mark.parametrize(
     ("manifest_path", "version"),
-    ((LEGACY_MANIFEST, "v1"), (V2_MANIFEST, "v2"), (V3_MANIFEST, "v3")),
+    (
+        (LEGACY_MANIFEST, "v1"),
+        (V2_MANIFEST, "v2"),
+        (V3_MANIFEST, "v3"),
+        (V4_MANIFEST, "v4"),
+    ),
 )
 def test_prior_validate_campaign_uses_preserved_artifacts_without_rederiving(
     manifest_path: Path,
@@ -312,7 +330,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v4").exists()
+    assert not (repository / "results/shape-placement-factorial-v5").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -337,7 +355,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v4").exists()
+    assert not (repository / "results/shape-placement-factorial-v5").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -363,7 +381,7 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v4-smoke"
+        repository / "results/shape-placement-factorial-v5-smoke"
     ).exists()
 
 
@@ -399,7 +417,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v4-smoke"
+        repository / "results/shape-placement-factorial-v5-smoke"
     ).exists()
 
 
@@ -459,7 +477,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v4-smoke"
+        / "results/shape-placement-factorial-v5-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"

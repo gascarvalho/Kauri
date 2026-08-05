@@ -42,6 +42,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v5.json"
+)
+V4_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v4.json"
 )
 V3_MANIFEST_PATH = (
@@ -212,7 +215,7 @@ def test_actor_and_fnv_vectors_recompute_without_runtime_decision_code() -> None
         ) == (vector.fnv1a64, vector.selected_actor)
 
 
-def test_validator_retains_exact_v1_through_v4_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v5_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -221,7 +224,8 @@ def test_validator_retains_exact_v1_through_v4_artifact_identities() -> None:
             (1, LEGACY_MANIFEST_PATH),
             (2, V2_MANIFEST_PATH),
             (3, V3_MANIFEST_PATH),
-            (4, MANIFEST_PATH),
+            (4, V4_MANIFEST_PATH),
+            (5, MANIFEST_PATH),
         )
     }
 
@@ -231,9 +235,27 @@ def test_validator_retains_exact_v1_through_v4_artifact_identities() -> None:
     assert identities[3].manifest_sha256 == validation.V3_MANIFEST_SHA256
     assert identities[3].runtime_sha256 == validation.V3_RUNTIME_SHA256
     assert identities[3].smoke_runtime_sha256 == validation.V3_SMOKE_RUNTIME_SHA256
-    assert identities[4].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[4].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
-    assert identities[4].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    assert identities[4].manifest_sha256 == validation.V4_MANIFEST_SHA256
+    assert identities[4].runtime_sha256 == validation.V4_RUNTIME_SHA256
+    assert identities[4].smoke_runtime_sha256 == validation.V4_SMOKE_RUNTIME_SHA256
+    assert identities[5].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[5].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[5].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
+
+
+def test_exact_v4_runtime_remains_validator_compatible() -> None:
+    manifest = load_frozen_manifest(V4_MANIFEST_PATH)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected for expected in validation._expected_slots(manifest)
+    }
+    runtime_slot = runtime.slots[0]
+
+    validation._validate_runtime_slot(
+        json.loads(json.dumps(runtime_slot.as_document())),
+        expected_by_id[runtime_slot.slot_id],
+        manifest,
+    )
 
 
 def _compact_snapshot_audit() -> dict[str, object]:
@@ -1096,6 +1118,89 @@ def test_post_selection_deadline_is_v2_only_for_legacy_compatibility(
         )
 
 
+def test_native_epoch_activation_payload_is_flat_and_exact() -> None:
+    payload = {
+        "epoch_number": 1,
+        "tree_id": 0,
+        "epoch_digest": (
+            "a1134b5b2bc72cd93fcfcc5a7e754c8b3e8be49ed9eabdd47e0cf045b0936e37"
+        ),
+        "activation_height": 2950,
+    }
+
+    assert (
+        validation._activation_identity(payload, "epoch.activated.payload") == payload
+    )
+
+    stale_nested = {
+        "configuration": {
+            "epoch_number": payload["epoch_number"],
+            "tree_id": payload["tree_id"],
+            "epoch_digest": payload["epoch_digest"],
+        },
+        "activation_height": payload["activation_height"],
+    }
+    with pytest.raises(FactorialValidationError, match="invalid field set"):
+        validation._activation_identity(
+            stale_nested,
+            "epoch.activated.payload",
+        )
+
+
+def test_native_activation_identity_is_bound_across_replicas_and_bundle() -> None:
+    digest = "22" * 32
+    command = validation.DecodedCommand(
+        issuer_id=0,
+        successor_epoch_number=1,
+        predecessor_epoch_digest="11" * 32,
+        successor_epoch_digest=digest,
+        activation_delay_blocks=5,
+        payload_digest="33" * 32,
+        signature=b"signature",
+    )
+    bundle = validation.DecodedBundle(
+        command=command,
+        epoch_number=1,
+        epoch_digest=digest,
+        previous_epoch_digest="11" * 32,
+        membership_digest="44" * 32,
+        generation_seed=1,
+        policy_version="test",
+        evidence_snapshot_id="55" * 32,
+        evidence_cutoff=1,
+        trees=(
+            Tree(0, 2, 2, (0, 1, 2), (1, 2)),
+            Tree(1, 2, 2, (1, 2, 0), (2, 0)),
+        ),
+    )
+    canonical: dict[int, dict[str, object]] = {}
+    activation = {
+        "epoch_number": 1,
+        "tree_id": 0,
+        "epoch_digest": digest,
+        "activation_height": 2_950,
+    }
+    validation._record_activation_identity(
+        activation,
+        bundle=bundle,
+        canonical_by_epoch=canonical,
+    )
+
+    with pytest.raises(FactorialValidationError, match="replicas disagree"):
+        validation._record_activation_identity(
+            {**activation, "tree_id": 1},
+            bundle=bundle,
+            canonical_by_epoch=canonical,
+        )
+
+    with pytest.raises(FactorialValidationError, match="tree absent"):
+        validation._record_activation_identity(
+            {**activation, "tree_id": 7},
+            bundle=bundle,
+            canonical_by_epoch={},
+        )
+
+
 def _phase_cutoff_fixture() -> tuple[
     dict[str, object],
     dict[tuple[str, int], validation._NativeEvent],
@@ -1240,20 +1345,16 @@ def _phase_cutoff_fixture() -> tuple[
         payload: dict[str, object] = {}
         if name == "epoch1_activation":
             payload = {
-                "configuration": {
-                    "epoch_number": 1,
-                    "tree_id": 0,
-                    "epoch_digest": "22" * 32,
-                },
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": "22" * 32,
                 "activation_height": 14,
             }
         elif name == "epoch2_activation":
             payload = {
-                "configuration": {
-                    "epoch_number": 2,
-                    "tree_id": 0,
-                    "epoch_digest": "33" * 32,
-                },
+                "epoch_number": 2,
+                "tree_id": 0,
+                "epoch_digest": "33" * 32,
                 "activation_height": 16,
             }
         event = _native_event(
@@ -1400,6 +1501,35 @@ def test_phase_cutoffs_enforce_prefault_baseline_and_full_observation_hold() -> 
         "drain_margin_s": 5,
     }
     validation._validate_phase_cutoffs(document, **arguments)
+
+    epoch1_activation_row = document["cutoffs"][3]
+    epoch1_activation_key = (
+        epoch1_activation_row["source_path"],
+        epoch1_activation_row["source_sequence"],
+    )
+    epoch1_activation = events[epoch1_activation_key]
+    stale_nested_activation = replace(
+        epoch1_activation,
+        payload={
+            "configuration": {
+                "epoch_number": epoch1_activation.payload["epoch_number"],
+                "tree_id": epoch1_activation.payload["tree_id"],
+                "epoch_digest": epoch1_activation.payload["epoch_digest"],
+            },
+            "activation_height": epoch1_activation.payload["activation_height"],
+        },
+    )
+    with pytest.raises(FactorialValidationError, match="invalid field set"):
+        validation._validate_phase_cutoffs(
+            document,
+            **{
+                **arguments,
+                "events_by_ref": {
+                    **events,
+                    epoch1_activation_key: stale_nested_activation,
+                },
+            },
+        )
 
     with pytest.raises(FactorialValidationError, match="during the fault window"):
         validation._validate_phase_cutoffs(
@@ -1875,7 +2005,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
-def test_v4_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+def test_v5_receipt_rejects_an_exact_legacy_manifest_plan_pair(
     tmp_path: Path,
 ) -> None:
     recovered, _, receipt, expected, runtime, authorization = (

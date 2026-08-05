@@ -65,6 +65,9 @@ from .factorial_manifest import (
     V3_MANIFEST_ID,
     V3_MANIFEST_SHA256,
     V3_PLAN_SHA256,
+    V4_MANIFEST_ID,
+    V4_MANIFEST_SHA256,
+    V4_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -108,11 +111,17 @@ V3_RUNTIME_SHA256 = (
 V3_SMOKE_RUNTIME_SHA256 = (
     "4e4231b3cd487549da5e468aafc67cefbc11c39459b79dcb37a679225d360c85"
 )
-FROZEN_RUNTIME_SHA256 = (
+V4_RUNTIME_SHA256 = (
     "27ca88025f5a22f74707bf724ca7e2155c7be8574043e96434cb7e553338a376"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V4_SMOKE_RUNTIME_SHA256 = (
     "80a54a9035ac2cc816fe985b4011c060fe21a81894da56156ce75dbda7e81046"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "5d66d23d9f2ac9c774c157d51435763ec7c7a19cfd1d1f5bc5ea67a32f1ecabf"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "455178e72413abb31ece95e37364e8f52d3318397c0d46b78d4451504ba03c2e"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -246,6 +255,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=V3_PLAN_SHA256,
             runtime_sha256=V3_RUNTIME_SHA256,
             smoke_runtime_sha256=V3_SMOKE_RUNTIME_SHA256,
+        ),
+        V4_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V4_MANIFEST_ID,
+            manifest_sha256=V4_MANIFEST_SHA256,
+            plan_sha256=V4_PLAN_SHA256,
+            runtime_sha256=V4_RUNTIME_SHA256,
+            smoke_runtime_sha256=V4_SMOKE_RUNTIME_SHA256,
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -1719,6 +1735,7 @@ def _validate_runtime_slot(
     if manifest.manifest_id in {
         V2_MANIFEST_ID,
         V3_MANIFEST_ID,
+        V4_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -4553,19 +4570,13 @@ def _validate_phase_cutoffs(
     }
     for epoch, phase_name in ((1, "epoch1_stable"), (2, "epoch2_stable")):
         activation_name = f"epoch{epoch}_activation"
-        activation_configuration = _mapping(
-            cutoff_events[activation_name].payload.get("configuration"),
-            f"{activation_name}.payload.configuration",
+        activation = _activation_identity(
+            cutoff_events[activation_name].payload,
+            f"{activation_name}.payload",
         )
         activated_identity = (
-            _integer(
-                activation_configuration.get("epoch_number"),
-                f"{activation_name}.payload.configuration.epoch_number",
-            ),
-            _digest(
-                activation_configuration.get("epoch_digest"),
-                f"{activation_name}.payload.configuration.epoch_digest",
-            ),
+            activation["epoch_number"],
+            activation["epoch_digest"],
         )
         expected_configuration = phase_configurations[phase_name]
         if activated_identity[0] != epoch or expected_configuration != activated_identity:
@@ -4834,6 +4845,42 @@ def _validate_successor_trees(
                 _fail("actor is wait-exempt but not a physical successor leaf")
 
 
+def _activation_identity(payload: Mapping[str, Any], label: str) -> dict[str, Any]:
+    """Decode the exact flat payload emitted by native epoch lifecycle events."""
+
+    _fields(
+        payload,
+        {"epoch_number", "tree_id", "epoch_digest", "activation_height"},
+        label,
+    )
+    return {
+        "epoch_number": _integer(payload["epoch_number"], f"{label}.epoch_number"),
+        "tree_id": _integer(payload["tree_id"], f"{label}.tree_id"),
+        "epoch_digest": _digest(payload["epoch_digest"], f"{label}.epoch_digest"),
+        "activation_height": _integer(
+            payload["activation_height"], f"{label}.activation_height", 1
+        ),
+    }
+
+
+def _record_activation_identity(
+    activation: dict[str, Any],
+    *,
+    bundle: DecodedBundle,
+    canonical_by_epoch: dict[int, dict[str, Any]],
+) -> None:
+    """Bind one activation to its bundle and the all-replica identity."""
+
+    epoch_number = activation["epoch_number"]
+    if activation["epoch_digest"] != bundle.epoch_digest:
+        _fail("replica activated a digest different from the preserved bundle")
+    if activation["tree_id"] not in {tree.tree_id for tree in bundle.trees}:
+        _fail("replica activated a tree absent from the preserved bundle")
+    canonical = canonical_by_epoch.setdefault(epoch_number, activation)
+    if canonical != activation:
+        _fail("replicas disagree on an epoch activation identity")
+
+
 def _command_identity(payload: Mapping[str, Any], label: str) -> dict[str, Any]:
     _fields(
         payload,
@@ -4907,6 +4954,7 @@ def _validate_native_transitions(
     command_times: dict[int, list[int]] = defaultdict(list)
     activation_times: dict[int, list[int]] = defaultdict(list)
     command_identity_by_epoch: dict[int, dict[str, Any]] = {}
+    activation_identity_by_epoch: dict[int, dict[str, Any]] = {}
     for replica_id in range(expected.replica_count):
         events = replica_events.get(replica_id)
         if events is None:
@@ -4928,25 +4976,23 @@ def _validate_native_transitions(
                 if canonical != identity:
                     _fail("replicas disagree on an actual epoch command identity")
             elif event.event_type == "epoch.activated":
-                _fields(
+                activation = _activation_identity(
                     event.payload,
-                    {"configuration", "activation_height"},
-                    "epoch activation payload",
+                    f"{event.relative_path}:{event.line_number}.payload",
                 )
-                configuration = _mapping(event.payload.get("configuration"), "epoch activation configuration")
-                _fields(configuration, {"epoch_number", "tree_id", "epoch_digest"}, "epoch activation configuration")
-                epoch_number = _integer(configuration["epoch_number"], "activated epoch")
+                epoch_number = activation["epoch_number"]
                 if epoch_number == 0:
                     continue
                 if epoch_number not in (1, 2) or epoch_number in seen_activations:
                     _fail("replica emitted an extra or duplicate epoch activation")
                 seen_activations.add(epoch_number)
-                _integer(configuration["tree_id"], "activated tree")
-                digest = _digest(configuration["epoch_digest"], "activated epoch digest")
-                activation_height = _integer(event.payload.get("activation_height"), "epoch activation height", 1)
+                activation_height = activation["activation_height"]
                 bundle = bundles[epoch_number - 1]
-                if digest != bundle.epoch_digest:
-                    _fail("replica activated a digest different from the preserved bundle")
+                _record_activation_identity(
+                    activation,
+                    bundle=bundle,
+                    canonical_by_epoch=activation_identity_by_epoch,
+                )
                 identity = command_identity_by_epoch.get(epoch_number)
                 if identity is not None and activation_height != identity["activation_height"]:
                     _fail("replica activation height differs from its command")

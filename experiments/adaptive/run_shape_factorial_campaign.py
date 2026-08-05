@@ -60,7 +60,7 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v4.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v5.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
@@ -298,26 +298,26 @@ def _validation_roots(
     return campaign_root, smoke_root
 
 
-def _require_frozen_v4_artifacts(
+def _require_frozen_v5_artifacts(
     manifest: FrozenFactorialManifest,
     plan: FactorialPlan,
     runtime: FactorialRuntimePlan,
 ) -> bytes:
-    """Fail before any result claim if producer bytes drift from v4."""
+    """Fail before any result claim if producer bytes drift from v5."""
 
     if (
         manifest.manifest_id != FROZEN_MANIFEST_ID
         or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
     ):
-        raise FactorialExecutionError("campaign production requires exact frozen v4")
+        raise FactorialExecutionError("campaign production requires exact frozen v5")
     if plan.plan_sha256 != FROZEN_PLAN_SHA256:
         raise FactorialExecutionError(
-            "campaign plan bytes differ from the exact frozen v4 identity"
+            "campaign plan bytes differ from the exact frozen v5 identity"
         )
     payload = canonical_runtime_bytes(runtime)
     if _sha256(payload) != FROZEN_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "campaign runtime bytes differ from the exact frozen v4 identity"
+            "campaign runtime bytes differ from the exact frozen v5 identity"
         )
     return payload
 
@@ -689,7 +689,7 @@ def _run_smoke(
     smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
     if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "smoke runtime bytes differ from the exact frozen v4 identity"
+            "smoke runtime bytes differ from the exact frozen v5 identity"
         )
     _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
@@ -994,12 +994,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) else 1
         if manifest.manifest_id != FROZEN_MANIFEST_ID:
             raise FactorialExecutionError(
-                "shape-placement-factorial-v1, v2, and v3 are validation-only; "
-                "plan, preflight, smoke, and run require shape-placement-factorial-v4"
+                "shape-placement-factorial-v1, v2, v3, and v4 are validation-only; "
+                "plan, preflight, smoke, and run require shape-placement-factorial-v5"
             )
         plan = build_factorial_plan(manifest)
         runtime = build_factorial_runtime(plan)
-        runtime_payload = _require_frozen_v4_artifacts(manifest, plan, runtime)
+        runtime_payload = _require_frozen_v5_artifacts(manifest, plan, runtime)
         repository, build_directory, build_provenance, campaign_root, smoke_root = (
             _paths(arguments, runtime)
         )

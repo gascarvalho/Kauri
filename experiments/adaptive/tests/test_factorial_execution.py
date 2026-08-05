@@ -31,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v4.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v5.json"
 
 
 @pytest.fixture(scope="module")
@@ -945,6 +945,142 @@ def _event(
         value=json.loads(encoded),
         line_sha256=hashlib.sha256(encoded).hexdigest(),
     )
+
+
+def test_epoch_activation_identity_uses_exact_native_flat_payload(
+    template_slot,
+) -> None:
+    spec = execution.build_n7_ps_smoke_slot(template_slot).runtime
+    activation = _event(
+        spec,
+        replica_id=0,
+        sequence=1,
+        timestamp_ns=56_459_065,
+        event_type="epoch.activated",
+        payload={
+            "epoch_number": 1,
+            "tree_id": 0,
+            "epoch_digest": "22" * 32,
+            "activation_height": 2_950,
+        },
+    )
+
+    assert execution._epoch_activation_identity(activation) == (
+        1,
+        0,
+        "22" * 32,
+        2_950,
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "configuration": {
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": "22" * 32,
+            },
+            "activation_height": 2_950,
+        },
+        {
+            "epoch_number": 1,
+            "tree_id": 0,
+            "epoch_digest": "22" * 32,
+            "activation_height": 2_950,
+            "configuration": {},
+        },
+    ),
+)
+def test_epoch_activation_identity_rejects_noncanonical_payloads(
+    template_slot,
+    payload: dict[str, object],
+) -> None:
+    spec = execution.build_n7_ps_smoke_slot(template_slot).runtime
+    activation = _event(
+        spec,
+        replica_id=0,
+        sequence=1,
+        timestamp_ns=56_459_065,
+        event_type="epoch.activated",
+        payload=payload,
+    )
+
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="epoch activation payload is malformed",
+    ):
+        execution._epoch_activation_identity(activation)
+
+
+def test_replica_activation_barrier_accepts_real_flat_streams(
+    template_slot,
+) -> None:
+    spec = execution.build_n7_ps_smoke_slot(template_slot).runtime
+    payload = {
+        "epoch_number": 1,
+        "tree_id": 0,
+        "epoch_digest": "22" * 32,
+        "activation_height": 2_950,
+    }
+    streams = {
+        f"replica-{replica_id}": (
+            _event(
+                spec,
+                replica_id=replica_id,
+                sequence=1,
+                timestamp_ns=56_459_065 + replica_id,
+                event_type="epoch.activated",
+                payload=payload,
+            ),
+        )
+        for replica_id in range(spec.replica_count)
+    }
+
+    barrier = execution._replica_transition_barrier(
+        streams,
+        replica_count=spec.replica_count,
+        event_type="epoch.activated",
+        epoch=1,
+    )
+
+    assert barrier is not None
+    assert barrier.source == f"replica-{spec.replica_count - 1}"
+
+
+def test_replica_activation_barrier_rejects_disagreeing_tree_identity(
+    template_slot,
+) -> None:
+    spec = execution.build_n7_ps_smoke_slot(template_slot).runtime
+    streams: dict[str, tuple[execution._Event, ...]] = {}
+    for replica_id in range(spec.replica_count):
+        streams[f"replica-{replica_id}"] = (
+            _event(
+                spec,
+                replica_id=replica_id,
+                sequence=1,
+                timestamp_ns=56_459_065 + replica_id,
+                event_type="epoch.activated",
+                payload={
+                    "epoch_number": 1,
+                    "tree_id": 1 if replica_id == spec.replica_count - 1 else 0,
+                    "epoch_digest": "22" * 32,
+                    "activation_height": 2_950,
+                },
+            ),
+        )
+
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="replicas disagree on epoch.activated",
+    ):
+        execution._replica_transition_barrier(
+            streams,
+            replica_count=spec.replica_count,
+            event_type="epoch.activated",
+            epoch=1,
+        )
 
 
 def test_common_commit_proof_preserves_observer_and_exact_q_witnesses(
