@@ -159,6 +159,152 @@ std::size_t first_leaf_index(
                : ((member_count - 2) / fanout) + 1;
 }
 
+struct CampaignScaleCase
+{
+    std::uint32_t fanout{0};
+    std::uint64_t scientific_seed{0};
+    std::vector<ReplicaID> hard;
+    std::vector<ReplicaID> responsive_degraded;
+    std::vector<ReplicaID> fast;
+};
+
+std::vector<ReplicaID> campaign_membership()
+{
+    std::vector<ReplicaID> members;
+    members.reserve(31);
+    for (ReplicaID replica = 0; replica < 31; ++replica)
+        members.push_back(replica);
+    return members;
+}
+
+EpochDefinitionInput campaign_contained_epoch_input(
+    const CampaignScaleCase &profile)
+{
+    const auto members = campaign_membership();
+    const std::set<ReplicaID> hard(
+        profile.hard.begin(), profile.hard.end());
+
+    EpochDefinitionInput input;
+    input.schema_version = hotstuff::kEpochDefinitionSchemaVersionV2;
+    input.epoch_number = 0;
+    input.membership_digest =
+        hotstuff::canonical_membership_digest(members);
+    input.trees.reserve(21);
+    for (std::uint32_t tree_id = 0; tree_id < 21; ++tree_id)
+    {
+        std::vector<ReplicaID> ordered;
+        ordered.reserve(members.size());
+        ordered.push_back(static_cast<ReplicaID>(tree_id));
+        for (const auto member : members)
+        {
+            if (member != tree_id && hard.count(member) == 0)
+                ordered.push_back(member);
+        }
+        for (const auto member : profile.hard)
+            ordered.push_back(member);
+        input.trees.push_back(
+            EpochTreeDefinition{
+                tree_id,
+                profile.fanout,
+                2,
+                std::move(ordered),
+                profile.hard});
+    }
+    input.activation_height = 0;
+    input.generation_seed = profile.scientific_seed;
+    input.policy_version = "shape25-contained-predecessor-v1";
+    input.evidence_snapshot_id = "shape25-contained-predecessor-snapshot";
+    input.evidence_cutoff = 7;
+    return input;
+}
+
+AdaptiveV2SelectionResult campaign_inherited_selection(
+    const EpochDefinition &current,
+    const CampaignScaleCase &profile)
+{
+    const auto members = campaign_membership();
+    const std::set<ReplicaID> hard(
+        profile.hard.begin(), profile.hard.end());
+    const std::set<ReplicaID> degraded(
+        profile.responsive_degraded.begin(),
+        profile.responsive_degraded.end());
+    const AdaptationEpochId epoch{
+        current.epoch_number(), current.epoch_digest()};
+
+    std::vector<AcceptedEvidenceRecord> records;
+    records.reserve(members.size() * 32);
+    std::uint64_t sequence = 0;
+    for (const auto target : members)
+    {
+        for (std::uint32_t attempt = 0; attempt < 32; ++attempt)
+        {
+            ResponseObservation observation;
+            observation.reporter_id =
+                static_cast<ReplicaID>((target + 1) % members.size());
+            observation.observed_replica_id = target;
+            observation.configuration = ConfigurationId{
+                epoch.epoch_number, 0, epoch.epoch_digest};
+            observation.block_hash = digest(
+                "shape25-campaign-attempt-" +
+                std::to_string(profile.scientific_seed) + "-" +
+                std::to_string(target) + "-" +
+                std::to_string(attempt));
+            observation.expected_message_type =
+                ExpectedMessageType::aggregate_relay;
+            observation.deadline_duration_us = 1'000;
+            observation.reporter_sequence = sequence + 1;
+            observation.reporter_monotonic_ns =
+                (sequence + 1) * 1'000;
+            const bool omitted =
+                hard.count(target) != 0 ||
+                (degraded.count(target) != 0 && attempt == 31);
+            if (omitted)
+            {
+                observation.outcome = ResponseOutcome::timeout;
+            }
+            else
+            {
+                observation.outcome = ResponseOutcome::on_time;
+                observation.response_duration_us =
+                    degraded.count(target) == 0 ? 10 : 20;
+                observation.signer_set = {target};
+            }
+            observation.observation_id =
+                hotstuff::compute_response_observation_id(
+                    observation.attempt_identity());
+            records.push_back({++sequence, std::move(observation)});
+        }
+    }
+
+    AdaptationPolicy policy;
+    policy.policy_version = "shape25-sensitive-responsiveness-v1";
+    policy.attempt_window = 128;
+    policy.minimum_attempts = 32;
+    policy.minimum_response_rate_ppm = 950'000;
+    policy.maximum_timeout_rate_ppm = 50'000;
+    policy.trailing_timeout_streak = 2;
+    policy.latency_percentile_basis_points = 5'000;
+    auto snapshot = hotstuff::build_adaptation_snapshot(
+        members,
+        epoch,
+        AcceptedEvidenceView{records.data(), records.size()},
+        sequence,
+        policy,
+        profile.scientific_seed);
+
+    AdaptiveV2SelectionResult result;
+    result.status = AdaptiveV2SelectionStatus::selected;
+    result.constraint_basis = AdaptiveV2SelectionConstraintBasis::
+        inherited_consensus_wait_exempt;
+    result.metadata = {31, 10, 21, 3, 11, 1, 1, 1, sequence};
+    result.snapshot =
+        std::make_unique<hotstuff::AdaptationSnapshot>(
+            std::move(snapshot));
+    result.selected_replicas = profile.hard;
+    result.eligible_roots = profile.fast;
+    return result;
+}
+
 AdaptiveV2SelectionResult successful_selection(
     const EpochDefinition &current,
     std::vector<ReplicaID> selected_replicas = {0, 1})
@@ -657,12 +803,175 @@ TEST_CASE(
     CHECK(fixture.selection.metadata.required_nonresponsive == 1);
     CHECK(fixture.selection.selected_replicas ==
           std::vector<ReplicaID>{6});
+    REQUIRE(fixture.selection.eligible_roots ==
+            std::vector<ReplicaID>{0, 1, 2, 3, 4});
+    const auto lower_ranked_responsive = std::find_if(
+        fixture.selection.snapshot->ranking().begin(),
+        fixture.selection.snapshot->ranking().end(),
+        [](const auto &entry) { return entry.replica_id == 5; });
+    REQUIRE(lower_ranked_responsive !=
+            fixture.selection.snapshot->ranking().end());
+    REQUIRE(lower_ranked_responsive->rank >=
+            fixture.selection.metadata.quorum);
+    REQUIRE(lower_ranked_responsive->classification ==
+            ResponsivenessClass::responsive);
+    REQUIRE(lower_ranked_responsive->eligible);
     REQUIRE(result.bundle->definition().trees.size() == 5);
     for (const auto &candidate : result.bundle->definition().trees)
     {
         CHECK(candidate.wait_exempt_leaves ==
               std::vector<ReplicaID>{6});
         CHECK(candidate.members_breadth_first.front() != 6);
+        const auto leaf_start = first_leaf_index(
+            candidate.members_breadth_first.size(), candidate.fanout);
+        for (const auto constrained_leaf : {ReplicaID{5}, ReplicaID{6}})
+        {
+            const auto position = std::find(
+                candidate.members_breadth_first.begin(),
+                candidate.members_breadth_first.end(),
+                constrained_leaf);
+            REQUIRE(position != candidate.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      candidate.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
+    }
+}
+
+TEST_CASE(
+    "optimization rejects a shape that cannot leaf the root complement",
+    "[adaptive-v2][epoch-factory][minority][leaves][fail-closed]")
+{
+    Fixture fixture;
+    fixture.selection = successful_selection(
+        *fixture.current, {ReplicaID{6}});
+    REQUIRE(fixture.selection.eligible_roots ==
+            std::vector<ReplicaID>{0, 1, 2, 3, 4});
+    fixture.placement.shape.fanout = 1;
+
+    const auto result = fixture.build();
+
+    CHECK(result.status ==
+          AdaptiveV2EpochFactoryStatus::insufficient_leaf_capacity);
+    CHECK(result.bundle == nullptr);
+}
+
+TEST_CASE(
+    "N31 optimization keeps the exact f10 complement below every influential position",
+    "[adaptive-v2][epoch-factory][n31][campaign][optimization]")
+{
+    const std::vector<CampaignScaleCase> profiles{
+        CampaignScaleCase{
+            2,
+            41'725,
+            {25, 27, 29},
+            {2, 5, 7, 8, 12, 18, 19},
+            {0, 1, 3, 4, 6, 9, 10, 11, 13, 14, 15, 16, 17, 20,
+             21, 22, 23, 24, 26, 28, 30}},
+        CampaignScaleCase{
+            5,
+            41'731,
+            {22, 26, 30},
+            {1, 6, 8, 9, 12, 15, 20},
+            {0, 2, 3, 4, 5, 7, 10, 11, 13, 14, 16, 17, 18, 19,
+             21, 23, 24, 25, 27, 28, 29}}};
+
+    for (const auto &profile : profiles)
+    {
+        INFO(
+            "fanout=" << profile.fanout << " seed=" <<
+                profile.scientific_seed);
+        const auto members = campaign_membership();
+        const std::set<ReplicaID> worse(
+            profile.hard.begin(), profile.hard.end());
+        std::set<ReplicaID> expected_worse = worse;
+        expected_worse.insert(
+            profile.responsive_degraded.begin(),
+            profile.responsive_degraded.end());
+        REQUIRE(expected_worse.size() == 10);
+        REQUIRE(profile.fast.size() == 21);
+
+        EpochStore store{members};
+        const auto &current = store.stage(
+            campaign_contained_epoch_input(profile),
+            EpochValidationContext{});
+        auto selection = campaign_inherited_selection(current, profile);
+        REQUIRE(selection.snapshot != nullptr);
+        REQUIRE(selection.snapshot->ranking().size() == members.size());
+        for (std::size_t rank = 0; rank < profile.fast.size(); ++rank)
+        {
+            CHECK(selection.snapshot->ranking()[rank].replica_id ==
+                  profile.fast[rank]);
+            CHECK(selection.snapshot->ranking()[rank].eligible);
+        }
+        for (const auto replica : profile.responsive_degraded)
+        {
+            const auto entry = std::find_if(
+                selection.snapshot->ranking().begin(),
+                selection.snapshot->ranking().end(),
+                [replica](const auto &candidate)
+                { return candidate.replica_id == replica; });
+            REQUIRE(entry != selection.snapshot->ranking().end());
+            CHECK(entry->rank >= 21);
+            CHECK(entry->classification ==
+                  ResponsivenessClass::responsive);
+            CHECK(entry->eligible);
+            CHECK(entry->response_rate_ppm == 968'750);
+            CHECK(entry->timeout_rate_ppm == 31'250);
+        }
+
+        hotstuff::AdaptiveV2TransitionPolicy policy;
+        policy.intent = TreePolicyKind::performance_optimization;
+        const TreePlacementInput placement{
+            members,
+            TreeShape{profile.fanout, 2, 21},
+            profile.scientific_seed,
+            "shape25-performance-optimization-v1"};
+        const auto result =
+            hotstuff::build_adaptive_v2_successor_bundle(
+                current,
+                selection,
+                policy,
+                placement,
+                5,
+                kIssuerId,
+                private_key(),
+                EpochChangeBundleLimits{});
+
+        REQUIRE(result);
+        REQUIRE(result.bundle != nullptr);
+        REQUIRE(result.bundle->definition().trees.size() == 21);
+        CHECK(bundle_roots(*result.bundle) == profile.fast);
+        for (const auto &candidate : result.bundle->definition().trees)
+        {
+            CHECK(candidate.fanout == profile.fanout);
+            CHECK(candidate.wait_exempt_leaves == profile.hard);
+            const auto leaf_start = first_leaf_index(
+                candidate.members_breadth_first.size(),
+                candidate.fanout);
+            for (std::size_t position = 0;
+                 position < leaf_start;
+                 ++position)
+            {
+                CHECK(std::find(
+                          profile.fast.begin(),
+                          profile.fast.end(),
+                          candidate.members_breadth_first[position]) !=
+                      profile.fast.end());
+            }
+            for (const auto replica : expected_worse)
+            {
+                const auto position = std::find(
+                    candidate.members_breadth_first.begin(),
+                    candidate.members_breadth_first.end(),
+                    replica);
+                REQUIRE(position !=
+                        candidate.members_breadth_first.end());
+                CHECK(static_cast<std::size_t>(std::distance(
+                          candidate.members_breadth_first.begin(),
+                          position)) >= leaf_start);
+            }
+        }
     }
 }
 

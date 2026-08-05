@@ -417,14 +417,55 @@ std::size_t first_leaf_index(
                : ((member_count - 2) / fanout) + 1;
 }
 
+std::optional<std::vector<ReplicaID>> exact_membership_complement(
+    const std::vector<ReplicaID> &membership,
+    const std::vector<ReplicaID> &roots)
+{
+    const std::set<ReplicaID> members(
+        membership.begin(), membership.end());
+    if (members.size() != membership.size())
+        return std::nullopt;
+
+    std::set<ReplicaID> root_set;
+    for (const auto root : roots)
+    {
+        if (members.count(root) == 0 ||
+            !root_set.insert(root).second)
+        {
+            return std::nullopt;
+        }
+    }
+
+    std::vector<ReplicaID> complement;
+    complement.reserve(membership.size() - root_set.size());
+    for (const auto member : membership)
+    {
+        if (root_set.count(member) == 0)
+            complement.push_back(member);
+    }
+    if (root_set.size() + complement.size() != membership.size())
+        return std::nullopt;
+    return complement;
+}
+
 bool exact_optimized_placement(
     const TreePlacementResult &placement,
     const TreePlacementInput &input,
     const AdaptationSnapshot &snapshot,
     const std::vector<ReplicaID> &membership,
     const std::vector<ReplicaID> &roots,
-    const std::vector<ReplicaID> &selected)
+    const std::vector<ReplicaID> &constrained_leaves)
 {
+    const auto expected_constrained = exact_membership_complement(
+        membership, roots);
+    if (!expected_constrained.has_value() ||
+        *expected_constrained != constrained_leaves)
+    {
+        return false;
+    }
+    const std::set<ReplicaID> constrained(
+        constrained_leaves.begin(), constrained_leaves.end());
+
     const auto &explanation = placement.explanation();
     if (explanation.policy_kind !=
             TreePolicyKind::performance_optimization ||
@@ -449,6 +490,7 @@ bool exact_optimized_placement(
             tree.tree_id != index ||
             tree.members_breadth_first.empty() ||
             tree.members_breadth_first.front() != roots[index] ||
+            constrained.count(roots[index]) != 0 ||
             !tree.wait_exempt_leaves.empty())
         {
             return false;
@@ -463,12 +505,12 @@ bool exact_optimized_placement(
 
         const auto leaf_start = first_leaf_index(
             tree.members_breadth_first.size(), tree.fanout);
-        for (const auto selected_replica : selected)
+        for (const auto constrained_leaf : constrained_leaves)
         {
             const auto position = std::find(
                 tree.members_breadth_first.begin(),
                 tree.members_breadth_first.end(),
-                selected_replica);
+                constrained_leaf);
             if (position == tree.members_breadth_first.end() ||
                 static_cast<std::size_t>(std::distance(
                     tree.members_breadth_first.begin(), position)) <
@@ -689,6 +731,20 @@ AdaptiveV2EpochFactoryResult build_validated(
     if (selection_status != AdaptiveV2EpochFactoryStatus::success)
         return rejected(selection_status);
 
+    std::vector<ReplicaID> optimization_constrained_leaves;
+    if (transition_policy.intent ==
+        TreePolicyKind::performance_optimization)
+    {
+        const auto complement = exact_membership_complement(
+            *current_members, roots);
+        if (!complement.has_value())
+        {
+            return rejected(
+                AdaptiveV2EpochFactoryStatus::root_mismatch);
+        }
+        optimization_constrained_leaves = *complement;
+    }
+
     if (placement_input.shape.tree_count != quorum->quorum)
     {
         return rejected(
@@ -726,7 +782,13 @@ AdaptiveV2EpochFactoryResult build_validated(
 
     const auto leaf_start = first_leaf_index(
         current_members->size(), placement_input.shape.fanout);
-    if (selected.size() > current_members->size() - leaf_start)
+    const auto constrained_leaf_count =
+        transition_policy.intent ==
+                TreePolicyKind::performance_optimization
+            ? optimization_constrained_leaves.size()
+            : selected.size();
+    if (constrained_leaf_count >
+        current_members->size() - leaf_start)
     {
         return rejected(
             AdaptiveV2EpochFactoryStatus::insufficient_leaf_capacity);
@@ -753,7 +815,8 @@ AdaptiveV2EpochFactoryResult build_validated(
             placement.emplace(build_tree_placement(
                 placement_input,
                 *selection.snapshot,
-                PerformanceOptimizationPolicy{selected}));
+                PerformanceOptimizationPolicy{
+                    optimization_constrained_leaves}));
             break;
         default:
             return rejected(
@@ -791,7 +854,7 @@ AdaptiveV2EpochFactoryResult build_validated(
                   *selection.snapshot,
                   *current_members,
                   roots,
-                  selected);
+                  optimization_constrained_leaves);
     if (!exact_placement)
     {
         return rejected(
