@@ -210,6 +210,18 @@ uint256_t digest(const std::string &label)
     return DataStream(label).get_hash();
 }
 
+std::uint64_t monotonic_raw_now_ns()
+{
+    struct timespec timestamp{};
+    if (::clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) != 0 ||
+        timestamp.tv_sec < 0 || timestamp.tv_nsec < 0 ||
+        timestamp.tv_nsec >= 1'000'000'000)
+        throw std::runtime_error("CLOCK_MONOTONIC_RAW is unavailable");
+    return static_cast<std::uint64_t>(timestamp.tv_sec) *
+               UINT64_C(1000000000) +
+           static_cast<std::uint64_t>(timestamp.tv_nsec);
+}
+
 ConfigurationId configuration(
     std::uint32_t epoch = 7,
     std::uint32_t tree = 3,
@@ -567,7 +579,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "persistent omission accepts one additional exact configuration only",
+    "persistent omission accepts the additional configuration before primary",
     "[adaptive-v2][experiment][byzantine][omission][crosscheck]")
 {
     auto options = aggregate_omission_options();
@@ -728,27 +740,38 @@ TEST_CASE(
     "direct-vote omission forwards non-leaves and omits a leaf once",
     "[adaptive-v2][experiment][byzantine][direct-vote][role]")
 {
-    ExperimentByzantineAdapter adapter(direct_vote_omission_options());
+    auto options = direct_vote_omission_options();
+    options.maximum_direct_vote_omission_contexts = 1;
+    ExperimentByzantineAdapter adapter(options);
     const auto root = context("static-root");
     const auto internal = context("static-internal");
     const auto leaf = context("static-leaf");
+    const auto over_limit = context("static-leaf-over-limit");
 
     CHECK(
         adapter.consume_outbound_direct_vote(
             root, ExperimentReplicaRole::root, 1) ==
         ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(adapter.outbound_direct_vote_omitted(root));
     CHECK(
         adapter.consume_outbound_direct_vote(
             internal, ExperimentReplicaRole::internal, 1) ==
         ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(adapter.outbound_direct_vote_omitted(internal));
     CHECK(
         adapter.consume_outbound_direct_vote(
             leaf, ExperimentReplicaRole::leaf, 1) ==
         ExperimentDirectVoteDisposition::omit_first);
+    CHECK(adapter.outbound_direct_vote_omitted(leaf));
     CHECK(
         adapter.consume_outbound_direct_vote(
             leaf, ExperimentReplicaRole::leaf, 2) ==
         ExperimentDirectVoteDisposition::omit_repeat);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            over_limit, ExperimentReplicaRole::leaf, 3) ==
+        ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(adapter.outbound_direct_vote_omitted(over_limit));
 }
 
 TEST_CASE(
@@ -1231,15 +1254,71 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "experiment marker raw clock is available and positive",
+    "experiment omission emits one exact marker with a positive raw timestamp",
     "[adaptive-v2][experiment][byzantine][clock]")
 {
-    struct timespec timestamp{};
-    REQUIRE(::clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) == 0);
-    CHECK(timestamp.tv_sec >= 0);
-    CHECK(timestamp.tv_nsec >= 0);
-    CHECK(timestamp.tv_nsec < 1'000'000'000);
-    CHECK((timestamp.tv_sec > 0 || timestamp.tv_nsec > 0));
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    auto options = rotating_omission_options(
+        1, &markers, &encoded_markers);
+    REQUIRE(options.rotating_omission.has_value());
+    const auto window_start = monotonic_raw_now_ns();
+    const auto window_end = window_start + UINT64_C(300000000000);
+    options.rotating_omission->window_start_monotonic_ns = window_start;
+    options.rotating_omission->window_end_monotonic_ns = window_end;
+    ExperimentByzantineAdapter adapter(std::move(options));
+    const auto leaf = selected_context(adapter, 1, "raw-clock-marker");
+
+    const auto marker_timestamp = monotonic_raw_now_ns();
+    REQUIRE(marker_timestamp >= window_start);
+    REQUIRE(marker_timestamp < window_end);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, marker_timestamp) ==
+        ExperimentDirectVoteDisposition::omit_first);
+
+    const auto retry_timestamp = monotonic_raw_now_ns();
+    REQUIRE(retry_timestamp < window_end);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, retry_timestamp) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+    REQUIRE(markers.size() == 1);
+    REQUIRE(encoded_markers.size() == 1);
+
+    const auto &marker = markers.front();
+    CHECK(marker.proposal == leaf.proposal);
+    CHECK(marker.diagnostic_window == "factorial-window-1");
+    CHECK(marker.fault_mode == "rotating_intermittent_omission_v1");
+    CHECK(marker.actor == 1);
+    CHECK(marker.action == ExperimentOmissionAction::omit_direct_vote);
+    CHECK(marker.window_start_monotonic_ns == window_start);
+    CHECK(marker.window_end_monotonic_ns == window_end);
+    CHECK(marker.monotonic_ns == marker_timestamp);
+    CHECK(marker.monotonic_ns > 0);
+
+    const auto fields = parse_marker_fields(encoded_markers.front());
+    CHECK(fields.at("fault") == "rotating_intermittent_omission_v1");
+    CHECK(fields.at("proposal_epoch") == "7");
+    CHECK(fields.at("proposal_tree") == "3");
+    CHECK(
+        fields.at("proposal_epoch_digest") ==
+        hotstuff::get_hex(leaf.proposal.configuration.epoch_digest));
+    CHECK(
+        fields.at("proposal_block_hash") ==
+        hotstuff::get_hex(leaf.proposal.block_hash));
+    CHECK(fields.at("window") == "factorial-window-1");
+    CHECK(
+        fields.at("window_start_monotonic_ns") ==
+        std::to_string(window_start));
+    CHECK(
+        fields.at("window_end_monotonic_ns") ==
+        std::to_string(window_end));
+    CHECK(fields.at("actor") == "1");
+    CHECK(fields.at("action") == "omit_direct_vote");
+    CHECK(
+        fields.at("monotonic_ns") ==
+        std::to_string(marker_timestamp));
 }
 
 TEST_CASE(
