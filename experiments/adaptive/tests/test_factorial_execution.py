@@ -31,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v4.json"
 
 
 @pytest.fixture(scope="module")
@@ -1274,6 +1274,240 @@ def test_cycle2_native_terminal_authorizes_only_zero_manager_exit(
     clean_manager.returncode = 0
     with pytest.raises(execution.IncompleteFactorialSlot, match="adaptive-manager=0"):
         execution._assert_process_health((record,), expected_clean_exits=())
+
+
+def test_wait_health_freshly_authorizes_manager_exit_after_stale_predicate_snapshot(
+    tmp_path: Path,
+    template_slot,
+) -> None:
+    smoke = execution.build_n7_ps_smoke_slot(template_slot)
+    slot_directory = tmp_path / smoke.slot.slot_id
+    (slot_directory / "raw").mkdir(parents=True)
+    predicate_saw_terminal = False
+
+    class ExitAfterPredicateSnapshot(_FakeProcess):
+        def poll(self) -> int | None:
+            assert not predicate_saw_terminal
+            _write_cycle2_terminal(smoke.runtime, slot_directory)
+            self.returncode = 0
+            return self.returncode
+
+    manager = ExitAfterPredicateSnapshot(9_002)
+    record = ProcessRecord(
+        "adaptive-manager",
+        execution.MANAGER_REPLICA_ID,
+        manager.pid,
+        manager.pid,
+        manager,
+    )
+
+    def predicate() -> object:
+        nonlocal predicate_saw_terminal
+        snapshot = execution.read_event_streams(
+            smoke.runtime,
+            slot_directory,
+            allow_partial=True,
+        )
+        predicate_saw_terminal = (
+            execution._successful_manager_terminal(snapshot, cycle_ordinal=1)
+            is not None
+        )
+        return "ready"
+
+    result = execution._wait_until(
+        "cycle-2 terminal race",
+        predicate,
+        phase_timeout_s=1,
+        hard_deadline_ns=10_000,
+        records=(record,),
+        clean_exit_authorizer=lambda exited: execution._authorize_manager_clean_exit(
+            smoke.runtime,
+            slot_directory,
+            exited,
+        ),
+        raw_now_ns=lambda: 1,
+        sleep=lambda _seconds: None,
+        poll_interval_s=0,
+    )
+
+    assert result == "ready"
+    assert manager.returncode == 0
+
+
+def test_fresh_manager_exit_authorization_rejects_missing_terminal(
+    tmp_path: Path,
+    template_slot,
+) -> None:
+    smoke = execution.build_n7_ps_smoke_slot(template_slot)
+    slot_directory = tmp_path / smoke.slot.slot_id
+    (slot_directory / "raw").mkdir(parents=True)
+    manager = _FakeProcess(9_003, returncode=0)
+    record = ProcessRecord(
+        "adaptive-manager",
+        execution.MANAGER_REPLICA_ID,
+        manager.pid,
+        manager.pid,
+        manager,
+    )
+
+    with pytest.raises(execution.IncompleteFactorialSlot, match="adaptive-manager=0"):
+        execution._assert_process_health(
+            (record,),
+            clean_exit_authorizer=lambda exited: execution._authorize_manager_clean_exit(
+                smoke.runtime,
+                slot_directory,
+                exited,
+            ),
+        )
+
+
+def test_fresh_manager_exit_authorization_rejects_partial_terminal(
+    tmp_path: Path,
+    template_slot,
+) -> None:
+    smoke = execution.build_n7_ps_smoke_slot(template_slot)
+    slot_directory = tmp_path / smoke.slot.slot_id
+    manager_path = slot_directory / smoke.runtime.structured_events.manager_output_relative_path
+    manager_path.parent.mkdir(parents=True)
+    manager_path.write_bytes(b'{"event_schema_version":1')
+    manager = _FakeProcess(9_004, returncode=0)
+    record = ProcessRecord(
+        "adaptive-manager",
+        execution.MANAGER_REPLICA_ID,
+        manager.pid,
+        manager.pid,
+        manager,
+    )
+
+    with pytest.raises(execution.FactorialExecutionError, match="incomplete final JSONL"):
+        execution._assert_process_health(
+            (record,),
+            clean_exit_authorizer=lambda exited: execution._authorize_manager_clean_exit(
+                smoke.runtime,
+                slot_directory,
+                exited,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("terminal_payload", "error_match"),
+    (
+        (
+            {
+                "cycle_ordinal": 0,
+                "outcome": "advanced",
+                "reason": "successor_converged",
+            },
+            "adaptive-manager=0",
+        ),
+        (
+            {
+                "cycle_ordinal": 1,
+                "outcome": "incomplete",
+                "reason": "successor_converged",
+            },
+            "cycle 1 terminated without convergence",
+        ),
+        (
+            {
+                "cycle_ordinal": 1,
+                "outcome": "advanced",
+                "reason": "successor_timeout",
+            },
+            "cycle 1 terminated without convergence",
+        ),
+    ),
+)
+def test_fresh_manager_exit_authorization_rejects_wrong_terminal(
+    tmp_path: Path,
+    template_slot,
+    terminal_payload: dict[str, object],
+    error_match: str,
+) -> None:
+    smoke = execution.build_n7_ps_smoke_slot(template_slot)
+    slot_directory = tmp_path / smoke.slot.slot_id
+    manager_path = slot_directory / smoke.runtime.structured_events.manager_output_relative_path
+    manager_path.parent.mkdir(parents=True)
+    manager_path.write_bytes(
+        _event_line(
+            smoke.runtime,
+            source="adaptive-manager",
+            instance=smoke.runtime.structured_events.manager_source_instance,
+            sequence=1,
+            timestamp_ns=350_000_000_000,
+            event_type="adaptive_v2_session_terminal",
+            payload=terminal_payload,
+        )
+    )
+    manager = _FakeProcess(9_005, returncode=0)
+    record = ProcessRecord(
+        "adaptive-manager",
+        execution.MANAGER_REPLICA_ID,
+        manager.pid,
+        manager.pid,
+        manager,
+    )
+
+    with pytest.raises(
+        execution.IncompleteFactorialSlot,
+        match=error_match,
+    ):
+        execution._assert_process_health(
+            (record,),
+            clean_exit_authorizer=lambda exited: execution._authorize_manager_clean_exit(
+                smoke.runtime,
+                slot_directory,
+                exited,
+            ),
+        )
+
+
+def test_fresh_manager_exit_authorization_never_applies_to_other_process(
+    tmp_path: Path,
+    template_slot,
+) -> None:
+    smoke = execution.build_n7_ps_smoke_slot(template_slot)
+    slot_directory = tmp_path / smoke.slot.slot_id
+    (slot_directory / "raw").mkdir(parents=True)
+    _write_cycle2_terminal(smoke.runtime, slot_directory)
+    replica = _FakeProcess(9_006, returncode=0)
+    record = ProcessRecord("replica-0", 0, replica.pid, replica.pid, replica)
+
+    with pytest.raises(execution.IncompleteFactorialSlot, match="replica-0=0"):
+        execution._assert_process_health(
+            (record,),
+            clean_exit_authorizer=lambda exited: execution._authorize_manager_clean_exit(
+                smoke.runtime,
+                slot_directory,
+                exited,
+            ),
+        )
+
+
+def test_process_health_never_authorizes_nonzero_exit() -> None:
+    manager = _FakeProcess(9_007, returncode=7)
+    record = ProcessRecord(
+        "adaptive-manager",
+        execution.MANAGER_REPLICA_ID,
+        manager.pid,
+        manager.pid,
+        manager,
+    )
+    authorization_calls = 0
+
+    def authorize(_record: ProcessRecord) -> bool:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        return True
+
+    with pytest.raises(execution.IncompleteFactorialSlot, match="adaptive-manager=7"):
+        execution._assert_process_health(
+            (record,),
+            clean_exit_authorizer=authorize,
+        )
+
+    assert authorization_calls == 0
 
 
 @pytest.mark.parametrize(

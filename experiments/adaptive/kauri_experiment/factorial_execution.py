@@ -1375,13 +1375,8 @@ def read_event_streams(
 ) -> dict[str, tuple[_Event, ...]]:
     contract = spec.structured_events
     streams = {
-        "adaptive-manager": _read_event_file(
-            spec,
-            slot_directory,
-            source="adaptive-manager",
-            instance=contract.manager_source_instance,
-            relative_path=contract.manager_output_relative_path,
-            allow_partial=allow_partial,
+        "adaptive-manager": _read_manager_event_stream(
+            spec, slot_directory, allow_partial=allow_partial
         )
     }
     for replica_id in range(spec.replica_count):
@@ -1397,10 +1392,28 @@ def read_event_streams(
     return streams
 
 
+def _read_manager_event_stream(
+    spec: SlotRuntimeSpec,
+    slot_directory: Path,
+    *,
+    allow_partial: bool,
+) -> tuple[_Event, ...]:
+    contract = spec.structured_events
+    return _read_event_file(
+        spec,
+        slot_directory,
+        source="adaptive-manager",
+        instance=contract.manager_source_instance,
+        relative_path=contract.manager_output_relative_path,
+        allow_partial=allow_partial,
+    )
+
+
 def _assert_process_health(
     records: Sequence[ProcessRecord],
     *,
     expected_clean_exits: Collection[str] = (),
+    clean_exit_authorizer: Callable[[ProcessRecord], bool] | None = None,
 ) -> None:
     allowed = frozenset(expected_clean_exits)
     exited: list[str] = []
@@ -1409,6 +1422,12 @@ def _assert_process_health(
         if returncode is None:
             continue
         if record.name in allowed and returncode == 0:
+            continue
+        if (
+            returncode == 0
+            and clean_exit_authorizer is not None
+            and clean_exit_authorizer(record)
+        ):
             continue
         exited.append(f"{record.name}={returncode}")
     if exited:
@@ -1426,6 +1445,7 @@ def _wait_until(
     sleep: Callable[[float], None],
     poll_interval_s: float,
     expected_clean_exits: Collection[str] = (),
+    clean_exit_authorizer: Callable[[ProcessRecord], bool] | None = None,
 ) -> object:
     phase_deadline_ns = raw_now_ns() + int(phase_timeout_s * NANOSECONDS_PER_SECOND)
     while True:
@@ -1433,6 +1453,7 @@ def _wait_until(
         _assert_process_health(
             records,
             expected_clean_exits=expected_clean_exits,
+            clean_exit_authorizer=clean_exit_authorizer,
         )
         now = raw_now_ns()
         if now >= hard_deadline_ns:
@@ -1633,6 +1654,26 @@ def _successful_manager_terminal(
     return terminal
 
 
+def _authorize_manager_clean_exit(
+    spec: SlotRuntimeSpec,
+    slot_directory: Path,
+    record: ProcessRecord,
+) -> bool:
+    """Authorize only the manager's final clean exit from a fresh full read."""
+
+    if record.name != "adaptive-manager":
+        return False
+    manager_events = _read_manager_event_stream(
+        spec,
+        slot_directory,
+        allow_partial=False,
+    )
+    return _successful_manager_terminal(
+        {"adaptive-manager": manager_events},
+        cycle_ordinal=1,
+    ) is not None
+
+
 def observe_slot_phases(
     spec: SlotRuntimeSpec,
     slot_directory: Path,
@@ -1655,6 +1696,14 @@ def observe_slot_phases(
             "transition observer has an unknown manager-selection clock bound"
         )
     expected_clean_exits: set[str] = set()
+
+    def authorize_clean_exit(record: ProcessRecord) -> bool:
+        if record.name in expected_clean_exits:
+            return True
+        authorized = _authorize_manager_clean_exit(spec, slot_directory, record)
+        if authorized:
+            expected_clean_exits.add(record.name)
+        return authorized
 
     def streams() -> dict[str, tuple[_Event, ...]]:
         return read_event_streams(spec, slot_directory, allow_partial=True)
@@ -1682,6 +1731,7 @@ def observe_slot_phases(
             sleep=sleep,
             poll_interval_s=poll_interval_s,
             expected_clean_exits=expected_clean_exits,
+            clean_exit_authorizer=authorize_clean_exit,
         )
     )
     width_s = spec.cutoff_contract.bucket_width_s
@@ -1733,6 +1783,7 @@ def observe_slot_phases(
         sleep=sleep,
         poll_interval_s=poll_interval_s,
         expected_clean_exits=expected_clean_exits,
+        clean_exit_authorizer=authorize_clean_exit,
     )
     if not isinstance(baseline_common, Mapping):
         raise FactorialExecutionError("baseline common-commit proof is malformed")
@@ -1781,10 +1832,14 @@ def observe_slot_phases(
         sleep=sleep,
         poll_interval_s=poll_interval_s,
         expected_clean_exits=expected_clean_exits,
+        clean_exit_authorizer=authorize_clean_exit,
     )
 
-    def replica_barrier(event_type: str, epoch: int) -> _Event | None:
-        current = streams()
+    def replica_barrier(
+        current: Mapping[str, Sequence[_Event]],
+        event_type: str,
+        epoch: int,
+    ) -> _Event | None:
         selected: list[_Event] = []
         identities: set[tuple[object, ...]] = set()
         for replica_id in range(spec.replica_count):
@@ -1838,12 +1893,6 @@ def observe_slot_phases(
     for cycle, epoch in ((0, 1), (1, 2)):
         def manager_selection() -> _Event | None:
             current = streams()
-            terminal = _successful_manager_terminal(
-                current,
-                cycle_ordinal=cycle,
-            )
-            if terminal is not None and cycle == 1:
-                expected_clean_exits.add("adaptive-manager")
             return _single_manager_event(
                 current,
                 event_type="adaptive_v2_shape_decision",
@@ -1854,8 +1903,8 @@ def observe_slot_phases(
             selected_shape: _Event | None = None,
         ) -> tuple[_Event, _Event, _Event] | None:
             current = streams()
-            command = replica_barrier("epoch.command_committed", epoch)
-            activation = replica_barrier("epoch.activated", epoch)
+            command = replica_barrier(current, "epoch.command_committed", epoch)
+            activation = replica_barrier(current, "epoch.activated", epoch)
             shape = _single_manager_event(
                 current,
                 event_type="adaptive_v2_shape_decision",
@@ -1865,8 +1914,6 @@ def observe_slot_phases(
                 current,
                 cycle_ordinal=cycle,
             )
-            if terminal is not None and cycle == 1:
-                expected_clean_exits.add("adaptive-manager")
             if selected_shape is not None and shape != selected_shape:
                 raise FactorialExecutionError(
                     f"epoch-{epoch} manager selection identity changed"
@@ -1894,6 +1941,7 @@ def observe_slot_phases(
                 sleep=sleep,
                 poll_interval_s=poll_interval_s,
                 expected_clean_exits=expected_clean_exits,
+                clean_exit_authorizer=authorize_clean_exit,
             )
             if not isinstance(shape, _Event):
                 raise FactorialExecutionError(
@@ -1913,6 +1961,7 @@ def observe_slot_phases(
                 sleep=sleep,
                 poll_interval_s=poll_interval_s,
                 expected_clean_exits=expected_clean_exits,
+                clean_exit_authorizer=authorize_clean_exit,
             )
         else:
             command, activation, shape = _wait_until(
@@ -1928,6 +1977,7 @@ def observe_slot_phases(
                 sleep=sleep,
                 poll_interval_s=poll_interval_s,
                 expected_clean_exits=expected_clean_exits,
+                clean_exit_authorizer=authorize_clean_exit,
             )
         transition_events[epoch] = (command, activation, shape)
         activation_configuration = _event_payload(activation).get("configuration")
@@ -1977,6 +2027,7 @@ def observe_slot_phases(
             sleep=sleep,
             poll_interval_s=poll_interval_s,
             expected_clean_exits=expected_clean_exits,
+            clean_exit_authorizer=authorize_clean_exit,
         )
         assert isinstance(stable_start_event, _Event)
         stable_end = stable_start_event.timestamp_ns + stable_count * width_ns
@@ -2003,6 +2054,7 @@ def observe_slot_phases(
             sleep=sleep,
             poll_interval_s=poll_interval_s,
             expected_clean_exits=expected_clean_exits,
+            clean_exit_authorizer=authorize_clean_exit,
         )
         if not isinstance(stable_common, Mapping):
             raise FactorialExecutionError(
@@ -2040,6 +2092,7 @@ def observe_slot_phases(
         sleep=sleep,
         poll_interval_s=poll_interval_s,
         expected_clean_exits=expected_clean_exits,
+        clean_exit_authorizer=authorize_clean_exit,
     )
     assert isinstance(drain_event, _Event)
 

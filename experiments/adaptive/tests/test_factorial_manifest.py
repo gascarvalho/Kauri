@@ -17,6 +17,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FROZEN_PLAN_SHA256,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
+    V3_MANIFEST_ID,
+    V3_MANIFEST_SHA256,
+    V3_PLAN_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -33,6 +36,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v4.json"
+)
+V3_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
 )
 V2_MANIFEST_PATH = (
@@ -251,7 +257,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v3/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v4/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -549,7 +555,34 @@ def test_manifest_preserves_not_started_slots() -> None:
         parse_manifest_bytes(_encoded(document))
 
 
-def test_compact_snapshot_format_is_frozen_and_v2_remains_loadable() -> None:
+def test_v4_changes_only_identity_and_root_while_prior_versions_remain_loadable() -> None:
+    v3 = load_frozen_manifest(V3_MANIFEST_PATH)
+    assert v3.manifest_id == V3_MANIFEST_ID
+    assert v3.manifest_sha256 == V3_MANIFEST_SHA256
+    assert build_factorial_plan(v3).plan_sha256 == V3_PLAN_SHA256
+    assert v3.evidence_snapshot_format == "digest_commitment_v2"
+
+    expected_v4_bytes = V3_MANIFEST_PATH.read_bytes().replace(
+        b'"shape-placement-factorial-v3"',
+        b'"shape-placement-factorial-v4"',
+    ).replace(
+        b'"results/shape-placement-factorial-v3"',
+        b'"results/shape-placement-factorial-v4"',
+    )
+    assert MANIFEST_PATH.read_bytes() == expected_v4_bytes
+
+    v4_document = json.loads(MANIFEST_PATH.read_bytes())
+    v3_document = json.loads(V3_MANIFEST_PATH.read_bytes())
+    assert v4_document.pop("manifest_id") == "shape-placement-factorial-v4"
+    assert v3_document.pop("manifest_id") == "shape-placement-factorial-v3"
+    assert v4_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v4"
+    )
+    assert v3_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v3"
+    )
+    assert v4_document == v3_document
+
     legacy_v2 = load_frozen_manifest(V2_MANIFEST_PATH)
     assert legacy_v2.manifest_id == V2_MANIFEST_ID
     assert legacy_v2.manifest_sha256 == V2_MANIFEST_SHA256

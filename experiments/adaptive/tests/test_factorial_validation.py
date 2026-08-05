@@ -42,6 +42,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v4.json"
+)
+V3_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
 )
 V2_MANIFEST_PATH = (
@@ -209,7 +212,7 @@ def test_actor_and_fnv_vectors_recompute_without_runtime_decision_code() -> None
         ) == (vector.fnv1a64, vector.selected_actor)
 
 
-def test_validator_retains_exact_v1_v2_and_v3_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v4_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -217,15 +220,20 @@ def test_validator_retains_exact_v1_v2_and_v3_artifact_identities() -> None:
         for version, path in (
             (1, LEGACY_MANIFEST_PATH),
             (2, V2_MANIFEST_PATH),
-            (3, MANIFEST_PATH),
+            (3, V3_MANIFEST_PATH),
+            (4, MANIFEST_PATH),
         )
     }
 
     assert identities[1].manifest_sha256 == validation.LEGACY_MANIFEST_SHA256
     assert identities[2].manifest_sha256 == validation.V2_MANIFEST_SHA256
     assert identities[2].runtime_sha256 == validation.V2_RUNTIME_SHA256
-    assert identities[3].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[3].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[3].manifest_sha256 == validation.V3_MANIFEST_SHA256
+    assert identities[3].runtime_sha256 == validation.V3_RUNTIME_SHA256
+    assert identities[3].smoke_runtime_sha256 == validation.V3_SMOKE_RUNTIME_SHA256
+    assert identities[4].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[4].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[4].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
 
 
 def _compact_snapshot_audit() -> dict[str, object]:
@@ -246,7 +254,7 @@ def _compact_snapshot_audit() -> dict[str, object]:
     }
 
 
-def test_v3_compact_snapshot_schema_and_legacy_snapshot_schema_are_exact() -> None:
+def test_compact_snapshot_schema_and_legacy_snapshot_schema_are_exact() -> None:
     compact = _compact_snapshot_audit()
     assert validation._validate_snapshot_audit_schema(
         compact,
@@ -294,7 +302,7 @@ def test_v3_compact_snapshot_schema_and_legacy_snapshot_schema_are_exact() -> No
         ("evidence_snapshot_id", "77" * 32, "commitments"),
     ),
 )
-def test_v3_compact_snapshot_rejects_count_or_commitment_tampering(
+def test_compact_snapshot_rejects_count_or_commitment_tampering(
     field: str,
     value: object,
     match: str,
@@ -337,7 +345,7 @@ def _sparse_evidence_record(
     )
 
 
-def test_v3_compact_snapshot_preserves_sparse_accepted_ledger_integrity(
+def test_compact_snapshot_preserves_sparse_accepted_ledger_integrity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     records = (
@@ -1867,7 +1875,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
-def test_v3_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+def test_v4_receipt_rejects_an_exact_legacy_manifest_plan_pair(
     tmp_path: Path,
 ) -> None:
     recovered, _, receipt, expected, runtime, authorization = (

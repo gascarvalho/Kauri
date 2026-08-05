@@ -62,6 +62,9 @@ from .factorial_manifest import (
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
     V2_PLAN_SHA256,
+    V3_MANIFEST_ID,
+    V3_MANIFEST_SHA256,
+    V3_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -99,11 +102,17 @@ V2_RUNTIME_SHA256 = (
 V2_SMOKE_RUNTIME_SHA256 = (
     "2be6930b5770b5bbe4991673675a1f1d8443d3526c388b744b601c59e9216a37"
 )
-FROZEN_RUNTIME_SHA256 = (
+V3_RUNTIME_SHA256 = (
     "ff62f12a584b5345e0043a3cf1d9567a2264261bafe25dec5bb9afe079513b92"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V3_SMOKE_RUNTIME_SHA256 = (
     "4e4231b3cd487549da5e468aafc67cefbc11c39459b79dcb37a679225d360c85"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "27ca88025f5a22f74707bf724ca7e2155c7be8574043e96434cb7e553338a376"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "80a54a9035ac2cc816fe985b4011c060fe21a81894da56156ce75dbda7e81046"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -230,6 +239,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=V2_PLAN_SHA256,
             runtime_sha256=V2_RUNTIME_SHA256,
             smoke_runtime_sha256=V2_SMOKE_RUNTIME_SHA256,
+        ),
+        V3_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V3_MANIFEST_ID,
+            manifest_sha256=V3_MANIFEST_SHA256,
+            plan_sha256=V3_PLAN_SHA256,
+            runtime_sha256=V3_RUNTIME_SHA256,
+            smoke_runtime_sha256=V3_SMOKE_RUNTIME_SHA256,
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -1700,7 +1716,11 @@ def _validate_runtime_slot(
         "drain_margin_s": manifest.common_timers.drain_margin_s,
         "hard_timeout_s": manifest.common_timers.hard_timeout_s,
     }
-    if manifest.manifest_id in {V2_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest.manifest_id in {
+        V2_MANIFEST_ID,
+        V3_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         expected_fault_window["transition_observation_bound_rule"] = (
             "shared_slot_hard_deadline_until_manager_selection_v1"
         )
