@@ -2928,25 +2928,47 @@ def _fault_markers(
     return tuple(markers)
 
 
-def _adaptive_proposal_identity(event: _NativeEvent) -> tuple[int, int, str, str, int] | None:
+def _adaptive_proposal_identity(
+    event: _NativeEvent,
+) -> tuple[int, int, str, str, int] | None:
+    if not (
+        event.event_type == "adaptive.configuration_active"
+        or event.event_type.startswith("aggregation.")
+    ):
+        return None
     payload = event.payload
-    configuration = payload.get("configuration")
+    _fields(
+        payload,
+        {
+            "epoch_number",
+            "tree_id",
+            "epoch_digest",
+            "block_hash",
+            "context_generation",
+            "observer_replica",
+            "wait_exempt_signers",
+            "accepted_signers",
+            "absent_direct_children",
+            "missing_optional_signers",
+            "required_branch_gaps",
+            "root_signer_count",
+            "global_quorum",
+            "rejection_reason",
+        },
+        f"{event.relative_path}:{event.line_number}.payload",
+    )
     block_hash = payload.get("block_hash")
     observer = payload.get("observer_replica")
-    if not isinstance(configuration, Mapping) or block_hash is None or type(observer) is not int:
+    if block_hash is None:
         return None
-    if set(configuration) != {"epoch_number", "tree_id", "epoch_digest"}:
-        return None
-    try:
-        return (
-            _integer(configuration["epoch_number"], "adaptive epoch"),
-            _integer(configuration["tree_id"], "adaptive tree"),
-            _digest(configuration["epoch_digest"], "adaptive epoch digest"),
-            _digest(block_hash, "adaptive block hash"),
-            _integer(observer, "adaptive observer"),
-        )
-    except FactorialValidationError:
-        raise
+    _integer(payload.get("context_generation"), "adaptive context generation", 1)
+    return (
+        _integer(payload["epoch_number"], "adaptive epoch"),
+        _integer(payload["tree_id"], "adaptive tree"),
+        _digest(payload["epoch_digest"], "adaptive epoch digest"),
+        _digest(block_hash, "adaptive block hash"),
+        _integer(observer, "adaptive observer"),
+    )
 
 
 def _validate_fault_marker_schedule(
@@ -3090,13 +3112,15 @@ def validate_fault_causality(
         fault_mode=fault_mode,
         max_omissions_per_proposal=max_omissions_per_proposal,
     )
-    proposals_by_replica: dict[int, set[tuple[int, int, str, str, int]]] = {}
+    proposals: set[tuple[int, int, str, str]] = set()
     for replica_id, events in replica_events.items():
-        proposals_by_replica[replica_id] = {
-            identity
-            for event in events
-            if (identity := _adaptive_proposal_identity(event)) is not None
-        }
+        for event in events:
+            identity = _adaptive_proposal_identity(event)
+            if identity is None:
+                continue
+            if identity[4] != replica_id:
+                _fail("adaptive proposal observer differs from its replica stream")
+            proposals.add(identity[:4])
     tree_by_id = {tree.tree_id: tree for tree in initial_trees}
     epoch1_tree_by_id = {tree.tree_id: tree for tree in epoch1_trees}
     epoch2_tree_by_id = {tree.tree_id: tree for tree in epoch2_trees}
@@ -3174,9 +3198,8 @@ def validate_fault_causality(
             marker.tree_id,
             marker.epoch_digest,
             marker.block_hash,
-            marker.actor,
         )
-        if identity not in proposals_by_replica.get(marker.actor, set()):
+        if identity not in proposals:
             _fail("fault marker has no matching native proposal/configuration event")
         if not (
             marker.epoch_number == 0
@@ -4863,6 +4886,34 @@ def _activation_identity(payload: Mapping[str, Any], label: str) -> dict[str, An
     }
 
 
+def _expected_activation_generation(
+    epoch_number: object,
+    rotation_ordinal: object = 0,
+) -> int:
+    """Mirror checked_activation_generation from the native epoch runtime."""
+
+    epoch = _integer(epoch_number, "activation generation epoch")
+    rotation = _integer(rotation_ordinal, "activation generation rotation")
+    if epoch > 0xFFFF_FFFF or rotation > 0xFFFF_FFFF:
+        _fail("activation generation components exceed uint32")
+    packed = (epoch << 32) | rotation
+    if packed == 0xFFFF_FFFF_FFFF_FFFF:
+        _fail("activation generation overflows uint64")
+    return packed + 1
+
+
+def _validated_activation_generation(
+    value: object,
+    *,
+    predecessor_epoch_number: int,
+    label: str,
+) -> int:
+    generation = _integer(value, label, 1)
+    if generation != _expected_activation_generation(predecessor_epoch_number):
+        _fail(f"{label} does not match the canonical predecessor epoch")
+    return generation
+
+
 def _record_activation_identity(
     activation: dict[str, Any],
     *,
@@ -5083,6 +5134,11 @@ def _validate_native_transitions(
             observation_bound_rule=transition_observation_bound_rule,
             convergence_deadline_s=expected_convergence_deadline_s,
         )
+        terminal_generation = _validated_activation_generation(
+            payload["evidence_window_activation_generation"],
+            predecessor_epoch_number=cycle,
+            label="manager terminal evidence-window activation generation",
+        )
         if (
             payload["cycle_ordinal"] != cycle
             or payload["policy_intent"] != expected_intent
@@ -5096,6 +5152,7 @@ def _validate_native_transitions(
             or payload["successor_epoch_digest"] != bundle.epoch_digest
             or payload["command_payload_digest"] != bundle.command.payload_digest
             or snapshot is None
+            or terminal_generation != snapshot.get("activation_generation")
             or payload["baseline_evidence_cutoff"] != snapshot.get("baseline_cutoff")
             or payload["current_evidence_cutoff"] != snapshot.get("current_cutoff")
         ):
@@ -5211,13 +5268,17 @@ def _validate_adaptation_cycles(
         intent = _string(request.get("policy_intent"), "transition policy intent")
         baseline_cutoff = _integer(snapshot["baseline_cutoff"], "snapshot baseline cutoff", 1)
         current_cutoff = _integer(snapshot["current_cutoff"], "snapshot current cutoff", 1)
+        _validated_activation_generation(
+            snapshot["activation_generation"],
+            predecessor_epoch_number=cycle,
+            label="snapshot activation generation",
+        )
         if (
             snapshot["cycle_ordinal"] != cycle
             or snapshot["policy_intent"] != intent
             or snapshot["transition_artifact_id"] != artifact_id
             or snapshot["predecessor_epoch_number"] != cycle
             or snapshot["predecessor_epoch_digest"] != predecessor_digest
-            or snapshot["activation_generation"] != cycle + 1
             or current_cutoff <= baseline_cutoff
         ):
             _fail("evidence snapshot is not bound to its exact live cycle")

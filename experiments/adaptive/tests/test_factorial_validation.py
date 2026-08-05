@@ -266,7 +266,7 @@ def _compact_snapshot_audit() -> dict[str, object]:
         "transition_artifact_id": "slot-test-epoch2",
         "predecessor_epoch_number": 1,
         "predecessor_epoch_digest": "33" * 32,
-        "activation_generation": 2,
+        "activation_generation": 4_294_967_297,
         "baseline_cutoff": 1,
         "current_cutoff": 3,
         "full_prefix_snapshot_id": "44" * 32,
@@ -313,6 +313,37 @@ def test_compact_snapshot_schema_and_legacy_snapshot_schema_are_exact() -> None:
             {**compact, "schema_version": 1},
             evidence_snapshot_format="digest_commitment_v2",
             label="test compact snapshot",
+        )
+
+
+def test_activation_generation_matches_native_epoch_packing() -> None:
+    assert validation._expected_activation_generation(0) == 1
+    assert validation._expected_activation_generation(1) == 4_294_967_297
+    assert validation._expected_activation_generation(1, 7) == 4_294_967_304
+    assert validation._expected_activation_generation(
+        0xFFFF_FFFF, 0xFFFF_FFFE
+    ) == 0xFFFF_FFFF_FFFF_FFFF
+    assert validation._validated_activation_generation(
+        4_294_967_297,
+        predecessor_epoch_number=1,
+        label="test generation",
+    ) == 4_294_967_297
+
+    with pytest.raises(FactorialValidationError, match="exceed uint32"):
+        validation._expected_activation_generation(0x1_0000_0000)
+    with pytest.raises(FactorialValidationError, match="overflows uint64"):
+        validation._expected_activation_generation(0xFFFF_FFFF, 0xFFFF_FFFF)
+    with pytest.raises(FactorialValidationError, match="integer"):
+        validation._validated_activation_generation(
+            True,
+            predecessor_epoch_number=0,
+            label="test generation",
+        )
+    with pytest.raises(FactorialValidationError, match="canonical predecessor"):
+        validation._validated_activation_generation(
+            2,
+            predecessor_epoch_number=0,
+            label="test generation",
         )
 
 
@@ -719,6 +750,26 @@ def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> No
                 return block_hash
             counter += 1
 
+    def adaptive_payload(
+        *, epoch: int, tree_id: int, digest: str, block_hash: str, actor: int
+    ) -> dict[str, object]:
+        return {
+            "epoch_number": epoch,
+            "tree_id": tree_id,
+            "epoch_digest": digest,
+            "block_hash": block_hash,
+            "context_generation": 1,
+            "observer_replica": actor,
+            "wait_exempt_signers": [],
+            "accepted_signers": [],
+            "absent_direct_children": [],
+            "missing_optional_signers": [],
+            "required_branch_gaps": [],
+            "root_signer_count": 0,
+            "global_quorum": 0,
+            "rejection_reason": None,
+        }
+
     for offset, actor in enumerate(actors):
         for guard_offset, tree_id in enumerate((actor - 1, actor - 2)):
             block_hash = selected_hash(
@@ -775,16 +826,14 @@ def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> No
                     source_id=f"replica-{actor}",
                     sequence=len(events_by_actor[actor]) + 1,
                     monotonic_ns=marker_ns - 10,
-                    event_type="proposal.received",
-                    payload={
-                        "configuration": {
-                            "epoch_number": 0,
-                            "tree_id": tree_id,
-                            "epoch_digest": epoch_digest,
-                        },
-                        "block_hash": block_hash,
-                        "observer_replica": actor,
-                    },
+                    event_type="aggregation.required_set_ready",
+                    payload=adaptive_payload(
+                        epoch=0,
+                        tree_id=tree_id,
+                        digest=epoch_digest,
+                        block_hash=block_hash,
+                        actor=actor,
+                    ),
                 )
             )
         epoch1_tree_id = offset
@@ -818,16 +867,14 @@ def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> No
                 source_id=f"replica-{actor}",
                 sequence=len(events_by_actor[actor]) + 1,
                 monotonic_ns=690 + offset,
-                event_type="proposal.received",
-                payload={
-                    "configuration": {
-                        "epoch_number": 1,
-                        "tree_id": epoch1_tree_id,
-                        "epoch_digest": epoch1_digest,
-                    },
-                    "block_hash": epoch1_block_hash,
-                    "observer_replica": actor,
-                },
+                event_type="aggregation.required_set_ready",
+                payload=adaptive_payload(
+                    epoch=1,
+                    tree_id=epoch1_tree_id,
+                    digest=epoch1_digest,
+                    block_hash=epoch1_block_hash,
+                    actor=actor,
+                ),
             )
         )
         epoch2_tree_id = offset
@@ -861,16 +908,14 @@ def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> No
                 source_id=f"replica-{actor}",
                 sequence=len(events_by_actor[actor]) + 1,
                 monotonic_ns=990 + offset,
-                event_type="proposal.received",
-                payload={
-                    "configuration": {
-                        "epoch_number": 2,
-                        "tree_id": epoch2_tree_id,
-                        "epoch_digest": epoch2_digest,
-                    },
-                    "block_hash": epoch2_block_hash,
-                    "observer_replica": actor,
-                },
+                event_type="aggregation.required_set_ready",
+                payload=adaptive_payload(
+                    epoch=2,
+                    tree_id=epoch2_tree_id,
+                    digest=epoch2_digest,
+                    block_hash=epoch2_block_hash,
+                    actor=actor,
+                ),
             )
         )
     events = {actor: tuple(rows) for actor, rows in events_by_actor.items()}
@@ -904,6 +949,59 @@ def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> No
         current_cutoff=10,
     )
     validate_fault_causality(markers=markers, **arguments)
+
+    actor = actors[0]
+    actor_events = events[actor]
+    first_proposal = actor_events[0]
+    cross_observer = 0
+    cross_observer_event = _native_event(
+        source_id=f"replica-{cross_observer}",
+        sequence=1,
+        monotonic_ns=first_proposal.monotonic_ns,
+        event_type=first_proposal.event_type,
+        payload={**first_proposal.payload, "observer_replica": cross_observer},
+    )
+    cross_observer_events = {
+        **events,
+        actor: actor_events[1:],
+        cross_observer: (cross_observer_event,),
+    }
+    validate_fault_causality(
+        markers=markers,
+        **{**arguments, "replica_events": cross_observer_events},
+    )
+
+    mismatched_observer = replace(
+        first_proposal,
+        payload={**first_proposal.payload, "observer_replica": cross_observer},
+    )
+    with pytest.raises(FactorialValidationError, match="observer differs"):
+        validate_fault_causality(
+            markers=markers,
+            **{
+                **arguments,
+                "replica_events": {
+                    **events,
+                    actor: (mismatched_observer, *actor_events[1:]),
+                },
+            },
+        )
+
+    mismatched_proposal = replace(
+        first_proposal,
+        payload={**first_proposal.payload, "block_hash": "99" * 32},
+    )
+    with pytest.raises(FactorialValidationError, match="no matching native proposal"):
+        validate_fault_causality(
+            markers=markers,
+            **{
+                **arguments,
+                "replica_events": {
+                    **events,
+                    actor: (mismatched_proposal, *actor_events[1:]),
+                },
+            },
+        )
 
     actor_internal = [
         marker
