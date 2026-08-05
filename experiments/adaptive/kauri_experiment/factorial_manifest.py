@@ -55,14 +55,23 @@ V5_SEMANTIC_SHA256 = (
 )
 V5_PLAN_SHA256 = "5566cf5262fa1b41cf60bc8328e37cdf9439cc60a3d90c03140d0ebec31f040f"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v6"
-FROZEN_MANIFEST_SHA256 = (
+V6_MANIFEST_ID = "shape-placement-factorial-v6"
+V6_MANIFEST_SHA256 = (
     "a513f5de8e04ea1a677e365dffcb086a27299bd7179c231d98d52fa104a059d3"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V6_SEMANTIC_SHA256 = (
     "bfb6f4d3f6e88fb5f58cd37fde7db4f67e2927ed81d0bcfb7059e59aa5c4f66f"
 )
-FROZEN_PLAN_SHA256 = "674fdac9511bac8362bce0aa3dd939a4a65117f35b3652a8cd6c153a8a7fdc57"
+V6_PLAN_SHA256 = "674fdac9511bac8362bce0aa3dd939a4a65117f35b3652a8cd6c153a8a7fdc57"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v7"
+FROZEN_MANIFEST_SHA256 = (
+    "3160855b1c023269c775ecf5b8d11b6cd19931dd686ff6875ea9c305b1744a18"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "e6a8ec618e7b5dddbd01f86846ea0b13cc4ee5acfc82436d63572410d7170b12"
+)
+FROZEN_PLAN_SHA256 = "18469f3b00f3dfb9b92c586ec46cce1f1b76b49faf506840eb30bd769e5f7026"
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
 EXPECTED_CANDIDATE_FANOUTS = (2, 3, 5)
@@ -543,6 +552,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V3_MANIFEST_ID,
         V4_MANIFEST_ID,
         V5_MANIFEST_ID,
+        V6_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
@@ -551,12 +561,14 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V3_MANIFEST_ID,
         V4_MANIFEST_ID,
         V5_MANIFEST_ID,
+        V6_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
         V3_MANIFEST_ID,
         V4_MANIFEST_ID,
         V5_MANIFEST_ID,
+        V6_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -954,7 +966,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v6 may carry the compact "
+            "only shape-placement-factorial-v3 through v7 may carry the compact "
             "snapshot format field"
         )
 
@@ -965,6 +977,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V3_MANIFEST_ID: V3_SEMANTIC_SHA256,
         V4_MANIFEST_ID: V4_SEMANTIC_SHA256,
         V5_MANIFEST_ID: V5_SEMANTIC_SHA256,
+        V6_MANIFEST_ID: V6_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -1160,6 +1173,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V3_MANIFEST_ID: V3_MANIFEST_SHA256,
         V4_MANIFEST_ID: V4_MANIFEST_SHA256,
         V5_MANIFEST_ID: V5_MANIFEST_SHA256,
+        V6_MANIFEST_ID: V6_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -1428,6 +1442,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V3_MANIFEST_ID: (V3_MANIFEST_SHA256, V3_PLAN_SHA256),
         V4_MANIFEST_ID: (V4_MANIFEST_SHA256, V4_PLAN_SHA256),
         V5_MANIFEST_ID: (V5_MANIFEST_SHA256, V5_PLAN_SHA256),
+        V6_MANIFEST_ID: (V6_MANIFEST_SHA256, V6_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -1476,6 +1491,10 @@ __all__ = (
     "V5_MANIFEST_SHA256",
     "V5_PLAN_SHA256",
     "V5_SEMANTIC_SHA256",
+    "V6_MANIFEST_ID",
+    "V6_MANIFEST_SHA256",
+    "V6_PLAN_SHA256",
+    "V6_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",

@@ -42,6 +42,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
+)
+V6_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v6.json"
 )
 V5_MANIFEST_PATH = (
@@ -218,7 +221,7 @@ def test_actor_and_fnv_vectors_recompute_without_runtime_decision_code() -> None
         ) == (vector.fnv1a64, vector.selected_actor)
 
 
-def test_validator_retains_exact_v1_through_v6_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v7_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -229,7 +232,8 @@ def test_validator_retains_exact_v1_through_v6_artifact_identities() -> None:
             (3, V3_MANIFEST_PATH),
             (4, V4_MANIFEST_PATH),
             (5, V5_MANIFEST_PATH),
-            (6, MANIFEST_PATH),
+            (6, V6_MANIFEST_PATH),
+            (7, MANIFEST_PATH),
         )
     }
 
@@ -245,12 +249,17 @@ def test_validator_retains_exact_v1_through_v6_artifact_identities() -> None:
     assert identities[5].manifest_sha256 == validation.V5_MANIFEST_SHA256
     assert identities[5].runtime_sha256 == validation.V5_RUNTIME_SHA256
     assert identities[5].smoke_runtime_sha256 == validation.V5_SMOKE_RUNTIME_SHA256
-    assert identities[6].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[6].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
-    assert identities[6].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    assert identities[6].manifest_sha256 == validation.V6_MANIFEST_SHA256
+    assert identities[6].runtime_sha256 == validation.V6_RUNTIME_SHA256
+    assert identities[6].smoke_runtime_sha256 == validation.V6_SMOKE_RUNTIME_SHA256
+    assert identities[7].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[7].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[7].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
 
 
-@pytest.mark.parametrize("manifest_path", (V4_MANIFEST_PATH, V5_MANIFEST_PATH))
+@pytest.mark.parametrize(
+    "manifest_path", (V4_MANIFEST_PATH, V5_MANIFEST_PATH, V6_MANIFEST_PATH)
+)
 def test_exact_prior_runtime_remains_validator_compatible(
     manifest_path: Path,
 ) -> None:
@@ -980,6 +989,82 @@ def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> No
         markers=markers,
         **{**arguments, "replica_events": cross_observer_events},
     )
+
+    authoritative_commit = _native_event(
+        source_id="replica-0",
+        sequence=1,
+        monotonic_ns=first_proposal.monotonic_ns + 20,
+        event_type="block.committed",
+        payload={
+            "block_height": 1,
+            "block_hash": first_proposal.payload["block_hash"],
+            "parent_hash": None,
+            "transaction_count": 1000,
+            "designated_observer": True,
+            "decision_proof": {
+                "epoch_number": first_proposal.payload["epoch_number"],
+                "tree_id": first_proposal.payload["tree_id"],
+                "epoch_digest": first_proposal.payload["epoch_digest"],
+                "block_hash": first_proposal.payload["block_hash"],
+            },
+            "view_generation": 1,
+            "commit_batch_index": 0,
+        },
+    )
+    commit_proved_events = {
+        **events,
+        actor: actor_events[1:],
+        0: (authoritative_commit,),
+    }
+    validate_fault_causality(
+        markers=markers,
+        **{**arguments, "replica_events": commit_proved_events},
+    )
+
+    noncausal_commit = replace(
+        authoritative_commit,
+        monotonic_ns=markers[0].monotonic_ns,
+    )
+    with pytest.raises(FactorialValidationError, match="does not precede"):
+        validate_fault_causality(
+            markers=markers,
+            **{
+                **arguments,
+                "replica_events": {
+                    **commit_proved_events,
+                    0: (noncausal_commit,),
+                },
+            },
+        )
+
+    non_authoritative_commit = replace(
+        authoritative_commit,
+        payload={**authoritative_commit.payload, "designated_observer": False},
+    )
+    with pytest.raises(FactorialValidationError, match="designated-observer"):
+        validate_fault_causality(
+            markers=markers,
+            **{
+                **arguments,
+                "replica_events": {
+                    **commit_proved_events,
+                    0: (non_authoritative_commit,),
+                },
+            },
+        )
+
+    with pytest.raises(FactorialValidationError, match="no matching native proposal"):
+        validate_fault_causality(
+            markers=markers,
+            **{
+                **arguments,
+                "replica_events": {
+                    **events,
+                    actor: actor_events[1:],
+                    1: (authoritative_commit,),
+                },
+            },
+        )
 
     mismatched_observer = replace(
         first_proposal,
@@ -2113,7 +2198,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
-def test_v6_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+def test_v7_receipt_rejects_an_exact_legacy_manifest_plan_pair(
     tmp_path: Path,
 ) -> None:
     recovered, _, receipt, expected, runtime, authorization = (
