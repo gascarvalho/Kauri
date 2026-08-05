@@ -46,6 +46,13 @@ enum class ExperimentOmissionAction
     capacity_exhausted
 };
 
+enum class ExperimentOmissionCohort
+{
+    none,
+    hard,
+    responsive_degraded
+};
+
 struct ExperimentRotatingOmissionOptions final
 {
     std::string mode;
@@ -57,6 +64,8 @@ struct ExperimentRotatingOmissionOptions final
     std::uint64_t window_end_monotonic_ns{0};
     std::size_t max_omissions_per_proposal{0};
     std::size_t maximum_contexts{0};
+    std::vector<ReplicaID> responsive_degraded_actor_ids;
+    std::size_t responsive_omission_period{0};
 };
 
 struct ExperimentOmissionMarker final
@@ -69,6 +78,13 @@ struct ExperimentOmissionMarker final
     std::uint64_t window_start_monotonic_ns{0};
     std::uint64_t window_end_monotonic_ns{0};
     std::uint64_t monotonic_ns{0};
+    ExperimentOmissionCohort cohort{ExperimentOmissionCohort::none};
+    std::size_t hard_actor_count{0};
+    std::size_t responsive_degraded_actor_count{0};
+    std::size_t fault_threshold{0};
+    std::size_t max_omissions_per_proposal{0};
+    std::size_t responsive_omission_period{0};
+    std::uint64_t contribution_ordinal{0};
 };
 
 std::string format_experiment_omission_marker(

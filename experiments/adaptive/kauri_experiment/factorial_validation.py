@@ -74,6 +74,9 @@ from .factorial_manifest import (
     V6_MANIFEST_ID,
     V6_MANIFEST_SHA256,
     V6_PLAN_SHA256,
+    V7_MANIFEST_ID,
+    V7_MANIFEST_SHA256,
+    V7_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -135,11 +138,17 @@ V6_RUNTIME_SHA256 = (
 V6_SMOKE_RUNTIME_SHA256 = (
     "f04879a1ca5a6ae59c8a4cc695ae878f2855acf4a9e0aad76cdb2916aa5ade87"
 )
-FROZEN_RUNTIME_SHA256 = (
+V7_RUNTIME_SHA256 = (
     "9136d26be778adbc4558dcef6d41e44fbb5b0bce60e0b065a3811ebb02cb2887"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V7_SMOKE_RUNTIME_SHA256 = (
     "d7476a1d6c314f5b117e5e5d39a817d6f787b07b675b6d789e7b345491936d0f"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "05b846c2fd9dc1005348993e147bb3e33def0011a7b52b3a68473ec79507e1a0"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "bd0bf9291e4b34a229be6ce5a5e09ffe7a34964199a0ea21696ab750ddab8e0b"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -201,14 +210,30 @@ _HEX_DIGITS = frozenset("0123456789abcdef")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _REDACTION = re.compile(r"hmac-sha256:([A-Za-z0-9_.-]{1,64}):([0-9a-f]{64})")
-_FAULT_MARKER = re.compile(
+_TIERED_OMISSION_MODE = "tiered_persistent_responsive_omission_v1"
+_RESPONSIVE_DEGRADED_SELECTOR_DOMAIN = (
+    "kauri.shape25.responsive-degraded.v1"
+)
+_RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
+    "replica_0_reserved_authoritative_commit_observer_v1"
+)
+_RESPONSIVE_OMISSION_PERIOD = 32
+_FAULT_MARKER_PREFIX = (
     r"(?:^|\s)KAURI_FAULT fault=([a-z0-9_]+) "
     r"proposal_epoch=(\d+) proposal_tree=(\d+) "
     r"proposal_epoch_digest=([0-9a-f]{64}) "
     r"proposal_block_hash=([0-9a-f]{64}) window=([^\s]+) "
     r"window_start_monotonic_ns=(\d+) window_end_monotonic_ns=(\d+) "
     r"actor=(\d+) action=(forward|omit_aggregate|omit_direct_vote|capacity_exhausted) "
-    r"monotonic_ns=(\d+)(?:\s|$)"
+    r"monotonic_ns=(\d+)"
+)
+_LEGACY_FAULT_MARKER = re.compile(_FAULT_MARKER_PREFIX + r"\s*$")
+_TIERED_FAULT_MARKER = re.compile(
+    _FAULT_MARKER_PREFIX
+    + r" cohort=(hard|responsive_degraded) hard_actor_count=(\d+) "
+    r"responsive_degraded_actor_count=(\d+) fault_threshold=(\d+) "
+    r"max_omissions_per_proposal=(\d+) responsive_omission_period=(\d+) "
+    r"contribution_ordinal=(\d+)\s*$"
 )
 _REDACTION_KEY_DOMAIN = b"kauri.shape25.launch-redaction-key.v1"
 _FORBIDDEN_MANAGER_KEYS = frozenset(
@@ -295,6 +320,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             runtime_sha256=V6_RUNTIME_SHA256,
             smoke_runtime_sha256=V6_SMOKE_RUNTIME_SHA256,
         ),
+        V7_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V7_MANIFEST_ID,
+            manifest_sha256=V7_MANIFEST_SHA256,
+            plan_sha256=V7_PLAN_SHA256,
+            runtime_sha256=V7_RUNTIME_SHA256,
+            smoke_runtime_sha256=V7_SMOKE_RUNTIME_SHA256,
+        ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
             manifest_sha256=FROZEN_MANIFEST_SHA256,
@@ -370,6 +402,13 @@ class FaultMarker:
     action: str
     monotonic_ns: int
     raw_line_sha256: str
+    cohort: str | None = None
+    hard_actor_count: int | None = None
+    responsive_degraded_actor_count: int | None = None
+    fault_threshold: int | None = None
+    max_omissions_per_proposal: int | None = None
+    responsive_omission_period: int | None = None
+    contribution_ordinal: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +432,21 @@ class SlotValidationResult:
     integrity_valid: bool = False
     schema_gaps: tuple[str, ...] = ()
     campaign_member: bool = True
+    epoch1_roots: tuple[int, ...] = ()
+    epoch2_roots: tuple[int, ...] = ()
+    promoted_replica_ids: tuple[int, ...] = ()
+    demoted_replica_ids: tuple[int, ...] = ()
+    placement_changed: bool | None = None
+    hard_actor_ids: tuple[int, ...] = ()
+    responsive_degraded_actor_ids: tuple[int, ...] = ()
+    fast_replica_ids: tuple[int, ...] = ()
+    degraded_rank_proof_count: int = 0
+    epoch1_degraded_root_proof_count: int = 0
+    epoch1_degraded_internal_proof_count: int = 0
+    epoch2_constrained_leaf_proof_count: int = 0
+    epoch2_fast_root_internal_position_proof_count: int = 0
+    epoch2_fast_root_internal_position_required_count: int = 0
+    full_hierarchy_gate_passed: bool | None = None
 
     @property
     def figure_eligible(self) -> bool:
@@ -418,6 +472,38 @@ class MatchedEstimate:
 
 
 @dataclass(frozen=True, slots=True)
+class MatchedLogRatioEstimate:
+    contrast: str
+    block_ids: tuple[str, ...]
+    block_effects_log_ratio: tuple[float, ...]
+    mean_log_ratio: float
+    sample_standard_deviation_log_ratio: float
+    ci95_lower_log_ratio: float
+    ci95_upper_log_ratio: float
+    geometric_mean_ratio: float
+    geometric_mean_percent_change: float
+    ci95_lower_ratio: float
+    ci95_upper_ratio: float
+    ci95_lower_percent_change: float
+    ci95_upper_percent_change: float
+    positive_block_count: int
+    directional_claim_supported: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MatchedEquivalenceEstimate:
+    contrast: str
+    block_ids: tuple[str, ...]
+    block_effects_log_ratio: tuple[float, ...]
+    mean_log_ratio: float
+    sample_standard_deviation_log_ratio: float
+    ci90_lower_log_ratio: float
+    ci90_upper_log_ratio: float
+    equivalence_margin_log_ratio: float
+    equivalence_supported: bool
+
+
+@dataclass(frozen=True, slots=True)
 class FactorialEffects:
     endpoint: str
     estimator: str
@@ -429,6 +515,71 @@ class FactorialEffects:
     fault_drop: MatchedEstimate
     containment_recovery: MatchedEstimate
     optimization_gain: MatchedEstimate
+    optimization_gain_p: MatchedEstimate
+    optimization_gain_ps: MatchedEstimate
+    primary_throughput_log_ratio: MatchedLogRatioEstimate | None
+    pre_epoch1_placebo_p_log_ratio: MatchedEquivalenceEstimate | None
+    pre_epoch1_placebo_ps_log_ratio: MatchedEquivalenceEstimate | None
+
+
+@dataclass(frozen=True, slots=True)
+class BreakthroughVerdict:
+    status: str
+    exact_scope: str
+    structural_gate: str
+    structural_required_slot_count: int
+    structural_validated_slot_count: int
+    structural_gate_passed: bool
+    realized_placement_rule: str
+    realized_placement_per_arm_requirement: int
+    placement_changed_p_block_count: int
+    placement_changed_ps_block_count: int
+    realized_placement_gate_passed: bool
+    primary_throughput_estimand: str
+    throughput_claim_rule: str
+    throughput_estimate_available: bool
+    throughput_ci95_lower_log_ratio_gt_zero: bool | None
+    throughput_positive_block_count: int | None
+    throughput_required_positive_block_count: int
+    throughput_rule_passed: bool | None
+    fault_drop_positive_block_count: int | None
+    fault_drop_rule_passed: bool | None
+    containment_recovery_positive_block_count: int | None
+    containment_recovery_rule_passed: bool | None
+    optimization_gain_positive_block_count: int | None
+    optimization_gain_rule_passed: bool | None
+    p_absolute_optimization_positive_block_count: int | None
+    ps_absolute_optimization_positive_block_count: int | None
+    per_arm_absolute_optimization_rule_passed: bool | None
+    absolute_sequence_gate_passed: bool | None
+    epoch1_baseline_ratio_role: str
+    pre_epoch1_placebo_estimand: str
+    placebo_equivalence_rule: str
+    placebo_equivalence_margin_log: float | None
+    placebo_p_estimate_available: bool
+    placebo_p_ci90_lower_log_ratio: float | None
+    placebo_p_ci90_upper_log_ratio: float | None
+    placebo_p_equivalence_rule_passed: bool | None
+    placebo_ps_estimate_available: bool
+    placebo_ps_ci90_lower_log_ratio: float | None
+    placebo_ps_ci90_upper_log_ratio: float | None
+    placebo_ps_equivalence_rule_passed: bool | None
+    placebo_equivalence_rule_passed: bool | None
+    cohort_ids_by_slot: tuple[
+        tuple[str, tuple[int, ...], tuple[int, ...], tuple[int, ...]], ...
+    ]
+    degraded_rank_required_count: int
+    degraded_rank_validated_count: int
+    epoch1_degraded_root_required_count: int
+    epoch1_degraded_root_validated_count: int
+    epoch1_degraded_internal_required_count: int
+    epoch1_degraded_internal_validated_count: int
+    epoch2_constrained_leaf_required_count: int
+    epoch2_constrained_leaf_validated_count: int
+    epoch2_fast_root_internal_position_required_count: int
+    epoch2_fast_root_internal_position_validated_count: int
+    full_hierarchy_gate_passed: bool
+    failed_requirements: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +590,7 @@ class CampaignValidationResult:
     parameter_coverage: tuple[tuple[int, int, str], ...]
     headline_effects: FactorialEffects | None
     figure_eligible: bool
+    breakthrough_verdict: BreakthroughVerdict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,9 +619,26 @@ class _ExpectedSlot:
     placement_adaptation: bool
     shape_adaptation: bool
     actor_ids: tuple[int, ...]
+    responsive_degraded_actor_ids: tuple[int, ...]
+    fast_replica_ids: tuple[int, ...]
     peer_base: int
     client_base: int
     manager_port: int
+
+    @property
+    def hard_actor_ids(self) -> tuple[int, ...]:
+        return self.actor_ids
+
+
+@dataclass(frozen=True, slots=True)
+class _HierarchyProof:
+    degraded_rank_count: int = 0
+    epoch1_degraded_root_count: int = 0
+    epoch1_degraded_internal_count: int = 0
+    epoch2_constrained_leaf_count: int = 0
+    epoch2_fast_position_count: int = 0
+    epoch2_fast_position_required_count: int = 0
+    full_gate_passed: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,15 +686,21 @@ def _effective_omission_contract(
     window_suffix = {
         "rotating_intermittent_omission_v1": "rotating-omission-v1",
         "persistent_selected_omission_v1": "persistent-omission-v1",
+        _TIERED_OMISSION_MODE: "tiered-responsive-omission-v1",
     }.get(manifest.byzantine.mode)
     if window_suffix is None:
         _fail("manifest Byzantine omission mode is unknown")
-    max_omissions = (
-        len(expected.actor_ids)
-        if expected.slot_id == EXCLUDED_SMOKE_SLOT_ID
+    if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+        max_omissions = expected.f
+    elif (
+        expected.slot_id == EXCLUDED_SMOKE_SLOT_ID
         and manifest.byzantine.mode == "persistent_selected_omission_v1"
-        else manifest.byzantine.max_omissions_per_proposal
-    )
+    ):
+        max_omissions = len(expected.actor_ids)
+    else:
+        max_omissions = manifest.byzantine.max_omissions_per_proposal
+    if type(max_omissions) is not int or max_omissions < 1:
+        _fail("manifest omission maximum is not independently derivable")
     return f"{expected.block_id}-{window_suffix}", max_omissions
 
 
@@ -574,6 +749,10 @@ def _canonical_json_bytes(value: object) -> bytes:
         )
     except (TypeError, ValueError) as error:
         raise _Reject("value cannot be canonically JSON encoded") from error
+
+
+def _exact_json_value(actual: object, expected: object) -> bool:
+    return _canonical_json_bytes(actual) == _canonical_json_bytes(expected)
 
 
 def _safe_file(root: Path, relative: str, *, required: bool = True) -> Path | None:
@@ -952,6 +1131,67 @@ def derive_actor_ids(
 
     selected = sorted(pool, key=rank)[:actor_count]
     return tuple(sorted(selected))
+
+
+def derive_responsive_degraded_actor_ids(
+    replica_count: int,
+    hard_actor_ids: Sequence[int],
+    scientific_seed: int,
+) -> tuple[int, ...]:
+    """Independently rank the isolated canonical-root pool ``[1, Q)``."""
+
+    if replica_count <= 0 or scientific_seed < 0 or (replica_count - 1) % 3:
+        _fail("responsive-degraded derivation input is invalid")
+    fault_threshold = (replica_count - 1) // 3
+    quorum = 2 * fault_threshold + 1
+    hard = tuple(sorted(hard_actor_ids))
+    if (
+        not hard
+        or len(set(hard)) != len(hard)
+        or len(hard) >= fault_threshold
+        or any(actor < quorum or actor >= replica_count for actor in hard)
+    ):
+        _fail("hard cohort is not a proper unique subset of [Q, N)")
+    degraded_count = fault_threshold - len(hard)
+    pool = tuple(range(1, quorum))
+    membership = ",".join(str(member) for member in range(replica_count))
+
+    def rank(member: int) -> tuple[bytes, int]:
+        preimage = (
+            f"{_RESPONSIVE_DEGRADED_SELECTOR_DOMAIN}\x00{membership}\x00"
+            f"{quorum}\x00{scientific_seed}\x00{member}"
+        ).encode("ascii")
+        return hashlib.sha256(preimage).digest(), member
+
+    selected = tuple(sorted(sorted(pool, key=rank)[:degraded_count]))
+    if 0 in selected or set(selected).intersection(hard):
+        _fail("responsive-degraded derivation violates cohort isolation")
+    return selected
+
+
+def _derive_tiered_cohorts(
+    replica_count: int,
+    hard_actor_count: int,
+    scientific_seed: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    hard = derive_actor_ids(replica_count, hard_actor_count, scientific_seed)
+    degraded = derive_responsive_degraded_actor_ids(
+        replica_count,
+        hard,
+        scientific_seed,
+    )
+    worse = frozenset((*hard, *degraded))
+    fast = tuple(member for member in range(replica_count) if member not in worse)
+    fault_threshold = (replica_count - 1) // 3
+    quorum = 2 * fault_threshold + 1
+    if (
+        len(worse) != fault_threshold
+        or len(fast) != quorum
+        or 0 not in fast
+        or set(hard).intersection(degraded)
+    ):
+        _fail("tiered cohorts do not partition N into f worse and Q fast replicas")
+    return hard, degraded, fast
 
 
 def fnv1a_rotating_actor(
@@ -1344,7 +1584,11 @@ def _block_ids(manifest: FrozenFactorialManifest) -> tuple[str, ...]:
 
 
 def _execution_schedule(
-    block_ids: Sequence[str], arm_codes: Sequence[str], seed: int
+    block_ids: Sequence[str],
+    arm_codes: Sequence[str],
+    seed: int,
+    *,
+    stratified: bool,
 ) -> tuple[tuple[str, int, tuple[str, ...]], ...]:
     blocks, arms = tuple(block_ids), tuple(arm_codes)
     if not blocks or len(set(blocks)) != len(blocks):
@@ -1355,18 +1599,34 @@ def _execution_schedule(
     def block_rank(block_id: str) -> tuple[bytes, str]:
         return hashlib.sha256(f"{seed}\x00{block_id}".encode("ascii")).digest(), block_id
 
-    counts = {(arm, position): 0 for arm in arms for position in range(len(arms))}
+    global_counts = {
+        (arm, position): 0 for arm in arms for position in range(len(arms))
+    }
+    counts_by_stratum: dict[str, dict[tuple[str, int], int]] = {}
     result: list[tuple[str, int, tuple[str, ...]]] = []
     for ordinal, block_id in enumerate(sorted(blocks, key=block_rank), start=1):
+        cell, separator, repetition = block_id.rpartition("-b")
+        if stratified and (
+            not separator or not cell or not repetition.isdigit()
+        ):
+            _fail("stratified schedule block ID is malformed")
+        counts = (
+            counts_by_stratum.setdefault(cell, dict(global_counts))
+            if stratified
+            else global_counts
+        )
         choices: list[tuple[tuple[int, int, bytes], tuple[str, ...]]] = []
         for order in itertools.permutations(arms):
             prospective = dict(counts)
             for position, arm in enumerate(order):
                 prospective[arm, position] += 1
             values = tuple(prospective.values())
-            tie = hashlib.sha256(
-                f"{seed}\x00{block_id}\x00{','.join(order)}".encode("ascii")
-            ).digest()
+            tie_preimage = (
+                f"{seed}\x00{cell}\x00{block_id}\x00{','.join(order)}"
+                if stratified
+                else f"{seed}\x00{block_id}\x00{','.join(order)}"
+            )
+            tie = hashlib.sha256(tie_preimage.encode("ascii")).digest()
             choices.append(((max(values) - min(values), sum(x * x for x in values), tie), order))
         _, order = min(choices)
         for position, arm in enumerate(order):
@@ -1382,7 +1642,16 @@ def _expected_slots(manifest: FrozenFactorialManifest) -> tuple[_ExpectedSlot, .
             f"manifest does not derive exactly {EXPECTED_BLOCK_COUNT} blocks"
         )
     arms = tuple(arm.code for arm in manifest.arms)
-    schedule = _execution_schedule(block_ids, arms, manifest.campaign_order_seed)
+    schedule = _execution_schedule(
+        block_ids,
+        arms,
+        manifest.campaign_order_seed,
+        stratified=(
+            manifest.arm_counterbalancing
+            == "stratified_greedy_minimum_position_imbalance_"
+            "sha256_tiebreak_v2"
+        ),
+    )
     scheduled = {block: (ordinal, order) for block, ordinal, order in schedule}
     result: list[_ExpectedSlot] = []
     block_ordinal = 0
@@ -1395,11 +1664,24 @@ def _expected_slots(manifest: FrozenFactorialManifest) -> tuple[_ExpectedSlot, .
                 block_id = f"n{replica_count}-f{fanout}-b{block_index:02d}"
                 block_execution_ordinal, order = scheduled[block_id]
                 scientific_seed = manifest.scientific_seed_base + block_ordinal
-                actor_ids = derive_actor_ids(
-                    replica_count,
-                    manifest.byzantine.actor_count,
-                    scientific_seed,
-                )
+                if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+                    (
+                        actor_ids,
+                        responsive_degraded_actor_ids,
+                        fast_replica_ids,
+                    ) = _derive_tiered_cohorts(
+                        replica_count,
+                        manifest.byzantine.actor_count,
+                        scientific_seed,
+                    )
+                else:
+                    actor_ids = derive_actor_ids(
+                        replica_count,
+                        manifest.byzantine.actor_count,
+                        scientific_seed,
+                    )
+                    responsive_degraded_actor_ids = ()
+                    fast_replica_ids = ()
                 candidate_depths = tuple(
                     (candidate, _tree_depth(replica_count, candidate))
                     for candidate in manifest.candidate_fanouts
@@ -1434,6 +1716,10 @@ def _expected_slots(manifest: FrozenFactorialManifest) -> tuple[_ExpectedSlot, .
                             placement_adaptation=arm.placement_adaptation,
                             shape_adaptation=arm.shape_adaptation,
                             actor_ids=actor_ids,
+                            responsive_degraded_actor_ids=(
+                                responsive_degraded_actor_ids
+                            ),
+                            fast_replica_ids=fast_replica_ids,
                             peer_base=manifest.resources.peer_port_base
                             + nonce * manifest.resources.slot_port_stride,
                             client_base=manifest.resources.client_port_base
@@ -1460,6 +1746,14 @@ def _expected_excluded_smoke(
         (candidate, _tree_depth(replica_count, candidate))
         for candidate in manifest.candidate_fanouts
     )
+    if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+        actor_ids, responsive_degraded_actor_ids, fast_replica_ids = (
+            _derive_tiered_cohorts(replica_count, 1, scientific_seed)
+        )
+    else:
+        actor_ids = derive_actor_ids(replica_count, min(3, f), scientific_seed)
+        responsive_degraded_actor_ids = ()
+        fast_replica_ids = ()
     return _ExpectedSlot(
         slot_id=EXCLUDED_SMOKE_SLOT_ID,
         block_id="n7-f2-smoke-b01",
@@ -1484,7 +1778,9 @@ def _expected_excluded_smoke(
         pipeline_stretch=manifest.pipeline_stretch,
         placement_adaptation=True,
         shape_adaptation=True,
-        actor_ids=derive_actor_ids(replica_count, min(3, f), scientific_seed),
+        actor_ids=actor_ids,
+        responsive_degraded_actor_ids=responsive_degraded_actor_ids,
+        fast_replica_ids=fast_replica_ids,
         peer_base=45_100,
         client_base=46_100,
         manager_port=47_100,
@@ -1495,7 +1791,14 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
     """Recompute and validate the frozen block/arm schedule."""
 
     expected = _execution_schedule(
-        _block_ids(manifest), tuple(arm.code for arm in manifest.arms), manifest.campaign_order_seed
+        _block_ids(manifest),
+        tuple(arm.code for arm in manifest.arms),
+        manifest.campaign_order_seed,
+        stratified=(
+            manifest.arm_counterbalancing
+            == "stratified_greedy_minimum_position_imbalance_"
+            "sha256_tiebreak_v2"
+        ),
     )
     raw = _array(plan.get("execution_schedule"), "plan.execution_schedule")
     observed: list[tuple[str, int, tuple[str, ...]]] = []
@@ -1539,6 +1842,36 @@ def _load_static_contracts(
             != vector.selected_actor_ids
         ):
             _fail("frozen actor-selection vector failed independent recomputation")
+    responsive_contract = manifest.byzantine.responsive_degradation
+    if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+        if (
+            responsive_contract is None
+            or responsive_contract.observer_isolation
+            != _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION
+            or responsive_contract.omission_period != _RESPONSIVE_OMISSION_PERIOD
+        ):
+            _fail("frozen tiered responsive-degradation contract drifted")
+        for vector in responsive_contract.actor_selection_vectors:
+            hard = derive_actor_ids(
+                vector.replica_count,
+                manifest.byzantine.actor_count,
+                vector.scientific_seed,
+            )
+            if (
+                vector.q != 2 * ((vector.replica_count - 1) // 3) + 1
+                or derive_responsive_degraded_actor_ids(
+                    vector.replica_count,
+                    hard,
+                    vector.scientific_seed,
+                )
+                != vector.selected_actor_ids
+            ):
+                _fail(
+                    "frozen responsive-degraded selection vector failed "
+                    "independent recomputation"
+                )
+    elif responsive_contract is not None:
+        _fail("legacy manifest unexpectedly carries tiered cohort semantics")
     for vector in manifest.byzantine.actor_rotation_vectors:
         value, actor = fnv1a_rotating_actor(
             vector.sorted_actor_ids,
@@ -1617,6 +1950,15 @@ def _load_static_contracts(
             "pipeline_stretch": derived.pipeline_stretch,
             "byzantine_actor_ids": list(derived.actor_ids),
         }
+        if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+            exact.update(
+                {
+                    "responsive_degraded_actor_ids": list(
+                        derived.responsive_degraded_actor_ids
+                    ),
+                    "fast_replica_ids": list(derived.fast_replica_ids),
+                }
+            )
         if any(item.get(key) != value for key, value in exact.items()):
             _fail(f"plan slot {slot_id} differs from independently derived identity")
         expected_consensus = {
@@ -1685,13 +2027,31 @@ def _load_static_contracts(
 def _validate_runtime_slot(
     runtime: Mapping[str, Any], expected: _ExpectedSlot, manifest: FrozenFactorialManifest
 ) -> None:
-    artifact_identity = {
-        "arm_code": expected.arm_code,
-        "block_id": expected.block_id,
-        "scientific_seed": expected.scientific_seed,
-        "slot_id": expected.slot_id,
-        "slot_nonce": expected.slot_nonce,
-    }
+    tiered = manifest.byzantine.mode == _TIERED_OMISSION_MODE
+    if tiered:
+        artifact_identity = {
+            "arm_code": expected.arm_code,
+            "block_id": expected.block_id,
+            "byzantine_mode": manifest.byzantine.mode,
+            "hard_actor_ids": expected.actor_ids,
+            "responsive_degraded_actor_ids": (
+                expected.responsive_degraded_actor_ids
+            ),
+            "fast_replica_ids": expected.fast_replica_ids,
+            "max_omissions_per_proposal": expected.f,
+            "responsive_omission_period": _RESPONSIVE_OMISSION_PERIOD,
+            "scientific_seed": expected.scientific_seed,
+            "slot_id": expected.slot_id,
+            "slot_nonce": expected.slot_nonce,
+        }
+    else:
+        artifact_identity = {
+            "arm_code": expected.arm_code,
+            "block_id": expected.block_id,
+            "scientific_seed": expected.scientific_seed,
+            "slot_id": expected.slot_id,
+            "slot_nonce": expected.slot_nonce,
+        }
     checks = {
         "schema_version": 1,
         "artifact_id": "slot-runtime-"
@@ -1715,6 +2075,31 @@ def _validate_runtime_slot(
     }
     if any(runtime.get(key) != value for key, value in checks.items()):
         _fail("runtime slot identity/consensus fields drifted")
+    if tiered:
+        responsive_contract = manifest.byzantine.responsive_degradation
+        assert responsive_contract is not None
+        expected_tiered = {
+            "mode": _TIERED_OMISSION_MODE,
+            "hard_actor_ids": list(expected.actor_ids),
+            "responsive_degraded_actor_ids": list(
+                expected.responsive_degraded_actor_ids
+            ),
+            "fast_replica_ids": list(expected.fast_replica_ids),
+            "responsive_omission_period": _RESPONSIVE_OMISSION_PERIOD,
+            "responsive_actor_schedule": responsive_contract.actor_schedule,
+            "max_omissions_per_proposal": expected.f,
+            "hard_cohort_wait_exempt": True,
+            "responsive_degraded_cohort_wait_exempt": False,
+            "observer_isolation": _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION,
+            "tiered_marker_schedule_required": True,
+            "responsive_degraded_rank_below_every_fast_replica": True,
+            "epoch1_responsive_degraded_are_roots": True,
+            "epoch1_responsive_degraded_internal_role_exposure_required": True,
+        }
+        if dict(_mapping(runtime.get("tiered_cohorts"), "runtime tiered cohorts")) != expected_tiered:
+            _fail("runtime tiered cohort contract differs from independent derivation")
+    elif "tiered_cohorts" in runtime:
+        _fail("legacy runtime unexpectedly carries tiered cohort semantics")
     timers = manifest.common_timers
     config = _mapping(runtime.get("main_config"), "runtime main_config")
     expected_lines = {
@@ -1770,6 +2155,7 @@ def _validate_runtime_slot(
         V4_MANIFEST_ID,
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
+        V7_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -1838,6 +2224,29 @@ def _validate_runtime_slot(
             or request.get("containment_baseline_roots") != []
         ):
             _fail("optimization request contains a containment-root binding")
+    for index, name in enumerate(("epoch1_placement", "epoch2_placement")):
+        optimized = index == 1 and expected.placement_adaptation
+        expected_placement = {
+            "policy_intent": (
+                "performance_optimization" if optimized else "fault_containment"
+            ),
+            "actors_are_wait_exempt_leaves": True,
+            "actor_truth_is_policy_input": False,
+            "roots_equal_live_highest_ranked_eligible": optimized,
+            "internal_assignment_uses_live_evidence_ranking": True,
+            "influential_order_source": "live_accepted_evidence_ranking",
+        }
+        if tiered:
+            expected_placement.update(
+                {
+                    "only_hard_cohort_is_wait_exempt": True,
+                    "all_worse_replicas_are_physical_leaves": optimized,
+                    "root_and_internal_roles_are_fast_only": optimized,
+                    "roots_equal_live_top_q_fast_replicas": optimized,
+                }
+            )
+        if dict(_mapping(runtime.get(name), f"runtime {name}")) != expected_placement:
+            _fail(f"runtime {name} acceptance contract drifted")
     sequence = _mapping(runtime.get("transition_sequence"), "runtime transition_sequence")
     if (
         sequence.get("required_events") != list(CUTOFF_NAMES)
@@ -1925,6 +2334,9 @@ def _validate_runtime_slot(
     if len(replica_templates) != expected.replica_count:
         _fail("runtime replica templates do not cover exact membership")
     expected_actors = ",".join(map(str, expected.actor_ids))
+    expected_degraded = ",".join(
+        map(str, expected.responsive_degraded_actor_ids)
+    )
     expected_window, expected_max_omissions = _effective_omission_contract(
         manifest, expected
     )
@@ -1937,8 +2349,25 @@ def _validate_runtime_slot(
             for value in _array(item.get("argv"), "runtime replica argv")
         )
         options = {argv[index]: argv[index + 1] for index in range(len(argv) - 1) if argv[index].startswith("--")}
+        tiered_options_valid = (
+            argv.count("--experiment-responsive-degraded-omission-actors") == 1
+            and options.get("--experiment-responsive-degraded-omission-actors")
+            == expected_degraded
+            and argv.count("--experiment-responsive-omission-period") == 1
+            and options.get("--experiment-responsive-omission-period")
+            == str(_RESPONSIVE_OMISSION_PERIOD)
+        ) if tiered else (
+            "--experiment-responsive-degraded-omission-actors" not in argv
+            and "--experiment-responsive-omission-period" not in argv
+        )
         if (
-            options.get("--experiment-byzantine-mode") != manifest.byzantine.mode
+            argv.count("--experiment-byzantine-mode") != 1
+            or argv.count("--experiment-byzantine-window") != 1
+            or argv.count("--experiment-rotating-omission-actors") != 1
+            or argv.count("--experiment-rotating-omission-context-limit") != 1
+            or argv.count("--experiment-byzantine-max-omissions-per-proposal") != 1
+            or options.get("--experiment-byzantine-mode")
+            != manifest.byzantine.mode
             or options.get("--experiment-byzantine-window") != expected_window
             or options.get("--experiment-rotating-omission-actors")
             != expected_actors
@@ -1946,6 +2375,7 @@ def _validate_runtime_slot(
             != str(manifest.byzantine.maximum_rotating_contexts)
             or options.get("--experiment-byzantine-max-omissions-per-proposal")
             != str(expected_max_omissions)
+            or not tiered_options_valid
         ):
             _fail("runtime replica omission actor/cap contract drifted")
 
@@ -2902,7 +3332,7 @@ def _fault_markers(
     paths_by_replica: Mapping[int, Sequence[str]],
 ) -> tuple[FaultMarker, ...]:
     markers: list[FaultMarker] = []
-    seen: set[tuple[str, int, int, str, str, int, str]] = set()
+    seen: set[tuple[str, int, int, str, str, int]] = set()
     for replica_id, paths in paths_by_replica.items():
         for relative in paths:
             path = _safe_file(slot_root, relative)
@@ -2922,7 +3352,12 @@ def _fault_markers(
                             line = raw.decode("utf-8", errors="strict").rstrip("\r\n")
                         except UnicodeDecodeError as error:
                             raise _Reject(f"{relative}:{line_number} fault marker is not UTF-8") from error
-                        matches = tuple(_FAULT_MARKER.finditer(line))
+                        pattern = (
+                            _TIERED_FAULT_MARKER
+                            if f"fault={_TIERED_OMISSION_MODE}" in line
+                            else _LEGACY_FAULT_MARKER
+                        )
+                        matches = tuple(pattern.finditer(line))
                         if len(matches) != 1:
                             _fail(f"{relative}:{line_number} has a malformed/ambiguous fault marker")
                         match = matches[0]
@@ -2941,6 +3376,41 @@ def _fault_markers(
                             action=match.group(10),
                             monotonic_ns=int(match.group(11)),
                             raw_line_sha256=_sha256(raw),
+                            cohort=(
+                                match.group(12)
+                                if pattern is _TIERED_FAULT_MARKER
+                                else None
+                            ),
+                            hard_actor_count=(
+                                int(match.group(13))
+                                if pattern is _TIERED_FAULT_MARKER
+                                else None
+                            ),
+                            responsive_degraded_actor_count=(
+                                int(match.group(14))
+                                if pattern is _TIERED_FAULT_MARKER
+                                else None
+                            ),
+                            fault_threshold=(
+                                int(match.group(15))
+                                if pattern is _TIERED_FAULT_MARKER
+                                else None
+                            ),
+                            max_omissions_per_proposal=(
+                                int(match.group(16))
+                                if pattern is _TIERED_FAULT_MARKER
+                                else None
+                            ),
+                            responsive_omission_period=(
+                                int(match.group(17))
+                                if pattern is _TIERED_FAULT_MARKER
+                                else None
+                            ),
+                            contribution_ordinal=(
+                                int(match.group(18))
+                                if pattern is _TIERED_FAULT_MARKER
+                                else None
+                            ),
                         )
                         if marker.action == "capacity_exhausted":
                             _fail(f"{relative}:{line_number} exhausted omission context capacity")
@@ -2951,7 +3421,6 @@ def _fault_markers(
                             marker.epoch_digest,
                             marker.block_hash,
                             marker.actor,
-                            marker.action,
                         )
                         if identity in seen:
                             _fail("native process logs contain a duplicate fault marker")
@@ -3005,48 +3474,110 @@ def _adaptive_proposal_identity(
     )
 
 
-def _authoritative_commit_proposal_identity(
-    event: _NativeEvent,
-    *,
-    replica_id: int,
-) -> tuple[int, int, str, str] | None:
-    """Return the exact proposal identity sealed by replica-0's commit proof."""
-
-    if event.event_type != "block.committed" or replica_id != 0:
-        return None
-    commit = _commit_payload(event, authoritative=True)
-    return (
-        commit["epoch_number"],
-        commit["tree_id"],
-        commit["epoch_digest"],
-        commit["hash"],
-    )
-
-
 def _validate_fault_marker_schedule(
     markers: Sequence[FaultMarker],
     *,
     actor_ids: Sequence[int],
     fault_mode: str,
     max_omissions_per_proposal: int,
+    responsive_degraded_actor_ids: Sequence[int] = (),
+    fault_threshold: int | None = None,
+    responsive_omission_period: int = _RESPONSIVE_OMISSION_PERIOD,
 ) -> None:
-    actors = tuple(sorted(actor_ids))
-    actor_set = set(actors)
+    hard = tuple(sorted(actor_ids))
+    hard_set = set(hard)
+    degraded = tuple(sorted(responsive_degraded_actor_ids))
+    degraded_set = set(degraded)
+    audit_fields = (
+        "cohort",
+        "hard_actor_count",
+        "responsive_degraded_actor_count",
+        "fault_threshold",
+        "max_omissions_per_proposal",
+        "responsive_omission_period",
+        "contribution_ordinal",
+    )
     if fault_mode not in {
         "rotating_intermittent_omission_v1",
         "persistent_selected_omission_v1",
+        _TIERED_OMISSION_MODE,
     }:
         _fail("fault causality mode is not a known omission schedule")
-    if not 1 <= max_omissions_per_proposal <= len(actors):
-        _fail("fault causality proposal bound is outside the selected actor set")
+    tiered = fault_mode == _TIERED_OMISSION_MODE
+    if tiered:
+        if (
+            not hard
+            or not degraded
+            or len(hard_set) != len(hard)
+            or len(degraded_set) != len(degraded)
+            or hard_set.intersection(degraded_set)
+            or 0 in hard_set
+            or 0 in degraded_set
+            or fault_threshold is None
+            or fault_threshold <= 0
+            or len(hard) + len(degraded) != fault_threshold
+            or max_omissions_per_proposal != fault_threshold
+            or responsive_omission_period != _RESPONSIVE_OMISSION_PERIOD
+        ):
+            _fail("tiered cohorts/bounds do not equal the independently derived f")
+    elif (
+        degraded
+        or fault_threshold is not None
+        or not 1 <= max_omissions_per_proposal <= len(hard)
+    ):
+        _fail("legacy fault causality proposal bound/cohort contract drifted")
     markers_by_proposal: dict[
         tuple[int, int, str, str], list[FaultMarker]
     ] = defaultdict(list)
+    degraded_by_actor: dict[int, list[FaultMarker]] = defaultdict(list)
     for marker in markers:
-        if marker.fault_mode != fault_mode or marker.actor not in actor_set:
+        cohort = (
+            "hard"
+            if marker.actor in hard_set
+            else "responsive_degraded"
+            if marker.actor in degraded_set
+            else None
+        )
+        if marker.fault_mode != fault_mode or cohort is None:
             _fail("fault marker mode/actor differs from the frozen schedule")
-        if marker.action == "forward":
-            _fail("fault marker cannot claim a no-op forward action")
+        if tiered:
+            expected_audit = (
+                cohort,
+                len(hard),
+                len(degraded),
+                fault_threshold,
+                max_omissions_per_proposal,
+                responsive_omission_period,
+            )
+            observed_audit = (
+                marker.cohort,
+                marker.hard_actor_count,
+                marker.responsive_degraded_actor_count,
+                marker.fault_threshold,
+                marker.max_omissions_per_proposal,
+                marker.responsive_omission_period,
+            )
+            if observed_audit != expected_audit:
+                _fail("tiered fault marker audit fields drifted")
+            ordinal = marker.contribution_ordinal
+            if cohort == "hard":
+                if ordinal != 0 or marker.action == "forward":
+                    _fail("hard markers must persistently omit with ordinal zero")
+            else:
+                if type(ordinal) is not int or ordinal <= 0:
+                    _fail("responsive-degraded marker ordinal must be positive")
+                should_omit = ordinal % responsive_omission_period == 0
+                if (marker.action != "forward") is not should_omit:
+                    _fail(
+                        "responsive-degraded marker action is not the exact "
+                        "every-32nd schedule"
+                    )
+                degraded_by_actor[marker.actor].append(marker)
+        else:
+            if any(getattr(marker, field) is not None for field in audit_fields):
+                _fail("legacy fault marker unexpectedly carries tiered audit fields")
+            if marker.action == "forward":
+                _fail("legacy fault marker cannot claim a no-op forward action")
         markers_by_proposal[
             (
                 marker.epoch_number,
@@ -3057,11 +3588,130 @@ def _validate_fault_marker_schedule(
         ].append(marker)
     for proposal, proposal_markers in markers_by_proposal.items():
         proposal_actors = [marker.actor for marker in proposal_markers]
+        omission_count = sum(
+            marker.action != "forward" for marker in proposal_markers
+        )
         if (
-            len(proposal_markers) > max_omissions_per_proposal
+            omission_count > max_omissions_per_proposal
             or len(set(proposal_actors)) != len(proposal_actors)
         ):
             _fail(f"fault proposal exceeds its independent omission bound: {proposal}")
+    if not tiered:
+        return
+    for actor in degraded:
+        actor_markers = degraded_by_actor.get(actor, ())
+        if not actor_markers:
+            _incomplete(
+                f"responsive-degraded actor {actor} emitted no scheduled markers"
+            )
+        proposal_keys = {
+            (
+                marker.epoch_number,
+                marker.tree_id,
+                marker.epoch_digest,
+                marker.block_hash,
+            )
+            for marker in actor_markers
+        }
+        ordinals = [
+            marker.contribution_ordinal for marker in actor_markers
+            if marker.contribution_ordinal is not None
+        ]
+        marker_times = [marker.monotonic_ns for marker in actor_markers]
+        if len(proposal_keys) != len(actor_markers):
+            _fail("responsive-degraded actor repeated a ProposalKey")
+        if ordinals != list(range(1, len(actor_markers) + 1)):
+            _fail(
+                "responsive-degraded contribution ordinals are not contiguous "
+                "from one or not chronological"
+            )
+        if any(
+            later <= earlier
+            for earlier, later in zip(marker_times, marker_times[1:])
+        ):
+            _fail("responsive-degraded marker clocks are not strictly increasing")
+        if len(actor_markers) < responsive_omission_period:
+            _incomplete(
+                f"responsive-degraded actor {actor} never reaches an omission ordinal"
+            )
+
+
+def _validate_tiered_observed_marker_completeness(
+    markers: Sequence[FaultMarker],
+    *,
+    fault_actor_ids: Sequence[int],
+    proposal_observations: Mapping[
+        tuple[int, int, str, str], Mapping[int, Sequence[int]]
+    ],
+    phase_windows: Mapping[str, tuple[int, int, int]],
+    phase_configurations: Sequence[
+        tuple[str, int, str, Mapping[int, Tree]]
+    ],
+) -> None:
+    """Bind every fully observed interior contribution to one audit marker.
+
+    A proposal is eligible for this completeness proof only when every
+    non-root fault actor has an actor-local native proposal/commit witness in
+    the frozen interior. For each such proposal the required marker set is
+    derived from the exact tree, so deleting a whole context or a trailing
+    marker cannot pass through marker-to-proposal checks alone.
+    """
+
+    actors = frozenset(fault_actor_ids)
+    grouped: dict[tuple[int, int, str, str], list[FaultMarker]] = defaultdict(list)
+    for marker in markers:
+        grouped[
+            (
+                marker.epoch_number,
+                marker.tree_id,
+                marker.epoch_digest,
+                marker.block_hash,
+            )
+        ].append(marker)
+
+    for phase, epoch_number, epoch_digest, trees in phase_configurations:
+        start_ns, end_ns, bucket_count = phase_windows[phase]
+        span_ns = end_ns - start_ns
+        if bucket_count <= 2 or span_ns <= 0 or span_ns % bucket_count:
+            _fail(f"{phase} cannot derive its frozen interior bucket boundary")
+        bucket_width_ns = span_ns // bucket_count
+        interior_start = start_ns + bucket_width_ns
+        interior_end = end_ns - bucket_width_ns
+        represented = 0
+        for proposal, observer_times in proposal_observations.items():
+            epoch, tree_id, digest, _ = proposal
+            if epoch != epoch_number or digest != epoch_digest:
+                continue
+            tree = trees.get(tree_id)
+            if tree is None:
+                _fail(f"{phase} observed proposal references an unknown tree")
+            if not actors.issubset(tree.members):
+                _fail(f"{phase} observed proposal tree omits a fault actor")
+            expected = {
+                actor
+                for actor in actors
+                if tree.members.index(actor) != 0
+            }
+            if not expected or not all(
+                any(
+                    interior_start <= monotonic_ns < interior_end
+                    for monotonic_ns in observer_times.get(actor, ())
+                )
+                for actor in expected
+            ):
+                continue
+            actual = {marker.actor for marker in grouped.get(proposal, ())}
+            if actual != expected:
+                _fail(
+                    f"{phase} fully observed proposal lacks the exact tiered "
+                    "actor marker set"
+                )
+            represented += 1
+        if represented == 0:
+            _incomplete(
+                f"{phase} lacks a fully observed tiered proposal in its frozen "
+                "interior"
+            )
 
 
 def _validate_persistent_interior_proposals(
@@ -3152,10 +3802,17 @@ def validate_fault_causality(
     accepted_epoch0: Sequence[_EvidenceRecord] = (),
     baseline_cutoff: int = 0,
     current_cutoff: int = 0,
+    responsive_degraded_actor_ids: Sequence[int] = (),
+    accepted_epoch1: Sequence[_EvidenceRecord] = (),
+    epoch1_baseline_cutoff: int = 0,
+    epoch1_current_cutoff: int = 0,
 ) -> None:
-    """Bind omissions to exact guarded evidence and both physical roles."""
+    """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
     actors = tuple(sorted(actor_ids))
+    degraded = tuple(sorted(responsive_degraded_actor_ids))
+    all_fault_actors = frozenset((*actors, *degraded))
+    tiered = fault_mode == _TIERED_OMISSION_MODE
     if not markers:
         _incomplete("native logs contain no KAURI_FAULT proposal markers")
     _validate_fault_marker_schedule(
@@ -3163,25 +3820,44 @@ def validate_fault_causality(
         actor_ids=actors,
         fault_mode=fault_mode,
         max_omissions_per_proposal=max_omissions_per_proposal,
+        responsive_degraded_actor_ids=degraded,
+        fault_threshold=(len(all_fault_actors) if tiered else None),
+        responsive_omission_period=_RESPONSIVE_OMISSION_PERIOD,
     )
     proposals: set[tuple[int, int, str, str]] = set()
     authoritative_commit_ns: dict[tuple[int, int, str, str], int] = {}
+    proposal_observations: dict[
+        tuple[int, int, str, str], dict[int, list[int]]
+    ] = defaultdict(lambda: defaultdict(list))
     for replica_id, events in replica_events.items():
         for event in events:
-            committed_identity = _authoritative_commit_proposal_identity(
-                event,
-                replica_id=replica_id,
-            )
-            if committed_identity is not None:
-                if committed_identity in authoritative_commit_ns:
-                    _fail("authoritative commit proposal identity is duplicated")
-                authoritative_commit_ns[committed_identity] = event.monotonic_ns
+            if event.event_type == "block.committed":
+                commit = _commit_payload(
+                    event,
+                    authoritative=replica_id == 0,
+                )
+                committed_identity = (
+                    commit["epoch_number"],
+                    commit["tree_id"],
+                    commit["epoch_digest"],
+                    commit["hash"],
+                )
+                proposal_observations[committed_identity][replica_id].append(
+                    event.monotonic_ns
+                )
+                if replica_id == 0:
+                    if committed_identity in authoritative_commit_ns:
+                        _fail("authoritative commit proposal identity is duplicated")
+                    authoritative_commit_ns[committed_identity] = event.monotonic_ns
             identity = _adaptive_proposal_identity(event)
             if identity is None:
                 continue
             if identity[4] != replica_id:
                 _fail("adaptive proposal observer differs from its replica stream")
             proposals.add(identity[:4])
+            proposal_observations[identity[:4]][replica_id].append(
+                event.monotonic_ns
+            )
     tree_by_id = {tree.tree_id: tree for tree in initial_trees}
     epoch1_tree_by_id = {tree.tree_id: tree for tree in epoch1_trees}
     epoch2_tree_by_id = {tree.tree_id: tree for tree in epoch2_trees}
@@ -3197,9 +3873,25 @@ def validate_fault_causality(
         and epoch2_phase[0] < epoch2_phase[1] <= window_end_ns
     ):
         _fail("fault causality phase windows are outside their exact live bounds")
-    if fault_mode == "persistent_selected_omission_v1":
-        _validate_persistent_interior_proposals(
+    if tiered:
+        _validate_tiered_observed_marker_completeness(
             markers,
+            fault_actor_ids=tuple(all_fault_actors),
+            proposal_observations=proposal_observations,
+            phase_windows=phase_windows,
+            phase_configurations=(
+                ("fault_evidence", 0, initial_epoch_digest, tree_by_id),
+                ("epoch1_stable", 1, epoch1_digest, epoch1_tree_by_id),
+                ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
+            ),
+        )
+    if fault_mode in {"persistent_selected_omission_v1", _TIERED_OMISSION_MODE}:
+        _validate_persistent_interior_proposals(
+            (
+                tuple(marker for marker in markers if marker.actor in set(actors))
+                if tiered
+                else markers
+            ),
             actor_ids=actors,
             phase_windows=phase_windows,
             phase_configurations=(
@@ -3208,31 +3900,57 @@ def validate_fault_causality(
                 ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
             ),
         )
-    outstanding: dict[str, _EvidenceRecord] = {}
-    for record in accepted_epoch0:
-        if not baseline_cutoff < record.ingestion_sequence <= current_cutoff:
-            continue
-        if record.outcome == "timeout":
-            outstanding[record.observation_id] = record
-        elif record.outcome == "late":
-            outstanding.pop(record.observation_id, None)
-    timeouts_by_proposal: dict[
-        tuple[int, int, int, str, str], list[_EvidenceRecord]
-    ] = defaultdict(list)
-    for record in outstanding.values():
-        timeouts_by_proposal[
-            (
-                record.target_id,
-                record.epoch_number,
-                record.tree_id,
-                record.epoch_digest,
-                record.block_hash,
-            )
-        ].append(record)
+    def outstanding_timeout_index(
+        records: Sequence[_EvidenceRecord],
+        *,
+        lower: int,
+        upper: int,
+    ) -> dict[tuple[int, int, int, str, str], tuple[_EvidenceRecord, ...]]:
+        outstanding: dict[str, _EvidenceRecord] = {}
+        for record in records:
+            if not lower < record.ingestion_sequence <= upper:
+                continue
+            if record.outcome == "timeout":
+                outstanding[record.observation_id] = record
+            elif record.outcome == "late":
+                outstanding.pop(record.observation_id, None)
+        grouped: dict[
+            tuple[int, int, int, str, str], list[_EvidenceRecord]
+        ] = defaultdict(list)
+        for record in outstanding.values():
+            grouped[
+                (
+                    record.target_id,
+                    record.epoch_number,
+                    record.tree_id,
+                    record.epoch_digest,
+                    record.block_hash,
+                )
+            ].append(record)
+        return {key: tuple(value) for key, value in grouped.items()}
+
+    timeout_indexes = {
+        0: outstanding_timeout_index(
+            accepted_epoch0,
+            lower=baseline_cutoff,
+            upper=current_cutoff,
+        ),
+        1: outstanding_timeout_index(
+            accepted_epoch1,
+            lower=epoch1_baseline_cutoff,
+            upper=epoch1_current_cutoff,
+        ),
+    }
     causal_reporters: dict[int, set[int]] = defaultdict(set)
     internal_actors: set[int] = set()
     epoch1_leaf_actors: set[int] = set()
     epoch2_leaf_actors: set[int] = set()
+    degraded_evidence_bound_actors: set[int] = set()
+    configurations = {
+        0: (initial_epoch_digest, tree_by_id, epoch1_command_ns),
+        1: (epoch1_digest, epoch1_tree_by_id, epoch2_command_ns),
+        2: (epoch2_digest, epoch2_tree_by_id, window_end_ns),
+    }
     for marker in markers:
         if (
             marker.fault_mode != fault_mode
@@ -3240,7 +3958,7 @@ def validate_fault_causality(
             or marker.window_start_ns != window_start_ns
             or marker.window_end_ns != window_end_ns
             or marker.actor != marker.source_replica
-            or marker.actor not in actors
+            or marker.actor not in all_fault_actors
             or not window_start_ns <= marker.monotonic_ns < window_end_ns
         ):
             _fail("fault marker is not bound to the exact slot actor/window")
@@ -3266,31 +3984,44 @@ def validate_fault_causality(
                 _fail("fault marker has no matching native proposal/configuration event")
             if marker.monotonic_ns >= commit_ns:
                 _fail("fault marker does not precede its authoritative commit proof")
-        if not (
-            marker.epoch_number == 0
-            and marker.epoch_digest == initial_epoch_digest
-            and fault_phase[0] <= marker.monotonic_ns < fault_phase[1]
-            and marker.monotonic_ns < epoch1_command_ns
-        ):
-            continue
-        tree = tree_by_id.get(marker.tree_id)
+        configuration = configurations.get(marker.epoch_number)
+        if configuration is None or marker.epoch_digest != configuration[0]:
+            _fail("fault marker references an unknown epoch configuration")
+        tree = configuration[1].get(marker.tree_id)
         if tree is None or marker.actor not in tree.members:
-            _fail("pre-containment omission references an unknown initial tree")
+            _fail("fault marker references an unknown physical tree role")
         position = tree.members.index(marker.actor)
+        if position == 0:
+            _fail("root actors must not emit omission-schedule markers")
         leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
-        if marker.action == "omit_aggregate":
-            if not 0 < position < leaf_start:
-                _fail("omit_aggregate marker actor was not physically internal")
-            expected_message_type = "aggregate_relay"
-            internal_actors.add(marker.actor)
-        elif marker.action == "omit_direct_vote":
-            if position < leaf_start:
-                _fail("pre-containment omit_direct_vote actor was not physically a leaf")
-            expected_message_type = "direct_vote"
-        else:
+        is_internal = position < leaf_start
+        expected_action = "omit_aggregate" if is_internal else "omit_direct_vote"
+        expected_message_type = "aggregate_relay" if is_internal else "direct_vote"
+        if marker.action != "forward" and marker.action != expected_action:
+            _fail("fault marker omission action differs from its physical role")
+        if marker.actor in degraded:
+            if marker.epoch_number in (1, 2) and marker.actor in tree.wait_exempt:
+                _fail("responsive-degraded actor is incorrectly wait-exempt")
+        elif marker.epoch_number in (1, 2) and marker.actor not in tree.wait_exempt:
+            _fail("hard actor is not wait-exempt after containment")
+        if marker.action == "forward":
             continue
+        if (
+            marker.actor in actors
+            and marker.action == "omit_direct_vote"
+            and marker.epoch_number == 1
+            and epoch1_phase[0] <= marker.monotonic_ns < epoch1_phase[1]
+        ):
+            epoch1_leaf_actors.add(marker.actor)
+        if (
+            marker.actor in actors
+            and marker.action == "omit_direct_vote"
+            and marker.epoch_number == 2
+            and epoch2_phase[0] <= marker.monotonic_ns < epoch2_phase[1]
+        ):
+            epoch2_leaf_actors.add(marker.actor)
         expected_reporter = tree.members[(position - 1) // tree.fanout]
-        matched_timeouts = timeouts_by_proposal.get(
+        matched_timeouts = timeout_indexes.get(marker.epoch_number, {}).get(
             (
                 marker.actor,
                 marker.epoch_number,
@@ -3300,6 +4031,7 @@ def validate_fault_causality(
             ),
             (),
         )
+        decision_deadline = configuration[2]
         exact_timeouts = [
             timeout
             for timeout in matched_timeouts
@@ -3308,55 +4040,34 @@ def validate_fault_causality(
             and timeout.reporter_id == expected_reporter
             and marker.monotonic_ns < timeout.reporter_monotonic_ns
             <= timeout.acceptance_monotonic_ns
-            < epoch1_command_ns
+            < decision_deadline
             )
         ]
-        if not exact_timeouts:
-            _fail(
-                "pre-containment omission has no exact outstanding timeout "
-                "accepted before Epoch1 selection"
-            )
-        causal_reporters[marker.actor].add(expected_reporter)
-    for marker in markers:
-        if marker.action != "omit_direct_vote":
-            continue
         if not (
-            marker.epoch_number == 1
-            and marker.epoch_digest == epoch1_digest
-            and epoch1_activation_ns <= marker.monotonic_ns < epoch2_command_ns
+            marker.epoch_number in (0, 1)
+            and marker.monotonic_ns < decision_deadline
         ):
             continue
-        tree = epoch1_tree_by_id.get(marker.tree_id)
-        if tree is None or marker.actor not in tree.members:
-            _fail("post-containment omission references an unknown Epoch1 tree")
-        position = tree.members.index(marker.actor)
-        if (
-            position < _first_leaf_index(len(tree.members), tree.fanout)
-            or marker.actor not in tree.wait_exempt
+        if marker.actor in degraded:
+            if not exact_timeouts:
+                _fail(
+                    "responsive-degraded omission has no exact outstanding raw "
+                    "timeout before the selecting transition"
+                )
+            if marker.epoch_number == 1:
+                degraded_evidence_bound_actors.add(marker.actor)
+        elif (
+            marker.epoch_number == 0
+            and fault_phase[0] <= marker.monotonic_ns < fault_phase[1]
         ):
-            _fail("omit_direct_vote marker actor was not a wait-exempt leaf")
-        if not epoch1_phase[0] <= marker.monotonic_ns < epoch1_phase[1]:
-            continue
-        epoch1_leaf_actors.add(marker.actor)
-    for marker in markers:
-        if marker.action != "omit_direct_vote":
-            continue
-        if not (
-            marker.epoch_number == 2
-            and marker.epoch_digest == epoch2_digest
-            and epoch2_phase[0] <= marker.monotonic_ns < epoch2_phase[1]
-        ):
-            continue
-        tree = epoch2_tree_by_id.get(marker.tree_id)
-        if tree is None or marker.actor not in tree.members:
-            _fail("Epoch2 omission references an unknown Epoch2 tree")
-        position = tree.members.index(marker.actor)
-        if (
-            position < _first_leaf_index(len(tree.members), tree.fanout)
-            or marker.actor not in tree.wait_exempt
-        ):
-            _fail("Epoch2 omit_direct_vote actor was not a wait-exempt leaf")
-        epoch2_leaf_actors.add(marker.actor)
+            if not exact_timeouts:
+                _fail(
+                    "pre-containment omission has no exact outstanding timeout "
+                    "accepted before Epoch1 selection"
+                )
+            causal_reporters[marker.actor].add(expected_reporter)
+            if is_internal:
+                internal_actors.add(marker.actor)
     if required_reporters <= 0:
         _fail("causal guard reporter threshold is invalid")
     missing_internal = set(actors) - internal_actors
@@ -3372,7 +4083,8 @@ def validate_fault_causality(
     }
     if missing:
         _fail(
-            "actors lack the full causally bound f+1 internal timeout guard: "
+            "actors lack the full causally bound f+1 timeout guard across exact "
+            "physical roles: "
             f"{missing}"
         )
     missing_epoch1_leaf = set(actors) - epoch1_leaf_actors
@@ -3387,6 +4099,13 @@ def validate_fault_causality(
             "actors lack Epoch2-stable wait-exempt leaf omit_direct_vote proof: "
             f"{sorted(missing_epoch2_leaf)}"
         )
+    if tiered:
+        missing_degraded_evidence = set(degraded) - degraded_evidence_bound_actors
+        if missing_degraded_evidence:
+            _fail(
+                "responsive-degraded actors lack an Epoch1 omission bound to raw "
+                f"performance-selection evidence: {sorted(missing_degraded_evidence)}"
+            )
 
 
 def _validate_slot_receipt(
@@ -3780,6 +4499,7 @@ def _validate_execution_authorization(
         "approved_utc",
         "kauri_revision",
         "slot_ids",
+        "result_root",
         "static_artifacts_sha256",
         "build_provenance_sha256",
         "automatic_retries",
@@ -3793,6 +4513,11 @@ def _validate_execution_authorization(
     ]
     expected_scope = "shape25_campaign" if campaign_member else "excluded_n7_smoke"
     expected_slots = planned_ids if campaign_member else [expected.slot_id]
+    expected_result_root = (
+        manifest.results_root
+        if campaign_member
+        else f"{manifest.results_root}-smoke"
+    )
     static_hashes = _mapping(
         document["static_artifacts_sha256"], "authorization static hashes"
     )
@@ -3824,12 +4549,13 @@ def _validate_execution_authorization(
         _canonical_json_bytes(core)
     )[:24]
     if (
-        document["schema_version"] != 1
+        document["schema_version"] != 2
         or document["scope"] != expected_scope
         or document["authorized_by"] != "thesis_author"
         or approved.tzinfo is None
         or approved.utcoffset() is None
         or document["slot_ids"] != expected_slots
+        or document["result_root"] != expected_result_root
         or document["automatic_retries"] != 0
         or document["replacement_policy"] != "none"
         or document["authorization_id"] != expected_id
@@ -4854,6 +5580,83 @@ def _validate_compact_snapshot_commitments(
         _fail("compact snapshot commitments do not recompute from raw evidence")
 
 
+def _validate_tiered_performance_ranking(
+    scores: Sequence[ReplicaScore],
+    *,
+    hard_actor_ids: Sequence[int],
+    responsive_degraded_actor_ids: Sequence[int],
+    fast_replica_ids: Sequence[int],
+    tree_count: int,
+    expected_roots: Sequence[int],
+    policy: Mapping[str, Any],
+) -> int:
+    """Prove responsive degradation, strict hierarchy, and replayed top-Q."""
+
+    hard = frozenset(hard_actor_ids)
+    degraded = frozenset(responsive_degraded_actor_ids)
+    fast = frozenset(fast_replica_ids)
+    score_by_id = {score.replica_id: score for score in scores}
+    if (
+        not degraded
+        or len(score_by_id) != len(scores)
+        or hard.intersection(degraded)
+        or hard.intersection(fast)
+        or degraded.intersection(fast)
+        or len(fast) != tree_count
+        or 0 not in fast
+        or hard | degraded | fast != set(score_by_id)
+    ):
+        _fail("tiered score cohorts do not form the independently derived partition")
+    minimum_attempts = _integer(
+        policy.get("minimum_attempts"),
+        "responsiveness.minimum_attempts",
+        1,
+    )
+    minimum_response_rate = _integer(
+        policy.get("minimum_response_rate_ppm"),
+        "responsiveness.minimum_response_rate_ppm",
+    )
+    maximum_timeout_rate = _integer(
+        policy.get("maximum_timeout_rate_ppm"),
+        "responsiveness.maximum_timeout_rate_ppm",
+    )
+    if minimum_attempts < _RESPONSIVE_OMISSION_PERIOD:
+        _fail("responsive policy no longer observes a full omission period")
+    rank_index = {score.replica_id: index for index, score in enumerate(scores)}
+    for replica in fast:
+        score = score_by_id[replica]
+        if score.classification != "responsive" or not score.eligible:
+            _fail("fast cohort is not fully responsive and eligible")
+    for replica in degraded:
+        score = score_by_id[replica]
+        if (
+            score.attempt_count < minimum_attempts
+            or score.classification != "responsive"
+            or not score.eligible
+            or not minimum_response_rate
+            <= score.response_rate_ppm
+            < 1_000_000
+            or not 0 < score.timeout_rate_ppm <= maximum_timeout_rate
+        ):
+            _fail(
+                "responsive-degraded actor lacks real nonzero degradation "
+                "inside the frozen responsive thresholds"
+            )
+    if max(rank_index[replica] for replica in fast) >= min(
+        rank_index[replica] for replica in degraded
+    ):
+        _fail("responsive-degraded actor does not rank below every fast replica")
+    replayed_top_q = tuple(
+        score.replica_id for score in scores if score.eligible
+    )[:tree_count]
+    if (
+        tuple(expected_roots) != replayed_top_q
+        or frozenset(replayed_top_q) != fast
+    ):
+        _fail("Epoch2 roots are not the independently replayed top-Q fast cohort")
+    return len(degraded)
+
+
 def _expected_roots(
     *,
     predecessor_trees: Sequence[Tree],
@@ -4907,7 +5710,9 @@ def _validate_successor_trees(
     actor_ids: Sequence[int],
     expected_roots: Sequence[int],
     expected_fanout: int,
-) -> None:
+    cycle: int = 0,
+    intent: str = "fault_containment",
+) -> tuple[int, int, int, int, int]:
     membership = tuple(range(expected.replica_count))
     if (
         bundle.membership_digest != _membership_digest(membership)
@@ -4919,6 +5724,13 @@ def _validate_successor_trees(
     ):
         _fail("successor epoch identity/tree roots differ from live independent derivation")
     actors = tuple(sorted(actor_ids))
+    degraded = tuple(sorted(expected.responsive_degraded_actor_ids))
+    fast = frozenset(expected.fast_replica_ids)
+    worse = frozenset((*actors, *degraded))
+    exposed_internal: set[int] = set()
+    constrained_leaf_count = 0
+    fast_position_count = 0
+    fast_position_required_count = 0
     for tree in bundle.trees:
         if (
             tuple(sorted(tree.members)) != membership
@@ -4931,6 +5743,43 @@ def _validate_successor_trees(
         for actor in actors:
             if tree.members.index(actor) < leaf_start:
                 _fail("actor is wait-exempt but not a physical successor leaf")
+        if degraded:
+            if any(actor in tree.wait_exempt for actor in degraded):
+                _fail("responsive-degraded actor is incorrectly wait-exempt")
+            for actor in degraded:
+                position = tree.members.index(actor)
+                if 0 < position < leaf_start:
+                    exposed_internal.add(actor)
+        if degraded and cycle == 1 and intent == "performance_optimization":
+            constrained = frozenset(membership) - fast
+            if constrained != worse or len(fast) != expected.q:
+                _fail("optimized tiered cohorts do not equal Q fast and f worse")
+            influential = tree.members[:leaf_start]
+            fast_position_required_count += len(influential)
+            if any(member not in fast for member in influential):
+                _fail("Epoch2 root/internal position contains a non-fast replica")
+            fast_position_count += len(influential)
+            for actor in constrained:
+                if tree.members.index(actor) < leaf_start:
+                    _fail("worse cohort member is not a physical Epoch2 leaf")
+                constrained_leaf_count += 1
+    degraded_root_count = 0
+    degraded_internal_count = 0
+    if degraded and cycle == 0:
+        roots = frozenset(tree.members[0] for tree in bundle.trees)
+        if not set(degraded).issubset(roots):
+            _fail("Epoch1 does not preserve every responsive-degraded canonical root")
+        if set(degraded) != exposed_internal:
+            _fail("Epoch1 does not expose every responsive-degraded actor internally")
+        degraded_root_count = len(degraded)
+        degraded_internal_count = len(exposed_internal)
+    return (
+        degraded_root_count,
+        degraded_internal_count,
+        constrained_leaf_count,
+        fast_position_count,
+        fast_position_required_count,
+    )
 
 
 def _activation_identity(payload: Mapping[str, Any], label: str) -> dict[str, Any]:
@@ -5280,7 +6129,7 @@ def _validate_adaptation_cycles(
     initial_epoch_digest: str,
     initial_trees: Sequence[Tree],
     cutoff_times: Mapping[str, int],
-) -> tuple[DecodedBundle, DecodedBundle]:
+) -> tuple[DecodedBundle, DecodedBundle, _HierarchyProof]:
     compact_snapshot = manifest.evidence_snapshot_format == "digest_commitment_v2"
     issuer_payload = _read_bytes(slot_root, "runtime/issuer-identities.txt")
     assert issuer_payload is not None
@@ -5302,6 +6151,12 @@ def _validate_adaptation_cycles(
     predecessor_digest = initial_epoch_digest
     predecessor_trees = tuple(initial_trees)
     bundles: list[DecodedBundle] = []
+    degraded_rank_count = 0
+    epoch1_degraded_root_count = 0
+    epoch1_degraded_internal_count = 0
+    epoch2_constrained_leaf_count = 0
+    epoch2_fast_position_count = 0
+    epoch2_fast_position_required_count = 0
     for cycle in range(2):
         transition = _mapping(runtime_transitions[cycle], f"runtime transition {cycle}")
         request = _mapping(transition.get("request"), f"runtime transition {cycle} request")
@@ -5446,6 +6301,22 @@ def _validate_adaptation_cycles(
         )
         if snapshot["eligible_ranking"] != list(roots):
             _fail("snapshot eligible roots differ from the live evidence ranking")
+        if (
+            expected.responsive_degraded_actor_ids
+            and cycle == 1
+            and intent == "performance_optimization"
+        ):
+            degraded_rank_count = _validate_tiered_performance_ranking(
+                scores,
+                hard_actor_ids=expected.actor_ids,
+                responsive_degraded_actor_ids=(
+                    expected.responsive_degraded_actor_ids
+                ),
+                fast_replica_ids=expected.fast_replica_ids,
+                tree_count=expected.q,
+                expected_roots=roots,
+                policy=policy,
+            )
 
         shape_event = shape_events[cycle]
         shape_payload = shape_event.payload
@@ -5473,20 +6344,57 @@ def _validate_adaptation_cycles(
             deterministic_seed=expected.scientific_seed,
             apply_selected=apply_selected,
         )
-        _validate_successor_trees(
+        structure = _validate_successor_trees(
             bundle,
             expected=expected,
             actor_ids=expected.actor_ids,
             expected_roots=roots,
             expected_fanout=_integer(decision["applied_fanout"], "applied fanout", 1),
+            cycle=cycle,
+            intent=intent,
         )
+        if cycle == 0:
+            epoch1_degraded_root_count = structure[0]
+            epoch1_degraded_internal_count = structure[1]
+        else:
+            epoch2_constrained_leaf_count = structure[2]
+            epoch2_fast_position_count = structure[3]
+            epoch2_fast_position_required_count = structure[4]
         bundles.append(bundle)
         predecessor_digest = bundle.epoch_digest
         predecessor_trees = bundle.trees
     if cutoff_times["shape_v1_computed"] != shape_events[1].monotonic_ns:
         _fail("shape cutoff is not the actual second live selector event")
     validate_manager_blinding((), tuple(event.payload for event in manager_events))
-    return bundles[0], bundles[1]
+    full_gate_passed: bool | None = None
+    if expected.responsive_degraded_actor_ids and expected.placement_adaptation:
+        degraded_count = len(expected.responsive_degraded_actor_ids)
+        full_gate_passed = (
+            degraded_rank_count == degraded_count
+            and epoch1_degraded_root_count == degraded_count
+            and epoch1_degraded_internal_count == degraded_count
+            and epoch2_constrained_leaf_count == expected.f * expected.q
+            and epoch2_fast_position_required_count > 0
+            and epoch2_fast_position_count
+            == epoch2_fast_position_required_count
+        )
+        if not full_gate_passed:
+            _fail("tiered adaptation hierarchy proof is incomplete")
+    return (
+        bundles[0],
+        bundles[1],
+        _HierarchyProof(
+            degraded_rank_count=degraded_rank_count,
+            epoch1_degraded_root_count=epoch1_degraded_root_count,
+            epoch1_degraded_internal_count=epoch1_degraded_internal_count,
+            epoch2_constrained_leaf_count=epoch2_constrained_leaf_count,
+            epoch2_fast_position_count=epoch2_fast_position_count,
+            epoch2_fast_position_required_count=(
+                epoch2_fast_position_required_count
+            ),
+            full_gate_passed=full_gate_passed,
+        ),
+    )
 
 
 def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
@@ -5666,7 +6574,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 manifest.evidence_snapshot_format == "digest_commitment_v2"
             ),
         )
-        bundles = _validate_adaptation_cycles(
+        epoch1_bundle, epoch2_bundle, hierarchy = _validate_adaptation_cycles(
             slot_root=slot_root,
             manager_events=manager_events,
             accepted=accepted,
@@ -5677,6 +6585,32 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             initial_trees=initial_trees,
             cutoff_times=cutoff_times,
         )
+        bundles = (epoch1_bundle, epoch2_bundle)
+        epoch1_roots = tuple(tree.members[0] for tree in bundles[0].trees)
+        epoch2_roots = tuple(tree.members[0] for tree in bundles[1].trees)
+        promoted_replica_ids = tuple(sorted(set(epoch2_roots) - set(epoch1_roots)))
+        demoted_replica_ids = tuple(sorted(set(epoch1_roots) - set(epoch2_roots)))
+        placement_changed = bool(promoted_replica_ids and demoted_replica_ids)
+        if (
+            manifest.byzantine.mode == _TIERED_OMISSION_MODE
+            and expected.placement_adaptation
+        ):
+            expected_demoted = expected.responsive_degraded_actor_ids
+            expected_promoted = tuple(
+                member
+                for member in range(expected.q, expected.replica_count)
+                if member not in set(expected.actor_ids)
+            )
+            if (
+                demoted_replica_ids != expected_demoted
+                or promoted_replica_ids != expected_promoted
+                or len(expected_demoted) != expected.f - len(expected.actor_ids)
+                or len(expected_promoted) != len(expected_demoted)
+            ):
+                _fail(
+                    "tiered Epoch1-to-Epoch2 movement is not the exact "
+                    "degraded demotion/canonical promotion set"
+                )
         _validate_cleanup_ledger(
             slot_root,
             expected=expected,
@@ -5712,15 +6646,19 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             for replica_id in range(expected.replica_count)
         }
         markers = _fault_markers(slot_root, paths_by_replica)
-        cycle0_snapshots = [
-            event
-            for event in manager_events
-            if event.event_type == "adaptive_v2_evidence_snapshot"
-            and event.payload.get("cycle_ordinal") == 0
-        ]
-        if len(cycle0_snapshots) != 1:
-            _fail("cycle-0 evidence snapshot is absent or duplicated")
-        cycle0_snapshot = cycle0_snapshots[0].payload
+        cycle_snapshots = {
+            cycle: [
+                event
+                for event in manager_events
+                if event.event_type == "adaptive_v2_evidence_snapshot"
+                and event.payload.get("cycle_ordinal") == cycle
+            ]
+            for cycle in (0, 1)
+        }
+        if any(len(events) != 1 for events in cycle_snapshots.values()):
+            _fail("cycle evidence snapshot is absent or duplicated")
+        cycle0_snapshot = cycle_snapshots[0][0].payload
+        cycle1_snapshot = cycle_snapshots[1][0].payload
         expected_window, expected_max_omissions = _effective_omission_contract(
             manifest, expected
         )
@@ -5753,6 +6691,20 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             current_cutoff=_integer(
                 cycle0_snapshot.get("current_cutoff"),
                 "cycle-0 current cutoff",
+                1,
+            ),
+            responsive_degraded_actor_ids=(
+                expected.responsive_degraded_actor_ids
+            ),
+            accepted_epoch1=accepted.get((1, bundles[0].epoch_digest), ()),
+            epoch1_baseline_cutoff=_integer(
+                cycle1_snapshot.get("baseline_cutoff"),
+                "cycle-1 baseline cutoff",
+                1,
+            ),
+            epoch1_current_cutoff=_integer(
+                cycle1_snapshot.get("current_cutoff"),
+                "cycle-1 current cutoff",
                 1,
             ),
         )
@@ -5833,6 +6785,33 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             metrics=metrics,
             integrity_valid=True,
             campaign_member=campaign_member,
+            epoch1_roots=epoch1_roots,
+            epoch2_roots=epoch2_roots,
+            promoted_replica_ids=promoted_replica_ids,
+            demoted_replica_ids=demoted_replica_ids,
+            placement_changed=placement_changed,
+            hard_actor_ids=expected.actor_ids,
+            responsive_degraded_actor_ids=(
+                expected.responsive_degraded_actor_ids
+            ),
+            fast_replica_ids=expected.fast_replica_ids,
+            degraded_rank_proof_count=hierarchy.degraded_rank_count,
+            epoch1_degraded_root_proof_count=(
+                hierarchy.epoch1_degraded_root_count
+            ),
+            epoch1_degraded_internal_proof_count=(
+                hierarchy.epoch1_degraded_internal_count
+            ),
+            epoch2_constrained_leaf_proof_count=(
+                hierarchy.epoch2_constrained_leaf_count
+            ),
+            epoch2_fast_root_internal_position_proof_count=(
+                hierarchy.epoch2_fast_position_count
+            ),
+            epoch2_fast_root_internal_position_required_count=(
+                hierarchy.epoch2_fast_position_required_count
+            ),
+            full_hierarchy_gate_passed=hierarchy.full_gate_passed,
         )
     except _Incomplete as error:
         return SlotValidationResult(
@@ -5890,6 +6869,165 @@ def _matched_estimate(
         ci95_upper_tps=upper,
         positive_block_count=sum(value > 0 for value in values),
         directional_claim_supported=lower > 0,
+    )
+
+
+def _primary_throughput_log_ratio_estimate(
+    block_ids: Sequence[str],
+    block_values: Sequence[Mapping[str, Mapping[str, float]]],
+    *,
+    positive_block_requirement: int,
+) -> MatchedLogRatioEstimate | None:
+    """Compute the frozen matched log ratio-of-ratios without an offset."""
+
+    blocks = tuple(block_ids)
+    values = tuple(block_values)
+    if (
+        len(blocks) != 5
+        or len(values) != len(blocks)
+        or positive_block_requirement != 4
+    ):
+        _fail("primary throughput estimate requires five blocks and the frozen 4/5 rule")
+    effects: list[float] = []
+    for value in values:
+        try:
+            required_means = (
+                value["00"]["epoch1_stable"],
+                value["00"]["epoch2_stable"],
+                value["P"]["epoch1_stable"],
+                value["P"]["epoch2_stable"],
+                value["S"]["epoch1_stable"],
+                value["S"]["epoch2_stable"],
+                value["PS"]["epoch1_stable"],
+                value["PS"]["epoch2_stable"],
+            )
+        except KeyError as error:
+            _fail("primary throughput estimate lacks a required arm/phase mean")
+        if not all(math.isfinite(mean) for mean in required_means):
+            _fail("primary throughput estimate requires finite arm/phase means")
+        if any(mean <= 0 for mean in required_means):
+            return None
+        control_adjusted_p = math.log(
+            (value["P"]["epoch2_stable"] / value["P"]["epoch1_stable"])
+            / (value["00"]["epoch2_stable"] / value["00"]["epoch1_stable"])
+        )
+        control_adjusted_ps = math.log(
+            (value["PS"]["epoch2_stable"] / value["PS"]["epoch1_stable"])
+            / (value["S"]["epoch2_stable"] / value["S"]["epoch1_stable"])
+        )
+        effects.append(0.5 * (control_adjusted_p + control_adjusted_ps))
+
+    mean = sum(effects) / len(effects)
+    sample_variance = sum((value - mean) ** 2 for value in effects) / (
+        len(effects) - 1
+    )
+    sample_standard_deviation = math.sqrt(sample_variance)
+    margin = 2.7764451051977987 * sample_standard_deviation / math.sqrt(
+        len(effects)
+    )
+    lower = mean - margin
+    upper = mean + margin
+    ratio = math.exp(mean)
+    lower_ratio = math.exp(lower)
+    upper_ratio = math.exp(upper)
+    positive_count = sum(value > 0 for value in effects)
+    return MatchedLogRatioEstimate(
+        contrast="placement_epoch2_over_epoch1_log_ratio_of_ratios",
+        block_ids=blocks,
+        block_effects_log_ratio=tuple(effects),
+        mean_log_ratio=mean,
+        sample_standard_deviation_log_ratio=sample_standard_deviation,
+        ci95_lower_log_ratio=lower,
+        ci95_upper_log_ratio=upper,
+        geometric_mean_ratio=ratio,
+        geometric_mean_percent_change=(ratio - 1.0) * 100.0,
+        ci95_lower_ratio=lower_ratio,
+        ci95_upper_ratio=upper_ratio,
+        ci95_lower_percent_change=(lower_ratio - 1.0) * 100.0,
+        ci95_upper_percent_change=(upper_ratio - 1.0) * 100.0,
+        positive_block_count=positive_count,
+        directional_claim_supported=(
+            lower > 0 and positive_count >= positive_block_requirement
+        ),
+    )
+
+
+def _pre_epoch1_placebo_log_ratio_estimate(
+    block_ids: Sequence[str],
+    block_values: Sequence[Mapping[str, Mapping[str, float]]],
+    *,
+    adaptive_arm: str,
+    control_arm: str,
+    equivalence_margin_log: float,
+) -> MatchedEquivalenceEstimate | None:
+    """Run one frozen df=4 TOST on an arm's baseline-to-fault contrast."""
+
+    blocks = tuple(block_ids)
+    values = tuple(block_values)
+    if len(blocks) != 5 or len(values) != len(blocks):
+        _fail("pre-Epoch1 placebo requires five matched blocks")
+    contrast_names = {
+        ("P", "00"): "p_over_00_pre_epoch1_log_ratio_of_ratios_placebo",
+        ("PS", "S"): "ps_over_s_pre_epoch1_log_ratio_of_ratios_placebo",
+    }
+    contrast = contrast_names.get((adaptive_arm, control_arm))
+    if contrast is None:
+        _fail("pre-Epoch1 placebo arm contrast is not prespecified")
+    if not math.isfinite(equivalence_margin_log) or equivalence_margin_log <= 0:
+        _fail("pre-Epoch1 placebo equivalence margin is invalid")
+    effects: list[float] = []
+    for value in values:
+        try:
+            required_means = (
+                value[control_arm]["baseline"],
+                value[control_arm]["fault_evidence"],
+                value[adaptive_arm]["baseline"],
+                value[adaptive_arm]["fault_evidence"],
+            )
+        except KeyError:
+            _fail("pre-Epoch1 placebo lacks a required arm/phase mean")
+        if not all(math.isfinite(mean) for mean in required_means):
+            _fail("pre-Epoch1 placebo requires finite arm/phase means")
+        if any(mean <= 0 for mean in required_means):
+            return None
+        effects.append(
+            math.log(
+                (
+                    value[adaptive_arm]["fault_evidence"]
+                    / value[adaptive_arm]["baseline"]
+                )
+                / (
+                    value[control_arm]["fault_evidence"]
+                    / value[control_arm]["baseline"]
+                )
+            )
+        )
+
+    mean = sum(effects) / len(effects)
+    sample_variance = sum((value - mean) ** 2 for value in effects) / (
+        len(effects) - 1
+    )
+    sample_standard_deviation = math.sqrt(sample_variance)
+    # Frozen two-sided 90% interval for TOST at alpha=0.05, df=4.
+    margin = 2.131846786326649 * sample_standard_deviation / math.sqrt(
+        len(effects)
+    )
+    lower = mean - margin
+    upper = mean + margin
+    numerical_boundary_tolerance = 8.0 * math.ulp(equivalence_margin_log)
+    return MatchedEquivalenceEstimate(
+        contrast=contrast,
+        block_ids=blocks,
+        block_effects_log_ratio=tuple(effects),
+        mean_log_ratio=mean,
+        sample_standard_deviation_log_ratio=sample_standard_deviation,
+        ci90_lower_log_ratio=lower,
+        ci90_upper_log_ratio=upper,
+        equivalence_margin_log_ratio=equivalence_margin_log,
+        equivalence_supported=(
+            lower + equivalence_margin_log > numerical_boundary_tolerance
+            and equivalence_margin_log - upper > numerical_boundary_tolerance
+        ),
     )
 
 
@@ -5972,6 +7110,43 @@ def _headline_effects(
         - adaptive_mean(value, "epoch1_stable")
         for value in placement
     ]
+    optimization_gains_p = [
+        value["P"]["epoch2_stable"] - value["P"]["epoch1_stable"]
+        for value in placement
+    ]
+    optimization_gains_ps = [
+        value["PS"]["epoch2_stable"] - value["PS"]["epoch1_stable"]
+        for value in placement
+    ]
+    primary_throughput_log_ratio = None
+    if scope.breakthrough_primary_throughput_estimand is not None:
+        primary_throughput_log_ratio = _primary_throughput_log_ratio_estimate(
+            placement_blocks,
+            placement,
+            positive_block_requirement=(
+                scope.breakthrough_positive_block_requirement or 0
+            ),
+        )
+    pre_epoch1_placebo_p_log_ratio = None
+    pre_epoch1_placebo_ps_log_ratio = None
+    if scope.breakthrough_pre_epoch1_placebo_estimand is not None:
+        equivalence_margin = scope.breakthrough_placebo_equivalence_margin_log
+        if equivalence_margin is None:
+            _fail("pre-Epoch1 placebo margin is not prespecified")
+        pre_epoch1_placebo_p_log_ratio = _pre_epoch1_placebo_log_ratio_estimate(
+            placement_blocks,
+            placement,
+            adaptive_arm="P",
+            control_arm="00",
+            equivalence_margin_log=equivalence_margin,
+        )
+        pre_epoch1_placebo_ps_log_ratio = _pre_epoch1_placebo_log_ratio_estimate(
+            placement_blocks,
+            placement,
+            adaptive_arm="PS",
+            control_arm="S",
+            equivalence_margin_log=equivalence_margin,
+        )
     return FactorialEffects(
         endpoint="epoch2_stable_mean_tps",
         estimator=scope.headline_estimator,
@@ -6007,7 +7182,589 @@ def _headline_effects(
             placement_blocks,
             optimization_gains,
         ),
+        optimization_gain_p=_matched_estimate(
+            "p_arm_epoch2_minus_epoch1_tps",
+            placement_blocks,
+            optimization_gains_p,
+        ),
+        optimization_gain_ps=_matched_estimate(
+            "ps_arm_epoch2_minus_epoch1_tps",
+            placement_blocks,
+            optimization_gains_ps,
+        ),
+        primary_throughput_log_ratio=primary_throughput_log_ratio,
+        pre_epoch1_placebo_p_log_ratio=pre_epoch1_placebo_p_log_ratio,
+        pre_epoch1_placebo_ps_log_ratio=pre_epoch1_placebo_ps_log_ratio,
     )
+
+
+def _breakthrough_structural_counts(
+    manifest: FrozenFactorialManifest,
+    results: Mapping[str, SlotValidationResult],
+) -> tuple[int, int]:
+    """Count required slots that pass the complete tiered hierarchy gate."""
+
+    summary = _breakthrough_hierarchy_summary(manifest, results)
+    return summary["required_slot_count"], summary["validated_slot_count"]
+
+
+def _breakthrough_hierarchy_summary(
+    manifest: FrozenFactorialManifest,
+    results: Mapping[str, SlotValidationResult],
+) -> dict[str, Any]:
+    scope = manifest.claim_scope
+    required = scope.breakthrough_structural_required_slot_count or 0
+    if required == 0:
+        return {
+            "required_slot_count": 0,
+            "validated_slot_count": 0,
+            "cohort_ids_by_slot": (),
+            "degraded_rank_required_count": 0,
+            "degraded_rank_validated_count": 0,
+            "epoch1_degraded_root_required_count": 0,
+            "epoch1_degraded_root_validated_count": 0,
+            "epoch1_degraded_internal_required_count": 0,
+            "epoch1_degraded_internal_validated_count": 0,
+            "epoch2_constrained_leaf_required_count": 0,
+            "epoch2_constrained_leaf_validated_count": 0,
+            "epoch2_fast_position_required_count": 0,
+            "epoch2_fast_position_validated_count": 0,
+            "full_hierarchy_gate_passed": False,
+        }
+    expected_slots = tuple(
+        slot
+        for slot in _expected_slots(manifest)
+        if slot.replica_count == scope.placement_headline_replica_count
+        and slot.initial_fanout == scope.placement_headline_initial_fanout
+        and slot.arm_code in {"P", "PS"}
+    )
+    if len(expected_slots) != required:
+        _fail("breakthrough structural scope disagrees with its required slot count")
+    required_pairs = {
+        (slot.block_id, slot.arm_code) for slot in expected_slots
+    }
+    result_by_pair: dict[tuple[str | None, str | None], SlotValidationResult] = {}
+    for result in results.values():
+        pair = (result.block_id, result.arm_code)
+        if pair not in required_pairs:
+            continue
+        if pair in result_by_pair:
+            _fail("campaign results duplicate a breakthrough block/arm identity")
+        result_by_pair[pair] = result
+    cohort_ids = tuple(
+        (
+            slot.slot_id,
+            slot.actor_ids,
+            slot.responsive_degraded_actor_ids,
+            slot.fast_replica_ids,
+        )
+        for slot in expected_slots
+    )
+    degraded_required = sum(
+        len(slot.responsive_degraded_actor_ids) for slot in expected_slots
+    )
+    constrained_leaf_required = sum(
+        slot.f * slot.q for slot in expected_slots
+    )
+    validated_slots = 0
+    degraded_rank_validated = 0
+    epoch1_root_validated = 0
+    epoch1_internal_validated = 0
+    epoch2_leaf_validated = 0
+    epoch2_fast_required = 0
+    epoch2_fast_validated = 0
+    for slot in expected_slots:
+        result = result_by_pair.get((slot.block_id, slot.arm_code))
+        if result is None or not result.figure_eligible:
+            continue
+        degraded_rank_validated += result.degraded_rank_proof_count
+        epoch1_root_validated += result.epoch1_degraded_root_proof_count
+        epoch1_internal_validated += result.epoch1_degraded_internal_proof_count
+        epoch2_leaf_validated += result.epoch2_constrained_leaf_proof_count
+        epoch2_fast_required += (
+            result.epoch2_fast_root_internal_position_required_count
+        )
+        epoch2_fast_validated += (
+            result.epoch2_fast_root_internal_position_proof_count
+        )
+        if (
+            result.hard_actor_ids == slot.actor_ids
+            and result.responsive_degraded_actor_ids
+            == slot.responsive_degraded_actor_ids
+            and result.fast_replica_ids == slot.fast_replica_ids
+            and result.degraded_rank_proof_count
+            == len(slot.responsive_degraded_actor_ids)
+            and result.epoch1_degraded_root_proof_count
+            == len(slot.responsive_degraded_actor_ids)
+            and result.epoch1_degraded_internal_proof_count
+            == len(slot.responsive_degraded_actor_ids)
+            and result.epoch2_constrained_leaf_proof_count == slot.f * slot.q
+            and result.epoch2_fast_root_internal_position_required_count > 0
+            and result.epoch2_fast_root_internal_position_proof_count
+            == result.epoch2_fast_root_internal_position_required_count
+            and result.full_hierarchy_gate_passed is True
+        ):
+            validated_slots += 1
+    full_gate = (
+        validated_slots == required
+        and degraded_rank_validated == degraded_required
+        and epoch1_root_validated == degraded_required
+        and epoch1_internal_validated == degraded_required
+        and epoch2_leaf_validated == constrained_leaf_required
+        and epoch2_fast_required > 0
+        and epoch2_fast_validated == epoch2_fast_required
+    )
+    return {
+        "required_slot_count": required,
+        "validated_slot_count": validated_slots,
+        "cohort_ids_by_slot": cohort_ids,
+        "degraded_rank_required_count": degraded_required,
+        "degraded_rank_validated_count": degraded_rank_validated,
+        "epoch1_degraded_root_required_count": degraded_required,
+        "epoch1_degraded_root_validated_count": epoch1_root_validated,
+        "epoch1_degraded_internal_required_count": degraded_required,
+        "epoch1_degraded_internal_validated_count": epoch1_internal_validated,
+        "epoch2_constrained_leaf_required_count": constrained_leaf_required,
+        "epoch2_constrained_leaf_validated_count": epoch2_leaf_validated,
+        "epoch2_fast_position_required_count": epoch2_fast_required,
+        "epoch2_fast_position_validated_count": epoch2_fast_validated,
+        "full_hierarchy_gate_passed": full_gate,
+    }
+
+
+def _breakthrough_realized_placement_counts(
+    manifest: FrozenFactorialManifest,
+    results: Mapping[str, SlotValidationResult],
+) -> tuple[int, int, int]:
+    """Count independently validated Epoch1-to-Epoch2 root-set changes."""
+
+    scope = manifest.claim_scope
+    requirement = scope.breakthrough_realized_placement_per_arm_requirement or 0
+    if requirement == 0:
+        return 0, 0, 0
+    changed_blocks: dict[str, set[str]] = {"P": set(), "PS": set()}
+    required_blocks = {
+        f"n{scope.placement_headline_replica_count}-"
+        f"f{scope.placement_headline_initial_fanout}-b{index:02d}"
+        for index in range(1, scope.placement_headline_block_count + 1)
+    }
+    expected_by_pair = {
+        (slot.block_id, slot.arm_code): slot
+        for slot in _expected_slots(manifest)
+        if slot.replica_count == scope.placement_headline_replica_count
+        and slot.initial_fanout == scope.placement_headline_initial_fanout
+        and slot.arm_code in {"P", "PS"}
+    }
+    for result in results.values():
+        if (
+            not result.figure_eligible
+            or result.replica_count != scope.placement_headline_replica_count
+            or result.initial_fanout != scope.placement_headline_initial_fanout
+            or result.arm_code not in changed_blocks
+            or result.block_id is None
+            or result.block_id not in required_blocks
+        ):
+            continue
+        epoch1 = set(result.epoch1_roots)
+        epoch2 = set(result.epoch2_roots)
+        promoted = tuple(sorted(epoch2 - epoch1))
+        demoted = tuple(sorted(epoch1 - epoch2))
+        expected = expected_by_pair.get((result.block_id, result.arm_code))
+        if expected is None:
+            continue
+        expected_promoted = tuple(
+            member
+            for member in range(expected.q, expected.replica_count)
+            if member not in set(expected.actor_ids)
+        )
+        if (
+            result.placement_changed is True
+            and result.full_hierarchy_gate_passed is True
+            and result.promoted_replica_ids == promoted
+            and result.demoted_replica_ids == demoted
+            and promoted == expected_promoted
+            and demoted == expected.responsive_degraded_actor_ids
+        ):
+            changed_blocks[result.arm_code].add(result.block_id)
+    return requirement, len(changed_blocks["P"]), len(changed_blocks["PS"])
+
+
+def _breakthrough_verdict(
+    manifest: FrozenFactorialManifest | None,
+    results: Mapping[str, SlotValidationResult],
+    *,
+    campaign_outcome: str,
+    effects: FactorialEffects | None,
+) -> BreakthroughVerdict:
+    if manifest is None or manifest.claim_scope.breakthrough_scope is None:
+        return BreakthroughVerdict(
+            status="NOT_EVALUABLE",
+            exact_scope="not_prespecified_for_validated_manifest",
+            structural_gate="not_prespecified",
+            structural_required_slot_count=0,
+            structural_validated_slot_count=0,
+            structural_gate_passed=False,
+            realized_placement_rule="not_prespecified",
+            realized_placement_per_arm_requirement=0,
+            placement_changed_p_block_count=0,
+            placement_changed_ps_block_count=0,
+            realized_placement_gate_passed=False,
+            primary_throughput_estimand="not_prespecified",
+            throughput_claim_rule="not_prespecified",
+            throughput_estimate_available=False,
+            throughput_ci95_lower_log_ratio_gt_zero=None,
+            throughput_positive_block_count=None,
+            throughput_required_positive_block_count=0,
+            throughput_rule_passed=None,
+            fault_drop_positive_block_count=None,
+            fault_drop_rule_passed=None,
+            containment_recovery_positive_block_count=None,
+            containment_recovery_rule_passed=None,
+            optimization_gain_positive_block_count=None,
+            optimization_gain_rule_passed=None,
+            p_absolute_optimization_positive_block_count=None,
+            ps_absolute_optimization_positive_block_count=None,
+            per_arm_absolute_optimization_rule_passed=None,
+            absolute_sequence_gate_passed=None,
+            epoch1_baseline_ratio_role="not_prespecified",
+            pre_epoch1_placebo_estimand="not_prespecified",
+            placebo_equivalence_rule="not_prespecified",
+            placebo_equivalence_margin_log=None,
+            placebo_p_estimate_available=False,
+            placebo_p_ci90_lower_log_ratio=None,
+            placebo_p_ci90_upper_log_ratio=None,
+            placebo_p_equivalence_rule_passed=None,
+            placebo_ps_estimate_available=False,
+            placebo_ps_ci90_lower_log_ratio=None,
+            placebo_ps_ci90_upper_log_ratio=None,
+            placebo_ps_equivalence_rule_passed=None,
+            placebo_equivalence_rule_passed=None,
+            cohort_ids_by_slot=(),
+            degraded_rank_required_count=0,
+            degraded_rank_validated_count=0,
+            epoch1_degraded_root_required_count=0,
+            epoch1_degraded_root_validated_count=0,
+            epoch1_degraded_internal_required_count=0,
+            epoch1_degraded_internal_validated_count=0,
+            epoch2_constrained_leaf_required_count=0,
+            epoch2_constrained_leaf_validated_count=0,
+            epoch2_fast_root_internal_position_required_count=0,
+            epoch2_fast_root_internal_position_validated_count=0,
+            full_hierarchy_gate_passed=False,
+            failed_requirements=(
+                "breakthrough analysis is not prespecified for this manifest",
+            ),
+        )
+
+    scope = manifest.claim_scope
+    hierarchy = _breakthrough_hierarchy_summary(manifest, results)
+    required = hierarchy["required_slot_count"]
+    validated = hierarchy["validated_slot_count"]
+    structural_passed = hierarchy["full_hierarchy_gate_passed"]
+    placement_requirement, changed_p, changed_ps = (
+        _breakthrough_realized_placement_counts(manifest, results)
+    )
+    realized_placement_passed = (
+        placement_requirement > 0
+        and changed_p >= placement_requirement
+        and changed_ps >= placement_requirement
+    )
+    common = {
+        "exact_scope": scope.breakthrough_scope,
+        "structural_gate": scope.breakthrough_structural_gate or "",
+        "structural_required_slot_count": required,
+        "structural_validated_slot_count": validated,
+        "structural_gate_passed": structural_passed,
+        "realized_placement_rule": (
+            scope.breakthrough_realized_placement_rule or ""
+        ),
+        "realized_placement_per_arm_requirement": placement_requirement,
+        "placement_changed_p_block_count": changed_p,
+        "placement_changed_ps_block_count": changed_ps,
+        "realized_placement_gate_passed": realized_placement_passed,
+        "primary_throughput_estimand": (
+            scope.breakthrough_primary_throughput_estimand or ""
+        ),
+        "throughput_claim_rule": scope.breakthrough_throughput_claim_rule or "",
+        "throughput_required_positive_block_count": (
+            scope.breakthrough_positive_block_requirement or 0
+        ),
+        "epoch1_baseline_ratio_role": (
+            scope.breakthrough_epoch1_baseline_ratio_role or ""
+        ),
+        "pre_epoch1_placebo_estimand": (
+            scope.breakthrough_pre_epoch1_placebo_estimand or ""
+        ),
+        "placebo_equivalence_rule": (
+            scope.breakthrough_placebo_equivalence_rule or ""
+        ),
+        "placebo_equivalence_margin_log": (
+            scope.breakthrough_placebo_equivalence_margin_log
+        ),
+        "cohort_ids_by_slot": hierarchy["cohort_ids_by_slot"],
+        "degraded_rank_required_count": (
+            hierarchy["degraded_rank_required_count"]
+        ),
+        "degraded_rank_validated_count": (
+            hierarchy["degraded_rank_validated_count"]
+        ),
+        "epoch1_degraded_root_required_count": (
+            hierarchy["epoch1_degraded_root_required_count"]
+        ),
+        "epoch1_degraded_root_validated_count": (
+            hierarchy["epoch1_degraded_root_validated_count"]
+        ),
+        "epoch1_degraded_internal_required_count": (
+            hierarchy["epoch1_degraded_internal_required_count"]
+        ),
+        "epoch1_degraded_internal_validated_count": (
+            hierarchy["epoch1_degraded_internal_validated_count"]
+        ),
+        "epoch2_constrained_leaf_required_count": (
+            hierarchy["epoch2_constrained_leaf_required_count"]
+        ),
+        "epoch2_constrained_leaf_validated_count": (
+            hierarchy["epoch2_constrained_leaf_validated_count"]
+        ),
+        "epoch2_fast_root_internal_position_required_count": (
+            hierarchy["epoch2_fast_position_required_count"]
+        ),
+        "epoch2_fast_root_internal_position_validated_count": (
+            hierarchy["epoch2_fast_position_validated_count"]
+        ),
+        "full_hierarchy_gate_passed": hierarchy["full_hierarchy_gate_passed"],
+    }
+    if campaign_outcome != "PASS" or effects is None:
+        failed = ["campaign lacks complete valid data for the prespecified scope"]
+        if not structural_passed:
+            failed.append(
+                f"structural gate validated {validated} of {required} required slots"
+            )
+        if not realized_placement_passed:
+            failed.append(
+                "realized placement gate lacks complete valid root-change evidence"
+            )
+        return BreakthroughVerdict(
+            status="NOT_EVALUABLE",
+            throughput_estimate_available=False,
+            throughput_ci95_lower_log_ratio_gt_zero=None,
+            throughput_positive_block_count=None,
+            throughput_rule_passed=None,
+            fault_drop_positive_block_count=None,
+            fault_drop_rule_passed=None,
+            containment_recovery_positive_block_count=None,
+            containment_recovery_rule_passed=None,
+            optimization_gain_positive_block_count=None,
+            optimization_gain_rule_passed=None,
+            p_absolute_optimization_positive_block_count=None,
+            ps_absolute_optimization_positive_block_count=None,
+            per_arm_absolute_optimization_rule_passed=None,
+            absolute_sequence_gate_passed=None,
+            placebo_p_estimate_available=False,
+            placebo_p_ci90_lower_log_ratio=None,
+            placebo_p_ci90_upper_log_ratio=None,
+            placebo_p_equivalence_rule_passed=None,
+            placebo_ps_estimate_available=False,
+            placebo_ps_ci90_lower_log_ratio=None,
+            placebo_ps_ci90_upper_log_ratio=None,
+            placebo_ps_equivalence_rule_passed=None,
+            placebo_equivalence_rule_passed=None,
+            failed_requirements=tuple(failed),
+            **common,
+        )
+
+    estimate = effects.primary_throughput_log_ratio
+    placebo_p = effects.pre_epoch1_placebo_p_log_ratio
+    placebo_ps = effects.pre_epoch1_placebo_ps_log_ratio
+    failed: list[str] = []
+    positive_requirement = scope.breakthrough_positive_block_requirement or 0
+    placebo_p_supported = (
+        placebo_p is not None and placebo_p.equivalence_supported
+    )
+    placebo_ps_supported = (
+        placebo_ps is not None and placebo_ps.equivalence_supported
+    )
+    placebo_supported = placebo_p_supported and placebo_ps_supported
+    placebo_fields = {
+        "placebo_p_estimate_available": placebo_p is not None,
+        "placebo_p_ci90_lower_log_ratio": (
+            None if placebo_p is None else placebo_p.ci90_lower_log_ratio
+        ),
+        "placebo_p_ci90_upper_log_ratio": (
+            None if placebo_p is None else placebo_p.ci90_upper_log_ratio
+        ),
+        "placebo_p_equivalence_rule_passed": (
+            None if placebo_p is None else placebo_p_supported
+        ),
+        "placebo_ps_estimate_available": placebo_ps is not None,
+        "placebo_ps_ci90_lower_log_ratio": (
+            None if placebo_ps is None else placebo_ps.ci90_lower_log_ratio
+        ),
+        "placebo_ps_ci90_upper_log_ratio": (
+            None if placebo_ps is None else placebo_ps.ci90_upper_log_ratio
+        ),
+        "placebo_ps_equivalence_rule_passed": (
+            None if placebo_ps is None else placebo_ps_supported
+        ),
+        "placebo_equivalence_rule_passed": placebo_supported,
+    }
+
+    def absolute_matched_rule(value: MatchedEstimate) -> bool:
+        return (
+            value.ci95_lower_tps > 0
+            and value.positive_block_count >= positive_requirement
+        )
+
+    fault_drop_passed = absolute_matched_rule(effects.fault_drop)
+    containment_recovery_passed = absolute_matched_rule(
+        effects.containment_recovery
+    )
+    optimization_gain_passed = absolute_matched_rule(effects.optimization_gain)
+    p_absolute_count = effects.optimization_gain_p.positive_block_count
+    ps_absolute_count = effects.optimization_gain_ps.positive_block_count
+    per_arm_absolute_passed = (
+        p_absolute_count >= positive_requirement
+        and ps_absolute_count >= positive_requirement
+    )
+    absolute_sequence_passed = (
+        fault_drop_passed
+        and containment_recovery_passed
+        and optimization_gain_passed
+        and per_arm_absolute_passed
+    )
+    absolute_fields = {
+        "fault_drop_positive_block_count": (
+            effects.fault_drop.positive_block_count
+        ),
+        "fault_drop_rule_passed": fault_drop_passed,
+        "containment_recovery_positive_block_count": (
+            effects.containment_recovery.positive_block_count
+        ),
+        "containment_recovery_rule_passed": containment_recovery_passed,
+        "optimization_gain_positive_block_count": (
+            effects.optimization_gain.positive_block_count
+        ),
+        "optimization_gain_rule_passed": optimization_gain_passed,
+        "p_absolute_optimization_positive_block_count": p_absolute_count,
+        "ps_absolute_optimization_positive_block_count": ps_absolute_count,
+        "per_arm_absolute_optimization_rule_passed": per_arm_absolute_passed,
+        "absolute_sequence_gate_passed": absolute_sequence_passed,
+    }
+    if placebo_p is None:
+        failed.append(
+            "P/00 pre-Epoch1 placebo requires strictly positive baseline/fault "
+            "means in every matched block"
+        )
+    elif not placebo_p_supported:
+        failed.append(
+            "P/00 pre-Epoch1 placebo 90% log-ratio interval is not strictly "
+            "within the prespecified equivalence margin"
+        )
+    if placebo_ps is None:
+        failed.append(
+            "PS/S pre-Epoch1 placebo requires strictly positive baseline/fault "
+            "means in every matched block"
+        )
+    elif not placebo_ps_supported:
+        failed.append(
+            "PS/S pre-Epoch1 placebo 90% log-ratio interval is not strictly "
+            "within the prespecified equivalence margin"
+        )
+    if not structural_passed:
+        failed.append(
+            f"structural gate validated {validated} of {required} required slots"
+        )
+    if changed_p < placement_requirement:
+        failed.append(
+            f"P realized placement changed in {changed_p} of 5 blocks; "
+            f"requires at least {placement_requirement}"
+        )
+    if changed_ps < placement_requirement:
+        failed.append(
+            f"PS realized placement changed in {changed_ps} of 5 blocks; "
+            f"requires at least {placement_requirement}"
+        )
+    if not fault_drop_passed:
+        failed.append(
+            "absolute fault-drop gate requires a positive 95% lower TPS bound "
+            f"and {positive_requirement}/5 positive blocks"
+        )
+    if not containment_recovery_passed:
+        failed.append(
+            "absolute containment-recovery gate requires a positive 95% lower "
+            f"TPS bound and {positive_requirement}/5 positive blocks"
+        )
+    if not optimization_gain_passed:
+        failed.append(
+            "absolute optimization-gain gate requires a positive 95% lower TPS "
+            f"bound and {positive_requirement}/5 positive blocks"
+        )
+    if p_absolute_count < positive_requirement:
+        failed.append(
+            f"P absolute Epoch2-minus-Epoch1 gain is positive in "
+            f"{p_absolute_count}/5 blocks; requires {positive_requirement}/5"
+        )
+    if ps_absolute_count < positive_requirement:
+        failed.append(
+            f"PS absolute Epoch2-minus-Epoch1 gain is positive in "
+            f"{ps_absolute_count}/5 blocks; requires {positive_requirement}/5"
+        )
+    if estimate is None:
+        failed.append(
+            "primary throughput log ratio requires strictly positive Epoch1/Epoch2 "
+            "means for all four arms in every matched block"
+        )
+        return BreakthroughVerdict(
+            status="NOT_SUPPORTED",
+            throughput_estimate_available=False,
+            throughput_ci95_lower_log_ratio_gt_zero=None,
+            throughput_positive_block_count=None,
+            throughput_rule_passed=False,
+            failed_requirements=tuple(failed),
+            **placebo_fields,
+            **absolute_fields,
+            **common,
+        )
+
+    ci_supported = estimate.ci95_lower_log_ratio > 0
+    count_supported = (
+        estimate.positive_block_count
+        >= (scope.breakthrough_positive_block_requirement or 0)
+    )
+    throughput_supported = ci_supported and count_supported
+    if not ci_supported:
+        failed.append("two-sided 95% lower log-ratio bound is not above zero")
+    if not count_supported:
+        failed.append(
+            "fewer than four of five matched block log-ratio effects are positive"
+        )
+    supported = (
+        structural_passed
+        and realized_placement_passed
+        and placebo_supported
+        and absolute_sequence_passed
+        and throughput_supported
+    )
+    return BreakthroughVerdict(
+        status="SUPPORTED" if supported else "NOT_SUPPORTED",
+        throughput_estimate_available=True,
+        throughput_ci95_lower_log_ratio_gt_zero=ci_supported,
+        throughput_positive_block_count=estimate.positive_block_count,
+        throughput_rule_passed=throughput_supported,
+        failed_requirements=tuple(failed),
+        **placebo_fields,
+        **absolute_fields,
+        **common,
+    )
+
+
+def _campaign_figure_eligible(
+    campaign_outcome: str,
+    effects: FactorialEffects | None,
+) -> bool:
+    """Keep evidence validity independent from hypothesis direction."""
+
+    return campaign_outcome == "PASS" and effects is not None
 
 
 def _validate_campaign_execution_ledger(
@@ -6037,6 +7794,7 @@ def _validate_campaign_execution_ledger(
         "approved_utc",
         "kauri_revision",
         "slot_ids",
+        "result_root",
         "static_artifacts_sha256",
         "build_provenance_sha256",
         "automatic_retries",
@@ -6068,7 +7826,8 @@ def _validate_campaign_execution_ledger(
         raise _Reject("campaign authorization timestamp is invalid") from error
     revision = _string(authorization["kauri_revision"], "campaign revision")
     if (
-        authorization["schema_version"] != 1
+        type(authorization["schema_version"]) is not int
+        or authorization["schema_version"] != 2
         or authorization["scope"] != "shape25_campaign"
         or authorization["authorized_by"] != "thesis_author"
         or not _string(
@@ -6078,6 +7837,7 @@ def _validate_campaign_execution_ledger(
         or approved.utcoffset() is None
         or _HEX40.fullmatch(revision) is None
         or authorization["slot_ids"] != planned_ids
+        or authorization["result_root"] != manifest.results_root
         or dict(
             _mapping(
                 authorization["static_artifacts_sha256"],
@@ -6089,6 +7849,7 @@ def _validate_campaign_execution_ledger(
             PLAN_FILENAME: identity.plan_sha256,
             RUNTIME_FILENAME: identity.runtime_sha256,
         }
+        or type(authorization["automatic_retries"]) is not int
         or authorization["automatic_retries"] != 0
         or authorization["replacement_policy"] != "none"
         or authorization["authorization_id"] != expected_authorization_id
@@ -6134,7 +7895,7 @@ def _validate_campaign_execution_ledger(
         "expected_slot_count": EXPECTED_SLOT_COUNT,
         "execution_schedule": schedule,
     }
-    if dict(contract) != expected_contract:
+    if contract_bytes != _canonical_json_bytes(expected_contract):
         _fail("campaign execution contract differs from the frozen schedule")
     contract_sha256 = _sha256(contract_bytes)
 
@@ -6251,7 +8012,10 @@ def _validate_campaign_execution_ledger(
             "replacement_policy": "none",
         }
         for row, state in ((started, "STARTED"), (terminal, "TERMINAL")):
-            if any(row[key] != value for key, value in expected_common.items()):
+            if any(
+                not _exact_json_value(row[key], value)
+                for key, value in expected_common.items()
+            ):
                 _fail("campaign ledger identity/order/no-retry binding drifted")
             if row["state"] != state:
                 _fail("campaign ledger does not alternate STARTED then TERMINAL")
@@ -6304,7 +8068,10 @@ def _validate_campaign_execution_ledger(
             "campaign_member": result.campaign_member,
             "figure_eligible": result.figure_eligible,
         }
-        if dict(_mapping(terminal["validation"], "terminal validation")) != expected_validation:
+        if not _exact_json_value(
+            dict(_mapping(terminal["validation"], "terminal validation")),
+            expected_validation,
+        ):
             _fail("campaign TERMINAL validator verdict does not independently replay")
         execution_outcome = terminal["execution_outcome"]
         execution_reason = terminal["execution_reason"]
@@ -6373,16 +8140,21 @@ def _validate_campaign_execution_ledger(
         raise _Reject("campaign completion timestamp is invalid") from error
     complete = attempted == EXPECTED_SLOT_COUNT and all_attempts_accepted
     if (
-        summary["schema_version"] != 1
+        type(summary["schema_version"]) is not int
+        or summary["schema_version"] != 1
         or summary["campaign_id"] != runtime["runtime_id"]
         or summary["authorization_id"] != authorization["authorization_id"]
         or summary["authorization_sha256"] != _sha256(authorization_bytes)
         or summary["contract_sha256"] != contract_sha256
         or summary["ledger_sha256"] != _sha256(ledger_bytes)
-        or summary["expected_slot_count"] != EXPECTED_SLOT_COUNT
-        or summary["attempted_slot_count"] != attempted
-        or summary["next_execution_ordinal"]
-        != (None if attempted == EXPECTED_SLOT_COUNT else attempted + 1)
+        or not _exact_json_value(
+            summary["expected_slot_count"], EXPECTED_SLOT_COUNT
+        )
+        or not _exact_json_value(summary["attempted_slot_count"], attempted)
+        or not _exact_json_value(
+            summary["next_execution_ordinal"],
+            None if attempted == EXPECTED_SLOT_COUNT else attempted + 1,
+        )
         or summary["execution_complete"] is not complete
         or (complete and stopped_reason is not None)
         or (not complete and stopped_reason is None)
@@ -6397,6 +8169,8 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
     """Validate all frozen slots and compute only prespecified contrasts."""
 
     root = Path(campaign_directory)
+    manifest_for_verdict: FrozenFactorialManifest | None = None
+    results_for_verdict: dict[str, SlotValidationResult] = {}
     try:
         if root.is_symlink() or not root.is_dir():
             _incomplete("campaign result directory is absent")
@@ -6424,6 +8198,7 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
         first_manifest = _read_bytes(slot_directories[0], MANIFEST_FILENAME)
         assert first_manifest is not None
         manifest = load_frozen_manifest_bytes(first_manifest)
+        manifest_for_verdict = manifest
         loaded_plan = _read_json(slot_directories[0], PLAN_FILENAME)
         loaded_runtime = _read_json(slot_directories[0], RUNTIME_FILENAME)
         assert loaded_plan is not None and loaded_runtime is not None
@@ -6458,6 +8233,7 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             else:
                 results.append(validate_slot(path))
         by_id = {result.slot_id: result for result in results}
+        results_for_verdict = by_id
         effects = _headline_effects(manifest, by_id)
         outcome = (
             "FAIL"
@@ -6485,7 +8261,7 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
                 }
             )
         )
-        figure_eligible = outcome == "PASS" and effects is not None
+        figure_eligible = _campaign_figure_eligible(outcome, effects)
         _validate_campaign_execution_ledger(
             root,
             manifest=manifest,
@@ -6496,6 +8272,12 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             results_by_id=by_id,
             campaign_outcome=outcome,
         )
+        breakthrough = _breakthrough_verdict(
+            manifest,
+            by_id,
+            campaign_outcome=outcome,
+            effects=effects,
+        )
         return CampaignValidationResult(
             outcome=outcome,
             reason=reason,
@@ -6503,6 +8285,7 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             parameter_coverage=coverage,
             headline_effects=effects,
             figure_eligible=figure_eligible,
+            breakthrough_verdict=breakthrough,
         )
     except _Incomplete as error:
         return CampaignValidationResult(
@@ -6512,6 +8295,12 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             parameter_coverage=(),
             headline_effects=None,
             figure_eligible=False,
+            breakthrough_verdict=_breakthrough_verdict(
+                manifest_for_verdict,
+                results_for_verdict,
+                campaign_outcome="INCOMPLETE",
+                effects=None,
+            ),
         )
     except Exception as error:
         return CampaignValidationResult(
@@ -6521,6 +8310,12 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             parameter_coverage=(),
             headline_effects=None,
             figure_eligible=False,
+            breakthrough_verdict=_breakthrough_verdict(
+                manifest_for_verdict,
+                results_for_verdict,
+                campaign_outcome="FAIL",
+                effects=None,
+            ),
         )
 
 
@@ -6541,11 +8336,14 @@ __all__ = (
     "SLOT_FILENAME",
     "THROUGHPUT_FILENAME",
     "CampaignValidationResult",
+    "BreakthroughVerdict",
     "DecodedBundle",
     "FactorialEffects",
     "FactorialValidationError",
     "FaultMarker",
+    "MatchedEquivalenceEstimate",
     "MatchedEstimate",
+    "MatchedLogRatioEstimate",
     "PhaseMetric",
     "SlotValidationResult",
     "Tree",

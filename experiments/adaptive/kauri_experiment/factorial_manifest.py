@@ -8,7 +8,7 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 LEGACY_MANIFEST_ID = "shape-placement-factorial-v1"
 LEGACY_MANIFEST_SHA256 = (
@@ -64,14 +64,23 @@ V6_SEMANTIC_SHA256 = (
 )
 V6_PLAN_SHA256 = "674fdac9511bac8362bce0aa3dd939a4a65117f35b3652a8cd6c153a8a7fdc57"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v7"
-FROZEN_MANIFEST_SHA256 = (
+V7_MANIFEST_ID = "shape-placement-factorial-v7"
+V7_MANIFEST_SHA256 = (
     "3160855b1c023269c775ecf5b8d11b6cd19931dd686ff6875ea9c305b1744a18"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V7_SEMANTIC_SHA256 = (
     "e6a8ec618e7b5dddbd01f86846ea0b13cc4ee5acfc82436d63572410d7170b12"
 )
-FROZEN_PLAN_SHA256 = "18469f3b00f3dfb9b92c586ec46cce1f1b76b49faf506840eb30bd769e5f7026"
+V7_PLAN_SHA256 = "18469f3b00f3dfb9b92c586ec46cce1f1b76b49faf506840eb30bd769e5f7026"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v8"
+FROZEN_MANIFEST_SHA256 = (
+    "05d8f3bbf38b2da8000d4a7788b0376803c71feaf8bb44e52e19c8e248757dee"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "af47ea9d35c1db786e5609b53bdffc93f18b47db40db948908edb611c92f76a3"
+)
+FROZEN_PLAN_SHA256 = "0f1d1c321109f795c03d658208d340fff5b38da7d74986996ed52bd7828a8598"
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
 EXPECTED_CANDIDATE_FANOUTS = (2, 3, 5)
@@ -127,6 +136,18 @@ class ActorSelectionVector(_Document):
 
 
 @dataclass(frozen=True, slots=True)
+class ResponsiveDegradationContract(_Document):
+    actor_count_rule: str
+    actor_selection: str
+    actor_selection_preimage: str
+    actor_selection_inputs: tuple[str, ...]
+    actor_selection_vectors: tuple[ActorSelectionVector, ...]
+    observer_isolation: str
+    actor_schedule: str
+    omission_period: int
+
+
+@dataclass(frozen=True, slots=True)
 class ByzantineContract(_Document):
     mode: str
     actor_count: int
@@ -140,8 +161,26 @@ class ByzantineContract(_Document):
     maximum_rotating_contexts: int
     start_after_prelaunch_anchor_s: int
     duration_s: int
-    max_omissions_per_proposal: int
+    max_omissions_per_proposal: int | None
     actions: ByzantineActions
+    responsive_degradation: ResponsiveDegradationContract | None = None
+    max_omissions_per_proposal_rule: str | None = None
+
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        if self.mode == "rotating_intermittent_omission_v1":
+            document["actor_rotation"] = document.pop("actor_schedule")
+        if self.responsive_degradation is None:
+            document.pop("responsive_degradation")
+        else:
+            document["responsive_degradation"] = (
+                self.responsive_degradation.as_document()
+            )
+        if self.max_omissions_per_proposal is None:
+            document.pop("max_omissions_per_proposal")
+        if self.max_omissions_per_proposal_rule is None:
+            document.pop("max_omissions_per_proposal_rule")
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +221,12 @@ class CommonTimers(_Document):
     hard_timeout_s: int
     transition_observation_bound_rule: str = "phase_deadline_v1"
 
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        if self.transition_observation_bound_rule == "phase_deadline_v1":
+            document.pop("transition_observation_bound_rule")
+        return document
+
     @property
     def aggregation_timeout_ms(self) -> int:
         return self.aggregation_timeout_ms_per_depth * self.global_worst_candidate_depth
@@ -219,6 +264,27 @@ class ClaimScope(_Document):
     shape_and_joint_headline_replica_count: int
     shape_and_joint_headline_initial_fanout: int
     shape_and_joint_headline_block_count: int
+    breakthrough_scope: str | None = None
+    breakthrough_structural_gate: str | None = None
+    breakthrough_structural_required_slot_count: int | None = None
+    breakthrough_realized_placement_rule: str | None = None
+    breakthrough_realized_placement_per_arm_requirement: int | None = None
+    breakthrough_primary_throughput_estimand: str | None = None
+    breakthrough_throughput_claim_rule: str | None = None
+    breakthrough_positive_block_requirement: int | None = None
+    breakthrough_epoch1_baseline_ratio_role: str | None = None
+    breakthrough_absolute_phase_sequence_estimands: str | None = None
+    breakthrough_phase_window_interpretation: str | None = None
+    breakthrough_pre_epoch1_placebo_estimand: str | None = None
+    breakthrough_placebo_equivalence_rule: str | None = None
+    breakthrough_placebo_equivalence_margin_log: float | None = None
+
+    def as_document(self) -> dict[str, object]:
+        return {
+            key: value
+            for key, value in _Document.as_document(self).items()
+            if value is not None
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +311,13 @@ class ConsensusShape(_Document):
     initial_depth: int
     candidate_depths: tuple[tuple[int, int], ...]
     worst_candidate_depth: int
+
+
+@dataclass(frozen=True, slots=True)
+class TieredCohorts(_Document):
+    hard_actor_ids: tuple[int, ...]
+    responsive_degraded_actor_ids: tuple[int, ...]
+    fast_replica_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +391,19 @@ class FactorialSlot(_Document):
     common_timers: CommonTimers
     ports: PortAllocation
     result_path: str
+    responsive_degraded_actor_ids: tuple[int, ...] = ()
+    fast_replica_ids: tuple[int, ...] = ()
+    max_omissions_per_proposal: int | None = None
+
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        document["byzantine"] = self.byzantine.as_document()
+        document["common_timers"] = self.common_timers.as_document()
+        if self.byzantine.responsive_degradation is None:
+            document.pop("responsive_degraded_actor_ids")
+            document.pop("fast_replica_ids")
+            document.pop("max_omissions_per_proposal")
+        return document
 
     @property
     def replica_count(self) -> int:
@@ -367,6 +453,20 @@ class FactorialSlot(_Document):
     def seed(self) -> int:
         return self.scientific_seed
 
+    @property
+    def maximum_omissions_per_proposal(self) -> int:
+        if (
+            self.byzantine.max_omissions_per_proposal_rule
+            == "derived_f_per_slot_v1"
+        ):
+            if self.max_omissions_per_proposal != self.f:
+                _error("slot Byzantine omission maximum must equal derived f")
+            return self.max_omissions_per_proposal
+        maximum = self.byzantine.max_omissions_per_proposal
+        if type(maximum) is not int or maximum < 1:
+            _error("slot Byzantine omission maximum is not derivable")
+        return maximum
+
 
 @dataclass(frozen=True, slots=True)
 class FactorialPlan(_Document):
@@ -394,6 +494,8 @@ class FactorialPlan(_Document):
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
+        document["claim_scope"] = self.claim_scope.as_document()
+        document["slots"] = tuple(slot.as_document() for slot in self.slots)
         document.update(
             {
                 "plan_id": f"{self.manifest_id}-plan-v1",
@@ -553,15 +655,18 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V4_MANIFEST_ID,
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
+        V7_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
+    tiered = manifest_id == FROZEN_MANIFEST_ID
     persistent = manifest_id in {
         V2_MANIFEST_ID,
         V3_MANIFEST_ID,
         V4_MANIFEST_ID,
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
+        V7_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
@@ -569,6 +674,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V4_MANIFEST_ID,
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
+        V7_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -670,9 +776,13 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
     if any(3 > (replica_count - 1) // 3 for replica_count in replica_counts):
         _error("fixed campaign actor count must not exceed derived f")
     expected_mode = (
-        "persistent_selected_omission_v1"
-        if persistent
-        else "rotating_intermittent_omission_v1"
+        "tiered_persistent_responsive_omission_v1"
+        if tiered
+        else (
+            "persistent_selected_omission_v1"
+            if persistent
+            else "rotating_intermittent_omission_v1"
+        )
     )
     if byzantine.get("mode") != expected_mode:
         _error(f"{manifest_id} requires Byzantine mode {expected_mode}")
@@ -712,11 +822,15 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         }:
             _error("actor selection vector disagrees with the SHA-256 ranking")
     expected_actor_schedule = (
-        "all_selected_actors_per_proposal_v1"
-        if persistent
+        "all_hard_actors_per_proposal_v1"
+        if tiered
         else (
-            "fnv1a64_be_epoch_tree_epoch_digest_block_hash_"
-            "modulo_sorted_actors_v1"
+            "all_selected_actors_per_proposal_v1"
+            if persistent
+            else (
+                "fnv1a64_be_epoch_tree_epoch_digest_block_hash_"
+                "modulo_sorted_actors_v1"
+            )
         )
     )
     actor_schedule = byzantine.get(
@@ -761,18 +875,112 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             or vector.get("selected_actor") != computed_actor
         ):
             _error("actor rotation vector disagrees with the FNV-1a reference")
-    expected_max_omissions = 3 if persistent else 1
-    if (
-        _integer(
-            byzantine.get("max_omissions_per_proposal"),
-            "byzantine.max_omissions_per_proposal",
+    if tiered:
+        responsive = _mapping(
+            byzantine.get("responsive_degradation"),
+            "byzantine.responsive_degradation",
         )
-        != expected_max_omissions
-    ):
-        _error(
-            "maximum omissions per proposal must equal the frozen actor "
-            "schedule cardinality"
+        expected_responsive_fields = {
+            "actor_count_rule",
+            "actor_selection",
+            "actor_selection_preimage",
+            "actor_selection_inputs",
+            "actor_selection_vectors",
+            "observer_isolation",
+            "actor_schedule",
+            "omission_period",
+        }
+        if set(responsive) != expected_responsive_fields:
+            _error("responsive-degradation contract fields are not frozen")
+        if (
+            responsive.get("actor_count_rule")
+            != "derived_f_minus_hard_actor_count_v1"
+            or responsive.get("actor_selection")
+            != (
+                "sha256_ranked_canonical_epoch0_reference_roots_"
+                "excluding_commit_observer_v1"
+            )
+            or responsive.get("actor_selection_preimage")
+            != (
+                r"kauri.shape25.responsive-degraded.v1\0{membership_csv}"
+                r"\0{q}\0{scientific_seed}\0{replica_id}"
+            )
+            or responsive.get("actor_selection_inputs")
+            != [
+                "membership",
+                "derived_q",
+                "canonical_epoch0_reference_roots_1_through_q_minus_1_v1",
+                "replica_0_reserved_authoritative_commit_observer_v1",
+                "scientific_block_seed",
+            ]
+            or responsive.get("observer_isolation")
+            != "replica_0_reserved_authoritative_commit_observer_v1"
+            or responsive.get("actor_schedule")
+            != (
+                "omit_every_32nd_unique_non_root_contribution_per_"
+                "responsive_degraded_actor_v1"
+            )
+            or _integer(
+                responsive.get("omission_period"),
+                "byzantine.responsive_degradation.omission_period",
+                minimum=2,
+            )
+            != 32
+        ):
+            _error("responsive-degradation semantics differ from frozen v8")
+        responsive_vectors = _array(
+            responsive.get("actor_selection_vectors"),
+            "byzantine.responsive_degradation.actor_selection_vectors",
         )
+        if len(responsive_vectors) != len(expected_selection_vector_inputs):
+            _error("responsive degradation requires three frozen ranking vectors")
+        for index, (raw_vector, expected_inputs) in enumerate(
+            zip(responsive_vectors, expected_selection_vector_inputs)
+        ):
+            vector = _mapping(
+                raw_vector, f"responsive degradation selection vector {index}"
+            )
+            replica_count, q, scientific_seed = expected_inputs
+            hard = derive_actor_ids(replica_count, q, 3, scientific_seed)
+            expected_selected = derive_responsive_degraded_actor_ids(
+                replica_count,
+                q,
+                hard,
+                scientific_seed,
+            )
+            if vector != {
+                "replica_count": replica_count,
+                "q": q,
+                "scientific_seed": scientific_seed,
+                "selected_actor_ids": list(expected_selected),
+            }:
+                _error(
+                    "responsive degradation vector disagrees with SHA-256 ranking"
+                )
+        if "max_omissions_per_proposal" in byzantine:
+            _error("v8 maximum omissions must be derived per slot, not scalar")
+        if (
+            byzantine.get("max_omissions_per_proposal_rule")
+            != "derived_f_per_slot_v1"
+        ):
+            _error("v8 maximum omissions must equal derived f per slot")
+    else:
+        if "responsive_degradation" in byzantine:
+            _error("only v8 may carry responsive-degradation semantics")
+        if "max_omissions_per_proposal_rule" in byzantine:
+            _error("legacy manifests must retain their scalar omission maximum")
+        expected_max_omissions = 3 if persistent else 1
+        if (
+            _integer(
+                byzantine.get("max_omissions_per_proposal"),
+                "byzantine.max_omissions_per_proposal",
+            )
+            != expected_max_omissions
+        ):
+            _error(
+                "maximum omissions per proposal must equal the frozen actor "
+                "schedule cardinality"
+            )
 
     global_worst_candidate_depth = max(
         tree_depth(replica_count, fanout)
@@ -901,15 +1109,21 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
     resources = _mapping(document.get("resources"), "resources")
     artifacts = _mapping(document.get("artifacts"), "artifacts")
     claim_scope = _mapping(document.get("claim_scope"), "claim_scope")
+    expected_counterbalancing = (
+        "stratified_greedy_minimum_position_imbalance_"
+        "sha256_tiebreak_v2"
+        if manifest_id == FROZEN_MANIFEST_ID
+        else "greedy_minimum_position_imbalance_sha256_tiebreak_v1"
+    )
     if (
         scheduling.get("execution_block_order") != "sha256_ranked_block_ids_v1"
         or scheduling.get("arm_counterbalancing")
-        != "greedy_minimum_position_imbalance_sha256_tiebreak_v1"
+        != expected_counterbalancing
         or type(scheduling.get("campaign_order_seed")) is not int
         or scheduling.get("campaign_order_seed") < 0
     ):
         _error("execution schedule must use the frozen counterbalancing rule")
-    if claim_scope != {
+    expected_claim_scope: dict[str, object] = {
         "other_cells": "parameter_coverage_only",
         "causal_inference": ("matched_repeated_blocks_within_prespecified_strata_only"),
         "headline_estimator": (
@@ -928,9 +1142,80 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         "shape_and_joint_headline_replica_count": 31,
         "shape_and_joint_headline_initial_fanout": 2,
         "shape_and_joint_headline_block_count": 5,
-    }:
+    }
+    if manifest_id == FROZEN_MANIFEST_ID:
+        expected_claim_scope.update(
+            {
+                "breakthrough_scope": (
+                    "n31_f5_placement_arms_p_and_ps_five_matched_blocks_v1"
+                ),
+                "breakthrough_structural_gate": (
+                    "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_"
+                    "and_every_32nd_unique_non_root_responsive_degraded_omission_"
+                    "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_"
+                    "role_bound_timeout_reporters_and_at_least_one_internal_"
+                    "omit_aggregate_proof_and_responsive_degraded_replicas_rank_"
+                    "below_every_"
+                    "fast_replica_and_epoch1_places_every_responsive_degraded_"
+                    "replica_as_a_root_and_exposes_each_in_an_internal_role_and_"
+                    "epoch2_roots_equal_top_q_fast_replicas_with_only_fast_"
+                    "replicas_in_root_and_internal_roles_and_all_f_worse_replicas_"
+                    "as_physical_leaves_and_only_hard_cohort_wait_exempt_v2"
+                ),
+                "breakthrough_structural_required_slot_count": 10,
+                "breakthrough_realized_placement_rule": (
+                    "for_each_p_and_ps_arm_all_5_of_5_n31_f5_blocks_have_"
+                    "epoch1_to_epoch2_demoted_set_exactly_responsive_degraded_"
+                    "cohort_and_promoted_set_exactly_canonical_non_reference_"
+                    "root_pool_minus_hard_cohort_v2"
+                ),
+                "breakthrough_realized_placement_per_arm_requirement": 5,
+                "breakthrough_primary_throughput_estimand": (
+                    "d_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+"
+                    "log((PS_e2/PS_e1)/(S_e2/S_e1))]"
+                ),
+                "breakthrough_throughput_claim_rule": (
+                    "two_sided_student_t_95_df4_lower_log_bound_strictly_"
+                    "greater_than_zero_and_at_least_4_of_5_block_effects_"
+                    "strictly_greater_than_zero_and_absolute_fault_drop_"
+                    "containment_recovery_and_pooled_optimization_each_two_"
+                    "sided_student_t_95_df4_lower_tps_bound_strictly_greater_"
+                    "than_zero_and_at_least_4_of_5_blocks_strictly_greater_"
+                    "than_zero_and_p_and_ps_each_absolute_epoch2_minus_epoch1_"
+                    "tps_strictly_greater_than_zero_in_at_least_4_of_5_blocks_v2"
+                ),
+                "breakthrough_positive_block_requirement": 4,
+                "breakthrough_epoch1_baseline_ratio_role": (
+                    "descriptive_only_no_noninferiority_threshold_v1"
+                ),
+                "breakthrough_absolute_phase_sequence_estimands": (
+                    "fault_drop_b=0.5*((P_baseline-P_fault)+(PS_baseline-PS_fault));"
+                    "containment_recovery_b=0.5*((P_e1-P_fault)+(PS_e1-PS_fault));"
+                    "pooled_optimization_b=0.5*((P_e2-P_e1)+(PS_e2-PS_e1));"
+                    "per_arm_optimization_b=(P_e2-P_e1,PS_e2-PS_e1)_v1"
+                ),
+                "breakthrough_phase_window_interpretation": (
+                    "fixed_six_5_second_bucket_windows_with_epoch_windows_"
+                    "anchored_at_first_authoritative_post_activation_commit_"
+                    "and_a_common_q_commit_required_within_each_window_not_"
+                    "steady_state_v1"
+                ),
+                "breakthrough_pre_epoch1_placebo_estimand": (
+                    "pP_b=log((P_fault/P_baseline)/(00_fault/00_baseline));"
+                    "pPS_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))"
+                ),
+                "breakthrough_placebo_equivalence_rule": (
+                    "both_component_two_one_sided_5_percent_tests_df4_90_cis_"
+                    "strictly_within_plus_minus_log_1p10_v2"
+                ),
+                "breakthrough_placebo_equivalence_margin_log": (
+                    0.09531017980432493
+                ),
+            }
+        )
+    if claim_scope != expected_claim_scope:
         _error(
-            "claim scope must stratify placement at N31/F5 and shape/joint " "at N31/F2"
+            "claim scope must preserve the exact frozen estimands and strata"
         )
     if (
         document.get("execution_authorized") is not False
@@ -966,7 +1251,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v7 may carry the compact "
+            "only shape-placement-factorial-v3 through v8 may carry the compact "
             "snapshot format field"
         )
 
@@ -978,6 +1263,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V4_MANIFEST_ID: V4_SEMANTIC_SHA256,
         V5_MANIFEST_ID: V5_SEMANTIC_SHA256,
         V6_MANIFEST_ID: V6_SEMANTIC_SHA256,
+        V7_MANIFEST_ID: V7_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -1025,6 +1311,27 @@ def epoch0_internal_tree_ids(
         for tree_id in range(n)
         if (position := (member - tree_id) % n) != 0 and position * fanout + 1 < n
     )
+
+
+def epoch0_distinct_parent_ids(
+    replica_count: int,
+    *,
+    initial_fanout: int,
+    replica_id: int,
+) -> tuple[int, ...]:
+    """Return every distinct physical parent available across epoch-0 trees."""
+
+    n = _integer(replica_count, "replica count")
+    fanout = _integer(initial_fanout, "initial fanout")
+    member = _integer(replica_id, "replica ID", minimum=0)
+    if member >= n:
+        _error("epoch-0 parent input is outside membership")
+    parents = {
+        (tree_id + ((position - 1) // fanout)) % n
+        for tree_id in range(n)
+        if (position := (member - tree_id) % n) != 0
+    }
+    return tuple(sorted(parents))
 
 
 def derive_consensus_shape(
@@ -1121,8 +1428,55 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
             maximum_rotating_contexts=byzantine["maximum_rotating_contexts"],
             start_after_prelaunch_anchor_s=window["start_after_prelaunch_anchor_s"],
             duration_s=window["duration_s"],
-            max_omissions_per_proposal=byzantine["max_omissions_per_proposal"],
+            max_omissions_per_proposal=byzantine.get(
+                "max_omissions_per_proposal"
+            ),
             actions=ByzantineActions(**byzantine["actions"]),
+            responsive_degradation=(
+                ResponsiveDegradationContract(
+                    actor_count_rule=(
+                        byzantine["responsive_degradation"]["actor_count_rule"]
+                    ),
+                    actor_selection=(
+                        byzantine["responsive_degradation"]["actor_selection"]
+                    ),
+                    actor_selection_preimage=(
+                        byzantine["responsive_degradation"][
+                            "actor_selection_preimage"
+                        ]
+                    ),
+                    actor_selection_inputs=tuple(
+                        byzantine["responsive_degradation"][
+                            "actor_selection_inputs"
+                        ]
+                    ),
+                    actor_selection_vectors=tuple(
+                        ActorSelectionVector(
+                            replica_count=vector["replica_count"],
+                            q=vector["q"],
+                            scientific_seed=vector["scientific_seed"],
+                            selected_actor_ids=tuple(vector["selected_actor_ids"]),
+                        )
+                        for vector in byzantine["responsive_degradation"][
+                            "actor_selection_vectors"
+                        ]
+                    ),
+                    observer_isolation=(
+                        byzantine["responsive_degradation"]["observer_isolation"]
+                    ),
+                    actor_schedule=(
+                        byzantine["responsive_degradation"]["actor_schedule"]
+                    ),
+                    omission_period=(
+                        byzantine["responsive_degradation"]["omission_period"]
+                    ),
+                )
+                if "responsive_degradation" in byzantine
+                else None
+            ),
+            max_omissions_per_proposal_rule=byzantine.get(
+                "max_omissions_per_proposal_rule"
+            ),
         ),
         workload=WorkloadContract(**document["workload"]),
         responsiveness_policy=ResponsivenessPolicyContract(
@@ -1174,6 +1528,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V4_MANIFEST_ID: V4_MANIFEST_SHA256,
         V5_MANIFEST_ID: V5_MANIFEST_SHA256,
         V6_MANIFEST_ID: V6_MANIFEST_SHA256,
+        V7_MANIFEST_ID: V7_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -1213,13 +1568,13 @@ def derive_slot_nonce(block_id: str, arm_code: str) -> int:
     return block_ordinal * len(EXPECTED_ARM_CODES) + arm_ordinal
 
 
-def derive_execution_schedule(
+def _derive_balanced_execution_schedule(
     block_ids: Sequence[str],
     arm_codes: Sequence[str],
     campaign_order_seed: int,
+    *,
+    stratum_key: Callable[[str], str] | None,
 ) -> tuple[BlockExecutionSchedule, ...]:
-    """Predeclare a result-independent, position-balanced launch order."""
-
     blocks = tuple(block_ids)
     arms = tuple(arm_codes)
     seed = _integer(campaign_order_seed, "campaign order seed", minimum=0)
@@ -1233,18 +1588,31 @@ def derive_execution_schedule(
         return hashlib.sha256(payload).digest(), block_id
 
     ranked_blocks = tuple(sorted(blocks, key=block_rank))
-    counts = {(arm, position): 0 for arm in arms for position in range(len(arms))}
+    counts_by_stratum: dict[str | None, dict[tuple[str, int], int]] = {}
+    block_counts: dict[str | None, int] = {}
     result: list[BlockExecutionSchedule] = []
     for block_ordinal, block_id in enumerate(ranked_blocks, start=1):
+        stratum = None if stratum_key is None else stratum_key(block_id)
+        counts = counts_by_stratum.setdefault(
+            stratum,
+            {
+                (arm, position): 0
+                for arm in arms
+                for position in range(len(arms))
+            },
+        )
+        block_counts[stratum] = block_counts.get(stratum, 0) + 1
         scored: list[tuple[tuple[int, int, bytes], tuple[str, ...]]] = []
         for permutation in itertools.permutations(arms):
             prospective = dict(counts)
             for position, arm in enumerate(permutation):
                 prospective[arm, position] += 1
             values = tuple(prospective.values())
-            tie_payload = (f"{seed}\x00{block_id}\x00{','.join(permutation)}").encode(
-                "ascii"
-            )
+            tie_parts = [str(seed)]
+            if stratum is not None:
+                tie_parts.append(stratum)
+            tie_parts.extend((block_id, ",".join(permutation)))
+            tie_payload = "\x00".join(tie_parts).encode("ascii")
             score = (
                 max(values) - min(values),
                 sum(value * value for value in values),
@@ -1261,11 +1629,55 @@ def derive_execution_schedule(
                 arm_order=arm_order,
             )
         )
-    lower = len(blocks) // len(arms)
-    upper = lower + int(len(blocks) % len(arms) != 0)
-    if set(counts.values()) - {lower, upper}:
-        _error("execution schedule did not balance arm positions")
+
+    for stratum, counts in counts_by_stratum.items():
+        lower = block_counts[stratum] // len(arms)
+        upper = lower + int(block_counts[stratum] % len(arms) != 0)
+        if set(counts.values()) - {lower, upper}:
+            suffix = "" if stratum is None else f" in {stratum}"
+            _error(f"execution schedule did not balance arm positions{suffix}")
     return tuple(result)
+
+
+def derive_execution_schedule(
+    block_ids: Sequence[str],
+    arm_codes: Sequence[str],
+    campaign_order_seed: int,
+) -> tuple[BlockExecutionSchedule, ...]:
+    """Predeclare a result-independent, position-balanced launch order."""
+
+    return _derive_balanced_execution_schedule(
+        block_ids,
+        arm_codes,
+        campaign_order_seed,
+        stratum_key=None,
+    )
+
+
+def derive_stratified_execution_schedule(
+    block_ids: Sequence[str],
+    arm_codes: Sequence[str],
+    campaign_order_seed: int,
+) -> tuple[BlockExecutionSchedule, ...]:
+    """Balance arm positions inside each replica-count/fanout stratum.
+
+    Block launch order remains the frozen result-independent SHA-256 order.
+    Arm-position counts are reset for each ``nN-fF`` cell so a global balance
+    cannot hide a systematic order imbalance in either repeated headline cell.
+    """
+
+    def stratum(block_id: str) -> str:
+        cell, separator, repetition = block_id.rpartition("-b")
+        if not separator or not cell or not repetition.isdigit():
+            _error("stratified execution requires nN-fF-bNN block IDs")
+        return cell
+
+    return _derive_balanced_execution_schedule(
+        block_ids,
+        arm_codes,
+        campaign_order_seed,
+        stratum_key=stratum,
+    )
 
 
 def derive_actor_ids(
@@ -1288,11 +1700,103 @@ def derive_actor_ids(
     return tuple(sorted(sorted(pool, key=rank)[:actor_count]))
 
 
+def derive_responsive_degraded_actor_ids(
+    replica_count: int,
+    quorum: int,
+    hard_actor_ids: Sequence[int],
+    scientific_seed: int,
+) -> tuple[int, ...]:
+    """Derive responsive-degraded actors while isolating commit observer 0.
+
+    The rank preimage is exactly the ASCII byte sequence
+    ``kauri.shape25.responsive-degraded.v1\0{membership_csv}\0{q}\0{seed}\0{id}``.
+    Candidate membership is the canonical epoch-0 reference-root pool
+    ``[1, Q)``; replica 0 is excluded because it is the authoritative commit
+    observer for the throughput endpoint.
+    """
+
+    n = _integer(replica_count, "N")
+    q = _integer(quorum, "Q")
+    seed = _integer(scientific_seed, "scientific seed", minimum=0)
+    if (n - 1) % 3:
+        _error("replica count must satisfy N = 3f + 1")
+    f = (n - 1) // 3
+    if q != 2 * f + 1:
+        _error("responsive-degraded derivation requires Q = 2f + 1")
+    hard = tuple(
+        sorted(_integer(actor, "hard actor", minimum=0) for actor in hard_actor_ids)
+    )
+    if (
+        not hard
+        or len(set(hard)) != len(hard)
+        or len(hard) >= f
+        or any(actor < q or actor >= n for actor in hard)
+    ):
+        _error("hard actors must be a unique proper subset of f in [Q, N)")
+    actor_count = f - len(hard)
+    pool = tuple(range(1, q))
+    if actor_count > len(pool):
+        _error("responsive-degraded actor count exceeds isolated root pool")
+    membership = ",".join(str(member) for member in range(n))
+
+    def rank(member: int) -> tuple[bytes, int]:
+        value = (
+            "kauri.shape25.responsive-degraded.v1"
+            f"\x00{membership}\x00{q}\x00{seed}\x00{member}"
+        ).encode("ascii")
+        return hashlib.sha256(value).digest(), member
+
+    return tuple(sorted(sorted(pool, key=rank)[:actor_count]))
+
+
+def derive_tiered_cohorts(
+    replica_count: int,
+    quorum: int,
+    hard_actor_count: int,
+    scientific_seed: int,
+) -> TieredCohorts:
+    """Derive disjoint hard, responsive-degraded, and fast cohorts."""
+
+    hard = derive_actor_ids(
+        replica_count,
+        quorum,
+        hard_actor_count,
+        scientific_seed,
+    )
+    responsive_degraded = derive_responsive_degraded_actor_ids(
+        replica_count,
+        quorum,
+        hard,
+        scientific_seed,
+    )
+    worse = frozenset((*hard, *responsive_degraded))
+    fast = tuple(member for member in range(replica_count) if member not in worse)
+    f = (replica_count - 1) // 3
+    if (
+        len(worse) != f
+        or len(fast) != quorum
+        or 0 not in fast
+        or set(hard).intersection(responsive_degraded)
+    ):
+        _error("tiered cohorts must be disjoint f-sized worse and Q-sized fast sets")
+    return TieredCohorts(
+        hard_actor_ids=hard,
+        responsive_degraded_actor_ids=responsive_degraded,
+        fast_replica_ids=fast,
+    )
+
+
 def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
     """Derive the immutable 17-block, 68-slot preflight plan."""
 
     slots: list[FactorialSlot] = []
-    execution_schedule = derive_execution_schedule(
+    schedule_builder = (
+        derive_stratified_execution_schedule
+        if manifest.arm_counterbalancing
+        == "stratified_greedy_minimum_position_imbalance_sha256_tiebreak_v2"
+        else derive_execution_schedule
+    )
+    execution_schedule = schedule_builder(
         _frozen_block_ids(),
         tuple(arm.code for arm in manifest.arms),
         manifest.campaign_order_seed,
@@ -1324,11 +1828,25 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
             for block_index in range(1, blocks_in_cell + 1):
                 block_id = f"n{replica_count}-f{initial_fanout}-b{block_index:02d}"
                 scientific_seed = manifest.scientific_seed_base + block_ordinal
-                actor_ids = derive_actor_ids(
-                    replica_count,
-                    consensus.q,
-                    manifest.byzantine.actor_count,
-                    scientific_seed,
+                tiered_cohorts = (
+                    derive_tiered_cohorts(
+                        replica_count,
+                        consensus.q,
+                        manifest.byzantine.actor_count,
+                        scientific_seed,
+                    )
+                    if manifest.byzantine.responsive_degradation is not None
+                    else None
+                )
+                actor_ids = (
+                    tiered_cohorts.hard_actor_ids
+                    if tiered_cohorts is not None
+                    else derive_actor_ids(
+                        replica_count,
+                        consensus.q,
+                        manifest.byzantine.actor_count,
+                        scientific_seed,
+                    )
                 )
                 if any(
                     not epoch0_internal_tree_ids(
@@ -1339,6 +1857,21 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
                     for actor in actor_ids
                 ):
                     _error("selected actor cannot be internal in an epoch-0 tree")
+                if any(
+                    len(
+                        epoch0_distinct_parent_ids(
+                            replica_count,
+                            initial_fanout=initial_fanout,
+                            replica_id=actor,
+                        )
+                    )
+                    < consensus.f + 1
+                    for actor in actor_ids
+                ):
+                    _error(
+                        "selected actor cannot obtain the frozen f+1 causal "
+                        "reporter guard across epoch-0 physical roles"
+                    )
                 scheduled = execution_by_block[block_id]
                 for arm in manifest.arms:
                     nonce = derive_slot_nonce(block_id, arm.code)
@@ -1390,6 +1923,19 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
                             common_timers=manifest.common_timers,
                             ports=ports,
                             result_path=f"{manifest.results_root}/{slot_id}",
+                            responsive_degraded_actor_ids=(
+                                tiered_cohorts.responsive_degraded_actor_ids
+                                if tiered_cohorts is not None
+                                else ()
+                            ),
+                            fast_replica_ids=(
+                                tiered_cohorts.fast_replica_ids
+                                if tiered_cohorts is not None
+                                else ()
+                            ),
+                            max_omissions_per_proposal=(
+                                consensus.f if tiered_cohorts is not None else None
+                            ),
                         )
                     )
                 block_ordinal += 1
@@ -1443,6 +1989,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V4_MANIFEST_ID: (V4_MANIFEST_SHA256, V4_PLAN_SHA256),
         V5_MANIFEST_ID: (V5_MANIFEST_SHA256, V5_PLAN_SHA256),
         V6_MANIFEST_ID: (V6_MANIFEST_SHA256, V6_PLAN_SHA256),
+        V7_MANIFEST_ID: (V7_MANIFEST_SHA256, V7_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -1495,6 +2042,10 @@ __all__ = (
     "V6_MANIFEST_SHA256",
     "V6_PLAN_SHA256",
     "V6_SEMANTIC_SHA256",
+    "V7_MANIFEST_ID",
+    "V7_MANIFEST_SHA256",
+    "V7_PLAN_SHA256",
+    "V7_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",
@@ -1511,13 +2062,19 @@ __all__ = (
     "PortAllocation",
     "ResponsivenessPolicyContract",
     "ResourceContract",
+    "ResponsiveDegradationContract",
+    "TieredCohorts",
     "WorkloadContract",
     "build_factorial_plan",
     "canonical_plan_bytes",
     "derive_actor_ids",
     "derive_consensus_shape",
     "derive_execution_schedule",
+    "derive_stratified_execution_schedule",
+    "derive_responsive_degraded_actor_ids",
     "derive_slot_nonce",
+    "derive_tiered_cohorts",
+    "epoch0_distinct_parent_ids",
     "epoch0_internal_tree_ids",
     "load_frozen_manifest",
     "load_frozen_manifest_bytes",

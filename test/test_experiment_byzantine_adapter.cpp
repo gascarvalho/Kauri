@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -197,6 +198,7 @@ using hotstuff::ExperimentByzantineOptions;
 using hotstuff::ExperimentDirectVoteDisposition;
 using hotstuff::ExperimentFalseTimeoutFenceTestAccess;
 using hotstuff::ExperimentOmissionAction;
+using hotstuff::ExperimentOmissionCohort;
 using hotstuff::ExperimentOmissionMarker;
 using hotstuff::ExperimentReplicaRole;
 using hotstuff::ExperimentRotatingOmissionOptions;
@@ -317,6 +319,40 @@ ExperimentByzantineOptions persistent_omission_options(
     return options;
 }
 
+ExperimentByzantineOptions tiered_omission_options(
+    ReplicaID local_replica,
+    std::size_t responsive_period = 32,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr,
+    std::vector<std::string> *encoded_markers = nullptr)
+{
+    auto options = rotating_omission_options(
+        local_replica, markers, encoded_markers);
+    options.rotating_omission->mode =
+        "tiered_persistent_responsive_omission_v1";
+    options.rotating_omission->replica_count = 31;
+    options.rotating_omission->actor_ids = {1};
+    options.rotating_omission->expected_actor_count = 1;
+    options.rotating_omission->responsive_degraded_actor_ids = {2};
+    options.rotating_omission->responsive_omission_period = responsive_period;
+    options.rotating_omission->max_omissions_per_proposal = 2;
+    return options;
+}
+
+ExperimentByzantineOptions campaign_tiered_omission_options(
+    ReplicaID local_replica,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr,
+    std::vector<std::string> *encoded_markers = nullptr)
+{
+    auto options = tiered_omission_options(
+        local_replica, 32, markers, encoded_markers);
+    options.rotating_omission->actor_ids = {22, 26, 30};
+    options.rotating_omission->expected_actor_count = 3;
+    options.rotating_omission->responsive_degraded_actor_ids = {
+        1, 6, 8, 9, 12, 15, 20};
+    options.rotating_omission->max_omissions_per_proposal = 10;
+    return options;
+}
+
 ExperimentByzantineContext selected_context(
     const ExperimentByzantineAdapter &adapter,
     ReplicaID selected_actor,
@@ -369,6 +405,51 @@ std::map<std::string, std::string> parse_marker_fields(
                 key,
                 token.substr(separator + 1))
                  .second)
+            throw std::invalid_argument("duplicate marker field");
+    }
+    if (fields.size() != expected_order.size())
+        throw std::invalid_argument("incomplete marker fields");
+    return fields;
+}
+
+std::map<std::string, std::string> parse_tiered_marker_fields(
+    const std::string &encoded)
+{
+    const std::vector<std::string> expected_order{
+        "fault",
+        "proposal_epoch",
+        "proposal_tree",
+        "proposal_epoch_digest",
+        "proposal_block_hash",
+        "window",
+        "window_start_monotonic_ns",
+        "window_end_monotonic_ns",
+        "actor",
+        "action",
+        "monotonic_ns",
+        "cohort",
+        "hard_actor_count",
+        "responsive_degraded_actor_count",
+        "fault_threshold",
+        "max_omissions_per_proposal",
+        "responsive_omission_period",
+        "contribution_ordinal"};
+    std::istringstream input(encoded);
+    std::map<std::string, std::string> fields;
+    std::string token;
+    if (!(input >> token) || token != "KAURI_FAULT")
+        throw std::invalid_argument("missing KAURI_FAULT marker prefix");
+    while (input >> token)
+    {
+        const auto separator = token.find('=');
+        if (separator == std::string::npos || separator == 0 ||
+            separator + 1 == token.size())
+            throw std::invalid_argument("malformed marker field");
+        const auto key = token.substr(0, separator);
+        if (fields.size() >= expected_order.size() ||
+            key != expected_order[fields.size()])
+            throw std::invalid_argument("unexpected marker field order");
+        if (!fields.emplace(key, token.substr(separator + 1)).second)
             throw std::invalid_argument("duplicate marker field");
     }
     if (fields.size() != expected_order.size())
@@ -1254,6 +1335,362 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "tiered omission validates disjoint cohorts period and total fault bound",
+    "[adaptive-v2][experiment][byzantine][tiered][validation]")
+{
+    CHECK_NOTHROW(ExperimentByzantineAdapter(tiered_omission_options(1)));
+    CHECK_NOTHROW(ExperimentByzantineAdapter(tiered_omission_options(2)));
+
+    auto overlap = tiered_omission_options(1);
+    overlap.rotating_omission->responsive_degraded_actor_ids = {1};
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(overlap), std::invalid_argument);
+
+    auto no_responsive_actors = tiered_omission_options(1);
+    no_responsive_actors.rotating_omission
+        ->responsive_degraded_actor_ids.clear();
+    no_responsive_actors.rotating_omission->max_omissions_per_proposal = 1;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(no_responsive_actors),
+        std::invalid_argument);
+
+    auto period_one = tiered_omission_options(2, 1);
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(period_one), std::invalid_argument);
+
+    auto wrong_maximum = tiered_omission_options(2);
+    wrong_maximum.rotating_omission->max_omissions_per_proposal = 1;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(wrong_maximum),
+        std::invalid_argument);
+
+    auto duplicate_responsive = tiered_omission_options(2);
+    duplicate_responsive.rotating_omission
+        ->responsive_degraded_actor_ids = {2, 2};
+    duplicate_responsive.rotating_omission->max_omissions_per_proposal = 3;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(duplicate_responsive),
+        std::invalid_argument);
+
+    auto outside_membership = tiered_omission_options(2);
+    outside_membership.rotating_omission
+        ->responsive_degraded_actor_ids = {31};
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(outside_membership),
+        std::invalid_argument);
+
+    auto over_fault_threshold = tiered_omission_options(1);
+    over_fault_threshold.rotating_omission->replica_count = 7;
+    over_fault_threshold.rotating_omission->actor_ids = {1, 3};
+    over_fault_threshold.rotating_omission->expected_actor_count = 2;
+    over_fault_threshold.rotating_omission
+        ->responsive_degraded_actor_ids = {5};
+    over_fault_threshold.rotating_omission->max_omissions_per_proposal = 3;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(over_fault_threshold),
+        std::invalid_argument);
+
+    auto unsafe_old_mode = rotating_omission_options(1);
+    unsafe_old_mode.rotating_omission->responsive_degraded_actor_ids = {2};
+    unsafe_old_mode.rotating_omission->responsive_omission_period = 32;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(unsafe_old_mode),
+        std::invalid_argument);
+}
+
+TEST_CASE(
+    "tiered responsive actor forwards 31 omits 32 caches retry then forwards 33",
+    "[adaptive-v2][experiment][byzantine][tiered][schedule]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    ExperimentByzantineAdapter adapter(
+        tiered_omission_options(2, 32, &markers, &encoded_markers));
+
+    const auto root = context(
+        "tiered-root", configuration(), "factorial-window-1");
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        root, ExperimentReplicaRole::root, 150));
+    CHECK(markers.empty());
+
+    for (std::uint32_t ordinal = 1; ordinal <= 31; ++ordinal)
+    {
+        const auto contribution = context(
+            "tiered-forward-" + std::to_string(ordinal),
+            configuration(),
+            "factorial-window-1");
+        CHECK(
+            adapter.consume_outbound_direct_vote(
+                contribution, ExperimentReplicaRole::leaf, 150) ==
+            ExperimentDirectVoteDisposition::forward);
+    }
+    REQUIRE(markers.size() == 31);
+    CHECK(markers.back().contribution_ordinal == 31);
+    CHECK(markers.back().action == ExperimentOmissionAction::forward);
+
+    const auto thirty_second = context(
+        "tiered-omit-32", configuration(), "factorial-window-1");
+    CHECK(adapter.consume_outbound_aggregate(
+        thirty_second, ExperimentReplicaRole::internal, 150));
+    CHECK(adapter.consume_outbound_aggregate(
+        thirty_second, ExperimentReplicaRole::internal, 151));
+    REQUIRE(markers.size() == 32);
+    CHECK(markers.back().contribution_ordinal == 32);
+    CHECK(markers.back().action == ExperimentOmissionAction::omit_aggregate);
+
+    const auto thirty_third = context(
+        "tiered-forward-33", configuration(), "factorial-window-1");
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            thirty_third, ExperimentReplicaRole::leaf, 152) ==
+        ExperimentDirectVoteDisposition::forward);
+    REQUIRE(markers.size() == 33);
+    CHECK(markers.back().contribution_ordinal == 33);
+    CHECK(markers.back().action == ExperimentOmissionAction::forward);
+
+    for (std::uint32_t ordinal = 34; ordinal < 64; ++ordinal)
+    {
+        const auto contribution = context(
+            "tiered-forward-" + std::to_string(ordinal),
+            configuration(),
+            "factorial-window-1");
+        CHECK_FALSE(adapter.consume_outbound_aggregate(
+            contribution, ExperimentReplicaRole::internal, 153));
+    }
+    const auto sixty_fourth = context(
+        "tiered-omit-64", configuration(), "factorial-window-1");
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            sixty_fourth, ExperimentReplicaRole::leaf, 154) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            sixty_fourth, ExperimentReplicaRole::leaf, 155) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+    REQUIRE(markers.size() == 64);
+    CHECK(markers.back().contribution_ordinal == 64);
+    CHECK(markers.back().action ==
+          ExperimentOmissionAction::omit_direct_vote);
+
+    REQUIRE(encoded_markers.size() == 64);
+    const auto fields = parse_tiered_marker_fields(encoded_markers[31]);
+    CHECK(
+        fields.at("fault") ==
+        "tiered_persistent_responsive_omission_v1");
+    CHECK(fields.at("cohort") == "responsive_degraded");
+    CHECK(fields.at("hard_actor_count") == "1");
+    CHECK(fields.at("responsive_degraded_actor_count") == "1");
+    CHECK(fields.at("fault_threshold") == "10");
+    CHECK(fields.at("max_omissions_per_proposal") == "2");
+    CHECK(fields.at("responsive_omission_period") == "32");
+    CHECK(fields.at("contribution_ordinal") == "32");
+}
+
+TEST_CASE(
+    "tiered hard actors always omit and combined omissions stay within f",
+    "[adaptive-v2][experiment][byzantine][tiered][hard]")
+{
+    std::vector<ExperimentOmissionMarker> hard_markers;
+    std::vector<std::string> hard_encoded;
+    ExperimentByzantineAdapter hard(
+        tiered_omission_options(1, 32, &hard_markers, &hard_encoded));
+    ExperimentByzantineAdapter responsive(tiered_omission_options(2, 2));
+    ExperimentByzantineAdapter outside(tiered_omission_options(3, 2));
+
+    const auto internal = context(
+        "tiered-hard-internal", configuration(), "factorial-window-1");
+    CHECK(hard.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 150));
+    CHECK(hard.consume_outbound_aggregate(
+        internal, ExperimentReplicaRole::internal, 151));
+    const auto leaf = context(
+        "tiered-hard-leaf", configuration(), "factorial-window-1");
+    CHECK(
+        hard.consume_outbound_direct_vote(
+            leaf, ExperimentReplicaRole::leaf, 152) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    const auto root = context(
+        "tiered-hard-root", configuration(), "factorial-window-1");
+    CHECK_FALSE(hard.consume_outbound_aggregate(
+        root, ExperimentReplicaRole::root, 153));
+    REQUIRE(hard_markers.size() == 2);
+    CHECK(hard_markers[0].cohort == ExperimentOmissionCohort::hard);
+    CHECK(hard_markers[0].contribution_ordinal == 0);
+    CHECK(hard_markers[1].cohort == ExperimentOmissionCohort::hard);
+    CHECK(parse_tiered_marker_fields(hard_encoded[0]).at("cohort") ==
+          "hard");
+
+    const auto first = context(
+        "tiered-combined-first", configuration(), "factorial-window-1");
+    CHECK_FALSE(responsive.consume_outbound_aggregate(
+        first, ExperimentReplicaRole::internal, 150));
+    const auto simultaneous = context(
+        "tiered-combined", configuration(), "factorial-window-1");
+    const std::size_t omitted =
+        static_cast<std::size_t>(hard.consume_outbound_aggregate(
+            simultaneous, ExperimentReplicaRole::internal, 154)) +
+        static_cast<std::size_t>(responsive.consume_outbound_aggregate(
+            simultaneous, ExperimentReplicaRole::internal, 154)) +
+        static_cast<std::size_t>(outside.consume_outbound_aggregate(
+            simultaneous, ExperimentReplicaRole::internal, 154));
+    const auto quorum = hotstuff::derive_byzantine_quorum(31);
+    REQUIRE(quorum.has_value());
+    CHECK(omitted == 2);
+    CHECK(omitted <= quorum->fault_threshold);
+}
+
+TEST_CASE(
+    "N31 tiered campaign reaches exactly f with three hard and seven degraded leaves",
+    "[adaptive-v2][experiment][byzantine][tiered][n31][campaign]")
+{
+    const std::vector<ReplicaID> hard_actors{22, 26, 30};
+    const std::vector<ReplicaID> responsive_degraded_actors{
+        1, 6, 8, 9, 12, 15, 20};
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    std::vector<std::unique_ptr<ExperimentByzantineAdapter>> adapters;
+    adapters.reserve(
+        hard_actors.size() + responsive_degraded_actors.size());
+    for (const auto actor : hard_actors)
+    {
+        adapters.push_back(std::make_unique<ExperimentByzantineAdapter>(
+            campaign_tiered_omission_options(
+                actor, &markers, &encoded_markers)));
+    }
+    for (const auto actor : responsive_degraded_actors)
+    {
+        adapters.push_back(std::make_unique<ExperimentByzantineAdapter>(
+            campaign_tiered_omission_options(
+                actor, &markers, &encoded_markers)));
+    }
+    ExperimentByzantineAdapter fast(
+        campaign_tiered_omission_options(
+            ReplicaID{0}, &markers, &encoded_markers));
+
+    for (std::size_t degraded = 0;
+         degraded < responsive_degraded_actors.size();
+         ++degraded)
+    {
+        auto &adapter = *adapters[hard_actors.size() + degraded];
+        for (std::uint32_t ordinal = 1; ordinal <= 31; ++ordinal)
+        {
+            const auto contribution = context(
+                "shape25-campaign-forward-" +
+                    std::to_string(responsive_degraded_actors[degraded]) +
+                    "-" + std::to_string(ordinal),
+                configuration(),
+                "factorial-window-1");
+            CHECK(
+                adapter.consume_outbound_direct_vote(
+                    contribution, ExperimentReplicaRole::leaf, 150) ==
+                ExperimentDirectVoteDisposition::forward);
+        }
+    }
+
+    const auto simultaneous = context(
+        "shape25-campaign-omit-32",
+        configuration(),
+        "factorial-window-1");
+    std::size_t omitted = 0;
+    for (auto &adapter : adapters)
+    {
+        omitted += static_cast<std::size_t>(
+            adapter->consume_outbound_direct_vote(
+                simultaneous, ExperimentReplicaRole::leaf, 151) ==
+            ExperimentDirectVoteDisposition::omit_first);
+    }
+    CHECK(
+        fast.consume_outbound_direct_vote(
+            simultaneous, ExperimentReplicaRole::leaf, 151) ==
+        ExperimentDirectVoteDisposition::forward);
+
+    const auto quorum = hotstuff::derive_byzantine_quorum(31);
+    REQUIRE(quorum.has_value());
+    REQUIRE(quorum->fault_threshold == 10);
+    CHECK(omitted == quorum->fault_threshold);
+
+    std::set<ReplicaID> target_actors;
+    std::size_t hard_target_markers = 0;
+    std::size_t degraded_target_markers = 0;
+    for (const auto &marker : markers)
+    {
+        if (!(marker.proposal == simultaneous.proposal))
+            continue;
+        target_actors.insert(marker.actor);
+        CHECK(marker.action ==
+              ExperimentOmissionAction::omit_direct_vote);
+        CHECK(marker.hard_actor_count == 3);
+        CHECK(marker.responsive_degraded_actor_count == 7);
+        CHECK(marker.fault_threshold == 10);
+        CHECK(marker.max_omissions_per_proposal == 10);
+        CHECK(marker.responsive_omission_period == 32);
+        if (marker.cohort == ExperimentOmissionCohort::hard)
+        {
+            ++hard_target_markers;
+            CHECK(marker.contribution_ordinal == 0);
+        }
+        else
+        {
+            REQUIRE(marker.cohort ==
+                    ExperimentOmissionCohort::responsive_degraded);
+            ++degraded_target_markers;
+            CHECK(marker.contribution_ordinal == 32);
+        }
+    }
+    CHECK(target_actors.size() == quorum->fault_threshold);
+    CHECK(hard_target_markers == hard_actors.size());
+    CHECK(
+        degraded_target_markers ==
+        responsive_degraded_actors.size());
+
+    REQUIRE_FALSE(encoded_markers.empty());
+    const auto fields = parse_tiered_marker_fields(
+        encoded_markers.back());
+    CHECK(fields.at("cohort") == "responsive_degraded");
+    CHECK(fields.at("hard_actor_count") == "3");
+    CHECK(fields.at("responsive_degraded_actor_count") == "7");
+    CHECK(fields.at("fault_threshold") == "10");
+    CHECK(fields.at("max_omissions_per_proposal") == "10");
+    CHECK(fields.at("responsive_omission_period") == "32");
+    CHECK(fields.at("contribution_ordinal") == "32");
+}
+
+TEST_CASE(
+    "tiered responsive ordinals bind exact epochs retries and window",
+    "[adaptive-v2][experiment][byzantine][tiered][identity]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    ExperimentByzantineAdapter adapter(
+        tiered_omission_options(2, 2, &markers));
+    const auto shared_block = digest("tiered-shared-block");
+    const auto epoch_digest = digest("tiered-shared-epoch");
+    ExperimentByzantineContext wrong_window{
+        ProposalKey{ConfigurationId{7, 3, epoch_digest}, shared_block},
+        "wrong-window"};
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        wrong_window, ExperimentReplicaRole::internal, 150));
+
+    const ExperimentByzantineContext epoch_seven{
+        ProposalKey{ConfigurationId{7, 3, epoch_digest}, shared_block},
+        "factorial-window-1"};
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        epoch_seven, ExperimentReplicaRole::internal, 150));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        epoch_seven, ExperimentReplicaRole::internal, 151));
+    REQUIRE(markers.size() == 1);
+    CHECK(markers[0].contribution_ordinal == 1);
+
+    const ExperimentByzantineContext epoch_eight{
+        ProposalKey{ConfigurationId{8, 3, epoch_digest}, shared_block},
+        "factorial-window-1"};
+    CHECK(adapter.consume_outbound_aggregate(
+        epoch_eight, ExperimentReplicaRole::internal, 152));
+    REQUIRE(markers.size() == 2);
+    CHECK(markers[1].contribution_ordinal == 2);
+    CHECK(markers[1].proposal.configuration.epoch_number == 8);
+}
+
+TEST_CASE(
     "experiment omission emits one exact marker with a positive raw timestamp",
     "[adaptive-v2][experiment][byzantine][clock]")
 {
@@ -1415,6 +1852,14 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         declarations.find(
+            "opt_experiment_responsive_degraded_omission_actors") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
+            "opt_experiment_responsive_omission_period") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
             "opt_experiment_byzantine_window_start_monotonic_ns") !=
         std::string::npos);
     CHECK(
@@ -1471,6 +1916,14 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         application.find(
+            "\"experiment-responsive-degraded-omission-actors\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-responsive-omission-period\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
             "\"experiment-byzantine-window-start-monotonic-ns\"") !=
         std::string::npos);
     CHECK(
@@ -1499,6 +1952,21 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         parser.find("persistent_selected_omission_v1") !=
+        std::string::npos);
+    CHECK(
+        parser.find("tiered_persistent_responsive_omission_v1") !=
+        std::string::npos);
+    CHECK(
+        parser.find("raw_responsive_degraded_omission_actors") !=
+        std::string::npos);
+    CHECK(
+        parser.find("responsive_omission_period") !=
+        std::string::npos);
+    CHECK(
+        parser.find("tiered omission actor cohorts must be disjoint") !=
+        std::string::npos);
+    CHECK(
+        parser.find("quorum->fault_threshold") !=
         std::string::npos);
     CHECK(
         parser.find("derive_byzantine_quorum(replica_count)") !=

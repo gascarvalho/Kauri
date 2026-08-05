@@ -21,9 +21,6 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     build_factorial_runtime,
     canonical_runtime_bytes,
 )
-from experiments.adaptive.kauri_experiment.factorial_validation import (
-    FROZEN_SMOKE_RUNTIME_SHA256,
-)
 from experiments.adaptive.kauri_experiment.processes import (
     CleanupOutcome,
     ProcessRecord,
@@ -31,7 +28,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
 
 
 @pytest.fixture(scope="module")
@@ -142,6 +139,7 @@ def _smoke_authorization(
         approved_utc="2026-08-04T00:00:00+00:00",
         kauri_revision=preflight.revision,
         slot_ids=(smoke.slot.slot_id,),
+        result_root=Path(smoke.slot.result_path).parent.as_posix(),
         static_artifacts=_smoke_static_artifacts(smoke),
         build_provenance_sha256=hashlib.sha256(
             execution._canonical_json_bytes(preflight.build_provenance)
@@ -166,6 +164,142 @@ def _campaign_static_artifacts() -> tuple[Any, Any, dict[str, bytes]]:
     )
 
 
+def _campaign_launch_context(tmp_path: Path, execution_ordinal: int) -> dict[str, Any]:
+    manifest = load_frozen_manifest(MANIFEST)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    spec = next(
+        item for item in runtime.slots if item.execution_ordinal == execution_ordinal
+    )
+    slot = next(item for item in plan.slots if item.slot_id == spec.slot_id)
+    static_artifacts = {
+        "manifest.json": MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": canonical_runtime_bytes(runtime),
+    }
+    binaries = _binaries(tmp_path / "bin")
+    provenance = _build_provenance(tmp_path / "build-inputs", binaries)
+    root = tmp_path / Path(slot.result_path).parent
+    preflight = execution.ExecutionPreflight(
+        revision="c" * 40,
+        repository=tmp_path,
+        build_directory=tmp_path / "build-adaptive",
+        result_root=root,
+        slot_directory=root / slot.slot_id,
+        free_bytes=runtime.minimum_free_bytes + 1,
+        binaries=binaries,
+        build_provenance=provenance,
+    )
+    authorization_payload = execution.build_execution_authorization_receipt(
+        scope="shape25_campaign",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-04T00:00:00+00:00",
+        kauri_revision=preflight.revision,
+        slot_ids=tuple(item.slot_id for item in plan.slots),
+        result_root=Path(slot.result_path).parent.as_posix(),
+        static_artifacts=static_artifacts,
+        build_provenance_sha256=hashlib.sha256(
+            execution._canonical_json_bytes(provenance)
+        ).hexdigest(),
+    )
+    authorization = json.loads(authorization_payload)
+    contract = execution.build_campaign_execution_contract(
+        runtime=runtime,
+        static_artifacts=static_artifacts,
+        authorization=authorization,
+        authorization_payload=authorization_payload,
+        build_provenance=provenance,
+    )
+    contract_payload = execution._canonical_json_bytes(contract)
+    execution.preserve_build_evidence(
+        root,
+        provenance,
+        initial_files={
+            execution.CAMPAIGN_AUTHORIZATION_FILENAME: authorization_payload,
+            execution.CAMPAIGN_CONTRACT_FILENAME: contract_payload,
+        },
+    )
+    return {
+        "plan": plan,
+        "runtime": runtime,
+        "slot": slot,
+        "spec": spec,
+        "static_artifacts": static_artifacts,
+        "preflight": preflight,
+        "authorization_payload": authorization_payload,
+        "authorization": authorization,
+        "contract_payload": contract_payload,
+    }
+
+
+def _campaign_ledger_row(
+    context: dict[str, Any],
+    execution_ordinal: int,
+    state: str,
+    monotonic_ns: int,
+) -> dict[str, object]:
+    runtime = context["runtime"]
+    spec = next(
+        item for item in runtime.slots if item.execution_ordinal == execution_ordinal
+    )
+    root = context["preflight"].result_root
+    authorization = context["authorization"]
+    common: dict[str, object] = {
+        "schema_version": 1,
+        "campaign_id": runtime.runtime_id,
+        "manifest_sha256": hashlib.sha256(
+            context["static_artifacts"]["manifest.json"]
+        ).hexdigest(),
+        "source_plan_sha256": hashlib.sha256(
+            context["static_artifacts"]["plan.json"]
+        ).hexdigest(),
+        "runtime_sha256": hashlib.sha256(
+            context["static_artifacts"]["runtime.json"]
+        ).hexdigest(),
+        "contract_sha256": hashlib.sha256(context["contract_payload"]).hexdigest(),
+        "authorization_id": authorization["authorization_id"],
+        "authorization_sha256": hashlib.sha256(
+            context["authorization_payload"]
+        ).hexdigest(),
+        "kauri_revision": context["preflight"].revision,
+        "execution_ordinal": execution_ordinal,
+        "slot_id": spec.slot_id,
+        "block_id": spec.block_id,
+        "arm_code": spec.arm_code,
+        "attempt_ordinal": 1,
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "state": state,
+        "recorded_utc": "2026-08-04T00:00:00+00:00",
+        "recorded_monotonic_ns": monotonic_ns,
+        "slot_directory": str(root / spec.slot_id),
+    }
+    if state == "STARTED":
+        return {
+            **common,
+            "preflight_revision": context["preflight"].revision,
+            "preflight_free_bytes": context["preflight"].free_bytes,
+            "build_provenance_sha256": hashlib.sha256(
+                execution._canonical_json_bytes(
+                    context["preflight"].build_provenance
+                )
+            ).hexdigest(),
+        }
+    return {
+        **common,
+        "execution_outcome": "PASS",
+        "execution_reason": None,
+        "launch_count": spec.replica_count + 1,
+        "validation": {
+            "outcome": "PASS",
+            "reason": None,
+            "integrity_valid": True,
+            "campaign_member": True,
+            "figure_eligible": True,
+        },
+    }
+
+
 def test_n7_smoke_is_excluded_ps_fanout_two_with_k_two(template_slot) -> None:
     smoke = execution.build_n7_ps_smoke_slot(template_slot)
     runtime_payload = execution._canonical_json_bytes(smoke.runtime.as_document())
@@ -177,17 +311,42 @@ def test_n7_smoke_is_excluded_ps_fanout_two_with_k_two(template_slot) -> None:
     assert smoke.slot.arm_code == "PS"
     assert smoke.slot.placement_adaptation is True
     assert smoke.slot.shape_adaptation is True
-    assert len(smoke.slot.byzantine_actor_ids) == min(3, smoke.slot.f) == 2
-    assert smoke.slot.byzantine.max_omissions_per_proposal == 2
+    assert len(smoke.slot.byzantine_actor_ids) == 1
+    assert len(smoke.slot.responsive_degraded_actor_ids) == 1
+    assert len(smoke.slot.fast_replica_ids) == smoke.slot.q == 5
+    assert 0 in smoke.slot.fast_replica_ids
+    assert smoke.slot.byzantine.max_omissions_per_proposal is None
+    assert smoke.slot.max_omissions_per_proposal == smoke.slot.f == 2
+    assert smoke.slot.maximum_omissions_per_proposal == smoke.slot.f == 2
     assert all(actor >= smoke.slot.q for actor in smoke.slot.byzantine_actor_ids)
+    assert all(
+        1 <= actor < smoke.slot.q
+        for actor in smoke.slot.responsive_degraded_actor_ids
+    )
+    assert set(smoke.slot.byzantine_actor_ids).isdisjoint(
+        smoke.slot.responsive_degraded_actor_ids
+    )
     assert smoke.runtime.actor_ids == smoke.slot.byzantine_actor_ids
-    assert hashlib.sha256(runtime_payload).hexdigest() == FROZEN_SMOKE_RUNTIME_SHA256
+    assert smoke.runtime.tiered_cohorts is not None
+    assert smoke.runtime.tiered_cohorts.responsive_degraded_actor_ids == (
+        smoke.slot.responsive_degraded_actor_ids
+    )
+    assert smoke.actor_count_rule == "fixed_1_hard_actor_smoke_only"
+    assert runtime_payload == execution._canonical_json_bytes(
+        execution.build_n7_ps_smoke_slot(template_slot).runtime.as_document()
+    )
     for process in smoke.runtime.replica_argv_templates:
         argv = process.argv
         option = "--experiment-byzantine-max-omissions-per-proposal"
         assert argv[argv.index(option) + 1] == "2"
+        option = "--experiment-responsive-degraded-omission-actors"
+        assert argv[argv.index(option) + 1] == ",".join(
+            map(str, smoke.slot.responsive_degraded_actor_ids)
+        )
+        option = "--experiment-responsive-omission-period"
+        assert argv[argv.index(option) + 1] == "32"
     manager = smoke.runtime.manager_argv_template.argv
-    assert manager[manager.index("--required-nonresponsive") + 1] == "2"
+    assert manager[manager.index("--required-nonresponsive") + 1] == "1"
     assert smoke.campaign_member is False
     assert smoke.figure_eligible is False
     assert smoke.denominator_contribution == 0
@@ -1185,7 +1344,7 @@ def _direct_preflight(
     smoke: execution.N7SmokeSlot,
 ) -> execution.ExecutionPreflight:
     binaries = _binaries(tmp_path / "bin")
-    root = tmp_path / "results"
+    root = tmp_path / Path(smoke.slot.result_path).parent
     provenance = _build_provenance(tmp_path / "build-inputs", binaries)
     preflight = execution.ExecutionPreflight(
         revision="c" * 40,
@@ -1938,6 +2097,7 @@ def test_execution_authorization_is_required_and_exact(
         approved_utc="2026-08-04T00:00:00+00:00",
         kauri_revision="d" * 40,
         slot_ids=(smoke.slot.slot_id,),
+        result_root=Path(smoke.slot.result_path).parent.as_posix(),
         static_artifacts=static_artifacts,
         build_provenance_sha256=hashlib.sha256(
             execution._canonical_json_bytes(preflight.build_provenance)
@@ -1950,6 +2110,208 @@ def test_execution_authorization_is_required_and_exact(
             preflight=preflight,
             static_artifacts=static_artifacts,
             campaign_member=False,
+        )
+
+    exact = _smoke_authorization(smoke, preflight)
+    relocated_root = preflight.repository / "results/relocated-smoke-attempt"
+    relocated = replace(
+        preflight,
+        result_root=relocated_root,
+        slot_directory=relocated_root / smoke.slot.slot_id,
+    )
+    with pytest.raises(execution.FactorialExecutionError, match="not exact"):
+        execution._bind_execution_authorization(
+            exact,
+            slot=smoke.slot,
+            preflight=relocated,
+            static_artifacts=static_artifacts,
+            campaign_member=False,
+        )
+
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="canonical repository-relative results path",
+    ):
+        execution.build_execution_authorization_receipt(
+            scope="excluded_n7_smoke",
+            approval_reference="test thesis-author approval",
+            approved_utc="2026-08-04T00:00:00+00:00",
+            kauri_revision=preflight.revision,
+            slot_ids=(smoke.slot.slot_id,),
+            result_root="results/../relocated-smoke-attempt",
+            static_artifacts=static_artifacts,
+            build_provenance_sha256=hashlib.sha256(
+                execution._canonical_json_bytes(preflight.build_provenance)
+            ).hexdigest(),
+        )
+
+
+def test_campaign_execute_rejects_ordinal_68_before_ordinal_1(tmp_path: Path) -> None:
+    context = _campaign_launch_context(tmp_path, 68)
+    ledger = context["preflight"].result_root / execution.CAMPAIGN_LEDGER_FILENAME
+    ledger.write_bytes(
+        execution._canonical_json_bytes(
+            _campaign_ledger_row(context, 68, "STARTED", 1)
+        )
+    )
+    launches: list[tuple[str, ...]] = []
+
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="exact next-slot prefix",
+    ):
+        execution.execute_slot_once(
+            context["slot"],
+            context["spec"],
+            preflight=context["preflight"],
+            static_artifacts=context["static_artifacts"],
+            authorization_receipt=context["authorization_payload"],
+            campaign_member=True,
+            run_command=lambda command, **_kwargs: launches.append(tuple(command)),
+        )
+
+    assert launches == []
+    assert not context["preflight"].slot_directory.exists()
+
+
+def test_campaign_launch_guard_accepts_only_the_exact_passed_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _campaign_launch_context(tmp_path / "first", 1)
+    first_ledger = (
+        first["preflight"].result_root / execution.CAMPAIGN_LEDGER_FILENAME
+    )
+    first_ledger.write_bytes(
+        execution._canonical_json_bytes(
+            _campaign_ledger_row(first, 1, "STARTED", 1)
+        )
+    )
+    execution._validate_campaign_launch_order(
+        spec=first["spec"],
+        preflight=first["preflight"],
+        static_artifacts=first["static_artifacts"],
+        authorization_receipt=first["authorization_payload"],
+        authorization=first["authorization"],
+    )
+
+    second = _campaign_launch_context(tmp_path / "second", 2)
+    prior_spec = next(
+        item for item in second["runtime"].slots if item.execution_ordinal == 1
+    )
+    prior_directory = second["preflight"].result_root / prior_spec.slot_id
+    (prior_directory / "runtime").mkdir(parents=True)
+    (prior_directory / "execution-authorization.json").write_bytes(
+        second["authorization_payload"]
+    )
+    (prior_directory / "runtime/exact-build-provenance.json").write_bytes(
+        execution._canonical_json_bytes(second["preflight"].build_provenance)
+    )
+    from experiments.adaptive.kauri_experiment import factorial_validation
+
+    monkeypatch.setattr(
+        factorial_validation,
+        "validate_slot",
+        lambda _path: SimpleNamespace(
+            slot_id=prior_spec.slot_id,
+            outcome="PASS",
+            reason=None,
+            integrity_valid=True,
+            campaign_member=True,
+            figure_eligible=True,
+        ),
+    )
+    rows = [
+        _campaign_ledger_row(second, 1, "STARTED", 1),
+        _campaign_ledger_row(second, 1, "TERMINAL", 2),
+        _campaign_ledger_row(second, 2, "STARTED", 3),
+    ]
+    second_ledger = (
+        second["preflight"].result_root / execution.CAMPAIGN_LEDGER_FILENAME
+    )
+    second_ledger.write_bytes(
+        b"".join(execution._canonical_json_bytes(row) for row in rows)
+    )
+    execution._validate_campaign_launch_order(
+        spec=second["spec"],
+        preflight=second["preflight"],
+        static_artifacts=second["static_artifacts"],
+        authorization_receipt=second["authorization_payload"],
+        authorization=second["authorization"],
+    )
+
+    rejected_rows = [dict(row) for row in rows]
+    rejected_rows[1]["execution_outcome"] = "INCOMPLETE"
+    rejected_rows[1]["execution_reason"] = "forced failure"
+    second_ledger.write_bytes(
+        b"".join(execution._canonical_json_bytes(row) for row in rejected_rows)
+    )
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="non-PASS terminal attempt",
+    ):
+        execution._validate_campaign_launch_order(
+            spec=second["spec"],
+            preflight=second["preflight"],
+            static_artifacts=second["static_artifacts"],
+            authorization_receipt=second["authorization_payload"],
+            authorization=second["authorization"],
+        )
+
+
+def test_campaign_launch_guard_rejects_finalized_and_typed_drift(
+    tmp_path: Path,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    started = _campaign_ledger_row(context, 1, "STARTED", 1)
+
+    typed_drift = dict(started)
+    typed_drift["schema_version"] = True
+    ledger.write_bytes(execution._canonical_json_bytes(typed_drift))
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="identity/order binding drifted",
+    ):
+        execution._validate_campaign_launch_order(
+            spec=context["spec"],
+            preflight=context["preflight"],
+            static_artifacts=context["static_artifacts"],
+            authorization_receipt=context["authorization_payload"],
+            authorization=context["authorization"],
+        )
+
+    ledger.write_bytes(execution._canonical_json_bytes(started))
+    summary = root / execution.CAMPAIGN_SUMMARY_FILENAME
+    summary.write_bytes(execution._canonical_json_bytes({"finalized": True}))
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="finalized campaign",
+    ):
+        execution._validate_campaign_launch_order(
+            spec=context["spec"],
+            preflight=context["preflight"],
+            static_artifacts=context["static_artifacts"],
+            authorization_receipt=context["authorization_payload"],
+            authorization=context["authorization"],
+        )
+
+    summary.unlink()
+    contract_path = root / execution.CAMPAIGN_CONTRACT_FILENAME
+    typed_contract = json.loads(context["contract_payload"])
+    typed_contract["outcome_dependent_order"] = 0
+    contract_path.write_bytes(execution._canonical_json_bytes(typed_contract))
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="exact frozen schedule",
+    ):
+        execution._validate_campaign_launch_order(
+            spec=context["spec"],
+            preflight=context["preflight"],
+            static_artifacts=context["static_artifacts"],
+            authorization_receipt=context["authorization_payload"],
+            authorization=context["authorization"],
         )
 
 

@@ -91,6 +91,23 @@ ExperimentByzantineOptions persistent_options(
     return options;
 }
 
+ExperimentByzantineOptions tiered_options(
+    ReplicaID local_replica,
+    std::size_t responsive_period = 32,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr)
+{
+    auto options = rotating_options(local_replica, markers);
+    options.rotating_omission->mode =
+        "tiered_persistent_responsive_omission_v1";
+    options.rotating_omission->replica_count = 31;
+    options.rotating_omission->actor_ids = {1};
+    options.rotating_omission->expected_actor_count = 1;
+    options.rotating_omission->responsive_degraded_actor_ids = {2};
+    options.rotating_omission->responsive_omission_period = responsive_period;
+    options.rotating_omission->max_omissions_per_proposal = 2;
+    return options;
+}
+
 ProposalKey selected_proposal(
     ReplicaID actor,
     const std::string &label)
@@ -235,6 +252,115 @@ TEST_CASE(
     CHECK(markers[1].fault_mode == "persistent_selected_omission_v1");
     CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
     CHECK(markers[1].monotonic_ns > 0);
+}
+
+TEST_CASE(
+    "native HotStuff hooks enforce tiered responsive ordinals and retries",
+    "[adaptive-v2][experiment][byzantine][tiered][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        2,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    std::vector<ExperimentOmissionMarker> markers;
+    runtime.configure_experiment_byzantine_faults(
+        tiered_options(2, 32, &markers));
+
+    const ConfigurationId configuration{7, 3, digest("tiered-native-epoch")};
+    const auto internal = tree(ExperimentReplicaRole::internal, 2);
+    const auto root = tree(ExperimentReplicaRole::root, 2);
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime,
+            ProposalKey{configuration, digest("tiered-native-root")},
+            root));
+
+    for (std::uint32_t ordinal = 1; ordinal <= 31; ++ordinal)
+    {
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+                runtime,
+                ProposalKey{
+                    configuration,
+                    digest(
+                        "tiered-native-forward-" +
+                        std::to_string(ordinal))},
+                internal));
+    }
+    REQUIRE(markers.size() == 31);
+    CHECK(markers.back().contribution_ordinal == 31);
+
+    const ProposalKey thirty_second{
+        configuration, digest("tiered-native-omit-32")};
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime, thirty_second, internal));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime, thirty_second, internal));
+    REQUIRE(markers.size() == 32);
+    CHECK(markers.back().contribution_ordinal == 32);
+    CHECK(markers.back().action == ExperimentOmissionAction::omit_aggregate);
+
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime,
+            ProposalKey{configuration, digest("tiered-native-forward-33")},
+            internal));
+    REQUIRE(markers.size() == 33);
+    CHECK(markers.back().contribution_ordinal == 33);
+    CHECK(markers.back().action == ExperimentOmissionAction::forward);
+}
+
+TEST_CASE(
+    "native HotStuff hooks keep tiered hard actors persistent by role",
+    "[adaptive-v2][experiment][byzantine][tiered][hard][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    std::vector<ExperimentOmissionMarker> markers;
+    runtime.configure_experiment_byzantine_faults(
+        tiered_options(1, 32, &markers));
+
+    const ConfigurationId configuration{7, 3, digest("tiered-hard-epoch")};
+    const auto internal = tree(ExperimentReplicaRole::internal, 1);
+    const auto leaf = tree(ExperimentReplicaRole::leaf, 1);
+    const auto root = tree(ExperimentReplicaRole::root, 1);
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime,
+        ProposalKey{configuration, digest("tiered-hard-internal")},
+        internal));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+        runtime,
+        ProposalKey{configuration, digest("tiered-hard-leaf")},
+        leaf));
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime,
+            ProposalKey{configuration, digest("tiered-hard-root")},
+            root));
+
+    REQUIRE(markers.size() == 2);
+    CHECK(markers[0].cohort == ExperimentOmissionCohort::hard);
+    CHECK(markers[0].contribution_ordinal == 0);
+    CHECK(markers[1].cohort == ExperimentOmissionCohort::hard);
+    CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
 }
 
 } // namespace

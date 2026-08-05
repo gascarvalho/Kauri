@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 import datetime as dt
+import fcntl
 import hashlib
 import hmac
 import json
@@ -36,9 +37,11 @@ from .factorial_manifest import (
     build_factorial_plan,
     derive_actor_ids,
     derive_consensus_shape,
+    derive_tiered_cohorts,
     load_frozen_manifest_bytes,
 )
 from .factorial_runtime import (
+    FactorialRuntimePlan,
     ManagerSecretMaterial,
     ReplicaProcessSpec,
     SlotRuntimeSpec,
@@ -63,6 +66,11 @@ NANOSECONDS_PER_SECOND = 1_000_000_000
 DEFAULT_POLL_INTERVAL_S = 0.05
 DEFAULT_CLEANUP_TIMEOUT_S = 5.0
 BUILD_EVIDENCE_DIRECTORY = "build-evidence"
+CAMPAIGN_AUTHORIZATION_FILENAME = "campaign-authorization.json"
+CAMPAIGN_CONTRACT_FILENAME = "campaign-execution-contract.json"
+CAMPAIGN_LEDGER_FILENAME = "campaign-attempt-ledger.jsonl"
+CAMPAIGN_SUMMARY_FILENAME = "campaign-execution-summary.json"
+MAX_CAMPAIGN_ROOT_ARTIFACT_BYTES = 4 << 20
 _BUILD_EVIDENCE_GROUPS = {
     "binaries": "binaries",
     "build_metadata": "build-metadata",
@@ -163,7 +171,7 @@ class N7SmokeSlot:
     campaign_member: bool = False
     figure_eligible: bool = False
     denominator_contribution: int = 0
-    actor_count_rule: str = "min_3_derived_f_smoke_only"
+    actor_count_rule: str = "fixed_1_hard_actor_smoke_only"
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +240,141 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _read_stable_regular_file(path: Path, label: str) -> bytes:
+    """Read one bounded root artifact without following links or racing a writer."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise FactorialExecutionError(
+            f"{label} is absent or is not a safe regular file"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > MAX_CAMPAIGN_ROOT_ARTIFACT_BYTES
+        ):
+            raise FactorialExecutionError(
+                f"{label} is not a bounded regular file"
+            )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise FactorialExecutionError(f"{label} changed while being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise FactorialExecutionError(f"{label} changed while being read")
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise FactorialExecutionError(f"{label} changed while being read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _acquire_campaign_root_lock(root: Path) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as error:
+        raise FactorialExecutionError(
+            "campaign result root is absent or unsafe"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise FactorialExecutionError("campaign result root identity drifted")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise FactorialExecutionError(
+                "another campaign ledger/launch operation is active"
+            ) from error
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _assert_campaign_root_identity(root: Path, descriptor: int) -> None:
+    opened = os.fstat(descriptor)
+    try:
+        current = os.stat(root, follow_symlinks=False)
+    except OSError as error:
+        raise FactorialExecutionError("campaign result root disappeared") from error
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise FactorialExecutionError("campaign result root identity drifted")
+
+
+def _release_campaign_root_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def append_campaign_ledger_record(path: Path, value: object) -> None:
+    """Append one canonical row while excluding concurrent launch guards."""
+
+    path = Path(path)
+    if path.name != CAMPAIGN_LEDGER_FILENAME:
+        raise FactorialExecutionError("campaign ledger path is not exact")
+    root_descriptor = _acquire_campaign_root_lock(path.parent)
+    try:
+        if path.is_symlink():
+            raise FactorialExecutionError(
+                "campaign attempt ledger must not be a symlink"
+            )
+        if path.exists() and not stat.S_ISREG(path.stat().st_mode):
+            raise FactorialExecutionError(
+                "campaign attempt ledger must be a regular file"
+            )
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_APPEND
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "ab") as output:
+                descriptor = -1
+                output.write(_canonical_json_bytes(value))
+                output.flush()
+                os.fsync(output.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        _assert_campaign_root_identity(path.parent, root_descriptor)
+    finally:
+        _release_campaign_root_lock(root_descriptor)
 
 
 def _build_evidence_rows(
@@ -544,6 +687,7 @@ def build_execution_authorization_receipt(
     approved_utc: str,
     kauri_revision: str,
     slot_ids: Sequence[str],
+    result_root: str,
     static_artifacts: Mapping[str, bytes],
     build_provenance_sha256: str,
 ) -> bytes:
@@ -572,6 +716,20 @@ def build_execution_authorization_receipt(
         not isinstance(slot_id, str) or not slot_id for slot_id in slots
     ):
         raise FactorialExecutionError("execution authorization slot set is invalid")
+    if not isinstance(result_root, str) or not result_root:
+        raise FactorialExecutionError("execution authorization result root is invalid")
+    result_path = Path(result_root)
+    if (
+        result_path.is_absolute()
+        or result_path.as_posix() != result_root
+        or not result_path.parts
+        or result_path.parts[0] != "results"
+        or any(part in {"", ".", ".."} for part in result_path.parts)
+    ):
+        raise FactorialExecutionError(
+            "execution authorization result root must be a canonical repository-relative "
+            "results path"
+        )
     if set(static_artifacts) != {"manifest.json", "plan.json", "runtime.json"}:
         raise FactorialExecutionError("execution authorization static artifacts drifted")
     static_hashes = {
@@ -587,13 +745,14 @@ def build_execution_authorization_receipt(
             "execution authorization build provenance digest is invalid"
         )
     core: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": scope,
         "authorized_by": "thesis_author",
         "approval_reference": approval_reference.strip(),
         "approved_utc": approved_utc,
         "kauri_revision": kauri_revision,
         "slot_ids": list(slots),
+        "result_root": result_root,
         "static_artifacts_sha256": static_hashes,
         "build_provenance_sha256": build_provenance_sha256,
         "automatic_retries": 0,
@@ -605,6 +764,53 @@ def build_execution_authorization_receipt(
         + _sha256_bytes(_canonical_json_bytes(core))[:24],
     }
     return _canonical_json_bytes(document)
+
+
+def build_campaign_execution_contract(
+    *,
+    runtime: FactorialRuntimePlan,
+    static_artifacts: Mapping[str, bytes],
+    authorization: Mapping[str, object],
+    authorization_payload: bytes,
+    build_provenance: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind the exact authorization, build, and immutable sequential schedule."""
+
+    if set(static_artifacts) != {"manifest.json", "plan.json", "runtime.json"}:
+        raise FactorialExecutionError("campaign contract static artifacts drifted")
+    try:
+        return {
+            "schema_version": 1,
+            "campaign_id": runtime.runtime_id,
+            "manifest_id": runtime.manifest_id,
+            "manifest_sha256": _sha256_bytes(static_artifacts["manifest.json"]),
+            "plan_sha256": _sha256_bytes(static_artifacts["plan.json"]),
+            "runtime_sha256": _sha256_bytes(static_artifacts["runtime.json"]),
+            "authorization_id": authorization["authorization_id"],
+            "authorization_sha256": _sha256_bytes(authorization_payload),
+            "kauri_revision": authorization["kauri_revision"],
+            "build_provenance_sha256": _sha256_bytes(
+                _canonical_json_bytes(build_provenance)
+            ),
+            "execution_mode": "fixed_sequential",
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "outcome_dependent_order": False,
+            "expected_slot_count": len(runtime.slots),
+            "execution_schedule": [
+                {
+                    "execution_ordinal": item.execution_ordinal,
+                    "slot_id": item.slot_id,
+                    "block_id": item.block_id,
+                    "arm_code": item.arm_code,
+                }
+                for item in runtime.slots
+            ],
+        }
+    except KeyError as error:
+        raise FactorialExecutionError(
+            "campaign contract authorization is malformed"
+        ) from error
 
 
 def _bind_execution_authorization(
@@ -631,6 +837,7 @@ def _bind_execution_authorization(
         "approved_utc",
         "kauri_revision",
         "slot_ids",
+        "result_root",
         "static_artifacts_sha256",
         "build_provenance_sha256",
         "automatic_retries",
@@ -655,8 +862,18 @@ def _bind_execution_authorization(
     expected_id = "execution-authorization-" + _sha256_bytes(
         _canonical_json_bytes(core)
     )[:24]
+    try:
+        actual_result_root = preflight.result_root.relative_to(
+            preflight.repository
+        ).as_posix()
+    except ValueError as error:
+        raise FactorialExecutionError(
+            "execution preflight result root is outside the exact repository"
+        ) from error
+    expected_result_root = Path(slot.result_path).parent.as_posix()
     if (
-        document["schema_version"] != 1
+        type(document["schema_version"]) is not int
+        or document["schema_version"] != 2
         or document["scope"] != expected_scope
         or document["authorized_by"] != "thesis_author"
         or not isinstance(document["approval_reference"], str)
@@ -664,9 +881,12 @@ def _bind_execution_authorization(
         or len(document["approval_reference"]) > 512
         or document["kauri_revision"] != preflight.revision
         or document["slot_ids"] != expected_slots
+        or document["result_root"] != expected_result_root
+        or document["result_root"] != actual_result_root
         or document["static_artifacts_sha256"] != expected_hashes
         or document["build_provenance_sha256"]
         != _sha256_bytes(_canonical_json_bytes(preflight.build_provenance))
+        or type(document["automatic_retries"]) is not int
         or document["automatic_retries"] != 0
         or document["replacement_policy"] != "none"
         or document["authorization_id"] != expected_id
@@ -681,6 +901,320 @@ def _bind_execution_authorization(
     if approved.tzinfo is None or approved.utcoffset() is None:
         raise FactorialExecutionError("execution approval timestamp must include UTC offset")
     return document
+
+
+def _parse_canonical_object(payload: bytes, label: str) -> dict[str, object]:
+    try:
+        document = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FactorialExecutionError(f"{label} is invalid JSON") from error
+    if not isinstance(document, dict) or _canonical_json_bytes(document) != payload:
+        raise FactorialExecutionError(f"{label} is not exact canonical JSON")
+    return document
+
+
+def _exact_json_value(actual: object, expected: object) -> bool:
+    return _canonical_json_bytes(actual) == _canonical_json_bytes(expected)
+
+
+def _validate_campaign_launch_order(
+    *,
+    spec: SlotRuntimeSpec,
+    preflight: ExecutionPreflight,
+    static_artifacts: Mapping[str, bytes],
+    authorization_receipt: bytes,
+    authorization: Mapping[str, object],
+) -> None:
+    """Require the exact accepted prefix plus this slot's sole STARTED row."""
+
+    root = preflight.result_root
+    if root.is_symlink() or not root.is_dir():
+        raise FactorialExecutionError("campaign result root is not a safe directory")
+    preserved_authorization = _read_stable_regular_file(
+        root / CAMPAIGN_AUTHORIZATION_FILENAME,
+        "campaign authorization",
+    )
+    if preserved_authorization != authorization_receipt:
+        raise FactorialExecutionError(
+            "campaign root authorization differs from the launch receipt"
+        )
+
+    try:
+        manifest = load_frozen_manifest_bytes(static_artifacts["manifest.json"])
+        plan = build_factorial_plan(manifest)
+        runtime = build_factorial_runtime(plan)
+    except (KeyError, FactorialManifestError) as error:
+        raise FactorialExecutionError(
+            "campaign launch order cannot derive the frozen runtime"
+        ) from error
+    expected_contract = build_campaign_execution_contract(
+        runtime=runtime,
+        static_artifacts=static_artifacts,
+        authorization=authorization,
+        authorization_payload=authorization_receipt,
+        build_provenance=preflight.build_provenance,
+    )
+    contract_payload = _read_stable_regular_file(
+        root / CAMPAIGN_CONTRACT_FILENAME,
+        "campaign execution contract",
+    )
+    contract = _parse_canonical_object(
+        contract_payload,
+        "campaign execution contract",
+    )
+    if contract_payload != _canonical_json_bytes(expected_contract):
+        raise FactorialExecutionError(
+            "campaign execution contract differs from the exact frozen schedule"
+        )
+
+    ledger_payload = _read_stable_regular_file(
+        root / CAMPAIGN_LEDGER_FILENAME,
+        "campaign attempt ledger",
+    )
+    if not ledger_payload or not ledger_payload.endswith(b"\n"):
+        raise FactorialExecutionError(
+            "campaign attempt ledger has no complete STARTED record"
+        )
+    raw_rows = ledger_payload.splitlines(keepends=True)
+    expected_row_count = spec.execution_ordinal * 2 - 1
+    if len(raw_rows) != expected_row_count:
+        raise FactorialExecutionError(
+            "campaign attempt ledger is not the exact next-slot prefix"
+        )
+    rows = [
+        _parse_canonical_object(raw, f"campaign attempt ledger row {index}")
+        for index, raw in enumerate(raw_rows, 1)
+    ]
+
+    ordered = tuple(sorted(runtime.slots, key=lambda item: item.execution_ordinal))
+    if (
+        len(ordered) != len(runtime.slots)
+        or tuple(item.execution_ordinal for item in ordered)
+        != tuple(range(1, len(ordered) + 1))
+        or spec.execution_ordinal > len(ordered)
+        or ordered[spec.execution_ordinal - 1] != spec
+    ):
+        raise FactorialExecutionError("campaign runtime order is not contiguous and exact")
+
+    if (root / CAMPAIGN_SUMMARY_FILENAME).exists() or (
+        root / CAMPAIGN_SUMMARY_FILENAME
+    ).is_symlink():
+        raise FactorialExecutionError("a finalized campaign cannot be resumed")
+    expected_root_entries = {
+        BUILD_EVIDENCE_DIRECTORY,
+        CAMPAIGN_AUTHORIZATION_FILENAME,
+        CAMPAIGN_CONTRACT_FILENAME,
+        CAMPAIGN_LEDGER_FILENAME,
+        *(item.slot_id for item in ordered[: spec.execution_ordinal - 1]),
+    }
+    actual_root_entries = {path.name: path for path in root.iterdir()}
+    if set(actual_root_entries) != expected_root_entries:
+        raise FactorialExecutionError(
+            "campaign result root is not the exact completed-slot prefix"
+        )
+    for name, path in actual_root_entries.items():
+        should_be_directory = name == BUILD_EVIDENCE_DIRECTORY or name.startswith(
+            "slot-"
+        )
+        if path.is_symlink() or (
+            should_be_directory and not path.is_dir()
+        ) or (not should_be_directory and not path.is_file()):
+            raise FactorialExecutionError(
+                "campaign result root contains an unsafe prefix artifact"
+            )
+    contract_sha256 = _sha256_bytes(contract_payload)
+    authorization_sha256 = _sha256_bytes(authorization_receipt)
+    build_provenance_sha256 = _sha256_bytes(
+        _canonical_json_bytes(preflight.build_provenance)
+    )
+    started_fields = {
+        "schema_version",
+        "campaign_id",
+        "manifest_sha256",
+        "source_plan_sha256",
+        "runtime_sha256",
+        "contract_sha256",
+        "authorization_id",
+        "authorization_sha256",
+        "kauri_revision",
+        "execution_ordinal",
+        "slot_id",
+        "block_id",
+        "arm_code",
+        "attempt_ordinal",
+        "automatic_retries",
+        "replacement_policy",
+        "state",
+        "recorded_utc",
+        "recorded_monotonic_ns",
+        "slot_directory",
+        "preflight_revision",
+        "preflight_free_bytes",
+        "build_provenance_sha256",
+    }
+    terminal_fields = (
+        started_fields
+        - {
+            "preflight_revision",
+            "preflight_free_bytes",
+            "build_provenance_sha256",
+        }
+        | {
+            "execution_outcome",
+            "execution_reason",
+            "launch_count",
+            "validation",
+        }
+    )
+    previous_monotonic_ns = 0
+    for ordinal in range(1, spec.execution_ordinal + 1):
+        expected = ordered[ordinal - 1]
+        expected_common = {
+            "schema_version": 1,
+            "campaign_id": runtime.runtime_id,
+            "manifest_sha256": _sha256_bytes(static_artifacts["manifest.json"]),
+            "source_plan_sha256": _sha256_bytes(static_artifacts["plan.json"]),
+            "runtime_sha256": _sha256_bytes(static_artifacts["runtime.json"]),
+            "contract_sha256": contract_sha256,
+            "authorization_id": authorization["authorization_id"],
+            "authorization_sha256": authorization_sha256,
+            "kauri_revision": preflight.revision,
+            "execution_ordinal": ordinal,
+            "slot_id": expected.slot_id,
+            "block_id": expected.block_id,
+            "arm_code": expected.arm_code,
+            "attempt_ordinal": 1,
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+        }
+        started = rows[(ordinal - 1) * 2]
+        if set(started) != started_fields or any(
+            not _exact_json_value(started.get(key), value)
+            for key, value in expected_common.items()
+        ):
+            raise FactorialExecutionError(
+                "campaign STARTED ledger identity/order binding drifted"
+            )
+        if (
+            started["state"] != "STARTED"
+            or started["slot_directory"] != str(root / expected.slot_id)
+            or started["preflight_revision"] != preflight.revision
+            or started["build_provenance_sha256"] != build_provenance_sha256
+            or type(started["preflight_free_bytes"]) is not int
+            or started["preflight_free_bytes"] < runtime.minimum_free_bytes
+        ):
+            raise FactorialExecutionError(
+                "campaign STARTED ledger does not bind the exact preflight"
+            )
+        if ordinal == spec.execution_ordinal and (
+            started["preflight_free_bytes"] != preflight.free_bytes
+            or started["slot_directory"] != str(preflight.slot_directory)
+        ):
+            raise FactorialExecutionError(
+                "current campaign STARTED row differs from this preflight"
+            )
+
+        records = [started]
+        if ordinal < spec.execution_ordinal:
+            terminal = rows[(ordinal - 1) * 2 + 1]
+            if set(terminal) != terminal_fields or any(
+                not _exact_json_value(terminal.get(key), value)
+                for key, value in expected_common.items()
+            ):
+                raise FactorialExecutionError(
+                    "campaign TERMINAL ledger identity/order binding drifted"
+                )
+            expected_validation = {
+                "outcome": "PASS",
+                "reason": None,
+                "integrity_valid": True,
+                "campaign_member": True,
+                "figure_eligible": True,
+            }
+            if (
+                terminal["state"] != "TERMINAL"
+                or terminal["slot_directory"] != str(root / expected.slot_id)
+                or terminal["execution_outcome"] != "PASS"
+                or terminal["execution_reason"] is not None
+                or type(terminal["launch_count"]) is not int
+                or terminal["launch_count"] != expected.replica_count + 1
+                or not _exact_json_value(
+                    terminal["validation"], expected_validation
+                )
+            ):
+                raise FactorialExecutionError(
+                    "campaign cannot continue after a non-PASS terminal attempt"
+                )
+            prior_directory = root / expected.slot_id
+            if prior_directory.is_symlink() or not prior_directory.is_dir():
+                raise FactorialExecutionError(
+                    "campaign ledger prefix lacks its preserved prior slot"
+                )
+            prior_authorization = _read_stable_regular_file(
+                prior_directory / "execution-authorization.json",
+                "prior slot execution authorization",
+            )
+            prior_build_provenance = _read_stable_regular_file(
+                prior_directory / "runtime/exact-build-provenance.json",
+                "prior slot exact-build provenance",
+            )
+            if (
+                prior_authorization != authorization_receipt
+                or prior_build_provenance
+                != _canonical_json_bytes(preflight.build_provenance)
+            ):
+                raise FactorialExecutionError(
+                    "campaign ledger prefix differs from its preserved authorization/build"
+                )
+            if ordinal == spec.execution_ordinal - 1:
+                # The immediately preceding slot independently validates the
+                # sequence inductively; the final validator replays every slot.
+                from .factorial_validation import validate_slot
+
+                replayed = validate_slot(prior_directory)
+                replayed_validation = {
+                    "outcome": replayed.outcome,
+                    "reason": replayed.reason,
+                    "integrity_valid": replayed.integrity_valid,
+                    "campaign_member": replayed.campaign_member,
+                    "figure_eligible": replayed.figure_eligible,
+                }
+                if (
+                    replayed.slot_id != expected.slot_id
+                    or not _exact_json_value(
+                        replayed_validation, expected_validation
+                    )
+                    or not _exact_json_value(
+                        terminal["validation"], replayed_validation
+                    )
+                ):
+                    raise FactorialExecutionError(
+                        "campaign cannot continue without an independently "
+                        "validated predecessor"
+                    )
+            records.append(terminal)
+
+        for record in records:
+            try:
+                recorded = dt.datetime.fromisoformat(
+                    str(record["recorded_utc"]).replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise FactorialExecutionError(
+                    "campaign ledger UTC timestamp is invalid"
+                ) from error
+            monotonic_ns = record["recorded_monotonic_ns"]
+            if (
+                recorded.tzinfo is None
+                or recorded.utcoffset() is None
+                or type(monotonic_ns) is not int
+                or monotonic_ns <= 0
+                or monotonic_ns < previous_monotonic_ns
+            ):
+                raise FactorialExecutionError(
+                    "campaign ledger timestamps are invalid or regress"
+                )
+            previous_monotonic_ns = monotonic_ns
 
 
 def _utc_now() -> str:
@@ -2643,14 +3177,34 @@ def execute_slot_once(
         static_artifacts=static_artifacts,
         campaign_member=campaign_member,
     )
-    verify_preserved_build_evidence(
-        preflight.result_root,
-        preflight.build_provenance,
-    )
-    execution_binaries = _preserved_execution_binaries(preflight.result_root)
-
-    slot_directory = preflight.slot_directory
-    _create_slot_directories(slot_directory, spec)
+    root_lock: int | None = None
+    if campaign_member:
+        root_lock = _acquire_campaign_root_lock(preflight.result_root)
+    try:
+        if campaign_member:
+            _validate_campaign_launch_order(
+                spec=spec,
+                preflight=preflight,
+                static_artifacts=static_artifacts,
+                authorization_receipt=authorization_receipt,
+                authorization=authorization,
+            )
+        verify_preserved_build_evidence(
+            preflight.result_root,
+            preflight.build_provenance,
+        )
+        execution_binaries = _preserved_execution_binaries(preflight.result_root)
+        slot_directory = preflight.slot_directory
+        if slot_directory.exists() or slot_directory.is_symlink():
+            raise FactorialExecutionError(
+                f"slot result collision; refusing reuse: {slot_directory}"
+            )
+        _create_slot_directories(slot_directory, spec)
+        if root_lock is not None:
+            _assert_campaign_root_identity(preflight.result_root, root_lock)
+    finally:
+        if root_lock is not None:
+            _release_campaign_root_lock(root_lock)
     for relative, payload in static_artifacts.items():
         _write_exclusive(slot_directory / relative, bytes(payload))
     _write_exclusive(
@@ -3011,14 +3565,59 @@ def build_n7_ps_smoke_slot(
         initial_fanout=2,
         candidate_fanouts=template.candidate_fanouts,
     )
-    actors = derive_actor_ids(
-        7,
-        consensus.q,
-        min(3, consensus.f),
-        scientific_seed,
+    tiered = (
+        template.byzantine.mode
+        == "tiered_persistent_responsive_omission_v1"
+        and template.byzantine.responsive_degradation is not None
     )
-    if len(actors) != min(3, consensus.f) or any(actor < consensus.q for actor in actors):
-        raise FactorialExecutionError("N=7 smoke actor derivation drifted")
+    if tiered:
+        cohorts = derive_tiered_cohorts(
+            7,
+            consensus.q,
+            1,
+            scientific_seed,
+        )
+        actors = cohorts.hard_actor_ids
+        degraded = cohorts.responsive_degraded_actor_ids
+        fast = cohorts.fast_replica_ids
+        if (
+            len(actors) != 1
+            or len(degraded) != 1
+            or len((*actors, *degraded)) != consensus.f
+            or len(fast) != consensus.q
+            or 0 not in fast
+            or any(actor < consensus.q for actor in actors)
+            or any(actor < 1 or actor >= consensus.q for actor in degraded)
+        ):
+            raise FactorialExecutionError("N=7 smoke tiered cohort derivation drifted")
+        responsive_degradation = replace(
+            template.byzantine.responsive_degradation,
+            actor_selection_vectors=(),
+        )
+        actor_count_rule = "fixed_1_hard_actor_smoke_only"
+        maximum = None
+        maximum_rule = "derived_f_per_slot_v1"
+    else:
+        actors = derive_actor_ids(
+            7,
+            consensus.q,
+            min(3, consensus.f),
+            scientific_seed,
+        )
+        degraded = ()
+        fast = ()
+        responsive_degradation = None
+        actor_count_rule = "min_3_derived_f_smoke_only"
+        maximum = (
+            len(actors)
+            if template.byzantine.mode == "persistent_selected_omission_v1"
+            else 1
+        )
+        maximum_rule = None
+        if len(actors) != min(3, consensus.f) or any(
+            actor < consensus.q for actor in actors
+        ):
+            raise FactorialExecutionError("N=7 legacy smoke actor derivation drifted")
     smoke = replace(
         template,
         ordinal=1,
@@ -3040,15 +3639,16 @@ def build_n7_ps_smoke_slot(
         byzantine=replace(
             template.byzantine,
             actor_count=len(actors),
-            actor_count_rule="min_3_derived_f_smoke_only",
+            actor_count_rule=actor_count_rule,
             actor_selection_vectors=(),
-            max_omissions_per_proposal=(
-                len(actors)
-                if template.byzantine.mode == "persistent_selected_omission_v1"
-                else 1
-            ),
+            responsive_degradation=responsive_degradation,
+            max_omissions_per_proposal=maximum,
+            max_omissions_per_proposal_rule=maximum_rule,
         ),
         byzantine_actor_ids=actors,
+        responsive_degraded_actor_ids=degraded,
+        fast_replica_ids=fast,
+        max_omissions_per_proposal=(consensus.f if tiered else None),
         ports=PortAllocation(
             peer_base=peer_base,
             client_base=client_base,
@@ -3056,7 +3656,11 @@ def build_n7_ps_smoke_slot(
         ),
         result_path=result_path,
     )
-    return N7SmokeSlot(slot=smoke, runtime=build_slot_runtime(smoke))
+    return N7SmokeSlot(
+        slot=smoke,
+        runtime=build_slot_runtime(smoke),
+        actor_count_rule=actor_count_rule,
+    )
 
 
 __all__ = (

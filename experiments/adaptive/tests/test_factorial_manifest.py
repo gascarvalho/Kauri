@@ -29,12 +29,19 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     V6_MANIFEST_ID,
     V6_MANIFEST_SHA256,
     V6_PLAN_SHA256,
+    V7_MANIFEST_ID,
+    V7_MANIFEST_SHA256,
+    V7_PLAN_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
+    derive_actor_ids,
     derive_consensus_shape,
-    derive_execution_schedule,
+    derive_stratified_execution_schedule,
+    derive_responsive_degraded_actor_ids,
     derive_slot_nonce,
+    derive_tiered_cohorts,
+    epoch0_distinct_parent_ids,
     epoch0_internal_tree_ids,
     load_frozen_manifest,
     load_frozen_manifest_bytes,
@@ -45,6 +52,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
+)
+V7_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
 )
 V6_MANIFEST_PATH = (
@@ -275,7 +285,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v7/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v8/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -283,11 +293,11 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
         first.slots[0].scientific_seed = 0  # type: ignore[misc]
 
 
-def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
+def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
     manifest = _manifest()
     plan = build_factorial_plan(manifest)
 
-    assert manifest.byzantine.mode == "persistent_selected_omission_v1"
+    assert manifest.byzantine.mode == "tiered_persistent_responsive_omission_v1"
     assert manifest.byzantine.actor_count == 3
     assert manifest.byzantine.actor_count_rule == "fixed_3_bounded_by_derived_f"
     assert manifest.byzantine.actor_selection == (
@@ -297,7 +307,7 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
         "ascii_csv_membership_nul_decimal_q_nul_decimal_scientific_"
         "seed_nul_decimal_replica_id_v1"
     )
-    assert manifest.byzantine.actor_schedule == "all_selected_actors_per_proposal_v1"
+    assert manifest.byzantine.actor_schedule == "all_hard_actors_per_proposal_v1"
     assert manifest.byzantine.maximum_rotating_contexts == 100_000
     assert manifest.byzantine.actions.as_document() == {
         "internal": "omit_aggregate",
@@ -306,15 +316,59 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
     }
     assert manifest.byzantine.start_after_prelaunch_anchor_s == 150
     assert manifest.byzantine.duration_s == 300
-    assert manifest.byzantine.max_omissions_per_proposal == 3
+    assert manifest.byzantine.max_omissions_per_proposal is None
+    assert (
+        manifest.byzantine.max_omissions_per_proposal_rule
+        == "derived_f_per_slot_v1"
+    )
+    responsive = manifest.byzantine.responsive_degradation
+    assert responsive is not None
+    assert responsive.actor_count_rule == "derived_f_minus_hard_actor_count_v1"
+    assert responsive.actor_selection == (
+        "sha256_ranked_canonical_epoch0_reference_roots_"
+        "excluding_commit_observer_v1"
+    )
+    assert responsive.actor_selection_preimage == (
+        r"kauri.shape25.responsive-degraded.v1\0{membership_csv}"
+        r"\0{q}\0{scientific_seed}\0{replica_id}"
+    )
+    assert responsive.observer_isolation == (
+        "replica_0_reserved_authoritative_commit_observer_v1"
+    )
+    assert responsive.actor_schedule == (
+        "omit_every_32nd_unique_non_root_contribution_per_"
+        "responsive_degraded_actor_v1"
+    )
+    assert responsive.omission_period == 32
 
     actors_by_block: dict[str, tuple[int, ...]] = {}
+    degraded_by_block: dict[str, tuple[int, ...]] = {}
+    fast_by_block: dict[str, tuple[int, ...]] = {}
     for slot in plan.slots:
         assert len(slot.byzantine_actor_ids) == 3
         assert len(set(slot.byzantine_actor_ids)) == 3
         assert all(
             slot.q <= actor < slot.replica_count for actor in slot.byzantine_actor_ids
         )
+        assert len(slot.responsive_degraded_actor_ids) == slot.f - 3
+        assert all(
+            1 <= actor < slot.q for actor in slot.responsive_degraded_actor_ids
+        )
+        assert 0 not in slot.responsive_degraded_actor_ids
+        worse = set(
+            (*slot.byzantine_actor_ids, *slot.responsive_degraded_actor_ids)
+        )
+        assert len(worse) == slot.f
+        assert set(slot.byzantine_actor_ids).isdisjoint(
+            slot.responsive_degraded_actor_ids
+        )
+        assert slot.fast_replica_ids == tuple(
+            member for member in range(slot.replica_count) if member not in worse
+        )
+        assert len(slot.fast_replica_ids) == slot.q
+        assert 0 in slot.fast_replica_ids
+        assert slot.max_omissions_per_proposal == slot.f
+        assert slot.maximum_omissions_per_proposal == slot.f
         assert slot.common_timers == manifest.common_timers
         assert slot.common_timers.as_document() == {
             "activation_delay_blocks": 5,
@@ -341,6 +395,16 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
             actors_by_block.setdefault(slot.block_id, slot.byzantine_actor_ids)
             == slot.byzantine_actor_ids
         )
+        assert (
+            degraded_by_block.setdefault(
+                slot.block_id, slot.responsive_degraded_actor_ids
+            )
+            == slot.responsive_degraded_actor_ids
+        )
+        assert (
+            fast_by_block.setdefault(slot.block_id, slot.fast_replica_ids)
+            == slot.fast_replica_ids
+        )
     for vector in manifest.byzantine.actor_selection_vectors:
         membership = ",".join(map(str, range(vector.replica_count)))
         ranked = sorted(
@@ -356,6 +420,46 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
             ),
         )
         assert vector.selected_actor_ids == tuple(sorted(ranked[:3]))
+    for vector in responsive.actor_selection_vectors:
+        membership = ",".join(map(str, range(vector.replica_count)))
+        hard = derive_actor_ids(
+            vector.replica_count,
+            vector.q,
+            3,
+            vector.scientific_seed,
+        )
+        expected_count = (vector.replica_count - 1) // 3 - len(hard)
+        ranked = sorted(
+            range(1, vector.q),
+            key=lambda member: (
+                hashlib.sha256(
+                    (
+                        "kauri.shape25.responsive-degraded.v1"
+                        f"\x00{membership}\x00{vector.q}\x00"
+                        f"{vector.scientific_seed}\x00{member}"
+                    ).encode("ascii")
+                ).digest(),
+                member,
+            ),
+        )
+        assert vector.selected_actor_ids == tuple(
+            sorted(ranked[:expected_count])
+        )
+        assert vector.selected_actor_ids == derive_responsive_degraded_actor_ids(
+            vector.replica_count,
+            vector.q,
+            hard,
+            vector.scientific_seed,
+        )
+        cohorts = derive_tiered_cohorts(
+            vector.replica_count,
+            vector.q,
+            3,
+            vector.scientific_seed,
+        )
+        assert cohorts.hard_actor_ids == hard
+        assert cohorts.responsive_degraded_actor_ids == vector.selected_actor_ids
+        assert len(cohorts.fast_replica_ids) == vector.q
     repeated_actor_sets = {
         (slot.initial_fanout, slot.block_id): slot.byzantine_actor_ids
         for slot in plan.slots
@@ -364,6 +468,37 @@ def test_each_slot_derives_actors_and_uses_one_common_timer_contract() -> None:
         and slot.arm_code == "00"
     }
     assert len(set(repeated_actor_sets.values())) > 1
+
+
+def test_tiered_schema_rejects_observer_injection_schedule_and_bound_drift() -> None:
+    document = _mutable_document()
+    document["byzantine"]["responsive_degradation"]["omission_period"] = 31  # type: ignore[index]
+    with pytest.raises(FactorialManifestError, match="responsive-degradation"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    document["byzantine"]["responsive_degradation"][  # type: ignore[index]
+        "actor_selection_vectors"
+    ][0]["selected_actor_ids"] = [0]
+    with pytest.raises(FactorialManifestError, match="vector"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    document["byzantine"]["max_omissions_per_proposal"] = 3  # type: ignore[index]
+    with pytest.raises(FactorialManifestError, match="derived per slot"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    document["byzantine"]["responsive_degradation"][  # type: ignore[index]
+        "observer_isolation"
+    ] = "none"
+    with pytest.raises(FactorialManifestError, match="responsive-degradation"):
+        parse_manifest_bytes(_encoded(document))
+
+    with pytest.raises(FactorialManifestError, match="proper subset"):
+        derive_responsive_degraded_actor_ids(7, 5, (5, 6), 41_700)
+    with pytest.raises(FactorialManifestError, match=r"\[Q, N\)"):
+        derive_responsive_degraded_actor_ids(7, 5, (4,), 41_700)
 
 
 def test_every_actor_candidate_is_physically_internal_in_an_active_epoch0_tree() -> (
@@ -392,6 +527,13 @@ def test_every_actor_candidate_is_physically_internal_in_an_active_epoch0_tree()
             assert witness_tree in tree_ids
             assert position == 1
             assert position * slot.initial_fanout + 1 < slot.replica_count
+            assert len(
+                epoch0_distinct_parent_ids(
+                    slot.replica_count,
+                    initial_fanout=slot.initial_fanout,
+                    replica_id=actor,
+                )
+            ) >= slot.f + 1
         assert set(slot.byzantine_actor_ids) <= set(range(slot.q, slot.replica_count))
 
 
@@ -436,6 +578,66 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
         "phase_sequence_endpoint": (
             "adaptive_arms_mean_tps_matched_by_block_v1"
         ),
+        "breakthrough_scope": (
+            "n31_f5_placement_arms_p_and_ps_five_matched_blocks_v1"
+        ),
+        "breakthrough_structural_gate": (
+            "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_and_"
+            "every_32nd_unique_non_root_responsive_degraded_omission_schedule_"
+            "and_each_hard_actor_has_f_plus_1_distinct_exact_role_bound_timeout_"
+            "reporters_and_at_least_one_internal_omit_aggregate_proof_and_"
+            "responsive_degraded_replicas_rank_below_every_fast_replica_"
+            "and_epoch1_places_every_responsive_degraded_replica_as_a_root_and_"
+            "exposes_each_in_an_internal_role_and_epoch2_roots_equal_top_q_fast_"
+            "replicas_with_only_fast_replicas_in_root_and_internal_roles_and_"
+            "all_f_worse_replicas_as_physical_leaves_and_only_hard_cohort_wait_"
+            "exempt_v2"
+        ),
+        "breakthrough_structural_required_slot_count": 10,
+        "breakthrough_realized_placement_rule": (
+            "for_each_p_and_ps_arm_all_5_of_5_n31_f5_blocks_have_"
+            "epoch1_to_epoch2_demoted_set_exactly_responsive_degraded_cohort_"
+            "and_promoted_set_exactly_canonical_non_reference_root_pool_minus_"
+            "hard_cohort_v2"
+        ),
+        "breakthrough_realized_placement_per_arm_requirement": 5,
+        "breakthrough_primary_throughput_estimand": (
+            "d_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+"
+            "log((PS_e2/PS_e1)/(S_e2/S_e1))]"
+        ),
+        "breakthrough_throughput_claim_rule": (
+            "two_sided_student_t_95_df4_lower_log_bound_strictly_greater_than_"
+            "zero_and_at_least_4_of_5_block_effects_strictly_greater_than_zero_"
+            "and_absolute_fault_drop_containment_recovery_and_pooled_optimization_"
+            "each_two_sided_student_t_95_df4_lower_tps_bound_strictly_greater_"
+            "than_zero_and_at_least_4_of_5_blocks_strictly_greater_than_zero_and_"
+            "p_and_ps_each_absolute_epoch2_minus_epoch1_tps_strictly_greater_than_"
+            "zero_in_at_least_4_of_5_blocks_v2"
+        ),
+        "breakthrough_positive_block_requirement": 4,
+        "breakthrough_epoch1_baseline_ratio_role": (
+            "descriptive_only_no_noninferiority_threshold_v1"
+        ),
+        "breakthrough_absolute_phase_sequence_estimands": (
+            "fault_drop_b=0.5*((P_baseline-P_fault)+(PS_baseline-PS_fault));"
+            "containment_recovery_b=0.5*((P_e1-P_fault)+(PS_e1-PS_fault));"
+            "pooled_optimization_b=0.5*((P_e2-P_e1)+(PS_e2-PS_e1));"
+            "per_arm_optimization_b=(P_e2-P_e1,PS_e2-PS_e1)_v1"
+        ),
+        "breakthrough_phase_window_interpretation": (
+            "fixed_six_5_second_bucket_windows_with_epoch_windows_anchored_at_"
+            "first_authoritative_post_activation_commit_and_a_common_q_commit_"
+            "required_within_each_window_not_steady_state_v1"
+        ),
+        "breakthrough_pre_epoch1_placebo_estimand": (
+            "pP_b=log((P_fault/P_baseline)/(00_fault/00_baseline));"
+            "pPS_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))"
+        ),
+        "breakthrough_placebo_equivalence_rule": (
+            "both_component_two_one_sided_5_percent_tests_df4_90_cis_"
+            "strictly_within_plus_minus_log_1p10_v2"
+        ),
+        "breakthrough_placebo_equivalence_margin_log": 0.09531017980432493,
         "placement_headline_block_count": 5,
         "placement_headline_initial_fanout": 5,
         "placement_headline_replica_count": 31,
@@ -573,7 +775,7 @@ def test_manifest_preserves_not_started_slots() -> None:
         parse_manifest_bytes(_encoded(document))
 
 
-def test_v7_changes_only_identity_and_root_while_prior_versions_remain_loadable() -> None:
+def test_v8_adds_the_tiered_failure_model_and_breakthrough_scope_to_v7() -> None:
     v3 = load_frozen_manifest(V3_MANIFEST_PATH)
     assert v3.manifest_id == V3_MANIFEST_ID
     assert v3.manifest_sha256 == V3_MANIFEST_SHA256
@@ -595,26 +797,166 @@ def test_v7_changes_only_identity_and_root_while_prior_versions_remain_loadable(
     assert v6.manifest_sha256 == V6_MANIFEST_SHA256
     assert build_factorial_plan(v6).plan_sha256 == V6_PLAN_SHA256
 
-    expected_v7_bytes = V6_MANIFEST_PATH.read_bytes().replace(
-        b'"shape-placement-factorial-v6"',
-        b'"shape-placement-factorial-v7"',
-    ).replace(
-        b'"results/shape-placement-factorial-v6"',
-        b'"results/shape-placement-factorial-v7"',
-    )
-    assert MANIFEST_PATH.read_bytes() == expected_v7_bytes
+    v7 = load_frozen_manifest(V7_MANIFEST_PATH)
+    assert v7.manifest_id == V7_MANIFEST_ID
+    assert v7.manifest_sha256 == V7_MANIFEST_SHA256
+    assert build_factorial_plan(v7).plan_sha256 == V7_PLAN_SHA256
 
-    v7_document = json.loads(MANIFEST_PATH.read_bytes())
-    v6_document = json.loads(V6_MANIFEST_PATH.read_bytes())
+    v8_document = json.loads(MANIFEST_PATH.read_bytes())
+    v7_document = json.loads(V7_MANIFEST_PATH.read_bytes())
+    assert v8_document.pop("manifest_id") == "shape-placement-factorial-v8"
     assert v7_document.pop("manifest_id") == "shape-placement-factorial-v7"
-    assert v6_document.pop("manifest_id") == "shape-placement-factorial-v6"
+    assert v8_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v8"
+    )
     assert v7_document["artifacts"].pop("results_root") == (  # type: ignore[index]
         "results/shape-placement-factorial-v7"
     )
-    assert v6_document["artifacts"].pop("results_root") == (  # type: ignore[index]
-        "results/shape-placement-factorial-v6"
+    v8_scope = v8_document["claim_scope"]  # type: ignore[index]
+    frozen_additions = {
+        key: v8_scope.pop(key)  # type: ignore[union-attr]
+        for key in (
+            "breakthrough_scope",
+            "breakthrough_structural_gate",
+            "breakthrough_structural_required_slot_count",
+            "breakthrough_realized_placement_rule",
+            "breakthrough_realized_placement_per_arm_requirement",
+            "breakthrough_primary_throughput_estimand",
+            "breakthrough_throughput_claim_rule",
+            "breakthrough_positive_block_requirement",
+            "breakthrough_epoch1_baseline_ratio_role",
+            "breakthrough_absolute_phase_sequence_estimands",
+            "breakthrough_phase_window_interpretation",
+            "breakthrough_pre_epoch1_placebo_estimand",
+            "breakthrough_placebo_equivalence_rule",
+            "breakthrough_placebo_equivalence_margin_log",
+        )
+    }
+    assert frozen_additions == {
+        "breakthrough_scope": (
+            "n31_f5_placement_arms_p_and_ps_five_matched_blocks_v1"
+        ),
+        "breakthrough_structural_gate": (
+            "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_and_"
+            "every_32nd_unique_non_root_responsive_degraded_omission_schedule_"
+            "and_each_hard_actor_has_f_plus_1_distinct_exact_role_bound_timeout_"
+            "reporters_and_at_least_one_internal_omit_aggregate_proof_and_"
+            "responsive_degraded_replicas_rank_below_every_fast_replica_"
+            "and_epoch1_places_every_responsive_degraded_replica_as_a_root_and_"
+            "exposes_each_in_an_internal_role_and_epoch2_roots_equal_top_q_fast_"
+            "replicas_with_only_fast_replicas_in_root_and_internal_roles_and_"
+            "all_f_worse_replicas_as_physical_leaves_and_only_hard_cohort_wait_"
+            "exempt_v2"
+        ),
+        "breakthrough_structural_required_slot_count": 10,
+        "breakthrough_realized_placement_rule": (
+            "for_each_p_and_ps_arm_all_5_of_5_n31_f5_blocks_have_"
+            "epoch1_to_epoch2_demoted_set_exactly_responsive_degraded_cohort_"
+            "and_promoted_set_exactly_canonical_non_reference_root_pool_minus_"
+            "hard_cohort_v2"
+        ),
+        "breakthrough_realized_placement_per_arm_requirement": 5,
+        "breakthrough_primary_throughput_estimand": (
+            "d_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+"
+            "log((PS_e2/PS_e1)/(S_e2/S_e1))]"
+        ),
+        "breakthrough_throughput_claim_rule": (
+            "two_sided_student_t_95_df4_lower_log_bound_strictly_greater_than_"
+            "zero_and_at_least_4_of_5_block_effects_strictly_greater_than_zero_"
+            "and_absolute_fault_drop_containment_recovery_and_pooled_optimization_"
+            "each_two_sided_student_t_95_df4_lower_tps_bound_strictly_greater_"
+            "than_zero_and_at_least_4_of_5_blocks_strictly_greater_than_zero_and_"
+            "p_and_ps_each_absolute_epoch2_minus_epoch1_tps_strictly_greater_than_"
+            "zero_in_at_least_4_of_5_blocks_v2"
+        ),
+        "breakthrough_positive_block_requirement": 4,
+        "breakthrough_epoch1_baseline_ratio_role": (
+            "descriptive_only_no_noninferiority_threshold_v1"
+        ),
+        "breakthrough_absolute_phase_sequence_estimands": (
+            "fault_drop_b=0.5*((P_baseline-P_fault)+(PS_baseline-PS_fault));"
+            "containment_recovery_b=0.5*((P_e1-P_fault)+(PS_e1-PS_fault));"
+            "pooled_optimization_b=0.5*((P_e2-P_e1)+(PS_e2-PS_e1));"
+            "per_arm_optimization_b=(P_e2-P_e1,PS_e2-PS_e1)_v1"
+        ),
+        "breakthrough_phase_window_interpretation": (
+            "fixed_six_5_second_bucket_windows_with_epoch_windows_anchored_at_"
+            "first_authoritative_post_activation_commit_and_a_common_q_commit_"
+            "required_within_each_window_not_steady_state_v1"
+        ),
+        "breakthrough_pre_epoch1_placebo_estimand": (
+            "pP_b=log((P_fault/P_baseline)/(00_fault/00_baseline));"
+            "pPS_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))"
+        ),
+        "breakthrough_placebo_equivalence_rule": (
+            "both_component_two_one_sided_5_percent_tests_df4_90_cis_"
+            "strictly_within_plus_minus_log_1p10_v2"
+        ),
+        "breakthrough_placebo_equivalence_margin_log": 0.09531017980432493,
+    }
+    v8_byzantine = v8_document["byzantine"]  # type: ignore[index]
+    assert v8_byzantine["mode"] == "tiered_persistent_responsive_omission_v1"
+    assert v8_byzantine["actor_schedule"] == "all_hard_actors_per_proposal_v1"
+    responsive_document = v8_byzantine.pop("responsive_degradation")
+    assert responsive_document == {
+        "actor_count_rule": "derived_f_minus_hard_actor_count_v1",
+        "actor_selection": (
+            "sha256_ranked_canonical_epoch0_reference_roots_"
+            "excluding_commit_observer_v1"
+        ),
+        "actor_selection_preimage": (
+            r"kauri.shape25.responsive-degraded.v1\0{membership_csv}"
+            r"\0{q}\0{scientific_seed}\0{replica_id}"
+        ),
+        "actor_selection_inputs": [
+            "membership",
+            "derived_q",
+            "canonical_epoch0_reference_roots_1_through_q_minus_1_v1",
+            "replica_0_reserved_authoritative_commit_observer_v1",
+            "scientific_block_seed",
+        ],
+        "actor_selection_vectors": [
+            {
+                "replica_count": 13,
+                "q": 9,
+                "scientific_seed": 41_719,
+                "selected_actor_ids": [2],
+            },
+            {
+                "replica_count": 22,
+                "q": 15,
+                "scientific_seed": 41_722,
+                "selected_actor_ids": [1, 9, 10, 14],
+            },
+            {
+                "replica_count": 31,
+                "q": 21,
+                "scientific_seed": 41_725,
+                "selected_actor_ids": [2, 5, 7, 8, 12, 18, 19],
+            },
+        ],
+        "observer_isolation": (
+            "replica_0_reserved_authoritative_commit_observer_v1"
+        ),
+        "actor_schedule": (
+            "omit_every_32nd_unique_non_root_contribution_per_"
+            "responsive_degraded_actor_v1"
+        ),
+        "omission_period": 32,
+    }
+    assert v8_byzantine.pop("max_omissions_per_proposal_rule") == (
+        "derived_f_per_slot_v1"
     )
-    assert v7_document == v6_document
+    v8_byzantine["mode"] = "persistent_selected_omission_v1"
+    v8_byzantine["actor_schedule"] = "all_selected_actors_per_proposal_v1"
+    v8_byzantine["max_omissions_per_proposal"] = 3
+    assert v8_document["scheduling"].pop("arm_counterbalancing") == (
+        "stratified_greedy_minimum_position_imbalance_sha256_tiebreak_v2"
+    )
+    v8_document["scheduling"]["arm_counterbalancing"] = (
+        "greedy_minimum_position_imbalance_sha256_tiebreak_v1"
+    )
+    assert v8_document == v7_document
 
     legacy_v2 = load_frozen_manifest(V2_MANIFEST_PATH)
     assert legacy_v2.manifest_id == V2_MANIFEST_ID
@@ -650,7 +992,7 @@ def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:
 def test_execution_schedule_is_predeclared_balanced_and_identity_preserving() -> None:
     manifest = _manifest()
     plan = build_factorial_plan(manifest)
-    recomputed = derive_execution_schedule(
+    recomputed = derive_stratified_execution_schedule(
         tuple(reversed(tuple(item.block_id for item in plan.execution_schedule))),
         tuple(arm.code for arm in manifest.arms),
         manifest.campaign_order_seed,
@@ -659,20 +1001,50 @@ def test_execution_schedule_is_predeclared_balanced_and_identity_preserving() ->
     assert recomputed == plan.execution_schedule
     assert plan.execution_block_order == "sha256_ranked_block_ids_v1"
     assert plan.arm_counterbalancing == (
-        "greedy_minimum_position_imbalance_sha256_tiebreak_v1"
+        "stratified_greedy_minimum_position_imbalance_sha256_tiebreak_v2"
     )
-    position_counts = Counter(
-        (slot.arm_code, slot.arm_execution_position) for slot in plan.slots
-    )
-    assert set(position_counts.values()) <= {4, 5}
-    assert len(position_counts) == 16
     for headline_fanout in (2, 5):
+        headline_slots = tuple(
+            slot
+            for slot in plan.slots
+            if slot.replica_count == 31
+            and slot.initial_fanout == headline_fanout
+        )
+        position_counts = Counter(
+            (slot.arm_code, slot.arm_execution_position)
+            for slot in headline_slots
+        )
+        assert set(position_counts.values()) == {1, 2}
+        assert len(position_counts) == 16
         headline_orders = {
             scheduled.arm_order
             for scheduled in plan.execution_schedule
             if scheduled.block_id.startswith(f"n31-f{headline_fanout}-")
         }
         assert len(headline_orders) > 1
+        if headline_fanout == 5:
+            ordered = tuple(headline_orders)
+            assert len(ordered) == 5
+            reverse_pair_count = sum(
+                right == tuple(reversed(left))
+                for index, left in enumerate(ordered)
+                for right in ordered[index + 1 :]
+            )
+            assert reverse_pair_count == 2
+            position_only_effects = []
+            for order in ordered:
+                position = {arm: index for index, arm in enumerate(order, start=1)}
+                position_only_effects.append(
+                    0.5
+                    * (
+                        position["P"]
+                        - position["00"]
+                        + position["PS"]
+                        - position["S"]
+                    )
+                )
+            assert sum(effect > 0 for effect in position_only_effects) <= 3
+            assert sum(effect < 0 for effect in position_only_effects) <= 3
 
     for slot in plan.slots:
         assert slot.slot_nonce == derive_slot_nonce(slot.block_id, slot.arm_code)

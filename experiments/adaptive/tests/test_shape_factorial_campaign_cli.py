@@ -6,6 +6,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -32,7 +33,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
+V7_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
+)
 V6_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v6.json"
 )
@@ -168,6 +172,7 @@ def _slot_validation(
         (V4_MANIFEST, "v4"),
         (V5_MANIFEST, "v5"),
         (V6_MANIFEST, "v6"),
+        (V7_MANIFEST, "v7"),
     ),
 )
 @pytest.mark.parametrize("command", ("plan", "preflight", "smoke", "run"))
@@ -194,8 +199,8 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1 through v6 are validation-only; "
-            "plan, preflight, smoke, and run require shape-placement-factorial-v7"
+            "shape-placement-factorial-v1 through v7 are validation-only; "
+            "plan, preflight, smoke, and run require shape-placement-factorial-v8"
         ),
         "status": "REJECT",
     }
@@ -203,6 +208,72 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
     assert not (
         repository / f"results/shape-placement-factorial-{version}-smoke"
     ).exists()
+
+
+def test_smoke_preflight_validates_the_exact_excluded_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    repository.mkdir()
+    monkeypatch.setattr(
+        cli.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=20_000_000_000),
+    )
+
+    assert cli.main(
+        [
+            "preflight",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--preflight-target",
+            "smoke",
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "PASS"
+    assert result["target"] == "smoke"
+    assert result["slot_count"] == 1
+    assert result["runtime_id"].startswith("slot-runtime-")
+    assert result["runtime_sha256"] == FROZEN_SMOKE_RUNTIME_SHA256
+    assert result["launch_permitted"] is False
+
+
+def test_smoke_preflight_rejects_runtime_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    repository.mkdir()
+    monkeypatch.setattr(
+        cli.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=20_000_000_000),
+    )
+    monkeypatch.setattr(cli, "FROZEN_SMOKE_RUNTIME_SHA256", "0" * 64)
+
+    assert cli.main(
+        [
+            "preflight",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--preflight-target",
+            "smoke",
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+    assert refusal == {
+        "reason": "smoke runtime bytes differ from the exact frozen v8 identity",
+        "status": "REJECT",
+    }
 
 
 @pytest.mark.parametrize(
@@ -214,6 +285,7 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
         (V4_MANIFEST, "v4"),
         (V5_MANIFEST, "v5"),
         (V6_MANIFEST, "v6"),
+        (V7_MANIFEST, "v7"),
     ),
 )
 def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
@@ -277,6 +349,7 @@ def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
         (V4_MANIFEST, "v4"),
         (V5_MANIFEST, "v5"),
         (V6_MANIFEST, "v6"),
+        (V7_MANIFEST, "v7"),
     ),
 )
 def test_prior_validate_campaign_uses_preserved_artifacts_without_rederiving(
@@ -342,7 +415,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v7").exists()
+    assert not (repository / "results/shape-placement-factorial-v8").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -367,7 +440,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v7").exists()
+    assert not (repository / "results/shape-placement-factorial-v8").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -393,7 +466,7 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v7-smoke"
+        repository / "results/shape-placement-factorial-v8-smoke"
     ).exists()
 
 
@@ -429,7 +502,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v7-smoke"
+        repository / "results/shape-placement-factorial-v8-smoke"
     ).exists()
 
 
@@ -489,7 +562,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v7-smoke"
+        / "results/shape-placement-factorial-v8-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"
@@ -517,6 +590,7 @@ def test_smoke_accepts_an_existing_exact_authorization_receipt(
         approved_utc="2026-08-04T00:00:00+00:00",
         kauri_revision=REVISION,
         slot_ids=(smoke.slot.slot_id,),
+        result_root=Path(smoke.slot.result_path).parent.as_posix(),
         static_artifacts=artifacts,
         build_provenance_sha256=hashlib.sha256(
             cli._canonical_json_bytes(

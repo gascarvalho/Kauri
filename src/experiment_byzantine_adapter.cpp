@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -52,6 +53,8 @@ constexpr const char *kRotatingOmissionMode =
     "rotating_intermittent_omission_v1";
 constexpr const char *kPersistentOmissionMode =
     "persistent_selected_omission_v1";
+constexpr const char *kTieredOmissionMode =
+    "tiered_persistent_responsive_omission_v1";
 
 bool is_rotating_omission_mode(const std::string &mode) noexcept
 {
@@ -63,10 +66,30 @@ bool is_persistent_omission_mode(const std::string &mode) noexcept
     return mode == kPersistentOmissionMode;
 }
 
+bool is_tiered_omission_mode(const std::string &mode) noexcept
+{
+    return mode == kTieredOmissionMode;
+}
+
 bool is_scheduled_omission_mode(const std::string &mode) noexcept
 {
     return is_rotating_omission_mode(mode) ||
-           is_persistent_omission_mode(mode);
+           is_persistent_omission_mode(mode) ||
+           is_tiered_omission_mode(mode);
+}
+
+const char *omission_cohort_name(ExperimentOmissionCohort cohort) noexcept
+{
+    switch (cohort)
+    {
+    case ExperimentOmissionCohort::none:
+        return "none";
+    case ExperimentOmissionCohort::hard:
+        return "hard";
+    case ExperimentOmissionCohort::responsive_degraded:
+        return "responsive_degraded";
+    }
+    return "unknown";
 }
 
 const char *omission_action_name(ExperimentOmissionAction action) noexcept
@@ -139,6 +162,20 @@ std::string format_experiment_omission_marker(
             << " actor=" << marker.actor
             << " action=" << omission_action_name(marker.action)
             << " monotonic_ns=" << marker.monotonic_ns;
+    if (marker.fault_mode == kTieredOmissionMode)
+    {
+        encoded << " cohort=" << omission_cohort_name(marker.cohort)
+                << " hard_actor_count=" << marker.hard_actor_count
+                << " responsive_degraded_actor_count="
+                << marker.responsive_degraded_actor_count
+                << " fault_threshold=" << marker.fault_threshold
+                << " max_omissions_per_proposal="
+                << marker.max_omissions_per_proposal
+                << " responsive_omission_period="
+                << marker.responsive_omission_period
+                << " contribution_ordinal="
+                << marker.contribution_ordinal;
+    }
     return encoded.str();
 }
 
@@ -156,6 +193,9 @@ struct ExperimentByzantineAdapter::State
         ExperimentOmissionAction action{ExperimentOmissionAction::forward};
         bool marker_emitted{false};
         bool direct_vote_omitted{false};
+        ExperimentOmissionCohort cohort{ExperimentOmissionCohort::none};
+        bool auditable{false};
+        std::uint64_t contribution_ordinal{0};
     };
 
     explicit State(ExperimentByzantineOptions configured)
@@ -251,6 +291,55 @@ struct ExperimentByzantineAdapter::State
                     { return actor >= scheduled.replica_count; }))
                 throw std::invalid_argument(
                     "scheduled omission actor is outside membership");
+            std::sort(
+                scheduled.responsive_degraded_actor_ids.begin(),
+                scheduled.responsive_degraded_actor_ids.end());
+            if (is_tiered_omission_mode(scheduled.mode))
+            {
+                if (scheduled.responsive_degraded_actor_ids.empty() ||
+                    scheduled.responsive_omission_period < 2)
+                    throw std::invalid_argument(
+                        "tiered omission requires responsive-degraded actors "
+                        "and a period greater than one");
+                if (std::adjacent_find(
+                        scheduled.responsive_degraded_actor_ids.begin(),
+                        scheduled.responsive_degraded_actor_ids.end()) !=
+                    scheduled.responsive_degraded_actor_ids.end())
+                    throw std::invalid_argument(
+                        "responsive-degraded omission actors must be unique");
+                if (std::any_of(
+                        scheduled.responsive_degraded_actor_ids.begin(),
+                        scheduled.responsive_degraded_actor_ids.end(),
+                        [&scheduled](ReplicaID actor)
+                        { return actor >= scheduled.replica_count; }))
+                    throw std::invalid_argument(
+                        "responsive-degraded omission actor is outside "
+                        "membership");
+                if (std::any_of(
+                        scheduled.responsive_degraded_actor_ids.begin(),
+                        scheduled.responsive_degraded_actor_ids.end(),
+                        [&scheduled](ReplicaID actor)
+                        {
+                            return std::binary_search(
+                                scheduled.actor_ids.begin(),
+                                scheduled.actor_ids.end(),
+                                actor);
+                        }))
+                    throw std::invalid_argument(
+                        "tiered omission actor cohorts must be disjoint");
+                const auto total_actor_count =
+                    scheduled.actor_ids.size() +
+                    scheduled.responsive_degraded_actor_ids.size();
+                if (total_actor_count > quorum->fault_threshold)
+                    throw std::invalid_argument(
+                        "tiered omission cohort exceeds the derived fault "
+                        "threshold");
+            }
+            else if (!scheduled.responsive_degraded_actor_ids.empty() ||
+                     scheduled.responsive_omission_period != 0)
+                throw std::invalid_argument(
+                    "responsive-degraded omission configuration requires "
+                    "the tiered mode");
             if (scheduled.window_start_monotonic_ns == 0 ||
                 scheduled.window_end_monotonic_ns <=
                     scheduled.window_start_monotonic_ns)
@@ -260,7 +349,10 @@ struct ExperimentByzantineAdapter::State
             const auto expected_maximum_omissions =
                 is_rotating_omission_mode(scheduled.mode)
                     ? std::size_t{1}
-                    : scheduled.expected_actor_count;
+                    : is_tiered_omission_mode(scheduled.mode)
+                          ? scheduled.actor_ids.size() +
+                                scheduled.responsive_degraded_actor_ids.size()
+                          : scheduled.expected_actor_count;
             if (scheduled.max_omissions_per_proposal !=
                 expected_maximum_omissions)
                 throw std::invalid_argument(
@@ -269,6 +361,7 @@ struct ExperimentByzantineAdapter::State
             if (scheduled.maximum_contexts == 0)
                 throw std::invalid_argument(
                     "scheduled omission context bound must be positive");
+            scheduled_fault_threshold = quorum->fault_threshold;
         }
     }
 
@@ -284,14 +377,31 @@ struct ExperimentByzantineAdapter::State
         return actors[proposal_actor_index(proposal, actors.size())];
     }
 
+    ExperimentOmissionCohort local_actor_cohort() const
+    {
+        const auto &scheduled = *options.rotating_omission;
+        if ((is_persistent_omission_mode(scheduled.mode) ||
+             is_tiered_omission_mode(scheduled.mode)) &&
+            std::binary_search(
+                scheduled.actor_ids.begin(),
+                scheduled.actor_ids.end(),
+                scheduled.local_replica))
+            return ExperimentOmissionCohort::hard;
+        if (is_tiered_omission_mode(scheduled.mode) &&
+            std::binary_search(
+                scheduled.responsive_degraded_actor_ids.begin(),
+                scheduled.responsive_degraded_actor_ids.end(),
+                scheduled.local_replica))
+            return ExperimentOmissionCohort::responsive_degraded;
+        return ExperimentOmissionCohort::none;
+    }
+
     bool local_actor_selected(const ProposalKey &proposal) const
     {
         const auto &scheduled = *options.rotating_omission;
-        if (is_persistent_omission_mode(scheduled.mode))
-            return std::binary_search(
-                scheduled.actor_ids.begin(),
-                scheduled.actor_ids.end(),
-                scheduled.local_replica);
+        if (is_persistent_omission_mode(scheduled.mode) ||
+            is_tiered_omission_mode(scheduled.mode))
+            return local_actor_cohort() != ExperimentOmissionCohort::none;
         return rotating_actor(proposal) ==
                std::optional<ReplicaID>{scheduled.local_replica};
     }
@@ -312,21 +422,76 @@ struct ExperimentByzantineAdapter::State
             return nullptr;
         }
 
-        ExperimentOmissionAction action = ExperimentOmissionAction::forward;
-        if (monotonic_ns >= scheduled.window_start_monotonic_ns &&
-            monotonic_ns < scheduled.window_end_monotonic_ns &&
-            local_actor_selected(context.proposal))
+        ScheduledDecisionState decision;
+        const bool inside_window =
+            monotonic_ns >= scheduled.window_start_monotonic_ns &&
+            monotonic_ns < scheduled.window_end_monotonic_ns;
+        if (is_tiered_omission_mode(scheduled.mode))
+        {
+            decision.cohort = local_actor_cohort();
+            decision.auditable =
+                inside_window && role != ExperimentReplicaRole::root &&
+                decision.cohort != ExperimentOmissionCohort::none;
+            if (decision.auditable)
+            {
+                bool omit =
+                    decision.cohort == ExperimentOmissionCohort::hard;
+                if (decision.cohort ==
+                    ExperimentOmissionCohort::responsive_degraded)
+                {
+                    if (responsive_contribution_ordinal ==
+                        std::numeric_limits<std::uint64_t>::max())
+                    {
+                        emit_scheduled_capacity_marker(
+                            context, monotonic_ns);
+                        return nullptr;
+                    }
+                    decision.contribution_ordinal =
+                        ++responsive_contribution_ordinal;
+                    omit = decision.contribution_ordinal %
+                               scheduled.responsive_omission_period ==
+                           0;
+                }
+                if (omit && role == ExperimentReplicaRole::internal)
+                    decision.action =
+                        ExperimentOmissionAction::omit_aggregate;
+                else if (omit && role == ExperimentReplicaRole::leaf)
+                    decision.action =
+                        ExperimentOmissionAction::omit_direct_vote;
+            }
+        }
+        else if (inside_window && local_actor_selected(context.proposal))
         {
             if (role == ExperimentReplicaRole::internal)
-                action = ExperimentOmissionAction::omit_aggregate;
+                decision.action = ExperimentOmissionAction::omit_aggregate;
             else if (role == ExperimentReplicaRole::leaf)
-                action = ExperimentOmissionAction::omit_direct_vote;
+                decision.action = ExperimentOmissionAction::omit_direct_vote;
         }
         return &scheduled_decisions
                     .emplace(
                         context.proposal,
-                        ScheduledDecisionState{action, false, false})
+                        decision)
                     .first->second;
+    }
+
+    void populate_tiered_marker(
+        ExperimentOmissionMarker &marker,
+        ExperimentOmissionCohort cohort,
+        std::uint64_t contribution_ordinal) const
+    {
+        const auto &scheduled = *options.rotating_omission;
+        if (!is_tiered_omission_mode(scheduled.mode))
+            return;
+        marker.cohort = cohort;
+        marker.hard_actor_count = scheduled.actor_ids.size();
+        marker.responsive_degraded_actor_count =
+            scheduled.responsive_degraded_actor_ids.size();
+        marker.fault_threshold = scheduled_fault_threshold;
+        marker.max_omissions_per_proposal =
+            scheduled.max_omissions_per_proposal;
+        marker.responsive_omission_period =
+            scheduled.responsive_omission_period;
+        marker.contribution_ordinal = contribution_ordinal;
     }
 
     void emit_scheduled_capacity_marker(
@@ -339,7 +504,7 @@ struct ExperimentByzantineAdapter::State
         if (!options.omission_marker_emitter)
             return;
         const auto &scheduled = *options.rotating_omission;
-        options.omission_marker_emitter(ExperimentOmissionMarker{
+        ExperimentOmissionMarker marker{
             context.proposal,
             context.diagnostic_window,
             scheduled.mode,
@@ -347,7 +512,10 @@ struct ExperimentByzantineAdapter::State
             ExperimentOmissionAction::capacity_exhausted,
             scheduled.window_start_monotonic_ns,
             scheduled.window_end_monotonic_ns,
-            monotonic_ns});
+            monotonic_ns};
+        populate_tiered_marker(
+            marker, local_actor_cohort(), 0);
+        options.omission_marker_emitter(marker);
     }
 
     void emit_scheduled_marker(
@@ -361,7 +529,7 @@ struct ExperimentByzantineAdapter::State
         if (!options.omission_marker_emitter)
             return;
         const auto &scheduled = *options.rotating_omission;
-        options.omission_marker_emitter(ExperimentOmissionMarker{
+        ExperimentOmissionMarker marker{
             context.proposal,
             context.diagnostic_window,
             scheduled.mode,
@@ -369,7 +537,10 @@ struct ExperimentByzantineAdapter::State
             decision.action,
             scheduled.window_start_monotonic_ns,
             scheduled.window_end_monotonic_ns,
-            monotonic_ns});
+            monotonic_ns};
+        populate_tiered_marker(
+            marker, decision.cohort, decision.contribution_ordinal);
+        options.omission_marker_emitter(marker);
     }
 
     ExperimentByzantineOptions options;
@@ -383,6 +554,8 @@ struct ExperimentByzantineAdapter::State
     std::set<ExperimentByzantineContext, ContextLess>
         direct_vote_omissions;
     std::map<ProposalKey, ScheduledDecisionState> scheduled_decisions;
+    std::uint64_t responsive_contribution_ordinal{0};
+    std::size_t scheduled_fault_threshold{0};
     bool scheduled_capacity_marker_emitted{false};
 };
 
@@ -494,10 +667,20 @@ bool ExperimentByzantineAdapter::consume_outbound_aggregate(
             return false;
         auto *decision =
             state_->scheduled_decision(context, role, monotonic_ns);
-        if (decision == nullptr ||
-            decision->action != ExperimentOmissionAction::omit_aggregate)
+        if (decision == nullptr)
             return false;
-        state_->emit_scheduled_marker(context, *decision, monotonic_ns);
+        const bool tiered_audit =
+            is_tiered_omission_mode(
+                state_->options.rotating_omission->mode) &&
+            decision->auditable;
+        if (tiered_audit)
+            state_->emit_scheduled_marker(
+                context, *decision, monotonic_ns);
+        if (decision->action != ExperimentOmissionAction::omit_aggregate)
+            return false;
+        if (!tiered_audit)
+            state_->emit_scheduled_marker(
+                context, *decision, monotonic_ns);
         return true;
     }
     if (!state_->options.omit_outbound_aggregate ||
@@ -533,13 +716,23 @@ ExperimentByzantineAdapter::consume_outbound_direct_vote(
             return ExperimentDirectVoteDisposition::forward;
         auto *decision =
             state_->scheduled_decision(context, role, monotonic_ns);
-        if (decision == nullptr ||
-            decision->action != ExperimentOmissionAction::omit_direct_vote)
+        if (decision == nullptr)
+            return ExperimentDirectVoteDisposition::forward;
+        const bool tiered_audit =
+            is_tiered_omission_mode(
+                state_->options.rotating_omission->mode) &&
+            decision->auditable;
+        if (tiered_audit)
+            state_->emit_scheduled_marker(
+                context, *decision, monotonic_ns);
+        if (decision->action != ExperimentOmissionAction::omit_direct_vote)
             return ExperimentDirectVoteDisposition::forward;
         if (decision->direct_vote_omitted)
             return ExperimentDirectVoteDisposition::omit_repeat;
         decision->direct_vote_omitted = true;
-        state_->emit_scheduled_marker(context, *decision, monotonic_ns);
+        if (!tiered_audit)
+            state_->emit_scheduled_marker(
+                context, *decision, monotonic_ns);
         return ExperimentDirectVoteDisposition::omit_first;
     }
     if (!state_->options.omit_outbound_direct_vote ||

@@ -6,6 +6,7 @@ from dataclasses import replace
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 
@@ -42,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
+)
+V7_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
 )
 V6_MANIFEST_PATH = (
@@ -221,7 +225,28 @@ def test_actor_and_fnv_vectors_recompute_without_runtime_decision_code() -> None
         ) == (vector.fnv1a64, vector.selected_actor)
 
 
-def test_validator_retains_exact_v1_through_v7_artifact_identities() -> None:
+def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    responsive = manifest.byzantine.responsive_degradation
+    assert responsive is not None
+    for vector in responsive.actor_selection_vectors:
+        hard = derive_actor_ids(
+            vector.replica_count,
+            manifest.byzantine.actor_count,
+            vector.scientific_seed,
+        )
+        degraded = validation.derive_responsive_degraded_actor_ids(
+            vector.replica_count,
+            hard,
+            vector.scientific_seed,
+        )
+        assert degraded == vector.selected_actor_ids
+        assert 0 not in degraded
+        assert not set(degraded).intersection(hard)
+        assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
+
+
+def test_validator_retains_exact_v1_through_v8_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -233,7 +258,8 @@ def test_validator_retains_exact_v1_through_v7_artifact_identities() -> None:
             (4, V4_MANIFEST_PATH),
             (5, V5_MANIFEST_PATH),
             (6, V6_MANIFEST_PATH),
-            (7, MANIFEST_PATH),
+            (7, V7_MANIFEST_PATH),
+            (8, MANIFEST_PATH),
         )
     }
 
@@ -252,13 +278,17 @@ def test_validator_retains_exact_v1_through_v7_artifact_identities() -> None:
     assert identities[6].manifest_sha256 == validation.V6_MANIFEST_SHA256
     assert identities[6].runtime_sha256 == validation.V6_RUNTIME_SHA256
     assert identities[6].smoke_runtime_sha256 == validation.V6_SMOKE_RUNTIME_SHA256
-    assert identities[7].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[7].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
-    assert identities[7].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    assert identities[7].manifest_sha256 == validation.V7_MANIFEST_SHA256
+    assert identities[7].runtime_sha256 == validation.V7_RUNTIME_SHA256
+    assert identities[7].smoke_runtime_sha256 == validation.V7_SMOKE_RUNTIME_SHA256
+    assert identities[8].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[8].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[8].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
 
 
 @pytest.mark.parametrize(
-    "manifest_path", (V4_MANIFEST_PATH, V5_MANIFEST_PATH, V6_MANIFEST_PATH)
+    "manifest_path",
+    (V4_MANIFEST_PATH, V5_MANIFEST_PATH, V6_MANIFEST_PATH, V7_MANIFEST_PATH),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
     manifest_path: Path,
@@ -1053,7 +1083,7 @@ def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> No
             },
         )
 
-    with pytest.raises(FactorialValidationError, match="no matching native proposal"):
+    with pytest.raises(FactorialValidationError, match="invalid designated-observer"):
         validate_fault_causality(
             markers=markers,
             **{
@@ -1231,6 +1261,423 @@ def test_persistent_fault_schedule_bounds_selected_actors_per_proposal() -> None
             actor_ids=actors,
             fault_mode="persistent_selected_omission_v1",
             max_omissions_per_proposal=3,
+        )
+
+
+def _tiered_marker(
+    *,
+    actor: int,
+    cohort: str,
+    ordinal: int,
+    block_ordinal: int,
+    action: str,
+) -> FaultMarker:
+    return FaultMarker(
+        source_replica=actor,
+        line_number=block_ordinal,
+        fault_mode="tiered_persistent_responsive_omission_v1",
+        epoch_number=1,
+        tree_id=4,
+        epoch_digest="11" * 32,
+        block_hash=f"{block_ordinal:064x}",
+        window="tiered-window",
+        window_start_ns=100,
+        window_end_ns=10_000,
+        actor=actor,
+        action=action,
+        monotonic_ns=200 + block_ordinal,
+        raw_line_sha256=f"{actor * 100 + block_ordinal:064x}",
+        cohort=cohort,
+        hard_actor_count=3,
+        responsive_degraded_actor_count=1,
+        fault_threshold=4,
+        max_omissions_per_proposal=4,
+        responsive_omission_period=32,
+        contribution_ordinal=ordinal,
+    )
+
+
+def _valid_tiered_markers() -> tuple[FaultMarker, ...]:
+    markers = [
+        _tiered_marker(
+            actor=2,
+            cohort="responsive_degraded",
+            ordinal=ordinal,
+            block_ordinal=ordinal,
+            action="omit_aggregate" if ordinal % 32 == 0 else "forward",
+        )
+        for ordinal in range(1, 33)
+    ]
+    markers.extend(
+        _tiered_marker(
+            actor=actor,
+            cohort="hard",
+            ordinal=0,
+            block_ordinal=32,
+            action="omit_aggregate",
+        )
+        for actor in (9, 10, 12)
+    )
+    return tuple(markers)
+
+
+def test_tiered_marker_parser_requires_exact_appended_audit_fields(
+    tmp_path: Path,
+) -> None:
+    line = (
+        "KAURI_FAULT fault=tiered_persistent_responsive_omission_v1 "
+        "proposal_epoch=1 proposal_tree=4 proposal_epoch_digest={digest} "
+        "proposal_block_hash={block} window=tiered-window "
+        "window_start_monotonic_ns=100 window_end_monotonic_ns=10000 "
+        "actor=2 action=forward monotonic_ns=201 "
+        "cohort=responsive_degraded hard_actor_count=3 "
+        "responsive_degraded_actor_count=1 fault_threshold=4 "
+        "max_omissions_per_proposal=4 responsive_omission_period=32 "
+        "contribution_ordinal=1\n"
+    ).format(digest="11" * 32, block=f"{1:064x}")
+    log = tmp_path / "replica.log"
+    log.write_text(line, encoding="utf-8")
+
+    marker = validation._fault_markers(tmp_path, {2: ("replica.log",)})[0]
+    assert marker.cohort == "responsive_degraded"
+    assert marker.responsive_omission_period == 32
+    assert marker.contribution_ordinal == 1
+
+    log.write_text(
+        line.replace(" contribution_ordinal=1", ""),
+        encoding="utf-8",
+    )
+    with pytest.raises(FactorialValidationError, match="malformed"):
+        validation._fault_markers(tmp_path, {2: ("replica.log",)})
+
+
+def test_tiered_marker_schedule_proves_exact_period_ordinals_and_f_bound() -> None:
+    markers = _valid_tiered_markers()
+    arguments = {
+        "actor_ids": (9, 10, 12),
+        "responsive_degraded_actor_ids": (2,),
+        "fault_mode": "tiered_persistent_responsive_omission_v1",
+        "fault_threshold": 4,
+        "max_omissions_per_proposal": 4,
+        "responsive_omission_period": 32,
+    }
+    validation._validate_fault_marker_schedule(markers, **arguments)
+
+    with pytest.raises(FactorialValidationError, match="audit fields"):
+        validation._validate_fault_marker_schedule(
+            (replace(markers[0], responsive_omission_period=31), *markers[1:]),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="not contiguous"):
+        validation._validate_fault_marker_schedule(
+            (*markers[:10], replace(markers[10], contribution_ordinal=12), *markers[11:]),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="not contiguous"):
+        validation._validate_fault_marker_schedule(
+            (markers[1], markers[0], *markers[2:]),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="every-32nd"):
+        validation._validate_fault_marker_schedule(
+            (*markers[:31], replace(markers[31], action="forward"), *markers[32:]),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="persistently omit"):
+        validation._validate_fault_marker_schedule(
+            (*markers[:-1], replace(markers[-1], action="forward")),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="omission bound"):
+        validation._validate_fault_marker_schedule(
+            (*markers, replace(markers[-1], line_number=999)),
+            **arguments,
+        )
+
+
+def test_tiered_completeness_rejects_a_whole_missing_observed_context() -> None:
+    digest = "11" * 32
+    tree = Tree(
+        tree_id=0,
+        fanout=5,
+        pipeline_stretch=2,
+        members=tuple(range(13)),
+        wait_exempt=(),
+    )
+    actors = (2, 9, 10, 12)
+    first = (0, 0, digest, "01" * 32)
+    missing = (0, 0, digest, "02" * 32)
+
+    def marker(actor: int, cohort: str, action: str) -> FaultMarker:
+        return replace(
+            _tiered_marker(
+                actor=actor,
+                cohort=cohort,
+                ordinal=1 if cohort == "responsive_degraded" else 0,
+                block_ordinal=actor,
+                action=action,
+            ),
+            epoch_number=first[0],
+            tree_id=first[1],
+            epoch_digest=first[2],
+            block_hash=first[3],
+        )
+
+    markers = (
+        marker(2, "responsive_degraded", "forward"),
+        marker(9, "hard", "omit_direct_vote"),
+        marker(10, "hard", "omit_direct_vote"),
+        marker(12, "hard", "omit_direct_vote"),
+    )
+    observations = {
+        first: {actor: (300,) for actor in actors},
+        missing: {actor: (400,) for actor in actors},
+    }
+    with pytest.raises(FactorialValidationError, match="exact tiered actor marker set"):
+        validation._validate_tiered_observed_marker_completeness(
+            markers,
+            fault_actor_ids=actors,
+            proposal_observations=observations,
+            phase_windows={"fault_evidence": (100, 700, 6)},
+            phase_configurations=(
+                ("fault_evidence", 0, digest, {0: tree}),
+            ),
+        )
+
+
+def _tiered_scores() -> tuple[ReplicaScore, ...]:
+    fast = (0, 1, 3, 4, 5, 6, 7, 8, 11)
+    return (
+        *(
+            ReplicaScore(
+                replica_id=replica,
+                classification="responsive",
+                eligible=True,
+                attempt_count=32,
+                response_rate_ppm=1_000_000,
+                timeout_rate_ppm=0,
+                latency_percentile_us=10,
+            )
+            for replica in fast
+        ),
+        ReplicaScore(2, "responsive", True, 32, 968_750, 31_250, 20),
+        *(
+            ReplicaScore(
+                replica_id=replica,
+                classification="nonresponsive",
+                eligible=False,
+                attempt_count=32,
+                response_rate_ppm=0,
+                timeout_rate_ppm=1_000_000,
+                latency_percentile_us=None,
+            )
+            for replica in (9, 10, 12)
+        ),
+    )
+
+
+def test_tiered_ranking_requires_real_degradation_and_exact_top_q() -> None:
+    scores = _tiered_scores()
+    policy = {
+        "minimum_attempts": 32,
+        "minimum_response_rate_ppm": 950_000,
+        "maximum_timeout_rate_ppm": 50_000,
+    }
+    fast = tuple(score.replica_id for score in scores[:9])
+    arguments = {
+        "hard_actor_ids": (9, 10, 12),
+        "responsive_degraded_actor_ids": (2,),
+        "fast_replica_ids": fast,
+        "tree_count": 9,
+        "expected_roots": fast,
+        "policy": policy,
+    }
+    assert validation._validate_tiered_performance_ranking(scores, **arguments) == 1
+
+    with pytest.raises(FactorialValidationError, match="real nonzero degradation"):
+        validation._validate_tiered_performance_ranking(
+            (*scores[:9], replace(scores[9], classification="nonresponsive", eligible=False), *scores[10:]),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="real nonzero degradation"):
+        validation._validate_tiered_performance_ranking(
+            (*scores[:9], replace(scores[9], response_rate_ppm=1_000_000, timeout_rate_ppm=0), *scores[10:]),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="top-Q"):
+        validation._validate_tiered_performance_ranking(
+            scores,
+            **{**arguments, "expected_roots": (*fast[:-1], 2)},
+        )
+
+
+def _tiered_expected_slot() -> validation._ExpectedSlot:
+    return validation._ExpectedSlot(
+        slot_id="tiered-test",
+        block_id="n13-f5-test",
+        arm_code="P",
+        ordinal=1,
+        slot_nonce=0,
+        block_index=1,
+        blocks_in_cell=1,
+        block_execution_ordinal=1,
+        arm_execution_position=1,
+        execution_ordinal=1,
+        scientific_seed=41_719,
+        replica_count=13,
+        f=4,
+        q=9,
+        tree_count=9,
+        initial_fanout=5,
+        initial_depth=2,
+        candidate_depths=((2, 3), (3, 2), (5, 2)),
+        worst_candidate_depth=3,
+        candidate_fanouts=(2, 3, 5),
+        pipeline_stretch=2,
+        placement_adaptation=True,
+        shape_adaptation=False,
+        actor_ids=(9, 10, 12),
+        responsive_degraded_actor_ids=(2,),
+        fast_replica_ids=(0, 1, 3, 4, 5, 6, 7, 8, 11),
+        peer_base=1,
+        client_base=2,
+        manager_port=3,
+    )
+
+
+def _tiered_bundle(
+    *,
+    expected: validation._ExpectedSlot,
+    epoch_number: int,
+    roots: tuple[int, ...],
+    epoch1: bool,
+) -> validation.DecodedBundle:
+    trees: list[Tree] = []
+    membership = tuple(range(expected.replica_count))
+    hard = set(expected.actor_ids)
+    for tree_id, root in enumerate(roots):
+        available_influential = [
+            member
+            for member in (
+                membership if epoch1 else expected.fast_replica_ids
+            )
+            if member != root and member not in hard
+        ]
+        if epoch1 and tree_id == 0 and 2 != root:
+            available_influential.remove(2)
+            influential = [2, available_influential[0]]
+        else:
+            influential = available_influential[:2]
+        prefix = (root, *influential)
+        members = (*prefix, *(member for member in membership if member not in prefix))
+        trees.append(
+            Tree(
+                tree_id=tree_id,
+                fanout=5,
+                pipeline_stretch=2,
+                members=members,
+                wait_exempt=expected.actor_ids,
+            )
+        )
+    digest = f"{epoch_number + 1:064x}"
+    return validation.DecodedBundle(
+        command=validation.DecodedCommand(
+            issuer_id=1,
+            successor_epoch_number=epoch_number,
+            predecessor_epoch_digest="11" * 32,
+            successor_epoch_digest=digest,
+            activation_delay_blocks=5,
+            payload_digest="22" * 32,
+            signature=b"test",
+        ),
+        epoch_number=epoch_number,
+        epoch_digest=digest,
+        previous_epoch_digest="11" * 32,
+        membership_digest=validation._membership_digest(membership),
+        generation_seed=validation._SNAPSHOT_SEED,
+        policy_version=validation._PLACEMENT_POLICY_VERSION,
+        evidence_snapshot_id="33" * 32,
+        evidence_cutoff=1,
+        trees=tuple(trees),
+    )
+
+
+def test_tiered_successor_structure_proves_e1_exposure_and_e2_hierarchy() -> None:
+    expected = _tiered_expected_slot()
+    epoch1_roots = tuple(range(expected.q))
+    epoch1 = _tiered_bundle(
+        expected=expected,
+        epoch_number=1,
+        roots=epoch1_roots,
+        epoch1=True,
+    )
+    assert validation._validate_successor_trees(
+        epoch1,
+        expected=expected,
+        actor_ids=expected.actor_ids,
+        expected_roots=epoch1_roots,
+        expected_fanout=5,
+        cycle=0,
+        intent="fault_containment",
+    ) == (1, 1, 0, 0, 0)
+
+    epoch2_roots = expected.fast_replica_ids
+    epoch2 = _tiered_bundle(
+        expected=expected,
+        epoch_number=2,
+        roots=epoch2_roots,
+        epoch1=False,
+    )
+    proof = validation._validate_successor_trees(
+        epoch2,
+        expected=expected,
+        actor_ids=expected.actor_ids,
+        expected_roots=epoch2_roots,
+        expected_fanout=5,
+        cycle=1,
+        intent="performance_optimization",
+    )
+    assert proof[:3] == (0, 0, expected.f * expected.q)
+    assert proof[3] == proof[4] == 3 * expected.q
+
+    first = epoch2.trees[0]
+    degraded_position = first.members.index(2)
+    tampered_members = list(first.members)
+    tampered_members[1], tampered_members[degraded_position] = (
+        tampered_members[degraded_position],
+        tampered_members[1],
+    )
+    degraded_internal = replace(
+        epoch2,
+        trees=(replace(first, members=tuple(tampered_members)), *epoch2.trees[1:]),
+    )
+    with pytest.raises(FactorialValidationError, match="non-fast"):
+        validation._validate_successor_trees(
+            degraded_internal,
+            expected=expected,
+            actor_ids=expected.actor_ids,
+            expected_roots=epoch2_roots,
+            expected_fanout=5,
+            cycle=1,
+            intent="performance_optimization",
+        )
+
+    degraded_wait_exempt = replace(
+        epoch2,
+        trees=(
+            replace(first, wait_exempt=(*expected.actor_ids, 2)),
+            *epoch2.trees[1:],
+        ),
+    )
+    with pytest.raises(FactorialValidationError, match="wait-exempt"):
+        validation._validate_successor_trees(
+            degraded_wait_exempt,
+            expected=expected,
+            actor_ids=expected.actor_ids,
+            expected_roots=epoch2_roots,
+            expected_fanout=5,
+            cycle=1,
+            intent="performance_optimization",
         )
 
 
@@ -2042,6 +2489,7 @@ def test_smoke_slot_authorization_must_match_the_claimed_root_envelope(
         approved_utc="2026-08-04T00:00:00+00:00",
         kauri_revision="ab" * 20,
         slot_ids=(smoke.slot.slot_id,),
+        result_root=f"{manifest.results_root}-smoke",
         static_artifacts=static_artifacts,
         build_provenance_sha256="cd" * 32,
     )
@@ -2198,7 +2646,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
-def test_v7_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+def test_v8_receipt_rejects_an_exact_legacy_manifest_plan_pair(
     tmp_path: Path,
 ) -> None:
     recovered, _, receipt, expected, runtime, authorization = (
@@ -2580,6 +3028,609 @@ def test_matched_estimate_uses_frozen_df4_interval_and_strict_claim_rule() -> No
     assert inconclusive.directional_claim_supported is False
 
 
+def _synthetic_breakthrough_results(
+    block_effects: tuple[float, ...],
+    *,
+    zero_mean: tuple[int, str, str] | None = None,
+    p_changed_blocks: int = 5,
+    ps_changed_blocks: int = 5,
+) -> dict[str, validation.SlotValidationResult]:
+    assert len(block_effects) == 5
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    expected_by_pair = {
+        (slot.block_id, slot.arm_code): slot
+        for slot in validation._expected_slots(manifest)
+    }
+    results: dict[str, validation.SlotValidationResult] = {}
+    for fanout in (5, 2):
+        for block_index, effect in enumerate(block_effects, 1):
+            block_id = f"n31-f{fanout}-b{block_index:02d}"
+            for arm in ("00", "P", "S", "PS"):
+                baseline = 100.0
+                fault_evidence = 50.0
+                epoch1 = 100.0
+                epoch2 = (
+                    100.0 * math.exp(effect)
+                    if fanout == 5 and arm in ("P", "PS")
+                    else 100.0
+                )
+                if zero_mean == (block_index, arm, "baseline"):
+                    baseline = 0.0
+                if zero_mean == (block_index, arm, "fault_evidence"):
+                    fault_evidence = 0.0
+                if zero_mean == (block_index, arm, "epoch1_stable"):
+                    epoch1 = 0.0
+                if zero_mean == (block_index, arm, "epoch2_stable"):
+                    epoch2 = 0.0
+                means = {
+                    "baseline": baseline,
+                    "fault_evidence": fault_evidence,
+                    "epoch1_stable": epoch1,
+                    "epoch2_stable": epoch2,
+                }
+                metrics = tuple(
+                    validation.PhaseMetric(
+                        phase=phase,
+                        transactions=int(mean * 30),
+                        mean_tps=mean,
+                        buckets_tps=(mean,) * 6,
+                    )
+                    for phase, mean in means.items()
+                )
+                slot_id = f"synthetic-{block_id}-{arm}"
+                expected = expected_by_pair[(block_id, arm)]
+                epoch1_roots = tuple(range(expected.q))
+                changed_limit = (
+                    p_changed_blocks
+                    if arm == "P"
+                    else ps_changed_blocks
+                    if arm == "PS"
+                    else 0
+                )
+                placement_changed = fanout == 5 and block_index <= changed_limit
+                epoch2_roots = (
+                    expected.fast_replica_ids
+                    if placement_changed
+                    else epoch1_roots
+                )
+                promoted = tuple(sorted(set(epoch2_roots) - set(epoch1_roots)))
+                demoted = tuple(sorted(set(epoch1_roots) - set(epoch2_roots)))
+                hierarchy_required = fanout == 5 and arm in {"P", "PS"}
+                results[slot_id] = validation.SlotValidationResult(
+                    slot_id=slot_id,
+                    outcome="PASS",
+                    reason=None,
+                    block_id=block_id,
+                    arm_code=arm,
+                    replica_count=31,
+                    initial_fanout=fanout,
+                    metrics=metrics,
+                    integrity_valid=True,
+                    epoch1_roots=epoch1_roots,
+                    epoch2_roots=epoch2_roots,
+                    promoted_replica_ids=promoted,
+                    demoted_replica_ids=demoted,
+                    placement_changed=placement_changed,
+                    hard_actor_ids=expected.actor_ids,
+                    responsive_degraded_actor_ids=(
+                        expected.responsive_degraded_actor_ids
+                    ),
+                    fast_replica_ids=expected.fast_replica_ids,
+                    degraded_rank_proof_count=(
+                        len(expected.responsive_degraded_actor_ids)
+                        if hierarchy_required
+                        else 0
+                    ),
+                    epoch1_degraded_root_proof_count=(
+                        len(expected.responsive_degraded_actor_ids)
+                        if hierarchy_required
+                        else 0
+                    ),
+                    epoch1_degraded_internal_proof_count=(
+                        len(expected.responsive_degraded_actor_ids)
+                        if hierarchy_required
+                        else 0
+                    ),
+                    epoch2_constrained_leaf_proof_count=(
+                        expected.f * expected.q if hierarchy_required else 0
+                    ),
+                    epoch2_fast_root_internal_position_proof_count=(
+                        expected.q if hierarchy_required else 0
+                    ),
+                    epoch2_fast_root_internal_position_required_count=(
+                        expected.q if hierarchy_required else 0
+                    ),
+                    full_hierarchy_gate_passed=(
+                        True if hierarchy_required else None
+                    ),
+                )
+    return results
+
+
+def _with_placebo_component_effects(
+    results: dict[str, validation.SlotValidationResult],
+    *,
+    p_effects: tuple[float, ...],
+    ps_effects: tuple[float, ...],
+) -> dict[str, validation.SlotValidationResult]:
+    assert len(p_effects) == len(ps_effects) == 5
+    updated = dict(results)
+    by_arm = {"P": p_effects, "PS": ps_effects}
+    for slot_id, result in results.items():
+        if result.initial_fanout != 5 or result.arm_code not in by_arm:
+            continue
+        block_index = int(result.block_id.rsplit("b", 1)[1]) - 1
+        fault_mean = 50.0 * math.exp(by_arm[result.arm_code][block_index])
+        updated[slot_id] = replace(
+            result,
+            metrics=tuple(
+                replace(metric, mean_tps=fault_mean)
+                if metric.phase == "fault_evidence"
+                else metric
+                for metric in result.metrics
+            ),
+        )
+    return updated
+
+
+def test_primary_throughput_estimate_is_the_exact_matched_log_ratio() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    expected_effects = (0.1, 0.2, 0.3, 0.4, 0.5)
+    effects = validation._headline_effects(
+        manifest,
+        _synthetic_breakthrough_results(expected_effects),
+    )
+
+    assert effects is not None
+    estimate = effects.primary_throughput_log_ratio
+    assert estimate is not None
+    assert estimate.block_effects_log_ratio == pytest.approx(expected_effects)
+    assert estimate.mean_log_ratio == pytest.approx(0.3)
+    assert estimate.sample_standard_deviation_log_ratio == pytest.approx(2.5**0.5 / 10)
+    assert estimate.ci95_lower_log_ratio == pytest.approx(0.10367568385)
+    assert estimate.ci95_upper_log_ratio == pytest.approx(0.49632431615)
+    assert estimate.geometric_mean_ratio == pytest.approx(math.exp(0.3))
+    assert estimate.geometric_mean_percent_change == pytest.approx(
+        (math.exp(0.3) - 1.0) * 100.0
+    )
+    assert estimate.ci95_lower_ratio == pytest.approx(
+        math.exp(estimate.ci95_lower_log_ratio)
+    )
+    assert estimate.ci95_upper_ratio == pytest.approx(
+        math.exp(estimate.ci95_upper_log_ratio)
+    )
+    for placebo in (
+        effects.pre_epoch1_placebo_p_log_ratio,
+        effects.pre_epoch1_placebo_ps_log_ratio,
+    ):
+        assert placebo is not None
+        assert placebo.block_effects_log_ratio == pytest.approx((0.0,) * 5)
+        assert placebo.mean_log_ratio == pytest.approx(0.0)
+        assert placebo.sample_standard_deviation_log_ratio == pytest.approx(0.0)
+        assert placebo.ci90_lower_log_ratio == pytest.approx(0.0)
+        assert placebo.ci90_upper_log_ratio == pytest.approx(0.0)
+        assert placebo.equivalence_margin_log_ratio == pytest.approx(math.log(1.1))
+        assert placebo.equivalence_supported is True
+
+
+def test_breakthrough_requires_lower_log_bound_and_four_positive_blocks() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    four_positive = _synthetic_breakthrough_results(
+        (0.2, 0.2, 0.2, 0.2, -0.001),
+        p_changed_blocks=5,
+        ps_changed_blocks=5,
+    )
+    effects = validation._headline_effects(manifest, four_positive)
+    assert effects is not None
+    estimate = effects.primary_throughput_log_ratio
+    assert estimate is not None
+    assert estimate.ci95_lower_log_ratio > 0
+    assert estimate.positive_block_count == 4
+    assert estimate.directional_claim_supported is True
+
+    supported = validation._breakthrough_verdict(
+        manifest,
+        four_positive,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert supported.status == "SUPPORTED"
+    assert supported.structural_required_slot_count == 10
+    assert supported.structural_validated_slot_count == 10
+    assert supported.structural_gate_passed is True
+    assert supported.placement_changed_p_block_count == 5
+    assert supported.placement_changed_ps_block_count == 5
+    assert supported.realized_placement_gate_passed is True
+    assert supported.throughput_rule_passed is True
+    assert supported.placebo_p_estimate_available is True
+    assert supported.placebo_p_ci90_lower_log_ratio == pytest.approx(0.0)
+    assert supported.placebo_p_ci90_upper_log_ratio == pytest.approx(0.0)
+    assert supported.placebo_p_equivalence_rule_passed is True
+    assert supported.placebo_ps_estimate_available is True
+    assert supported.placebo_ps_ci90_lower_log_ratio == pytest.approx(0.0)
+    assert supported.placebo_ps_ci90_upper_log_ratio == pytest.approx(0.0)
+    assert supported.placebo_ps_equivalence_rule_passed is True
+    assert supported.placebo_equivalence_rule_passed is True
+    assert supported.failed_requirements == ()
+
+    missing_structural_slot = dict(four_positive)
+    missing_structural_slot.pop("synthetic-n31-f5-b05-P")
+    structural_failure = validation._breakthrough_verdict(
+        manifest,
+        missing_structural_slot,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert structural_failure.status == "NOT_SUPPORTED"
+    assert structural_failure.structural_validated_slot_count == 9
+    assert structural_failure.structural_gate_passed is False
+    assert structural_failure.realized_placement_gate_passed is False
+    assert structural_failure.failed_requirements == (
+        "structural gate validated 9 of 10 required slots",
+        "P realized placement changed in 4 of 5 blocks; requires at least 5",
+    )
+
+    three_positive = _synthetic_breakthrough_results(
+        (0.2, 0.2, 0.2, -0.001, -0.001)
+    )
+    unsupported_effects = validation._headline_effects(manifest, three_positive)
+    assert unsupported_effects is not None
+    unsupported = validation._breakthrough_verdict(
+        manifest,
+        three_positive,
+        campaign_outcome="PASS",
+        effects=unsupported_effects,
+    )
+    assert unsupported.status == "NOT_SUPPORTED"
+    assert unsupported.throughput_positive_block_count == 3
+    assert unsupported.throughput_rule_passed is False
+    assert unsupported.failed_requirements
+
+
+def test_relative_gain_cannot_hide_absolute_p_and_ps_throughput_decline() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _synthetic_breakthrough_results((0.2,) * 5)
+    for slot_id, result in tuple(results.items()):
+        if result.initial_fanout != 5:
+            continue
+        phase_means = {
+            "baseline": 100.0,
+            "fault_evidence": 50.0,
+            "epoch1_stable": 100.0,
+            "epoch2_stable": (
+                90.0 if result.arm_code in {"P", "PS"} else 50.0
+            ),
+        }
+        results[slot_id] = replace(
+            result,
+            metrics=tuple(
+                replace(metric, mean_tps=phase_means[metric.phase])
+                for metric in result.metrics
+            ),
+        )
+
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    assert effects.primary_throughput_log_ratio is not None
+    assert effects.primary_throughput_log_ratio.directional_claim_supported is True
+    assert effects.optimization_gain.mean_tps == pytest.approx(-10.0)
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_SUPPORTED"
+    assert verdict.throughput_rule_passed is True
+    assert verdict.optimization_gain_rule_passed is False
+    assert verdict.p_absolute_optimization_positive_block_count == 0
+    assert verdict.ps_absolute_optimization_positive_block_count == 0
+    assert verdict.per_arm_absolute_optimization_rule_passed is False
+    assert verdict.absolute_sequence_gate_passed is False
+    assert any(
+        "absolute optimization-gain" in failure
+        for failure in verdict.failed_requirements
+    )
+    assert validation._campaign_figure_eligible("PASS", effects) is True
+
+
+def test_pre_epoch1_arm_specific_trajectory_blocks_breakthrough() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    arm_pretrend = (math.log(1.2),) * 5
+    results = _with_placebo_component_effects(
+        _synthetic_breakthrough_results((0.2,) * 5),
+        p_effects=arm_pretrend,
+        ps_effects=arm_pretrend,
+    )
+
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    assert effects.primary_throughput_log_ratio is not None
+    assert effects.primary_throughput_log_ratio.directional_claim_supported
+    for placebo in (
+        effects.pre_epoch1_placebo_p_log_ratio,
+        effects.pre_epoch1_placebo_ps_log_ratio,
+    ):
+        assert placebo is not None
+        assert placebo.mean_log_ratio == pytest.approx(math.log(1.2))
+        assert placebo.ci90_lower_log_ratio == pytest.approx(math.log(1.2))
+        assert placebo.ci90_upper_log_ratio == pytest.approx(math.log(1.2))
+        assert placebo.equivalence_supported is False
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_SUPPORTED"
+    assert verdict.throughput_rule_passed is True
+    assert verdict.absolute_sequence_gate_passed is True
+    assert verdict.placebo_p_estimate_available is True
+    assert verdict.placebo_p_equivalence_rule_passed is False
+    assert verdict.placebo_ps_estimate_available is True
+    assert verdict.placebo_ps_equivalence_rule_passed is False
+    assert verdict.placebo_equivalence_rule_passed is False
+    assert verdict.failed_requirements == (
+        "P/00 pre-Epoch1 placebo 90% log-ratio interval is not strictly "
+        "within the prespecified equivalence margin",
+        "PS/S pre-Epoch1 placebo 90% log-ratio interval is not strictly "
+        "within the prespecified equivalence margin",
+    )
+
+
+def test_both_placebo_components_accept_small_nonzero_matched_variation() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    small = (-0.02, -0.01, 0.0, 0.01, 0.02)
+    results = _with_placebo_component_effects(
+        _synthetic_breakthrough_results((0.2,) * 5),
+        p_effects=small,
+        ps_effects=tuple(reversed(small)),
+    )
+
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    for placebo in (
+        effects.pre_epoch1_placebo_p_log_ratio,
+        effects.pre_epoch1_placebo_ps_log_ratio,
+    ):
+        assert placebo is not None
+        assert placebo.sample_standard_deviation_log_ratio > 0
+        assert placebo.ci90_lower_log_ratio > -math.log(1.1)
+        assert placebo.ci90_upper_log_ratio < math.log(1.1)
+        assert placebo.equivalence_supported is True
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "SUPPORTED"
+    assert verdict.placebo_equivalence_rule_passed is True
+
+
+def test_opposite_placebo_components_cannot_cancel_into_support() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _with_placebo_component_effects(
+        _synthetic_breakthrough_results((0.2,) * 5),
+        p_effects=(math.log(2.0),) * 5,
+        ps_effects=(math.log(0.5),) * 5,
+    )
+
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    assert effects.fault_drop.ci95_lower_tps == pytest.approx(37.5)
+    assert effects.pre_epoch1_placebo_p_log_ratio is not None
+    assert effects.pre_epoch1_placebo_ps_log_ratio is not None
+    assert effects.pre_epoch1_placebo_p_log_ratio.mean_log_ratio == pytest.approx(
+        math.log(2.0)
+    )
+    assert effects.pre_epoch1_placebo_ps_log_ratio.mean_log_ratio == pytest.approx(
+        math.log(0.5)
+    )
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_SUPPORTED"
+    assert verdict.throughput_rule_passed is True
+    assert verdict.absolute_sequence_gate_passed is True
+    assert verdict.placebo_p_equivalence_rule_passed is False
+    assert verdict.placebo_ps_equivalence_rule_passed is False
+    assert verdict.placebo_equivalence_rule_passed is False
+
+
+def test_placebo_rejects_ci_crossing_margin_despite_zero_mean() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _with_placebo_component_effects(
+        _synthetic_breakthrough_results((0.2,) * 5),
+        p_effects=(-0.2, 0.0, 0.0, 0.0, 0.2),
+        ps_effects=(0.0,) * 5,
+    )
+
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    placebo_p = effects.pre_epoch1_placebo_p_log_ratio
+    assert placebo_p is not None
+    assert placebo_p.mean_log_ratio == pytest.approx(0.0)
+    assert placebo_p.ci90_lower_log_ratio < -math.log(1.1)
+    assert placebo_p.ci90_upper_log_ratio > math.log(1.1)
+    assert placebo_p.equivalence_supported is False
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_SUPPORTED"
+    assert verdict.placebo_p_equivalence_rule_passed is False
+    assert verdict.placebo_ps_equivalence_rule_passed is True
+
+
+@pytest.mark.parametrize("boundary", (math.log(1.1), -math.log(1.1)))
+def test_placebo_rejects_exact_equivalence_margin(boundary: float) -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _with_placebo_component_effects(
+        _synthetic_breakthrough_results((0.2,) * 5),
+        p_effects=(boundary,) * 5,
+        ps_effects=(0.0,) * 5,
+    )
+
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    placebo_p = effects.pre_epoch1_placebo_p_log_ratio
+    assert placebo_p is not None
+    assert placebo_p.ci90_lower_log_ratio == pytest.approx(boundary)
+    assert placebo_p.ci90_upper_log_ratio == pytest.approx(boundary)
+    assert placebo_p.equivalence_supported is False
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_SUPPORTED"
+    assert verdict.placebo_p_equivalence_rule_passed is False
+    assert verdict.placebo_equivalence_rule_passed is False
+
+
+def test_nonpositive_placebo_mean_is_unavailable_and_not_supported() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _synthetic_breakthrough_results(
+        (0.2,) * 5,
+        zero_mean=(1, "P", "fault_evidence"),
+    )
+
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    assert effects.pre_epoch1_placebo_p_log_ratio is None
+    assert effects.pre_epoch1_placebo_ps_log_ratio is not None
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_SUPPORTED"
+    assert verdict.placebo_p_estimate_available is False
+    assert verdict.placebo_p_equivalence_rule_passed is None
+    assert verdict.placebo_ps_estimate_available is True
+    assert verdict.placebo_ps_equivalence_rule_passed is True
+    assert verdict.placebo_equivalence_rule_passed is False
+    assert any(
+        "P/00 pre-Epoch1 placebo requires strictly positive" in failure
+        for failure in verdict.failed_requirements
+    )
+
+
+def test_breakthrough_requires_realized_root_changes_in_each_adaptive_arm() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    throughput_passes = (0.2,) * 5
+
+    unchanged = _synthetic_breakthrough_results(
+        throughput_passes,
+        p_changed_blocks=0,
+        ps_changed_blocks=0,
+    )
+    unchanged_effects = validation._headline_effects(manifest, unchanged)
+    assert unchanged_effects is not None
+    assert unchanged_effects.primary_throughput_log_ratio is not None
+    assert unchanged_effects.primary_throughput_log_ratio.directional_claim_supported
+    unchanged_verdict = validation._breakthrough_verdict(
+        manifest,
+        unchanged,
+        campaign_outcome="PASS",
+        effects=unchanged_effects,
+    )
+    assert unchanged_verdict.status == "NOT_SUPPORTED"
+    assert unchanged_verdict.placement_changed_p_block_count == 0
+    assert unchanged_verdict.placement_changed_ps_block_count == 0
+    assert unchanged_verdict.realized_placement_gate_passed is False
+    assert validation._campaign_figure_eligible("PASS", unchanged_effects) is True
+
+    one_arm_short = _synthetic_breakthrough_results(
+        throughput_passes,
+        p_changed_blocks=4,
+        ps_changed_blocks=5,
+    )
+    one_arm_short_effects = validation._headline_effects(manifest, one_arm_short)
+    assert one_arm_short_effects is not None
+    one_arm_short_verdict = validation._breakthrough_verdict(
+        manifest,
+        one_arm_short,
+        campaign_outcome="PASS",
+        effects=one_arm_short_effects,
+    )
+    assert one_arm_short_verdict.status == "NOT_SUPPORTED"
+    assert one_arm_short_verdict.placement_changed_p_block_count == 4
+    assert one_arm_short_verdict.placement_changed_ps_block_count == 5
+    assert one_arm_short_verdict.failed_requirements == (
+        "P realized placement changed in 4 of 5 blocks; requires at least 5",
+    )
+
+
+def test_breakthrough_verdict_is_not_evaluable_without_complete_valid_data() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _synthetic_breakthrough_results((0.2,) * 5)
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="INCOMPLETE",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_EVALUABLE"
+    assert verdict.structural_validated_slot_count == 10
+    assert verdict.throughput_rule_passed is None
+    assert verdict.failed_requirements == (
+        "campaign lacks complete valid data for the prespecified scope",
+    )
+
+
+def test_zero_mean_rejects_breakthrough_without_invalidating_campaign_evidence() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _synthetic_breakthrough_results(
+        (0.2,) * 5,
+        zero_mean=(1, "P", "epoch1_stable"),
+    )
+    effects = validation._headline_effects(manifest, results)
+    assert effects is not None
+    assert effects.primary_throughput_log_ratio is None
+
+    verdict = validation._breakthrough_verdict(
+        manifest,
+        results,
+        campaign_outcome="PASS",
+        effects=effects,
+    )
+    assert verdict.status == "NOT_SUPPORTED"
+    assert verdict.throughput_estimate_available is False
+    assert "strictly positive" in verdict.failed_requirements[-1]
+    assert validation._campaign_figure_eligible("PASS", effects) is True
+
+    negative_results = _synthetic_breakthrough_results((-0.1,) * 5)
+    negative_effects = validation._headline_effects(manifest, negative_results)
+    assert negative_effects is not None
+    negative = validation._breakthrough_verdict(
+        manifest,
+        negative_results,
+        campaign_outcome="PASS",
+        effects=negative_effects,
+    )
+    assert negative.status == "NOT_SUPPORTED"
+    assert validation._campaign_figure_eligible("PASS", negative_effects) is True
+
+
 def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
     tmp_path: Path,
 ) -> None:
@@ -2603,6 +3654,7 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
         approved_utc="2026-08-04T00:00:00+00:00",
         kauri_revision="cd" * 20,
         slot_ids=tuple(slot.slot_id for slot in plan.slots),
+        result_root=manifest.results_root,
         static_artifacts=static_artifacts,
         build_provenance_sha256=hashlib.sha256(
             _canonical({"revision": "cd" * 20})
@@ -2761,6 +3813,59 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
         results_by_id={first.slot_id: result},
         campaign_outcome="INCOMPLETE",
     ) == 1
+
+    typed_contract = dict(contract)
+    typed_contract["outcome_dependent_order"] = 0
+    (root / validation.CAMPAIGN_CONTRACT_FILENAME).write_bytes(
+        _canonical(typed_contract)
+    )
+    with pytest.raises(FactorialValidationError, match="frozen schedule"):
+        validation._validate_campaign_execution_ledger(
+            root,
+            manifest=manifest,
+            plan=json.loads(canonical_plan_bytes(plan)),
+            runtime=runtime,
+            expected_slots=expected_slots,
+            actual_by_id={first.slot_id: first_path},
+            results_by_id={first.slot_id: result},
+            campaign_outcome="INCOMPLETE",
+        )
+    (root / validation.CAMPAIGN_CONTRACT_FILENAME).write_bytes(contract_bytes)
+
+    typed_rows = [dict(row) for row in rows]
+    typed_rows[0]["schema_version"] = True
+    ledger_path.write_bytes(b"".join(_canonical(row) for row in typed_rows))
+    with pytest.raises(FactorialValidationError, match="identity/order"):
+        validation._validate_campaign_execution_ledger(
+            root,
+            manifest=manifest,
+            plan=json.loads(canonical_plan_bytes(plan)),
+            runtime=runtime,
+            expected_slots=expected_slots,
+            actual_by_id={first.slot_id: first_path},
+            results_by_id={first.slot_id: result},
+            campaign_outcome="INCOMPLETE",
+        )
+    ledger_path.write_bytes(b"".join(_canonical(row) for row in rows))
+
+    typed_summary = dict(summary)
+    typed_summary["expected_slot_count"] = True
+    typed_summary["ledger_sha256"] = hashlib.sha256(
+        ledger_path.read_bytes()
+    ).hexdigest()
+    summary_path.write_bytes(_canonical(typed_summary))
+    with pytest.raises(FactorialValidationError, match="summary"):
+        validation._validate_campaign_execution_ledger(
+            root,
+            manifest=manifest,
+            plan=json.loads(canonical_plan_bytes(plan)),
+            runtime=runtime,
+            expected_slots=expected_slots,
+            actual_by_id={first.slot_id: first_path},
+            results_by_id={first.slot_id: result},
+            campaign_outcome="INCOMPLETE",
+        )
+    summary_path.write_bytes(_canonical(summary))
 
     summary_path.unlink()
     with pytest.raises(FactorialValidationError, match="campaign-execution-summary"):

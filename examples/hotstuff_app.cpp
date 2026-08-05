@@ -226,6 +226,8 @@ parse_experiment_byzantine_options(
     bool omit_outbound_direct_vote,
     int context_limit,
     const std::string &raw_rotating_omission_actors,
+    const std::string &raw_responsive_degraded_omission_actors,
+    int responsive_omission_period,
     const std::string &raw_window_start_monotonic_ns,
     const std::string &raw_window_end_monotonic_ns,
     int max_omissions_per_proposal,
@@ -233,6 +235,8 @@ parse_experiment_byzantine_options(
 {
     const bool scheduled_argument_present =
         !raw_rotating_omission_actors.empty() ||
+        !raw_responsive_degraded_omission_actors.empty() ||
+        responsive_omission_period != 0 ||
         !raw_window_start_monotonic_ns.empty() ||
         !raw_window_end_monotonic_ns.empty() ||
         max_omissions_per_proposal != 0 ||
@@ -278,7 +282,8 @@ parse_experiment_byzantine_options(
     if (scheduled_mode)
     {
         if (fault_mode != "rotating_intermittent_omission_v1" &&
-            fault_mode != "persistent_selected_omission_v1")
+            fault_mode != "persistent_selected_omission_v1" &&
+            fault_mode != "tiered_persistent_responsive_omission_v1")
             throw HotStuffError(
                 "unsupported experiment Byzantine mode");
         if (!raw_configuration.empty() ||
@@ -359,18 +364,79 @@ parse_experiment_byzantine_options(
         if (!quorum.has_value())
             throw HotStuffError(
                 "scheduled omission requires a valid Byzantine membership");
-        std::vector<ReplicaID> actors;
-        for (const auto &raw_actor :
-             trim_all(split(raw_rotating_omission_actors, ",")))
-            actors.push_back(parse_adaptive_v2_unsigned<ReplicaID>(
-                raw_actor,
-                "experiment scheduled omission actor",
-                false));
+        const auto parse_actor_list =
+            [replica_count](
+                const std::string &raw_actors,
+                const char *name) -> std::vector<ReplicaID>
+            {
+                std::vector<ReplicaID> parsed_actors;
+                for (const auto &raw_actor :
+                     trim_all(split(raw_actors, ",")))
+                    parsed_actors.push_back(
+                        parse_adaptive_v2_unsigned<ReplicaID>(
+                            raw_actor, name, false));
+                auto ordered = parsed_actors;
+                std::sort(ordered.begin(), ordered.end());
+                if (ordered.empty() ||
+                    std::adjacent_find(
+                        ordered.begin(), ordered.end()) != ordered.end() ||
+                    std::any_of(
+                        ordered.begin(),
+                        ordered.end(),
+                        [replica_count](ReplicaID actor)
+                        { return actor >= replica_count; }))
+                    throw HotStuffError(
+                        std::string(name) +
+                        " list must be non-empty, unique, and in membership");
+                return parsed_actors;
+            };
+        auto actors = parse_actor_list(
+            raw_rotating_omission_actors,
+            "experiment scheduled omission actor");
+        const bool tiered_mode =
+            fault_mode ==
+            "tiered_persistent_responsive_omission_v1";
+        std::vector<ReplicaID> responsive_degraded_actors;
+        if (tiered_mode)
+        {
+            if (raw_responsive_degraded_omission_actors.empty() ||
+                responsive_omission_period <= 1)
+                throw HotStuffError(
+                    "tiered omission requires responsive-degraded actors "
+                    "and a period greater than one");
+            responsive_degraded_actors = parse_actor_list(
+                raw_responsive_degraded_omission_actors,
+                "experiment responsive-degraded omission actor");
+            auto ordered_hard = actors;
+            std::sort(ordered_hard.begin(), ordered_hard.end());
+            if (std::any_of(
+                    responsive_degraded_actors.begin(),
+                    responsive_degraded_actors.end(),
+                    [&ordered_hard](ReplicaID actor)
+                    {
+                        return std::binary_search(
+                            ordered_hard.begin(), ordered_hard.end(), actor);
+                    }))
+                throw HotStuffError(
+                    "tiered omission actor cohorts must be disjoint");
+            if (actors.size() + responsive_degraded_actors.size() >
+                quorum->fault_threshold)
+                throw HotStuffError(
+                    "tiered omission cohort exceeds the derived fault "
+                    "threshold");
+        }
+        else if (!raw_responsive_degraded_omission_actors.empty() ||
+                 responsive_omission_period != 0)
+            throw HotStuffError(
+                "responsive-degraded omission arguments require the tiered "
+                "mode");
         const auto actor_count = actors.size();
         const auto expected_maximum_omissions =
             fault_mode == "rotating_intermittent_omission_v1"
                 ? std::size_t{1}
-                : actor_count;
+                : tiered_mode
+                      ? actor_count + responsive_degraded_actors.size()
+                      : actor_count;
         if (max_omissions_per_proposal <= 0 ||
             static_cast<std::size_t>(max_omissions_per_proposal) !=
                 expected_maximum_omissions)
@@ -392,7 +458,11 @@ parse_experiment_byzantine_options(
                     "experiment Byzantine window end",
                     true),
                 static_cast<std::size_t>(max_omissions_per_proposal),
-                static_cast<std::size_t>(maximum_rotating_contexts)};
+                static_cast<std::size_t>(maximum_rotating_contexts),
+                std::move(responsive_degraded_actors),
+                tiered_mode
+                    ? static_cast<std::size_t>(responsive_omission_period)
+                    : std::size_t{0}};
         return options;
     }
 
@@ -816,6 +886,10 @@ int main(int argc, char **argv)
         Config::OptValInt::create(0);
     auto opt_experiment_rotating_omission_actors =
         Config::OptValStr::create("");
+    auto opt_experiment_responsive_degraded_omission_actors =
+        Config::OptValStr::create("");
+    auto opt_experiment_responsive_omission_period =
+        Config::OptValInt::create(0);
     auto opt_experiment_byzantine_window_start_monotonic_ns =
         Config::OptValStr::create("");
     auto opt_experiment_byzantine_window_end_monotonic_ns =
@@ -1030,6 +1104,18 @@ int main(int argc, char **argv)
         -1,
         "comma-separated scheduled omission actor replica IDs");
     config.add_opt(
+        "experiment-responsive-degraded-omission-actors",
+        opt_experiment_responsive_degraded_omission_actors,
+        Config::SET_VAL,
+        -1,
+        "comma-separated responsive-degraded omission actor replica IDs");
+    config.add_opt(
+        "experiment-responsive-omission-period",
+        opt_experiment_responsive_omission_period,
+        Config::SET_VAL,
+        -1,
+        "unique non-root contributions per responsive omission");
+    config.add_opt(
         "experiment-byzantine-window-start-monotonic-ns",
         opt_experiment_byzantine_window_start_monotonic_ns,
         Config::SET_VAL,
@@ -1180,6 +1266,8 @@ int main(int argc, char **argv)
             opt_experiment_omit_outbound_direct_vote->get(),
             opt_experiment_byzantine_context_limit->get(),
             opt_experiment_rotating_omission_actors->get(),
+            opt_experiment_responsive_degraded_omission_actors->get(),
+            opt_experiment_responsive_omission_period->get(),
             opt_experiment_byzantine_window_start_monotonic_ns->get(),
             opt_experiment_byzantine_window_end_monotonic_ns->get(),
             opt_experiment_byzantine_max_omissions_per_proposal->get(),

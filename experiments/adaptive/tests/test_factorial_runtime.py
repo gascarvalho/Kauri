@@ -11,7 +11,9 @@ from pathlib import Path
 import pytest
 
 from experiments.adaptive import run_shape_factorial_campaign
+from experiments.adaptive.kauri_experiment import factorial_execution
 from experiments.adaptive.kauri_experiment import factorial_runtime
+from experiments.adaptive.kauri_experiment import factorial_validation
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FactorialManifestError,
     build_factorial_plan,
@@ -33,6 +35,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
+)
+V7_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
 )
 V6_MANIFEST_PATH = (
@@ -49,6 +54,9 @@ V3_MANIFEST_PATH = (
 )
 V2_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
+)
+LEGACY_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
 )
 
 
@@ -81,6 +89,7 @@ def test_matched_arms_share_the_frozen_cutoff_and_transition_contracts(
     assert {spec.arm_code for spec in specs} == {"00", "P", "S", "PS"}
     assert len({spec.scientific_seed for spec in specs}) == 1
     assert len({spec.actor_ids for spec in specs}) == 1
+    assert len({spec.tiered_cohorts for spec in specs}) == 1
     assert len({spec.fault_window for spec in specs}) == 1
     assert len({spec.cutoff_contract for spec in specs}) == 1
     assert len({spec.transition_sequence for spec in specs}) == 1
@@ -98,6 +107,22 @@ def test_matched_arms_share_the_frozen_cutoff_and_transition_contracts(
     assert specs[0].transition_sequence.transition_count == 2
     assert specs[0].transition_sequence.total_activation_overhead_blocks == (
         2 * slots[0].common_timers.activation_delay_blocks
+    )
+    tiered = specs[0].tiered_cohorts
+    assert tiered is not None
+    assert tiered.hard_actor_ids == slots[0].byzantine_actor_ids
+    assert tiered.responsive_degraded_actor_ids == (
+        slots[0].responsive_degraded_actor_ids
+    )
+    assert tiered.fast_replica_ids == slots[0].fast_replica_ids
+    assert len((*tiered.hard_actor_ids, *tiered.responsive_degraded_actor_ids)) == (
+        specs[0].f
+    )
+    assert len(tiered.fast_replica_ids) == specs[0].q
+    assert tiered.max_omissions_per_proposal == specs[0].f
+    assert tiered.responsive_omission_period == 32
+    assert tiered.observer_isolation == (
+        "replica_0_reserved_authoritative_commit_observer_v1"
     )
 
 
@@ -151,13 +176,45 @@ def test_factorial_placement_is_expressed_as_live_acceptance_predicates(
         assert spec.epoch1_placement.policy_intent == "fault_containment"
         assert spec.epoch1_placement.actors_are_wait_exempt_leaves is True
         assert spec.epoch1_placement.actor_truth_is_policy_input is False
+        assert spec.epoch1_placement.only_hard_cohort_is_wait_exempt is True
+        assert (
+            spec.epoch1_placement.all_worse_replicas_are_physical_leaves is False
+        )
+        assert spec.epoch1_placement.root_and_internal_roles_are_fast_only is False
+        assert spec.epoch1_placement.roots_equal_live_top_q_fast_replicas is False
         assert spec.epoch2_placement.actors_are_wait_exempt_leaves is True
         assert spec.epoch2_placement.actor_truth_is_policy_input is False
+        assert spec.epoch2_placement.only_hard_cohort_is_wait_exempt is True
+        assert spec.tiered_cohorts is not None
+        assert spec.tiered_cohorts.hard_cohort_wait_exempt is True
+        assert spec.tiered_cohorts.responsive_degraded_cohort_wait_exempt is False
+        assert spec.tiered_cohorts.tiered_marker_schedule_required is True
+        assert (
+            spec.tiered_cohorts.responsive_degraded_rank_below_every_fast_replica
+            is True
+        )
+        assert spec.tiered_cohorts.epoch1_responsive_degraded_are_roots is True
+        assert (
+            spec.tiered_cohorts.epoch1_responsive_degraded_internal_role_exposure_required
+            is True
+        )
 
     for code in ("00", "S"):
         assert specs[code].epoch2_placement.policy_intent == "fault_containment"
         assert (
             specs[code].epoch2_placement.roots_equal_live_highest_ranked_eligible
+            is False
+        )
+        assert (
+            specs[code].epoch2_placement.all_worse_replicas_are_physical_leaves
+            is False
+        )
+        assert (
+            specs[code].epoch2_placement.root_and_internal_roles_are_fast_only
+            is False
+        )
+        assert (
+            specs[code].epoch2_placement.roots_equal_live_top_q_fast_replicas
             is False
         )
     for code in ("P", "PS"):
@@ -170,6 +227,18 @@ def test_factorial_placement_is_expressed_as_live_acceptance_predicates(
         )
         assert specs[code].epoch2_placement.influential_order_source == (
             "live_accepted_evidence_ranking"
+        )
+        assert (
+            specs[code].epoch2_placement.all_worse_replicas_are_physical_leaves
+            is True
+        )
+        assert (
+            specs[code].epoch2_placement.root_and_internal_roles_are_fast_only
+            is True
+        )
+        assert (
+            specs[code].epoch2_placement.roots_equal_live_top_q_fast_replicas
+            is True
         )
 
 
@@ -305,6 +374,14 @@ def test_every_slot_requires_the_frozen_three_nonresponsive_actors(
             )
             == "3"
         )
+    assert {
+        replica_count: {
+            build_slot_runtime(slot).tiered_cohorts.max_omissions_per_proposal  # type: ignore[union-attr]
+            for slot in frozen_plan.slots
+            if slot.replica_count == replica_count
+        }
+        for replica_count in (13, 22, 31)
+    } == {13: {4}, 22: {7}, 31: {10}}
 
 
 def test_manager_materialization_supplies_hex_and_absolute_slot_paths(
@@ -457,11 +534,15 @@ def test_replica_argv_materialization_uses_one_shared_raw_clock_anchor(
         )
         assert _option(argv, "--experiment-byzantine-mode") == slot.byzantine.mode
         assert _option(argv, "--experiment-byzantine-window") == (
-            f"{slot.block_id}-persistent-omission-v1"
+            f"{slot.block_id}-tiered-responsive-omission-v1"
         )
         assert _option(argv, "--experiment-rotating-omission-actors") == ",".join(
             map(str, slot.byzantine_actor_ids)
         )
+        assert _option(
+            argv, "--experiment-responsive-degraded-omission-actors"
+        ) == ",".join(map(str, slot.responsive_degraded_actor_ids))
+        assert _option(argv, "--experiment-responsive-omission-period") == "32"
         assert _option(argv, "--experiment-byzantine-window-start-monotonic-ns") == str(
             expected_start
         )
@@ -470,7 +551,7 @@ def test_replica_argv_materialization_uses_one_shared_raw_clock_anchor(
         )
         assert _option(
             argv, "--experiment-byzantine-max-omissions-per-proposal"
-        ) == str(slot.byzantine.max_omissions_per_proposal)
+        ) == str(slot.f)
         assert _option(argv, "--experiment-rotating-omission-context-limit") == str(
             slot.byzantine.maximum_rotating_contexts
         )
@@ -526,6 +607,37 @@ def test_two_epoch_sequence_and_artifact_identity_are_deterministic(
         0,
     )
     assert len({transition.artifact_id for transition in first.transitions}) == 2
+
+
+def test_slot_artifact_identity_seals_all_three_tiered_cohorts(frozen_plan) -> None:
+    slot = next(
+        slot
+        for slot in frozen_plan.slots
+        if slot.replica_count == 31 and slot.arm_code == "00"
+    )
+    original = build_slot_runtime(slot)
+    promoted = next(
+        actor
+        for actor in range(1, slot.q)
+        if actor not in slot.responsive_degraded_actor_ids
+    )
+    changed_degraded = tuple(
+        sorted((promoted, *slot.responsive_degraded_actor_ids[1:]))
+    )
+    changed_worse = set((*slot.byzantine_actor_ids, *changed_degraded))
+    changed_slot = replace(
+        slot,
+        responsive_degraded_actor_ids=changed_degraded,
+        fast_replica_ids=tuple(
+            member
+            for member in range(slot.replica_count)
+            if member not in changed_worse
+        ),
+    )
+
+    changed = build_slot_runtime(changed_slot)
+    assert changed.artifact_id != original.artifact_id
+    assert changed.tiered_cohorts != original.tiered_cohorts
 
 
 def test_runtime_contract_has_no_duplicate_transition_fields_or_bare_config_lines(
@@ -592,6 +704,90 @@ def test_preflight_and_smoke_metadata_never_authorize_a_process(runtime_plan) ->
     assert smoke.launch_permitted is False
     assert "import subprocess" not in inspect.getsource(factorial_runtime)
     assert "import subprocess" not in inspect.getsource(run_shape_factorial_campaign)
+
+
+def test_preflight_accepts_only_the_exact_n7_hard_one_smoke(
+    frozen_plan,
+    runtime_plan,
+) -> None:
+    smoke = factorial_execution.build_n7_ps_smoke_slot(frozen_plan.slots[0])
+    smoke_plan = replace(runtime_plan, slots=(smoke.runtime,))
+
+    result = runtime_preflight(
+        smoke_plan,
+        available_free_bytes=smoke_plan.minimum_free_bytes,
+    )
+    assert result["status"] == "PASS"
+    assert smoke.runtime.tiered_cohorts is not None
+    assert len(smoke.runtime.actor_ids) == 1
+    assert len(smoke.runtime.tiered_cohorts.responsive_degraded_actor_ids) == 1
+    assert smoke.runtime.tiered_cohorts.max_omissions_per_proposal == 2
+    assert _option(
+        smoke.runtime.manager_argv_template.argv,
+        "--required-nonresponsive",
+    ) == "1"
+
+    wrong_hard = 5 if smoke.runtime.actor_ids != (5,) else 6
+    wrong_worse = {
+        wrong_hard,
+        *smoke.runtime.tiered_cohorts.responsive_degraded_actor_ids,
+    }
+    wrong_tiered = replace(
+        smoke.runtime.tiered_cohorts,
+        hard_actor_ids=(wrong_hard,),
+        fast_replica_ids=tuple(
+            member
+            for member in range(smoke.runtime.replica_count)
+            if member not in wrong_worse
+        ),
+    )
+    wrong_smoke = replace(
+        smoke.runtime,
+        actor_ids=(wrong_hard,),
+        tiered_cohorts=wrong_tiered,
+    )
+    with pytest.raises(FactorialManifestError, match="tiered cohort"):
+        runtime_preflight(
+            replace(runtime_plan, slots=(wrong_smoke,)),
+            available_free_bytes=runtime_plan.minimum_free_bytes,
+        )
+
+
+def test_preflight_rejects_tiered_period_and_native_argv_drift(runtime_plan) -> None:
+    slot = runtime_plan.slots[0]
+    assert slot.tiered_cohorts is not None
+    bad_period_slot = replace(
+        slot,
+        tiered_cohorts=replace(
+            slot.tiered_cohorts,
+            responsive_omission_period=31,
+        ),
+    )
+    with pytest.raises(FactorialManifestError, match="tiered cohort"):
+        runtime_preflight(
+            replace(runtime_plan, slots=(bad_period_slot, *runtime_plan.slots[1:])),
+            available_free_bytes=runtime_plan.minimum_free_bytes,
+        )
+
+    process = slot.replica_argv_templates[0]
+    renamed = tuple(
+        "--experiment-responsive-degradation-actors"
+        if argument == "--experiment-responsive-degraded-omission-actors"
+        else argument
+        for argument in process.argv
+    )
+    bad_argv_slot = replace(
+        slot,
+        replica_argv_templates=(
+            replace(process, argv=renamed),
+            *slot.replica_argv_templates[1:],
+        ),
+    )
+    with pytest.raises(FactorialManifestError, match="tiered replica argv"):
+        runtime_preflight(
+            replace(runtime_plan, slots=(bad_argv_slot, *runtime_plan.slots[1:])),
+            available_free_bytes=runtime_plan.minimum_free_bytes,
+        )
 
 
 def test_preflight_rejects_an_early_epoch1_evaluation_hold(runtime_plan) -> None:
@@ -710,9 +906,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V4_MANIFEST_PATH,
         V5_MANIFEST_PATH,
         V6_MANIFEST_PATH,
+        V7_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v7_and_refuses_prior_production(
+def test_cli_defaults_to_v8_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -725,4 +922,36 @@ def test_cli_defaults_to_v7_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v6 are validation-only" in refusal["reason"]
+    assert "v1 through v7 are validation-only" in refusal["reason"]
+
+
+@pytest.mark.parametrize(
+    "historical_manifest",
+    (
+        LEGACY_MANIFEST_PATH,
+        V2_MANIFEST_PATH,
+        V3_MANIFEST_PATH,
+        V4_MANIFEST_PATH,
+        V5_MANIFEST_PATH,
+        V6_MANIFEST_PATH,
+        V7_MANIFEST_PATH,
+    ),
+)
+def test_historical_v1_through_v7_runtime_identities_remain_exact(
+    historical_manifest: Path,
+) -> None:
+    manifest = load_frozen_manifest(historical_manifest)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    identity = factorial_validation._frozen_artifact_identity(manifest.manifest_id)
+    encoded = canonical_runtime_bytes(runtime)
+
+    assert plan.plan_sha256 == identity.plan_sha256
+    assert hashlib.sha256(encoded).hexdigest() == identity.runtime_sha256
+    document = json.loads(encoded)
+    assert all("tiered_cohorts" not in slot for slot in document["slots"])
+    assert all(
+        "only_hard_cohort_is_wait_exempt" not in placement
+        for slot in document["slots"]
+        for placement in (slot["epoch1_placement"], slot["epoch2_placement"])
+    )

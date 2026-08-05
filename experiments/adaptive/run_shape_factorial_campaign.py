@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import datetime as dt
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
-import stat
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -20,9 +19,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from experiments.adaptive.kauri_experiment.factorial_execution import (  # noqa: E402
+    CAMPAIGN_AUTHORIZATION_FILENAME,
+    CAMPAIGN_CONTRACT_FILENAME,
+    CAMPAIGN_LEDGER_FILENAME,
     ExecutionPreflight,
     FactorialExecutionError,
     SlotExecutionResult,
+    append_campaign_ledger_record,
+    build_campaign_execution_contract,
     build_execution_authorization_receipt,
     build_n7_ps_smoke_slot,
     execute_slot_once,
@@ -60,13 +64,10 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v7.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v8.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
-CAMPAIGN_AUTHORIZATION_FILENAME = "campaign-authorization.json"
-CAMPAIGN_CONTRACT_FILENAME = "campaign-execution-contract.json"
-CAMPAIGN_LEDGER_FILENAME = "campaign-attempt-ledger.jsonl"
 CAMPAIGN_SUMMARY_FILENAME = "campaign-execution-summary.json"
 
 
@@ -152,21 +153,7 @@ def _write_exclusive(path: Path, payload: bytes) -> None:
 
 
 def _append_canonical_jsonl(path: Path, value: object) -> None:
-    if path.is_symlink():
-        raise FactorialExecutionError("campaign attempt ledger must not be a symlink")
-    if path.exists() and not stat.S_ISREG(path.stat().st_mode):
-        raise FactorialExecutionError("campaign attempt ledger must be a regular file")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "ab") as output:
-            descriptor = -1
-            output.write(_canonical_json_bytes(value))
-            output.flush()
-            os.fsync(output.fileno())
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    append_campaign_ledger_record(path, value)
 
 
 def _direct_runtime_bytes(spec: SlotRuntimeSpec) -> bytes:
@@ -298,26 +285,26 @@ def _validation_roots(
     return campaign_root, smoke_root
 
 
-def _require_frozen_v7_artifacts(
+def _require_frozen_v8_artifacts(
     manifest: FrozenFactorialManifest,
     plan: FactorialPlan,
     runtime: FactorialRuntimePlan,
 ) -> bytes:
-    """Fail before any result claim if producer bytes drift from v7."""
+    """Fail before any result claim if producer bytes drift from v8."""
 
     if (
         manifest.manifest_id != FROZEN_MANIFEST_ID
         or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
     ):
-        raise FactorialExecutionError("campaign production requires exact frozen v7")
+        raise FactorialExecutionError("campaign production requires exact frozen v8")
     if plan.plan_sha256 != FROZEN_PLAN_SHA256:
         raise FactorialExecutionError(
-            "campaign plan bytes differ from the exact frozen v7 identity"
+            "campaign plan bytes differ from the exact frozen v8 identity"
         )
     payload = canonical_runtime_bytes(runtime)
     if _sha256(payload) != FROZEN_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "campaign runtime bytes differ from the exact frozen v7 identity"
+            "campaign runtime bytes differ from the exact frozen v8 identity"
         )
     return payload
 
@@ -401,6 +388,9 @@ def _authorization_receipt(
                 approved_utc=document["approved_utc"],
                 kauri_revision=preflight.revision,
                 slot_ids=slot_ids,
+                result_root=preflight.result_root.relative_to(
+                    preflight.repository
+                ).as_posix(),
                 static_artifacts=static_artifacts,
                 build_provenance_sha256=_sha256(
                     _canonical_json_bytes(preflight.build_provenance)
@@ -423,6 +413,9 @@ def _authorization_receipt(
         approved_utc=approved_utc,
         kauri_revision=preflight.revision,
         slot_ids=slot_ids,
+        result_root=preflight.result_root.relative_to(
+            preflight.repository
+        ).as_posix(),
         static_artifacts=static_artifacts,
         build_provenance_sha256=_sha256(
             _canonical_json_bytes(preflight.build_provenance)
@@ -523,34 +516,13 @@ def _campaign_contract(
     authorization_payload: bytes,
     build_provenance: Mapping[str, object],
 ) -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "campaign_id": runtime.runtime_id,
-        "manifest_id": runtime.manifest_id,
-        "manifest_sha256": _sha256(static_artifacts["manifest.json"]),
-        "plan_sha256": _sha256(static_artifacts["plan.json"]),
-        "runtime_sha256": _sha256(static_artifacts["runtime.json"]),
-        "authorization_id": authorization["authorization_id"],
-        "authorization_sha256": _sha256(authorization_payload),
-        "kauri_revision": authorization["kauri_revision"],
-        "build_provenance_sha256": _sha256(
-            _canonical_json_bytes(build_provenance)
-        ),
-        "execution_mode": "fixed_sequential",
-        "automatic_retries": 0,
-        "replacement_policy": "none",
-        "outcome_dependent_order": False,
-        "expected_slot_count": len(runtime.slots),
-        "execution_schedule": [
-            {
-                "execution_ordinal": spec.execution_ordinal,
-                "slot_id": spec.slot_id,
-                "block_id": spec.block_id,
-                "arm_code": spec.arm_code,
-            }
-            for spec in runtime.slots
-        ],
-    }
+    return build_campaign_execution_contract(
+        runtime=runtime,
+        static_artifacts=static_artifacts,
+        authorization=authorization,
+        authorization_payload=authorization_payload,
+        build_provenance=build_provenance,
+    )
 
 
 def _ledger_common(
@@ -689,7 +661,7 @@ def _run_smoke(
     smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
     if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "smoke runtime bytes differ from the exact frozen v7 identity"
+            "smoke runtime bytes differ from the exact frozen v8 identity"
         )
     _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
@@ -994,12 +966,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) else 1
         if manifest.manifest_id != FROZEN_MANIFEST_ID:
             raise FactorialExecutionError(
-                "shape-placement-factorial-v1 through v6 are validation-only; "
-                "plan, preflight, smoke, and run require shape-placement-factorial-v7"
+                "shape-placement-factorial-v1 through v7 are validation-only; "
+                "plan, preflight, smoke, and run require shape-placement-factorial-v8"
             )
         plan = build_factorial_plan(manifest)
         runtime = build_factorial_runtime(plan)
-        runtime_payload = _require_frozen_v7_artifacts(manifest, plan, runtime)
+        runtime_payload = _require_frozen_v8_artifacts(manifest, plan, runtime)
         repository, build_directory, build_provenance, campaign_root, smoke_root = (
             _paths(arguments, runtime)
         )
@@ -1007,9 +979,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(runtime_payload.decode("ascii"), end="")
             return 0
         if arguments.command == "preflight":
+            preflight_runtime = runtime
+            preflight_root = campaign_root
+            target_runtime_sha256 = FROZEN_RUNTIME_SHA256
+            target_runtime_id = runtime.runtime_id
+            if arguments.preflight_target == "smoke":
+                smoke = build_n7_ps_smoke_slot(plan.slots[0])
+                smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
+                target_runtime_sha256 = _sha256(smoke_runtime_payload)
+                if target_runtime_sha256 != FROZEN_SMOKE_RUNTIME_SHA256:
+                    raise FactorialExecutionError(
+                        "smoke runtime bytes differ from the exact frozen v8 identity"
+                    )
+                preflight_root = smoke_root
+                target_runtime_id = smoke.runtime.artifact_id
+                preflight_runtime = replace(
+                    runtime,
+                    runtime_id=f"{runtime.manifest_id}-excluded-n7-smoke-preflight-v1",
+                    results_root=Path(smoke.slot.result_path).parent.as_posix(),
+                    slots=(smoke.runtime,),
+                )
             pure = runtime_preflight(
-                runtime,
-                available_free_bytes=shutil.disk_usage(campaign_root.parent).free,
+                preflight_runtime,
+                available_free_bytes=shutil.disk_usage(preflight_root.parent).free,
+            )
+            pure.update(
+                {
+                    "runtime_id": target_runtime_id,
+                    "runtime_sha256": target_runtime_sha256,
+                    "slot_count": len(preflight_runtime.slots),
+                }
             )
             _emit(
                 {

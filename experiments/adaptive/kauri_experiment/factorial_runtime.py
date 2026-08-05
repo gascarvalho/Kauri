@@ -19,6 +19,7 @@ from .factorial_manifest import (
     FactorialPlan,
     FactorialSlot,
     ResponsivenessPolicyContract,
+    derive_tiered_cohorts,
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -127,6 +128,12 @@ class FaultWindowContract(_Document):
     hard_timeout_s: int
     transition_observation_bound_rule: str
 
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        if self.transition_observation_bound_rule == "phase_deadline_v1":
+            document.pop("transition_observation_bound_rule")
+        return document
+
 
 @dataclass(frozen=True, slots=True)
 class CutoffContract(_Document):
@@ -175,6 +182,40 @@ class PlacementAcceptanceContract(_Document):
     roots_equal_live_highest_ranked_eligible: bool
     internal_assignment_uses_live_evidence_ranking: bool
     influential_order_source: str
+    only_hard_cohort_is_wait_exempt: bool
+    all_worse_replicas_are_physical_leaves: bool
+    root_and_internal_roles_are_fast_only: bool
+    roots_equal_live_top_q_fast_replicas: bool
+
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        if not self.only_hard_cohort_is_wait_exempt:
+            for field in (
+                "only_hard_cohort_is_wait_exempt",
+                "all_worse_replicas_are_physical_leaves",
+                "root_and_internal_roles_are_fast_only",
+                "roots_equal_live_top_q_fast_replicas",
+            ):
+                document.pop(field)
+        return document
+
+
+@dataclass(frozen=True, slots=True)
+class TieredCohortContract(_Document):
+    mode: str
+    hard_actor_ids: tuple[int, ...]
+    responsive_degraded_actor_ids: tuple[int, ...]
+    fast_replica_ids: tuple[int, ...]
+    responsive_omission_period: int
+    responsive_actor_schedule: str
+    max_omissions_per_proposal: int
+    hard_cohort_wait_exempt: bool
+    responsive_degraded_cohort_wait_exempt: bool
+    observer_isolation: str
+    tiered_marker_schedule_required: bool
+    responsive_degraded_rank_below_every_fast_replica: bool
+    epoch1_responsive_degraded_are_roots: bool
+    epoch1_responsive_degraded_internal_role_exposure_required: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +386,7 @@ class SlotRuntimeSpec(_Document):
     candidate_fanouts: tuple[int, ...]
     pipeline_stretch: int
     actor_ids: tuple[int, ...]
+    tiered_cohorts: TieredCohortContract | None
     result_path: str
     responsiveness_policy: ResponsivenessPolicyContract
     fault_window: FaultWindowContract
@@ -360,6 +402,17 @@ class SlotRuntimeSpec(_Document):
     process_logs: ProcessLogContract
     manager_argv_template: ManagerArgvTemplate
     replica_argv_templates: tuple[ReplicaProcessSpec, ...]
+
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        document["fault_window"] = self.fault_window.as_document()
+        document["epoch1_placement"] = self.epoch1_placement.as_document()
+        document["epoch2_placement"] = self.epoch2_placement.as_document()
+        if self.tiered_cohorts is None:
+            document.pop("tiered_cohorts")
+        else:
+            document["tiered_cohorts"] = self.tiered_cohorts.as_document()
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +444,7 @@ class FactorialRuntimePlan(_Document):
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
+        document["slots"] = tuple(slot.as_document() for slot in self.slots)
         document.update(
             {
                 "launch_permitted": self.launch_permitted,
@@ -470,8 +524,65 @@ def _shape_invocation(slot: FactorialSlot) -> ShapeInvocationContract:
     )
 
 
-def _placement_contract(policy_intent: str) -> PlacementAcceptanceContract:
+def _tiered_cohort_contract(
+    slot: FactorialSlot,
+) -> TieredCohortContract | None:
+    responsive = slot.byzantine.responsive_degradation
+    if responsive is None:
+        if slot.responsive_degraded_actor_ids or slot.fast_replica_ids:
+            raise FactorialManifestError(
+                "legacy Byzantine mode cannot carry tiered cohort identities"
+            )
+        return None
+    if slot.byzantine.mode != "tiered_persistent_responsive_omission_v1":
+        raise FactorialManifestError(
+            "responsive-degradation contract requires the frozen tiered mode"
+        )
+    hard = slot.byzantine_actor_ids
+    degraded = slot.responsive_degraded_actor_ids
+    fast = slot.fast_replica_ids
+    worse = frozenset((*hard, *degraded))
+    expected_fast = tuple(
+        member for member in range(slot.replica_count) if member not in worse
+    )
+    if (
+        len(hard) != slot.byzantine.actor_count
+        or len(degraded) != slot.f - len(hard)
+        or len(worse) != slot.f
+        or len(fast) != slot.q
+        or fast != expected_fast
+        or 0 not in fast
+        or any(actor < slot.q or actor >= slot.replica_count for actor in hard)
+        or any(actor < 1 or actor >= slot.q for actor in degraded)
+        or responsive.omission_period != 32
+        or slot.maximum_omissions_per_proposal != slot.f
+    ):
+        raise FactorialManifestError("slot tiered cohort derivation drifted")
+    return TieredCohortContract(
+        mode=slot.byzantine.mode,
+        hard_actor_ids=hard,
+        responsive_degraded_actor_ids=degraded,
+        fast_replica_ids=fast,
+        responsive_omission_period=responsive.omission_period,
+        responsive_actor_schedule=responsive.actor_schedule,
+        max_omissions_per_proposal=slot.maximum_omissions_per_proposal,
+        hard_cohort_wait_exempt=True,
+        responsive_degraded_cohort_wait_exempt=False,
+        observer_isolation=responsive.observer_isolation,
+        tiered_marker_schedule_required=True,
+        responsive_degraded_rank_below_every_fast_replica=True,
+        epoch1_responsive_degraded_are_roots=True,
+        epoch1_responsive_degraded_internal_role_exposure_required=True,
+    )
+
+
+def _placement_contract(
+    policy_intent: str,
+    *,
+    tiered: bool,
+) -> PlacementAcceptanceContract:
     optimized = policy_intent == "performance_optimization"
+    optimized_tiered = optimized and tiered
     return PlacementAcceptanceContract(
         policy_intent=policy_intent,
         actors_are_wait_exempt_leaves=True,
@@ -479,6 +590,10 @@ def _placement_contract(policy_intent: str) -> PlacementAcceptanceContract:
         roots_equal_live_highest_ranked_eligible=optimized,
         internal_assignment_uses_live_evidence_ranking=True,
         influential_order_source="live_accepted_evidence_ranking",
+        only_hard_cohort_is_wait_exempt=tiered,
+        all_worse_replicas_are_physical_leaves=optimized_tiered,
+        root_and_internal_roles_are_fast_only=optimized_tiered,
+        roots_equal_live_top_q_fast_replicas=optimized_tiered,
     )
 
 
@@ -725,15 +840,29 @@ def _replica_argv_templates(
     slot: FactorialSlot,
     main_config: ConfigContract,
     structured_events: StructuredEventContract,
+    tiered: TieredCohortContract | None,
 ) -> tuple[ReplicaProcessSpec, ...]:
     actors = ",".join(map(str, slot.byzantine_actor_ids))
     window_suffix = {
         "rotating_intermittent_omission_v1": "rotating-omission-v1",
         "persistent_selected_omission_v1": "persistent-omission-v1",
+        "tiered_persistent_responsive_omission_v1": (
+            "tiered-responsive-omission-v1"
+        ),
     }.get(slot.byzantine.mode)
     if window_suffix is None:
         raise FactorialManifestError("unknown Byzantine omission mode")
     window_id = f"{slot.block_id}-{window_suffix}"
+    tiered_arguments = (
+        (
+            "--experiment-responsive-degraded-omission-actors",
+            ",".join(map(str, tiered.responsive_degraded_actor_ids)),
+            "--experiment-responsive-omission-period",
+            str(tiered.responsive_omission_period),
+        )
+        if tiered is not None
+        else ()
+    )
     result: list[ReplicaProcessSpec] = []
     for replica_id in range(slot.replica_count):
         argv = (
@@ -759,8 +888,9 @@ def _replica_argv_templates(
             window_id,
             "--experiment-rotating-omission-actors",
             actors,
+            *tiered_arguments,
             "--experiment-byzantine-max-omissions-per-proposal",
-            str(slot.byzantine.max_omissions_per_proposal),
+            str(slot.maximum_omissions_per_proposal),
             "--experiment-rotating-omission-context-limit",
             str(slot.byzantine.maximum_rotating_contexts),
         )
@@ -784,6 +914,7 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
     main_config = _main_config(slot)
     structured_events = _structured_events(slot)
     process_logs = _process_logs(slot)
+    tiered_cohorts = _tiered_cohort_contract(slot)
     identity = {
         "arm_code": slot.arm_code,
         "block_id": slot.block_id,
@@ -791,6 +922,23 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
         "slot_id": slot.slot_id,
         "slot_nonce": slot.slot_nonce,
     }
+    if tiered_cohorts is not None:
+        identity.update(
+            {
+                "byzantine_mode": slot.byzantine.mode,
+                "hard_actor_ids": slot.byzantine_actor_ids,
+                "responsive_degraded_actor_ids": (
+                    slot.responsive_degraded_actor_ids
+                ),
+                "fast_replica_ids": slot.fast_replica_ids,
+                "max_omissions_per_proposal": (
+                    slot.maximum_omissions_per_proposal
+                ),
+                "responsive_omission_period": (
+                    tiered_cohorts.responsive_omission_period
+                ),
+            }
+        )
     return SlotRuntimeSpec(
         schema_version=1,
         artifact_id=f"slot-runtime-{_digest(identity)[:24]}",
@@ -810,14 +958,19 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
         candidate_fanouts=slot.candidate_fanouts,
         pipeline_stretch=slot.pipeline_stretch,
         actor_ids=slot.byzantine_actor_ids,
+        tiered_cohorts=tiered_cohorts,
         result_path=slot.result_path,
         responsiveness_policy=slot.responsiveness_policy,
         fault_window=_fault_window(slot),
         cutoff_contract=_cutoff_contract(slot),
         shape_invocation=_shape_invocation(slot),
         causal_acceptance=_causal_acceptance(),
-        epoch1_placement=_placement_contract(epoch1_policy),
-        epoch2_placement=_placement_contract(epoch2_policy),
+        epoch1_placement=_placement_contract(
+            epoch1_policy, tiered=tiered_cohorts is not None
+        ),
+        epoch2_placement=_placement_contract(
+            epoch2_policy, tiered=tiered_cohorts is not None
+        ),
         transition_sequence=_transition_sequence(slot),
         transitions=transitions,
         main_config=main_config,
@@ -827,7 +980,7 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             slot, transitions, structured_events
         ),
         replica_argv_templates=_replica_argv_templates(
-            slot, main_config, structured_events
+            slot, main_config, structured_events, tiered_cohorts
         ),
     )
 
@@ -1132,6 +1285,113 @@ def runtime_preflight(
             raise FactorialManifestError(
                 f"slot has an invalid transition contract: {slot.slot_id}"
             )
+        tiered = slot.tiered_cohorts
+        if tiered is not None:
+            hard = tiered.hard_actor_ids
+            degraded = tiered.responsive_degraded_actor_ids
+            worse = frozenset((*hard, *degraded))
+            expected_fast = tuple(
+                member
+                for member in range(slot.replica_count)
+                if member not in worse
+            )
+            optimized = slot.arm_code in {"P", "PS"}
+            exact_n7_smoke = (
+                slot.slot_id == "smoke-n7-f2-PS"
+                and slot.block_id == "n7-f2-smoke-b01"
+                and slot.replica_count == 7
+                and slot.f == 2
+                and slot.q == 5
+                and slot.arm_code == "PS"
+            )
+            expected_hard_count = 1 if exact_n7_smoke else 3
+            expected_cohorts = derive_tiered_cohorts(
+                slot.replica_count,
+                slot.q,
+                expected_hard_count,
+                slot.scientific_seed,
+            )
+            if (
+                tiered.mode != "tiered_persistent_responsive_omission_v1"
+                or hard != slot.actor_ids
+                or len(hard) != expected_hard_count
+                or hard != expected_cohorts.hard_actor_ids
+                or degraded != expected_cohorts.responsive_degraded_actor_ids
+                or tiered.fast_replica_ids != expected_cohorts.fast_replica_ids
+                or len(degraded) != slot.f - len(hard)
+                or len(worse) != slot.f
+                or tiered.fast_replica_ids != expected_fast
+                or len(expected_fast) != slot.q
+                or 0 not in expected_fast
+                or any(actor < slot.q for actor in hard)
+                or any(actor < 1 or actor >= slot.q for actor in degraded)
+                or tiered.responsive_omission_period != 32
+                or tiered.max_omissions_per_proposal != slot.f
+                or not tiered.hard_cohort_wait_exempt
+                or tiered.responsive_degraded_cohort_wait_exempt
+                or tiered.observer_isolation
+                != "replica_0_reserved_authoritative_commit_observer_v1"
+                or not tiered.tiered_marker_schedule_required
+                or not tiered.responsive_degraded_rank_below_every_fast_replica
+                or not tiered.epoch1_responsive_degraded_are_roots
+                or not tiered.epoch1_responsive_degraded_internal_role_exposure_required
+                or not slot.epoch1_placement.only_hard_cohort_is_wait_exempt
+                or slot.epoch1_placement.all_worse_replicas_are_physical_leaves
+                or slot.epoch1_placement.root_and_internal_roles_are_fast_only
+                or slot.epoch1_placement.roots_equal_live_top_q_fast_replicas
+                or not slot.epoch2_placement.only_hard_cohort_is_wait_exempt
+                or slot.epoch2_placement.all_worse_replicas_are_physical_leaves
+                is not optimized
+                or slot.epoch2_placement.root_and_internal_roles_are_fast_only
+                is not optimized
+                or slot.epoch2_placement.roots_equal_live_top_q_fast_replicas
+                is not optimized
+            ):
+                raise FactorialManifestError(
+                    f"slot has an invalid tiered cohort contract: {slot.slot_id}"
+                )
+            hard_csv = ",".join(map(str, hard))
+            degraded_csv = ",".join(map(str, degraded))
+            for process in slot.replica_argv_templates:
+                argv = process.argv
+                if (
+                    argv.count("--experiment-rotating-omission-actors") != 1
+                    or argv[
+                        argv.index("--experiment-rotating-omission-actors") + 1
+                    ]
+                    != hard_csv
+                    or argv.count(
+                        "--experiment-responsive-degraded-omission-actors"
+                    )
+                    != 1
+                    or argv[
+                        argv.index(
+                            "--experiment-responsive-degraded-omission-actors"
+                        )
+                        + 1
+                    ]
+                    != degraded_csv
+                    or argv.count("--experiment-responsive-omission-period")
+                    != 1
+                    or argv[
+                        argv.index("--experiment-responsive-omission-period") + 1
+                    ]
+                    != "32"
+                    or argv.count(
+                        "--experiment-byzantine-max-omissions-per-proposal"
+                    )
+                    != 1
+                    or argv[
+                        argv.index(
+                            "--experiment-byzantine-max-omissions-per-proposal"
+                        )
+                        + 1
+                    ]
+                    != str(slot.f)
+                ):
+                    raise FactorialManifestError(
+                        f"slot tiered replica argv drifted: {slot.slot_id}"
+                    )
         if (
             policy.minimum_attempts > policy.attempt_window
             or not 0 <= policy.minimum_response_rate_ppm <= 1_000_000
@@ -1296,6 +1556,7 @@ __all__ = (
     "SlotRuntimeSpec",
     "SmokeMetadata",
     "StructuredEventContract",
+    "TieredCohortContract",
     "TransitionContract",
     "TransitionRequestContract",
     "TransitionSequenceContract",
