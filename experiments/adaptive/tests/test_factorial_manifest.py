@@ -15,6 +15,8 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
     FROZEN_PLAN_SHA256,
+    V2_MANIFEST_ID,
+    V2_MANIFEST_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -31,6 +33,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
+)
+V2_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
 )
 LEGACY_MANIFEST_PATH = (
@@ -63,6 +68,7 @@ def test_loader_binds_the_exact_duplicate_free_manifest_bytes(tmp_path: Path) ->
     assert hashlib.sha256(MANIFEST_PATH.read_bytes()).hexdigest() == (
         FROZEN_MANIFEST_SHA256
     )
+    assert manifest.evidence_snapshot_format == "digest_commitment_v2"
 
     changed = tmp_path / "changed.json"
     changed.write_bytes(MANIFEST_PATH.read_bytes() + b"\n")
@@ -245,7 +251,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v2/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v3/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -540,6 +546,18 @@ def test_manifest_preserves_not_started_slots() -> None:
     ]
 
     with pytest.raises(FactorialManifestError, match="unstarted"):
+        parse_manifest_bytes(_encoded(document))
+
+
+def test_compact_snapshot_format_is_frozen_and_v2_remains_loadable() -> None:
+    legacy_v2 = load_frozen_manifest(V2_MANIFEST_PATH)
+    assert legacy_v2.manifest_id == V2_MANIFEST_ID
+    assert legacy_v2.manifest_sha256 == V2_MANIFEST_SHA256
+    assert legacy_v2.evidence_snapshot_format == "full_prefix_v1"
+
+    document = _mutable_document()
+    document["artifacts"]["evidence_snapshot_format"] = "full_prefix_v1"  # type: ignore[index]
+    with pytest.raises(FactorialManifestError, match="digest_commitment_v2"):
         parse_manifest_bytes(_encoded(document))
 
 

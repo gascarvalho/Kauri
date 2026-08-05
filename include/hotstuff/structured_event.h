@@ -22,6 +22,7 @@ namespace hotstuff
 {
 
 constexpr std::uint32_t kStructuredEventSchemaVersion = 1;
+constexpr std::uint32_t kAdaptiveV2EvidenceSnapshotSchemaVersion = 2;
 
 enum class StructuredEventSourceKind : std::uint8_t
 {
@@ -158,22 +159,11 @@ struct AdaptiveV2ConvergenceStructuredEvent
     std::string failure_reason;
 };
 
-/** One accepted exact-predecessor observation in a manager evidence snapshot. */
-struct AdaptiveV2EvidenceSnapshotObservation
-{
-    uint256_t observation_id;
-    std::uint64_t ingestion_sequence{0};
-    std::uint32_t epoch_number{0};
-    uint256_t epoch_digest;
-    ReplicaID reporter_id{0};
-    ReplicaID target_id{0};
-    ResponseOutcome outcome{ResponseOutcome::on_time};
-    std::optional<std::uint64_t> latency_ns;
-};
-
-/** Immutable accepted-evidence prefix that caused one explicit transition. */
+/** Bounded commitment to the accepted evidence that caused one transition. */
 struct AdaptiveV2EvidenceSnapshotStructuredEvent
 {
+    std::uint32_t schema_version{
+        kAdaptiveV2EvidenceSnapshotSchemaVersion};
     std::uint64_t cycle_ordinal{0};
     TreePolicyKind policy_intent{
         TreePolicyKind::performance_optimization};
@@ -183,7 +173,11 @@ struct AdaptiveV2EvidenceSnapshotStructuredEvent
     std::uint64_t activation_generation{0};
     std::uint64_t baseline_cutoff{0};
     std::uint64_t current_cutoff{0};
-    std::vector<AdaptiveV2EvidenceSnapshotObservation> observations;
+    /** Digest over every accepted predecessor record through current_cutoff. */
+    uint256_t full_prefix_snapshot_id;
+    /** Selection digest carried by the signed successor epoch definition. */
+    uint256_t evidence_snapshot_id;
+    std::uint64_t accepted_prefix_count{0};
     std::vector<ReplicaID> eligible_ranking;
 };
 

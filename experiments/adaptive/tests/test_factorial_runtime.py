@@ -33,6 +33,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
+)
+V2_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
 )
 
@@ -685,3 +688,16 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
     assert "authorized" in refusal["reason"] or "receipt" in refusal["reason"]
+
+
+def test_cli_defaults_to_v3_and_refuses_v2_production(capsys) -> None:
+    assert run_shape_factorial_campaign.DEFAULT_MANIFEST == MANIFEST_PATH
+    assert (
+        run_shape_factorial_campaign.main(
+            ["--manifest", str(V2_MANIFEST_PATH), "plan"]
+        )
+        == 2
+    )
+    refusal = json.loads(capsys.readouterr().err)
+    assert refusal["status"] == "REJECT"
+    assert "v1 and v2 are validation-only" in refusal["reason"]

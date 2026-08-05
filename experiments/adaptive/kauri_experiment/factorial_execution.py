@@ -2893,12 +2893,29 @@ def build_n7_ps_smoke_slot(
     peer_base: int = 45_100,
     client_base: int = 46_100,
     manager_port: int = 47_100,
-    result_path: str = "results/shape-placement-factorial-v2-smoke/smoke-n7-f2-PS",
+    result_path: str | None = None,
 ) -> N7SmokeSlot:
     """Derive the excluded N=7, f=2, k=2, fanout-two PS smoke."""
 
     if not isinstance(template, FactorialSlot):
         raise FactorialExecutionError("N=7 smoke requires one frozen slot template")
+    if result_path is None:
+        template_path = Path(template.result_path)
+        if (
+            template_path.is_absolute()
+            or ".." in template_path.parts
+            or len(template_path.parts) < 3
+            or template_path.parent.name == ""
+        ):
+            raise FactorialExecutionError(
+                "N=7 smoke template result path is not an exact relative slot path"
+            )
+        campaign_root = template_path.parent
+        result_path = str(
+            campaign_root.parent
+            / f"{campaign_root.name}-smoke"
+            / "smoke-n7-f2-PS"
+        )
     consensus = derive_consensus_shape(
         7,
         initial_fanout=2,

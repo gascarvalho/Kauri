@@ -59,6 +59,9 @@ from .factorial_manifest import (
     LEGACY_MANIFEST_ID,
     LEGACY_MANIFEST_SHA256,
     LEGACY_PLAN_SHA256,
+    V2_MANIFEST_ID,
+    V2_MANIFEST_SHA256,
+    V2_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -90,11 +93,17 @@ MANAGER_EVENTS_FILENAME = "raw/adaptive-manager.jsonl"
 REPLICA_EVENTS_PATTERN = "raw/replica-{replica_id}.jsonl"
 REPLICA_STDERR_PATTERN = "raw/process/replica-{replica_id}.stderr.log"
 EXCLUDED_SMOKE_SLOT_ID = "smoke-n7-f2-PS"
-FROZEN_RUNTIME_SHA256 = (
+V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V2_SMOKE_RUNTIME_SHA256 = (
     "2be6930b5770b5bbe4991673675a1f1d8443d3526c388b744b601c59e9216a37"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "ff62f12a584b5345e0043a3cf1d9567a2264261bafe25dec5bb9afe079513b92"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "4e4231b3cd487549da5e468aafc67cefbc11c39459b79dcb37a679225d360c85"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -214,6 +223,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=LEGACY_PLAN_SHA256,
             runtime_sha256=LEGACY_RUNTIME_SHA256,
             smoke_runtime_sha256=LEGACY_SMOKE_RUNTIME_SHA256,
+        ),
+        V2_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V2_MANIFEST_ID,
+            manifest_sha256=V2_MANIFEST_SHA256,
+            plan_sha256=V2_PLAN_SHA256,
+            runtime_sha256=V2_RUNTIME_SHA256,
+            smoke_runtime_sha256=V2_SMOKE_RUNTIME_SHA256,
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -1684,7 +1700,7 @@ def _validate_runtime_slot(
         "drain_margin_s": manifest.common_timers.drain_margin_s,
         "hard_timeout_s": manifest.common_timers.hard_timeout_s,
     }
-    if manifest.manifest_id == FROZEN_MANIFEST_ID:
+    if manifest.manifest_id in {V2_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         expected_fault_window["transition_observation_bound_rule"] = (
             "shared_slot_hard_deadline_until_manager_selection_v1"
         )
@@ -2018,7 +2034,10 @@ def _evidence_record(event: _NativeEvent, membership: set[int]) -> _EvidenceReco
 
 
 def _accepted_evidence(
-    manager_events: Sequence[_NativeEvent], replica_count: int
+    manager_events: Sequence[_NativeEvent],
+    replica_count: int,
+    *,
+    allow_ingestion_sequence_gaps: bool = False,
 ) -> dict[tuple[int, str], tuple[_EvidenceRecord, ...]]:
     membership = set(range(replica_count))
     grouped: dict[tuple[int, str], list[_EvidenceRecord]] = defaultdict(list)
@@ -2042,7 +2061,13 @@ def _accepted_evidence(
         )
     for epoch_id, records in grouped.items():
         sequences = tuple(record.ingestion_sequence for record in records)
-        if sequences != tuple(range(1, len(records) + 1)):
+        if allow_ingestion_sequence_gaps:
+            if any(left >= right for left, right in zip(sequences, sequences[1:])):
+                _fail(
+                    f"accepted evidence for epoch {epoch_id[0]} is not "
+                    "strictly increasing"
+                )
+        elif sequences != tuple(range(1, len(records) + 1)):
             _fail(f"accepted evidence for epoch {epoch_id[0]} is non-contiguous")
         attempts: dict[str, _EvidenceRecord] = {}
         for record in records:
@@ -2076,9 +2101,15 @@ def _snapshot_records(
     baseline_cutoff: int,
     current_cutoff: int,
     suffix_only: bool,
+    allow_high_watermark_gaps: bool = False,
 ) -> tuple[_EvidenceRecord, ...]:
     prefix = tuple(record for record in records if record.ingestion_sequence <= current_cutoff)
-    if not prefix or prefix[-1].ingestion_sequence != current_cutoff:
+    if not prefix:
+        _fail("evidence snapshot contains no accepted prefix")
+    if (
+        not allow_high_watermark_gaps
+        and prefix[-1].ingestion_sequence != current_cutoff
+    ):
         _fail("evidence snapshot cutoff is not an exact accepted prefix")
     if not suffix_only:
         return prefix
@@ -4631,6 +4662,79 @@ def _expected_snapshot_payload_observations(
     return result
 
 
+_SNAPSHOT_AUDIT_COMMON_FIELDS = frozenset(
+    {
+        "cycle_ordinal",
+        "policy_intent",
+        "transition_artifact_id",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "activation_generation",
+        "baseline_cutoff",
+        "current_cutoff",
+        "eligible_ranking",
+    }
+)
+_COMPACT_SNAPSHOT_AUDIT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "full_prefix_snapshot_id",
+        "evidence_snapshot_id",
+        "accepted_prefix_count",
+    }
+)
+
+
+def _validate_snapshot_audit_schema(
+    snapshot: Mapping[str, Any],
+    *,
+    evidence_snapshot_format: str,
+    label: str,
+) -> bool:
+    if evidence_snapshot_format == "digest_commitment_v2":
+        compact = True
+        expected = _SNAPSHOT_AUDIT_COMMON_FIELDS | _COMPACT_SNAPSHOT_AUDIT_FIELDS
+    elif evidence_snapshot_format == "full_prefix_v1":
+        compact = False
+        expected = _SNAPSHOT_AUDIT_COMMON_FIELDS | {"observations"}
+    else:
+        _fail("manifest names an unsupported evidence snapshot format")
+    _fields(snapshot, set(expected), label)
+    if compact and snapshot["schema_version"] != 2:
+        _fail(f"{label} compact schema version is not 2")
+    return compact
+
+
+def _validate_compact_snapshot_commitments(
+    snapshot: Mapping[str, Any],
+    *,
+    accepted_prefix_count: int,
+    current_cutoff: int,
+    full_prefix_snapshot_id: str,
+    evidence_snapshot_id: str,
+) -> None:
+    recorded_count = _integer(
+        snapshot["accepted_prefix_count"],
+        "snapshot accepted prefix count",
+        1,
+    )
+    if recorded_count != accepted_prefix_count or recorded_count > current_cutoff:
+        _fail("snapshot accepted prefix count differs from accepted raw evidence")
+    if (
+        _digest(
+            snapshot["full_prefix_snapshot_id"],
+            "snapshot full-prefix commitment",
+        )
+        != full_prefix_snapshot_id
+        or _digest(
+            snapshot["evidence_snapshot_id"],
+            "snapshot selected-evidence commitment",
+        )
+        != evidence_snapshot_id
+    ):
+        _fail("compact snapshot commitments do not recompute from raw evidence")
+
+
 def _expected_roots(
     *,
     predecessor_trees: Sequence[Tree],
@@ -4983,11 +5087,13 @@ def _validate_adaptation_cycles(
     manager_events: Sequence[_NativeEvent],
     accepted: Mapping[tuple[int, str], Sequence[_EvidenceRecord]],
     runtime: Mapping[str, Any],
+    manifest: FrozenFactorialManifest,
     expected: _ExpectedSlot,
     initial_epoch_digest: str,
     initial_trees: Sequence[Tree],
     cutoff_times: Mapping[str, int],
 ) -> tuple[DecodedBundle, DecodedBundle]:
+    compact_snapshot = manifest.evidence_snapshot_format == "digest_commitment_v2"
     issuer_payload = _read_bytes(slot_root, "runtime/issuer-identities.txt")
     assert issuer_payload is not None
     issuer_public_key = _identity_rows(
@@ -5030,22 +5136,12 @@ def _validate_adaptation_cycles(
 
         snapshot_event = snapshot_events[cycle]
         snapshot = snapshot_event.payload
-        _fields(
+        if _validate_snapshot_audit_schema(
             snapshot,
-            {
-                "cycle_ordinal",
-                "policy_intent",
-                "transition_artifact_id",
-                "predecessor_epoch_number",
-                "predecessor_epoch_digest",
-                "activation_generation",
-                "baseline_cutoff",
-                "current_cutoff",
-                "observations",
-                "eligible_ranking",
-            },
-            f"cycle-{cycle} evidence snapshot",
-        )
+            evidence_snapshot_format=manifest.evidence_snapshot_format,
+            label=f"cycle-{cycle} evidence snapshot",
+        ) != compact_snapshot:
+            _fail("manifest evidence snapshot format changed within a slot")
         intent = _string(request.get("policy_intent"), "transition policy intent")
         baseline_cutoff = _integer(snapshot["baseline_cutoff"], "snapshot baseline cutoff", 1)
         current_cutoff = _integer(snapshot["current_cutoff"], "snapshot current cutoff", 1)
@@ -5077,8 +5173,11 @@ def _validate_adaptation_cycles(
             baseline_cutoff=baseline_cutoff,
             current_cutoff=current_cutoff,
             suffix_only=False,
+            allow_high_watermark_gaps=compact_snapshot,
         )
-        if snapshot["observations"] != _expected_snapshot_payload_observations(
+        if not compact_snapshot and snapshot[
+            "observations"
+        ] != _expected_snapshot_payload_observations(
             full_prefix, current_cutoff
         ):
             _fail("snapshot audit observations differ from accepted raw evidence")
@@ -5099,6 +5198,7 @@ def _validate_adaptation_cycles(
             baseline_cutoff=baseline_cutoff,
             current_cutoff=current_cutoff,
             suffix_only=suffix_only,
+            allow_high_watermark_gaps=compact_snapshot,
         )
         policy = _mapping(runtime.get("responsiveness_policy"), "runtime responsiveness policy")
         scores = _score_snapshot(selected_records, expected.replica_count, policy)
@@ -5124,6 +5224,22 @@ def _validate_adaptation_cycles(
             cutoff=current_cutoff,
             policy=policy,
         )
+        computed_full_prefix_snapshot_id = _snapshot_id(
+            full_prefix,
+            replica_count=expected.replica_count,
+            epoch_number=cycle,
+            epoch_digest=predecessor_digest,
+            cutoff=current_cutoff,
+            policy=policy,
+        )
+        if compact_snapshot:
+            _validate_compact_snapshot_commitments(
+                snapshot,
+                accepted_prefix_count=len(full_prefix),
+                current_cutoff=current_cutoff,
+                full_prefix_snapshot_id=computed_full_prefix_snapshot_id,
+                evidence_snapshot_id=computed_snapshot_id,
+            )
         if (
             bundle.evidence_snapshot_id != computed_snapshot_id
             or bundle.evidence_cutoff != current_cutoff
@@ -5351,12 +5467,19 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         )
 
         initial_epoch_digest, initial_trees = _initial_epoch(expected)
-        accepted = _accepted_evidence(manager_events, expected.replica_count)
+        accepted = _accepted_evidence(
+            manager_events,
+            expected.replica_count,
+            allow_ingestion_sequence_gaps=(
+                manifest.evidence_snapshot_format == "digest_commitment_v2"
+            ),
+        )
         bundles = _validate_adaptation_cycles(
             slot_root=slot_root,
             manager_events=manager_events,
             accepted=accepted,
             runtime=runtime,
+            manifest=manifest,
             expected=expected,
             initial_epoch_digest=initial_epoch_digest,
             initial_trees=initial_trees,

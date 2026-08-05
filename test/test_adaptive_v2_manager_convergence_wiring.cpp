@@ -871,7 +871,8 @@ TEST_CASE(
         snapshot,
         {"session_.ingress()",
          "ledger.accepted()",
-         "bundle.definition().trees",
+         "definition.evidence_snapshot_id",
+         "definition.trees",
          "serialize_adaptive_v2_evidence_snapshot_payload(",
          "structured_event_sink_.emit_audit(",
          "structured_event_sink_.health()",
@@ -881,6 +882,21 @@ TEST_CASE(
     CHECK(snapshot.find("observation.configuration.epoch_number") !=
           std::string::npos);
     CHECK(snapshot.find("observation.configuration.epoch_digest") !=
+          std::string::npos);
+    CHECK(snapshot.find("accepted_prefix_count") !=
+          std::string::npos);
+    CHECK(snapshot.find("has_post_baseline_observation") !=
+          std::string::npos);
+    CHECK(snapshot.find("build_adaptation_snapshot(") !=
+          std::string::npos);
+    CHECK(snapshot.find("full_prefix_snapshot_id") !=
+          std::string::npos);
+    CHECK(snapshot.find("const auto &definition = bundle.definition()") !=
+          std::string::npos);
+    CHECK(snapshot.find("definition.evidence_snapshot_id") !=
+          std::string::npos);
+    CHECK(snapshot.find("event.observations") == std::string::npos);
+    CHECK(snapshot.find("AdaptiveV2EvidenceSnapshotObservation") ==
           std::string::npos);
     CHECK(snapshot.find("tree.members_breadth_first.front()") !=
           std::string::npos);
@@ -942,6 +958,9 @@ TEST_CASE(
               "AdaptiveV2EvidenceSnapshotStructuredEvent") !=
           std::string::npos);
     CHECK(header.find(
+              "AdaptiveV2EvidenceSnapshotObservation") ==
+          std::string::npos);
+    CHECK(header.find(
               "serialize_adaptive_v2_evidence_snapshot_payload") !=
           std::string::npos);
     CHECK(implementation.find("adaptive_v2_evidence_snapshot") !=
@@ -965,27 +984,25 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "manager gives exact evidence snapshots one shared bounded line capacity",
+    "manager keeps compact snapshots within the default line capacity",
     "[adaptive-v2][manager][snapshot][structured-event][wiring]")
 {
     const auto manager = code_without_comments_or_literals(
         source("examples/adaptation_manager.cpp"));
 
     CHECK(manager.find(
-              "kManagerStructuredEventMaximumLineBytes") !=
+              "kManagerStructuredEventMaximumLineBytes") ==
           std::string::npos);
     CHECK(manager.find(
-              "StructuredEventLimits{}.maximum_queued_bytes") !=
+              "StructuredEventLimits{}.maximum_queued_bytes") ==
           std::string::npos);
 
     const auto config = function_body(
         manager,
         "hotstuff::StructuredEventConfig manager_structured_event_config(");
     REQUIRE_FALSE(config.empty());
-    CHECK(without_whitespace(config).find(
-              "limits.maximum_line_bytes="
-              "kManagerStructuredEventMaximumLineBytes") !=
-          std::string::npos);
+    CHECK(config.find("maximum_line_bytes") == std::string::npos);
+    CHECK(config.find("maximum_queued_bytes") == std::string::npos);
 
     const auto snapshot = function_body(
         manager, "void emit_evidence_snapshot(");
@@ -994,7 +1011,7 @@ TEST_CASE(
         "serialize_adaptive_v2_evidence_snapshot_payload(");
     REQUIRE(serialization != std::string::npos);
     CHECK(snapshot.find(
-              "kManagerStructuredEventMaximumLineBytes",
+              "StructuredEventLimits{}.maximum_line_bytes",
               serialization) != std::string::npos);
 }
 

@@ -109,8 +109,6 @@ constexpr double kConvergenceAckDrainSeconds = 1.1;
 constexpr std::size_t kMaximumTransitionRequestBytes = 16 * 1024;
 constexpr std::size_t kMaximumTransitionArtifactIdBytes = 128;
 constexpr std::size_t kMaximumTransitionPathBytes = 4096;
-constexpr std::size_t kManagerStructuredEventMaximumLineBytes =
-    hotstuff::StructuredEventLimits{}.maximum_queued_bytes;
 constexpr std::uint32_t kMaximumPredecessorResidencyMs = 3'600'000;
 constexpr opcode_t kCommittedObservationOpcode =
     MsgAdaptiveV2EpochChangeCommittedObservation::opcode;
@@ -909,9 +907,6 @@ std::string transition_bundle_output_path(
 hotstuff::StructuredEventConfig manager_structured_event_config(
     const ManagerOptions &options)
 {
-    auto limits = hotstuff::StructuredEventLimits{};
-    limits.maximum_line_bytes =
-        kManagerStructuredEventMaximumLineBytes;
     return hotstuff::StructuredEventConfig{
         options.structured_event_run_id,
         hotstuff::StructuredEventSource{
@@ -919,7 +914,7 @@ hotstuff::StructuredEventConfig manager_structured_event_config(
             "adaptive-manager",
             options.structured_event_source_instance},
         std::nullopt,
-        limits};
+        hotstuff::StructuredEventLimits{}};
 }
 
 const char *controller_status_name(
@@ -2252,8 +2247,14 @@ private:
         const auto &ingress = session_.ingress();
         const auto &predecessor = ingress.current_epoch();
         const auto &ledger = ingress.ledger();
+        const auto &definition = bundle.definition();
         if (request.predecessor_epoch_number !=
                 predecessor.epoch_number() ||
+            definition.previous_epoch_digest !=
+                predecessor.epoch_digest() ||
+            definition.evidence_cutoff !=
+                audit.current_evidence_cutoff ||
+            definition.evidence_snapshot_id.empty() ||
             audit.activation_generation !=
                 ingress.activation_generation() ||
             audit.baseline_evidence_cutoff == 0 ||
@@ -2280,9 +2281,12 @@ private:
         event.current_cutoff = audit.current_evidence_cutoff;
 
         std::uint64_t previous_ingestion_sequence = 0;
+        std::size_t accepted_prefix_count = 0;
+        bool has_post_baseline_observation = false;
         for (const auto &record : ledger.accepted())
         {
-            if (record.ingestion_sequence <=
+            if (record.ingestion_sequence == 0 ||
+                record.ingestion_sequence <=
                 previous_ingestion_sequence)
             {
                 throw std::logic_error(
@@ -2302,17 +2306,6 @@ private:
                     "evidence snapshot contains a mixed epoch");
             }
 
-            hotstuff::AdaptiveV2EvidenceSnapshotObservation snapshot;
-            snapshot.observation_id = observation.observation_id;
-            snapshot.ingestion_sequence = record.ingestion_sequence;
-            snapshot.epoch_number =
-                observation.configuration.epoch_number;
-            snapshot.epoch_digest =
-                observation.configuration.epoch_digest;
-            snapshot.reporter_id = observation.reporter_id;
-            snapshot.target_id =
-                observation.observed_replica_id;
-            snapshot.outcome = observation.outcome;
             if (observation.outcome == hotstuff::ResponseOutcome::timeout)
             {
                 if (observation.response_duration_us != 0)
@@ -2321,28 +2314,64 @@ private:
                         "timeout evidence has a response duration");
                 }
             }
-            else if (observation.response_duration_us != 0)
-            {
-                if (observation.response_duration_us >
-                    std::numeric_limits<std::uint64_t>::max() / 1000)
-                {
-                    throw std::overflow_error(
-                        "evidence latency nanoseconds overflow");
-                }
-                snapshot.latency_ns =
-                    observation.response_duration_us * 1000;
-            }
             else if (observation.outcome ==
-                     hotstuff::ResponseOutcome::late)
+                         hotstuff::ResponseOutcome::late &&
+                     observation.response_duration_us == 0)
             {
                 throw std::logic_error(
                     "late evidence has no response duration");
             }
-            event.observations.push_back(std::move(snapshot));
+            ++accepted_prefix_count;
+            has_post_baseline_observation =
+                has_post_baseline_observation ||
+                record.ingestion_sequence > event.baseline_cutoff;
+        }
+        if (accepted_prefix_count == 0 ||
+            accepted_prefix_count > event.current_cutoff ||
+            !has_post_baseline_observation)
+        {
+            throw std::logic_error(
+                "evidence snapshot accepted prefix count is invalid");
+        }
+
+        const hotstuff::AcceptedEvidenceView full_prefix{
+            ledger.accepted().data(), accepted_prefix_count};
+        const auto full_prefix_snapshot =
+            hotstuff::build_adaptation_snapshot(
+                options_.membership,
+                hotstuff::AdaptationEpochId{
+                    event.predecessor_epoch_number,
+                    event.predecessor_epoch_digest},
+                full_prefix,
+                event.current_cutoff,
+                options_.responsiveness_policy,
+                kSnapshotSeed);
+        if (full_prefix_snapshot.accepted_record_count() !=
+                accepted_prefix_count ||
+            full_prefix_snapshot.evidence_cutoff() !=
+                event.current_cutoff)
+        {
+            throw std::logic_error(
+                "full evidence prefix snapshot is inconsistent");
+        }
+        event.full_prefix_snapshot_id = hotstuff::uint256_t(parse_hex(
+            full_prefix_snapshot.snapshot_id(),
+            "full prefix evidence snapshot id",
+            64));
+        event.evidence_snapshot_id = hotstuff::uint256_t(parse_hex(
+            definition.evidence_snapshot_id,
+            "selected evidence snapshot id",
+            64));
+        event.accepted_prefix_count = accepted_prefix_count;
+        if (event.full_prefix_snapshot_id == hotstuff::uint256_t{} ||
+            event.evidence_snapshot_id == hotstuff::uint256_t{})
+        {
+            throw std::logic_error(
+                "evidence snapshot commitment is zero");
         }
 
         std::set<ReplicaID> eligible_leaders;
-        for (const auto &tree : bundle.definition().trees)
+        for (const auto &tree : definition.trees)
         {
             if (tree.members_breadth_first.empty() ||
                 !eligible_leaders.insert(
@@ -2358,7 +2387,7 @@ private:
         auto canonical_payload =
             hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
                 event,
-                kManagerStructuredEventMaximumLineBytes);
+                hotstuff::StructuredEventLimits{}.maximum_line_bytes);
         canonical_payload.push_back('\n');
         structured_event_sink_.emit_audit(
             hotstuff::AuditStructuredEventPayload{event});

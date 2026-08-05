@@ -19,14 +19,23 @@ LEGACY_SEMANTIC_SHA256 = (
 )
 LEGACY_PLAN_SHA256 = "e5e1acf5228446795810e8f2ad0ef2f9af25203a2a213a2a427b218f19907fb1"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v2"
-FROZEN_MANIFEST_SHA256 = (
+V2_MANIFEST_ID = "shape-placement-factorial-v2"
+V2_MANIFEST_SHA256 = (
     "ef1133f2d3b5204bdb8fd4be5ebd4990801b77e2aafa3b6a03cc5c262a40a8fd"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V2_SEMANTIC_SHA256 = (
     "5d10ff2498fb265b19c3990df87e06db212687d9a55585b37545b4dbeb2f96c9"
 )
-FROZEN_PLAN_SHA256 = "b17fb3fa654d44080ad52e01b24aeed8c38726e33149229d0f6e540dc7f97516"
+V2_PLAN_SHA256 = "b17fb3fa654d44080ad52e01b24aeed8c38726e33149229d0f6e540dc7f97516"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v3"
+FROZEN_MANIFEST_SHA256 = (
+    "5f741a08c104801d83e8d25668fd74a34ebb41f99421cba736843bae89b1ea01"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "63862ce82ddb651e35dffb20d81bdfa5af8e5803b169e3c27847ba3e0b96963c"
+)
+FROZEN_PLAN_SHA256 = "18d407a1b6c4a49a2246706c758a8b2ac152555cfcc11e09e1c3c07dbd979636"
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
 EXPECTED_CANDIDATE_FANOUTS = (2, 3, 5)
@@ -232,6 +241,7 @@ class FrozenFactorialManifest:
     canonical_plan_filename: str
     one_directory_per_slot: bool
     preserve_outcomes: tuple[str, ...]
+    evidence_snapshot_format: str
     resources: ResourceContract
     execution_mode: str
     automatic_retries: int
@@ -500,9 +510,14 @@ def rotating_omission_actor(
 
 def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
     manifest_id = document.get("manifest_id")
-    if manifest_id not in {LEGACY_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest_id not in {
+        LEGACY_MANIFEST_ID,
+        V2_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
-    persistent = manifest_id == FROZEN_MANIFEST_ID
+    persistent = manifest_id in {V2_MANIFEST_ID, FROZEN_MANIFEST_ID}
+    compact_snapshot = manifest_id == FROZEN_MANIFEST_ID
     replica_counts = tuple(
         _integer(item, f"replica_counts[{index}]")
         for index, item in enumerate(
@@ -885,11 +900,29 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         "INCOMPLETE",
     ]:
         _error("all terminal and unstarted slot outcomes must be preserved")
+    evidence_snapshot_format = artifacts.get(
+        "evidence_snapshot_format", "full_prefix_v1"
+    )
+    expected_snapshot_format = (
+        "digest_commitment_v2" if compact_snapshot else "full_prefix_v1"
+    )
+    if evidence_snapshot_format != expected_snapshot_format:
+        _error(
+            f"{manifest_id} requires evidence snapshot format "
+            f"{expected_snapshot_format}"
+        )
+    if compact_snapshot != ("evidence_snapshot_format" in artifacts):
+        _error(
+            "only shape-placement-factorial-v3 may carry the compact "
+            "snapshot format field"
+        )
 
     semantic_sha256 = hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
-    expected_semantic_sha256 = (
-        FROZEN_SEMANTIC_SHA256 if persistent else LEGACY_SEMANTIC_SHA256
-    )
+    expected_semantic_sha256 = {
+        LEGACY_MANIFEST_ID: LEGACY_SEMANTIC_SHA256,
+        V2_MANIFEST_ID: V2_SEMANTIC_SHA256,
+        FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
+    }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
         _error("manifest differs from the frozen semantic contract")
 
@@ -1052,6 +1085,9 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         canonical_plan_filename=artifacts["canonical_plan_filename"],
         one_directory_per_slot=artifacts["one_directory_per_slot"],
         preserve_outcomes=tuple(artifacts["preserve_outcomes"]),
+        evidence_snapshot_format=artifacts.get(
+            "evidence_snapshot_format", "full_prefix_v1"
+        ),
         resources=ResourceContract(
             minimum_free_bytes=resources["minimum_free_bytes"],
             minimum_free_bytes_interpretation=(
@@ -1076,6 +1112,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
     manifest = parse_manifest_bytes(payload)
     expected_sha256 = {
         LEGACY_MANIFEST_ID: LEGACY_MANIFEST_SHA256,
+        V2_MANIFEST_ID: V2_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -1338,9 +1375,15 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         != plan.global_worst_candidate_depth
     ):
         _error("common timer depth disagrees with the derived global depth")
+    expected_plan_identity = {
+        LEGACY_MANIFEST_ID: None,
+        V2_MANIFEST_ID: (V2_MANIFEST_SHA256, V2_PLAN_SHA256),
+        FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
+    }[manifest.manifest_id]
     if (
-        manifest.manifest_sha256 == FROZEN_MANIFEST_SHA256
-        and plan.plan_sha256 != FROZEN_PLAN_SHA256
+        expected_plan_identity is not None
+        and manifest.manifest_sha256 == expected_plan_identity[0]
+        and plan.plan_sha256 != expected_plan_identity[1]
     ):
         _error("canonical plan bytes differ from the frozen plan identity")
     return plan
@@ -1363,6 +1406,14 @@ __all__ = (
     "FROZEN_MANIFEST_SHA256",
     "FROZEN_PLAN_SHA256",
     "FROZEN_SEMANTIC_SHA256",
+    "LEGACY_MANIFEST_ID",
+    "LEGACY_MANIFEST_SHA256",
+    "LEGACY_PLAN_SHA256",
+    "LEGACY_SEMANTIC_SHA256",
+    "V2_MANIFEST_ID",
+    "V2_MANIFEST_SHA256",
+    "V2_PLAN_SHA256",
+    "V2_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",

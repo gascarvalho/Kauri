@@ -32,7 +32,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
+V2_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
+)
 LEGACY_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v1.json"
 )
@@ -144,9 +147,15 @@ def _slot_validation(
     )
 
 
+@pytest.mark.parametrize(
+    ("manifest_path", "version"),
+    ((LEGACY_MANIFEST, "v1"), (V2_MANIFEST, "v2")),
+)
 @pytest.mark.parametrize("command", ("plan", "preflight", "smoke", "run"))
-def test_legacy_manifest_is_validation_only_before_any_result_claim(
+def test_prior_manifest_is_validation_only_before_any_result_claim(
     command: str,
+    manifest_path: Path,
+    version: str,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -154,7 +163,7 @@ def test_legacy_manifest_is_validation_only_before_any_result_claim(
     arguments = [
         command,
         "--manifest",
-        str(LEGACY_MANIFEST),
+        str(manifest_path),
         "--repository",
         str(repository),
     ]
@@ -166,13 +175,15 @@ def test_legacy_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1 is validation-only; "
-            "plan, preflight, smoke, and run require shape-placement-factorial-v2"
+            "shape-placement-factorial-v1 and v2 are validation-only; "
+            "plan, preflight, smoke, and run require shape-placement-factorial-v3"
         ),
         "status": "REJECT",
     }
-    assert not (repository / "results/shape-placement-factorial-v1").exists()
-    assert not (repository / "results/shape-placement-factorial-v1-smoke").exists()
+    assert not (repository / f"results/shape-placement-factorial-{version}").exists()
+    assert not (
+        repository / f"results/shape-placement-factorial-{version}-smoke"
+    ).exists()
 
 
 def test_legacy_validate_smoke_uses_preserved_artifacts_without_rederiving(
@@ -286,7 +297,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v2").exists()
+    assert not (repository / "results/shape-placement-factorial-v3").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -311,7 +322,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v2").exists()
+    assert not (repository / "results/shape-placement-factorial-v3").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -337,7 +348,7 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v2-smoke"
+        repository / "results/shape-placement-factorial-v3-smoke"
     ).exists()
 
 
@@ -373,7 +384,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v2-smoke"
+        repository / "results/shape-placement-factorial-v3-smoke"
     ).exists()
 
 
@@ -433,7 +444,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v2-smoke"
+        / "results/shape-placement-factorial-v3-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"

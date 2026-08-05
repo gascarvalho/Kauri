@@ -779,7 +779,9 @@ bool valid_evidence_snapshot_payload(
         packed_generation & std::numeric_limits<std::uint32_t>::max());
     const auto expected_generation = checked_activation_generation(
         event.predecessor_epoch_number, rotation_ordinal);
-    if (tree_policy_kind_name(event.policy_intent) == nullptr ||
+    if (event.schema_version !=
+            kAdaptiveV2EvidenceSnapshotSchemaVersion ||
+        tree_policy_kind_name(event.policy_intent) == nullptr ||
         event.transition_artifact_id.empty() ||
         !valid_utf8(event.transition_artifact_id) ||
         event.predecessor_epoch_digest == uint256_t{} ||
@@ -787,47 +789,15 @@ bool valid_evidence_snapshot_payload(
         event.activation_generation != *expected_generation ||
         event.baseline_cutoff == 0 ||
         event.current_cutoff <= event.baseline_cutoff ||
-        event.observations.empty() ||
-        event.observations.size() >
-            kMaximumAdaptationEvidenceRecords ||
+        event.full_prefix_snapshot_id == uint256_t{} ||
+        event.evidence_snapshot_id == uint256_t{} ||
+        event.accepted_prefix_count == 0 ||
+        event.accepted_prefix_count > event.current_cutoff ||
         event.eligible_ranking.empty() ||
         event.eligible_ranking.size() > kMaximumTreePolicyTrees)
     {
         return false;
     }
-
-    bool has_post_baseline_observation = false;
-    std::uint64_t previous_ingestion_sequence = 0;
-    for (const auto &observation : event.observations)
-    {
-        if (observation.observation_id == uint256_t{} ||
-            observation.ingestion_sequence == 0 ||
-            observation.ingestion_sequence <=
-                previous_ingestion_sequence ||
-            observation.ingestion_sequence > event.current_cutoff ||
-            observation.epoch_number !=
-                event.predecessor_epoch_number ||
-            observation.epoch_digest !=
-                event.predecessor_epoch_digest ||
-            observation.reporter_id == observation.target_id ||
-            response_outcome_name(observation.outcome) == nullptr ||
-            (observation.latency_ns.has_value() &&
-             *observation.latency_ns == 0) ||
-            (observation.outcome == ResponseOutcome::timeout &&
-             observation.latency_ns.has_value()) ||
-            (observation.outcome == ResponseOutcome::late &&
-             !observation.latency_ns.has_value()))
-        {
-            return false;
-        }
-        previous_ingestion_sequence =
-            observation.ingestion_sequence;
-        has_post_baseline_observation =
-            has_post_baseline_observation ||
-            observation.ingestion_sequence > event.baseline_cutoff;
-    }
-    if (!has_post_baseline_observation)
-        return false;
 
     for (std::size_t index = 0;
          index < event.eligible_ranking.size();
@@ -1360,7 +1330,9 @@ void append_evidence_snapshot_payload(
     JsonLineBuilder &builder,
     const AdaptiveV2EvidenceSnapshotStructuredEvent &event)
 {
-    builder.append("{\"cycle_ordinal\":");
+    builder.append("{\"schema_version\":");
+    builder.append_integer(event.schema_version);
+    builder.append(",\"cycle_ordinal\":");
     builder.append_integer(event.cycle_ordinal);
     builder.append(",\"policy_intent\":");
     builder.append_escaped(tree_policy_kind_name(event.policy_intent));
@@ -1376,36 +1348,14 @@ void append_evidence_snapshot_payload(
     builder.append_integer(event.baseline_cutoff);
     builder.append(",\"current_cutoff\":");
     builder.append_integer(event.current_cutoff);
-    builder.append(",\"observations\":[");
+    builder.append(",\"full_prefix_snapshot_id\":");
+    builder.append_escaped(event.full_prefix_snapshot_id.to_hex());
+    builder.append(",\"evidence_snapshot_id\":");
+    builder.append_escaped(event.evidence_snapshot_id.to_hex());
+    builder.append(",\"accepted_prefix_count\":");
+    builder.append_integer(event.accepted_prefix_count);
+    builder.append(",\"eligible_ranking\":[");
     bool first = true;
-    for (const auto &observation : event.observations)
-    {
-        if (!first)
-            builder.append(',');
-        builder.append("{\"observation_id\":");
-        builder.append_escaped(observation.observation_id.to_hex());
-        builder.append(",\"ingestion_sequence\":");
-        builder.append_integer(observation.ingestion_sequence);
-        builder.append(",\"epoch_number\":");
-        builder.append_integer(observation.epoch_number);
-        builder.append(",\"epoch_digest\":");
-        builder.append_escaped(observation.epoch_digest.to_hex());
-        builder.append(",\"reporter_id\":");
-        builder.append_integer(observation.reporter_id);
-        builder.append(",\"target_id\":");
-        builder.append_integer(observation.target_id);
-        builder.append(",\"outcome\":");
-        builder.append_escaped(response_outcome_name(observation.outcome));
-        if (observation.latency_ns.has_value())
-        {
-            builder.append(",\"latency_ns\":");
-            builder.append_integer(*observation.latency_ns);
-        }
-        builder.append('}');
-        first = false;
-    }
-    builder.append("],\"eligible_ranking\":[");
-    first = true;
     for (const auto replica : event.eligible_ranking)
     {
         if (!first)

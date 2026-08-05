@@ -42,6 +42,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v3.json"
+)
+V2_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v2.json"
 )
 LEGACY_MANIFEST_PATH = (
@@ -204,6 +207,182 @@ def test_actor_and_fnv_vectors_recompute_without_runtime_decision_code() -> None
             epoch_digest=vector.epoch_digest,
             block_hash=vector.block_hash,
         ) == (vector.fnv1a64, vector.selected_actor)
+
+
+def test_validator_retains_exact_v1_v2_and_v3_artifact_identities() -> None:
+    identities = {
+        version: validation._frozen_artifact_identity(
+            load_frozen_manifest(path).manifest_id
+        )
+        for version, path in (
+            (1, LEGACY_MANIFEST_PATH),
+            (2, V2_MANIFEST_PATH),
+            (3, MANIFEST_PATH),
+        )
+    }
+
+    assert identities[1].manifest_sha256 == validation.LEGACY_MANIFEST_SHA256
+    assert identities[2].manifest_sha256 == validation.V2_MANIFEST_SHA256
+    assert identities[2].runtime_sha256 == validation.V2_RUNTIME_SHA256
+    assert identities[3].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[3].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+
+
+def _compact_snapshot_audit() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "cycle_ordinal": 1,
+        "policy_intent": "performance_optimization",
+        "transition_artifact_id": "slot-test-epoch2",
+        "predecessor_epoch_number": 1,
+        "predecessor_epoch_digest": "33" * 32,
+        "activation_generation": 2,
+        "baseline_cutoff": 1,
+        "current_cutoff": 3,
+        "full_prefix_snapshot_id": "44" * 32,
+        "evidence_snapshot_id": "55" * 32,
+        "accepted_prefix_count": 3,
+        "eligible_ranking": [0, 1, 2],
+    }
+
+
+def test_v3_compact_snapshot_schema_and_legacy_snapshot_schema_are_exact() -> None:
+    compact = _compact_snapshot_audit()
+    assert validation._validate_snapshot_audit_schema(
+        compact,
+        evidence_snapshot_format="digest_commitment_v2",
+        label="test compact snapshot",
+    ) is True
+
+    legacy = {
+        key: value
+        for key, value in compact.items()
+        if key
+        not in {
+            "schema_version",
+            "full_prefix_snapshot_id",
+            "evidence_snapshot_id",
+            "accepted_prefix_count",
+        }
+    }
+    legacy["observations"] = []
+    assert validation._validate_snapshot_audit_schema(
+        legacy,
+        evidence_snapshot_format="full_prefix_v1",
+        label="test legacy snapshot",
+    ) is False
+
+    with pytest.raises(FactorialValidationError, match="invalid field set"):
+        validation._validate_snapshot_audit_schema(
+            {**compact, "observations": []},
+            evidence_snapshot_format="digest_commitment_v2",
+            label="test compact snapshot",
+        )
+    with pytest.raises(FactorialValidationError, match="schema version"):
+        validation._validate_snapshot_audit_schema(
+            {**compact, "schema_version": 1},
+            evidence_snapshot_format="digest_commitment_v2",
+            label="test compact snapshot",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("accepted_prefix_count", 2, "prefix count"),
+        ("full_prefix_snapshot_id", "66" * 32, "commitments"),
+        ("evidence_snapshot_id", "77" * 32, "commitments"),
+    ),
+)
+def test_v3_compact_snapshot_rejects_count_or_commitment_tampering(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    snapshot = _compact_snapshot_audit()
+    snapshot[field] = value
+
+    with pytest.raises(FactorialValidationError, match=match):
+        validation._validate_compact_snapshot_commitments(
+            snapshot,
+            accepted_prefix_count=3,
+            current_cutoff=3,
+            full_prefix_snapshot_id="44" * 32,
+            evidence_snapshot_id="55" * 32,
+        )
+
+
+def _sparse_evidence_record(
+    ingestion_sequence: int,
+    *,
+    reporter_sequence: int,
+) -> validation._EvidenceRecord:
+    return validation._EvidenceRecord(
+        ingestion_sequence=ingestion_sequence,
+        acceptance_monotonic_ns=100 + ingestion_sequence,
+        observation_id=f"{ingestion_sequence:064x}",
+        reporter_id=0,
+        target_id=1,
+        epoch_number=0,
+        tree_id=0,
+        epoch_digest="11" * 32,
+        block_hash=f"{1000 + ingestion_sequence:064x}",
+        message_type="direct_vote",
+        outcome="on_time",
+        response_duration_us=10,
+        deadline_duration_us=20,
+        reporter_monotonic_ns=200 + ingestion_sequence,
+        reporter_sequence=reporter_sequence,
+        signer_set=(1,),
+    )
+
+
+def test_v3_compact_snapshot_preserves_sparse_accepted_ledger_integrity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = (
+        _sparse_evidence_record(1, reporter_sequence=1),
+        _sparse_evidence_record(3, reporter_sequence=2),
+    )
+    events = tuple(
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=index,
+            monotonic_ns=record.acceptance_monotonic_ns,
+            event_type="evidence.observation_accepted",
+            payload={"record_index": index - 1},
+        )
+        for index, record in enumerate(records, start=1)
+    )
+    monkeypatch.setattr(
+        validation,
+        "_evidence_record",
+        lambda event, _membership: records[event.payload["record_index"]],
+    )
+
+    with pytest.raises(FactorialValidationError, match="non-contiguous"):
+        validation._accepted_evidence(events, 4)
+    grouped = validation._accepted_evidence(
+        events,
+        4,
+        allow_ingestion_sequence_gaps=True,
+    )
+    assert grouped[(0, "11" * 32)] == records
+
+    with pytest.raises(FactorialValidationError, match="exact accepted prefix"):
+        validation._snapshot_records(
+            records,
+            baseline_cutoff=1,
+            current_cutoff=4,
+            suffix_only=False,
+        )
+    assert validation._snapshot_records(
+        records,
+        baseline_cutoff=1,
+        current_cutoff=4,
+        suffix_only=False,
+        allow_high_watermark_gaps=True,
+    ) == records
 
 
 def test_epoch_command_signature_is_independently_verified() -> None:
@@ -1688,7 +1867,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
-def test_v2_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+def test_v3_receipt_rejects_an_exact_legacy_manifest_plan_pair(
     tmp_path: Path,
 ) -> None:
     recovered, _, receipt, expected, runtime, authorization = (

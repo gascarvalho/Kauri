@@ -522,7 +522,6 @@ using hotstuff::AdaptiveAggregationTransition;
 using hotstuff::AdaptiveStructuredEventEmitter;
 using hotstuff::AdaptiveV2ConvergenceStructuredEvent;
 using hotstuff::AdaptiveV2ConvergenceTransition;
-using hotstuff::AdaptiveV2EvidenceSnapshotObservation;
 using hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent;
 using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ManagerCycleOutcome;
@@ -762,25 +761,10 @@ AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event()
         (std::uint64_t{7} << 32) | std::uint64_t{17};
     event.baseline_cutoff = 44;
     event.current_cutoff = 52;
-    event.observations = {
-        AdaptiveV2EvidenceSnapshotObservation{
-            digest("snapshot-observation-before-baseline"),
-            42,
-            7,
-            event.predecessor_epoch_digest,
-            2,
-            0,
-            ResponseOutcome::on_time,
-            1'250'000},
-        AdaptiveV2EvidenceSnapshotObservation{
-            digest("snapshot-observation-after-baseline"),
-            45,
-            7,
-            event.predecessor_epoch_digest,
-            3,
-            1,
-            ResponseOutcome::timeout,
-            std::nullopt}};
+    event.full_prefix_snapshot_id =
+        digest("full-prefix-evidence-snapshot");
+    event.evidence_snapshot_id = digest("selected-evidence-snapshot");
+    event.accepted_prefix_count = 2;
     event.eligible_ranking = {2, 3, 4, 5, 6};
     return event;
 }
@@ -821,35 +805,6 @@ AdaptiveV2ShapeDecisionStructuredEvent shape_decision_event()
     REQUIRE(hotstuff::valid_shape_decision_record(decision));
     return AdaptiveV2ShapeDecisionStructuredEvent{
         3, "e7-to-e8-shape", std::move(decision)};
-}
-
-AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event(
-    std::size_t observation_count)
-{
-    REQUIRE(observation_count > 1);
-    auto event = evidence_snapshot_event();
-    event.baseline_cutoff = observation_count - 1;
-    event.current_cutoff = observation_count;
-    event.observations.clear();
-    event.observations.reserve(observation_count);
-    for (std::size_t index = 0; index < observation_count; ++index)
-    {
-        const auto sequence = index + 1;
-        const auto reporter = static_cast<ReplicaID>(sequence % 7);
-        event.observations.push_back(
-            AdaptiveV2EvidenceSnapshotObservation{
-                digest(
-                    "profile-snapshot-observation-" +
-                    std::to_string(sequence)),
-                sequence,
-                event.predecessor_epoch_number,
-                event.predecessor_epoch_digest,
-                reporter,
-                static_cast<ReplicaID>((reporter + 1) % 7),
-                ResponseOutcome::on_time,
-                1'000'000 + sequence});
-    }
-    return event;
 }
 
 AdaptiveV2ManagerSessionTerminalStructuredEvent manager_terminal_event()
@@ -2130,10 +2085,9 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
     SECTION("evidence snapshot event and artifact share one canonical payload")
     {
         const auto event = evidence_snapshot_event();
-        const auto &before = event.observations[0];
-        const auto &after = event.observations[1];
         const auto payload =
-            "{\"cycle_ordinal\":3,"
+            "{\"schema_version\":2,"
+            "\"cycle_ordinal\":3,"
             "\"policy_intent\":\"fault_containment\","
             "\"transition_artifact_id\":\"e7-to-e8-containment\","
             "\"predecessor_epoch_number\":7,"
@@ -2142,26 +2096,11 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
             "\"activation_generation\":30064771089,"
             "\"baseline_cutoff\":44,"
             "\"current_cutoff\":52,"
-            "\"observations\":[{"
-            "\"observation_id\":\"" +
-            before.observation_id.to_hex() + "\","
-            "\"ingestion_sequence\":42,"
-            "\"epoch_number\":7,"
-            "\"epoch_digest\":\"" +
-            before.epoch_digest.to_hex() + "\","
-            "\"reporter_id\":2,"
-            "\"target_id\":0,"
-            "\"outcome\":\"on_time\","
-            "\"latency_ns\":1250000},{"
-            "\"observation_id\":\"" +
-            after.observation_id.to_hex() + "\","
-            "\"ingestion_sequence\":45,"
-            "\"epoch_number\":7,"
-            "\"epoch_digest\":\"" +
-            after.epoch_digest.to_hex() + "\","
-            "\"reporter_id\":3,"
-            "\"target_id\":1,"
-            "\"outcome\":\"timeout\"}],"
+            "\"full_prefix_snapshot_id\":\"" +
+            event.full_prefix_snapshot_id.to_hex() + "\","
+            "\"evidence_snapshot_id\":\"" +
+            event.evidence_snapshot_id.to_hex() + "\","
+            "\"accepted_prefix_count\":2,"
             "\"eligible_ranking\":[2,3,4,5,6]}";
 
         CHECK(hotstuff::
@@ -2262,40 +2201,35 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
 }
 
 TEST_CASE(
-    "manager capacity preserves the 4441-observation exact snapshot",
+    "compact snapshot stays below the default line bound at large cutoffs",
     "[adaptive-v2][structured-event][audit][snapshot][capacity]")
 {
-    constexpr std::size_t kProfileObservationCount = 4'441;
+    constexpr std::uint64_t kLargeExactPrefix = 1'048'576;
     const auto defaults = StructuredEventLimits{};
-    const auto manager_line_bytes = defaults.maximum_queued_bytes;
-    const auto event =
-        evidence_snapshot_event(kProfileObservationCount);
-
-    CHECK_THROWS_AS(
-        hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
-            event, defaults.maximum_line_bytes),
-        std::length_error);
+    auto event = evidence_snapshot_event();
+    event.baseline_cutoff = kLargeExactPrefix - 1;
+    event.current_cutoff = kLargeExactPrefix;
+    event.accepted_prefix_count = kLargeExactPrefix;
 
     const auto payload =
         hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
-            event, manager_line_bytes);
-    CHECK(payload.size() > defaults.maximum_line_bytes);
-    REQUIRE(payload.size() < manager_line_bytes);
-    CHECK(count_occurrences(payload, "\"observation_id\":") ==
-          kProfileObservationCount);
+            event, defaults.maximum_line_bytes);
+    REQUIRE(payload.size() < defaults.maximum_line_bytes);
+    CHECK(payload.size() < 1024);
+    CHECK(count_occurrences(payload, "\"observation_id\":") == 0);
+    CHECK(payload.find("\"accepted_prefix_count\":1048576") !=
+          std::string::npos);
 
     auto config = manager_event_config();
-    config.limits.maximum_line_bytes = manager_line_bytes;
     FakeClock clock({7004});
     MemoryOutput output;
-    output.reserve(manager_line_bytes);
     StructuredEventSink sink(config, clock, output);
     sink.emit_audit(AuditStructuredEventPayload{event});
     const auto queued = sink.health();
     REQUIRE(queued.healthy);
     CHECK(queued.queued_events == 1);
     CHECK(queued.queued_bytes > payload.size());
-    CHECK(queued.queued_bytes <= manager_line_bytes);
+    CHECK(queued.queued_bytes <= defaults.maximum_line_bytes);
     sink.shutdown();
 
     const auto record = rendered(output);
@@ -2305,32 +2239,9 @@ TEST_CASE(
               payload_marker + std::string("\"payload\":").size(),
               payload.size(),
               payload) == 0);
-    CHECK(count_occurrences(record, "\"observation_id\":") ==
-          kProfileObservationCount);
+    CHECK(count_occurrences(record, "\"observation_id\":") == 0);
     CHECK(sink.health().healthy);
     CHECK(sink.health().complete_records == 1);
-
-    const auto oversized = evidence_snapshot_event(20'000);
-    CHECK_THROWS_AS(
-        hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
-            oversized, manager_line_bytes),
-        std::length_error);
-
-    auto oversized_config = manager_event_config();
-    oversized_config.limits.maximum_line_bytes = manager_line_bytes;
-    FakeClock oversized_clock({7005});
-    MemoryOutput oversized_output;
-    StructuredEventSink oversized_sink(
-        oversized_config, oversized_clock, oversized_output);
-    oversized_sink.emit_audit(AuditStructuredEventPayload{oversized});
-    const auto rejected = oversized_sink.health();
-    CHECK_FALSE(rejected.healthy);
-    CHECK(rejected.stopped);
-    CHECK(rejected.last_assigned_sequence == 0);
-    CHECK(rejected.queued_events == 0);
-    CHECK(rejected.queued_bytes == 0);
-    CHECK(rejected.dropped_records == 1);
-    CHECK(oversized_output.bytes().empty());
 }
 
 TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
@@ -2544,7 +2455,7 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
               std::string::npos);
     }
 
-    SECTION("evidence snapshot is an exact bounded predecessor prefix")
+    SECTION("evidence snapshot is a bounded signed prefix commitment")
     {
         auto invalid = evidence_snapshot_event();
         CHECK(rejects(event_config(), invalid));
@@ -2555,37 +2466,27 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = evidence_snapshot_event();
-        invalid.observations.clear();
+        invalid.schema_version = 1;
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = evidence_snapshot_event();
-        invalid.observations[1].epoch_number = 8;
+        invalid.full_prefix_snapshot_id = hotstuff::uint256_t{};
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = evidence_snapshot_event();
-        invalid.observations[1].epoch_digest =
-            digest("mixed-evidence-snapshot-epoch");
+        invalid.evidence_snapshot_id = hotstuff::uint256_t{};
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = evidence_snapshot_event();
-        invalid.observations[1].ingestion_sequence = 53;
+        invalid.accepted_prefix_count = 0;
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = evidence_snapshot_event();
-        invalid.observations[1].ingestion_sequence = 43;
+        invalid.accepted_prefix_count = invalid.current_cutoff + 1;
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = evidence_snapshot_event();
-        invalid.observations[1].ingestion_sequence = 42;
-        CHECK(rejects(manager_event_config(), invalid));
-
-        invalid = evidence_snapshot_event();
-        invalid.observations[1].latency_ns = 1;
-        CHECK(rejects(manager_event_config(), invalid));
-
-        invalid = evidence_snapshot_event();
-        invalid.observations[0].outcome = ResponseOutcome::late;
-        invalid.observations[0].latency_ns.reset();
+        invalid.current_cutoff = invalid.baseline_cutoff;
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = evidence_snapshot_event();
@@ -2596,6 +2497,12 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         invalid = evidence_snapshot_event();
         invalid.eligible_ranking.clear();
         CHECK(rejects(manager_event_config(), invalid));
+
+        const auto sparse = evidence_snapshot_event();
+        REQUIRE(sparse.accepted_prefix_count < sparse.current_cutoff);
+        CHECK_NOTHROW(
+            hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
+                sparse, StructuredEventLimits{}.maximum_line_bytes));
 
         CHECK_THROWS_AS(
             hotstuff::
