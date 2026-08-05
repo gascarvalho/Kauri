@@ -68,6 +68,9 @@ from .factorial_manifest import (
     V4_MANIFEST_ID,
     V4_MANIFEST_SHA256,
     V4_PLAN_SHA256,
+    V5_MANIFEST_ID,
+    V5_MANIFEST_SHA256,
+    V5_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -117,11 +120,17 @@ V4_RUNTIME_SHA256 = (
 V4_SMOKE_RUNTIME_SHA256 = (
     "80a54a9035ac2cc816fe985b4011c060fe21a81894da56156ce75dbda7e81046"
 )
-FROZEN_RUNTIME_SHA256 = (
+V5_RUNTIME_SHA256 = (
     "5d66d23d9f2ac9c774c157d51435763ec7c7a19cfd1d1f5bc5ea67a32f1ecabf"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V5_SMOKE_RUNTIME_SHA256 = (
     "455178e72413abb31ece95e37364e8f52d3318397c0d46b78d4451504ba03c2e"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "f0358f0de7291dae50881046f8107e29bc60c5f9cf15bbb37b2911edb0129410"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "f04879a1ca5a6ae59c8a4cc695ae878f2855acf4a9e0aad76cdb2916aa5ade87"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -262,6 +271,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=V4_PLAN_SHA256,
             runtime_sha256=V4_RUNTIME_SHA256,
             smoke_runtime_sha256=V4_SMOKE_RUNTIME_SHA256,
+        ),
+        V5_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V5_MANIFEST_ID,
+            manifest_sha256=V5_MANIFEST_SHA256,
+            plan_sha256=V5_PLAN_SHA256,
+            runtime_sha256=V5_RUNTIME_SHA256,
+            smoke_runtime_sha256=V5_SMOKE_RUNTIME_SHA256,
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -1736,6 +1752,7 @@ def _validate_runtime_slot(
         V2_MANIFEST_ID,
         V3_MANIFEST_ID,
         V4_MANIFEST_ID,
+        V5_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (

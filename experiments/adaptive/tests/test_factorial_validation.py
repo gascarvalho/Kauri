@@ -42,6 +42,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v6.json"
+)
+V5_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v5.json"
 )
 V4_MANIFEST_PATH = (
@@ -215,7 +218,7 @@ def test_actor_and_fnv_vectors_recompute_without_runtime_decision_code() -> None
         ) == (vector.fnv1a64, vector.selected_actor)
 
 
-def test_validator_retains_exact_v1_through_v5_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v6_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -225,7 +228,8 @@ def test_validator_retains_exact_v1_through_v5_artifact_identities() -> None:
             (2, V2_MANIFEST_PATH),
             (3, V3_MANIFEST_PATH),
             (4, V4_MANIFEST_PATH),
-            (5, MANIFEST_PATH),
+            (5, V5_MANIFEST_PATH),
+            (6, MANIFEST_PATH),
         )
     }
 
@@ -238,13 +242,19 @@ def test_validator_retains_exact_v1_through_v5_artifact_identities() -> None:
     assert identities[4].manifest_sha256 == validation.V4_MANIFEST_SHA256
     assert identities[4].runtime_sha256 == validation.V4_RUNTIME_SHA256
     assert identities[4].smoke_runtime_sha256 == validation.V4_SMOKE_RUNTIME_SHA256
-    assert identities[5].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[5].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
-    assert identities[5].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    assert identities[5].manifest_sha256 == validation.V5_MANIFEST_SHA256
+    assert identities[5].runtime_sha256 == validation.V5_RUNTIME_SHA256
+    assert identities[5].smoke_runtime_sha256 == validation.V5_SMOKE_RUNTIME_SHA256
+    assert identities[6].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[6].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[6].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
 
 
-def test_exact_v4_runtime_remains_validator_compatible() -> None:
-    manifest = load_frozen_manifest(V4_MANIFEST_PATH)
+@pytest.mark.parametrize("manifest_path", (V4_MANIFEST_PATH, V5_MANIFEST_PATH))
+def test_exact_prior_runtime_remains_validator_compatible(
+    manifest_path: Path,
+) -> None:
+    manifest = load_frozen_manifest(manifest_path)
     runtime = build_factorial_runtime(build_factorial_plan(manifest))
     expected_by_id = {
         expected.slot_id: expected for expected in validation._expected_slots(manifest)
@@ -2103,7 +2113,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
-def test_v5_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+def test_v6_receipt_rejects_an_exact_legacy_manifest_plan_pair(
     tmp_path: Path,
 ) -> None:
     recovered, _, receipt, expected, runtime, authorization = (
