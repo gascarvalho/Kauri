@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import FrozenInstanceError
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
     FROZEN_PLAN_SHA256,
+    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
     V3_MANIFEST_ID,
@@ -32,6 +35,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     V7_MANIFEST_ID,
     V7_MANIFEST_SHA256,
     V7_PLAN_SHA256,
+    V8_MANIFEST_ID,
+    V8_MANIFEST_SHA256,
+    V8_PLAN_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -52,6 +58,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v9.json"
+)
+V8_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
 )
 V7_MANIFEST_PATH = (
@@ -285,7 +294,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v8/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v9/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -336,10 +345,15 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
         "replica_0_reserved_authoritative_commit_observer_v1"
     )
     assert responsive.actor_schedule == (
-        "omit_every_32nd_unique_non_root_contribution_per_"
-        "responsive_degraded_actor_v1"
+        "omit_every_41st_unique_non_root_contribution_per_"
+        "responsive_degraded_actor_v2"
     )
-    assert responsive.omission_period == 32
+    assert responsive.omission_period == 41
+    assert (
+        responsive.pending_attempt_retention
+        == RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
+    )
+    assert responsive.causal_timeout_linkage == RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
 
     actors_by_block: dict[str, tuple[int, ...]] = {}
     degraded_by_block: dict[str, tuple[int, ...]] = {}
@@ -470,9 +484,34 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
     assert len(set(repeated_actor_sets.values())) > 1
 
 
+def test_v9_responsive_schedule_is_coprime_and_never_exceeds_five_percent() -> None:
+    manifest = _manifest()
+    responsive = manifest.byzantine.responsive_degradation
+    assert responsive is not None
+    period = responsive.omission_period
+    cycle_lengths = {
+        cycle
+        for replica_count in (*manifest.replica_counts, 7)
+        for cycle in (
+            replica_count - 1,
+            2 * ((replica_count - 1) // 3),
+        )
+    }
+
+    assert period == 41
+    assert all(math.gcd(period, cycle) == 1 for cycle in cycle_lengths)
+    assert all(
+        math.ceil(attempt_count / period) / attempt_count <= 0.05
+        for attempt_count in range(
+            manifest.responsiveness_policy.minimum_attempts,
+            manifest.responsiveness_policy.attempt_window + 1,
+        )
+    )
+
+
 def test_tiered_schema_rejects_observer_injection_schedule_and_bound_drift() -> None:
     document = _mutable_document()
-    document["byzantine"]["responsive_degradation"]["omission_period"] = 31  # type: ignore[index]
+    document["byzantine"]["responsive_degradation"]["omission_period"] = 40  # type: ignore[index]
     with pytest.raises(FactorialManifestError, match="responsive-degradation"):
         parse_manifest_bytes(_encoded(document))
 
@@ -493,6 +532,20 @@ def test_tiered_schema_rejects_observer_injection_schedule_and_bound_drift() -> 
         "observer_isolation"
     ] = "none"
     with pytest.raises(FactorialManifestError, match="responsive-degradation"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    document["byzantine"]["responsive_degradation"][  # type: ignore[index]
+        "pending_attempt_retention"
+    ] = "retire_at_commit"
+    with pytest.raises(FactorialManifestError, match="causal measurement"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    del document["byzantine"]["responsive_degradation"][  # type: ignore[index]
+        "causal_timeout_linkage"
+    ]
+    with pytest.raises(FactorialManifestError, match="fields"):
         parse_manifest_bytes(_encoded(document))
 
     with pytest.raises(FactorialManifestError, match="proper subset"):
@@ -583,15 +636,16 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
         ),
         "breakthrough_structural_gate": (
             "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_and_"
-            "every_32nd_unique_non_root_responsive_degraded_omission_schedule_"
+            "every_41st_unique_non_root_responsive_degraded_omission_schedule_"
             "and_each_hard_actor_has_f_plus_1_distinct_exact_role_bound_timeout_"
-            "reporters_and_at_least_one_internal_omit_aggregate_proof_and_"
-            "responsive_degraded_replicas_rank_below_every_fast_replica_"
-            "and_epoch1_places_every_responsive_degraded_replica_as_a_root_and_"
-            "exposes_each_in_an_internal_role_and_epoch2_roots_equal_top_q_fast_"
-            "replicas_with_only_fast_replicas_in_root_and_internal_roles_and_"
-            "all_f_worse_replicas_as_physical_leaves_and_only_hard_cohort_wait_"
-            "exempt_v2"
+            "reporters_and_at_least_one_internal_omit_aggregate_proof_and_each_"
+            "responsive_degraded_actor_has_its_own_exact_reporter_local_epoch1_"
+            "internal_omit_aggregate_cross_commit_witness_and_responsive_"
+            "degraded_replicas_rank_below_every_fast_replica_and_epoch1_places_"
+            "every_responsive_degraded_replica_as_a_root_and_exposes_each_in_an_"
+            "internal_role_and_epoch2_roots_equal_top_q_fast_replicas_with_only_"
+            "fast_replicas_in_root_and_internal_roles_and_all_f_worse_replicas_"
+            "as_physical_leaves_and_only_hard_cohort_wait_exempt_v3"
         ),
         "breakthrough_structural_required_slot_count": 10,
         "breakthrough_realized_placement_rule": (
@@ -638,6 +692,46 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
             "strictly_within_plus_minus_log_1p10_v2"
         ),
         "breakthrough_placebo_equivalence_margin_log": 0.09531017980432493,
+        "breakthrough_secondary_scope": (
+            "n31_f2_placement_arms_p_and_ps_five_matched_blocks_"
+            "prespecified_secondary_v1"
+        ),
+        "breakthrough_secondary_status_rule": (
+            "supported_only_if_primary_f5_supported_and_all_secondary_f2_gates_"
+            "pass_not_supported_if_primary_f5_supported_and_any_secondary_gate_"
+            "fails_descriptive_only_if_primary_f5_not_supported_v1"
+        ),
+        "breakthrough_secondary_structural_gate": (
+            "all_n31_f2_p_ps_slots_validate_existing_tiered_full_hierarchy_and_"
+            "exact_epoch1_to_epoch2_degraded_demotion_and_fast_promotion_proofs_v1"
+        ),
+        "breakthrough_secondary_structural_required_slot_count": 10,
+        "breakthrough_secondary_realized_placement_rule": (
+            "for_each_p_and_ps_arm_all_5_of_5_n31_f2_blocks_have_epoch1_to_"
+            "epoch2_demoted_set_exactly_responsive_degraded_cohort_and_promoted_"
+            "set_exactly_canonical_non_reference_root_pool_minus_hard_cohort_v1"
+        ),
+        "breakthrough_secondary_realized_placement_per_arm_requirement": 5,
+        "breakthrough_secondary_throughput_estimand": (
+            "d2_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+"
+            "log((PS_e2/PS_e1)/(S_e2/S_e1))]"
+        ),
+        "breakthrough_secondary_throughput_claim_rule": (
+            "two_sided_student_t_95_df4_lower_log_bound_strictly_greater_than_"
+            "zero_and_at_least_4_of_5_block_effects_strictly_greater_than_zero_v1"
+        ),
+        "breakthrough_secondary_positive_block_requirement": 4,
+        "breakthrough_secondary_pre_epoch1_placebo_estimand": (
+            "pP2_b=log((P_fault/P_baseline)/(00_fault/00_baseline));"
+            "pPS2_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))"
+        ),
+        "breakthrough_secondary_placebo_equivalence_rule": (
+            "both_component_two_one_sided_5_percent_tests_df4_90_cis_strictly_"
+            "within_plus_minus_log_1p10_v2"
+        ),
+        "breakthrough_secondary_placebo_equivalence_margin_log": (
+            0.09531017980432493
+        ),
         "placement_headline_block_count": 5,
         "placement_headline_initial_fanout": 5,
         "placement_headline_replica_count": 31,
@@ -650,7 +744,7 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
         "attempt_window": 128,
         "latency_percentile_basis_points": 5000,
         "maximum_timeout_rate_ppm": 50000,
-        "minimum_attempts": 32,
+        "minimum_attempts": 41,
         "minimum_response_rate_ppm": 950000,
         "policy_version": "shape25-sensitive-responsiveness-v1",
         "trailing_timeout_streak": 2,
@@ -745,7 +839,7 @@ def test_fault_window_timing_is_mechanical_and_hard_timeout_feasible(
     ("field", "value"),
     (
         ("attempt_window", 127),
-        ("minimum_attempts", 31),
+        ("minimum_attempts", 40),
         ("minimum_response_rate_ppm", 949_999),
         ("maximum_timeout_rate_ppm", 50_001),
         ("trailing_timeout_streak", 3),
@@ -802,7 +896,12 @@ def test_v8_adds_the_tiered_failure_model_and_breakthrough_scope_to_v7() -> None
     assert v7.manifest_sha256 == V7_MANIFEST_SHA256
     assert build_factorial_plan(v7).plan_sha256 == V7_PLAN_SHA256
 
-    v8_document = json.loads(MANIFEST_PATH.read_bytes())
+    v8 = load_frozen_manifest(V8_MANIFEST_PATH)
+    assert v8.manifest_id == V8_MANIFEST_ID
+    assert v8.manifest_sha256 == V8_MANIFEST_SHA256
+    assert build_factorial_plan(v8).plan_sha256 == V8_PLAN_SHA256
+
+    v8_document = json.loads(V8_MANIFEST_PATH.read_bytes())
     v7_document = json.loads(V7_MANIFEST_PATH.read_bytes())
     assert v8_document.pop("manifest_id") == "shape-placement-factorial-v8"
     assert v7_document.pop("manifest_id") == "shape-placement-factorial-v7"
@@ -967,6 +1066,96 @@ def test_v8_adds_the_tiered_failure_model_and_breakthrough_scope_to_v7() -> None
     document["artifacts"]["evidence_snapshot_format"] = "full_prefix_v1"  # type: ignore[index]
     with pytest.raises(FactorialManifestError, match="digest_commitment_v2"):
         parse_manifest_bytes(_encoded(document))
+
+
+def test_v9_adds_causal_measurement_and_predeclared_breakthrough_corrections() -> None:
+    v9_document = json.loads(MANIFEST_PATH.read_bytes())
+    v8_document = json.loads(V8_MANIFEST_PATH.read_bytes())
+
+    assert v9_document.pop("manifest_id") == "shape-placement-factorial-v9"
+    assert v8_document.pop("manifest_id") == "shape-placement-factorial-v8"
+    assert v9_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v9"
+    )
+    assert v8_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v8"
+    )
+    responsive = v9_document["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    assert responsive.pop("pending_attempt_retention") == (  # type: ignore[union-attr]
+        RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
+    )
+    assert responsive.pop("causal_timeout_linkage") == (  # type: ignore[union-attr]
+        RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
+    )
+    v8_responsive = v8_document["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    assert responsive["actor_schedule"] == (  # type: ignore[index]
+        "omit_every_41st_unique_non_root_contribution_per_"
+        "responsive_degraded_actor_v2"
+    )
+    assert responsive["omission_period"] == 41  # type: ignore[index]
+    responsive["actor_schedule"] = v8_responsive["actor_schedule"]  # type: ignore[index]
+    responsive["omission_period"] = v8_responsive["omission_period"]  # type: ignore[index]
+    assert v9_document["responsiveness_policy"]["minimum_attempts"] == 41  # type: ignore[index]
+    v9_document["responsiveness_policy"]["minimum_attempts"] = (  # type: ignore[index]
+        v8_document["responsiveness_policy"]["minimum_attempts"]  # type: ignore[index]
+    )
+    v9_claim = v9_document["claim_scope"]  # type: ignore[index]
+    v8_claim = v8_document["claim_scope"]  # type: ignore[index]
+    secondary_fields = {
+        key: v9_claim.pop(key)  # type: ignore[union-attr]
+        for key in tuple(v9_claim)  # type: ignore[arg-type]
+        if key.startswith("breakthrough_secondary_")
+    }
+    assert secondary_fields == {
+        "breakthrough_secondary_scope": (
+            "n31_f2_placement_arms_p_and_ps_five_matched_blocks_"
+            "prespecified_secondary_v1"
+        ),
+        "breakthrough_secondary_status_rule": (
+            "supported_only_if_primary_f5_supported_and_all_secondary_f2_gates_"
+            "pass_not_supported_if_primary_f5_supported_and_any_secondary_gate_"
+            "fails_descriptive_only_if_primary_f5_not_supported_v1"
+        ),
+        "breakthrough_secondary_structural_gate": (
+            "all_n31_f2_p_ps_slots_validate_existing_tiered_full_hierarchy_and_"
+            "exact_epoch1_to_epoch2_degraded_demotion_and_fast_promotion_proofs_v1"
+        ),
+        "breakthrough_secondary_structural_required_slot_count": 10,
+        "breakthrough_secondary_realized_placement_rule": (
+            "for_each_p_and_ps_arm_all_5_of_5_n31_f2_blocks_have_epoch1_to_"
+            "epoch2_demoted_set_exactly_responsive_degraded_cohort_and_promoted_"
+            "set_exactly_canonical_non_reference_root_pool_minus_hard_cohort_v1"
+        ),
+        "breakthrough_secondary_realized_placement_per_arm_requirement": 5,
+        "breakthrough_secondary_throughput_estimand": (
+            "d2_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+"
+            "log((PS_e2/PS_e1)/(S_e2/S_e1))]"
+        ),
+        "breakthrough_secondary_throughput_claim_rule": (
+            "two_sided_student_t_95_df4_lower_log_bound_strictly_greater_than_"
+            "zero_and_at_least_4_of_5_block_effects_strictly_greater_than_zero_v1"
+        ),
+        "breakthrough_secondary_positive_block_requirement": 4,
+        "breakthrough_secondary_pre_epoch1_placebo_estimand": (
+            "pP2_b=log((P_fault/P_baseline)/(00_fault/00_baseline));"
+            "pPS2_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))"
+        ),
+        "breakthrough_secondary_placebo_equivalence_rule": (
+            "both_component_two_one_sided_5_percent_tests_df4_90_cis_strictly_"
+            "within_plus_minus_log_1p10_v2"
+        ),
+        "breakthrough_secondary_placebo_equivalence_margin_log": (
+            0.09531017980432493
+        ),
+    }
+    assert "every_41st" in v9_claim["breakthrough_structural_gate"]  # type: ignore[index]
+    assert "each_responsive_degraded_actor_has_its_own" in (  # type: ignore[index]
+        v9_claim["breakthrough_structural_gate"]
+    )
+    v9_claim["breakthrough_structural_gate"] = v8_claim[  # type: ignore[index]
+        "breakthrough_structural_gate"
+    ]
+    assert v9_document == v8_document
 
 
 def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:

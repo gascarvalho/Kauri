@@ -31,10 +31,14 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
 )
 from experiments.adaptive.kauri_experiment.factorial_validation import (
     FROZEN_RUNTIME_SHA256,
+    FROZEN_SMOKE_RUNTIME_SHA256,
 )
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v9.json"
+)
+V8_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
 )
 V7_MANIFEST_PATH = (
@@ -120,9 +124,17 @@ def test_matched_arms_share_the_frozen_cutoff_and_transition_contracts(
     )
     assert len(tiered.fast_replica_ids) == specs[0].q
     assert tiered.max_omissions_per_proposal == specs[0].f
-    assert tiered.responsive_omission_period == 32
+    assert tiered.responsive_omission_period == 41
     assert tiered.observer_isolation == (
         "replica_0_reserved_authoritative_commit_observer_v1"
+    )
+    assert tiered.pending_attempt_retention == (
+        "retain_unanswered_exact_parent_child_attempt_across_consensus_commit_"
+        "until_original_aggregation_derived_deadline_observational_only_no_"
+        "consensus_authority_v1"
+    )
+    assert tiered.causal_timeout_linkage == (
+        "fault_marker_to_exact_parent_attempt_to_scored_timeout_required_v1"
     )
 
 
@@ -542,7 +554,7 @@ def test_replica_argv_materialization_uses_one_shared_raw_clock_anchor(
         assert _option(
             argv, "--experiment-responsive-degraded-omission-actors"
         ) == ",".join(map(str, slot.responsive_degraded_actor_ids))
-        assert _option(argv, "--experiment-responsive-omission-period") == "32"
+        assert _option(argv, "--experiment-responsive-omission-period") == "41"
         assert _option(argv, "--experiment-byzantine-window-start-monotonic-ns") == str(
             expected_start
         )
@@ -679,6 +691,11 @@ def test_campaign_runtime_is_execution_ordered_and_cannot_launch(
     encoded = canonical_runtime_bytes(runtime_plan)
     assert encoded == canonical_runtime_bytes(build_factorial_runtime(frozen_plan))
     assert hashlib.sha256(encoded).hexdigest() == FROZEN_RUNTIME_SHA256
+    smoke = factorial_execution.build_n7_ps_smoke_slot(frozen_plan.slots[0])
+    smoke_payload = factorial_execution._canonical_json_bytes(
+        smoke.runtime.as_document()
+    )
+    assert hashlib.sha256(smoke_payload).hexdigest() == FROZEN_SMOKE_RUNTIME_SHA256
     document = json.loads(encoded)
     assert document["slot_count"] == len(frozen_plan.slots)
     assert "selected_fanout" not in document
@@ -760,12 +777,29 @@ def test_preflight_rejects_tiered_period_and_native_argv_drift(runtime_plan) -> 
         slot,
         tiered_cohorts=replace(
             slot.tiered_cohorts,
-            responsive_omission_period=31,
+            responsive_omission_period=40,
         ),
     )
     with pytest.raises(FactorialManifestError, match="tiered cohort"):
         runtime_preflight(
             replace(runtime_plan, slots=(bad_period_slot, *runtime_plan.slots[1:])),
+            available_free_bytes=runtime_plan.minimum_free_bytes,
+        )
+
+    missing_measurement_slot = replace(
+        slot,
+        tiered_cohorts=replace(
+            slot.tiered_cohorts,
+            pending_attempt_retention=None,
+            causal_timeout_linkage=None,
+        ),
+    )
+    with pytest.raises(FactorialManifestError, match="tiered cohort"):
+        runtime_preflight(
+            replace(
+                runtime_plan,
+                slots=(missing_measurement_slot, *runtime_plan.slots[1:]),
+            ),
             available_free_bytes=runtime_plan.minimum_free_bytes,
         )
 
@@ -909,7 +943,7 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V7_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v8_and_refuses_prior_production(
+def test_cli_defaults_to_v9_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -922,7 +956,7 @@ def test_cli_defaults_to_v8_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v7 are validation-only" in refusal["reason"]
+    assert "v1 through v8 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -954,4 +988,31 @@ def test_historical_v1_through_v7_runtime_identities_remain_exact(
         "only_hard_cohort_is_wait_exempt" not in placement
         for slot in document["slots"]
         for placement in (slot["epoch1_placement"], slot["epoch2_placement"])
+    )
+
+
+def test_v8_tiered_runtime_identity_remains_exact_without_v9_fields() -> None:
+    manifest = load_frozen_manifest(V8_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    encoded = canonical_runtime_bytes(runtime)
+
+    assert plan.plan_sha256 == (
+        "0f1d1c321109f795c03d658208d340fff5b38da7d74986996ed52bd7828a8598"
+    )
+    assert hashlib.sha256(encoded).hexdigest() == (
+        "05b846c2fd9dc1005348993e147bb3e33def0011a7b52b3a68473ec79507e1a0"
+    )
+    smoke = factorial_execution.build_n7_ps_smoke_slot(plan.slots[0])
+    smoke_payload = factorial_execution._canonical_json_bytes(
+        smoke.runtime.as_document()
+    )
+    assert hashlib.sha256(smoke_payload).hexdigest() == (
+        "bd0bf9291e4b34a229be6ce5a5e09ffe7a34964199a0ea21696ab750ddab8e0b"
+    )
+    document = json.loads(encoded)
+    assert all(
+        "pending_attempt_retention" not in slot["tiered_cohorts"]
+        and "causal_timeout_linkage" not in slot["tiered_cohorts"]
+        for slot in document["slots"]
     )

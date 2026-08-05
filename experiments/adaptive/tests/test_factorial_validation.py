@@ -43,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v9.json"
+)
+V8_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
 )
 V7_MANIFEST_PATH = (
@@ -111,11 +114,12 @@ def _commit_event(
     epoch_number: int = 0,
     epoch_digest: str = "11" * 32,
     tree_id: int = 0,
+    replica_id: int = 0,
 ) -> validation._NativeEvent:
     block_hash = f"{height:064x}"
     parent_hash = None if height == 1 else f"{height - 1:064x}"
     return _native_event(
-        source_id="replica-0",
+        source_id=f"replica-{replica_id}",
         sequence=sequence,
         monotonic_ns=monotonic_ns,
         event_type="block.committed",
@@ -124,7 +128,7 @@ def _commit_event(
             "block_hash": block_hash,
             "parent_hash": parent_hash,
             "transaction_count": 1000,
-            "designated_observer": True,
+            "designated_observer": replica_id == 0,
             "decision_proof": {
                 "epoch_number": epoch_number,
                 "tree_id": tree_id,
@@ -246,7 +250,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v8_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v9_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -259,7 +263,8 @@ def test_validator_retains_exact_v1_through_v8_artifact_identities() -> None:
             (5, V5_MANIFEST_PATH),
             (6, V6_MANIFEST_PATH),
             (7, V7_MANIFEST_PATH),
-            (8, MANIFEST_PATH),
+            (8, V8_MANIFEST_PATH),
+            (9, MANIFEST_PATH),
         )
     }
 
@@ -281,14 +286,23 @@ def test_validator_retains_exact_v1_through_v8_artifact_identities() -> None:
     assert identities[7].manifest_sha256 == validation.V7_MANIFEST_SHA256
     assert identities[7].runtime_sha256 == validation.V7_RUNTIME_SHA256
     assert identities[7].smoke_runtime_sha256 == validation.V7_SMOKE_RUNTIME_SHA256
-    assert identities[8].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[8].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
-    assert identities[8].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    assert identities[8].manifest_sha256 == validation.V8_MANIFEST_SHA256
+    assert identities[8].runtime_sha256 == validation.V8_RUNTIME_SHA256
+    assert identities[8].smoke_runtime_sha256 == validation.V8_SMOKE_RUNTIME_SHA256
+    assert identities[9].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[9].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[9].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
 
 
 @pytest.mark.parametrize(
     "manifest_path",
-    (V4_MANIFEST_PATH, V5_MANIFEST_PATH, V6_MANIFEST_PATH, V7_MANIFEST_PATH),
+    (
+        V4_MANIFEST_PATH,
+        V5_MANIFEST_PATH,
+        V6_MANIFEST_PATH,
+        V7_MANIFEST_PATH,
+        V8_MANIFEST_PATH,
+    ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
     manifest_path: Path,
@@ -305,6 +319,45 @@ def test_exact_prior_runtime_remains_validator_compatible(
         expected_by_id[runtime_slot.slot_id],
         manifest,
     )
+
+
+def test_validator_requires_v9_causal_measurement_contract_but_accepts_v8() -> None:
+    for manifest_path in (V8_MANIFEST_PATH, MANIFEST_PATH):
+        manifest = load_frozen_manifest(manifest_path)
+        runtime = build_factorial_runtime(build_factorial_plan(manifest))
+        expected_by_id = {
+            expected.slot_id: expected
+            for expected in validation._expected_slots(manifest)
+        }
+        slot = runtime.slots[0]
+        document = json.loads(json.dumps(slot.as_document()))
+
+        validation._validate_runtime_slot(
+            document,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+        if manifest_path == V8_MANIFEST_PATH:
+            assert "pending_attempt_retention" not in document["tiered_cohorts"]
+            assert "causal_timeout_linkage" not in document["tiered_cohorts"]
+            continue
+
+        assert document["tiered_cohorts"]["pending_attempt_retention"] == (
+            validation.RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
+        )
+        assert document["tiered_cohorts"]["causal_timeout_linkage"] == (
+            validation.RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
+        )
+        del document["tiered_cohorts"]["pending_attempt_retention"]
+        with pytest.raises(
+            FactorialValidationError,
+            match="tiered cohort contract",
+        ):
+            validation._validate_runtime_slot(
+                document,
+                expected_by_id[slot.slot_id],
+                manifest,
+            )
 
 
 def _compact_snapshot_audit() -> dict[str, object]:
@@ -741,6 +794,85 @@ def test_capacity_or_skipped_fault_marker_fails_closed(tmp_path: Path, line: str
 
     with pytest.raises(FactorialValidationError, match="skipped|capacity"):
         validation._fault_markers(tmp_path, {0: ("replica.log",)})
+
+
+def _response_attempt_arm_line(
+    *,
+    reporter: int = 0,
+    child: int = 2,
+    start_ns: int = 1_900_000,
+    duration_us: int = 500,
+    absolute_deadline_ns: int | None = None,
+) -> str:
+    deadline_ns = (
+        start_ns + duration_us * 1_000
+        if absolute_deadline_ns is None
+        else absolute_deadline_ns
+    )
+    return (
+        "2026-08-05 12:00:00 [hotstuff info] "
+        "KAURI_EVIDENCE response_attempt_armed "
+        f"reporter={reporter} child={child} epoch=1 tree=4 "
+        f"epoch_digest={'11' * 32} block={900:064x} "
+        "expected_message_type=aggregate_relay "
+        f"start_monotonic_ns={start_ns} "
+        f"deadline_duration_us={duration_us} "
+        f"absolute_deadline_ns={deadline_ns}\n"
+    )
+
+
+def test_v9_response_attempt_arm_parser_accepts_exact_marker(tmp_path: Path) -> None:
+    log = tmp_path / "replica.log"
+    log.write_text(_response_attempt_arm_line(), encoding="utf-8")
+
+    marker = validation._response_attempt_arm_markers(
+        tmp_path,
+        {0: ("replica.log",)},
+    )[0]
+
+    assert marker.source_replica == marker.reporter_id == 0
+    assert marker.child_id == 2
+    assert marker.expected_message_type == "aggregate_relay"
+    assert marker.absolute_deadline_ns == (
+        marker.start_monotonic_ns + marker.deadline_duration_us * 1_000
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        _response_attempt_arm_line().replace(" child=2", ""),
+        (
+            "KAURI_EVIDENCE response_attempt_arm_marker_failed "
+            "reason=deadline_counter reporter=0 epoch=1 tree=4\n"
+        ),
+    ),
+)
+def test_v9_response_attempt_arm_parser_rejects_malformed_or_failure_marker(
+    tmp_path: Path,
+    line: str,
+) -> None:
+    log = tmp_path / "replica.log"
+    log.write_text(line, encoding="utf-8")
+
+    with pytest.raises(FactorialValidationError, match="malformed|failed"):
+        validation._response_attempt_arm_markers(
+            tmp_path,
+            {0: ("replica.log",)},
+        )
+
+
+def test_v9_response_attempt_arm_parser_rejects_source_reporter_mismatch(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "replica.log"
+    log.write_text(_response_attempt_arm_line(reporter=1), encoding="utf-8")
+
+    with pytest.raises(FactorialValidationError, match="source.*reporter"):
+        validation._response_attempt_arm_markers(
+            tmp_path,
+            {0: ("replica.log",)},
+        )
 
 
 def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> None:
@@ -1292,7 +1424,7 @@ def _tiered_marker(
         responsive_degraded_actor_count=1,
         fault_threshold=4,
         max_omissions_per_proposal=4,
-        responsive_omission_period=32,
+        responsive_omission_period=41,
         contribution_ordinal=ordinal,
     )
 
@@ -1304,16 +1436,16 @@ def _valid_tiered_markers() -> tuple[FaultMarker, ...]:
             cohort="responsive_degraded",
             ordinal=ordinal,
             block_ordinal=ordinal,
-            action="omit_aggregate" if ordinal % 32 == 0 else "forward",
+            action="omit_aggregate" if ordinal % 41 == 0 else "forward",
         )
-        for ordinal in range(1, 33)
+        for ordinal in range(1, 42)
     ]
     markers.extend(
         _tiered_marker(
             actor=actor,
             cohort="hard",
             ordinal=0,
-            block_ordinal=32,
+            block_ordinal=41,
             action="omit_aggregate",
         )
         for actor in (9, 10, 12)
@@ -1332,7 +1464,7 @@ def test_tiered_marker_parser_requires_exact_appended_audit_fields(
         "actor=2 action=forward monotonic_ns=201 "
         "cohort=responsive_degraded hard_actor_count=3 "
         "responsive_degraded_actor_count=1 fault_threshold=4 "
-        "max_omissions_per_proposal=4 responsive_omission_period=32 "
+        "max_omissions_per_proposal=4 responsive_omission_period=41 "
         "contribution_ordinal=1\n"
     ).format(digest="11" * 32, block=f"{1:064x}")
     log = tmp_path / "replica.log"
@@ -1340,7 +1472,7 @@ def test_tiered_marker_parser_requires_exact_appended_audit_fields(
 
     marker = validation._fault_markers(tmp_path, {2: ("replica.log",)})[0]
     assert marker.cohort == "responsive_degraded"
-    assert marker.responsive_omission_period == 32
+    assert marker.responsive_omission_period == 41
     assert marker.contribution_ordinal == 1
 
     log.write_text(
@@ -1359,13 +1491,13 @@ def test_tiered_marker_schedule_proves_exact_period_ordinals_and_f_bound() -> No
         "fault_mode": "tiered_persistent_responsive_omission_v1",
         "fault_threshold": 4,
         "max_omissions_per_proposal": 4,
-        "responsive_omission_period": 32,
+        "responsive_omission_period": 41,
     }
     validation._validate_fault_marker_schedule(markers, **arguments)
 
     with pytest.raises(FactorialValidationError, match="audit fields"):
         validation._validate_fault_marker_schedule(
-            (replace(markers[0], responsive_omission_period=31), *markers[1:]),
+            (replace(markers[0], responsive_omission_period=40), *markers[1:]),
             **arguments,
         )
     with pytest.raises(FactorialValidationError, match="not contiguous"):
@@ -1378,9 +1510,9 @@ def test_tiered_marker_schedule_proves_exact_period_ordinals_and_f_bound() -> No
             (markers[1], markers[0], *markers[2:]),
             **arguments,
         )
-    with pytest.raises(FactorialValidationError, match="every-32nd"):
+    with pytest.raises(FactorialValidationError, match="every-41st"):
         validation._validate_fault_marker_schedule(
-            (*markers[:31], replace(markers[31], action="forward"), *markers[32:]),
+            (*markers[:40], replace(markers[40], action="forward"), *markers[41:]),
             **arguments,
         )
     with pytest.raises(FactorialValidationError, match="persistently omit"):
@@ -1392,6 +1524,542 @@ def test_tiered_marker_schedule_proves_exact_period_ordinals_and_f_bound() -> No
         validation._validate_fault_marker_schedule(
             (*markers, replace(markers[-1], line_number=999)),
             **arguments,
+        )
+
+
+def _v9_cross_commit_witness_fixture() -> dict[str, object]:
+    digest = "11" * 32
+    markers: list[FaultMarker] = []
+    arm_markers: list[validation.ResponseAttemptArmMarker] = []
+    trees: dict[int, Tree] = {}
+    commit_times: dict[tuple[int, int, str, str], int] = {}
+    proposal_commit_times: dict[
+        int,
+        dict[tuple[int, int, str, str], tuple[int, ...]],
+    ] = {}
+    timeout_index: dict[
+        tuple[int, int, int, str, str], tuple[validation._EvidenceRecord, ...]
+    ] = {}
+    for offset, actor in enumerate((2, 5)):
+        reporter = 1 + offset * 2
+        tree_id = 4 + offset
+        block_hash = f"{900 + offset:064x}"
+        marker_ns = 2_000_000 + offset * 3_000_000
+        start_ns = marker_ns - 100_000
+        deadline_duration_us = 500
+        absolute_deadline_ns = start_ns + deadline_duration_us * 1_000
+        members = (
+            reporter,
+            actor,
+            *(
+                member
+                for member in range(13)
+                if member not in {reporter, actor}
+            ),
+        )
+        trees[tree_id] = Tree(
+            tree_id=tree_id,
+            fanout=5,
+            pipeline_stretch=2,
+            members=members,
+            wait_exempt=(9, 10, 12),
+        )
+        marker = replace(
+            _tiered_marker(
+                actor=actor,
+                cohort="responsive_degraded",
+                ordinal=41,
+                block_ordinal=900 + offset,
+                action="omit_aggregate",
+            ),
+            tree_id=tree_id,
+            epoch_digest=digest,
+            block_hash=block_hash,
+            monotonic_ns=marker_ns,
+        )
+        markers.append(marker)
+        proposal_key = (1, tree_id, digest, block_hash)
+        commit_times[proposal_key] = marker_ns + 50_000
+        proposal_commit_times.setdefault(reporter, {})[proposal_key] = (
+            marker_ns + 100_000,
+        )
+        arm_markers.append(
+            validation.ResponseAttemptArmMarker(
+                source_replica=reporter,
+                line_number=offset + 1,
+                reporter_id=reporter,
+                child_id=actor,
+                epoch_number=1,
+                tree_id=tree_id,
+                epoch_digest=digest,
+                block_hash=block_hash,
+                expected_message_type="aggregate_relay",
+                start_monotonic_ns=start_ns,
+                deadline_duration_us=deadline_duration_us,
+                absolute_deadline_ns=absolute_deadline_ns,
+                raw_line_sha256=f"{offset + 1:064x}",
+            )
+        )
+        timeout_index[(actor, *proposal_key)] = (
+            validation._EvidenceRecord(
+                ingestion_sequence=offset + 1,
+                acceptance_monotonic_ns=absolute_deadline_ns + 50_000,
+                observation_id=f"{offset + 1:064x}",
+                reporter_id=reporter,
+                target_id=actor,
+                epoch_number=1,
+                tree_id=tree_id,
+                epoch_digest=digest,
+                block_hash=block_hash,
+                message_type="aggregate_relay",
+                outcome="timeout",
+                response_duration_us=0,
+                deadline_duration_us=deadline_duration_us,
+                reporter_monotonic_ns=absolute_deadline_ns,
+                reporter_sequence=offset + 1,
+                signer_set=(),
+            ),
+        )
+    return {
+        "markers": tuple(markers),
+        "arm_markers": tuple(arm_markers),
+        "responsive_degraded_actor_ids": (2, 5),
+        "authoritative_commit_ns": commit_times,
+        "proposal_commit_ns_by_replica": proposal_commit_times,
+        "epoch1_trees": trees,
+        "epoch1_timeout_index": timeout_index,
+        "epoch2_selection_ns": 10_000_000,
+    }
+
+
+def test_v9_proposal_commit_identity_binds_the_replica_event_stream() -> None:
+    event = _commit_event(
+        1,
+        2_000_000,
+        900,
+        epoch_number=1,
+        tree_id=4,
+        replica_id=1,
+    )
+    assert validation._proposal_commit_identity(
+        event,
+        replica_id=1,
+        require_exact_source_binding=True,
+    ) == (1, 4, "11" * 32, f"{900:064x}")
+
+    with pytest.raises(FactorialValidationError, match="source.*replica event stream"):
+        validation._proposal_commit_identity(
+            replace(event, source_id="replica-7"),
+            replica_id=1,
+            require_exact_source_binding=True,
+        )
+
+
+def test_v9_cross_commit_retention_witness_requires_every_degraded_actor() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    assert validation._validate_v9_cross_commit_retention_witnesses(
+        **arguments
+    ) == (2, 5)
+
+    commit_times = dict(arguments["authoritative_commit_ns"])
+    missing_key = next(
+        key
+        for key in commit_times
+        if key[3] == f"{901:064x}"
+    )
+    commit_times.pop(missing_key)
+    with pytest.raises(FactorialValidationError, match=r"cross-commit.*\[5\]"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{**arguments, "authoritative_commit_ns": commit_times}
+        )
+
+
+def test_v9_cross_commit_retention_rejects_missing_arm_marker() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+
+    with pytest.raises(FactorialValidationError, match=r"arm.*\[2\]"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "arm_markers": tuple(
+                    arm
+                    for arm in arguments["arm_markers"]
+                    if arm.child_id != 2
+                ),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "binding",
+    ("parent", "child", "proposal", "message_type"),
+)
+def test_v9_cross_commit_retention_binds_exact_arm_identity(binding: str) -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    arms = list(arguments["arm_markers"])
+    arm = arms[0]
+    if binding == "parent":
+        arms[0] = replace(
+            arm,
+            source_replica=arm.reporter_id + 1,
+            reporter_id=arm.reporter_id + 1,
+        )
+    elif binding == "child":
+        arms[0] = replace(arm, child_id=3)
+    elif binding == "proposal":
+        arms[0] = replace(arm, block_hash="ff" * 32)
+    else:
+        arms[0] = replace(arm, expected_message_type="direct_vote")
+
+    with pytest.raises(FactorialValidationError, match="physical parent|missing"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{**arguments, "arm_markers": tuple(arms)}
+        )
+
+
+def test_v9_cross_commit_retention_rejects_post_commit_arm() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    arms = list(arguments["arm_markers"])
+    proposal_commit_times = arguments["proposal_commit_ns_by_replica"]
+    timeout_index = dict(arguments["epoch1_timeout_index"])
+    arm = arms[0]
+    proposal_key = (
+        arm.epoch_number,
+        arm.tree_id,
+        arm.epoch_digest,
+        arm.block_hash,
+    )
+    post_commit_start = (
+        proposal_commit_times[arm.reporter_id][proposal_key][0] + 1
+    )
+    post_commit_deadline = post_commit_start + arm.deadline_duration_us * 1_000
+    arms[0] = replace(
+        arm,
+        start_monotonic_ns=post_commit_start,
+        absolute_deadline_ns=post_commit_deadline,
+    )
+    timeout_key = (arm.child_id, *proposal_key)
+    timeout_index[timeout_key] = (
+        replace(
+            timeout_index[timeout_key][0],
+            reporter_monotonic_ns=post_commit_deadline,
+            acceptance_monotonic_ns=post_commit_deadline + 1,
+        ),
+    )
+
+    with pytest.raises(FactorialValidationError, match="arm ordering"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "arm_markers": tuple(arms),
+                "epoch1_timeout_index": timeout_index,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    ("absolute_deadline_ns", "deadline_duration_us"),
+)
+def test_v9_cross_commit_retention_rejects_changed_arm_deadline_or_duration(
+    changed_field: str,
+) -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    arms = list(arguments["arm_markers"])
+    arm = arms[0]
+    if changed_field == "absolute_deadline_ns":
+        arms[0] = replace(arm, absolute_deadline_ns=arm.absolute_deadline_ns + 1)
+        expected_error = "absolute deadline"
+    else:
+        arms[0] = replace(
+            arm,
+            deadline_duration_us=arm.deadline_duration_us + 1,
+            absolute_deadline_ns=(
+                arm.start_monotonic_ns + (arm.deadline_duration_us + 1) * 1_000
+            ),
+        )
+        expected_error = "duration"
+
+    with pytest.raises(FactorialValidationError, match=expected_error):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{**arguments, "arm_markers": tuple(arms)}
+        )
+
+
+def test_v9_cross_commit_retention_rejects_cancel_and_rearm() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    arms = list(arguments["arm_markers"])
+    original = arms[0]
+    proposal_commit_times = arguments["proposal_commit_ns_by_replica"]
+    proposal_key = (
+        original.epoch_number,
+        original.tree_id,
+        original.epoch_digest,
+        original.block_hash,
+    )
+    rearm_start = (
+        proposal_commit_times[original.reporter_id][proposal_key][0] + 1
+    )
+    arms.append(
+        replace(
+            original,
+            line_number=99,
+            start_monotonic_ns=rearm_start,
+            absolute_deadline_ns=(
+                rearm_start + original.deadline_duration_us * 1_000
+            ),
+            raw_line_sha256="99" * 32,
+        )
+    )
+
+    with pytest.raises(FactorialValidationError, match="duplicate|rearm"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{**arguments, "arm_markers": tuple(arms)}
+        )
+
+
+@pytest.mark.parametrize("reporter_offset", (-1, 0))
+def test_v9_cross_commit_retention_rejects_timeout_before_or_at_commit(
+    reporter_offset: int,
+) -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    proposal_commit_times = arguments["proposal_commit_ns_by_replica"]
+    timeout_index = dict(arguments["epoch1_timeout_index"])
+    timeout_key = next(key for key in timeout_index if key[0] == 2)
+    timeout = timeout_index[timeout_key][0]
+    proposal_key = timeout_key[1:]
+    local_commit_ns = proposal_commit_times[timeout.reporter_id][proposal_key][0]
+    timeout_index[timeout_key] = (
+        replace(
+            timeout,
+            reporter_monotonic_ns=local_commit_ns + reporter_offset,
+        ),
+    )
+
+    with pytest.raises(FactorialValidationError, match=r"cross-commit.*\[2\]"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{**arguments, "epoch1_timeout_index": timeout_index}
+        )
+
+
+def test_v9_cross_commit_uses_reporter_commit_not_earlier_authoritative_commit() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    arm = arguments["arm_markers"][0]
+    proposal_key = arm.proposal_key
+    proposal_commit_times = {
+        replica_id: dict(commits)
+        for replica_id, commits in arguments[
+            "proposal_commit_ns_by_replica"
+        ].items()
+    }
+    proposal_commit_times[arm.reporter_id][proposal_key] = (
+        arm.absolute_deadline_ns + 1,
+    )
+
+    with pytest.raises(FactorialValidationError, match="reporter-local commit"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "proposal_commit_ns_by_replica": proposal_commit_times,
+            }
+        )
+
+
+def test_v9_cross_commit_keeps_later_authoritative_commit_as_separate_link() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    arm = arguments["arm_markers"][0]
+    proposal_key = arm.proposal_key
+    timeout = arguments["epoch1_timeout_index"][(arm.child_id, *proposal_key)][0]
+    authoritative = dict(arguments["authoritative_commit_ns"])
+    authoritative[proposal_key] = timeout.acceptance_monotonic_ns + 1
+
+    validation._validate_v9_cross_commit_retention_witnesses(
+        **{**arguments, "authoritative_commit_ns": authoritative}
+    )
+
+
+@pytest.mark.parametrize("corruption", ("missing", "duplicate", "proposal", "reporter"))
+def test_v9_cross_commit_rejects_nonexact_reporter_local_commit(
+    corruption: str,
+) -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    arm = arguments["arm_markers"][0]
+    proposal_key = arm.proposal_key
+    proposal_commit_times = {
+        replica_id: dict(commits)
+        for replica_id, commits in arguments[
+            "proposal_commit_ns_by_replica"
+        ].items()
+    }
+    original = proposal_commit_times[arm.reporter_id].pop(proposal_key)
+    if corruption == "duplicate":
+        proposal_commit_times[arm.reporter_id][proposal_key] = (
+            original[0],
+            original[0] + 1,
+        )
+    elif corruption == "proposal":
+        proposal_commit_times[arm.reporter_id][
+            (*proposal_key[:3], "ff" * 32)
+        ] = original
+    elif corruption == "reporter":
+        proposal_commit_times.setdefault(arm.reporter_id + 1, {})[
+            proposal_key
+        ] = original
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="missing exact reporter-local|duplicated/ambiguous exact reporter-local",
+    ):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "proposal_commit_ns_by_replica": proposal_commit_times,
+            }
+        )
+
+
+def test_v9_cross_commit_retention_requires_an_internal_aggregate_witness() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    markers = tuple(
+        replace(marker, action="omit_direct_vote")
+        for marker in arguments["markers"]
+    )
+    trees: dict[int, Tree] = {}
+    for marker in markers:
+        tree = arguments["epoch1_trees"][marker.tree_id]
+        trees[marker.tree_id] = replace(
+            tree,
+            members=(
+                *(member for member in tree.members if member != marker.actor),
+                marker.actor,
+            ),
+        )
+    timeout_index = dict(arguments["epoch1_timeout_index"])
+    proposal_commit_times: dict[
+        int,
+        dict[tuple[int, int, str, str], tuple[int, ...]],
+    ] = {}
+    arm_markers = {
+        arm.child_id: arm for arm in arguments["arm_markers"]
+    }
+    for marker in markers:
+        proposal_key = (
+            marker.epoch_number,
+            marker.tree_id,
+            marker.epoch_digest,
+            marker.block_hash,
+        )
+        timeout_key = (marker.actor, *proposal_key)
+        tree = trees[marker.tree_id]
+        position = tree.members.index(marker.actor)
+        parent = tree.members[(position - 1) // tree.fanout]
+        timeout_index[timeout_key] = (
+            replace(
+                timeout_index[timeout_key][0],
+                reporter_id=parent,
+                message_type="direct_vote",
+            ),
+        )
+        arm_markers[marker.actor] = replace(
+            arm_markers[marker.actor],
+            source_replica=parent,
+            reporter_id=parent,
+            expected_message_type="direct_vote",
+        )
+        proposal_commit_times.setdefault(parent, {})[proposal_key] = (
+            marker.monotonic_ns + 100_000,
+        )
+
+    with pytest.raises(
+        FactorialValidationError,
+        match=r"internal-role omit_aggregate",
+    ):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "markers": markers,
+                "epoch1_trees": trees,
+                "epoch1_timeout_index": timeout_index,
+                "arm_markers": tuple(arm_markers.values()),
+                "proposal_commit_ns_by_replica": proposal_commit_times,
+            }
+        )
+
+
+def test_primary_v9_cross_commit_requires_each_actor_to_be_internal() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    leaf_only_actor = 5
+    markers = tuple(
+        replace(marker, action="omit_direct_vote")
+        if marker.actor == leaf_only_actor
+        else marker
+        for marker in arguments["markers"]
+    )
+    marker = next(marker for marker in markers if marker.actor == leaf_only_actor)
+    proposal_key = (
+        marker.epoch_number,
+        marker.tree_id,
+        marker.epoch_digest,
+        marker.block_hash,
+    )
+    trees = dict(arguments["epoch1_trees"])
+    original_tree = trees[marker.tree_id]
+    trees[marker.tree_id] = replace(
+        original_tree,
+        members=(
+            *(member for member in original_tree.members if member != leaf_only_actor),
+            leaf_only_actor,
+        ),
+    )
+    position = trees[marker.tree_id].members.index(leaf_only_actor)
+    parent = trees[marker.tree_id].members[
+        (position - 1) // trees[marker.tree_id].fanout
+    ]
+    timeout_key = (leaf_only_actor, *proposal_key)
+    timeout_index = dict(arguments["epoch1_timeout_index"])
+    timeout_index[timeout_key] = (
+        replace(
+            timeout_index[timeout_key][0],
+            reporter_id=parent,
+            message_type="direct_vote",
+        ),
+    )
+    arms = tuple(
+        replace(
+            arm,
+            source_replica=parent,
+            reporter_id=parent,
+            expected_message_type="direct_vote",
+        )
+        if arm.child_id == leaf_only_actor
+        else arm
+        for arm in arguments["arm_markers"]
+    )
+    proposal_commit_times = {
+        replica_id: dict(commits)
+        for replica_id, commits in arguments[
+            "proposal_commit_ns_by_replica"
+        ].items()
+    }
+    original_arm = next(
+        arm for arm in arguments["arm_markers"] if arm.child_id == leaf_only_actor
+    )
+    local_commit = proposal_commit_times[original_arm.reporter_id].pop(
+        proposal_key
+    )
+    proposal_commit_times.setdefault(parent, {})[proposal_key] = local_commit
+
+    with pytest.raises(FactorialValidationError, match=r"own.*\[5\]"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "markers": markers,
+                "epoch1_trees": trees,
+                "epoch1_timeout_index": timeout_index,
+                "arm_markers": arms,
+                "proposal_commit_ns_by_replica": proposal_commit_times,
+                "require_each_degraded_actor_internal_witness": True,
+            }
         )
 
 
@@ -1453,20 +2121,20 @@ def _tiered_scores() -> tuple[ReplicaScore, ...]:
                 replica_id=replica,
                 classification="responsive",
                 eligible=True,
-                attempt_count=32,
+                attempt_count=41,
                 response_rate_ppm=1_000_000,
                 timeout_rate_ppm=0,
                 latency_percentile_us=10,
             )
             for replica in fast
         ),
-        ReplicaScore(2, "responsive", True, 32, 968_750, 31_250, 20),
+        ReplicaScore(2, "responsive", True, 41, 975_610, 24_390, 20),
         *(
             ReplicaScore(
                 replica_id=replica,
                 classification="nonresponsive",
                 eligible=False,
-                attempt_count=32,
+                attempt_count=41,
                 response_rate_ppm=0,
                 timeout_rate_ppm=1_000_000,
                 latency_percentile_us=None,
@@ -1479,7 +2147,7 @@ def _tiered_scores() -> tuple[ReplicaScore, ...]:
 def test_tiered_ranking_requires_real_degradation_and_exact_top_q() -> None:
     scores = _tiered_scores()
     policy = {
-        "minimum_attempts": 32,
+        "minimum_attempts": 41,
         "minimum_response_rate_ppm": 950_000,
         "maximum_timeout_rate_ppm": 50_000,
     }
@@ -1491,6 +2159,7 @@ def test_tiered_ranking_requires_real_degradation_and_exact_top_q() -> None:
         "tree_count": 9,
         "expected_roots": fast,
         "policy": policy,
+        "responsive_omission_period": 41,
     }
     assert validation._validate_tiered_performance_ranking(scores, **arguments) == 1
 
@@ -2646,7 +3315,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         )
 
 
-def test_v8_receipt_rejects_an_exact_legacy_manifest_plan_pair(
+def test_v9_receipt_rejects_an_exact_legacy_manifest_plan_pair(
     tmp_path: Path,
 ) -> None:
     recovered, _, receipt, expected, runtime, authorization = (
@@ -3031,11 +3700,17 @@ def test_matched_estimate_uses_frozen_df4_interval_and_strict_claim_rule() -> No
 def _synthetic_breakthrough_results(
     block_effects: tuple[float, ...],
     *,
+    secondary_block_effects: tuple[float, ...] | None = None,
     zero_mean: tuple[int, str, str] | None = None,
     p_changed_blocks: int = 5,
     ps_changed_blocks: int = 5,
+    secondary_p_changed_blocks: int = 5,
+    secondary_ps_changed_blocks: int = 5,
 ) -> dict[str, validation.SlotValidationResult]:
     assert len(block_effects) == 5
+    if secondary_block_effects is None:
+        secondary_block_effects = (0.0,) * 5
+    assert len(secondary_block_effects) == 5
     manifest = load_frozen_manifest(MANIFEST_PATH)
     expected_by_pair = {
         (slot.block_id, slot.arm_code): slot
@@ -3044,14 +3719,19 @@ def _synthetic_breakthrough_results(
     results: dict[str, validation.SlotValidationResult] = {}
     for fanout in (5, 2):
         for block_index, effect in enumerate(block_effects, 1):
+            cell_effect = (
+                effect
+                if fanout == 5
+                else secondary_block_effects[block_index - 1]
+            )
             block_id = f"n31-f{fanout}-b{block_index:02d}"
             for arm in ("00", "P", "S", "PS"):
                 baseline = 100.0
                 fault_evidence = 50.0
                 epoch1 = 100.0
                 epoch2 = (
-                    100.0 * math.exp(effect)
-                    if fanout == 5 and arm in ("P", "PS")
+                    100.0 * math.exp(cell_effect)
+                    if arm in ("P", "PS")
                     else 100.0
                 )
                 if zero_mean == (block_index, arm, "baseline"):
@@ -3081,13 +3761,17 @@ def _synthetic_breakthrough_results(
                 expected = expected_by_pair[(block_id, arm)]
                 epoch1_roots = tuple(range(expected.q))
                 changed_limit = (
-                    p_changed_blocks
+                    (p_changed_blocks if fanout == 5 else secondary_p_changed_blocks)
                     if arm == "P"
-                    else ps_changed_blocks
+                    else (
+                        ps_changed_blocks
+                        if fanout == 5
+                        else secondary_ps_changed_blocks
+                    )
                     if arm == "PS"
                     else 0
                 )
-                placement_changed = fanout == 5 and block_index <= changed_limit
+                placement_changed = block_index <= changed_limit
                 epoch2_roots = (
                     expected.fast_replica_ids
                     if placement_changed
@@ -3095,7 +3779,7 @@ def _synthetic_breakthrough_results(
                 )
                 promoted = tuple(sorted(set(epoch2_roots) - set(epoch1_roots)))
                 demoted = tuple(sorted(set(epoch1_roots) - set(epoch2_roots)))
-                hierarchy_required = fanout == 5 and arm in {"P", "PS"}
+                hierarchy_required = arm in {"P", "PS"}
                 results[slot_id] = validation.SlotValidationResult(
                     slot_id=slot_id,
                     outcome="PASS",
@@ -3131,6 +3815,11 @@ def _synthetic_breakthrough_results(
                         if hierarchy_required
                         else 0
                     ),
+                    epoch1_degraded_internal_cross_commit_witness_count=(
+                        len(expected.responsive_degraded_actor_ids)
+                        if fanout == 5 and hierarchy_required
+                        else 0
+                    ),
                     epoch2_constrained_leaf_proof_count=(
                         expected.f * expected.q if hierarchy_required else 0
                     ),
@@ -3152,12 +3841,16 @@ def _with_placebo_component_effects(
     *,
     p_effects: tuple[float, ...],
     ps_effects: tuple[float, ...],
+    initial_fanout: int = 5,
 ) -> dict[str, validation.SlotValidationResult]:
     assert len(p_effects) == len(ps_effects) == 5
     updated = dict(results)
     by_arm = {"P": p_effects, "PS": ps_effects}
     for slot_id, result in results.items():
-        if result.initial_fanout != 5 or result.arm_code not in by_arm:
+        if (
+            result.initial_fanout != initial_fanout
+            or result.arm_code not in by_arm
+        ):
             continue
         block_index = int(result.block_id.rsplit("b", 1)[1]) - 1
         fault_mean = 50.0 * math.exp(by_arm[result.arm_code][block_index])
@@ -3213,6 +3906,158 @@ def test_primary_throughput_estimate_is_the_exact_matched_log_ratio() -> None:
         assert placebo.equivalence_supported is True
 
 
+def test_secondary_f2_status_depends_on_primary_without_changing_primary() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+
+    both = _synthetic_breakthrough_results(
+        (0.2,) * 5,
+        secondary_block_effects=(0.2,) * 5,
+    )
+    both_effects = validation._headline_effects(manifest, both)
+    assert both_effects is not None
+    primary_both = validation._breakthrough_verdict(
+        manifest,
+        both,
+        campaign_outcome="PASS",
+        effects=both_effects,
+    )
+    secondary_both = validation._secondary_placement_verdict(
+        manifest,
+        both,
+        primary=primary_both,
+        effects=both_effects,
+    )
+    assert primary_both.status == "SUPPORTED"
+    assert secondary_both is not None
+    assert secondary_both.status == "SUPPORTED"
+    assert secondary_both.structural_validated_slot_count == 10
+    assert secondary_both.placement_changed_p_block_count == 5
+    assert secondary_both.placement_changed_ps_block_count == 5
+    assert secondary_both.throughput_positive_block_count == 5
+    assert secondary_both.placebo_equivalence_rule_passed is True
+
+    only_f5 = _synthetic_breakthrough_results((0.2,) * 5)
+    only_f5_effects = validation._headline_effects(manifest, only_f5)
+    assert only_f5_effects is not None
+    primary_only_f5 = validation._breakthrough_verdict(
+        manifest,
+        only_f5,
+        campaign_outcome="PASS",
+        effects=only_f5_effects,
+    )
+    secondary_only_f5 = validation._secondary_placement_verdict(
+        manifest,
+        only_f5,
+        primary=primary_only_f5,
+        effects=only_f5_effects,
+    )
+    assert primary_only_f5.status == "SUPPORTED"
+    assert secondary_only_f5 is not None
+    assert secondary_only_f5.status == "NOT_SUPPORTED"
+    assert secondary_only_f5.throughput_rule_passed is False
+
+    only_f2 = _synthetic_breakthrough_results(
+        (-0.1,) * 5,
+        secondary_block_effects=(0.2,) * 5,
+    )
+    only_f2_effects = validation._headline_effects(manifest, only_f2)
+    assert only_f2_effects is not None
+    primary_only_f2 = validation._breakthrough_verdict(
+        manifest,
+        only_f2,
+        campaign_outcome="PASS",
+        effects=only_f2_effects,
+    )
+    secondary_only_f2 = validation._secondary_placement_verdict(
+        manifest,
+        only_f2,
+        primary=primary_only_f2,
+        effects=only_f2_effects,
+    )
+    assert primary_only_f2.status == "NOT_SUPPORTED"
+    assert secondary_only_f2 is not None
+    assert secondary_only_f2.status == "DESCRIPTIVE_ONLY"
+    assert secondary_only_f2.throughput_rule_passed is True
+
+
+def test_secondary_f2_requires_its_own_structural_and_placebo_gates() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    results = _synthetic_breakthrough_results(
+        (0.2,) * 5,
+        secondary_block_effects=(0.2,) * 5,
+    )
+    structurally_invalid = dict(results)
+    slot_id = "synthetic-n31-f2-b05-P"
+    structurally_invalid[slot_id] = replace(
+        structurally_invalid[slot_id],
+        full_hierarchy_gate_passed=False,
+    )
+    structural_effects = validation._headline_effects(
+        manifest,
+        structurally_invalid,
+    )
+    assert structural_effects is not None
+    primary = validation._breakthrough_verdict(
+        manifest,
+        structurally_invalid,
+        campaign_outcome="PASS",
+        effects=structural_effects,
+    )
+    structural_secondary = validation._secondary_placement_verdict(
+        manifest,
+        structurally_invalid,
+        primary=primary,
+        effects=structural_effects,
+    )
+    assert primary.status == "SUPPORTED"
+    assert structural_secondary is not None
+    assert structural_secondary.status == "NOT_SUPPORTED"
+    assert structural_secondary.structural_validated_slot_count == 9
+
+    placebo_invalid = _with_placebo_component_effects(
+        results,
+        p_effects=(math.log(1.2),) * 5,
+        ps_effects=(0.0,) * 5,
+        initial_fanout=2,
+    )
+    placebo_effects = validation._headline_effects(manifest, placebo_invalid)
+    assert placebo_effects is not None
+    primary = validation._breakthrough_verdict(
+        manifest,
+        placebo_invalid,
+        campaign_outcome="PASS",
+        effects=placebo_effects,
+    )
+    placebo_secondary = validation._secondary_placement_verdict(
+        manifest,
+        placebo_invalid,
+        primary=primary,
+        effects=placebo_effects,
+    )
+    assert primary.status == "SUPPORTED"
+    assert placebo_secondary is not None
+    assert placebo_secondary.status == "NOT_SUPPORTED"
+    assert placebo_secondary.placebo_p_equivalence_rule_passed is False
+    assert placebo_secondary.placebo_ps_equivalence_rule_passed is True
+
+
+def test_v8_breakthrough_hierarchy_does_not_require_v9_internal_witnesses() -> None:
+    manifest = load_frozen_manifest(V8_MANIFEST_PATH)
+    results = {
+        slot_id: replace(
+            result,
+            epoch1_degraded_internal_cross_commit_witness_count=0,
+        )
+        for slot_id, result in _synthetic_breakthrough_results((0.2,) * 5).items()
+    }
+
+    summary = validation._breakthrough_hierarchy_summary(manifest, results)
+
+    assert summary["validated_slot_count"] == 10
+    assert summary["epoch1_degraded_internal_cross_commit_required_count"] == 0
+    assert summary["full_hierarchy_gate_passed"] is True
+
+
 def test_breakthrough_requires_lower_log_bound_and_four_positive_blocks() -> None:
     manifest = load_frozen_manifest(MANIFEST_PATH)
     four_positive = _synthetic_breakthrough_results(
@@ -3238,6 +4083,12 @@ def test_breakthrough_requires_lower_log_bound_and_four_positive_blocks() -> Non
     assert supported.structural_required_slot_count == 10
     assert supported.structural_validated_slot_count == 10
     assert supported.structural_gate_passed is True
+    assert (
+        supported.epoch1_degraded_internal_cross_commit_required_count == 70
+    )
+    assert (
+        supported.epoch1_degraded_internal_cross_commit_validated_count == 70
+    )
     assert supported.placement_changed_p_block_count == 5
     assert supported.placement_changed_ps_block_count == 5
     assert supported.realized_placement_gate_passed is True
@@ -3263,6 +4114,10 @@ def test_breakthrough_requires_lower_log_bound_and_four_positive_blocks() -> Non
     )
     assert structural_failure.status == "NOT_SUPPORTED"
     assert structural_failure.structural_validated_slot_count == 9
+    assert (
+        structural_failure.epoch1_degraded_internal_cross_commit_validated_count
+        == 63
+    )
     assert structural_failure.structural_gate_passed is False
     assert structural_failure.realized_placement_gate_passed is False
     assert structural_failure.failed_requirements == (
@@ -3631,6 +4486,135 @@ def test_zero_mean_rejects_breakthrough_without_invalidating_campaign_evidence()
     assert validation._campaign_figure_eligible("PASS", negative_effects) is True
 
 
+def _campaign_chronology_rows(
+    monotonic_ns: tuple[object, ...] = (1, 2, 3, 4),
+    recorded_utc: tuple[str, ...] = (
+        "2026-08-04T00:00:01+00:00",
+        "2026-08-04T00:00:02+00:00",
+        "2026-08-04T00:00:03+00:00",
+        "2026-08-04T00:00:04+00:00",
+    ),
+) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "recorded_monotonic_ns": timestamp,
+            "recorded_utc": wall_time,
+        }
+        for timestamp, wall_time in zip(monotonic_ns, recorded_utc)
+    )
+
+
+def test_campaign_chronology_accepts_strict_full_monotonic_chain() -> None:
+    validation._validate_campaign_chronology(
+        approved_utc="2026-08-04T00:00:00+00:00",
+        ledger_rows=_campaign_chronology_rows(),
+        completed_utc="2026-08-04T00:00:04+00:00",
+    )
+
+
+@pytest.mark.parametrize(
+    "monotonic_ns",
+    (
+        (1, 2, 2, 4),
+        (1, 2, 1, 4),
+    ),
+)
+def test_campaign_chronology_rejects_equal_or_regressing_monotonic_chain(
+    monotonic_ns: tuple[object, ...],
+) -> None:
+    with pytest.raises(FactorialValidationError, match="strictly increasing"):
+        validation._validate_campaign_chronology(
+            approved_utc="2026-08-04T00:00:00+00:00",
+            ledger_rows=_campaign_chronology_rows(monotonic_ns),
+            completed_utc="2026-08-04T00:00:04+00:00",
+        )
+
+
+@pytest.mark.parametrize("invalid", (0, True, 1.0, "1"))
+def test_campaign_chronology_requires_exact_positive_monotonic_integers(
+    invalid: object,
+) -> None:
+    with pytest.raises(FactorialValidationError, match=r"integer >= 1"):
+        validation._validate_campaign_chronology(
+            approved_utc="2026-08-04T00:00:00+00:00",
+            ledger_rows=_campaign_chronology_rows((1, invalid, 3, 4)),
+            completed_utc="2026-08-04T00:00:04+00:00",
+        )
+
+
+@pytest.mark.parametrize(
+    "recorded_utc",
+    (
+        (
+            "2026-08-03T23:59:59+00:00",
+            "2026-08-04T00:00:02+00:00",
+            "2026-08-04T00:00:03+00:00",
+            "2026-08-04T00:00:04+00:00",
+        ),
+        (
+            "2026-08-04T00:00:01+00:00",
+            "2026-08-04T00:00:00+00:00",
+            "2026-08-04T00:00:03+00:00",
+            "2026-08-04T00:00:04+00:00",
+        ),
+    ),
+)
+def test_campaign_chronology_rejects_preapproval_or_regressing_row_utc(
+    recorded_utc: tuple[str, ...],
+) -> None:
+    with pytest.raises(FactorialValidationError, match="UTC chronology"):
+        validation._validate_campaign_chronology(
+            approved_utc="2026-08-04T00:00:00+00:00",
+            ledger_rows=_campaign_chronology_rows(recorded_utc=recorded_utc),
+            completed_utc="2026-08-04T00:00:04+00:00",
+        )
+
+
+@pytest.mark.parametrize(
+    "completed_utc",
+    (
+        "2026-08-03T23:59:59+00:00",
+        "2026-08-04T00:00:03+00:00",
+    ),
+)
+def test_campaign_chronology_rejects_summary_before_approval_or_terminal(
+    completed_utc: str,
+) -> None:
+    with pytest.raises(FactorialValidationError, match="completion UTC precedes"):
+        validation._validate_campaign_chronology(
+            approved_utc="2026-08-04T00:00:00+00:00",
+            ledger_rows=_campaign_chronology_rows(),
+            completed_utc=completed_utc,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("approved_utc", "2026-08-04T00:00:00"),
+        ("recorded_utc", "2026-08-04T00:00:01"),
+        ("completed_utc", "2026-08-04T00:00:04"),
+    ),
+)
+def test_campaign_chronology_requires_aware_wall_timestamps(
+    field: str,
+    value: str,
+) -> None:
+    arguments: dict[str, object] = {
+        "approved_utc": "2026-08-04T00:00:00+00:00",
+        "ledger_rows": _campaign_chronology_rows(),
+        "completed_utc": "2026-08-04T00:00:04+00:00",
+    }
+    if field == "recorded_utc":
+        rows = list(arguments["ledger_rows"])
+        rows[0] = {**rows[0], "recorded_utc": value}
+        arguments["ledger_rows"] = tuple(rows)
+    else:
+        arguments[field] = value
+    with pytest.raises(FactorialValidationError, match="timezone-aware"):
+        validation._validate_campaign_chronology(**arguments)
+
+
 def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
     tmp_path: Path,
 ) -> None:
@@ -3813,6 +4797,59 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
         results_by_id={first.slot_id: result},
         campaign_outcome="INCOMPLETE",
     ) == 1
+
+    equal_monotonic_rows = [dict(row) for row in rows]
+    equal_monotonic_rows[1]["recorded_monotonic_ns"] = 1
+    ledger_path.write_bytes(
+        b"".join(_canonical(row) for row in equal_monotonic_rows)
+    )
+    equal_monotonic_summary = {
+        **summary,
+        "ledger_sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+    }
+    summary_path.write_bytes(_canonical(equal_monotonic_summary))
+    with pytest.raises(FactorialValidationError, match="strictly increasing"):
+        validation._validate_campaign_execution_ledger(
+            root,
+            manifest=manifest,
+            plan=json.loads(canonical_plan_bytes(plan)),
+            runtime=runtime,
+            expected_slots=expected_slots,
+            actual_by_id={first.slot_id: first_path},
+            results_by_id={first.slot_id: result},
+            campaign_outcome="INCOMPLETE",
+        )
+
+    terminal_after_summary_rows = [dict(row) for row in rows]
+    terminal_after_summary_rows[0]["recorded_utc"] = (
+        "2026-08-04T00:00:01+00:00"
+    )
+    terminal_after_summary_rows[1]["recorded_utc"] = (
+        "2026-08-04T00:00:02+00:00"
+    )
+    ledger_path.write_bytes(
+        b"".join(_canonical(row) for row in terminal_after_summary_rows)
+    )
+    early_summary = {
+        **summary,
+        "ledger_sha256": hashlib.sha256(ledger_path.read_bytes()).hexdigest(),
+        "completed_utc": "2026-08-04T00:00:01+00:00",
+    }
+    summary_path.write_bytes(_canonical(early_summary))
+    with pytest.raises(FactorialValidationError, match="completion UTC precedes"):
+        validation._validate_campaign_execution_ledger(
+            root,
+            manifest=manifest,
+            plan=json.loads(canonical_plan_bytes(plan)),
+            runtime=runtime,
+            expected_slots=expected_slots,
+            actual_by_id={first.slot_id: first_path},
+            results_by_id={first.slot_id: result},
+            campaign_outcome="INCOMPLETE",
+        )
+
+    ledger_path.write_bytes(b"".join(_canonical(row) for row in rows))
+    summary_path.write_bytes(_canonical(summary))
 
     typed_contract = dict(contract)
     typed_contract["outcome_dependent_order"] = 0

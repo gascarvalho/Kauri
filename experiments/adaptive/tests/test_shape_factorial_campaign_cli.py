@@ -33,7 +33,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v9.json"
+V8_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
+)
 V7_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v7.json"
 )
@@ -173,6 +176,7 @@ def _slot_validation(
         (V5_MANIFEST, "v5"),
         (V6_MANIFEST, "v6"),
         (V7_MANIFEST, "v7"),
+        (V8_MANIFEST, "v8"),
     ),
 )
 @pytest.mark.parametrize("command", ("plan", "preflight", "smoke", "run"))
@@ -199,8 +203,8 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1 through v7 are validation-only; "
-            "plan, preflight, smoke, and run require shape-placement-factorial-v8"
+            "shape-placement-factorial-v1 through v8 are validation-only; "
+            "plan, preflight, smoke, and run require shape-placement-factorial-v9"
         ),
         "status": "REJECT",
     }
@@ -271,7 +275,7 @@ def test_smoke_preflight_rejects_runtime_identity_drift(
     ) == 2
     refusal = json.loads(capsys.readouterr().err)
     assert refusal == {
-        "reason": "smoke runtime bytes differ from the exact frozen v8 identity",
+        "reason": "smoke runtime bytes differ from the exact frozen v9 identity",
         "status": "REJECT",
     }
 
@@ -286,6 +290,7 @@ def test_smoke_preflight_rejects_runtime_identity_drift(
         (V5_MANIFEST, "v5"),
         (V6_MANIFEST, "v6"),
         (V7_MANIFEST, "v7"),
+        (V8_MANIFEST, "v8"),
     ),
 )
 def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
@@ -350,6 +355,7 @@ def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
         (V5_MANIFEST, "v5"),
         (V6_MANIFEST, "v6"),
         (V7_MANIFEST, "v7"),
+        (V8_MANIFEST, "v8"),
     ),
 )
 def test_prior_validate_campaign_uses_preserved_artifacts_without_rederiving(
@@ -415,7 +421,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v8").exists()
+    assert not (repository / "results/shape-placement-factorial-v9").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -440,7 +446,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v8").exists()
+    assert not (repository / "results/shape-placement-factorial-v9").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -466,7 +472,7 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v8-smoke"
+        repository / "results/shape-placement-factorial-v9-smoke"
     ).exists()
 
 
@@ -502,7 +508,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v8-smoke"
+        repository / "results/shape-placement-factorial-v9-smoke"
     ).exists()
 
 
@@ -562,7 +568,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v8-smoke"
+        / "results/shape-placement-factorial-v9-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"
@@ -767,10 +773,18 @@ def test_campaign_uses_exact_execution_order_and_stops_without_retry(
     repository = tmp_path / "Kauri"
     executed: list[str] = []
     validations: dict[str, str] = {}
+    published_summaries: list[Path] = []
     monkeypatch.setattr(cli, "_preflight", _preflight)
     monkeypatch.setattr(
         cli, "_require_validated_smoke", lambda _root, **_kwargs: None
     )
+    original_publish_summary = cli.publish_campaign_summary
+
+    def publish_summary(path: Path, value: object) -> None:
+        published_summaries.append(path)
+        original_publish_summary(path, value)
+
+    monkeypatch.setattr(cli, "publish_campaign_summary", publish_summary)
 
     def execute(slot, spec, **kwargs: Any):
         executed.append(slot.slot_id)
@@ -846,6 +860,7 @@ def test_campaign_uses_exact_execution_order_and_stops_without_retry(
     assert summary["attempted_slot_count"] == 2
     assert summary["next_execution_ordinal"] == 3
     assert summary["execution_complete"] is False
+    assert published_summaries == [root / cli.CAMPAIGN_SUMMARY_FILENAME]
     assert result["attempted_slot_count"] == 2
     assert "without retry or replacement" in result["stopped_reason"]
 

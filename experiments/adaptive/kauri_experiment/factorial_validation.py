@@ -59,6 +59,8 @@ from .factorial_manifest import (
     LEGACY_MANIFEST_ID,
     LEGACY_MANIFEST_SHA256,
     LEGACY_PLAN_SHA256,
+    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
     V2_PLAN_SHA256,
@@ -77,6 +79,9 @@ from .factorial_manifest import (
     V7_MANIFEST_ID,
     V7_MANIFEST_SHA256,
     V7_PLAN_SHA256,
+    V8_MANIFEST_ID,
+    V8_MANIFEST_SHA256,
+    V8_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -144,11 +149,17 @@ V7_RUNTIME_SHA256 = (
 V7_SMOKE_RUNTIME_SHA256 = (
     "d7476a1d6c314f5b117e5e5d39a817d6f787b07b675b6d789e7b345491936d0f"
 )
-FROZEN_RUNTIME_SHA256 = (
+V8_RUNTIME_SHA256 = (
     "05b846c2fd9dc1005348993e147bb3e33def0011a7b52b3a68473ec79507e1a0"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V8_SMOKE_RUNTIME_SHA256 = (
     "bd0bf9291e4b34a229be6ce5a5e09ffe7a34964199a0ea21696ab750ddab8e0b"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "a0ed61f9e27546467c82a33b2412ee117b701fe48054fc35303a172da0309096"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "a6733bb8705a34d82b02cc2bdf0596b12a08da57e57f9e12dd1968e6135a31d2"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -217,7 +228,27 @@ _RESPONSIVE_DEGRADED_SELECTOR_DOMAIN = (
 _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
     "replica_0_reserved_authoritative_commit_observer_v1"
 )
-_RESPONSIVE_OMISSION_PERIOD = 32
+_V8_RESPONSIVE_OMISSION_PERIOD = 32
+_RESPONSIVE_OMISSION_PERIOD = 41
+
+
+def _expected_responsive_omission_period(manifest_id: str) -> int:
+    return (
+        _RESPONSIVE_OMISSION_PERIOD
+        if manifest_id == FROZEN_MANIFEST_ID
+        else _V8_RESPONSIVE_OMISSION_PERIOD
+    )
+
+
+def _ordinal_label(value: int) -> str:
+    suffix = (
+        "th"
+        if 10 <= value % 100 <= 20
+        else {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+    )
+    return f"{value}{suffix}"
+
+
 _FAULT_MARKER_PREFIX = (
     r"(?:^|\s)KAURI_FAULT fault=([a-z0-9_]+) "
     r"proposal_epoch=(\d+) proposal_tree=(\d+) "
@@ -234,6 +265,14 @@ _TIERED_FAULT_MARKER = re.compile(
     r"responsive_degraded_actor_count=(\d+) fault_threshold=(\d+) "
     r"max_omissions_per_proposal=(\d+) responsive_omission_period=(\d+) "
     r"contribution_ordinal=(\d+)\s*$"
+)
+_RESPONSE_ATTEMPT_ARM_MARKER = re.compile(
+    r"(?:^|\s)KAURI_EVIDENCE response_attempt_armed "
+    r"reporter=([0-9]+) child=([0-9]+) epoch=([0-9]+) tree=([0-9]+) "
+    r"epoch_digest=([0-9a-f]{64}) block=([0-9a-f]{64}) "
+    r"expected_message_type=(direct_vote|aggregate_relay) "
+    r"start_monotonic_ns=([0-9]+) deadline_duration_us=([0-9]+) "
+    r"absolute_deadline_ns=([0-9]+)\s*$"
 )
 _REDACTION_KEY_DOMAIN = b"kauri.shape25.launch-redaction-key.v1"
 _FORBIDDEN_MANAGER_KEYS = frozenset(
@@ -327,6 +366,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             runtime_sha256=V7_RUNTIME_SHA256,
             smoke_runtime_sha256=V7_SMOKE_RUNTIME_SHA256,
         ),
+        V8_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V8_MANIFEST_ID,
+            manifest_sha256=V8_MANIFEST_SHA256,
+            plan_sha256=V8_PLAN_SHA256,
+            runtime_sha256=V8_RUNTIME_SHA256,
+            smoke_runtime_sha256=V8_SMOKE_RUNTIME_SHA256,
+        ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
             manifest_sha256=FROZEN_MANIFEST_SHA256,
@@ -412,6 +458,44 @@ class FaultMarker:
 
 
 @dataclass(frozen=True, slots=True)
+class ResponseAttemptArmMarker:
+    source_replica: int
+    line_number: int
+    reporter_id: int
+    child_id: int
+    epoch_number: int
+    tree_id: int
+    epoch_digest: str
+    block_hash: str
+    expected_message_type: str
+    start_monotonic_ns: int
+    deadline_duration_us: int
+    absolute_deadline_ns: int
+    raw_line_sha256: str
+
+    @property
+    def proposal_key(self) -> tuple[int, int, str, str]:
+        return (
+            self.epoch_number,
+            self.tree_id,
+            self.epoch_digest,
+            self.block_hash,
+        )
+
+    @property
+    def identity(self) -> tuple[int, int, int, int, str, str, str]:
+        return (
+            self.reporter_id,
+            self.child_id,
+            self.epoch_number,
+            self.tree_id,
+            self.epoch_digest,
+            self.block_hash,
+            self.expected_message_type,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PhaseMetric:
     phase: str
     transactions: int
@@ -443,6 +527,7 @@ class SlotValidationResult:
     degraded_rank_proof_count: int = 0
     epoch1_degraded_root_proof_count: int = 0
     epoch1_degraded_internal_proof_count: int = 0
+    epoch1_degraded_internal_cross_commit_witness_count: int = 0
     epoch2_constrained_leaf_proof_count: int = 0
     epoch2_fast_root_internal_position_proof_count: int = 0
     epoch2_fast_root_internal_position_required_count: int = 0
@@ -520,6 +605,9 @@ class FactorialEffects:
     primary_throughput_log_ratio: MatchedLogRatioEstimate | None
     pre_epoch1_placebo_p_log_ratio: MatchedEquivalenceEstimate | None
     pre_epoch1_placebo_ps_log_ratio: MatchedEquivalenceEstimate | None
+    secondary_f2_throughput_log_ratio: MatchedLogRatioEstimate | None
+    secondary_f2_pre_epoch1_placebo_p_log_ratio: MatchedEquivalenceEstimate | None
+    secondary_f2_pre_epoch1_placebo_ps_log_ratio: MatchedEquivalenceEstimate | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,11 +662,45 @@ class BreakthroughVerdict:
     epoch1_degraded_root_validated_count: int
     epoch1_degraded_internal_required_count: int
     epoch1_degraded_internal_validated_count: int
+    epoch1_degraded_internal_cross_commit_required_count: int
+    epoch1_degraded_internal_cross_commit_validated_count: int
     epoch2_constrained_leaf_required_count: int
     epoch2_constrained_leaf_validated_count: int
     epoch2_fast_root_internal_position_required_count: int
     epoch2_fast_root_internal_position_validated_count: int
     full_hierarchy_gate_passed: bool
+    failed_requirements: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SecondaryPlacementVerdict:
+    status: str
+    exact_scope: str
+    status_rule: str
+    structural_gate: str
+    structural_required_slot_count: int
+    structural_validated_slot_count: int
+    structural_gate_passed: bool
+    realized_placement_rule: str
+    realized_placement_per_arm_requirement: int
+    placement_changed_p_block_count: int
+    placement_changed_ps_block_count: int
+    realized_placement_gate_passed: bool
+    throughput_estimand: str
+    throughput_claim_rule: str
+    throughput_estimate_available: bool
+    throughput_ci95_lower_log_ratio_gt_zero: bool | None
+    throughput_positive_block_count: int | None
+    throughput_required_positive_block_count: int
+    throughput_rule_passed: bool | None
+    pre_epoch1_placebo_estimand: str
+    placebo_equivalence_rule: str
+    placebo_equivalence_margin_log: float
+    placebo_p_estimate_available: bool
+    placebo_p_equivalence_rule_passed: bool | None
+    placebo_ps_estimate_available: bool
+    placebo_ps_equivalence_rule_passed: bool | None
+    placebo_equivalence_rule_passed: bool | None
     failed_requirements: tuple[str, ...]
 
 
@@ -591,6 +713,7 @@ class CampaignValidationResult:
     headline_effects: FactorialEffects | None
     figure_eligible: bool
     breakthrough_verdict: BreakthroughVerdict | None = None
+    secondary_placement_verdict: SecondaryPlacementVerdict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1844,11 +1967,14 @@ def _load_static_contracts(
             _fail("frozen actor-selection vector failed independent recomputation")
     responsive_contract = manifest.byzantine.responsive_degradation
     if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+        expected_responsive_period = _expected_responsive_omission_period(
+            manifest.manifest_id
+        )
         if (
             responsive_contract is None
             or responsive_contract.observer_isolation
             != _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION
-            or responsive_contract.omission_period != _RESPONSIVE_OMISSION_PERIOD
+            or responsive_contract.omission_period != expected_responsive_period
         ):
             _fail("frozen tiered responsive-degradation contract drifted")
         for vector in responsive_contract.actor_selection_vectors:
@@ -2028,6 +2154,10 @@ def _validate_runtime_slot(
     runtime: Mapping[str, Any], expected: _ExpectedSlot, manifest: FrozenFactorialManifest
 ) -> None:
     tiered = manifest.byzantine.mode == _TIERED_OMISSION_MODE
+    causal_measurement = manifest.manifest_id == FROZEN_MANIFEST_ID
+    expected_responsive_period = _expected_responsive_omission_period(
+        manifest.manifest_id
+    )
     if tiered:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -2039,11 +2169,22 @@ def _validate_runtime_slot(
             ),
             "fast_replica_ids": expected.fast_replica_ids,
             "max_omissions_per_proposal": expected.f,
-            "responsive_omission_period": _RESPONSIVE_OMISSION_PERIOD,
+            "responsive_omission_period": expected_responsive_period,
             "scientific_seed": expected.scientific_seed,
             "slot_id": expected.slot_id,
             "slot_nonce": expected.slot_nonce,
         }
+        if causal_measurement:
+            artifact_identity.update(
+                {
+                    "pending_attempt_retention": (
+                        RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
+                    ),
+                    "causal_timeout_linkage": (
+                        RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
+                    ),
+                }
+            )
     else:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -2085,7 +2226,7 @@ def _validate_runtime_slot(
                 expected.responsive_degraded_actor_ids
             ),
             "fast_replica_ids": list(expected.fast_replica_ids),
-            "responsive_omission_period": _RESPONSIVE_OMISSION_PERIOD,
+            "responsive_omission_period": expected_responsive_period,
             "responsive_actor_schedule": responsive_contract.actor_schedule,
             "max_omissions_per_proposal": expected.f,
             "hard_cohort_wait_exempt": True,
@@ -2096,6 +2237,17 @@ def _validate_runtime_slot(
             "epoch1_responsive_degraded_are_roots": True,
             "epoch1_responsive_degraded_internal_role_exposure_required": True,
         }
+        if causal_measurement:
+            expected_tiered.update(
+                {
+                    "pending_attempt_retention": (
+                        RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
+                    ),
+                    "causal_timeout_linkage": (
+                        RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
+                    ),
+                }
+            )
         if dict(_mapping(runtime.get("tiered_cohorts"), "runtime tiered cohorts")) != expected_tiered:
             _fail("runtime tiered cohort contract differs from independent derivation")
     elif "tiered_cohorts" in runtime:
@@ -2156,6 +2308,7 @@ def _validate_runtime_slot(
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
         V7_MANIFEST_ID,
+        V8_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -2355,7 +2508,7 @@ def _validate_runtime_slot(
             == expected_degraded
             and argv.count("--experiment-responsive-omission-period") == 1
             and options.get("--experiment-responsive-omission-period")
-            == str(_RESPONSIVE_OMISSION_PERIOD)
+            == str(expected_responsive_period)
         ) if tiered else (
             "--experiment-responsive-degraded-omission-actors" not in argv
             and "--experiment-responsive-omission-period" not in argv
@@ -3431,6 +3584,110 @@ def _fault_markers(
     return tuple(markers)
 
 
+def _response_attempt_arm_markers(
+    slot_root: Path,
+    paths_by_replica: Mapping[int, Sequence[str]],
+) -> tuple[ResponseAttemptArmMarker, ...]:
+    """Parse the exact v9 response-attempt arm provenance from raw logs."""
+
+    markers: list[ResponseAttemptArmMarker] = []
+    seen: set[tuple[int, int, int, int, str, str, str]] = set()
+
+    def uint64(token: str, label: str, *, minimum: int = 0) -> int:
+        value = int(token)
+        if not minimum <= value <= _UINT64_MAX:
+            _fail(f"{label} exceeds its unsigned 64-bit bound")
+        return value
+
+    for replica_id, paths in paths_by_replica.items():
+        for relative in paths:
+            path = _safe_file(slot_root, relative)
+            assert path is not None
+            try:
+                if path.stat().st_size > _MAX_EVENT_STREAM_BYTES:
+                    _fail(f"process log exceeds its fixed bound: {relative}")
+                with path.open("rb") as stream:
+                    for line_number, raw in enumerate(stream, start=1):
+                        if len(raw) > _MAX_EVENT_LINE_BYTES:
+                            _fail(f"{relative}:{line_number} exceeds the line bound")
+                        if b"response_attempt_arm_marker_failed" in raw:
+                            _fail(
+                                f"{relative}:{line_number} reports a failed v9 "
+                                "response-attempt arm marker"
+                            )
+                        if b"response_attempt_armed" not in raw:
+                            continue
+                        if raw.count(b"response_attempt_armed") != 1:
+                            _fail(
+                                f"{relative}:{line_number} has a malformed/ambiguous "
+                                "response-attempt arm marker"
+                            )
+                        try:
+                            line = raw.decode(
+                                "utf-8", errors="strict"
+                            ).rstrip("\r\n")
+                        except UnicodeDecodeError as error:
+                            raise _Reject(
+                                f"{relative}:{line_number} response-attempt arm "
+                                "marker is not UTF-8"
+                            ) from error
+                        matches = tuple(_RESPONSE_ATTEMPT_ARM_MARKER.finditer(line))
+                        if len(matches) != 1:
+                            _fail(
+                                f"{relative}:{line_number} has a malformed/ambiguous "
+                                "response-attempt arm marker"
+                            )
+                        match = matches[0]
+                        marker = ResponseAttemptArmMarker(
+                            source_replica=replica_id,
+                            line_number=line_number,
+                            reporter_id=uint64(match.group(1), "arm reporter"),
+                            child_id=uint64(match.group(2), "arm child"),
+                            epoch_number=uint64(match.group(3), "arm epoch"),
+                            tree_id=uint64(match.group(4), "arm tree"),
+                            epoch_digest=match.group(5),
+                            block_hash=match.group(6),
+                            expected_message_type=match.group(7),
+                            start_monotonic_ns=uint64(
+                                match.group(8), "arm start", minimum=1
+                            ),
+                            deadline_duration_us=uint64(
+                                match.group(9), "arm duration", minimum=1
+                            ),
+                            absolute_deadline_ns=uint64(
+                                match.group(10), "arm absolute deadline", minimum=1
+                            ),
+                            raw_line_sha256=_sha256(raw),
+                        )
+                        if marker.source_replica != marker.reporter_id:
+                            _fail(
+                                "response-attempt arm source replica differs from "
+                                "its reporter"
+                            )
+                        if (
+                            marker.deadline_duration_us > _UINT64_MAX // 1_000
+                            or marker.start_monotonic_ns
+                            > _UINT64_MAX - marker.deadline_duration_us * 1_000
+                            or marker.absolute_deadline_ns
+                            != marker.start_monotonic_ns
+                            + marker.deadline_duration_us * 1_000
+                        ):
+                            _fail(
+                                "response-attempt arm absolute deadline does not "
+                                "equal start plus duration"
+                            )
+                        if marker.identity in seen:
+                            _fail(
+                                "native process logs contain a duplicate/rearm "
+                                "response-attempt arm identity"
+                            )
+                        seen.add(marker.identity)
+                        markers.append(marker)
+            except OSError as error:
+                raise _Incomplete(f"cannot read process log {relative}") from error
+    return tuple(markers)
+
+
 def _adaptive_proposal_identity(
     event: _NativeEvent,
 ) -> tuple[int, int, str, str, int] | None:
@@ -3482,7 +3739,7 @@ def _validate_fault_marker_schedule(
     max_omissions_per_proposal: int,
     responsive_degraded_actor_ids: Sequence[int] = (),
     fault_threshold: int | None = None,
-    responsive_omission_period: int = _RESPONSIVE_OMISSION_PERIOD,
+    responsive_omission_period: int = _V8_RESPONSIVE_OMISSION_PERIOD,
 ) -> None:
     hard = tuple(sorted(actor_ids))
     hard_set = set(hard)
@@ -3517,7 +3774,6 @@ def _validate_fault_marker_schedule(
             or fault_threshold <= 0
             or len(hard) + len(degraded) != fault_threshold
             or max_omissions_per_proposal != fault_threshold
-            or responsive_omission_period != _RESPONSIVE_OMISSION_PERIOD
         ):
             _fail("tiered cohorts/bounds do not equal the independently derived f")
     elif (
@@ -3570,7 +3826,8 @@ def _validate_fault_marker_schedule(
                 if (marker.action != "forward") is not should_omit:
                     _fail(
                         "responsive-degraded marker action is not the exact "
-                        "every-32nd schedule"
+                        "every-"
+                        f"{_ordinal_label(responsive_omission_period)} schedule"
                     )
                 degraded_by_actor[marker.actor].append(marker)
         else:
@@ -3778,9 +4035,226 @@ def _validate_persistent_interior_proposals(
             )
 
 
+def _proposal_commit_identity(
+    event: _NativeEvent,
+    *,
+    replica_id: int,
+    require_exact_source_binding: bool,
+) -> tuple[int, int, str, str]:
+    if require_exact_source_binding and (
+        event.source_kind != "replica"
+        or event.source_id != f"replica-{replica_id}"
+    ):
+        _fail(
+            "v9 reporter-local commit source differs from its replica event stream"
+        )
+    commit = _commit_payload(event, authoritative=replica_id == 0)
+    return (
+        commit["epoch_number"],
+        commit["tree_id"],
+        commit["epoch_digest"],
+        commit["hash"],
+    )
+
+
+def _validate_v9_cross_commit_retention_witnesses(
+    *,
+    markers: Sequence[FaultMarker],
+    arm_markers: Sequence[ResponseAttemptArmMarker],
+    responsive_degraded_actor_ids: Sequence[int],
+    authoritative_commit_ns: Mapping[tuple[int, int, str, str], int],
+    proposal_commit_ns_by_replica: Mapping[
+        int,
+        Mapping[tuple[int, int, str, str], Sequence[int]],
+    ],
+    epoch1_trees: Mapping[int, Tree],
+    epoch1_timeout_index: Mapping[
+        tuple[int, int, int, str, str], Sequence[_EvidenceRecord]
+    ],
+    epoch2_selection_ns: int,
+    require_each_degraded_actor_internal_witness: bool = False,
+) -> tuple[int, ...]:
+    """Bind each proof to its parent-local commit and authoritative commit."""
+
+    degraded = frozenset(responsive_degraded_actor_ids)
+    witnessed: set[int] = set()
+    internal_witnessed: set[int] = set()
+    arms_by_child_proposal: dict[
+        tuple[int, int, int, str, str], list[ResponseAttemptArmMarker]
+    ] = defaultdict(list)
+    seen_arm_identities: set[
+        tuple[int, int, int, int, str, str, str]
+    ] = set()
+    for arm in arm_markers:
+        if arm.source_replica != arm.reporter_id:
+            _fail("response-attempt arm source replica differs from its reporter")
+        if (
+            arm.start_monotonic_ns <= 0
+            or arm.deadline_duration_us <= 0
+            or arm.absolute_deadline_ns <= 0
+            or arm.deadline_duration_us > _UINT64_MAX // 1_000
+            or arm.start_monotonic_ns
+            > _UINT64_MAX - arm.deadline_duration_us * 1_000
+            or arm.absolute_deadline_ns
+            != arm.start_monotonic_ns + arm.deadline_duration_us * 1_000
+        ):
+            _fail(
+                "response-attempt arm absolute deadline does not equal start "
+                "plus duration"
+            )
+        if arm.identity in seen_arm_identities:
+            _fail("v9 cross-commit proof contains a duplicate/rearm arm identity")
+        seen_arm_identities.add(arm.identity)
+        arms_by_child_proposal[(arm.child_id, *arm.proposal_key)].append(arm)
+
+    for marker in markers:
+        if (
+            marker.actor not in degraded
+            or marker.epoch_number != 1
+            or marker.action == "forward"
+        ):
+            continue
+        proposal_key = (
+            marker.epoch_number,
+            marker.tree_id,
+            marker.epoch_digest,
+            marker.block_hash,
+        )
+        tree = epoch1_trees.get(marker.tree_id)
+        if tree is None or marker.actor not in tree.members:
+            _fail("v9 retention witness references an unknown Epoch1 tree role")
+        position = tree.members.index(marker.actor)
+        if position == 0:
+            _fail("v9 retention witness actor cannot be an Epoch1 root")
+        leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+        internal_role = position < leaf_start
+        expected_action = (
+            "omit_aggregate" if internal_role else "omit_direct_vote"
+        )
+        expected_message_type = "aggregate_relay" if internal_role else "direct_vote"
+        if marker.action != expected_action:
+            continue
+        expected_reporter = tree.members[(position - 1) // tree.fanout]
+        timeout_key = (marker.actor, *proposal_key)
+        exact_timeouts = tuple(
+            timeout
+            for timeout in epoch1_timeout_index.get(timeout_key, ())
+            if (
+                timeout.outcome == "timeout"
+                and timeout.target_id == marker.actor
+                and (
+                    timeout.epoch_number,
+                    timeout.tree_id,
+                    timeout.epoch_digest,
+                    timeout.block_hash,
+                )
+                == proposal_key
+                and timeout.message_type == expected_message_type
+                and timeout.reporter_id == expected_reporter
+                and marker.monotonic_ns < timeout.reporter_monotonic_ns
+                <= timeout.acceptance_monotonic_ns
+                < epoch2_selection_ns
+            )
+        )
+        if not exact_timeouts:
+            continue
+
+        matching_arms = arms_by_child_proposal.get(timeout_key, ())
+        if len(matching_arms) != 1:
+            _fail(
+                "v9 cross-commit arm proof is missing or duplicated/rearmed for "
+                f"actor [{marker.actor}] and its exact ProposalKey"
+            )
+        arm = matching_arms[0]
+        if (
+            arm.source_replica != expected_reporter
+            or arm.reporter_id != expected_reporter
+            or arm.child_id != marker.actor
+            or arm.proposal_key != proposal_key
+            or arm.expected_message_type != expected_message_type
+        ):
+            _fail(
+                "v9 cross-commit arm does not bind the exact physical parent, "
+                "child, ProposalKey, message type, and required role"
+            )
+        authoritative_ns = authoritative_commit_ns.get(proposal_key)
+        if (
+            type(authoritative_ns) is not int
+            or not marker.monotonic_ns < authoritative_ns < epoch2_selection_ns
+        ):
+            _fail(
+                "v9 cross-commit proof lacks an exact authoritative commit "
+                f"for actor [{marker.actor}] between its fault marker and "
+                "Epoch2 selection"
+            )
+        reporter_commits = proposal_commit_ns_by_replica.get(expected_reporter)
+        local_commit_times = (
+            () if reporter_commits is None else reporter_commits.get(proposal_key, ())
+        )
+        if len(local_commit_times) != 1:
+            qualifier = "missing" if not local_commit_times else "duplicated/ambiguous"
+            _fail(
+                "v9 cross-commit proof has a "
+                f"{qualifier} exact reporter-local commit for reporter "
+                f"[{expected_reporter}] and its ProposalKey"
+            )
+        local_commit_ns = local_commit_times[0]
+        if type(local_commit_ns) is not int or local_commit_ns <= 0:
+            _fail("v9 cross-commit reporter-local commit timestamp is invalid")
+        for timeout in exact_timeouts:
+            if timeout.deadline_duration_us != arm.deadline_duration_us:
+                _fail(
+                    "v9 cross-commit timeout duration differs from its exact arm "
+                    "duration"
+                )
+            if not (
+                arm.start_monotonic_ns
+                <= marker.monotonic_ns
+                < local_commit_ns
+                < arm.absolute_deadline_ns
+                <= timeout.reporter_monotonic_ns
+                <= timeout.acceptance_monotonic_ns
+                < epoch2_selection_ns
+            ):
+                _fail(
+                    "v9 cross-commit arm ordering for actor "
+                    f"[{marker.actor}] reporter [{expected_reporter}] is not "
+                    "start <= fault marker "
+                    "< reporter-local commit < absolute deadline <= timeout "
+                    "reporter <= timeout acceptance < Epoch2 selection"
+                )
+        witnessed.add(marker.actor)
+        if internal_role:
+            internal_witnessed.add(marker.actor)
+
+    missing = degraded - witnessed
+    if missing:
+        _fail(
+            "responsive-degraded actors lack a v9 Epoch1 cross-commit retention "
+            "witness ordered marker < reporter-local commit < original deadline "
+            "<= timeout reporter <= timeout acceptance < Epoch2 selection: "
+            f"{sorted(missing)}"
+        )
+    if not internal_witnessed:
+        _fail(
+            "v9 cross-commit retention proof lacks an Epoch1 internal-role "
+            "omit_aggregate witness with its exact parent and message type"
+        )
+    if require_each_degraded_actor_internal_witness:
+        missing_internal = degraded - internal_witnessed
+        if missing_internal:
+            _fail(
+                "primary n31/f5 placement actors lack their own reporter-local "
+                "Epoch1 internal omit_aggregate cross-commit witness: "
+                f"{sorted(missing_internal)}"
+            )
+    return tuple(sorted(internal_witnessed))
+
+
 def validate_fault_causality(
     *,
     markers: Sequence[FaultMarker],
+    arm_markers: Sequence[ResponseAttemptArmMarker] = (),
     replica_events: Mapping[int, Sequence[_NativeEvent]],
     actor_ids: Sequence[int],
     fault_mode: str,
@@ -3806,7 +4280,10 @@ def validate_fault_causality(
     accepted_epoch1: Sequence[_EvidenceRecord] = (),
     epoch1_baseline_cutoff: int = 0,
     epoch1_current_cutoff: int = 0,
-) -> None:
+    require_cross_commit_retention_witnesses: bool = False,
+    require_each_degraded_actor_internal_witness: bool = False,
+    responsive_omission_period: int = _V8_RESPONSIVE_OMISSION_PERIOD,
+) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
     actors = tuple(sorted(actor_ids))
@@ -3822,29 +4299,33 @@ def validate_fault_causality(
         max_omissions_per_proposal=max_omissions_per_proposal,
         responsive_degraded_actor_ids=degraded,
         fault_threshold=(len(all_fault_actors) if tiered else None),
-        responsive_omission_period=_RESPONSIVE_OMISSION_PERIOD,
+        responsive_omission_period=responsive_omission_period,
     )
     proposals: set[tuple[int, int, str, str]] = set()
     authoritative_commit_ns: dict[tuple[int, int, str, str], int] = {}
+    proposal_commit_ns_by_replica: dict[
+        int,
+        dict[tuple[int, int, str, str], list[int]],
+    ] = defaultdict(lambda: defaultdict(list))
     proposal_observations: dict[
         tuple[int, int, str, str], dict[int, list[int]]
     ] = defaultdict(lambda: defaultdict(list))
     for replica_id, events in replica_events.items():
         for event in events:
             if event.event_type == "block.committed":
-                commit = _commit_payload(
+                committed_identity = _proposal_commit_identity(
                     event,
-                    authoritative=replica_id == 0,
-                )
-                committed_identity = (
-                    commit["epoch_number"],
-                    commit["tree_id"],
-                    commit["epoch_digest"],
-                    commit["hash"],
+                    replica_id=replica_id,
+                    require_exact_source_binding=(
+                        require_cross_commit_retention_witnesses
+                    ),
                 )
                 proposal_observations[committed_identity][replica_id].append(
                     event.monotonic_ns
                 )
+                proposal_commit_ns_by_replica[replica_id][
+                    committed_identity
+                ].append(event.monotonic_ns)
                 if replica_id == 0:
                     if committed_identity in authoritative_commit_ns:
                         _fail("authoritative commit proposal identity is duplicated")
@@ -4068,6 +4549,25 @@ def validate_fault_causality(
             causal_reporters[marker.actor].add(expected_reporter)
             if is_internal:
                 internal_actors.add(marker.actor)
+    internal_retention_witnesses: tuple[int, ...] = ()
+    if require_cross_commit_retention_witnesses:
+        if not tiered:
+            _fail("cross-commit retention witnesses require the tiered fault mode")
+        internal_retention_witnesses = _validate_v9_cross_commit_retention_witnesses(
+            markers=markers,
+            arm_markers=arm_markers,
+            responsive_degraded_actor_ids=degraded,
+            authoritative_commit_ns=authoritative_commit_ns,
+            proposal_commit_ns_by_replica=proposal_commit_ns_by_replica,
+            epoch1_trees=epoch1_tree_by_id,
+            epoch1_timeout_index=timeout_indexes[1],
+            epoch2_selection_ns=epoch2_command_ns,
+            require_each_degraded_actor_internal_witness=(
+                require_each_degraded_actor_internal_witness
+            ),
+        )
+    elif require_each_degraded_actor_internal_witness:
+        _fail("per-actor internal witnesses require v9 cross-commit validation")
     if required_reporters <= 0:
         _fail("causal guard reporter threshold is invalid")
     missing_internal = set(actors) - internal_actors
@@ -4106,6 +4606,7 @@ def validate_fault_causality(
                 "responsive-degraded actors lack an Epoch1 omission bound to raw "
                 f"performance-selection evidence: {sorted(missing_degraded_evidence)}"
             )
+    return len(internal_retention_witnesses)
 
 
 def _validate_slot_receipt(
@@ -5589,6 +6090,7 @@ def _validate_tiered_performance_ranking(
     tree_count: int,
     expected_roots: Sequence[int],
     policy: Mapping[str, Any],
+    responsive_omission_period: int,
 ) -> int:
     """Prove responsive degradation, strict hierarchy, and replayed top-Q."""
 
@@ -5620,7 +6122,7 @@ def _validate_tiered_performance_ranking(
         policy.get("maximum_timeout_rate_ppm"),
         "responsiveness.maximum_timeout_rate_ppm",
     )
-    if minimum_attempts < _RESPONSIVE_OMISSION_PERIOD:
+    if minimum_attempts < responsive_omission_period:
         _fail("responsive policy no longer observes a full omission period")
     rank_index = {score.replica_id: index for index, score in enumerate(scores)}
     for replica in fast:
@@ -6316,6 +6818,11 @@ def _validate_adaptation_cycles(
                 tree_count=expected.q,
                 expected_roots=roots,
                 policy=policy,
+                responsive_omission_period=(
+                    manifest.byzantine.responsive_degradation.omission_period
+                    if manifest.byzantine.responsive_degradation is not None
+                    else 0
+                ),
             )
 
         shape_event = shape_events[cycle]
@@ -6646,6 +7153,11 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             for replica_id in range(expected.replica_count)
         }
         markers = _fault_markers(slot_root, paths_by_replica)
+        arm_markers = (
+            _response_attempt_arm_markers(slot_root, paths_by_replica)
+            if manifest.manifest_id == FROZEN_MANIFEST_ID
+            else ()
+        )
         cycle_snapshots = {
             cycle: [
                 event
@@ -6662,8 +7174,19 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         expected_window, expected_max_omissions = _effective_omission_contract(
             manifest, expected
         )
-        validate_fault_causality(
+        primary_internal_witness_gate = (
+            manifest.manifest_id == FROZEN_MANIFEST_ID
+            and campaign_member
+            and expected.replica_count
+            == manifest.claim_scope.placement_headline_replica_count
+            and expected.initial_fanout
+            == manifest.claim_scope.placement_headline_initial_fanout
+            and expected.arm_code in {"P", "PS"}
+        )
+        responsive_contract = manifest.byzantine.responsive_degradation
+        internal_cross_commit_witness_count = validate_fault_causality(
             markers=markers,
+            arm_markers=arm_markers,
             replica_events=replica_events,
             actor_ids=expected.actor_ids,
             fault_mode=manifest.byzantine.mode,
@@ -6706,6 +7229,17 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 cycle1_snapshot.get("current_cutoff"),
                 "cycle-1 current cutoff",
                 1,
+            ),
+            require_cross_commit_retention_witnesses=(
+                manifest.manifest_id == FROZEN_MANIFEST_ID
+            ),
+            require_each_degraded_actor_internal_witness=(
+                primary_internal_witness_gate
+            ),
+            responsive_omission_period=(
+                responsive_contract.omission_period
+                if responsive_contract is not None
+                else _V8_RESPONSIVE_OMISSION_PERIOD
             ),
         )
 
@@ -6802,6 +7336,9 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             epoch1_degraded_internal_proof_count=(
                 hierarchy.epoch1_degraded_internal_count
             ),
+            epoch1_degraded_internal_cross_commit_witness_count=(
+                internal_cross_commit_witness_count
+            ),
             epoch2_constrained_leaf_proof_count=(
                 hierarchy.epoch2_constrained_leaf_count
             ),
@@ -6872,11 +7409,12 @@ def _matched_estimate(
     )
 
 
-def _primary_throughput_log_ratio_estimate(
+def _placement_throughput_log_ratio_estimate(
     block_ids: Sequence[str],
     block_values: Sequence[Mapping[str, Mapping[str, float]]],
     *,
     positive_block_requirement: int,
+    contrast: str,
 ) -> MatchedLogRatioEstimate | None:
     """Compute the frozen matched log ratio-of-ratios without an offset."""
 
@@ -6887,7 +7425,10 @@ def _primary_throughput_log_ratio_estimate(
         or len(values) != len(blocks)
         or positive_block_requirement != 4
     ):
-        _fail("primary throughput estimate requires five blocks and the frozen 4/5 rule")
+        _fail(
+            "placement throughput estimate requires five blocks and the frozen "
+            "4/5 rule"
+        )
     effects: list[float] = []
     for value in values:
         try:
@@ -6902,9 +7443,9 @@ def _primary_throughput_log_ratio_estimate(
                 value["PS"]["epoch2_stable"],
             )
         except KeyError as error:
-            _fail("primary throughput estimate lacks a required arm/phase mean")
+            _fail("placement throughput estimate lacks a required arm/phase mean")
         if not all(math.isfinite(mean) for mean in required_means):
-            _fail("primary throughput estimate requires finite arm/phase means")
+            _fail("placement throughput estimate requires finite arm/phase means")
         if any(mean <= 0 for mean in required_means):
             return None
         control_adjusted_p = math.log(
@@ -6932,7 +7473,7 @@ def _primary_throughput_log_ratio_estimate(
     upper_ratio = math.exp(upper)
     positive_count = sum(value > 0 for value in effects)
     return MatchedLogRatioEstimate(
-        contrast="placement_epoch2_over_epoch1_log_ratio_of_ratios",
+        contrast=contrast,
         block_ids=blocks,
         block_effects_log_ratio=tuple(effects),
         mean_log_ratio=mean,
@@ -7120,12 +7661,13 @@ def _headline_effects(
     ]
     primary_throughput_log_ratio = None
     if scope.breakthrough_primary_throughput_estimand is not None:
-        primary_throughput_log_ratio = _primary_throughput_log_ratio_estimate(
+        primary_throughput_log_ratio = _placement_throughput_log_ratio_estimate(
             placement_blocks,
             placement,
             positive_block_requirement=(
                 scope.breakthrough_positive_block_requirement or 0
             ),
+            contrast="f5_placement_epoch2_over_epoch1_log_ratio_of_ratios",
         )
     pre_epoch1_placebo_p_log_ratio = None
     pre_epoch1_placebo_ps_log_ratio = None
@@ -7146,6 +7688,39 @@ def _headline_effects(
             adaptive_arm="PS",
             control_arm="S",
             equivalence_margin_log=equivalence_margin,
+        )
+    secondary_f2_throughput_log_ratio = None
+    secondary_f2_placebo_p = None
+    secondary_f2_placebo_ps = None
+    if scope.breakthrough_secondary_scope is not None:
+        secondary_f2_throughput_log_ratio = (
+            _placement_throughput_log_ratio_estimate(
+                joint_blocks,
+                joint,
+                positive_block_requirement=(
+                    scope.breakthrough_secondary_positive_block_requirement or 0
+                ),
+                contrast="f2_placement_epoch2_over_epoch1_log_ratio_of_ratios",
+            )
+        )
+        secondary_margin = (
+            scope.breakthrough_secondary_placebo_equivalence_margin_log
+        )
+        if secondary_margin is None:
+            _fail("secondary f2 pre-Epoch1 placebo margin is not prespecified")
+        secondary_f2_placebo_p = _pre_epoch1_placebo_log_ratio_estimate(
+            joint_blocks,
+            joint,
+            adaptive_arm="P",
+            control_arm="00",
+            equivalence_margin_log=secondary_margin,
+        )
+        secondary_f2_placebo_ps = _pre_epoch1_placebo_log_ratio_estimate(
+            joint_blocks,
+            joint,
+            adaptive_arm="PS",
+            control_arm="S",
+            equivalence_margin_log=secondary_margin,
         )
     return FactorialEffects(
         endpoint="epoch2_stable_mean_tps",
@@ -7195,6 +7770,9 @@ def _headline_effects(
         primary_throughput_log_ratio=primary_throughput_log_ratio,
         pre_epoch1_placebo_p_log_ratio=pre_epoch1_placebo_p_log_ratio,
         pre_epoch1_placebo_ps_log_ratio=pre_epoch1_placebo_ps_log_ratio,
+        secondary_f2_throughput_log_ratio=secondary_f2_throughput_log_ratio,
+        secondary_f2_pre_epoch1_placebo_p_log_ratio=secondary_f2_placebo_p,
+        secondary_f2_pre_epoch1_placebo_ps_log_ratio=secondary_f2_placebo_ps,
     )
 
 
@@ -7213,7 +7791,30 @@ def _breakthrough_hierarchy_summary(
     results: Mapping[str, SlotValidationResult],
 ) -> dict[str, Any]:
     scope = manifest.claim_scope
-    required = scope.breakthrough_structural_required_slot_count or 0
+    return _placement_hierarchy_summary(
+        manifest,
+        results,
+        replica_count=scope.placement_headline_replica_count,
+        initial_fanout=scope.placement_headline_initial_fanout,
+        required_slot_count=(
+            scope.breakthrough_structural_required_slot_count or 0
+        ),
+        require_each_degraded_actor_internal_cross_commit=(
+            manifest.manifest_id == FROZEN_MANIFEST_ID
+        ),
+    )
+
+
+def _placement_hierarchy_summary(
+    manifest: FrozenFactorialManifest,
+    results: Mapping[str, SlotValidationResult],
+    *,
+    replica_count: int,
+    initial_fanout: int,
+    required_slot_count: int,
+    require_each_degraded_actor_internal_cross_commit: bool,
+) -> dict[str, Any]:
+    required = required_slot_count
     if required == 0:
         return {
             "required_slot_count": 0,
@@ -7225,6 +7826,8 @@ def _breakthrough_hierarchy_summary(
             "epoch1_degraded_root_validated_count": 0,
             "epoch1_degraded_internal_required_count": 0,
             "epoch1_degraded_internal_validated_count": 0,
+            "epoch1_degraded_internal_cross_commit_required_count": 0,
+            "epoch1_degraded_internal_cross_commit_validated_count": 0,
             "epoch2_constrained_leaf_required_count": 0,
             "epoch2_constrained_leaf_validated_count": 0,
             "epoch2_fast_position_required_count": 0,
@@ -7234,8 +7837,8 @@ def _breakthrough_hierarchy_summary(
     expected_slots = tuple(
         slot
         for slot in _expected_slots(manifest)
-        if slot.replica_count == scope.placement_headline_replica_count
-        and slot.initial_fanout == scope.placement_headline_initial_fanout
+        if slot.replica_count == replica_count
+        and slot.initial_fanout == initial_fanout
         and slot.arm_code in {"P", "PS"}
     )
     if len(expected_slots) != required:
@@ -7263,6 +7866,11 @@ def _breakthrough_hierarchy_summary(
     degraded_required = sum(
         len(slot.responsive_degraded_actor_ids) for slot in expected_slots
     )
+    internal_cross_commit_required = (
+        degraded_required
+        if require_each_degraded_actor_internal_cross_commit
+        else 0
+    )
     constrained_leaf_required = sum(
         slot.f * slot.q for slot in expected_slots
     )
@@ -7270,6 +7878,7 @@ def _breakthrough_hierarchy_summary(
     degraded_rank_validated = 0
     epoch1_root_validated = 0
     epoch1_internal_validated = 0
+    internal_cross_commit_validated = 0
     epoch2_leaf_validated = 0
     epoch2_fast_required = 0
     epoch2_fast_validated = 0
@@ -7280,6 +7889,9 @@ def _breakthrough_hierarchy_summary(
         degraded_rank_validated += result.degraded_rank_proof_count
         epoch1_root_validated += result.epoch1_degraded_root_proof_count
         epoch1_internal_validated += result.epoch1_degraded_internal_proof_count
+        internal_cross_commit_validated += (
+            result.epoch1_degraded_internal_cross_commit_witness_count
+        )
         epoch2_leaf_validated += result.epoch2_constrained_leaf_proof_count
         epoch2_fast_required += (
             result.epoch2_fast_root_internal_position_required_count
@@ -7298,6 +7910,11 @@ def _breakthrough_hierarchy_summary(
             == len(slot.responsive_degraded_actor_ids)
             and result.epoch1_degraded_internal_proof_count
             == len(slot.responsive_degraded_actor_ids)
+            and (
+                not require_each_degraded_actor_internal_cross_commit
+                or result.epoch1_degraded_internal_cross_commit_witness_count
+                == len(slot.responsive_degraded_actor_ids)
+            )
             and result.epoch2_constrained_leaf_proof_count == slot.f * slot.q
             and result.epoch2_fast_root_internal_position_required_count > 0
             and result.epoch2_fast_root_internal_position_proof_count
@@ -7310,6 +7927,10 @@ def _breakthrough_hierarchy_summary(
         and degraded_rank_validated == degraded_required
         and epoch1_root_validated == degraded_required
         and epoch1_internal_validated == degraded_required
+        and (
+            not require_each_degraded_actor_internal_cross_commit
+            or internal_cross_commit_validated == internal_cross_commit_required
+        )
         and epoch2_leaf_validated == constrained_leaf_required
         and epoch2_fast_required > 0
         and epoch2_fast_validated == epoch2_fast_required
@@ -7324,6 +7945,14 @@ def _breakthrough_hierarchy_summary(
         "epoch1_degraded_root_validated_count": epoch1_root_validated,
         "epoch1_degraded_internal_required_count": degraded_required,
         "epoch1_degraded_internal_validated_count": epoch1_internal_validated,
+        "epoch1_degraded_internal_cross_commit_required_count": (
+            internal_cross_commit_required
+        ),
+        "epoch1_degraded_internal_cross_commit_validated_count": (
+            internal_cross_commit_validated
+            if require_each_degraded_actor_internal_cross_commit
+            else 0
+        ),
         "epoch2_constrained_leaf_required_count": constrained_leaf_required,
         "epoch2_constrained_leaf_validated_count": epoch2_leaf_validated,
         "epoch2_fast_position_required_count": epoch2_fast_required,
@@ -7336,30 +7965,49 @@ def _breakthrough_realized_placement_counts(
     manifest: FrozenFactorialManifest,
     results: Mapping[str, SlotValidationResult],
 ) -> tuple[int, int, int]:
+    scope = manifest.claim_scope
+    return _placement_realized_placement_counts(
+        manifest,
+        results,
+        replica_count=scope.placement_headline_replica_count,
+        initial_fanout=scope.placement_headline_initial_fanout,
+        block_count=scope.placement_headline_block_count,
+        requirement=(
+            scope.breakthrough_realized_placement_per_arm_requirement or 0
+        ),
+    )
+
+
+def _placement_realized_placement_counts(
+    manifest: FrozenFactorialManifest,
+    results: Mapping[str, SlotValidationResult],
+    *,
+    replica_count: int,
+    initial_fanout: int,
+    block_count: int,
+    requirement: int,
+) -> tuple[int, int, int]:
     """Count independently validated Epoch1-to-Epoch2 root-set changes."""
 
-    scope = manifest.claim_scope
-    requirement = scope.breakthrough_realized_placement_per_arm_requirement or 0
     if requirement == 0:
         return 0, 0, 0
     changed_blocks: dict[str, set[str]] = {"P": set(), "PS": set()}
     required_blocks = {
-        f"n{scope.placement_headline_replica_count}-"
-        f"f{scope.placement_headline_initial_fanout}-b{index:02d}"
-        for index in range(1, scope.placement_headline_block_count + 1)
+        f"n{replica_count}-f{initial_fanout}-b{index:02d}"
+        for index in range(1, block_count + 1)
     }
     expected_by_pair = {
         (slot.block_id, slot.arm_code): slot
         for slot in _expected_slots(manifest)
-        if slot.replica_count == scope.placement_headline_replica_count
-        and slot.initial_fanout == scope.placement_headline_initial_fanout
+        if slot.replica_count == replica_count
+        and slot.initial_fanout == initial_fanout
         and slot.arm_code in {"P", "PS"}
     }
     for result in results.values():
         if (
             not result.figure_eligible
-            or result.replica_count != scope.placement_headline_replica_count
-            or result.initial_fanout != scope.placement_headline_initial_fanout
+            or result.replica_count != replica_count
+            or result.initial_fanout != initial_fanout
             or result.arm_code not in changed_blocks
             or result.block_id is None
             or result.block_id not in required_blocks
@@ -7446,6 +8094,8 @@ def _breakthrough_verdict(
             epoch1_degraded_root_validated_count=0,
             epoch1_degraded_internal_required_count=0,
             epoch1_degraded_internal_validated_count=0,
+            epoch1_degraded_internal_cross_commit_required_count=0,
+            epoch1_degraded_internal_cross_commit_validated_count=0,
             epoch2_constrained_leaf_required_count=0,
             epoch2_constrained_leaf_validated_count=0,
             epoch2_fast_root_internal_position_required_count=0,
@@ -7519,6 +8169,16 @@ def _breakthrough_verdict(
         ),
         "epoch1_degraded_internal_validated_count": (
             hierarchy["epoch1_degraded_internal_validated_count"]
+        ),
+        "epoch1_degraded_internal_cross_commit_required_count": (
+            hierarchy[
+                "epoch1_degraded_internal_cross_commit_required_count"
+            ]
+        ),
+        "epoch1_degraded_internal_cross_commit_validated_count": (
+            hierarchy[
+                "epoch1_degraded_internal_cross_commit_validated_count"
+            ]
         ),
         "epoch2_constrained_leaf_required_count": (
             hierarchy["epoch2_constrained_leaf_required_count"]
@@ -7758,6 +8418,177 @@ def _breakthrough_verdict(
     )
 
 
+def _secondary_placement_verdict(
+    manifest: FrozenFactorialManifest | None,
+    results: Mapping[str, SlotValidationResult],
+    *,
+    primary: BreakthroughVerdict,
+    effects: FactorialEffects | None,
+) -> SecondaryPlacementVerdict | None:
+    if manifest is None:
+        return None
+    scope = manifest.claim_scope
+    if scope.breakthrough_secondary_scope is None:
+        return None
+    required_slots = (
+        scope.breakthrough_secondary_structural_required_slot_count or 0
+    )
+    hierarchy = _placement_hierarchy_summary(
+        manifest,
+        results,
+        replica_count=scope.shape_and_joint_headline_replica_count,
+        initial_fanout=scope.shape_and_joint_headline_initial_fanout,
+        required_slot_count=required_slots,
+        require_each_degraded_actor_internal_cross_commit=False,
+    )
+    placement_requirement, changed_p, changed_ps = (
+        _placement_realized_placement_counts(
+            manifest,
+            results,
+            replica_count=scope.shape_and_joint_headline_replica_count,
+            initial_fanout=scope.shape_and_joint_headline_initial_fanout,
+            block_count=scope.shape_and_joint_headline_block_count,
+            requirement=(
+                scope.breakthrough_secondary_realized_placement_per_arm_requirement
+                or 0
+            ),
+        )
+    )
+    realized_placement_passed = (
+        placement_requirement > 0
+        and changed_p >= placement_requirement
+        and changed_ps >= placement_requirement
+    )
+    estimate = None if effects is None else effects.secondary_f2_throughput_log_ratio
+    placebo_p = (
+        None
+        if effects is None
+        else effects.secondary_f2_pre_epoch1_placebo_p_log_ratio
+    )
+    placebo_ps = (
+        None
+        if effects is None
+        else effects.secondary_f2_pre_epoch1_placebo_ps_log_ratio
+    )
+    positive_requirement = (
+        scope.breakthrough_secondary_positive_block_requirement or 0
+    )
+    throughput_passed = (
+        estimate is not None
+        and estimate.ci95_lower_log_ratio > 0
+        and estimate.positive_block_count >= positive_requirement
+    )
+    placebo_p_passed = placebo_p is not None and placebo_p.equivalence_supported
+    placebo_ps_passed = (
+        placebo_ps is not None and placebo_ps.equivalence_supported
+    )
+    placebo_passed = placebo_p_passed and placebo_ps_passed
+    structural_passed = hierarchy["full_hierarchy_gate_passed"]
+    secondary_gates_passed = (
+        structural_passed
+        and realized_placement_passed
+        and throughput_passed
+        and placebo_passed
+    )
+    failed: list[str] = []
+    if primary.status != "SUPPORTED":
+        failed.append(
+            "primary n31/f5 breakthrough is not SUPPORTED; the secondary f2 "
+            "endpoint is descriptive only"
+        )
+    if not structural_passed:
+        failed.append(
+            "secondary f2 structural gate validated "
+            f"{hierarchy['validated_slot_count']} of {required_slots} required slots"
+        )
+    if not realized_placement_passed:
+        failed.append(
+            "secondary f2 realized placement lacks all five P and PS root-change "
+            "proofs"
+        )
+    if placebo_p is None:
+        failed.append("secondary f2 P/00 pre-Epoch1 placebo is unavailable")
+    elif not placebo_p_passed:
+        failed.append("secondary f2 P/00 pre-Epoch1 placebo is not equivalent")
+    if placebo_ps is None:
+        failed.append("secondary f2 PS/S pre-Epoch1 placebo is unavailable")
+    elif not placebo_ps_passed:
+        failed.append("secondary f2 PS/S pre-Epoch1 placebo is not equivalent")
+    if estimate is None:
+        failed.append(
+            "secondary f2 throughput log ratio requires strictly positive "
+            "Epoch1/Epoch2 means in every matched block"
+        )
+    else:
+        if estimate.ci95_lower_log_ratio <= 0:
+            failed.append(
+                "secondary f2 two-sided 95% lower log-ratio bound is not above zero"
+            )
+        if estimate.positive_block_count < positive_requirement:
+            failed.append(
+                "secondary f2 has fewer than four of five positive matched "
+                "block effects"
+            )
+    status = (
+        "DESCRIPTIVE_ONLY"
+        if primary.status != "SUPPORTED"
+        else "SUPPORTED"
+        if secondary_gates_passed
+        else "NOT_SUPPORTED"
+    )
+    margin = scope.breakthrough_secondary_placebo_equivalence_margin_log
+    if margin is None:
+        _fail("secondary f2 placebo margin is not prespecified")
+    return SecondaryPlacementVerdict(
+        status=status,
+        exact_scope=scope.breakthrough_secondary_scope,
+        status_rule=scope.breakthrough_secondary_status_rule or "",
+        structural_gate=scope.breakthrough_secondary_structural_gate or "",
+        structural_required_slot_count=required_slots,
+        structural_validated_slot_count=hierarchy["validated_slot_count"],
+        structural_gate_passed=structural_passed,
+        realized_placement_rule=(
+            scope.breakthrough_secondary_realized_placement_rule or ""
+        ),
+        realized_placement_per_arm_requirement=placement_requirement,
+        placement_changed_p_block_count=changed_p,
+        placement_changed_ps_block_count=changed_ps,
+        realized_placement_gate_passed=realized_placement_passed,
+        throughput_estimand=scope.breakthrough_secondary_throughput_estimand or "",
+        throughput_claim_rule=(
+            scope.breakthrough_secondary_throughput_claim_rule or ""
+        ),
+        throughput_estimate_available=estimate is not None,
+        throughput_ci95_lower_log_ratio_gt_zero=(
+            None if estimate is None else estimate.ci95_lower_log_ratio > 0
+        ),
+        throughput_positive_block_count=(
+            None if estimate is None else estimate.positive_block_count
+        ),
+        throughput_required_positive_block_count=positive_requirement,
+        throughput_rule_passed=(None if estimate is None else throughput_passed),
+        pre_epoch1_placebo_estimand=(
+            scope.breakthrough_secondary_pre_epoch1_placebo_estimand or ""
+        ),
+        placebo_equivalence_rule=(
+            scope.breakthrough_secondary_placebo_equivalence_rule or ""
+        ),
+        placebo_equivalence_margin_log=margin,
+        placebo_p_estimate_available=placebo_p is not None,
+        placebo_p_equivalence_rule_passed=(
+            None if placebo_p is None else placebo_p_passed
+        ),
+        placebo_ps_estimate_available=placebo_ps is not None,
+        placebo_ps_equivalence_rule_passed=(
+            None if placebo_ps is None else placebo_ps_passed
+        ),
+        placebo_equivalence_rule_passed=(
+            None if placebo_p is None or placebo_ps is None else placebo_passed
+        ),
+        failed_requirements=tuple(failed),
+    )
+
+
 def _campaign_figure_eligible(
     campaign_outcome: str,
     effects: FactorialEffects | None,
@@ -7765,6 +8596,60 @@ def _campaign_figure_eligible(
     """Keep evidence validity independent from hypothesis direction."""
 
     return campaign_outcome == "PASS" and effects is not None
+
+
+def _aware_utc(value: object, label: str) -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(
+            _string(value, label).replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise _Reject(f"{label} is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        _fail(f"{label} must be timezone-aware")
+    return parsed
+
+
+def _validate_campaign_chronology(
+    *,
+    approved_utc: object,
+    ledger_rows: Sequence[Mapping[str, Any]],
+    completed_utc: object,
+) -> None:
+    """Validate strict process order and nondecreasing UTC wall time."""
+
+    approved = _aware_utc(approved_utc, "campaign approval timestamp")
+    previous_utc = approved
+    previous_monotonic_ns = 0
+    for index, row in enumerate(ledger_rows, 1):
+        recorded_utc = _aware_utc(
+            row.get("recorded_utc"),
+            f"campaign ledger row {index} UTC",
+        )
+        monotonic_ns = _integer(
+            row.get("recorded_monotonic_ns"),
+            f"campaign ledger row {index} monotonic timestamp",
+            1,
+        )
+        if monotonic_ns <= previous_monotonic_ns:
+            _fail(
+                "campaign ledger monotonic chain must be strictly increasing "
+                "across every STARTED and TERMINAL row"
+            )
+        if recorded_utc < previous_utc:
+            _fail(
+                "campaign ledger UTC chronology must be nondecreasing from "
+                "authorization through every STARTED and TERMINAL row"
+            )
+        previous_monotonic_ns = monotonic_ns
+        previous_utc = recorded_utc
+
+    completed = _aware_utc(completed_utc, "campaign completion timestamp")
+    if completed < approved or completed < previous_utc:
+        _fail(
+            "campaign completion UTC precedes authorization or the final "
+            "TERMINAL row"
+        )
 
 
 def _validate_campaign_execution_ledger(
@@ -7816,14 +8701,9 @@ def _validate_campaign_execution_ledger(
     expected_authorization_id = "execution-authorization-" + _sha256(
         _canonical_json_bytes(authorization_core)
     )[:24]
-    try:
-        approved = dt.datetime.fromisoformat(
-            _string(authorization["approved_utc"], "campaign approval timestamp").replace(
-                "Z", "+00:00"
-            )
-        )
-    except ValueError as error:
-        raise _Reject("campaign authorization timestamp is invalid") from error
+    approved = _aware_utc(
+        authorization["approved_utc"], "campaign approval timestamp"
+    )
     revision = _string(authorization["kauri_revision"], "campaign revision")
     if (
         type(authorization["schema_version"]) is not int
@@ -7920,7 +8800,6 @@ def _validate_campaign_execution_ledger(
     ordered_slots = tuple(
         sorted(expected_slots, key=lambda value: value.execution_ordinal)
     )
-    previous_monotonic_ns = 0
     attempted_ids: set[str] = set()
     all_attempts_accepted = True
     common_fields = {
@@ -8019,24 +8898,6 @@ def _validate_campaign_execution_ledger(
                 _fail("campaign ledger identity/order/no-retry binding drifted")
             if row["state"] != state:
                 _fail("campaign ledger does not alternate STARTED then TERMINAL")
-            try:
-                recorded_utc = dt.datetime.fromisoformat(
-                    _string(row["recorded_utc"], "campaign ledger UTC").replace(
-                        "Z", "+00:00"
-                    )
-                )
-            except ValueError as error:
-                raise _Reject("campaign ledger UTC timestamp is invalid") from error
-            monotonic_ns = _integer(
-                row["recorded_monotonic_ns"], "campaign ledger monotonic timestamp", 1
-            )
-            if (
-                recorded_utc.tzinfo is None
-                or recorded_utc.utcoffset() is None
-                or monotonic_ns < previous_monotonic_ns
-            ):
-                _fail("campaign ledger timestamps are invalid or regress")
-            previous_monotonic_ns = monotonic_ns
         slot_directory = actual_by_id.get(expected.slot_id)
         if slot_directory is None:
             _fail("campaign ledger references a slot directory that is not preserved")
@@ -8130,14 +8991,11 @@ def _validate_campaign_execution_ledger(
         not isinstance(stopped_reason, str) or not stopped_reason
     ):
         _fail("campaign summary stopped reason is invalid")
-    try:
-        completed = dt.datetime.fromisoformat(
-            _string(summary["completed_utc"], "campaign completion UTC").replace(
-                "Z", "+00:00"
-            )
-        )
-    except ValueError as error:
-        raise _Reject("campaign completion timestamp is invalid") from error
+    _validate_campaign_chronology(
+        approved_utc=authorization["approved_utc"],
+        ledger_rows=ledger_rows,
+        completed_utc=summary["completed_utc"],
+    )
     complete = attempted == EXPECTED_SLOT_COUNT and all_attempts_accepted
     if (
         type(summary["schema_version"]) is not int
@@ -8158,8 +9016,6 @@ def _validate_campaign_execution_ledger(
         or summary["execution_complete"] is not complete
         or (complete and stopped_reason is not None)
         or (not complete and stopped_reason is None)
-        or completed.tzinfo is None
-        or completed.utcoffset() is None
     ):
         _fail("campaign execution summary does not seal the replayed lifecycle")
     return attempted
@@ -8278,6 +9134,12 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             campaign_outcome=outcome,
             effects=effects,
         )
+        secondary = _secondary_placement_verdict(
+            manifest,
+            by_id,
+            primary=breakthrough,
+            effects=effects,
+        )
         return CampaignValidationResult(
             outcome=outcome,
             reason=reason,
@@ -8286,8 +9148,15 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             headline_effects=effects,
             figure_eligible=figure_eligible,
             breakthrough_verdict=breakthrough,
+            secondary_placement_verdict=secondary,
         )
     except _Incomplete as error:
+        breakthrough = _breakthrough_verdict(
+            manifest_for_verdict,
+            results_for_verdict,
+            campaign_outcome="INCOMPLETE",
+            effects=None,
+        )
         return CampaignValidationResult(
             outcome="INCOMPLETE",
             reason=str(error),
@@ -8295,14 +9164,21 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             parameter_coverage=(),
             headline_effects=None,
             figure_eligible=False,
-            breakthrough_verdict=_breakthrough_verdict(
+            breakthrough_verdict=breakthrough,
+            secondary_placement_verdict=_secondary_placement_verdict(
                 manifest_for_verdict,
                 results_for_verdict,
-                campaign_outcome="INCOMPLETE",
+                primary=breakthrough,
                 effects=None,
             ),
         )
     except Exception as error:
+        breakthrough = _breakthrough_verdict(
+            manifest_for_verdict,
+            results_for_verdict,
+            campaign_outcome="FAIL",
+            effects=None,
+        )
         return CampaignValidationResult(
             outcome="FAIL",
             reason=str(error),
@@ -8310,10 +9186,11 @@ def validate_campaign(campaign_directory: str | Path) -> CampaignValidationResul
             parameter_coverage=(),
             headline_effects=None,
             figure_eligible=False,
-            breakthrough_verdict=_breakthrough_verdict(
+            breakthrough_verdict=breakthrough,
+            secondary_placement_verdict=_secondary_placement_verdict(
                 manifest_for_verdict,
                 results_for_verdict,
-                campaign_outcome="FAIL",
+                primary=breakthrough,
                 effects=None,
             ),
         )
@@ -8345,6 +9222,7 @@ __all__ = (
     "MatchedEstimate",
     "MatchedLogRatioEstimate",
     "PhaseMetric",
+    "SecondaryPlacementVerdict",
     "SlotValidationResult",
     "Tree",
     "decode_epoch_change_bundle",

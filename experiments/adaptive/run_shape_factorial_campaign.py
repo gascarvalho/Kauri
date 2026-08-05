@@ -8,7 +8,6 @@ from dataclasses import asdict, replace
 import datetime as dt
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import sys
@@ -22,6 +21,7 @@ from experiments.adaptive.kauri_experiment.factorial_execution import (  # noqa:
     CAMPAIGN_AUTHORIZATION_FILENAME,
     CAMPAIGN_CONTRACT_FILENAME,
     CAMPAIGN_LEDGER_FILENAME,
+    CAMPAIGN_SUMMARY_FILENAME,
     ExecutionPreflight,
     FactorialExecutionError,
     SlotExecutionResult,
@@ -31,6 +31,7 @@ from experiments.adaptive.kauri_experiment.factorial_execution import (  # noqa:
     build_n7_ps_smoke_slot,
     execute_slot_once,
     preserve_build_evidence,
+    publish_campaign_summary,
     verify_evidence_preflight,
 )
 from experiments.adaptive.kauri_experiment.factorial_manifest import (  # noqa: E402
@@ -64,11 +65,10 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v8.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v9.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
-CAMPAIGN_SUMMARY_FILENAME = "campaign-execution-summary.json"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -136,20 +136,6 @@ def _utc_now() -> str:
 
 def _emit(value: object, *, stream) -> None:
     print(_canonical_json_bytes(value).decode("ascii"), end="", file=stream)
-
-
-def _write_exclusive(path: Path, payload: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            descriptor = -1
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def _append_canonical_jsonl(path: Path, value: object) -> None:
@@ -285,26 +271,26 @@ def _validation_roots(
     return campaign_root, smoke_root
 
 
-def _require_frozen_v8_artifacts(
+def _require_frozen_artifacts(
     manifest: FrozenFactorialManifest,
     plan: FactorialPlan,
     runtime: FactorialRuntimePlan,
 ) -> bytes:
-    """Fail before any result claim if producer bytes drift from v8."""
+    """Fail before any result claim if producer bytes drift from v9."""
 
     if (
         manifest.manifest_id != FROZEN_MANIFEST_ID
         or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
     ):
-        raise FactorialExecutionError("campaign production requires exact frozen v8")
+        raise FactorialExecutionError("campaign production requires exact frozen v9")
     if plan.plan_sha256 != FROZEN_PLAN_SHA256:
         raise FactorialExecutionError(
-            "campaign plan bytes differ from the exact frozen v8 identity"
+            "campaign plan bytes differ from the exact frozen v9 identity"
         )
     payload = canonical_runtime_bytes(runtime)
     if _sha256(payload) != FROZEN_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "campaign runtime bytes differ from the exact frozen v8 identity"
+            "campaign runtime bytes differ from the exact frozen v9 identity"
         )
     return payload
 
@@ -661,7 +647,7 @@ def _run_smoke(
     smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
     if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "smoke runtime bytes differ from the exact frozen v8 identity"
+            "smoke runtime bytes differ from the exact frozen v9 identity"
         )
     _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
@@ -882,8 +868,9 @@ def _run_campaign(
         attempted_count=attempted_count,
         stopped_reason=stopped_reason,
     )
-    _write_exclusive(
-        campaign_root / CAMPAIGN_SUMMARY_FILENAME, _canonical_json_bytes(summary)
+    publish_campaign_summary(
+        campaign_root / CAMPAIGN_SUMMARY_FILENAME,
+        summary,
     )
     campaign_validation = validate_campaign(campaign_root)
     accepted = (
@@ -966,12 +953,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) else 1
         if manifest.manifest_id != FROZEN_MANIFEST_ID:
             raise FactorialExecutionError(
-                "shape-placement-factorial-v1 through v7 are validation-only; "
-                "plan, preflight, smoke, and run require shape-placement-factorial-v8"
+                "shape-placement-factorial-v1 through v8 are validation-only; "
+                "plan, preflight, smoke, and run require shape-placement-factorial-v9"
             )
         plan = build_factorial_plan(manifest)
         runtime = build_factorial_runtime(plan)
-        runtime_payload = _require_frozen_v8_artifacts(manifest, plan, runtime)
+        runtime_payload = _require_frozen_artifacts(manifest, plan, runtime)
         repository, build_directory, build_provenance, campaign_root, smoke_root = (
             _paths(arguments, runtime)
         )
@@ -989,7 +976,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target_runtime_sha256 = _sha256(smoke_runtime_payload)
                 if target_runtime_sha256 != FROZEN_SMOKE_RUNTIME_SHA256:
                     raise FactorialExecutionError(
-                        "smoke runtime bytes differ from the exact frozen v8 identity"
+                        "smoke runtime bytes differ from the exact frozen v9 identity"
                     )
                 preflight_root = smoke_root
                 target_runtime_id = smoke.runtime.artifact_id

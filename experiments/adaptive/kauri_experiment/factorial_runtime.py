@@ -15,9 +15,12 @@ import string
 from typing import Any
 
 from .factorial_manifest import (
+    FROZEN_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
     FactorialSlot,
+    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     ResponsivenessPolicyContract,
     derive_tiered_cohorts,
 )
@@ -216,6 +219,15 @@ class TieredCohortContract(_Document):
     responsive_degraded_rank_below_every_fast_replica: bool
     epoch1_responsive_degraded_are_roots: bool
     epoch1_responsive_degraded_internal_role_exposure_required: bool
+    pending_attempt_retention: str | None = None
+    causal_timeout_linkage: str | None = None
+
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        for field in ("pending_attempt_retention", "causal_timeout_linkage"):
+            if document[field] is None:
+                document.pop(field)
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,6 +554,29 @@ def _tiered_cohort_contract(
     degraded = slot.responsive_degraded_actor_ids
     fast = slot.fast_replica_ids
     worse = frozenset((*hard, *degraded))
+    measurement_contract = (
+        responsive.pending_attempt_retention,
+        responsive.causal_timeout_linkage,
+    )
+    if measurement_contract not in {
+        (None, None),
+        (
+            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+        ),
+    }:
+        raise FactorialManifestError(
+            "responsive-degradation measurement contract drifted"
+        )
+    expected_responsive_period = (
+        41
+        if measurement_contract
+        == (
+            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+        )
+        else 32
+    )
     expected_fast = tuple(
         member for member in range(slot.replica_count) if member not in worse
     )
@@ -554,7 +589,7 @@ def _tiered_cohort_contract(
         or 0 not in fast
         or any(actor < slot.q or actor >= slot.replica_count for actor in hard)
         or any(actor < 1 or actor >= slot.q for actor in degraded)
-        or responsive.omission_period != 32
+        or responsive.omission_period != expected_responsive_period
         or slot.maximum_omissions_per_proposal != slot.f
     ):
         raise FactorialManifestError("slot tiered cohort derivation drifted")
@@ -573,6 +608,8 @@ def _tiered_cohort_contract(
         responsive_degraded_rank_below_every_fast_replica=True,
         epoch1_responsive_degraded_are_roots=True,
         epoch1_responsive_degraded_internal_role_exposure_required=True,
+        pending_attempt_retention=responsive.pending_attempt_retention,
+        causal_timeout_linkage=responsive.causal_timeout_linkage,
     )
 
 
@@ -939,6 +976,17 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
                 ),
             }
         )
+        if tiered_cohorts.pending_attempt_retention is not None:
+            identity.update(
+                {
+                    "pending_attempt_retention": (
+                        tiered_cohorts.pending_attempt_retention
+                    ),
+                    "causal_timeout_linkage": (
+                        tiered_cohorts.causal_timeout_linkage
+                    ),
+                }
+            )
     return SlotRuntimeSpec(
         schema_version=1,
         artifact_id=f"slot-runtime-{_digest(identity)[:24]}",
@@ -1311,6 +1359,17 @@ def runtime_preflight(
                 expected_hard_count,
                 slot.scientific_seed,
             )
+            expected_measurement_contract = (
+                (
+                    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                )
+                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                else (None, None)
+            )
+            expected_responsive_period = (
+                41 if runtime.manifest_id == FROZEN_MANIFEST_ID else 32
+            )
             if (
                 tiered.mode != "tiered_persistent_responsive_omission_v1"
                 or hard != slot.actor_ids
@@ -1325,7 +1384,7 @@ def runtime_preflight(
                 or 0 not in expected_fast
                 or any(actor < slot.q for actor in hard)
                 or any(actor < 1 or actor >= slot.q for actor in degraded)
-                or tiered.responsive_omission_period != 32
+                or tiered.responsive_omission_period != expected_responsive_period
                 or tiered.max_omissions_per_proposal != slot.f
                 or not tiered.hard_cohort_wait_exempt
                 or tiered.responsive_degraded_cohort_wait_exempt
@@ -1335,6 +1394,11 @@ def runtime_preflight(
                 or not tiered.responsive_degraded_rank_below_every_fast_replica
                 or not tiered.epoch1_responsive_degraded_are_roots
                 or not tiered.epoch1_responsive_degraded_internal_role_exposure_required
+                or (
+                    tiered.pending_attempt_retention,
+                    tiered.causal_timeout_linkage,
+                )
+                != expected_measurement_contract
                 or not slot.epoch1_placement.only_hard_cohort_is_wait_exempt
                 or slot.epoch1_placement.all_worse_replicas_are_physical_leaves
                 or slot.epoch1_placement.root_and_internal_roles_are_fast_only
@@ -1376,7 +1440,7 @@ def runtime_preflight(
                     or argv[
                         argv.index("--experiment-responsive-omission-period") + 1
                     ]
-                    != "32"
+                    != str(expected_responsive_period)
                     or argv.count(
                         "--experiment-byzantine-max-omissions-per-proposal"
                     )

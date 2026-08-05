@@ -346,8 +346,15 @@ def append_campaign_ledger_record(path: Path, value: object) -> None:
     path = Path(path)
     if path.name != CAMPAIGN_LEDGER_FILENAME:
         raise FactorialExecutionError("campaign ledger path is not exact")
-    root_descriptor = _acquire_campaign_root_lock(path.parent)
+    root = path.parent
+    root_descriptor = _acquire_campaign_root_lock(root)
     try:
+        _assert_campaign_root_identity(root, root_descriptor)
+        summary_path = root / CAMPAIGN_SUMMARY_FILENAME
+        if summary_path.exists() or summary_path.is_symlink():
+            raise FactorialExecutionError(
+                "finalized campaign cannot append another ledger record"
+            )
         if path.is_symlink():
             raise FactorialExecutionError(
                 "campaign attempt ledger must not be a symlink"
@@ -372,7 +379,289 @@ def append_campaign_ledger_record(path: Path, value: object) -> None:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-        _assert_campaign_root_identity(path.parent, root_descriptor)
+        _assert_campaign_root_identity(root, root_descriptor)
+    finally:
+        _release_campaign_root_lock(root_descriptor)
+
+
+def _campaign_summary_payload_for_locked_ledger(
+    value: object,
+    *,
+    authorization_payload: bytes,
+    contract_payload: bytes,
+    ledger_payload: bytes,
+) -> bytes:
+    summary_payload = _canonical_json_bytes(value)
+    summary = _parse_canonical_object(
+        summary_payload,
+        "campaign execution summary",
+    )
+    authorization = _parse_canonical_object(
+        authorization_payload,
+        "campaign authorization",
+    )
+    contract = _parse_canonical_object(
+        contract_payload,
+        "campaign execution contract",
+    )
+    if not ledger_payload or not ledger_payload.endswith(b"\n"):
+        raise FactorialExecutionError(
+            "campaign attempt ledger has no complete terminal record"
+        )
+    raw_rows = ledger_payload.splitlines(keepends=True)
+    if len(raw_rows) % 2:
+        raise FactorialExecutionError(
+            "campaign attempt ledger has an active unpaired STARTED record"
+        )
+    rows = tuple(
+        _parse_canonical_object(raw, f"campaign attempt ledger row {index}")
+        for index, raw in enumerate(raw_rows, 1)
+    )
+    attempted_count = len(rows) // 2
+    expected_slot_count = contract.get("expected_slot_count")
+    schedule = contract.get("execution_schedule")
+    if (
+        type(expected_slot_count) is not int
+        or expected_slot_count <= 0
+        or not isinstance(schedule, list)
+        or len(schedule) != expected_slot_count
+        or attempted_count > expected_slot_count
+    ):
+        raise FactorialExecutionError(
+            "campaign execution contract has an invalid expected count"
+        )
+
+    campaign_id = contract.get("campaign_id")
+    authorization_id = authorization.get("authorization_id")
+    authorization_sha256 = _sha256_bytes(authorization_payload)
+    contract_sha256 = _sha256_bytes(contract_payload)
+    raw_approved_utc = authorization.get("approved_utc")
+    if not isinstance(raw_approved_utc, str) or not raw_approved_utc:
+        raise FactorialExecutionError(
+            "campaign authorization approval timestamp is invalid"
+        )
+    try:
+        approved_utc = dt.datetime.fromisoformat(
+            raw_approved_utc.replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise FactorialExecutionError(
+            "campaign authorization approval timestamp is invalid"
+        ) from error
+    if approved_utc.tzinfo is None or approved_utc.utcoffset() is None:
+        raise FactorialExecutionError(
+            "campaign authorization approval timestamp must be timezone-aware"
+        )
+    first_recorded_utc: dt.datetime | None = None
+    previous_recorded_utc: dt.datetime | None = None
+    previous_monotonic_ns = 0
+    final_terminal_utc: dt.datetime | None = None
+    for attempt_index in range(attempted_count):
+        started = rows[attempt_index * 2]
+        terminal = rows[attempt_index * 2 + 1]
+        expected = schedule[attempt_index]
+        if not isinstance(expected, Mapping):
+            raise FactorialExecutionError(
+                "campaign execution contract schedule is malformed"
+            )
+        if started.get("state") != "STARTED" or terminal.get("state") != "TERMINAL":
+            raise FactorialExecutionError(
+                "campaign attempt ledger does not pair STARTED then TERMINAL"
+            )
+        expected_ordinal = attempt_index + 1
+        if (
+            type(expected.get("execution_ordinal")) is not int
+            or expected.get("execution_ordinal") != expected_ordinal
+            or any(
+                row.get("execution_ordinal") != expected_ordinal
+                or type(row.get("execution_ordinal")) is not int
+                or row.get("campaign_id") != campaign_id
+                or row.get("authorization_id") != authorization_id
+                or row.get("authorization_sha256") != authorization_sha256
+                or row.get("contract_sha256") != contract_sha256
+                or any(
+                    row.get(field) != expected.get(field)
+                    for field in ("slot_id", "block_id", "arm_code")
+                )
+                for row in (started, terminal)
+            )
+        ):
+            raise FactorialExecutionError(
+                "campaign attempt ledger pair identity/order binding drifted"
+            )
+        for row in (started, terminal):
+            raw_recorded_utc = row.get("recorded_utc")
+            if not isinstance(raw_recorded_utc, str) or not raw_recorded_utc:
+                raise FactorialExecutionError(
+                    "campaign ledger recorded UTC timestamp is invalid"
+                )
+            try:
+                recorded_utc = dt.datetime.fromisoformat(
+                    raw_recorded_utc.replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise FactorialExecutionError(
+                    "campaign ledger recorded UTC timestamp is invalid"
+                ) from error
+            if recorded_utc.tzinfo is None or recorded_utc.utcoffset() is None:
+                raise FactorialExecutionError(
+                    "campaign ledger recorded UTC timestamp must be timezone-aware"
+                )
+            monotonic_ns = row.get("recorded_monotonic_ns")
+            if type(monotonic_ns) is not int or monotonic_ns <= 0:
+                raise FactorialExecutionError(
+                    "campaign ledger monotonic timestamp is invalid"
+                )
+            if monotonic_ns <= previous_monotonic_ns:
+                raise FactorialExecutionError(
+                    "campaign ledger monotonic timestamps are not strictly increasing"
+                )
+            if (
+                previous_recorded_utc is not None
+                and recorded_utc <= previous_recorded_utc
+            ):
+                raise FactorialExecutionError(
+                    "campaign ledger UTC timestamps are not strictly increasing"
+                )
+            if first_recorded_utc is None:
+                first_recorded_utc = recorded_utc
+            previous_monotonic_ns = monotonic_ns
+            previous_recorded_utc = recorded_utc
+        final_terminal_utc = previous_recorded_utc
+
+    expected_summary_fields = {
+        "schema_version",
+        "campaign_id",
+        "authorization_id",
+        "authorization_sha256",
+        "contract_sha256",
+        "ledger_sha256",
+        "expected_slot_count",
+        "attempted_slot_count",
+        "next_execution_ordinal",
+        "execution_complete",
+        "stopped_reason",
+        "completed_utc",
+    }
+    if set(summary) != expected_summary_fields:
+        raise FactorialExecutionError("campaign execution summary schema drifted")
+    if summary.get("ledger_sha256") != _sha256_bytes(ledger_payload):
+        raise FactorialExecutionError(
+            "campaign execution summary ledger digest drifted"
+        )
+    if (
+        type(summary.get("attempted_slot_count")) is not int
+        or summary.get("attempted_slot_count") != attempted_count
+    ):
+        raise FactorialExecutionError(
+            "campaign execution summary attempted count drifted"
+        )
+    if (
+        type(summary.get("expected_slot_count")) is not int
+        or summary.get("expected_slot_count") != expected_slot_count
+    ):
+        raise FactorialExecutionError(
+            "campaign execution summary expected count drifted"
+        )
+    stopped_reason = summary.get("stopped_reason")
+    complete = attempted_count == expected_slot_count and stopped_reason is None
+    expected_next = (
+        None if attempted_count == expected_slot_count else attempted_count + 1
+    )
+    raw_completed_utc = summary.get("completed_utc")
+    if not isinstance(raw_completed_utc, str) or not raw_completed_utc:
+        raise FactorialExecutionError(
+            "campaign execution summary completion timestamp is invalid"
+        )
+    try:
+        completed = dt.datetime.fromisoformat(
+            raw_completed_utc.replace("Z", "+00:00")
+        )
+    except ValueError as error:
+        raise FactorialExecutionError(
+            "campaign execution summary completion timestamp is invalid"
+        ) from error
+    if completed.tzinfo is None or completed.utcoffset() is None:
+        raise FactorialExecutionError(
+            "campaign execution summary completion timestamp must be timezone-aware"
+        )
+    if completed < approved_utc:
+        raise FactorialExecutionError(
+            "campaign execution summary completion timestamp precedes authorization "
+            "approval"
+        )
+    if first_recorded_utc is None or first_recorded_utc < approved_utc:
+        raise FactorialExecutionError(
+            "campaign first ledger record precedes authorization approval"
+        )
+    if final_terminal_utc is None or completed < final_terminal_utc:
+        raise FactorialExecutionError(
+            "campaign execution summary completion timestamp precedes final TERMINAL"
+        )
+    if (
+        type(summary.get("schema_version")) is not int
+        or summary.get("schema_version") != 1
+        or summary.get("campaign_id") != campaign_id
+        or summary.get("authorization_id") != authorization_id
+        or summary.get("authorization_sha256") != authorization_sha256
+        or summary.get("contract_sha256") != contract_sha256
+        or summary.get("next_execution_ordinal") != expected_next
+        or type(summary.get("execution_complete")) is not bool
+        or summary.get("execution_complete") is not complete
+        or (
+            not complete
+            and (not isinstance(stopped_reason, str) or not stopped_reason)
+        )
+    ):
+        raise FactorialExecutionError(
+            "campaign execution summary does not seal the locked lifecycle"
+        )
+    return summary_payload
+
+
+def publish_campaign_summary(path: Path, value: object) -> None:
+    """Publish the sole canonical final summary under the campaign-root lock."""
+
+    path = Path(path)
+    if path.name != CAMPAIGN_SUMMARY_FILENAME:
+        raise FactorialExecutionError("campaign summary path is not exact")
+    root = path.parent
+    root_descriptor = _acquire_campaign_root_lock(root)
+    try:
+        _assert_campaign_root_identity(root, root_descriptor)
+        authorization_payload = _read_stable_regular_file(
+            root / CAMPAIGN_AUTHORIZATION_FILENAME,
+            "campaign authorization",
+        )
+        contract_payload = _read_stable_regular_file(
+            root / CAMPAIGN_CONTRACT_FILENAME,
+            "campaign execution contract",
+        )
+        ledger_payload = _read_stable_regular_file(
+            root / CAMPAIGN_LEDGER_FILENAME,
+            "campaign attempt ledger",
+        )
+        if path.exists() or path.is_symlink():
+            raise FactorialExecutionError(
+                "campaign summary already exists; refusing replacement"
+            )
+        payload = _campaign_summary_payload_for_locked_ledger(
+            value,
+            authorization_payload=authorization_payload,
+            contract_payload=contract_payload,
+            ledger_payload=ledger_payload,
+        )
+        try:
+            _write_exclusive(path, payload)
+        except FileExistsError as error:
+            raise FactorialExecutionError(
+                "campaign summary already exists; refusing replacement"
+            ) from error
+        if _read_stable_regular_file(path, "campaign execution summary") != payload:
+            raise FactorialExecutionError(
+                "published campaign summary differs from exact canonical bytes"
+            )
+        _assert_campaign_root_identity(root, root_descriptor)
     finally:
         _release_campaign_root_lock(root_descriptor)
 

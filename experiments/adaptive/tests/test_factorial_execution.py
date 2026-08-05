@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import signal
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,7 +29,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v8.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v9.json"
 
 
 @pytest.fixture(scope="module")
@@ -270,7 +271,7 @@ def _campaign_ledger_row(
         "automatic_retries": 0,
         "replacement_policy": "none",
         "state": state,
-        "recorded_utc": "2026-08-04T00:00:00+00:00",
+        "recorded_utc": f"2026-08-04T00:00:{monotonic_ns:02d}+00:00",
         "recorded_monotonic_ns": monotonic_ns,
         "slot_directory": str(root / spec.slot_id),
     }
@@ -297,6 +298,43 @@ def _campaign_ledger_row(
             "campaign_member": True,
             "figure_eligible": True,
         },
+    }
+
+
+def _campaign_summary(
+    context: dict[str, Any],
+    ledger_payload: bytes,
+    *,
+    stopped_reason: str | None = "test campaign stopped after the preserved prefix",
+) -> dict[str, object]:
+    ledger_rows = tuple(json.loads(line) for line in ledger_payload.splitlines())
+    attempted_count = len(ledger_rows) // 2
+    expected_slot_count = len(context["runtime"].slots)
+    return {
+        "schema_version": 1,
+        "campaign_id": context["runtime"].runtime_id,
+        "authorization_id": context["authorization"]["authorization_id"],
+        "authorization_sha256": hashlib.sha256(
+            context["authorization_payload"]
+        ).hexdigest(),
+        "contract_sha256": hashlib.sha256(context["contract_payload"]).hexdigest(),
+        "ledger_sha256": hashlib.sha256(ledger_payload).hexdigest(),
+        "expected_slot_count": expected_slot_count,
+        "attempted_slot_count": attempted_count,
+        "next_execution_ordinal": (
+            None
+            if attempted_count == expected_slot_count
+            else attempted_count + 1
+        ),
+        "execution_complete": (
+            attempted_count == expected_slot_count and stopped_reason is None
+        ),
+        "stopped_reason": stopped_reason,
+        "completed_utc": (
+            ledger_rows[-1]["recorded_utc"]
+            if ledger_rows
+            else "2026-08-04T00:00:00+00:00"
+        ),
     }
 
 
@@ -344,7 +382,7 @@ def test_n7_smoke_is_excluded_ps_fanout_two_with_k_two(template_slot) -> None:
             map(str, smoke.slot.responsive_degraded_actor_ids)
         )
         option = "--experiment-responsive-omission-period"
-        assert argv[argv.index(option) + 1] == "32"
+        assert argv[argv.index(option) + 1] == "41"
     manager = smoke.runtime.manager_argv_template.argv
     assert manager[manager.index("--required-nonresponsive") + 1] == "1"
     assert smoke.campaign_member is False
@@ -2313,6 +2351,405 @@ def test_campaign_launch_guard_rejects_finalized_and_typed_drift(
             authorization_receipt=context["authorization_payload"],
             authorization=context["authorization"],
         )
+
+
+def test_campaign_summary_publication_loses_when_launcher_owns_root_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    ledger.write_bytes(
+        execution._canonical_json_bytes(
+            _campaign_ledger_row(context, 1, "STARTED", 1)
+        )
+    )
+    launch_has_lock = threading.Event()
+    publisher_attempted = threading.Event()
+    launch_errors: list[BaseException] = []
+    original_validate = execution._validate_campaign_launch_order
+
+    def hold_launch_lock(**kwargs: Any) -> None:
+        original_validate(**kwargs)
+        launch_has_lock.set()
+        if not publisher_attempted.wait(timeout=5):
+            raise AssertionError("publisher did not attempt while launch held the lock")
+        raise execution.FactorialExecutionError("stop after lock-order regression")
+
+    monkeypatch.setattr(execution, "_validate_campaign_launch_order", hold_launch_lock)
+
+    def launch() -> None:
+        try:
+            execution.execute_slot_once(
+                context["slot"],
+                context["spec"],
+                preflight=context["preflight"],
+                static_artifacts=context["static_artifacts"],
+                authorization_receipt=context["authorization_payload"],
+                campaign_member=True,
+            )
+        except BaseException as error:
+            launch_errors.append(error)
+
+    launch_thread = threading.Thread(target=launch, daemon=True)
+    launch_thread.start()
+    assert launch_has_lock.wait(timeout=5)
+
+    try:
+        with pytest.raises(
+            execution.FactorialExecutionError,
+            match="another campaign ledger/launch operation is active",
+        ):
+            execution.publish_campaign_summary(
+                root / execution.CAMPAIGN_SUMMARY_FILENAME,
+                _campaign_summary(context, ledger.read_bytes()),
+            )
+    finally:
+        publisher_attempted.set()
+        launch_thread.join(timeout=5)
+
+    assert not launch_thread.is_alive()
+    assert len(launch_errors) == 1
+    assert isinstance(launch_errors[0], execution.FactorialExecutionError)
+    assert str(launch_errors[0]) == "stop after lock-order regression"
+    assert not (root / execution.CAMPAIGN_SUMMARY_FILENAME).exists()
+    assert not context["preflight"].slot_directory.exists()
+
+
+def test_campaign_launcher_loses_when_summary_publisher_owns_root_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    ledger.write_bytes(
+        b"".join(
+            execution._canonical_json_bytes(row)
+            for row in (
+                _campaign_ledger_row(context, 1, "STARTED", 1),
+                _campaign_ledger_row(context, 1, "TERMINAL", 2),
+            )
+        )
+    )
+    summary_path = root / execution.CAMPAIGN_SUMMARY_FILENAME
+    summary = _campaign_summary(context, ledger.read_bytes())
+    publisher_has_lock = threading.Event()
+    allow_publication = threading.Event()
+    publisher_errors: list[BaseException] = []
+    original_write = execution._write_exclusive
+
+    def pause_summary_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
+        if path == summary_path:
+            publisher_has_lock.set()
+            if not allow_publication.wait(timeout=5):
+                raise AssertionError("launcher did not attempt while publisher held lock")
+        original_write(path, payload, mode=mode)
+
+    monkeypatch.setattr(execution, "_write_exclusive", pause_summary_write)
+
+    def publish() -> None:
+        try:
+            execution.publish_campaign_summary(summary_path, summary)
+        except BaseException as error:
+            publisher_errors.append(error)
+
+    publisher_thread = threading.Thread(target=publish, daemon=True)
+    publisher_thread.start()
+    assert publisher_has_lock.wait(timeout=5)
+
+    try:
+        with pytest.raises(
+            execution.FactorialExecutionError,
+            match="another campaign ledger/launch operation is active",
+        ):
+            execution.execute_slot_once(
+                context["slot"],
+                context["spec"],
+                preflight=context["preflight"],
+                static_artifacts=context["static_artifacts"],
+                authorization_receipt=context["authorization_payload"],
+                campaign_member=True,
+            )
+    finally:
+        allow_publication.set()
+        publisher_thread.join(timeout=5)
+
+    assert not publisher_thread.is_alive()
+    assert publisher_errors == []
+    assert summary_path.read_bytes() == execution._canonical_json_bytes(summary)
+    assert not context["preflight"].slot_directory.exists()
+
+
+def test_campaign_summary_rejects_started_until_terminal_is_appended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    summary_path = root / execution.CAMPAIGN_SUMMARY_FILENAME
+
+    execution.append_campaign_ledger_record(
+        ledger,
+        _campaign_ledger_row(context, 1, "STARTED", 1),
+    )
+    started_payload = ledger.read_bytes()
+    launch_released_lock = threading.Event()
+    publisher_attempted = threading.Event()
+    launch_errors: list[BaseException] = []
+    original_write = execution._write_exclusive
+
+    def stop_launch_after_lock_release(
+        path: Path,
+        payload: bytes,
+        *,
+        mode: int = 0o600,
+    ) -> None:
+        if path == context["preflight"].slot_directory / "manifest.json":
+            launch_released_lock.set()
+            if not publisher_attempted.wait(timeout=5):
+                raise AssertionError("publisher did not attempt after launch lock release")
+            raise execution.FactorialExecutionError(
+                "stop after post-launch finalization regression"
+            )
+        original_write(path, payload, mode=mode)
+
+    monkeypatch.setattr(execution, "_write_exclusive", stop_launch_after_lock_release)
+
+    def launch() -> None:
+        try:
+            execution.execute_slot_once(
+                context["slot"],
+                context["spec"],
+                preflight=context["preflight"],
+                static_artifacts=context["static_artifacts"],
+                authorization_receipt=context["authorization_payload"],
+                campaign_member=True,
+            )
+        except BaseException as error:
+            launch_errors.append(error)
+
+    launch_thread = threading.Thread(target=launch, daemon=True)
+    launch_thread.start()
+    assert launch_released_lock.wait(timeout=5)
+
+    try:
+        with pytest.raises(
+            execution.FactorialExecutionError,
+            match="active unpaired STARTED",
+        ):
+            execution.publish_campaign_summary(
+                summary_path,
+                _campaign_summary(context, started_payload),
+            )
+    finally:
+        publisher_attempted.set()
+        launch_thread.join(timeout=5)
+
+    assert not launch_thread.is_alive()
+    assert len(launch_errors) == 1
+    assert isinstance(launch_errors[0], execution.FactorialExecutionError)
+    assert str(launch_errors[0]) == "stop after post-launch finalization regression"
+    assert not summary_path.exists()
+    assert ledger.read_bytes() == started_payload
+
+    execution.append_campaign_ledger_record(
+        ledger,
+        _campaign_ledger_row(context, 1, "TERMINAL", 2),
+    )
+    terminal_payload = ledger.read_bytes()
+    summary = _campaign_summary(context, terminal_payload)
+    execution.publish_campaign_summary(summary_path, summary)
+
+    assert summary_path.read_bytes() == execution._canonical_json_bytes(summary)
+    assert ledger.read_bytes() == terminal_payload
+
+
+def test_campaign_summary_seals_ledger_against_later_append(tmp_path: Path) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    summary_path = root / execution.CAMPAIGN_SUMMARY_FILENAME
+    for state, monotonic_ns in (("STARTED", 1), ("TERMINAL", 2)):
+        execution.append_campaign_ledger_record(
+            ledger,
+            _campaign_ledger_row(context, 1, state, monotonic_ns),
+        )
+    sealed_ledger = ledger.read_bytes()
+    summary = _campaign_summary(context, sealed_ledger)
+    execution.publish_campaign_summary(summary_path, summary)
+
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="finalized campaign cannot append",
+    ):
+        execution.append_campaign_ledger_record(
+            ledger,
+            _campaign_ledger_row(context, 2, "STARTED", 3),
+        )
+
+    assert ledger.read_bytes() == sealed_ledger
+    assert summary_path.read_bytes() == execution._canonical_json_bytes(summary)
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value", "reason"),
+    (
+        ("ledger_sha256", "0" * 64, "ledger digest"),
+        ("attempted_slot_count", 2, "attempted count"),
+        ("expected_slot_count", 67, "expected count"),
+    ),
+)
+def test_campaign_summary_binds_locked_ledger_digest_and_counts(
+    tmp_path: Path,
+    field: str,
+    drifted_value: object,
+    reason: str,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    for state, monotonic_ns in (("STARTED", 1), ("TERMINAL", 2)):
+        execution.append_campaign_ledger_record(
+            ledger,
+            _campaign_ledger_row(context, 1, state, monotonic_ns),
+        )
+    summary = _campaign_summary(context, ledger.read_bytes())
+    summary[field] = drifted_value
+
+    with pytest.raises(execution.FactorialExecutionError, match=reason):
+        execution.publish_campaign_summary(
+            root / execution.CAMPAIGN_SUMMARY_FILENAME,
+            summary,
+        )
+
+    assert not (root / execution.CAMPAIGN_SUMMARY_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("drift", "reason"),
+    (
+        ("equal_monotonic", "monotonic timestamps are not strictly increasing"),
+        ("regressing_monotonic", "monotonic timestamps are not strictly increasing"),
+        ("equal_utc", "UTC timestamps are not strictly increasing"),
+        ("regressing_utc", "UTC timestamps are not strictly increasing"),
+        ("naive_utc", "recorded UTC timestamp must be timezone-aware"),
+    ),
+)
+def test_campaign_summary_rejects_non_strict_ledger_timestamps(
+    tmp_path: Path,
+    drift: str,
+    reason: str,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    rows = [
+        _campaign_ledger_row(context, 1, "STARTED", 1),
+        _campaign_ledger_row(context, 1, "TERMINAL", 2),
+        _campaign_ledger_row(context, 2, "STARTED", 3),
+        _campaign_ledger_row(context, 2, "TERMINAL", 4),
+    ]
+    if drift == "equal_monotonic":
+        rows[1]["recorded_monotonic_ns"] = rows[0]["recorded_monotonic_ns"]
+    elif drift == "regressing_monotonic":
+        rows[2]["recorded_monotonic_ns"] = 1
+    elif drift == "equal_utc":
+        rows[1]["recorded_utc"] = rows[0]["recorded_utc"]
+    elif drift == "regressing_utc":
+        rows[2]["recorded_utc"] = rows[0]["recorded_utc"]
+    else:
+        rows[1]["recorded_utc"] = "2026-08-04T00:00:02"
+    ledger_payload = b"".join(
+        execution._canonical_json_bytes(row) for row in rows
+    )
+    ledger.write_bytes(ledger_payload)
+
+    with pytest.raises(execution.FactorialExecutionError, match=reason):
+        execution.publish_campaign_summary(
+            root / execution.CAMPAIGN_SUMMARY_FILENAME,
+            _campaign_summary(context, ledger_payload),
+        )
+
+    assert not (root / execution.CAMPAIGN_SUMMARY_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("completed_utc", "reason"),
+    (
+        ("2026-08-04T00:00:01+00:00", "precedes final TERMINAL"),
+        ("2026-08-04T00:00:02", "completion timestamp must be timezone-aware"),
+    ),
+)
+def test_campaign_summary_rejects_backdated_or_naive_completion_time(
+    tmp_path: Path,
+    completed_utc: str,
+    reason: str,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    rows = (
+        _campaign_ledger_row(context, 1, "STARTED", 1),
+        _campaign_ledger_row(context, 1, "TERMINAL", 2),
+    )
+    ledger_payload = b"".join(
+        execution._canonical_json_bytes(row) for row in rows
+    )
+    ledger.write_bytes(ledger_payload)
+    summary = _campaign_summary(context, ledger_payload)
+    summary["completed_utc"] = completed_utc
+
+    with pytest.raises(execution.FactorialExecutionError, match=reason):
+        execution.publish_campaign_summary(
+            root / execution.CAMPAIGN_SUMMARY_FILENAME,
+            summary,
+        )
+
+    assert not (root / execution.CAMPAIGN_SUMMARY_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("drift", "reason"),
+    (
+        ("row_before_approval", "first ledger record precedes authorization approval"),
+        (
+            "completion_before_approval",
+            "completion timestamp precedes authorization approval",
+        ),
+    ),
+)
+def test_campaign_summary_rejects_evidence_before_authorization(
+    tmp_path: Path,
+    drift: str,
+    reason: str,
+) -> None:
+    context = _campaign_launch_context(tmp_path, 1)
+    root = context["preflight"].result_root
+    ledger = root / execution.CAMPAIGN_LEDGER_FILENAME
+    rows = [
+        _campaign_ledger_row(context, 1, "STARTED", 1),
+        _campaign_ledger_row(context, 1, "TERMINAL", 2),
+    ]
+    if drift == "row_before_approval":
+        rows[0]["recorded_utc"] = "2026-08-03T23:59:59+00:00"
+    ledger_payload = b"".join(
+        execution._canonical_json_bytes(row) for row in rows
+    )
+    ledger.write_bytes(ledger_payload)
+    summary = _campaign_summary(context, ledger_payload)
+    if drift == "completion_before_approval":
+        summary["completed_utc"] = "2026-08-03T23:59:59+00:00"
+
+    with pytest.raises(execution.FactorialExecutionError, match=reason):
+        execution.publish_campaign_summary(
+            root / execution.CAMPAIGN_SUMMARY_FILENAME,
+            summary,
+        )
+
+    assert not (root / execution.CAMPAIGN_SUMMARY_FILENAME).exists()
 
 
 def test_redaction_key_derivation_is_domain_separated_and_reproducible() -> None:

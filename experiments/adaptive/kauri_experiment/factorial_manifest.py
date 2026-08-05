@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import itertools
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,14 +74,32 @@ V7_SEMANTIC_SHA256 = (
 )
 V7_PLAN_SHA256 = "18469f3b00f3dfb9b92c586ec46cce1f1b76b49faf506840eb30bd769e5f7026"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v8"
-FROZEN_MANIFEST_SHA256 = (
+V8_MANIFEST_ID = "shape-placement-factorial-v8"
+V8_MANIFEST_SHA256 = (
     "05d8f3bbf38b2da8000d4a7788b0376803c71feaf8bb44e52e19c8e248757dee"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V8_SEMANTIC_SHA256 = (
     "af47ea9d35c1db786e5609b53bdffc93f18b47db40db948908edb611c92f76a3"
 )
-FROZEN_PLAN_SHA256 = "0f1d1c321109f795c03d658208d340fff5b38da7d74986996ed52bd7828a8598"
+V8_PLAN_SHA256 = "0f1d1c321109f795c03d658208d340fff5b38da7d74986996ed52bd7828a8598"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v9"
+FROZEN_MANIFEST_SHA256 = (
+    "878394cf2fc9bbb283daa2667d9c4312ede2285522452079b7289bbe005b6c02"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "f72e3ece6b73490a372c03479e6456976134dd4f8c8662d32e841d5920e5aaac"
+)
+FROZEN_PLAN_SHA256 = "36ba999a4e585ee5203f1a0acbdecc728815ad1a44bf5d43b11f10a7df57c2f6"
+
+RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1 = (
+    "retain_unanswered_exact_parent_child_attempt_across_consensus_commit_until_"
+    "original_aggregation_derived_deadline_observational_only_no_consensus_"
+    "authority_v1"
+)
+RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1 = (
+    "fault_marker_to_exact_parent_attempt_to_scored_timeout_required_v1"
+)
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
 EXPECTED_CANDIDATE_FANOUTS = (2, 3, 5)
@@ -145,6 +164,15 @@ class ResponsiveDegradationContract(_Document):
     observer_isolation: str
     actor_schedule: str
     omission_period: int
+    pending_attempt_retention: str | None = None
+    causal_timeout_linkage: str | None = None
+
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        for field in ("pending_attempt_retention", "causal_timeout_linkage"):
+            if document[field] is None:
+                document.pop(field)
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +306,18 @@ class ClaimScope(_Document):
     breakthrough_pre_epoch1_placebo_estimand: str | None = None
     breakthrough_placebo_equivalence_rule: str | None = None
     breakthrough_placebo_equivalence_margin_log: float | None = None
+    breakthrough_secondary_scope: str | None = None
+    breakthrough_secondary_status_rule: str | None = None
+    breakthrough_secondary_structural_gate: str | None = None
+    breakthrough_secondary_structural_required_slot_count: int | None = None
+    breakthrough_secondary_realized_placement_rule: str | None = None
+    breakthrough_secondary_realized_placement_per_arm_requirement: int | None = None
+    breakthrough_secondary_throughput_estimand: str | None = None
+    breakthrough_secondary_throughput_claim_rule: str | None = None
+    breakthrough_secondary_positive_block_requirement: int | None = None
+    breakthrough_secondary_pre_epoch1_placebo_estimand: str | None = None
+    breakthrough_secondary_placebo_equivalence_rule: str | None = None
+    breakthrough_secondary_placebo_equivalence_margin_log: float | None = None
 
     def as_document(self) -> dict[str, object]:
         return {
@@ -656,10 +696,12 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
         V7_MANIFEST_ID,
+        V8_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
-    tiered = manifest_id == FROZEN_MANIFEST_ID
+    tiered = manifest_id in {V8_MANIFEST_ID, FROZEN_MANIFEST_ID}
+    causal_measurement = manifest_id == FROZEN_MANIFEST_ID
     persistent = manifest_id in {
         V2_MANIFEST_ID,
         V3_MANIFEST_ID,
@@ -667,6 +709,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
         V7_MANIFEST_ID,
+        V8_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
@@ -675,6 +718,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V5_MANIFEST_ID,
         V6_MANIFEST_ID,
         V7_MANIFEST_ID,
+        V8_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -720,9 +764,10 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         responsiveness.get("latency_percentile_basis_points"),
         "responsiveness_policy.latency_percentile_basis_points",
     )
+    expected_minimum_attempts = 41 if causal_measurement else 32
     if (
         attempt_window != 128
-        or minimum_attempts != 32
+        or minimum_attempts != expected_minimum_attempts
         or minimum_response_rate_ppm != 950_000
         or maximum_timeout_rate_ppm != 50_000
         or trailing_timeout_streak != 2
@@ -875,6 +920,16 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             or vector.get("selected_actor") != computed_actor
         ):
             _error("actor rotation vector disagrees with the FNV-1a reference")
+    expected_responsive_schedule = (
+        "omit_every_41st_unique_non_root_contribution_per_"
+        "responsive_degraded_actor_v2"
+        if causal_measurement
+        else (
+            "omit_every_32nd_unique_non_root_contribution_per_"
+            "responsive_degraded_actor_v1"
+        )
+    )
+    expected_responsive_period = 41 if causal_measurement else 32
     if tiered:
         responsive = _mapping(
             byzantine.get("responsive_degradation"),
@@ -890,6 +945,10 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             "actor_schedule",
             "omission_period",
         }
+        if causal_measurement:
+            expected_responsive_fields.update(
+                {"pending_attempt_retention", "causal_timeout_linkage"}
+            )
         if set(responsive) != expected_responsive_fields:
             _error("responsive-degradation contract fields are not frozen")
         if (
@@ -916,18 +975,52 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             or responsive.get("observer_isolation")
             != "replica_0_reserved_authoritative_commit_observer_v1"
             or responsive.get("actor_schedule")
-            != (
-                "omit_every_32nd_unique_non_root_contribution_per_"
-                "responsive_degraded_actor_v1"
-            )
+            != expected_responsive_schedule
             or _integer(
                 responsive.get("omission_period"),
                 "byzantine.responsive_degradation.omission_period",
                 minimum=2,
             )
-            != 32
+            != expected_responsive_period
         ):
-            _error("responsive-degradation semantics differ from frozen v8")
+            _error("responsive-degradation semantics differ from frozen profile")
+        if causal_measurement:
+            cycle_lengths = {
+                cycle
+                for replica_count in (*replica_counts, 7)
+                for cycle in (
+                    replica_count - 1,
+                    2 * ((replica_count - 1) // 3),
+                )
+            }
+            if any(
+                math.gcd(expected_responsive_period, cycle) != 1
+                for cycle in cycle_lengths
+            ):
+                _error(
+                    "v9 responsive omission period must be coprime to every "
+                    "campaign and excluded-smoke N-1/Q-1 role cycle"
+                )
+            if any(
+                (
+                    (attempt_count + expected_responsive_period - 1)
+                    // expected_responsive_period
+                )
+                * 1_000_000
+                > maximum_timeout_rate_ppm * attempt_count
+                for attempt_count in range(minimum_attempts, attempt_window + 1)
+            ):
+                _error(
+                    "v9 responsive omission schedule can exceed the frozen "
+                    "timeout ceiling in a selected attempt window"
+                )
+        if causal_measurement and (
+            responsive.get("pending_attempt_retention")
+            != RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
+            or responsive.get("causal_timeout_linkage")
+            != RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
+        ):
+            _error("responsive-degradation causal measurement contract drifted")
         responsive_vectors = _array(
             responsive.get("actor_selection_vectors"),
             "byzantine.responsive_degradation.actor_selection_vectors",
@@ -958,15 +1051,15 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                     "responsive degradation vector disagrees with SHA-256 ranking"
                 )
         if "max_omissions_per_proposal" in byzantine:
-            _error("v8 maximum omissions must be derived per slot, not scalar")
+            _error("tiered maximum omissions must be derived per slot, not scalar")
         if (
             byzantine.get("max_omissions_per_proposal_rule")
             != "derived_f_per_slot_v1"
         ):
-            _error("v8 maximum omissions must equal derived f per slot")
+            _error("tiered maximum omissions must equal derived f per slot")
     else:
         if "responsive_degradation" in byzantine:
-            _error("only v8 may carry responsive-degradation semantics")
+            _error("only tiered manifests may carry responsive-degradation semantics")
         if "max_omissions_per_proposal_rule" in byzantine:
             _error("legacy manifests must retain their scalar omission maximum")
         expected_max_omissions = 3 if persistent else 1
@@ -1112,7 +1205,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
     expected_counterbalancing = (
         "stratified_greedy_minimum_position_imbalance_"
         "sha256_tiebreak_v2"
-        if manifest_id == FROZEN_MANIFEST_ID
+        if tiered
         else "greedy_minimum_position_imbalance_sha256_tiebreak_v1"
     )
     if (
@@ -1143,25 +1236,40 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         "shape_and_joint_headline_initial_fanout": 2,
         "shape_and_joint_headline_block_count": 5,
     }
-    if manifest_id == FROZEN_MANIFEST_ID:
+    if tiered:
+        breakthrough_structural_gate = (
+            "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_"
+            "and_every_41st_unique_non_root_responsive_degraded_omission_"
+            "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_role_"
+            "bound_timeout_reporters_and_at_least_one_internal_omit_aggregate_"
+            "proof_and_each_responsive_degraded_actor_has_its_own_exact_"
+            "reporter_local_epoch1_internal_omit_aggregate_cross_commit_"
+            "witness_and_responsive_degraded_replicas_rank_below_every_fast_"
+            "replica_and_epoch1_places_every_responsive_degraded_replica_as_a_"
+            "root_and_exposes_each_in_an_internal_role_and_epoch2_roots_equal_"
+            "top_q_fast_replicas_with_only_fast_replicas_in_root_and_internal_"
+            "roles_and_all_f_worse_replicas_as_physical_leaves_and_only_hard_"
+            "cohort_wait_exempt_v3"
+            if causal_measurement
+            else (
+                "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_"
+                "and_every_32nd_unique_non_root_responsive_degraded_omission_"
+                "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_"
+                "role_bound_timeout_reporters_and_at_least_one_internal_"
+                "omit_aggregate_proof_and_responsive_degraded_replicas_rank_"
+                "below_every_fast_replica_and_epoch1_places_every_responsive_"
+                "degraded_replica_as_a_root_and_exposes_each_in_an_internal_"
+                "role_and_epoch2_roots_equal_top_q_fast_replicas_with_only_"
+                "fast_replicas_in_root_and_internal_roles_and_all_f_worse_"
+                "replicas_as_physical_leaves_and_only_hard_cohort_wait_exempt_v2"
+            )
+        )
         expected_claim_scope.update(
             {
                 "breakthrough_scope": (
                     "n31_f5_placement_arms_p_and_ps_five_matched_blocks_v1"
                 ),
-                "breakthrough_structural_gate": (
-                    "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_"
-                    "and_every_32nd_unique_non_root_responsive_degraded_omission_"
-                    "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_"
-                    "role_bound_timeout_reporters_and_at_least_one_internal_"
-                    "omit_aggregate_proof_and_responsive_degraded_replicas_rank_"
-                    "below_every_"
-                    "fast_replica_and_epoch1_places_every_responsive_degraded_"
-                    "replica_as_a_root_and_exposes_each_in_an_internal_role_and_"
-                    "epoch2_roots_equal_top_q_fast_replicas_with_only_fast_"
-                    "replicas_in_root_and_internal_roles_and_all_f_worse_replicas_"
-                    "as_physical_leaves_and_only_hard_cohort_wait_exempt_v2"
-                ),
+                "breakthrough_structural_gate": breakthrough_structural_gate,
                 "breakthrough_structural_required_slot_count": 10,
                 "breakthrough_realized_placement_rule": (
                     "for_each_p_and_ps_arm_all_5_of_5_n31_f5_blocks_have_"
@@ -1213,6 +1321,55 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 ),
             }
         )
+        if causal_measurement:
+            expected_claim_scope.update(
+                {
+                    "breakthrough_secondary_scope": (
+                        "n31_f2_placement_arms_p_and_ps_five_matched_blocks_"
+                        "prespecified_secondary_v1"
+                    ),
+                    "breakthrough_secondary_status_rule": (
+                        "supported_only_if_primary_f5_supported_and_all_"
+                        "secondary_f2_gates_pass_not_supported_if_primary_f5_"
+                        "supported_and_any_secondary_gate_fails_descriptive_"
+                        "only_if_primary_f5_not_supported_v1"
+                    ),
+                    "breakthrough_secondary_structural_gate": (
+                        "all_n31_f2_p_ps_slots_validate_existing_tiered_full_"
+                        "hierarchy_and_exact_epoch1_to_epoch2_degraded_demotion_"
+                        "and_fast_promotion_proofs_v1"
+                    ),
+                    "breakthrough_secondary_structural_required_slot_count": 10,
+                    "breakthrough_secondary_realized_placement_rule": (
+                        "for_each_p_and_ps_arm_all_5_of_5_n31_f2_blocks_have_"
+                        "epoch1_to_epoch2_demoted_set_exactly_responsive_"
+                        "degraded_cohort_and_promoted_set_exactly_canonical_"
+                        "non_reference_root_pool_minus_hard_cohort_v1"
+                    ),
+                    "breakthrough_secondary_realized_placement_per_arm_requirement": 5,
+                    "breakthrough_secondary_throughput_estimand": (
+                        "d2_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+"
+                        "log((PS_e2/PS_e1)/(S_e2/S_e1))]"
+                    ),
+                    "breakthrough_secondary_throughput_claim_rule": (
+                        "two_sided_student_t_95_df4_lower_log_bound_strictly_"
+                        "greater_than_zero_and_at_least_4_of_5_block_effects_"
+                        "strictly_greater_than_zero_v1"
+                    ),
+                    "breakthrough_secondary_positive_block_requirement": 4,
+                    "breakthrough_secondary_pre_epoch1_placebo_estimand": (
+                        "pP2_b=log((P_fault/P_baseline)/(00_fault/00_baseline));"
+                        "pPS2_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))"
+                    ),
+                    "breakthrough_secondary_placebo_equivalence_rule": (
+                        "both_component_two_one_sided_5_percent_tests_df4_90_"
+                        "cis_strictly_within_plus_minus_log_1p10_v2"
+                    ),
+                    "breakthrough_secondary_placebo_equivalence_margin_log": (
+                        0.09531017980432493
+                    ),
+                }
+            )
     if claim_scope != expected_claim_scope:
         _error(
             "claim scope must preserve the exact frozen estimands and strata"
@@ -1251,7 +1408,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v8 may carry the compact "
+            "only shape-placement-factorial-v3 through v9 may carry the compact "
             "snapshot format field"
         )
 
@@ -1264,6 +1421,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V5_MANIFEST_ID: V5_SEMANTIC_SHA256,
         V6_MANIFEST_ID: V6_SEMANTIC_SHA256,
         V7_MANIFEST_ID: V7_SEMANTIC_SHA256,
+        V8_MANIFEST_ID: V8_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -1470,6 +1628,16 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
                     omission_period=(
                         byzantine["responsive_degradation"]["omission_period"]
                     ),
+                    pending_attempt_retention=(
+                        byzantine["responsive_degradation"].get(
+                            "pending_attempt_retention"
+                        )
+                    ),
+                    causal_timeout_linkage=(
+                        byzantine["responsive_degradation"].get(
+                            "causal_timeout_linkage"
+                        )
+                    ),
                 )
                 if "responsive_degradation" in byzantine
                 else None
@@ -1529,6 +1697,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V5_MANIFEST_ID: V5_MANIFEST_SHA256,
         V6_MANIFEST_ID: V6_MANIFEST_SHA256,
         V7_MANIFEST_ID: V7_MANIFEST_SHA256,
+        V8_MANIFEST_ID: V8_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -1990,6 +2159,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V5_MANIFEST_ID: (V5_MANIFEST_SHA256, V5_PLAN_SHA256),
         V6_MANIFEST_ID: (V6_MANIFEST_SHA256, V6_PLAN_SHA256),
         V7_MANIFEST_ID: (V7_MANIFEST_SHA256, V7_PLAN_SHA256),
+        V8_MANIFEST_ID: (V8_MANIFEST_SHA256, V8_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -2018,6 +2188,8 @@ __all__ = (
     "FROZEN_MANIFEST_SHA256",
     "FROZEN_PLAN_SHA256",
     "FROZEN_SEMANTIC_SHA256",
+    "RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1",
+    "RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1",
     "LEGACY_MANIFEST_ID",
     "LEGACY_MANIFEST_SHA256",
     "LEGACY_PLAN_SHA256",
@@ -2046,6 +2218,10 @@ __all__ = (
     "V7_MANIFEST_SHA256",
     "V7_PLAN_SHA256",
     "V7_SEMANTIC_SHA256",
+    "V8_MANIFEST_ID",
+    "V8_MANIFEST_SHA256",
+    "V8_PLAN_SHA256",
+    "V8_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",
