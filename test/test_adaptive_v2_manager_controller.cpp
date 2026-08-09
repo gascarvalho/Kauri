@@ -213,6 +213,37 @@ LeafEdge leaf_edge(
     return edges[reporter_index];
 }
 
+LeafEdge internal_edge(
+    const hotstuff::EpochDefinition &epoch,
+    ReplicaID target)
+{
+    std::vector<LeafEdge> edges;
+    for (const auto &tree : epoch.trees())
+    {
+        const auto found = std::find(
+            tree.members_breadth_first.begin(),
+            tree.members_breadth_first.end(),
+            target);
+        if (found == tree.members_breadth_first.end())
+            continue;
+        const auto position = static_cast<std::size_t>(std::distance(
+            tree.members_breadth_first.begin(), found));
+        if (position == 0 ||
+            position >= first_leaf_index(
+                            tree.members_breadth_first.size(),
+                            tree.fanout))
+        {
+            continue;
+        }
+        const auto parent_position = (position - 1U) / tree.fanout;
+        edges.push_back(
+            {tree.tree_id,
+             tree.members_breadth_first[parent_position]});
+    }
+    REQUIRE_FALSE(edges.empty());
+    return edges.front();
+}
+
 const ReplicaAdaptationResult *ranking_entry(
     const hotstuff::AdaptationSnapshot &snapshot,
     ReplicaID replica_id)
@@ -369,6 +400,37 @@ struct Fixture
         admit(value);
         ingest(value);
         return value;
+    }
+
+    void record_aggregate_timeout(
+        ReplicaID target,
+        const std::string &label)
+    {
+        const auto edge = internal_edge(
+            ingress.current_epoch(), target);
+        ResponseObservation value;
+        value.reporter_id = edge.reporter;
+        value.observed_replica_id = target;
+        value.configuration = ConfigurationId{
+            ingress.current_epoch().epoch_number(),
+            edge.tree_id,
+            ingress.current_epoch().epoch_digest()};
+        value.block_hash = digest(
+            label + "-" + std::to_string(++proposal_counter));
+        value.expected_message_type =
+            ExpectedMessageType::aggregate_relay;
+        value.outcome = ResponseOutcome::timeout;
+        value.response_duration_us = 0;
+        value.deadline_duration_us = 100;
+        value.reporter_sequence =
+            ++evidence_sequences[value.reporter_id];
+        value.reporter_monotonic_ns =
+            value.reporter_sequence * 1'000;
+        value.observation_id =
+            hotstuff::compute_response_observation_id(
+                value.attempt_identity());
+        admit(value);
+        ingest(value);
     }
 
     void record_late(const ResponseObservation &timed_out)
@@ -828,6 +890,41 @@ TEST_CASE(
     CHECK(fixture.controller->baseline_audit_snapshot() == baseline);
     CHECK(fixture.controller->selection_audit() == nullptr);
     CHECK(fixture.controller->healthy());
+}
+
+TEST_CASE(
+    "N7 v13 baseline ignores aggregate relay timeout noise",
+    "[adaptive-v2][manager-controller][baseline][direct-vote][v13][n7]")
+{
+    Fixture fixture;
+    fixture.controller.reset();
+    fixture.config.selection.responsiveness_policy.policy_version =
+        "shape25-direct-vote-responsiveness-v2";
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+
+    fixture.ready_all();
+    fixture.complete_responsive_baseline();
+    fixture.record_aggregate_timeout(0, "baseline-aggregate-noise");
+    const auto baseline_cutoff =
+        fixture.ingress.ledger().high_watermark();
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    REQUIRE(fixture.controller->baseline_audit_snapshot() != nullptr);
+    const auto &baseline =
+        *fixture.controller->baseline_audit_snapshot();
+    const auto *target = ranking_entry(baseline, 0);
+    REQUIRE(target != nullptr);
+
+    CHECK(baseline_cutoff == 15);
+    CHECK(baseline.accepted_record_count() == 15);
+    CHECK(target->attempt_count == 2);
+    CHECK(target->response_count == 2);
+    CHECK(target->timeout_count == 0);
+    CHECK(target->classification == ResponsivenessClass::responsive);
+    CHECK(target->eligible);
 }
 
 TEST_CASE(

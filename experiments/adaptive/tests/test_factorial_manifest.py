@@ -56,6 +56,10 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     V11_MANIFEST_SHA256,
     V11_PLAN_SHA256,
     V11_SEMANTIC_SHA256,
+    V12_MANIFEST_ID,
+    V12_MANIFEST_SHA256,
+    V12_PLAN_SHA256,
+    V12_SEMANTIC_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -76,6 +80,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
+)
+V12_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v12.json"
 )
 V11_MANIFEST_PATH = (
@@ -331,7 +338,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v12/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v13/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -836,7 +843,7 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
         "maximum_timeout_rate_ppm": 50000,
         "minimum_attempts": 60,
         "minimum_response_rate_ppm": 950000,
-        "policy_version": "shape25-sensitive-responsiveness-v1",
+        "policy_version": "shape25-direct-vote-responsiveness-v2",
         "trailing_timeout_streak": 7,
     }
     assert all(
@@ -1343,7 +1350,22 @@ def test_v11_only_adds_exact_causal_edge_eligibility_to_v10() -> None:
 
 
 def test_v12_only_changes_the_role_scoped_omission_contract_from_v11() -> None:
-    v12_document = json.loads(MANIFEST_PATH.read_bytes())
+    v12 = load_frozen_manifest(V12_MANIFEST_PATH)
+    assert v12.manifest_id == V12_MANIFEST_ID
+    assert v12.manifest_sha256 == V12_MANIFEST_SHA256
+    assert build_factorial_plan(v12).plan_sha256 == V12_PLAN_SHA256
+    assert hashlib.sha256(
+        json.dumps(
+            json.loads(V12_MANIFEST_PATH.read_bytes()),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    ).hexdigest() == V12_SEMANTIC_SHA256
+
+    v12_document = json.loads(V12_MANIFEST_PATH.read_bytes())
     v11_document = json.loads(V11_MANIFEST_PATH.read_bytes())
 
     assert v12_document.pop("manifest_id") == "shape-placement-factorial-v12"
@@ -1376,6 +1398,27 @@ def test_v12_only_changes_the_role_scoped_omission_contract_from_v11() -> None:
     assert v11_document["responsiveness_policy"].pop("trailing_timeout_streak") == 2  # type: ignore[index]
 
     assert v12_document == v11_document
+
+
+def test_v13_only_changes_direct_vote_scoring_identity_from_v12() -> None:
+    v13_document = json.loads(MANIFEST_PATH.read_bytes())
+    v12_document = json.loads(V12_MANIFEST_PATH.read_bytes())
+
+    assert v13_document.pop("manifest_id") == "shape-placement-factorial-v13"
+    assert v12_document.pop("manifest_id") == "shape-placement-factorial-v12"
+    assert v13_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v13"
+    )
+    assert v12_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v12"
+    )
+    assert v13_document["responsiveness_policy"].pop("policy_version") == (  # type: ignore[index]
+        "shape25-direct-vote-responsiveness-v2"
+    )
+    assert v12_document["responsiveness_policy"].pop("policy_version") == (  # type: ignore[index]
+        "shape25-sensitive-responsiveness-v1"
+    )
+    assert v13_document == v12_document
 
 
 def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:

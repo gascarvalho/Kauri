@@ -490,6 +490,20 @@ AdaptationPolicy permissive_policy()
     return policy;
 }
 
+AdaptationPolicy direct_vote_responsiveness_policy()
+{
+    AdaptationPolicy policy;
+    policy.policy_version =
+        "shape25-direct-vote-responsiveness-v2";
+    policy.attempt_window = 4;
+    policy.minimum_attempts = 4;
+    policy.minimum_response_rate_ppm = 750'000;
+    policy.maximum_timeout_rate_ppm = 250'000;
+    policy.trailing_timeout_streak = 2;
+    policy.latency_percentile_basis_points = 5'000;
+    return policy;
+}
+
 std::string read_source(const std::string &relative_path)
 {
 #ifdef KAURI_PROJECT_SOURCE_DIR
@@ -691,6 +705,111 @@ TEST_CASE(
     CHECK(healthy.timeout_rate_ppm == 0);
     CHECK(healthy.classification == ResponsivenessClass::responsive);
     CHECK(healthy.eligible);
+}
+
+TEST_CASE(
+    "v13 scores direct votes while legacy policy keeps pooled evidence",
+    "[r09][adaptation][shape25][direct-vote][v13]")
+{
+    const auto epoch = epoch_id(32, "shape25-direct-vote-v13");
+    RecordBuilder builder(epoch);
+    for (std::uint32_t attempt = 0; attempt < 4; ++attempt)
+    {
+        builder.add_on_time(0, 20);
+        if (attempt == 3)
+            builder.add_timeout(1);
+        else
+            builder.add_on_time(1, 20);
+    }
+    for (std::uint32_t attempt = 0; attempt < 4; ++attempt)
+    {
+        builder.add_timeout(
+            0, ExpectedMessageType::aggregate_relay);
+    }
+
+    const auto direct_policy = direct_vote_responsiveness_policy();
+    const auto direct = snapshot(
+        {0, 1},
+        epoch,
+        builder.records(),
+        builder.cutoff(),
+        direct_policy,
+        3201);
+    const auto &direct_zero = result_for(direct, 0);
+    const auto &direct_one = result_for(direct, 1);
+
+    CHECK(direct.accepted_record_count() == 12);
+    CHECK(direct_zero.attempt_count == 4);
+    CHECK(direct_zero.response_count == 4);
+    CHECK(direct_zero.timeout_count == 0);
+    CHECK(direct_zero.classification == ResponsivenessClass::responsive);
+    CHECK(direct_zero.eligible);
+    CHECK(direct_one.attempt_count == 4);
+    CHECK(direct_one.response_count == 3);
+    CHECK(direct_one.timeout_count == 1);
+    CHECK(direct_one.response_rate_ppm == 750'000);
+    CHECK(direct_one.timeout_rate_ppm == 250'000);
+    CHECK(direct_one.classification == ResponsivenessClass::responsive);
+    CHECK(direct_one.eligible);
+    CHECK(ranked_ids(direct) == std::vector<ReplicaID>{0, 1});
+
+    auto legacy_policy = direct_policy;
+    legacy_policy.policy_version = "shape25-sensitive-responsiveness-v1";
+    const auto legacy = snapshot(
+        {0, 1},
+        epoch,
+        builder.records(),
+        builder.cutoff(),
+        legacy_policy,
+        3201);
+    const auto &legacy_zero = result_for(legacy, 0);
+
+    CHECK(legacy_zero.attempt_count == 4);
+    CHECK(legacy_zero.response_count == 0);
+    CHECK(legacy_zero.timeout_count == 4);
+    CHECK(legacy_zero.response_rate_ppm == 0);
+    CHECK(legacy_zero.timeout_rate_ppm == 1'000'000);
+    CHECK(legacy_zero.classification ==
+          ResponsivenessClass::nonresponsive);
+    CHECK_FALSE(legacy_zero.eligible);
+
+    auto unknown_policy = direct_policy;
+    unknown_policy.policy_version =
+        "shape25-direct-vote-responsiveness-v2-typo";
+    const auto unknown = snapshot(
+        {0, 1},
+        epoch,
+        builder.records(),
+        builder.cutoff(),
+        unknown_policy,
+        3201);
+    CHECK(result_for(unknown, 0).attempt_count == 4);
+    CHECK(result_for(unknown, 0).timeout_count == 4);
+}
+
+TEST_CASE(
+    "v13 snapshot identity still commits ignored aggregate evidence",
+    "[r09][adaptation][shape25][direct-vote][snapshot][v13]")
+{
+    const auto epoch = epoch_id(33, "shape25-direct-vote-digest-v13");
+    RecordBuilder builder(epoch);
+    for (std::uint32_t attempt = 0; attempt < 4; ++attempt)
+        builder.add_on_time(0, 20);
+    builder.add_timeout(0, ExpectedMessageType::aggregate_relay);
+
+    const auto records = builder.copy_records();
+    const auto policy = direct_vote_responsiveness_policy();
+    const auto canonical = snapshot(
+        {0}, epoch, records, builder.cutoff(), policy, 3301);
+    auto changed = records;
+    ++changed.back().observation.reporter_monotonic_ns;
+    const auto tampered = snapshot(
+        {0}, epoch, changed, builder.cutoff(), policy, 3301);
+
+    CHECK(canonical.accepted_record_count() == 5);
+    CHECK(tampered.accepted_record_count() == 5);
+    CHECK(canonical.ranking() == tampered.ranking());
+    CHECK(canonical.snapshot_id() != tampered.snapshot_id());
 }
 
 TEST_CASE("a late completion recovers a persistent trailing miss streak",

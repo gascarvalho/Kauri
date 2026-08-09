@@ -13,6 +13,8 @@ namespace
 {
 
 constexpr char kSnapshotDomain[] = "kauri-adaptation-snapshot-v1";
+constexpr char kDirectVoteResponsivenessPolicy[] =
+    "shape25-direct-vote-responsiveness-v2";
 constexpr std::size_t kDigestBytes = 32;
 constexpr std::size_t kMaximumAcceptedSigners = 4'096;
 
@@ -574,9 +576,17 @@ AdaptationSnapshot build_adaptation_snapshot(
     }
 
     std::map<ReplicaID, std::vector<const Attempt *>> by_replica;
+    const bool direct_vote_only =
+        policy.policy_version == kDirectVoteResponsivenessPolicy;
     for (const auto &entry : attempts)
     {
         const auto &attempt = entry.second;
+        if (direct_vote_only &&
+            attempt.identity.expected_message_type !=
+                ExpectedMessageType::direct_vote)
+        {
+            continue;
+        }
         by_replica[attempt.identity.observed_replica_id]
             .push_back(&attempt);
     }

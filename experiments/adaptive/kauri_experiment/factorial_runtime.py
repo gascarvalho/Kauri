@@ -18,6 +18,7 @@ from .factorial_manifest import (
     FROZEN_MANIFEST_ID,
     V10_MANIFEST_ID,
     V11_MANIFEST_ID,
+    V12_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -40,11 +41,17 @@ V11_RUNTIME_SHA256 = (
 V11_SMOKE_RUNTIME_SHA256 = (
     "dc4e13ac0ed9f333f72003c0c49e6ab7820024d3533cd07b0fd6013f8a34a3e6"
 )
-FROZEN_RUNTIME_SHA256 = (
+V12_RUNTIME_SHA256 = (
     "fc65a289fa6bf574eae2cc37ac4117f352a9d499cf2d7d32d422cda67835dbfb"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V12_SMOKE_RUNTIME_SHA256 = (
     "21661e6b936bbeaa5983b66c669d67a4ffb846c1e534cdc9e6563856f039978e"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "613e78129d1f600f9690a9fe3dad18c2f9f7515c247958e0215a1f0d4ef7a693"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "5f70c7b117be7a5f425e9cd19b421cbc7958a4904daf7336b2989eea4fce641e"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -1497,7 +1504,8 @@ def runtime_preflight(
                     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
                 )
-                if runtime.manifest_id in {V11_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                if runtime.manifest_id
+                in {V11_MANIFEST_ID, V12_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else (
                     (
                         RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
@@ -1531,13 +1539,15 @@ def runtime_preflight(
                     V9_MANIFEST_ID,
                     V10_MANIFEST_ID,
                     V11_MANIFEST_ID,
+                    V12_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
             )
             expected_tiered_mode = (
                 "tiered_persistent_responsive_omission_v2"
-                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                if runtime.manifest_id
+                in {V12_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else "tiered_persistent_responsive_omission_v1"
             )
             expected_responsive_schedule = _responsive_actor_schedule(
@@ -1812,6 +1822,8 @@ __all__ = (
     "TransitionSequenceContract",
     "V11_RUNTIME_SHA256",
     "V11_SMOKE_RUNTIME_SHA256",
+    "V12_RUNTIME_SHA256",
+    "V12_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

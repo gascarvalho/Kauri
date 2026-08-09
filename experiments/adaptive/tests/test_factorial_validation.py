@@ -43,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
+)
+V12_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v12.json"
 )
 V11_MANIFEST_PATH = (
@@ -259,7 +262,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v12_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v13_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -276,7 +279,8 @@ def test_validator_retains_exact_v1_through_v12_artifact_identities() -> None:
             (9, V9_MANIFEST_PATH),
             (10, V10_MANIFEST_PATH),
             (11, V11_MANIFEST_PATH),
-            (12, MANIFEST_PATH),
+            (12, V12_MANIFEST_PATH),
+            (13, MANIFEST_PATH),
         )
     }
 
@@ -316,10 +320,16 @@ def test_validator_retains_exact_v1_through_v12_artifact_identities() -> None:
         identities[11].smoke_runtime_sha256
         == validation.V11_SMOKE_RUNTIME_SHA256
     )
-    assert identities[12].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[12].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[12].manifest_sha256 == validation.V12_MANIFEST_SHA256
+    assert identities[12].runtime_sha256 == validation.V12_RUNTIME_SHA256
     assert (
         identities[12].smoke_runtime_sha256
+        == validation.V12_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[13].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[13].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[13].smoke_runtime_sha256
         == validation.FROZEN_SMOKE_RUNTIME_SHA256
     )
 
@@ -335,6 +345,7 @@ def test_validator_retains_exact_v1_through_v12_artifact_identities() -> None:
         V9_MANIFEST_PATH,
         V10_MANIFEST_PATH,
         V11_MANIFEST_PATH,
+        V12_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -354,7 +365,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v12_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v13_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -379,6 +390,7 @@ def test_validator_requires_v9_through_v12_causal_contracts_but_accepts_v8() -> 
         V9_MANIFEST_PATH,
         V10_MANIFEST_PATH,
         V11_MANIFEST_PATH,
+        V12_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -421,7 +433,11 @@ def test_validator_requires_v9_through_v12_causal_contracts_but_accepts_v8() -> 
                 field: document["tiered_cohorts"][field]
                 for field in explicit_v10_fields
             } == explicit_v10_fields
-        if manifest_path in (V11_MANIFEST_PATH, MANIFEST_PATH):
+        if manifest_path in (
+            V11_MANIFEST_PATH,
+            V12_MANIFEST_PATH,
+            MANIFEST_PATH,
+        ):
             assert {
                 field: document["tiered_cohorts"][field]
                 for field in explicit_v11_fields
@@ -444,7 +460,7 @@ def test_validator_requires_v9_through_v12_causal_contracts_but_accepts_v8() -> 
             )
 
 
-def test_v10_through_v12_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v13_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -455,16 +471,22 @@ def test_v10_through_v12_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V11_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V12_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_and_v12_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v13_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V11_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V12_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
@@ -481,7 +503,12 @@ def test_v11_and_v12_route_through_explicit_phase_edge_eligibility() -> None:
 )
 @pytest.mark.parametrize(
     "manifest_path",
-    (V10_MANIFEST_PATH, V11_MANIFEST_PATH, MANIFEST_PATH),
+    (
+        V10_MANIFEST_PATH,
+        V11_MANIFEST_PATH,
+        V12_MANIFEST_PATH,
+        MANIFEST_PATH,
+    ),
 )
 def test_validator_requires_each_explicit_causal_linkage_field(
     field: str,
@@ -512,7 +539,11 @@ def test_validator_requires_each_explicit_causal_linkage_field(
 def test_validator_requires_each_explicit_v11_phase_edge_field(
     field: str,
 ) -> None:
-    for manifest_path in (V11_MANIFEST_PATH, MANIFEST_PATH):
+    for manifest_path in (
+        V11_MANIFEST_PATH,
+        V12_MANIFEST_PATH,
+        MANIFEST_PATH,
+    ):
         manifest = load_frozen_manifest(manifest_path)
         runtime = build_factorial_runtime(build_factorial_plan(manifest))
         expected_by_id = {
@@ -671,6 +702,240 @@ def _sparse_evidence_record(
         reporter_monotonic_ns=200 + ingestion_sequence,
         reporter_sequence=reporter_sequence,
         signer_set=(1,),
+    )
+
+
+def _scoring_policy(policy_version: str) -> dict[str, object]:
+    return {
+        "policy_version": policy_version,
+        "attempt_window": 128,
+        "minimum_attempts": 60,
+        "minimum_response_rate_ppm": 950_000,
+        "maximum_timeout_rate_ppm": 50_000,
+        "trailing_timeout_streak": 7,
+        "latency_percentile_basis_points": 5_000,
+    }
+
+
+def _scoring_evidence_record(
+    ingestion_sequence: int,
+    *,
+    target_id: int,
+    message_type: str,
+    outcome: str,
+) -> validation._EvidenceRecord:
+    return validation._EvidenceRecord(
+        ingestion_sequence=ingestion_sequence,
+        acceptance_monotonic_ns=1_000 + ingestion_sequence,
+        observation_id=f"{ingestion_sequence:064x}",
+        reporter_id=(target_id + 1) % 3,
+        target_id=target_id,
+        epoch_number=1,
+        tree_id=0,
+        epoch_digest="11" * 32,
+        block_hash=f"{10_000 + ingestion_sequence:064x}",
+        message_type=message_type,
+        outcome=outcome,
+        response_duration_us=10 if outcome == "on_time" else 0,
+        deadline_duration_us=20,
+        reporter_monotonic_ns=900 + ingestion_sequence,
+        reporter_sequence=ingestion_sequence,
+        signer_set=(target_id,) if outcome == "on_time" else (),
+    )
+
+
+def _cohort_scoring_records() -> tuple[validation._EvidenceRecord, ...]:
+    records: list[validation._EvidenceRecord] = []
+    sequence = 1
+    for target_id, direct_timeouts in ((0, 0), (1, 1), (2, 10)):
+        for ordinal in range(60):
+            records.append(
+                _scoring_evidence_record(
+                    sequence,
+                    target_id=target_id,
+                    message_type="direct_vote",
+                    outcome=(
+                        "timeout"
+                        if ordinal >= 60 - direct_timeouts
+                        else "on_time"
+                    ),
+                )
+            )
+            sequence += 1
+    return tuple(records)
+
+
+def test_v13_scoring_ignores_mixed_aggregate_noise_only_for_new_policy() -> None:
+    records = _cohort_scoring_records()
+    noisy = tuple(
+        _scoring_evidence_record(
+            len(records) + ordinal,
+            target_id=0,
+            message_type="aggregate_relay",
+            outcome="timeout",
+        )
+        for ordinal in range(1, 9)
+    )
+
+    v13_scores = validation._score_snapshot(
+        (*records, *noisy),
+        3,
+        _scoring_policy("shape25-direct-vote-responsiveness-v2"),
+    )
+    v12_scores = validation._score_snapshot(
+        (*records, *noisy),
+        3,
+        _scoring_policy("shape25-sensitive-responsiveness-v1"),
+    )
+
+    v13_fast = next(score for score in v13_scores if score.replica_id == 0)
+    v12_fast = next(score for score in v12_scores if score.replica_id == 0)
+    assert (v13_fast.attempt_count, v13_fast.timeout_rate_ppm) == (60, 0)
+    assert (v13_fast.classification, v13_fast.eligible) == ("responsive", True)
+    assert (v12_fast.attempt_count, v12_fast.timeout_rate_ppm) == (68, 117_647)
+    assert (v12_fast.classification, v12_fast.eligible) == (
+        "nonresponsive",
+        False,
+    )
+
+
+def test_v13_direct_vote_timeouts_produce_strict_cohort_ranking() -> None:
+    scores = validation._score_snapshot(
+        _cohort_scoring_records(),
+        3,
+        _scoring_policy("shape25-direct-vote-responsiveness-v2"),
+    )
+
+    assert tuple(score.replica_id for score in scores) == (0, 1, 2)
+    assert (
+        scores[0].classification,
+        scores[0].attempt_count,
+        scores[0].timeout_rate_ppm,
+    ) == ("responsive", 60, 0)
+    assert (
+        scores[1].classification,
+        scores[1].attempt_count,
+        scores[1].timeout_rate_ppm,
+    ) == ("responsive", 60, 16_666)
+    assert (
+        scores[2].classification,
+        scores[2].attempt_count,
+        scores[2].timeout_rate_ppm,
+    ) == ("nonresponsive", 60, 166_666)
+
+
+def test_v13_requires_minimum_direct_vote_attempts() -> None:
+    direct = tuple(
+        _scoring_evidence_record(
+            ordinal,
+            target_id=0,
+            message_type="direct_vote",
+            outcome="on_time",
+        )
+        for ordinal in range(1, 60)
+    )
+    aggregate = _scoring_evidence_record(
+        60,
+        target_id=0,
+        message_type="aggregate_relay",
+        outcome="on_time",
+    )
+
+    v13_score = validation._score_snapshot(
+        (*direct, aggregate),
+        1,
+        _scoring_policy("shape25-direct-vote-responsiveness-v2"),
+    )[0]
+    v12_score = validation._score_snapshot(
+        (*direct, aggregate),
+        1,
+        _scoring_policy("shape25-sensitive-responsiveness-v1"),
+    )[0]
+
+    assert (v13_score.attempt_count, v13_score.classification) == (
+        59,
+        "insufficient_evidence",
+    )
+    assert (v12_score.attempt_count, v12_score.classification) == (
+        60,
+        "responsive",
+    )
+
+
+def test_manifest_policy_routes_v12_pooled_and_v13_direct_vote_scoring() -> None:
+    v12 = load_frozen_manifest(V12_MANIFEST_PATH)
+    v13 = load_frozen_manifest(MANIFEST_PATH)
+    records = tuple(
+        _scoring_evidence_record(
+            ordinal,
+            target_id=0,
+            message_type="direct_vote",
+            outcome="on_time",
+        )
+        for ordinal in range(1, 60)
+    ) + (
+        _scoring_evidence_record(
+            60,
+            target_id=0,
+            message_type="aggregate_relay",
+            outcome="on_time",
+        ),
+    )
+
+    assert v12.responsiveness_policy.policy_version == (
+        "shape25-sensitive-responsiveness-v1"
+    )
+    assert v13.responsiveness_policy.policy_version == (
+        "shape25-direct-vote-responsiveness-v2"
+    )
+    v12_score = validation._score_snapshot(
+        records,
+        1,
+        v12.responsiveness_policy.as_document(),
+    )[0]
+    v13_score = validation._score_snapshot(
+        records,
+        1,
+        v13.responsiveness_policy.as_document(),
+    )[0]
+    assert (v12_score.attempt_count, v12_score.classification) == (
+        60,
+        "responsive",
+    )
+    assert (v13_score.attempt_count, v13_score.classification) == (
+        59,
+        "insufficient_evidence",
+    )
+
+
+def test_v13_snapshot_digest_still_binds_ignored_aggregate_records() -> None:
+    direct, aggregate = (
+        _scoring_evidence_record(
+            ordinal,
+            target_id=0,
+            message_type=message_type,
+            outcome="on_time",
+        )
+        for ordinal, message_type in (
+            (1, "direct_vote"),
+            (2, "aggregate_relay"),
+        )
+    )
+    policy = _scoring_policy("shape25-direct-vote-responsiveness-v2")
+    mutated_aggregate = replace(aggregate, response_duration_us=11)
+
+    assert validation._score_snapshot((direct, aggregate), 1, policy) == (
+        validation._score_snapshot((direct, mutated_aggregate), 1, policy)
+    )
+    common = {
+        "replica_count": 1,
+        "epoch_number": 1,
+        "epoch_digest": "11" * 32,
+        "cutoff": 2,
+        "policy": policy,
+    }
+    assert validation._snapshot_id((direct, aggregate), **common) != (
+        validation._snapshot_id((direct, mutated_aggregate), **common)
     )
 
 

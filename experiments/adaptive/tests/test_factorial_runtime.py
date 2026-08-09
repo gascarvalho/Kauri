@@ -20,6 +20,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     V10_PLAN_SHA256,
     V11_PLAN_SHA256,
+    V12_PLAN_SHA256,
     V9_PLAN_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
@@ -30,6 +31,8 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     ManagerSecretMaterial,
     V11_RUNTIME_SHA256,
     V11_SMOKE_RUNTIME_SHA256,
+    V12_RUNTIME_SHA256,
+    V12_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     build_slot_runtime,
     build_smoke_metadata,
@@ -47,6 +50,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
+)
+V12_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v12.json"
 )
 V11_MANIFEST_PATH = (
@@ -663,7 +669,7 @@ def test_two_epoch_sequence_and_artifact_identity_are_deterministic(
     assert len({transition.artifact_id for transition in first.transitions}) == 2
 
 
-def test_slot_artifact_identity_seals_tiered_cohorts_and_v12_evidence_rules(
+def test_slot_artifact_identity_seals_tiered_cohorts_and_v13_evidence_rules(
     frozen_plan,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1021,9 +1027,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V9_MANIFEST_PATH,
         V10_MANIFEST_PATH,
         V11_MANIFEST_PATH,
+        V12_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v12_and_refuses_prior_production(
+def test_cli_defaults_to_v13_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1036,7 +1043,7 @@ def test_cli_defaults_to_v12_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v11 are validation-only" in refusal["reason"]
+    assert "v1 through v12 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1163,5 +1170,28 @@ def test_v11_runtime_identities_remain_exact_without_v12_role_scoping() -> None:
             "omit_every_41st_unique_non_root_contribution_per_responsive_"
             "degraded_actor_v2"
         )
+        for slot in document["slots"]
+    )
+
+
+def test_v12_runtime_identities_remain_exact_with_legacy_scoring_policy() -> None:
+    manifest = load_frozen_manifest(V12_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    encoded = canonical_runtime_bytes(runtime)
+
+    assert plan.plan_sha256 == V12_PLAN_SHA256
+    assert hashlib.sha256(encoded).hexdigest() == V12_RUNTIME_SHA256
+    smoke = factorial_execution.build_n7_ps_smoke_slot(plan.slots[0])
+    smoke_payload = factorial_execution._canonical_json_bytes(
+        smoke.runtime.as_document()
+    )
+    assert hashlib.sha256(smoke_payload).hexdigest() == V12_SMOKE_RUNTIME_SHA256
+    document = json.loads(encoded)
+    assert all(
+        slot["responsiveness_policy"]["policy_version"]
+        == "shape25-sensitive-responsiveness-v1"
+        and slot["tiered_cohorts"]["mode"]
+        == "tiered_persistent_responsive_omission_v2"
         for slot in document["slots"]
     )

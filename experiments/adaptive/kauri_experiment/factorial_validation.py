@@ -96,6 +96,9 @@ from .factorial_manifest import (
     V11_MANIFEST_ID,
     V11_MANIFEST_SHA256,
     V11_PLAN_SHA256,
+    V12_MANIFEST_ID,
+    V12_MANIFEST_SHA256,
+    V12_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -187,11 +190,17 @@ V11_RUNTIME_SHA256 = (
 V11_SMOKE_RUNTIME_SHA256 = (
     "dc4e13ac0ed9f333f72003c0c49e6ab7820024d3533cd07b0fd6013f8a34a3e6"
 )
-FROZEN_RUNTIME_SHA256 = (
+V12_RUNTIME_SHA256 = (
     "fc65a289fa6bf574eae2cc37ac4117f352a9d499cf2d7d32d422cda67835dbfb"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V12_SMOKE_RUNTIME_SHA256 = (
     "21661e6b936bbeaa5983b66c669d67a4ffb846c1e534cdc9e6563856f039978e"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "613e78129d1f600f9690a9fe3dad18c2f9f7515c247958e0215a1f0d4ef7a693"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "5f70c7b117be7a5f425e9cd19b421cbc7958a4904daf7336b2989eea4fce641e"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -232,6 +241,9 @@ _MAX_COMMAND_BYTES = 4096
 _MAX_ANCESTRY_BLOCKS = 128
 _ISSUER_ID = 1
 _PLACEMENT_POLICY_VERSION = "adaptive-v2-performance-optimization-v1"
+_DIRECT_VOTE_RESPONSIVENESS_POLICY_VERSION = (
+    "shape25-direct-vote-responsiveness-v2"
+)
 _BUNDLE_DOMAIN = b"kauri-adaptive-v2-epoch-change-bundle-v1"
 _AUTHORIZED_COMMAND_DOMAIN = b"kauri-authorized-epoch-change-v1"
 _EPOCH_CHANGE_PAYLOAD_DOMAIN = b"kauri-epoch-change-payload-v1"
@@ -267,7 +279,13 @@ _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
 _V8_RESPONSIVE_OMISSION_PERIOD = 32
 _RESPONSIVE_OMISSION_PERIOD = 41
 _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
-    {V9_MANIFEST_ID, V10_MANIFEST_ID, V11_MANIFEST_ID, FROZEN_MANIFEST_ID}
+    {
+        V9_MANIFEST_ID,
+        V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
+        V12_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }
 )
 
 
@@ -468,6 +486,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=V11_PLAN_SHA256,
             runtime_sha256=V11_RUNTIME_SHA256,
             smoke_runtime_sha256=V11_SMOKE_RUNTIME_SHA256,
+        ),
+        V12_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V12_MANIFEST_ID,
+            manifest_sha256=V12_MANIFEST_SHA256,
+            plan_sha256=V12_PLAN_SHA256,
+            runtime_sha256=V12_RUNTIME_SHA256,
+            smoke_runtime_sha256=V12_SMOKE_RUNTIME_SHA256,
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -2473,6 +2498,7 @@ def _validate_runtime_slot(
         V9_MANIFEST_ID,
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
+        V12_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -2960,8 +2986,16 @@ def _score_snapshot(
     replica_count: int,
     policy: Mapping[str, Any],
 ) -> tuple[ReplicaScore, ...]:
+    policy_version = _string(
+        policy.get("policy_version"), "responsiveness.policy_version"
+    )
+    scored_records = (
+        tuple(record for record in records if record.message_type == "direct_vote")
+        if policy_version == _DIRECT_VOTE_RESPONSIVENESS_POLICY_VERSION
+        else records
+    )
     attempts: dict[str, dict[str, Any]] = {}
-    for record in records:
+    for record in scored_records:
         attempt = attempts.get(record.observation_id)
         if attempt is None:
             if record.outcome == "late":
