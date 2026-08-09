@@ -11,23 +11,23 @@ import pytest
 from experiments.adaptive import run_shape_factorial_campaign as cli
 from experiments.adaptive.kauri_experiment import factorial_execution as execution
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
-    FROZEN_MANIFEST_ID,
-    FROZEN_MANIFEST_SHA256,
-    FROZEN_PLAN_SHA256,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     V14_MANIFEST_ID,
     V14_MANIFEST_SHA256,
     V14_PLAN_SHA256,
+    V15_MANIFEST_ID,
+    V15_MANIFEST_SHA256,
+    V15_PLAN_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
-    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
     ManagerSecretMaterial,
     V14_RUNTIME_SHA256,
     V14_SMOKE_RUNTIME_SHA256,
+    V15_COVERAGE_SMOKE_RUNTIME_SHA256,
+    V15_RUNTIME_SHA256,
+    V15_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     canonical_runtime_bytes,
     materialize_manager_argv,
@@ -57,10 +57,10 @@ def test_v15_is_frozen_and_v14_bytes_remain_loadable() -> None:
     plan = build_factorial_plan(manifest)
     runtime = build_factorial_runtime(plan)
 
-    assert manifest.manifest_id == FROZEN_MANIFEST_ID == "shape-placement-factorial-v15"
-    assert manifest.manifest_sha256 == FROZEN_MANIFEST_SHA256
-    assert plan.plan_sha256 == FROZEN_PLAN_SHA256
-    assert runtime.runtime_sha256 == FROZEN_RUNTIME_SHA256
+    assert manifest.manifest_id == V15_MANIFEST_ID == "shape-placement-factorial-v15"
+    assert manifest.manifest_sha256 == V15_MANIFEST_SHA256
+    assert plan.plan_sha256 == V15_PLAN_SHA256
+    assert runtime.runtime_sha256 == V15_RUNTIME_SHA256
     assert manifest.byzantine.responsive_degradation is not None
     assert (
         manifest.byzantine.responsive_degradation.precontainment_fault_coverage_gate
@@ -146,11 +146,11 @@ def test_v15_excluded_n31_coverage_smoke_is_exact_first_campaign_slot() -> None:
     assert coverage.denominator_contribution == 0
     assert hashlib.sha256(
         execution._canonical_json_bytes(coverage.runtime.as_document())
-    ).hexdigest() == FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+    ).hexdigest() == V15_COVERAGE_SMOKE_RUNTIME_SHA256
 
     with pytest.raises(
         execution.FactorialExecutionError,
-        match="exact v15 campaign slot 066",
+        match="exact frozen campaign slot 066",
     ):
         execution.build_n31_coverage_smoke_slot(
             replace(first, fast_replica_ids=tuple(reversed(first.fast_replica_ids)))
@@ -166,19 +166,19 @@ def test_v15_static_runtime_identities_are_distinct() -> None:
     )
 
     assert hashlib.sha256(canonical_runtime_bytes(runtime)).hexdigest() == (
-        FROZEN_RUNTIME_SHA256
+        V15_RUNTIME_SHA256
     )
     assert hashlib.sha256(
         execution._canonical_json_bytes(n7.runtime.as_document())
-    ).hexdigest() == FROZEN_SMOKE_RUNTIME_SHA256
+    ).hexdigest() == V15_SMOKE_RUNTIME_SHA256
     assert hashlib.sha256(
         execution._canonical_json_bytes(n31.runtime.as_document())
-    ).hexdigest() == FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+    ).hexdigest() == V15_COVERAGE_SMOKE_RUNTIME_SHA256
     assert len(
         {
-            FROZEN_RUNTIME_SHA256,
-            FROZEN_SMOKE_RUNTIME_SHA256,
-            FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V15_RUNTIME_SHA256,
+            V15_SMOKE_RUNTIME_SHA256,
+            V15_COVERAGE_SMOKE_RUNTIME_SHA256,
         }
     ) == 3
 

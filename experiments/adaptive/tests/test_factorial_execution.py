@@ -31,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v16.json"
 
 
 @pytest.fixture(scope="module")
@@ -2242,7 +2242,7 @@ def test_n31_coverage_smoke_authorization_is_separate_and_exact(
     assert bound["scope"] == "excluded_n31_coverage_smoke"
     assert bound["slot_ids"] == ["slot-066-n31-f5-b05-P"]
     assert bound["result_root"] == (
-        "results/shape-placement-factorial-v15-coverage-smoke"
+        "results/shape-placement-factorial-v16-coverage-smoke"
     )
     assert bound["automatic_retries"] == 0
     assert bound["replacement_policy"] == "none"

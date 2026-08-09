@@ -43,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v16.json"
+)
+V15_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
 )
 V14_MANIFEST_PATH = (
@@ -268,7 +271,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v15_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v16_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -288,7 +291,8 @@ def test_validator_retains_exact_v1_through_v15_artifact_identities() -> None:
             (12, V12_MANIFEST_PATH),
             (13, V13_MANIFEST_PATH),
             (14, V14_MANIFEST_PATH),
-            (15, MANIFEST_PATH),
+            (15, V15_MANIFEST_PATH),
+            (16, MANIFEST_PATH),
         )
     }
 
@@ -346,11 +350,27 @@ def test_validator_retains_exact_v1_through_v15_artifact_identities() -> None:
         identities[14].smoke_runtime_sha256
         == validation.V14_SMOKE_RUNTIME_SHA256
     )
-    assert identities[15].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[15].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[15].manifest_sha256 == validation.V15_MANIFEST_SHA256
+    assert identities[15].plan_sha256 == validation.V15_PLAN_SHA256
+    assert identities[15].runtime_sha256 == validation.V15_RUNTIME_SHA256
     assert (
         identities[15].smoke_runtime_sha256
+        == validation.V15_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[15].coverage_smoke_runtime_sha256
+        == validation.V15_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[16].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[16].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[16].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[16].smoke_runtime_sha256
         == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[16].coverage_smoke_runtime_sha256
+        == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
 
 
@@ -368,6 +388,7 @@ def test_validator_retains_exact_v1_through_v15_artifact_identities() -> None:
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
+        V15_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -387,7 +408,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v15_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v16_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -415,6 +436,7 @@ def test_validator_requires_v9_through_v15_causal_contracts_but_accepts_v8() -> 
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
+        V15_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -467,13 +489,21 @@ def test_validator_requires_v9_through_v15_causal_contracts_but_accepts_v8() -> 
                 for field in explicit_v11_fields
             } == explicit_v11_fields
         else:
-            if manifest_path in (V14_MANIFEST_PATH, MANIFEST_PATH):
+            if manifest_path in (
+                V14_MANIFEST_PATH,
+                V15_MANIFEST_PATH,
+                MANIFEST_PATH,
+            ):
                 assert document["tiered_cohorts"][
                     "marker_completeness_witness"
                 ] == validation.RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
                 assert document["tiered_cohorts"][
                     "causal_timeout_eligibility"
-                ] == validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+                ] == (
+                    validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
+                    if manifest_path == MANIFEST_PATH
+                    else validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+                )
             else:
                 assert not set(explicit_v11_fields).intersection(
                     document["tiered_cohorts"]
@@ -492,7 +522,7 @@ def test_validator_requires_v9_through_v15_causal_contracts_but_accepts_v8() -> 
             )
 
 
-def test_v10_through_v14_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v16_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -509,11 +539,17 @@ def test_v10_through_v14_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V13_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V14_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V15_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_through_v14_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v16_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
@@ -527,22 +563,43 @@ def test_v11_through_v14_route_through_explicit_phase_edge_eligibility() -> None
         load_frozen_manifest(V13_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V14_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V15_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v14_alone_dispatches_source_bound_witnesses_and_sigint_cleanup() -> None:
+def test_only_v16_uses_selection_visible_hard_timeout_witnesses() -> None:
+    assert not validation._uses_selection_visible_hard_timeout_witnesses(
+        load_frozen_manifest(V15_MANIFEST_PATH)
+    )
+    assert validation._uses_selection_visible_hard_timeout_witnesses(
+        load_frozen_manifest(MANIFEST_PATH)
+    )
+
+
+def test_v14_through_v16_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
     v13 = load_frozen_manifest(V13_MANIFEST_PATH)
-    v14 = load_frozen_manifest(MANIFEST_PATH)
 
     assert not validation._uses_source_bound_contribution_opportunities(v13)
     assert not validation._uses_strict_sigint_cleanup(v13)
-    assert validation._uses_source_bound_contribution_opportunities(v14)
-    assert validation._uses_strict_sigint_cleanup(v14)
+    for manifest_path in (V14_MANIFEST_PATH, V15_MANIFEST_PATH, MANIFEST_PATH):
+        manifest = load_frozen_manifest(manifest_path)
+        assert validation._uses_source_bound_contribution_opportunities(manifest)
+        assert validation._uses_strict_sigint_cleanup(manifest)
 
 
-def test_validator_binds_v14_cleanup_contract_without_changing_v13() -> None:
-    for manifest_path in (V13_MANIFEST_PATH, MANIFEST_PATH):
+def test_validator_binds_v14_through_v16_cleanup_without_changing_v13() -> None:
+    for manifest_path in (
+        V13_MANIFEST_PATH,
+        V14_MANIFEST_PATH,
+        V15_MANIFEST_PATH,
+        MANIFEST_PATH,
+    ):
         manifest = load_frozen_manifest(manifest_path)
         runtime = build_factorial_runtime(build_factorial_plan(manifest))
         expected_by_id = {
@@ -551,7 +608,7 @@ def test_validator_binds_v14_cleanup_contract_without_changing_v13() -> None:
         }
         slot = runtime.slots[0]
         document = json.loads(json.dumps(slot.as_document()))
-        if manifest_path == MANIFEST_PATH:
+        if manifest_path != V13_MANIFEST_PATH:
             assert document.pop("cleanup_contract") == (
                 validation.EXECUTION_CLEANUP_CONTRACT_V1
             )
@@ -582,6 +639,8 @@ def test_validator_binds_v14_cleanup_contract_without_changing_v13() -> None:
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
+        V14_MANIFEST_PATH,
+        V15_MANIFEST_PATH,
         MANIFEST_PATH,
     ),
 )
@@ -611,13 +670,15 @@ def test_validator_requires_each_explicit_causal_linkage_field(
     "field",
     ("marker_completeness_witness", "causal_timeout_eligibility"),
 )
-def test_validator_requires_each_explicit_v11_through_v14_phase_edge_field(
+def test_validator_requires_each_explicit_v11_through_v16_phase_edge_field(
     field: str,
 ) -> None:
     for manifest_path in (
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
+        V14_MANIFEST_PATH,
+        V15_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -2973,7 +3034,7 @@ def test_role_scoped_causality_binds_marker_role_to_physical_topology(
         )
 
 
-def test_v13_v14_causality_dispatch_keeps_role41_and_cross_commit_gates(
+def test_v13_through_v16_causality_dispatch_keeps_structural_gates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -3043,6 +3104,7 @@ def test_v13_v14_causality_dispatch_keeps_role41_and_cross_commit_gates(
     assert validate_fault_causality(
         **common,
         source_bound_contribution_opportunities=True,
+        selection_visible_hard_timeout_witnesses=True,
     ) == 1
     assert calls == ["schedule", "v14_bijection", "role41", "cross_commit"]
 
@@ -5011,16 +5073,28 @@ def test_smoke_slot_authorization_must_match_the_claimed_root_envelope(
 
 def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None:
     campaign = (
-        Path("results/shape-placement-factorial-v15")
+        Path("results/shape-placement-factorial-v16")
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     )
     coverage = (
         Path(validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     )
+    v15_coverage = (
+        Path(validation.V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
 
     assert not validation._is_excluded_coverage_smoke_slot(campaign)
     assert validation._is_excluded_coverage_smoke_slot(coverage)
+    assert validation._is_excluded_coverage_smoke_slot(
+        v15_coverage,
+        manifest_id=validation.V15_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v15_coverage,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
     assert not validation._is_excluded_coverage_smoke_slot(
         coverage,
         manifest_id=validation.V14_MANIFEST_ID,
@@ -5986,6 +6060,284 @@ def test_v15_hard_causal_window_extends_to_selection_only_for_qualifying_keys() 
         **arguments,
         qualifying_proposal_keys={(0, 18, key[2], key[3])},
     )
+
+
+def _v16_hard_timeout_witness_fixture() -> dict[str, object]:
+    actor = 5
+    epoch0_digest = "11" * 32
+    epoch1_digest = "22" * 32
+    epoch2_digest = "33" * 32
+    initial_trees = (
+        Tree(0, 2, 2, (0, 1, actor, 2, 3, 4, 6), ()),
+        Tree(1, 2, 2, (1, 0, actor, 2, 3, 4, 6), ()),
+        Tree(2, 2, 2, (2, 0, actor, 1, 3, 4, 6), ()),
+    )
+    contained_tree = Tree(
+        0,
+        2,
+        2,
+        (0, 1, 2, 3, 4, 6, actor),
+        (actor,),
+    )
+
+    def marker(
+        *,
+        line_number: int,
+        epoch_number: int,
+        tree_id: int,
+        epoch_digest: str,
+        block_number: int,
+        action: str,
+        monotonic_ns: int,
+    ) -> FaultMarker:
+        return FaultMarker(
+            source_replica=actor,
+            line_number=line_number,
+            fault_mode="rotating_intermittent_omission_v1",
+            epoch_number=epoch_number,
+            tree_id=tree_id,
+            epoch_digest=epoch_digest,
+            block_hash=f"{block_number:064x}",
+            window="selection-visible-v2",
+            window_start_ns=100,
+            window_end_ns=1_200,
+            actor=actor,
+            action=action,
+            monotonic_ns=monotonic_ns,
+            raw_line_sha256=f"{line_number:064x}",
+        )
+
+    epoch0_markers = (
+        marker(
+            line_number=1,
+            epoch_number=0,
+            tree_id=0,
+            epoch_digest=epoch0_digest,
+            block_number=100,
+            action="omit_aggregate",
+            monotonic_ns=200,
+        ),
+        marker(
+            line_number=2,
+            epoch_number=0,
+            tree_id=1,
+            epoch_digest=epoch0_digest,
+            block_number=101,
+            action="omit_aggregate",
+            monotonic_ns=220,
+        ),
+        marker(
+            line_number=3,
+            epoch_number=0,
+            tree_id=2,
+            epoch_digest=epoch0_digest,
+            block_number=102,
+            action="omit_aggregate",
+            monotonic_ns=240,
+        ),
+    )
+    markers = (
+        *epoch0_markers,
+        marker(
+            line_number=4,
+            epoch_number=1,
+            tree_id=0,
+            epoch_digest=epoch1_digest,
+            block_number=200,
+            action="omit_direct_vote",
+            monotonic_ns=700,
+        ),
+        marker(
+            line_number=5,
+            epoch_number=2,
+            tree_id=0,
+            epoch_digest=epoch2_digest,
+            block_number=300,
+            action="omit_direct_vote",
+            monotonic_ns=1_000,
+        ),
+    )
+
+    def proposal_event(marker: FaultMarker, sequence: int) -> validation._NativeEvent:
+        return _native_event(
+            source_id=f"replica-{actor}",
+            sequence=sequence,
+            monotonic_ns=marker.monotonic_ns - 10,
+            event_type="aggregation.required_set_ready",
+            payload={
+                "epoch_number": marker.epoch_number,
+                "tree_id": marker.tree_id,
+                "epoch_digest": marker.epoch_digest,
+                "block_hash": marker.block_hash,
+                "context_generation": 1,
+                "observer_replica": actor,
+                "wait_exempt_signers": [],
+                "accepted_signers": [],
+                "absent_direct_children": [],
+                "missing_optional_signers": [],
+                "required_branch_gaps": [],
+                "root_signer_count": 0,
+                "global_quorum": 0,
+                "rejection_reason": None,
+            },
+        )
+
+    def timeout_record(
+        marker: FaultMarker,
+        *,
+        ingestion_sequence: int,
+        reporter_id: int,
+        reporter_monotonic_ns: int,
+    ) -> validation._EvidenceRecord:
+        return validation._EvidenceRecord(
+            ingestion_sequence=ingestion_sequence,
+            acceptance_monotonic_ns=reporter_monotonic_ns + 1,
+            observation_id=f"{ingestion_sequence:064x}",
+            reporter_id=reporter_id,
+            target_id=actor,
+            epoch_number=marker.epoch_number,
+            tree_id=marker.tree_id,
+            epoch_digest=marker.epoch_digest,
+            block_hash=marker.block_hash,
+            message_type="aggregate_relay",
+            outcome="timeout",
+            response_duration_us=0,
+            deadline_duration_us=10,
+            reporter_monotonic_ns=reporter_monotonic_ns,
+            reporter_sequence=ingestion_sequence,
+            signer_set=(),
+        )
+
+    accepted_epoch0 = (
+        timeout_record(
+            epoch0_markers[0],
+            ingestion_sequence=2,
+            reporter_id=0,
+            reporter_monotonic_ns=250,
+        ),
+        timeout_record(
+            epoch0_markers[1],
+            ingestion_sequence=3,
+            reporter_id=1,
+            reporter_monotonic_ns=270,
+        ),
+        # This exact timeout exists in the retained evidence prefix but is not
+        # visible at the selecting cutoff.  It is the immature-tail case.
+        timeout_record(
+            epoch0_markers[2],
+            ingestion_sequence=4,
+            reporter_id=2,
+            reporter_monotonic_ns=290,
+        ),
+    )
+    return {
+        "markers": markers,
+        "replica_events": {
+            actor: tuple(
+                proposal_event(item, sequence)
+                for sequence, item in enumerate(markers, start=1)
+            )
+        },
+        "actor_ids": (actor,),
+        "fault_mode": "rotating_intermittent_omission_v1",
+        "max_omissions_per_proposal": 1,
+        "initial_epoch_digest": epoch0_digest,
+        "initial_trees": initial_trees,
+        "window_id": "selection-visible-v2",
+        "window_start_ns": 100,
+        "window_end_ns": 1_200,
+        "epoch1_command_ns": 500,
+        "epoch1_activation_ns": 600,
+        "epoch2_command_ns": 900,
+        "epoch1_selection_ns": 450,
+        "epoch2_selection_ns": 850,
+        "explicit_phase_edge_eligibility": True,
+        "epoch1_digest": epoch1_digest,
+        "epoch1_trees": (contained_tree,),
+        "epoch2_digest": epoch2_digest,
+        "epoch2_trees": (contained_tree,),
+        "phase_windows": {
+            "baseline": (10, 90, 1),
+            "fault_evidence": (100, 400, 1),
+            "epoch1_stable": (650, 800, 1),
+            "epoch2_stable": (950, 1_100, 1),
+        },
+        "required_reporters": 2,
+        "accepted_epoch0": accepted_epoch0,
+        "baseline_cutoff": 1,
+        "current_cutoff": 3,
+        "epoch0_qualifying_proposal_keys": {
+            (
+                item.epoch_number,
+                item.tree_id,
+                item.epoch_digest,
+                item.block_hash,
+            )
+            for item in epoch0_markers
+        },
+    }
+
+
+def test_v16_tail_timeout_after_selection_cutoff_is_a_nonwitness() -> None:
+    assert validate_fault_causality(
+        **_v16_hard_timeout_witness_fixture(),
+        selection_visible_hard_timeout_witnesses=True,
+    ) == 0
+
+
+def test_v15_preserves_universal_qualifying_hard_marker_timeout_gate() -> None:
+    with pytest.raises(
+        FactorialValidationError,
+        match="pre-containment omission has no exact outstanding timeout",
+    ):
+        validate_fault_causality(**_v16_hard_timeout_witness_fixture())
+
+
+def test_v16_pending_only_and_post_cutoff_timeouts_fail_final_gates() -> None:
+    arguments = _v16_hard_timeout_witness_fixture()
+    accepted = arguments["accepted_epoch0"]
+    assert isinstance(accepted, tuple)
+    pending_only = tuple(
+        replace(
+            record,
+            outcome="on_time",
+            response_duration_us=1,
+            signer_set=(record.target_id,),
+        )
+        for record in accepted
+    )
+    with pytest.raises(FactorialValidationError, match="lack pre-Epoch1.*internal"):
+        validate_fault_causality(
+            **{**arguments, "accepted_epoch0": pending_only},
+            selection_visible_hard_timeout_witnesses=True,
+        )
+
+    with pytest.raises(FactorialValidationError, match=r"full causally bound f\+1"):
+        validate_fault_causality(
+            **{**arguments, "current_cutoff": 2},
+            selection_visible_hard_timeout_witnesses=True,
+        )
+
+
+def test_v16_selection_visible_mismatched_timeout_fails_closed() -> None:
+    arguments = _v16_hard_timeout_witness_fixture()
+    accepted = arguments["accepted_epoch0"]
+    assert isinstance(accepted, tuple)
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="selection-visible.*fails its exact role/message/timing join",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "accepted_epoch0": (
+                    replace(accepted[0], message_type="direct_vote"),
+                    *accepted[1:],
+                ),
+            },
+            selection_visible_hard_timeout_witnesses=True,
+        )
 
 
 def test_on_time_evidence_at_deadline_is_rejected() -> None:

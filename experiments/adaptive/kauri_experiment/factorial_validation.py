@@ -63,6 +63,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
@@ -108,6 +109,9 @@ from .factorial_manifest import (
     V14_MANIFEST_ID,
     V14_MANIFEST_SHA256,
     V14_PLAN_SHA256,
+    V15_MANIFEST_ID,
+    V15_MANIFEST_SHA256,
+    V15_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -143,8 +147,11 @@ REPLICA_EVENTS_PATTERN = "raw/replica-{replica_id}.jsonl"
 REPLICA_STDERR_PATTERN = "raw/process/replica-{replica_id}.stderr.log"
 EXCLUDED_SMOKE_SLOT_ID = "smoke-n7-f2-PS"
 EXCLUDED_COVERAGE_SMOKE_SLOT_ID = "slot-066-n31-f5-b05-P"
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v15-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v16-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -224,14 +231,23 @@ V14_RUNTIME_SHA256 = (
 V14_SMOKE_RUNTIME_SHA256 = (
     "82b5f4bf0f90b93f34e374b96f09de55b8a2953a9ef83d2e533d3a16362be6d3"
 )
-FROZEN_RUNTIME_SHA256 = (
+V15_RUNTIME_SHA256 = (
     "97a6222f8d51aca78cbaa64ada641cc0227614c217e0f2f734144e21315c734c"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V15_SMOKE_RUNTIME_SHA256 = (
     "b2593316eb97bb683dc5156490ebcc20fb2f58d70b57b0953a14c28b896d6d48"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V15_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "e5ce14245c9c225ac748c66e1447151eda802397f9bf9f84e5378bf09de99209"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "f79b565f53fe5f0ec950be14ae1c0e1d0faf4d9c2ef955f759aa3e1de1de70da"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "0e5e239655b166eb6b1ebee91c8a34105d586a3e288f90b79217e52fdffde67c"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "e466b66c35795d671aae050831870aba45e89ecf4f4c68033185e2b8ecb89e2a"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -324,6 +340,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V12_MANIFEST_ID,
         V13_MANIFEST_ID,
         V14_MANIFEST_ID,
+        V15_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -363,7 +380,22 @@ def _uses_explicit_phase_edge_eligibility(
             RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
         }
         and responsive.causal_timeout_eligibility
-        == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+        in {
+            RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        }
+    )
+
+
+def _uses_selection_visible_hard_timeout_witnesses(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and responsive.causal_timeout_eligibility
+        == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
     )
 
 
@@ -372,7 +404,8 @@ def _uses_source_bound_contribution_opportunities(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V14_MANIFEST_ID, V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and responsive.marker_completeness_witness
         == RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
@@ -381,7 +414,8 @@ def _uses_source_bound_contribution_opportunities(
 
 def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
     return (
-        manifest.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V14_MANIFEST_ID, V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
     )
 
@@ -391,7 +425,7 @@ def _uses_precontainment_fault_coverage(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and responsive.precontainment_fault_coverage_gate
         == PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
@@ -581,6 +615,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=V14_PLAN_SHA256,
             runtime_sha256=V14_RUNTIME_SHA256,
             smoke_runtime_sha256=V14_SMOKE_RUNTIME_SHA256,
+        ),
+        V15_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V15_MANIFEST_ID,
+            manifest_sha256=V15_MANIFEST_SHA256,
+            plan_sha256=V15_PLAN_SHA256,
+            runtime_sha256=V15_RUNTIME_SHA256,
+            smoke_runtime_sha256=V15_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V15_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -2210,11 +2254,25 @@ def _is_excluded_coverage_smoke_slot(
     *,
     manifest_id: str = FROZEN_MANIFEST_ID,
 ) -> bool:
+    contract_by_manifest = {
+        V15_MANIFEST_ID: (
+            V15_RUNTIME_SHA256,
+            V15_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
+        FROZEN_MANIFEST_ID: (
+            FROZEN_RUNTIME_SHA256,
+            FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
+    }
+    contract = contract_by_manifest.get(manifest_id)
     if (
-        manifest_id != FROZEN_MANIFEST_ID
+        contract is None
         or slot_root.name != EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     ):
         return False
+    runtime_sha256_expected, coverage_sha256_expected, result_root = contract
     runtime_path = slot_root / RUNTIME_FILENAME
     try:
         if (
@@ -2223,16 +2281,25 @@ def _is_excluded_coverage_smoke_slot(
             and runtime_path.stat().st_size <= _MAX_JSON_BYTES
         ):
             runtime_sha256 = _sha256(runtime_path.read_bytes())
-            if runtime_sha256 == FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256:
+            if runtime_sha256 == coverage_sha256_expected:
                 return True
-            if runtime_sha256 == FROZEN_RUNTIME_SHA256:
+            if runtime_sha256 == runtime_sha256_expected:
                 return False
     except OSError:
         pass
     return (
         slot_root.parent.name
-        == Path(EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT).name
+        == Path(result_root).name
     )
+
+
+def _coverage_smoke_result_root(manifest_id: str) -> str:
+    if manifest_id == V15_MANIFEST_ID:
+        return V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == FROZEN_MANIFEST_ID:
+        return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    _fail("manifest does not define an excluded N=31 coverage smoke")
+    raise AssertionError("unreachable")
 
 
 def _load_static_contracts(
@@ -2359,7 +2426,7 @@ def _load_static_contracts(
                 "smoke identity"
             )
         if runtime.get("result_path") != (
-            f"{EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT}/"
+            f"{_coverage_smoke_result_root(manifest.manifest_id)}/"
             f"{EXCLUDED_COVERAGE_SMOKE_SLOT_ID}"
         ):
             _fail("coverage smoke runtime result path drifted")
@@ -2541,7 +2608,7 @@ def _validate_runtime_slot(
                         responsive_contract.marker_completeness_witness
                     ),
                     "causal_timeout_eligibility": (
-                        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+                        responsive_contract.causal_timeout_eligibility
                     ),
                 }
             )
@@ -2633,7 +2700,7 @@ def _validate_runtime_slot(
                         responsive_contract.marker_completeness_witness
                     ),
                     "causal_timeout_eligibility": (
-                        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+                        responsive_contract.causal_timeout_eligibility
                     ),
                 }
             )
@@ -2743,6 +2810,7 @@ def _validate_runtime_slot(
         V12_MANIFEST_ID,
         V13_MANIFEST_ID,
         V14_MANIFEST_ID,
+        V15_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -5627,6 +5695,7 @@ def validate_fault_causality(
         tuple[int, int, str, str]
     ]
     | None = None,
+    selection_visible_hard_timeout_witnesses: bool = False,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
@@ -6006,6 +6075,13 @@ def validate_fault_causality(
             qualifying_proposal_keys=qualifying_epoch0,
         ):
             if not exact_timeouts:
+                if selection_visible_hard_timeout_witnesses:
+                    if matched_timeouts:
+                        _fail(
+                            "selection-visible hard timeout fails its exact "
+                            "role/message/timing join"
+                        )
+                    continue
                 _fail(
                     "pre-containment omission has no exact outstanding timeout "
                     "accepted before Epoch1 selection"
@@ -6536,7 +6612,7 @@ def _validate_execution_authorization(
     elif coverage_smoke:
         expected_scope = "excluded_n31_coverage_smoke"
         expected_slots = [expected.slot_id]
-        expected_result_root = EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+        expected_result_root = _coverage_smoke_result_root(manifest.manifest_id)
         root_authorization_filename = COVERAGE_SMOKE_AUTHORIZATION_FILENAME
     else:
         expected_scope = "excluded_n7_smoke"
@@ -8868,6 +8944,9 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 hierarchy.epoch0_fault_qualifying_proposal_keys
                 if _uses_precontainment_fault_coverage(manifest)
                 else None
+            ),
+            selection_visible_hard_timeout_witnesses=(
+                _uses_selection_visible_hard_timeout_witnesses(manifest)
             ),
         )
 

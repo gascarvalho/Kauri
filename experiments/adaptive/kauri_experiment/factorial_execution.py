@@ -35,6 +35,8 @@ from .factorial_manifest import (
     FactorialManifestError,
     FactorialSlot,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     PortAllocation,
     build_factorial_plan,
     derive_actor_ids,
@@ -4240,12 +4242,23 @@ def build_n31_coverage_smoke_slot(
             "N=31 coverage smoke requires one frozen slot template"
         )
     responsive = template.byzantine.responsive_degradation
-    expected_campaign_path = (
-        "results/shape-placement-factorial-v15/slot-066-n31-f5-b05-P"
-    )
+    frozen_campaign_paths = {
+        "results/shape-placement-factorial-v15/slot-066-n31-f5-b05-P": "v15",
+        "results/shape-placement-factorial-v16/slot-066-n31-f5-b05-P": "v16",
+    }
+    manifest_version = frozen_campaign_paths.get(template.result_path)
+    expected_timeout_eligibility = {
+        "v15": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+        "v16": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+    }.get(manifest_version)
     if (
-        template.slot_id != "slot-066-n31-f5-b05-P"
-        or template.result_path != expected_campaign_path
+        manifest_version is None
+        or template.slot_id != "slot-066-n31-f5-b05-P"
+        or template.result_path
+        != (
+            f"results/shape-placement-factorial-{manifest_version}/"
+            "slot-066-n31-f5-b05-P"
+        )
         or template.ordinal != 66
         or template.execution_ordinal != 1
         or template.block_id != "n31-f5-b05"
@@ -4295,12 +4308,15 @@ def build_n31_coverage_smoke_slot(
         or responsive is None
         or responsive.precontainment_fault_coverage_gate
         != PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+        or responsive.causal_timeout_eligibility
+        != expected_timeout_eligibility
     ):
         raise FactorialExecutionError(
-            "N=31 coverage smoke must derive from exact v15 campaign slot 066"
+            "N=31 coverage smoke must derive from an exact frozen campaign "
+            "slot 066"
         )
     expected_result_path = (
-        "results/shape-placement-factorial-v15-coverage-smoke/"
+        f"results/shape-placement-factorial-{manifest_version}-coverage-smoke/"
         "slot-066-n31-f5-b05-P"
     )
     if result_path is None:

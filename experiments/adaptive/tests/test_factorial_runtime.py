@@ -18,7 +18,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     EXECUTION_CLEANUP_CONTRACT_V1,
     FactorialManifestError,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
-    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     V13_PLAN_SHA256,
@@ -59,6 +59,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v16.json"
+)
+V15_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
 )
 V14_MANIFEST_PATH = (
@@ -198,7 +201,7 @@ def test_matched_arms_share_the_frozen_cutoff_and_transition_contracts(
     )
     assert specs[0].cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
     assert tiered.causal_timeout_eligibility == (
-        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
     )
 
 
@@ -1070,9 +1073,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
+        V15_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v15_and_refuses_prior_production(
+def test_cli_defaults_to_v16_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1085,7 +1089,7 @@ def test_cli_defaults_to_v15_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v14 are validation-only" in refusal["reason"]
+    assert "v1 through v15 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(

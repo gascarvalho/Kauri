@@ -23,6 +23,7 @@ from .factorial_manifest import (
     V12_MANIFEST_ID,
     V13_MANIFEST_ID,
     V14_MANIFEST_ID,
+    V15_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -30,6 +31,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
@@ -64,14 +66,23 @@ V14_RUNTIME_SHA256 = (
 V14_SMOKE_RUNTIME_SHA256 = (
     "82b5f4bf0f90b93f34e374b96f09de55b8a2953a9ef83d2e533d3a16362be6d3"
 )
-FROZEN_RUNTIME_SHA256 = (
+V15_RUNTIME_SHA256 = (
     "97a6222f8d51aca78cbaa64ada641cc0227614c217e0f2f734144e21315c734c"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V15_SMOKE_RUNTIME_SHA256 = (
     "b2593316eb97bb683dc5156490ebcc20fb2f58d70b57b0953a14c28b896d6d48"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V15_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "e5ce14245c9c225ac748c66e1447151eda802397f9bf9f84e5378bf09de99209"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "f79b565f53fe5f0ec950be14ae1c0e1d0faf4d9c2ef955f759aa3e1de1de70da"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "0e5e239655b166eb6b1ebee91c8a34105d586a3e288f90b79217e52fdffde67c"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "e466b66c35795d671aae050831870aba45e89ecf4f4c68033185e2b8ecb89e2a"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -711,6 +722,15 @@ def _tiered_cohort_contract(
             RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
             RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
         ),
+        (
+            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+            RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+            RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+            RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
+            RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        ),
     }:
         raise FactorialManifestError(
             "responsive-degradation measurement contract drifted"
@@ -1314,7 +1334,8 @@ def materialize_manager_argv(
             or shared_raw_clock_anchor_ns > _MAXIMUM_MONOTONIC_NS
         ):
             raise FactorialManifestError(
-                "v15 manager argv requires the shared CLOCK_MONOTONIC_RAW anchor"
+                "coverage-gated manager argv requires the shared "
+                "CLOCK_MONOTONIC_RAW anchor"
             )
         evidence_start_ns = shared_raw_clock_anchor_ns + (
             spec.fault_window.start_after_prelaunch_anchor_s
@@ -1337,11 +1358,11 @@ def materialize_manager_argv(
             != str(spec.replica_count)
         ):
             raise FactorialManifestError(
-                "v15 manager precontainment coverage argv drifted"
+                "coverage-gated manager precontainment argv drifted"
             )
     elif any(option in manager_template for option in coverage_options):
         raise FactorialManifestError(
-            "legacy manager argv must not carry v15 precontainment coverage options"
+            "legacy manager argv must not carry precontainment coverage options"
         )
     replacements = {
         _SLOT_DIRECTORY_TOKEN: str(slot_directory),
@@ -1584,7 +1605,8 @@ def runtime_preflight(
     for slot in runtime.slots:
         expected_cleanup_contract = (
             EXECUTION_CLEANUP_CONTRACT_V1
-            if runtime.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id
+            in {V14_MANIFEST_ID, V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         if slot.cleanup_contract != expected_cleanup_contract:
@@ -1663,7 +1685,50 @@ def runtime_preflight(
                 slot.scientific_seed,
             )
             expected_measurement_contract = (
-                (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            if runtime.manifest_id == V9_MANIFEST_ID:
+                expected_measurement_contract = (
+                    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            elif runtime.manifest_id == V10_MANIFEST_ID:
+                expected_measurement_contract = (
+                    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+                    RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+                    RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+                    None,
+                    None,
+                )
+            elif runtime.manifest_id in {
+                V11_MANIFEST_ID,
+                V12_MANIFEST_ID,
+                V13_MANIFEST_ID,
+            }:
+                expected_measurement_contract = (
+                    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+                    RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+                    RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+                    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+                )
+            elif runtime.manifest_id in {V14_MANIFEST_ID, V15_MANIFEST_ID}:
+                expected_measurement_contract = (
                     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
                     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
                     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
@@ -1672,50 +1737,16 @@ def runtime_preflight(
                     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
                 )
-                if runtime.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
-                else (
-                    (
-                        RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
-                        RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
-                        RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
-                        RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
-                        RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
-                        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
-                        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
-                    )
-                    if runtime.manifest_id
-                    in {
-                        V11_MANIFEST_ID,
-                        V12_MANIFEST_ID,
-                        V13_MANIFEST_ID,
-                    }
-                    else (
-                        (
-                            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
-                            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
-                            RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
-                            RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
-                            RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
-                            None,
-                            None,
-                        )
-                        if runtime.manifest_id == V10_MANIFEST_ID
-                        else (
-                            (
-                                RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
-                                RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                            )
-                            if runtime.manifest_id == V9_MANIFEST_ID
-                            else (None, None, None, None, None, None, None)
-                        )
-                    )
+            elif runtime.manifest_id == FROZEN_MANIFEST_ID:
+                expected_measurement_contract = (
+                    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+                    RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+                    RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+                    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
+                    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
                 )
-            )
             expected_responsive_period = (
                 41
                 if runtime.manifest_id
@@ -1726,6 +1757,7 @@ def runtime_preflight(
                     V12_MANIFEST_ID,
                     V13_MANIFEST_ID,
                     V14_MANIFEST_ID,
+                    V15_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -1737,6 +1769,7 @@ def runtime_preflight(
                     V12_MANIFEST_ID,
                     V13_MANIFEST_ID,
                     V14_MANIFEST_ID,
+                    V15_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -1784,7 +1817,8 @@ def runtime_preflight(
                 or tiered.precontainment_fault_coverage_gate
                 != (
                     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
-                    if runtime.manifest_id == FROZEN_MANIFEST_ID
+                    if runtime.manifest_id
+                    in {V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
                     else None
                 )
                 or not slot.epoch1_placement.only_hard_cohort_is_wait_exempt
@@ -1981,7 +2015,10 @@ def runtime_preflight(
             "--fault-containment-evidence-start-monotonic-ns",
             "--fault-containment-required-tree-coverage",
         )
-        expected_coverage_enabled = runtime.manifest_id == FROZEN_MANIFEST_ID
+        expected_coverage_enabled = runtime.manifest_id in {
+            V15_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         if (
             (manager_template.count(coverage_options[0]) == 1)
             is not expected_coverage_enabled
@@ -2057,6 +2094,9 @@ __all__ = (
     "V13_SMOKE_RUNTIME_SHA256",
     "V14_RUNTIME_SHA256",
     "V14_SMOKE_RUNTIME_SHA256",
+    "V15_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V15_RUNTIME_SHA256",
+    "V15_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",
