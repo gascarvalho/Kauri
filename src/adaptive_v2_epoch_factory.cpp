@@ -67,6 +67,14 @@ bool exact_selection_metadata(
     const ByzantineQuorum &quorum) noexcept
 {
     const auto &metadata = selection.metadata;
+    switch (metadata.timeout_audit_basis)
+    {
+    case AdaptiveV2TimeoutAuditBasis::unfiltered_post_baseline:
+    case AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered:
+        break;
+    default:
+        return false;
+    }
     return metadata.replica_count == quorum.replica_count &&
            metadata.fault_threshold == quorum.fault_threshold &&
            metadata.quorum == quorum.quorum &&
@@ -90,6 +98,39 @@ const ReplicaAdaptationResult *snapshot_entry(
             return entry.replica_id == replica_id;
         });
     return found == snapshot.ranking().end() ? nullptr : &*found;
+}
+
+bool valid_candidate_timeout_audit(
+    const AdaptiveV2CandidateAudit &candidate,
+    const AdaptiveV2SelectionMetadata &metadata) noexcept
+{
+    switch (metadata.timeout_audit_basis)
+    {
+    case AdaptiveV2TimeoutAuditBasis::unfiltered_post_baseline:
+        return candidate.guard_drawdown >= 0 ||
+               static_cast<std::uint64_t>(
+                   -(candidate.guard_drawdown + 1)) +
+                       1U <=
+                   candidate.total_uncompensated_timeouts;
+    case AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered:
+    {
+        if (metadata.minimum_timeouts_per_reporter == 0 ||
+            candidate.qualifying_reporters.size() >
+            std::numeric_limits<std::uint64_t>::max() /
+                metadata.minimum_timeouts_per_reporter)
+        {
+            return false;
+        }
+        const auto minimum_qualifying_timeouts =
+            static_cast<std::uint64_t>(
+                candidate.qualifying_reporters.size()) *
+            metadata.minimum_timeouts_per_reporter;
+        return candidate.total_uncompensated_timeouts >=
+               minimum_qualifying_timeouts;
+    }
+    default:
+        return false;
+    }
 }
 
 bool valid_guarded_candidates(
@@ -118,11 +159,8 @@ bool valid_guarded_candidates(
                 -static_cast<std::int64_t>(
                     selection.metadata.minimum_score_drop) ||
             candidate.guard_drawdown > 0 ||
-            (candidate.guard_drawdown < 0 &&
-             static_cast<std::uint64_t>(
-                 -(candidate.guard_drawdown + 1)) +
-                     1U >
-                 candidate.total_uncompensated_timeouts) ||
+            !valid_candidate_timeout_audit(
+                candidate, selection.metadata) ||
             static_cast<std::int64_t>(candidate.current_score) -
                     static_cast<std::int64_t>(candidate.baseline_score) !=
                 candidate.baseline_score_delta)

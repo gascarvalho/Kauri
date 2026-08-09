@@ -27,6 +27,7 @@ using hotstuff::AdaptiveV2EpochFactoryStatus;
 using hotstuff::AdaptiveV2SelectionResult;
 using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
+using hotstuff::AdaptiveV2TimeoutAuditBasis;
 using hotstuff::ConfigurationId;
 using hotstuff::BaselineRoot;
 using hotstuff::EpochChangeBundleLimits;
@@ -1090,6 +1091,30 @@ TEST_CASE(
         CHECK(result.bundle == nullptr);
     }
 
+    SECTION("proposal-filtered timeout audit does not compare domains")
+    {
+        fixture.selection.metadata.timeout_audit_basis =
+            AdaptiveV2TimeoutAuditBasis::
+                post_fault_proposal_filtered;
+        fixture.selection.eligible_candidates.front().guard_drawdown = -7;
+        const auto result = fixture.build();
+        CHECK(result.status == AdaptiveV2EpochFactoryStatus::success);
+        CHECK(result.bundle != nullptr);
+    }
+
+    SECTION("proposal-filtered timeout total covers reporter minima")
+    {
+        fixture.selection.metadata.timeout_audit_basis =
+            AdaptiveV2TimeoutAuditBasis::
+                post_fault_proposal_filtered;
+        fixture.selection.eligible_candidates.front()
+            .total_uncompensated_timeouts = 5;
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
     SECTION("membership cannot change")
     {
         fixture.placement.membership.back() = 7;
@@ -1266,6 +1291,18 @@ TEST_CASE(
     "factory independently rejects forged inherited constraints",
     "[adaptive-v2][epoch-factory][inheritance][negative][n7]")
 {
+    SECTION("unknown timeout audit basis fails with no candidate audits")
+    {
+        InheritedFixture fixture;
+        REQUIRE(fixture.selection.eligible_candidates.empty());
+        fixture.selection.metadata.timeout_audit_basis =
+            static_cast<AdaptiveV2TimeoutAuditBasis>(0);
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
     SECTION("an exact predecessor cannot be relabeled guarded evidence")
     {
         InheritedFixture fixture;

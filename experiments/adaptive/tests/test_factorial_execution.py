@@ -31,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v17.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v18.json"
 
 
 @pytest.fixture(scope="module")
@@ -764,7 +764,7 @@ def test_observer_baseline_timeout_covers_remaining_prefault_delay(
     )
 
 
-def test_v17_manager_selection_stream_has_no_cycle0_shape_event() -> None:
+def test_v18_manager_selection_stream_has_no_cycle0_shape_event() -> None:
     contract = (
         "epoch_zero_fault_containment_preserves_current_fanout_without_shape_v1_"
         "decision_later_transition_retains_exact_shape_v1_v1"
@@ -807,7 +807,7 @@ def test_v17_manager_selection_stream_has_no_cycle0_shape_event() -> None:
     ) == cycle1_shape
 
 
-def test_v17_manager_selection_rejects_a_cycle0_shape_event() -> None:
+def test_v18_manager_selection_rejects_a_cycle0_shape_event() -> None:
     contract = (
         "epoch_zero_fault_containment_preserves_current_fanout_without_shape_v1_"
         "decision_later_transition_retains_exact_shape_v1_v1"
@@ -2319,7 +2319,7 @@ def test_n31_coverage_smoke_authorization_is_separate_and_exact(
     assert bound["scope"] == "excluded_n31_coverage_smoke"
     assert bound["slot_ids"] == ["slot-066-n31-f5-b05-P"]
     assert bound["result_root"] == (
-        "results/shape-placement-factorial-v17-coverage-smoke"
+        "results/shape-placement-factorial-v18-coverage-smoke"
     )
     assert bound["automatic_retries"] == 0
     assert bound["replacement_policy"] == "none"

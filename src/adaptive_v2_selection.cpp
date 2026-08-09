@@ -786,7 +786,12 @@ struct AdaptiveV2ByzantineSelection::State
             config.minimum_timeouts_per_reporter,
             config.minimum_score_drop,
             baseline_cutoff,
-            evidence_cutoff};
+            evidence_cutoff,
+            config.fault_containment_evidence_start_monotonic_ns == 0
+                ? AdaptiveV2TimeoutAuditBasis::
+                      unfiltered_post_baseline
+                : AdaptiveV2TimeoutAuditBasis::
+                      post_fault_proposal_filtered};
     }
 
     AdaptiveV2SelectionResult result(

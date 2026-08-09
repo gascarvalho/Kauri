@@ -18,6 +18,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     EXECUTION_CLEANUP_CONTRACT_V1,
     FactorialManifestError,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
+    PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
@@ -60,6 +61,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v18.json"
+)
+V17_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v17.json"
 )
 V16_MANIFEST_PATH = (
@@ -350,6 +354,9 @@ def test_causal_sequence_requires_independent_raw_actor_role_proof(
             ),
             "precontainment_shape_evaluation_contract": (
                 PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+            ),
+            "precontainment_guarded_selection_contract": (
+                PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
             ),
             "proof_source": "independent_raw_artifact_validation",
         }
@@ -1082,9 +1089,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V14_MANIFEST_PATH,
         V15_MANIFEST_PATH,
         V16_MANIFEST_PATH,
+        V17_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v17_and_refuses_prior_production(
+def test_cli_defaults_to_v18_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1097,7 +1105,7 @@ def test_cli_defaults_to_v17_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v16 are validation-only" in refusal["reason"]
+    assert "v1 through v17 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(

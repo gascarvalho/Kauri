@@ -14,17 +14,17 @@ from experiments.adaptive.kauri_experiment import factorial_execution as executi
 from experiments.adaptive.kauri_experiment import factorial_manifest as manifest_module
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FactorialManifestError,
-    FROZEN_MANIFEST_SHA256,
-    FROZEN_PLAN_SHA256,
-    FROZEN_SEMANTIC_SHA256,
+    V17_MANIFEST_SHA256,
+    V17_PLAN_SHA256,
+    V17_SEMANTIC_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
     parse_manifest_bytes,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
-    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
+    V17_COVERAGE_SMOKE_RUNTIME_SHA256,
+    V17_RUNTIME_SHA256,
+    V17_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     canonical_runtime_bytes,
 )
@@ -35,6 +35,9 @@ V17_MANIFEST = (
 )
 V16_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v16.json"
+)
+V18_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v18.json"
 )
 PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT = (
     "epoch_zero_fault_containment_preserves_current_fanout_without_shape_v1_"
@@ -91,7 +94,7 @@ def test_v17_only_changes_identity_root_and_precontainment_shape_contract() -> N
     assert "precontainment_shape_evaluation_contract" not in v16_responsive
     assert v17 == v16
 
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v17"
+    assert manifest_module.V17_MANIFEST_ID == "shape-placement-factorial-v17"
 
 
 @pytest.mark.parametrize("replacement", (None, "shape_v1_may_be_skipped"))
@@ -136,22 +139,22 @@ def test_v17_runtime_freezes_no_cycle0_shape_and_exact_cycle1_shape_v1() -> None
 
 def test_v17_all_six_static_identities_are_frozen() -> None:
     assert _runtime_identities(V17_MANIFEST) == (
-        FROZEN_MANIFEST_SHA256,
-        FROZEN_SEMANTIC_SHA256,
-        FROZEN_PLAN_SHA256,
-        FROZEN_RUNTIME_SHA256,
-        FROZEN_SMOKE_RUNTIME_SHA256,
-        FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        V17_MANIFEST_SHA256,
+        V17_SEMANTIC_SHA256,
+        V17_PLAN_SHA256,
+        V17_RUNTIME_SHA256,
+        V17_SMOKE_RUNTIME_SHA256,
+        V17_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
 
 
-def test_v17_default_refuses_v16_and_keeps_ordered_smoke_roots(
+def test_v17_is_validation_only_and_keeps_historical_smoke_roots(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V17_MANIFEST
-    assert cli.main(["--manifest", str(V16_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST == V18_MANIFEST
+    assert cli.main(["--manifest", str(V17_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v16 are validation-only" in refusal["reason"]
+    assert "v1 through v17 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V17_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

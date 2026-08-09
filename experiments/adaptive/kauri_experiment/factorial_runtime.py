@@ -18,6 +18,7 @@ from .factorial_manifest import (
     EXECUTION_CLEANUP_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
+    PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
     V10_MANIFEST_ID,
     V11_MANIFEST_ID,
@@ -26,6 +27,7 @@ from .factorial_manifest import (
     V14_MANIFEST_ID,
     V15_MANIFEST_ID,
     V16_MANIFEST_ID,
+    V17_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -86,14 +88,23 @@ V16_SMOKE_RUNTIME_SHA256 = (
 V16_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "e466b66c35795d671aae050831870aba45e89ecf4f4c68033185e2b8ecb89e2a"
 )
-FROZEN_RUNTIME_SHA256 = (
+V17_RUNTIME_SHA256 = (
     "4de3d25cc3f6ed0325e39cc670c27d5db67c3facb7bb081bf8f93707094c0fac"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V17_SMOKE_RUNTIME_SHA256 = (
     "28aa251fb7a21296eec0ef3b49f9e1c6c68dc30d4cda83998f9ee1559896ae07"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V17_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "7c4a5b7be38b7e985326e3c2286cac71891c2dc32488087064b4f85566d81d70"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "a418a0d80e9deefd7bbc988fd92129ddc82b971d1a981e9d204b757e7f75ea37"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "ba095ceb0ac43a42aba395963bc81f47dc8315ce914e6f06dd43878a3ed36d3b"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "0912ff8e9f5a0f8581e0c8422e8d55c5ff6942a6573864d635bec39d69d1835a"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -337,6 +348,7 @@ class CausalAcceptanceContract(_Document):
     precontainment_coverage_ready_event_type: str | None = None
     precontainment_required_tree_coverage_rule: str | None = None
     precontainment_shape_evaluation_contract: str | None = None
+    precontainment_guarded_selection_contract: str | None = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
@@ -345,6 +357,7 @@ class CausalAcceptanceContract(_Document):
             "precontainment_coverage_ready_event_type",
             "precontainment_required_tree_coverage_rule",
             "precontainment_shape_evaluation_contract",
+            "precontainment_guarded_selection_contract",
         ):
             if document[field] is None:
                 document.pop(field)
@@ -839,6 +852,7 @@ def _placement_contract(
 def _causal_acceptance(
     coverage_gate: str | None,
     shape_evaluation_contract: str | None,
+    guarded_selection_contract: str | None,
 ) -> CausalAcceptanceContract:
     if coverage_gate not in {None, PRECONTAINMENT_FAULT_COVERAGE_GATE_V1}:
         raise FactorialManifestError(
@@ -854,6 +868,19 @@ def _causal_acceptance(
     if shape_evaluation_contract is not None and coverage_gate is None:
         raise FactorialManifestError(
             "precontainment shape evaluation requires the coverage-gated contract"
+        )
+    if guarded_selection_contract not in {
+        None,
+        PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
+    }:
+        raise FactorialManifestError(
+            "causal acceptance precontainment guarded selection contract drifted"
+        )
+    if guarded_selection_contract is not None and (
+        coverage_gate is None or shape_evaluation_contract is None
+    ):
+        raise FactorialManifestError(
+            "guarded selection domains require coverage and shape contracts"
         )
     return CausalAcceptanceContract(
         proof_source="independent_raw_artifact_validation",
@@ -876,6 +903,7 @@ def _causal_acceptance(
             else None
         ),
         precontainment_shape_evaluation_contract=shape_evaluation_contract,
+        precontainment_guarded_selection_contract=guarded_selection_contract,
     )
 
 
@@ -1277,6 +1305,13 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             identity["precontainment_shape_evaluation_contract"] = (
                 responsive.precontainment_shape_evaluation_contract
             )
+        if (
+            responsive is not None
+            and responsive.precontainment_guarded_selection_contract is not None
+        ):
+            identity["precontainment_guarded_selection_contract"] = (
+                responsive.precontainment_guarded_selection_contract
+            )
     if slot.cleanup_contract is not None:
         identity["cleanup_contract"] = slot.cleanup_contract
     return SlotRuntimeSpec(
@@ -1312,6 +1347,11 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             ),
             (
                 slot.byzantine.responsive_degradation.precontainment_shape_evaluation_contract
+                if slot.byzantine.responsive_degradation is not None
+                else None
+            ),
+            (
+                slot.byzantine.responsive_degradation.precontainment_guarded_selection_contract
                 if slot.byzantine.responsive_degradation is not None
                 else None
             ),
@@ -1651,6 +1691,7 @@ def runtime_preflight(
                 V14_MANIFEST_ID,
                 V15_MANIFEST_ID,
                 V16_MANIFEST_ID,
+                V17_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1785,6 +1826,7 @@ def runtime_preflight(
                 )
             elif runtime.manifest_id in {
                 V16_MANIFEST_ID,
+                V17_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }:
                 expected_measurement_contract = (
@@ -1808,6 +1850,7 @@ def runtime_preflight(
                     V14_MANIFEST_ID,
                     V15_MANIFEST_ID,
                     V16_MANIFEST_ID,
+                    V17_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -1821,6 +1864,7 @@ def runtime_preflight(
                     V14_MANIFEST_ID,
                     V15_MANIFEST_ID,
                     V16_MANIFEST_ID,
+                    V17_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -1872,6 +1916,7 @@ def runtime_preflight(
                     in {
                         V15_MANIFEST_ID,
                         V16_MANIFEST_ID,
+                        V17_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2073,6 +2118,7 @@ def runtime_preflight(
         expected_coverage_enabled = runtime.manifest_id in {
             V15_MANIFEST_ID,
             V16_MANIFEST_ID,
+            V17_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2102,6 +2148,9 @@ def runtime_preflight(
             if expected_coverage_enabled
             else None,
             PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+            if runtime.manifest_id in {V17_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            else None,
+            PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
             if runtime.manifest_id == FROZEN_MANIFEST_ID
             else None,
         ):
@@ -2159,6 +2208,9 @@ __all__ = (
     "V16_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V16_RUNTIME_SHA256",
     "V16_SMOKE_RUNTIME_SHA256",
+    "V17_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V17_RUNTIME_SHA256",
+    "V17_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

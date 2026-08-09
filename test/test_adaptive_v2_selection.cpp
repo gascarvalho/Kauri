@@ -25,6 +25,7 @@ using hotstuff::AdaptiveV2ReplicaScore;
 using hotstuff::AdaptiveV2SelectionConfig;
 using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
+using hotstuff::AdaptiveV2TimeoutAuditBasis;
 using hotstuff::AdaptiveV2FaultContainmentCoverageStatus;
 using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AuthenticatedReporter;
@@ -759,8 +760,13 @@ TEST_CASE(
     CHECK(selected.selected_replicas ==
           std::vector<ReplicaID>{0});
     REQUIRE(selected.eligible_candidates.size() == 1);
+    CHECK(selected.metadata.timeout_audit_basis ==
+          AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered);
     CHECK(selected.eligible_candidates.front().qualifying_reporters ==
           std::vector<ReplicaID>{2, 3, 4});
+    CHECK(selected.eligible_candidates.front().guard_drawdown == -6);
+    CHECK(selected.eligible_candidates.front()
+              .total_uncompensated_timeouts == 3);
 
     fixture.late(qualifying_timeouts.front(), 1'000'000);
     for (std::size_t index = 1;

@@ -101,6 +101,16 @@ enum class AdaptiveV2SelectionConstraintBasis : std::uint8_t
     inherited_consensus_wait_exempt,
 };
 
+/**
+ * Evidence domain used only for guarded timeout counts and reporters.
+ * Candidate guard_drawdown always retains the raw post-baseline domain.
+ */
+enum class AdaptiveV2TimeoutAuditBasis : std::uint8_t
+{
+    unfiltered_post_baseline = 1,
+    post_fault_proposal_filtered,
+};
+
 struct AdaptiveV2SelectionMetadata
 {
     std::uint32_t replica_count{0};
@@ -112,6 +122,9 @@ struct AdaptiveV2SelectionMetadata
     std::uint32_t minimum_score_drop{0};
     std::uint64_t baseline_cutoff{0};
     std::uint64_t evidence_cutoff{0};
+    /** Domain of candidate timeout totals/reporters, not guard_drawdown. */
+    AdaptiveV2TimeoutAuditBasis timeout_audit_basis{
+        AdaptiveV2TimeoutAuditBasis::unfiltered_post_baseline};
 };
 
 struct AdaptiveV2ReplicaScore
@@ -136,8 +149,13 @@ struct AdaptiveV2CandidateAudit
      * move it toward (but never above) zero. A late response compensates only
      * its correlated post-baseline timeout. Unlike the raw score delta,
      * healthy history cannot bank credit against a later failure.
+     * This raw domain is independent of metadata.timeout_audit_basis.
      */
     std::int64_t guard_drawdown{0};
+    /**
+     * Exact outstanding timeout count in metadata.timeout_audit_basis.
+     * Qualifying reporters are derived from the same evidence domain.
+     */
     std::uint64_t total_uncompensated_timeouts{0};
     std::vector<ReplicaID> qualifying_reporters;
     bool snapshot_nonresponsive{false};

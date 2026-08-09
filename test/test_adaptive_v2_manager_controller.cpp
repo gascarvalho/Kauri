@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -24,6 +26,7 @@ using hotstuff::AdaptiveV2ManagerIngressStatus;
 using hotstuff::AdaptiveV2ReadinessNotice;
 using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
+using hotstuff::AdaptiveV2TimeoutAuditBasis;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::BaselineRoot;
 using hotstuff::ConfigurationId;
@@ -36,6 +39,7 @@ using hotstuff::EpochWireLimits;
 using hotstuff::ExpectedMessageType;
 using hotstuff::NormalProposalRuntimeInitialized;
 using hotstuff::PrivKeySecp256k1;
+using hotstuff::ProposalKey;
 using hotstuff::ProposalLifecycleFact;
 using hotstuff::ProposalLifecycleNotice;
 using hotstuff::ReplicaAdaptationResult;
@@ -400,6 +404,86 @@ struct Fixture
         admit(value);
         ingest(value);
         return value;
+    }
+
+    ResponseObservation direct_vote_anchor(
+        const ProposalKey &proposal,
+        std::optional<std::pair<ReplicaID, ReplicaID>> avoid =
+            std::nullopt)
+    {
+        const auto &trees = ingress.current_epoch().trees();
+        const auto tree = std::find_if(
+            trees.begin(), trees.end(), [&proposal](const auto &entry) {
+                return entry.tree_id ==
+                       proposal.configuration.tree_id;
+            });
+        REQUIRE(tree != trees.end());
+        const auto leaf_start = first_leaf_index(
+            tree->members_breadth_first.size(), tree->fanout);
+        for (std::size_t position = leaf_start;
+             position < tree->members_breadth_first.size();
+             ++position)
+        {
+            const auto parent_position =
+                (position - 1U) / tree->fanout;
+            const auto reporter =
+                tree->members_breadth_first[parent_position];
+            const auto target =
+                tree->members_breadth_first[position];
+            if (avoid.has_value() &&
+                avoid->first == reporter &&
+                avoid->second == target)
+            {
+                continue;
+            }
+
+            ResponseObservation value;
+            value.reporter_id = reporter;
+            value.observed_replica_id = target;
+            value.configuration = proposal.configuration;
+            value.block_hash = proposal.block_hash;
+            value.expected_message_type =
+                ExpectedMessageType::direct_vote;
+            value.outcome = ResponseOutcome::on_time;
+            value.response_duration_us = 0;
+            value.deadline_duration_us = 100;
+            value.reporter_sequence =
+                ++evidence_sequences[value.reporter_id];
+            value.reporter_monotonic_ns =
+                value.reporter_sequence * 1'000;
+            value.signer_set = {target};
+            value.observation_id =
+                hotstuff::compute_response_observation_id(
+                    value.attempt_identity());
+            return value;
+        }
+        throw std::logic_error(
+            "test tree has no distinct direct-vote anchor");
+    }
+
+    void cover_tree(std::uint32_t tree_id)
+    {
+        const ProposalKey proposal{
+            ConfigurationId{
+                ingress.current_epoch().epoch_number(),
+                tree_id,
+                ingress.current_epoch().epoch_digest()},
+            digest("post-fault-coverage-" +
+                   std::to_string(++proposal_counter))};
+        auto anchor = direct_vote_anchor(proposal);
+        admit(anchor);
+        ingest(anchor);
+    }
+
+    void anchor_timeout_proposal(
+        const ResponseObservation &timeout)
+    {
+        auto anchor = direct_vote_anchor(
+            timeout.proposal_key(),
+            std::make_pair(
+                timeout.reporter_id,
+                timeout.observed_replica_id));
+        ingest(anchor);
     }
 
     void record_aggregate_timeout(
@@ -1221,6 +1305,8 @@ TEST_CASE(
     CHECK(selection->status == AdaptiveV2SelectionStatus::selected);
     CHECK(selection->constraint_basis ==
           AdaptiveV2SelectionConstraintBasis::guarded_evidence);
+    CHECK(selection->metadata.timeout_audit_basis ==
+          AdaptiveV2TimeoutAuditBasis::unfiltered_post_baseline);
     CHECK(selection->metadata.replica_count == 7);
     CHECK(selection->metadata.fault_threshold == 2);
     CHECK(selection->metadata.quorum == 5);
@@ -1344,6 +1430,60 @@ TEST_CASE(
               std::vector<ReplicaID>{6});
         CHECK(tree.members_breadth_first.front() != 6);
     }
+}
+
+TEST_CASE(
+    "controller composes raw drawdown with proposal-filtered timeout audit",
+    "[adaptive-v2][manager-controller][selection][epoch-factory]"
+    "[fault-containment][audit-domain]")
+{
+    Fixture fixture(5, 4096, 1);
+    fixture.controller.reset();
+    fixture.config.selection.minimum_score_drop = 3;
+    fixture.config.selection.minimum_timeouts_per_reporter = 1;
+    fixture.config.selection
+        .fault_containment_evidence_start_monotonic_ns = 1;
+    fixture.config.selection
+        .fault_containment_required_tree_coverage = 7;
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+    fixture.freeze_baseline();
+
+    for (std::uint32_t tree_id = 0; tree_id < 7; ++tree_id)
+        fixture.cover_tree(tree_id);
+
+    // This timeout remains in the raw post-baseline drawdown, but its
+    // proposal has no independent post-fault direct-vote anchor.
+    fixture.record(
+        6, 0, ResponseOutcome::timeout, "excluded-proposal");
+
+    for (std::size_t reporter_index = 0;
+         reporter_index < 3;
+         ++reporter_index)
+    {
+        const auto timeout = fixture.record(
+            6,
+            reporter_index,
+            ResponseOutcome::timeout,
+            "eligible-proposal");
+        fixture.anchor_timeout_proposal(timeout);
+    }
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    const auto *selection = fixture.controller->selection_audit();
+    REQUIRE(selection != nullptr);
+    REQUIRE(selection->status == AdaptiveV2SelectionStatus::selected);
+    CHECK(selection->metadata.timeout_audit_basis ==
+          AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered);
+    REQUIRE(selection->eligible_candidates.size() == 1);
+    CHECK(selection->eligible_candidates.front().replica_id == 6);
+    CHECK(selection->eligible_candidates.front().guard_drawdown == -4);
+    CHECK(selection->eligible_candidates.front()
+              .total_uncompensated_timeouts == 3);
+    CHECK(fixture.controller->successor_bundle() != nullptr);
+    CHECK(fixture.controller->healthy());
 }
 
 TEST_CASE(

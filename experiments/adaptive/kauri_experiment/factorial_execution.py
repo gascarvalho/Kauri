@@ -35,6 +35,7 @@ from .factorial_manifest import (
     FactorialManifestError,
     FactorialSlot,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
+    PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
@@ -4305,16 +4306,23 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v15/slot-066-n31-f5-b05-P": "v15",
         "results/shape-placement-factorial-v16/slot-066-n31-f5-b05-P": "v16",
         "results/shape-placement-factorial-v17/slot-066-n31-f5-b05-P": "v17",
+        "results/shape-placement-factorial-v18/slot-066-n31-f5-b05-P": "v18",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
         "v15": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
         "v16": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
         "v17": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        "v18": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
-        if manifest_version == "v17"
+        if manifest_version in {"v17", "v18"}
+        else None
+    )
+    expected_guarded_selection_contract = (
+        PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
+        if manifest_version == "v18"
         else None
     )
     if (
@@ -4378,6 +4386,8 @@ def build_n31_coverage_smoke_slot(
         != expected_timeout_eligibility
         or responsive.precontainment_shape_evaluation_contract
         != expected_shape_evaluation_contract
+        or responsive.precontainment_guarded_selection_contract
+        != expected_guarded_selection_contract
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "
