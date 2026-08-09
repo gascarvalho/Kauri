@@ -15,9 +15,12 @@ from experiments.adaptive.kauri_experiment import factorial_execution
 from experiments.adaptive.kauri_experiment import factorial_runtime
 from experiments.adaptive.kauri_experiment import factorial_validation
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
+    EXECUTION_CLEANUP_CONTRACT_V1,
     FactorialManifestError,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
+    V13_PLAN_SHA256,
     V10_PLAN_SHA256,
     V11_PLAN_SHA256,
     V12_PLAN_SHA256,
@@ -33,6 +36,8 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     V11_SMOKE_RUNTIME_SHA256,
     V12_RUNTIME_SHA256,
     V12_SMOKE_RUNTIME_SHA256,
+    V13_RUNTIME_SHA256,
+    V13_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     build_slot_runtime,
     build_smoke_metadata,
@@ -50,6 +55,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
+)
+V13_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
 )
 V12_MANIFEST_PATH = (
@@ -179,8 +187,9 @@ def test_matched_arms_share_the_frozen_cutoff_and_transition_contracts(
         "epoch1_manager_ingestion_sequence_baseline_exclusive_current_inclusive_v1"
     )
     assert tiered.marker_completeness_witness == (
-        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
     )
+    assert specs[0].cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
     assert tiered.causal_timeout_eligibility == (
         RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
     )
@@ -855,6 +864,16 @@ def test_preflight_accepts_only_the_exact_n7_hard_one_smoke(
 def test_preflight_rejects_tiered_period_and_native_argv_drift(runtime_plan) -> None:
     slot = runtime_plan.slots[0]
     assert slot.tiered_cohorts is not None
+    missing_cleanup_slot = replace(slot, cleanup_contract=None)
+    with pytest.raises(FactorialManifestError, match="cleanup contract"):
+        runtime_preflight(
+            replace(
+                runtime_plan,
+                slots=(missing_cleanup_slot, *runtime_plan.slots[1:]),
+            ),
+            available_free_bytes=runtime_plan.minimum_free_bytes,
+        )
+
     bad_period_slot = replace(
         slot,
         tiered_cohorts=replace(
@@ -1028,9 +1047,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V10_MANIFEST_PATH,
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
+        V13_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v13_and_refuses_prior_production(
+def test_cli_defaults_to_v14_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1043,7 +1063,7 @@ def test_cli_defaults_to_v13_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v12 are validation-only" in refusal["reason"]
+    assert "v1 through v13 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1193,5 +1213,27 @@ def test_v12_runtime_identities_remain_exact_with_legacy_scoring_policy() -> Non
         == "shape25-sensitive-responsiveness-v1"
         and slot["tiered_cohorts"]["mode"]
         == "tiered_persistent_responsive_omission_v2"
+        for slot in document["slots"]
+    )
+
+
+def test_v13_runtime_identities_remain_exact_without_v14_contracts() -> None:
+    manifest = load_frozen_manifest(V13_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    encoded = canonical_runtime_bytes(runtime)
+
+    assert plan.plan_sha256 == V13_PLAN_SHA256
+    assert hashlib.sha256(encoded).hexdigest() == V13_RUNTIME_SHA256
+    smoke = factorial_execution.build_n7_ps_smoke_slot(plan.slots[0])
+    smoke_payload = factorial_execution._canonical_json_bytes(
+        smoke.runtime.as_document()
+    )
+    assert hashlib.sha256(smoke_payload).hexdigest() == V13_SMOKE_RUNTIME_SHA256
+    document = json.loads(encoded)
+    assert all(
+        slot["tiered_cohorts"]["marker_completeness_witness"]
+        == RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+        and "cleanup_contract" not in slot
         for slot in document["slots"]
     )

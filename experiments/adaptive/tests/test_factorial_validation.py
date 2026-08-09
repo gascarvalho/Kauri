@@ -43,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
+)
+V13_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
 )
 V12_MANIFEST_PATH = (
@@ -262,7 +265,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v13_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v14_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -280,7 +283,8 @@ def test_validator_retains_exact_v1_through_v13_artifact_identities() -> None:
             (10, V10_MANIFEST_PATH),
             (11, V11_MANIFEST_PATH),
             (12, V12_MANIFEST_PATH),
-            (13, MANIFEST_PATH),
+            (13, V13_MANIFEST_PATH),
+            (14, MANIFEST_PATH),
         )
     }
 
@@ -326,10 +330,16 @@ def test_validator_retains_exact_v1_through_v13_artifact_identities() -> None:
         identities[12].smoke_runtime_sha256
         == validation.V12_SMOKE_RUNTIME_SHA256
     )
-    assert identities[13].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[13].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[13].manifest_sha256 == validation.V13_MANIFEST_SHA256
+    assert identities[13].runtime_sha256 == validation.V13_RUNTIME_SHA256
     assert (
         identities[13].smoke_runtime_sha256
+        == validation.V13_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[14].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[14].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[14].smoke_runtime_sha256
         == validation.FROZEN_SMOKE_RUNTIME_SHA256
     )
 
@@ -346,6 +356,7 @@ def test_validator_retains_exact_v1_through_v13_artifact_identities() -> None:
         V10_MANIFEST_PATH,
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
+        V13_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -365,7 +376,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v13_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v14_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -391,6 +402,7 @@ def test_validator_requires_v9_through_v13_causal_contracts_but_accepts_v8() -> 
         V10_MANIFEST_PATH,
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
+        V13_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -436,16 +448,24 @@ def test_validator_requires_v9_through_v13_causal_contracts_but_accepts_v8() -> 
         if manifest_path in (
             V11_MANIFEST_PATH,
             V12_MANIFEST_PATH,
-            MANIFEST_PATH,
+            V13_MANIFEST_PATH,
         ):
             assert {
                 field: document["tiered_cohorts"][field]
                 for field in explicit_v11_fields
             } == explicit_v11_fields
         else:
-            assert not set(explicit_v11_fields).intersection(
-                document["tiered_cohorts"]
-            )
+            if manifest_path == MANIFEST_PATH:
+                assert document["tiered_cohorts"][
+                    "marker_completeness_witness"
+                ] == validation.RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
+                assert document["tiered_cohorts"][
+                    "causal_timeout_eligibility"
+                ] == validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+            else:
+                assert not set(explicit_v11_fields).intersection(
+                    document["tiered_cohorts"]
+                )
 
         drifted = copy.deepcopy(document)
         del drifted["tiered_cohorts"]["pending_attempt_retention"]
@@ -460,7 +480,7 @@ def test_validator_requires_v9_through_v13_causal_contracts_but_accepts_v8() -> 
             )
 
 
-def test_v10_through_v13_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v14_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -474,11 +494,14 @@ def test_v10_through_v13_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V12_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V13_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_through_v13_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v14_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
@@ -489,8 +512,47 @@ def test_v11_through_v13_route_through_explicit_phase_edge_eligibility() -> None
         load_frozen_manifest(V12_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V13_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
     )
+
+
+def test_v14_alone_dispatches_source_bound_witnesses_and_sigint_cleanup() -> None:
+    v13 = load_frozen_manifest(V13_MANIFEST_PATH)
+    v14 = load_frozen_manifest(MANIFEST_PATH)
+
+    assert not validation._uses_source_bound_contribution_opportunities(v13)
+    assert not validation._uses_strict_sigint_cleanup(v13)
+    assert validation._uses_source_bound_contribution_opportunities(v14)
+    assert validation._uses_strict_sigint_cleanup(v14)
+
+
+def test_validator_binds_v14_cleanup_contract_without_changing_v13() -> None:
+    for manifest_path in (V13_MANIFEST_PATH, MANIFEST_PATH):
+        manifest = load_frozen_manifest(manifest_path)
+        runtime = build_factorial_runtime(build_factorial_plan(manifest))
+        expected_by_id = {
+            expected.slot_id: expected
+            for expected in validation._expected_slots(manifest)
+        }
+        slot = runtime.slots[0]
+        document = json.loads(json.dumps(slot.as_document()))
+        if manifest_path == MANIFEST_PATH:
+            assert document.pop("cleanup_contract") == (
+                validation.EXECUTION_CLEANUP_CONTRACT_V1
+            )
+            message = "cleanup contract"
+        else:
+            document["cleanup_contract"] = validation.EXECUTION_CLEANUP_CONTRACT_V1
+            message = "legacy runtime"
+        with pytest.raises(FactorialValidationError, match=message):
+            validation._validate_runtime_slot(
+                document,
+                expected_by_id[slot.slot_id],
+                manifest,
+            )
 
 
 @pytest.mark.parametrize(
@@ -507,6 +569,7 @@ def test_v11_through_v13_route_through_explicit_phase_edge_eligibility() -> None
         V10_MANIFEST_PATH,
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
+        V13_MANIFEST_PATH,
         MANIFEST_PATH,
     ),
 )
@@ -536,12 +599,13 @@ def test_validator_requires_each_explicit_causal_linkage_field(
     "field",
     ("marker_completeness_witness", "causal_timeout_eligibility"),
 )
-def test_validator_requires_each_explicit_v11_phase_edge_field(
+def test_validator_requires_each_explicit_v11_through_v14_phase_edge_field(
     field: str,
 ) -> None:
     for manifest_path in (
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
+        V13_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -864,7 +928,7 @@ def test_v13_requires_minimum_direct_vote_attempts() -> None:
 
 def test_manifest_policy_routes_v12_pooled_and_v13_direct_vote_scoring() -> None:
     v12 = load_frozen_manifest(V12_MANIFEST_PATH)
-    v13 = load_frozen_manifest(MANIFEST_PATH)
+    v13 = load_frozen_manifest(V13_MANIFEST_PATH)
     records = tuple(
         _scoring_evidence_record(
             ordinal,
@@ -1873,6 +1937,426 @@ def _tiered_marker(
     )
 
 
+def _v14_opportunity_event(
+    marker: FaultMarker,
+    tree: Tree,
+    *,
+    sequence: int = 1,
+    payload_overrides: dict[str, object] | None = None,
+    source_id: str | None = None,
+) -> validation._NativeEvent:
+    position = tree.members.index(marker.actor)
+    assert position > 0
+    leaf_start = validation._first_leaf_index(len(tree.members), tree.fanout)
+    physical_role = "internal" if position < leaf_start else "leaf"
+    payload: dict[str, object] = {
+        "actor": marker.actor,
+        "proposal": {
+            "epoch_number": marker.epoch_number,
+            "tree_id": marker.tree_id,
+            "epoch_digest": marker.epoch_digest,
+            "block_hash": marker.block_hash,
+        },
+        "view_generation": 7,
+        "physical_role": physical_role,
+        "parent_replica": tree.members[(position - 1) // tree.fanout],
+        "expected_message_type": (
+            "aggregate_relay" if physical_role == "internal" else "direct_vote"
+        ),
+        "cohort": marker.cohort,
+        "diagnostic_window": marker.window,
+        "window_start_monotonic_ns": marker.window_start_ns,
+        "window_end_monotonic_ns": marker.window_end_ns,
+        "decision_monotonic_ns": marker.monotonic_ns,
+        "contribution_ordinal": marker.contribution_ordinal,
+        "role_contribution_ordinal": marker.role_contribution_ordinal,
+        "scheduled_action": marker.action,
+        "responsive_omission_period": marker.responsive_omission_period,
+        "fault_threshold": marker.fault_threshold,
+        "hard_actor_count": marker.hard_actor_count,
+        "responsive_degraded_actor_count": (
+            marker.responsive_degraded_actor_count
+        ),
+        "fault_mode": marker.fault_mode,
+    }
+    if payload_overrides:
+        payload.update(payload_overrides)
+    return _native_event(
+        source_id=source_id or f"replica-{marker.actor}",
+        sequence=sequence,
+        monotonic_ns=marker.monotonic_ns + 1,
+        event_type="fault.contribution_opportunity",
+        payload=payload,
+    )
+
+
+def _v14_marker(
+    *,
+    actor: int,
+    tree: Tree,
+    epoch_number: int,
+    epoch_digest: str,
+    block_ordinal: int,
+    monotonic_ns: int,
+    cohort: str,
+    contribution_ordinal: int,
+    role_contribution_ordinal: int,
+) -> FaultMarker:
+    position = tree.members.index(actor)
+    leaf_start = validation._first_leaf_index(len(tree.members), tree.fanout)
+    role = "internal" if position < leaf_start else "leaf"
+    should_omit = (
+        cohort == "hard"
+        or role_contribution_ordinal % validation._RESPONSIVE_OMISSION_PERIOD == 0
+    )
+    action = "forward"
+    if should_omit:
+        action = "omit_aggregate" if role == "internal" else "omit_direct_vote"
+    return FaultMarker(
+        source_replica=actor,
+        line_number=block_ordinal,
+        fault_mode="tiered_persistent_responsive_omission_v2",
+        epoch_number=epoch_number,
+        tree_id=tree.tree_id,
+        epoch_digest=epoch_digest,
+        block_hash=f"{block_ordinal:064x}",
+        window="v14-window",
+        window_start_ns=100,
+        window_end_ns=2_000,
+        actor=actor,
+        action=action,
+        monotonic_ns=monotonic_ns,
+        raw_line_sha256=f"{actor * 1000 + block_ordinal:064x}",
+        cohort=cohort,
+        hard_actor_count=1,
+        responsive_degraded_actor_count=1,
+        fault_threshold=2,
+        max_omissions_per_proposal=2,
+        responsive_omission_period=validation._RESPONSIVE_OMISSION_PERIOD,
+        contribution_ordinal=(0 if cohort == "hard" else contribution_ordinal),
+        contribution_role=role,
+        role_contribution_ordinal=(
+            0 if cohort == "hard" else role_contribution_ordinal
+        ),
+    )
+
+
+def test_v14_opportunity_parser_and_bijection_accept_internal_and_leaf() -> None:
+    tree = Tree(
+        tree_id=4,
+        fanout=2,
+        pipeline_stretch=2,
+        members=(0, 2, 1, 9, 3, 4, 5),
+        wait_exempt=(9,),
+    )
+    digest = "11" * 32
+    internal = _v14_marker(
+        actor=2,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest=digest,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    leaf = _v14_marker(
+        actor=9,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest=digest,
+        block_ordinal=2,
+        monotonic_ns=301,
+        cohort="hard",
+        contribution_ordinal=0,
+        role_contribution_ordinal=0,
+    )
+    replica_events = {
+        2: (_v14_opportunity_event(internal, tree),),
+        9: (_v14_opportunity_event(leaf, tree),),
+    }
+    opportunities = validation._fault_contribution_opportunities(replica_events)
+
+    validation._validate_fault_contribution_opportunity_bijection(
+        markers=(internal, leaf),
+        opportunities=opportunities,
+        fault_actor_ids=(2, 9),
+        phase_windows={"fault_evidence": (100, 700, 6)},
+        phase_configurations=(
+            ("fault_evidence", 0, digest, {tree.tree_id: tree}),
+        ),
+    )
+
+    by_actor = {opportunity.actor: opportunity for opportunity in opportunities}
+    assert by_actor[2].physical_role == "internal"
+    assert by_actor[2].expected_message_type == "aggregate_relay"
+    assert by_actor[9].physical_role == "leaf"
+    assert by_actor[9].expected_message_type == "direct_vote"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("extra_field", "payload schema"),
+        ("source", "source actor"),
+        ("generation", "view generation"),
+    ),
+)
+def test_v14_opportunity_parser_rejects_schema_source_and_generation(
+    mutation: str,
+    message: str,
+) -> None:
+    tree = Tree(0, 2, 2, (0, 2, 1), ())
+    marker = _v14_marker(
+        actor=2,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest="11" * 32,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    payload_overrides = None
+    source_id = None
+    if mutation == "extra_field":
+        payload_overrides = {"unexpected": 1}
+    elif mutation == "source":
+        source_id = "replica-1"
+    else:
+        payload_overrides = {"view_generation": 0}
+    event = _v14_opportunity_event(
+        marker,
+        tree,
+        payload_overrides=payload_overrides,
+        source_id=source_id,
+    )
+
+    with pytest.raises(FactorialValidationError, match=message):
+        validation._fault_contribution_opportunities({2: (event,)})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("physical_role", "leaf", "physical role"),
+        ("parent_replica", 1, "physical parent"),
+        ("expected_message_type", "direct_vote", "message type"),
+    ),
+)
+def test_v14_opportunity_bijection_rejects_topology_drift(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    tree = Tree(0, 2, 2, (0, 2, 1, 3, 4, 5, 6), ())
+    marker = _v14_marker(
+        actor=2,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest="11" * 32,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    opportunities = validation._fault_contribution_opportunities(
+        {2: (_v14_opportunity_event(marker, tree),)}
+    )
+    opportunity = replace(opportunities[0], **{field: value})
+
+    with pytest.raises(FactorialValidationError, match=message):
+        validation._validate_fault_contribution_opportunity_bijection(
+            markers=(marker,),
+            opportunities=(opportunity,),
+            fault_actor_ids=(2,),
+            phase_windows={"fault_evidence": (100, 700, 6)},
+            phase_configurations=(
+                ("fault_evidence", 0, marker.epoch_digest, {0: tree}),
+            ),
+        )
+
+
+def test_v14_opportunity_bijection_rejects_missing_duplicate_and_shared_drift() -> None:
+    tree = Tree(0, 2, 2, (0, 2, 1), ())
+    marker = _v14_marker(
+        actor=2,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest="11" * 32,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    event = _v14_opportunity_event(marker, tree)
+    opportunity = validation._fault_contribution_opportunities({2: (event,)})[0]
+    arguments = {
+        "fault_actor_ids": (2,),
+        "phase_windows": {"fault_evidence": (100, 700, 6)},
+        "phase_configurations": (
+            ("fault_evidence", 0, marker.epoch_digest, {0: tree}),
+        ),
+    }
+
+    with pytest.raises(FactorialValidationError, match="marker-only"):
+        validation._validate_fault_contribution_opportunity_bijection(
+            markers=(marker,), opportunities=(), **arguments
+        )
+    with pytest.raises(FactorialValidationError, match="event-only"):
+        validation._validate_fault_contribution_opportunity_bijection(
+            markers=(), opportunities=(opportunity,), **arguments
+        )
+    with pytest.raises(FactorialValidationError, match="duplicate"):
+        validation._fault_contribution_opportunities({2: (event, event)})
+    with pytest.raises(FactorialValidationError, match="shared fields"):
+        validation._validate_fault_contribution_opportunity_bijection(
+            markers=(marker,),
+            opportunities=(replace(opportunity, scheduled_action="omit_aggregate"),),
+            **arguments,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("fault_mode", "tiered_persistent_responsive_omission_v1"),
+        ("window", "other-window"),
+        ("window_start_ns", 101),
+        ("window_end_ns", 1_999),
+        ("decision_monotonic_ns", 301),
+        ("cohort", "hard"),
+        ("scheduled_action", "omit_direct_vote"),
+        ("contribution_ordinal", 2),
+        ("role_contribution_ordinal", 2),
+        ("responsive_omission_period", 40),
+        ("fault_threshold", 3),
+        ("hard_actor_count", 2),
+        ("responsive_degraded_actor_count", 2),
+    ),
+)
+def test_v14_opportunity_pair_requires_every_shared_audit_field(
+    field: str,
+    value: object,
+) -> None:
+    tree = Tree(0, 2, 2, (0, 2, 1), ())
+    marker = _v14_marker(
+        actor=2,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest="11" * 32,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    opportunity = validation._fault_contribution_opportunities(
+        {2: (_v14_opportunity_event(marker, tree),)}
+    )[0]
+
+    with pytest.raises(FactorialValidationError, match="shared fields"):
+        validation._validate_fault_contribution_opportunity_bijection(
+            markers=(marker,),
+            opportunities=(replace(opportunity, **{field: value}),),
+            fault_actor_ids=(2,),
+            phase_windows={"fault_evidence": (100, 700, 6)},
+            phase_configurations=(
+                ("fault_evidence", 0, marker.epoch_digest, {0: tree}),
+            ),
+        )
+
+
+def test_v14_opportunity_nonvacuity_is_per_phase_and_actor_not_per_root_qc() -> None:
+    actors = (2, 9)
+    tree = Tree(0, 2, 2, (0, 2, 1, 9, 3, 4, 5), (9,))
+    phase_rows = (
+        ("fault_evidence", 0, "11" * 32, 300),
+        ("epoch1_stable", 1, "22" * 32, 900),
+        ("epoch2_stable", 2, "33" * 32, 1_500),
+    )
+    phase_windows = {
+        "fault_evidence": (100, 700, 6),
+        "epoch1_stable": (700, 1_300, 6),
+        "epoch2_stable": (1_300, 1_900, 6),
+    }
+    markers: list[FaultMarker] = []
+    events: dict[int, list[validation._NativeEvent]] = {actor: [] for actor in actors}
+    for phase_index, (_phase, epoch, digest, timestamp) in enumerate(phase_rows):
+        for actor in actors:
+            marker = _v14_marker(
+                actor=actor,
+                tree=tree,
+                epoch_number=epoch,
+                epoch_digest=digest,
+                block_ordinal=phase_index * 10 + actor,
+                monotonic_ns=timestamp + actor,
+                cohort="responsive_degraded" if actor == 2 else "hard",
+                contribution_ordinal=phase_index + 1,
+                role_contribution_ordinal=phase_index + 1,
+            )
+            markers.append(marker)
+            events[actor].append(
+                _v14_opportunity_event(
+                    marker,
+                    tree,
+                    sequence=len(events[actor]) + 1,
+                )
+            )
+    # A committed root-only proposal has no contribution hook and is therefore
+    # not required to manufacture either side of the opportunity/marker pair.
+    events[0] = [
+        _commit_event(
+            1,
+            350,
+            99,
+            epoch_number=0,
+            epoch_digest=phase_rows[0][2],
+            tree_id=tree.tree_id,
+        )
+    ]
+    opportunities = validation._fault_contribution_opportunities(
+        {replica: tuple(rows) for replica, rows in events.items()}
+    )
+    arguments = {
+        "fault_actor_ids": actors,
+        "phase_windows": phase_windows,
+        "phase_configurations": tuple(
+            (phase, epoch, digest, {tree.tree_id: tree})
+            for phase, epoch, digest, _ in phase_rows
+        ),
+    }
+
+    validation._validate_fault_contribution_opportunity_bijection(
+        markers=tuple(markers), opportunities=opportunities, **arguments
+    )
+
+    omitted = next(
+        marker
+        for marker in markers
+        if marker.actor == 9 and marker.epoch_number == 1
+    )
+    with pytest.raises(FactorialValidationError, match="epoch1_stable.*actor.*9"):
+        validation._validate_fault_contribution_opportunity_bijection(
+            markers=tuple(marker for marker in markers if marker != omitted),
+            opportunities=tuple(
+                opportunity
+                for opportunity in opportunities
+                if opportunity.identity != (omitted.actor, *(
+                    omitted.epoch_number,
+                    omitted.tree_id,
+                    omitted.epoch_digest,
+                    omitted.block_hash,
+                ))
+            ),
+            **arguments,
+        )
+
+
 def _valid_tiered_markers() -> tuple[FaultMarker, ...]:
     markers = [
         _tiered_marker(
@@ -2475,6 +2959,80 @@ def test_role_scoped_causality_binds_marker_role_to_physical_topology(
             },
             explicit_causal_linkage_windows=True,
         )
+
+
+def test_v13_v14_causality_dispatch_keeps_role41_and_cross_commit_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        validation,
+        "_validate_fault_marker_schedule",
+        lambda *args, **kwargs: calls.append("schedule"),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_tiered_observed_marker_completeness",
+        lambda *args, **kwargs: calls.append("legacy_completeness"),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_persistent_interior_proposals",
+        lambda *args, **kwargs: calls.append("legacy_persistent"),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_fault_contribution_opportunity_bijection",
+        lambda *args, **kwargs: calls.append("v14_bijection"),
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_role_scoped_epoch1_internal_opportunities",
+        lambda *args, **kwargs: calls.append("role41"),
+    )
+
+    def cross_commit(**_arguments: object) -> tuple[int, ...]:
+        calls.append("cross_commit")
+        return (2,)
+
+    monkeypatch.setattr(
+        validation,
+        "_validate_v9_cross_commit_retention_witnesses",
+        cross_commit,
+    )
+    arguments = _epoch1_causal_prefix_fixture()
+    markers = tuple(
+        replace(
+            marker,
+            fault_mode="tiered_persistent_responsive_omission_v2",
+            contribution_role="leaf",
+            role_contribution_ordinal=index,
+        )
+        for index, marker in enumerate(arguments["markers"], start=1)
+    )
+    common = {
+        **arguments,
+        "markers": markers,
+        "fault_mode": "tiered_persistent_responsive_omission_v2",
+        "require_cross_commit_retention_witnesses": True,
+        "explicit_causal_linkage_windows": True,
+    }
+
+    assert validate_fault_causality(**common) == 1
+    assert calls == [
+        "schedule",
+        "legacy_completeness",
+        "legacy_persistent",
+        "role41",
+        "cross_commit",
+    ]
+
+    calls.clear()
+    assert validate_fault_causality(
+        **common,
+        source_bound_contribution_opportunities=True,
+    ) == 1
+    assert calls == ["schedule", "v14_bijection", "role41", "cross_commit"]
 
 
 def test_v9_epoch1_causality_retains_its_frozen_suffix_interpretation(
@@ -4744,6 +5302,53 @@ def test_cleanup_validator_rejects_uncredible_signaled_exit(tmp_path: Path) -> N
         expected=expected,
         manager_events=(terminal,),
         drain_complete_ns=900,
+    )
+
+    with pytest.raises(FactorialValidationError, match="SIGINT-only"):
+        validation._validate_cleanup_ledger(
+            tmp_path,
+            expected=expected,
+            manager_events=(terminal,),
+            drain_complete_ns=900,
+            strict_sigint_contract=True,
+        )
+
+    for process in document["processes"]:
+        process["signal_number"] = int(signal.SIGINT)
+        process["returncode"] = -int(signal.SIGINT)
+    (tmp_path / validation.CLEANUP_LEDGER_FILENAME).write_bytes(_canonical(document))
+    validation._validate_cleanup_ledger(
+        tmp_path,
+        expected=expected,
+        manager_events=(terminal,),
+        drain_complete_ns=900,
+        strict_sigint_contract=True,
+    )
+
+    manager = document["processes"][0]
+    manager.update(
+        {
+            "signal_number": None,
+            "returncode": 0,
+            "classification": "expected_clean_exit",
+            "exit_authorization": {
+                "relative_path": terminal.relative_path,
+                "line_number": terminal.line_number,
+                "source_id": terminal.source_id,
+                "source_sequence": terminal.source_sequence,
+                "source_monotonic_ns": terminal.monotonic_ns,
+                "event_type": terminal.event_type,
+                "line_sha256": terminal.line_sha256,
+            },
+        }
+    )
+    (tmp_path / validation.CLEANUP_LEDGER_FILENAME).write_bytes(_canonical(document))
+    validation._validate_cleanup_ledger(
+        tmp_path,
+        expected=expected,
+        manager_events=(terminal,),
+        drain_complete_ns=900,
+        strict_sigint_contract=True,
     )
 
     document["processes"][1]["returncode"] = 7

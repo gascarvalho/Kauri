@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
+    BREAKTHROUGH_STRUCTURAL_GATE_V4,
+    EXECUTION_CLEANUP_CONTRACT_V1,
     EXPECTED_SLOT_COUNT,
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
@@ -23,6 +25,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
@@ -60,6 +63,10 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     V12_MANIFEST_SHA256,
     V12_PLAN_SHA256,
     V12_SEMANTIC_SHA256,
+    V13_MANIFEST_ID,
+    V13_MANIFEST_SHA256,
+    V13_PLAN_SHA256,
+    V13_SEMANTIC_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -80,6 +87,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
+)
+V13_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
 )
 V12_MANIFEST_PATH = (
@@ -338,7 +348,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v13/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v14/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -408,8 +418,9 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
         RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
     )
     assert responsive.marker_completeness_witness == (
-        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
     )
+    assert manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
     assert responsive.causal_timeout_eligibility == (
         RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
     )
@@ -645,6 +656,16 @@ def test_tiered_schema_rejects_observer_injection_schedule_and_bound_drift() -> 
     with pytest.raises(FactorialManifestError, match="fields"):
         parse_manifest_bytes(_encoded(document))
 
+    document = _mutable_document()
+    document["execution"]["cleanup_contract"] = "manager_zero_unconditionally"  # type: ignore[index]
+    with pytest.raises(FactorialManifestError, match="execution"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    del document["execution"]["cleanup_contract"]  # type: ignore[index]
+    with pytest.raises(FactorialManifestError, match="execution"):
+        parse_manifest_bytes(_encoded(document))
+
     with pytest.raises(FactorialManifestError, match="proper subset"):
         derive_responsive_degraded_actor_ids(7, 5, (5, 6), 41_700)
     with pytest.raises(FactorialManifestError, match=r"\[Q, N\)"):
@@ -731,19 +752,7 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
         "breakthrough_scope": (
             "n31_f5_placement_arms_p_and_ps_five_matched_blocks_v1"
         ),
-        "breakthrough_structural_gate": (
-            "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_and_"
-            "every_41st_unique_non_root_responsive_degraded_omission_schedule_"
-            "and_each_hard_actor_has_f_plus_1_distinct_exact_role_bound_timeout_"
-            "reporters_and_at_least_one_internal_omit_aggregate_proof_and_each_"
-            "responsive_degraded_actor_has_its_own_exact_reporter_local_epoch1_"
-            "internal_omit_aggregate_cross_commit_witness_and_responsive_"
-            "degraded_replicas_rank_below_every_fast_replica_and_epoch1_places_"
-            "every_responsive_degraded_replica_as_a_root_and_exposes_each_in_an_"
-            "internal_role_and_epoch2_roots_equal_top_q_fast_replicas_with_only_"
-            "fast_replicas_in_root_and_internal_roles_and_all_f_worse_replicas_"
-            "as_physical_leaves_and_only_hard_cohort_wait_exempt_v3"
-        ),
+        "breakthrough_structural_gate": BREAKTHROUGH_STRUCTURAL_GATE_V4,
         "breakthrough_structural_required_slot_count": 10,
         "breakthrough_realized_placement_rule": (
             "for_each_p_and_ps_arm_all_5_of_5_n31_f5_blocks_have_"
@@ -1401,7 +1410,7 @@ def test_v12_only_changes_the_role_scoped_omission_contract_from_v11() -> None:
 
 
 def test_v13_only_changes_direct_vote_scoring_identity_from_v12() -> None:
-    v13_document = json.loads(MANIFEST_PATH.read_bytes())
+    v13_document = json.loads(V13_MANIFEST_PATH.read_bytes())
     v12_document = json.loads(V12_MANIFEST_PATH.read_bytes())
 
     assert v13_document.pop("manifest_id") == "shape-placement-factorial-v13"
@@ -1419,6 +1428,60 @@ def test_v13_only_changes_direct_vote_scoring_identity_from_v12() -> None:
         "shape25-sensitive-responsiveness-v1"
     )
     assert v13_document == v12_document
+
+
+def test_v14_only_freezes_source_bound_markers_and_cleanup_from_v13() -> None:
+    v14 = load_frozen_manifest(MANIFEST_PATH)
+    v13 = load_frozen_manifest(V13_MANIFEST_PATH)
+
+    assert v14.manifest_id == FROZEN_MANIFEST_ID
+    assert v13.manifest_id == V13_MANIFEST_ID
+    assert v13.manifest_sha256 == V13_MANIFEST_SHA256
+    assert build_factorial_plan(v13).plan_sha256 == V13_PLAN_SHA256
+    assert hashlib.sha256(
+        json.dumps(
+            json.loads(V13_MANIFEST_PATH.read_bytes()),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    ).hexdigest() == V13_SEMANTIC_SHA256
+
+    v14_document = json.loads(MANIFEST_PATH.read_bytes())
+    v13_document = json.loads(V13_MANIFEST_PATH.read_bytes())
+    assert v14_document.pop("manifest_id") == "shape-placement-factorial-v14"
+    assert v13_document.pop("manifest_id") == "shape-placement-factorial-v13"
+    assert v14_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v14"
+    )
+    assert v13_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v13"
+    )
+    v14_responsive = v14_document["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    v13_responsive = v13_document["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    assert v14_responsive.pop("marker_completeness_witness") == (  # type: ignore[union-attr]
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
+    )
+    assert v13_responsive.pop("marker_completeness_witness") == (  # type: ignore[union-attr]
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+    )
+    v14_gate = v14_document["claim_scope"].pop(  # type: ignore[index]
+        "breakthrough_structural_gate"
+    )
+    v13_gate = v13_document["claim_scope"].pop(  # type: ignore[index]
+        "breakthrough_structural_gate"
+    )
+    assert "fault_contribution_opportunity_to_kauri_fault_exact_bijection" in v14_gate
+    assert "per_phase_actor_nonvacuity" in v14_gate
+    assert v14_gate.endswith("_v4")
+    assert v13_gate.endswith("_v3")
+    assert v14_document["execution"].pop("cleanup_contract") == (  # type: ignore[index]
+        EXECUTION_CLEANUP_CONTRACT_V1
+    )
+    assert "cleanup_contract" not in v13_document["execution"]  # type: ignore[operator]
+    assert v14_document == v13_document
 
 
 def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:

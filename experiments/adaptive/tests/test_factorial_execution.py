@@ -15,6 +15,7 @@ import pytest
 
 from experiments.adaptive.kauri_experiment import factorial_execution as execution
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
+    EXECUTION_CLEANUP_CONTRACT_V1,
     build_factorial_plan,
     load_frozen_manifest,
 )
@@ -30,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
 
 
 @pytest.fixture(scope="module")
@@ -2839,6 +2840,16 @@ def test_cleanup_classifies_only_terminal_authorized_zero_manager_exit(
         )
     else:
         assert manager_row["exit_authorization"] is None
+
+
+def test_v14_cleanup_contract_matches_the_execution_classification_boundary(
+    template_slot,
+) -> None:
+    smoke = execution.build_n7_ps_smoke_slot(template_slot)
+
+    assert template_slot.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
+    assert smoke.slot.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
+    assert smoke.runtime.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
 
 
 @pytest.mark.parametrize(

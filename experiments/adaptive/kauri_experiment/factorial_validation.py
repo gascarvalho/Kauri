@@ -50,6 +50,7 @@ import signal
 from typing import Any
 
 from .factorial_manifest import (
+    EXECUTION_CLEANUP_CONTRACT_V1,
     EXPECTED_ARM_CODES,
     EXPECTED_BLOCK_COUNT,
     EXPECTED_SLOT_COUNT,
@@ -65,6 +66,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
@@ -99,6 +101,9 @@ from .factorial_manifest import (
     V12_MANIFEST_ID,
     V12_MANIFEST_SHA256,
     V12_PLAN_SHA256,
+    V13_MANIFEST_ID,
+    V13_MANIFEST_SHA256,
+    V13_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -196,11 +201,17 @@ V12_RUNTIME_SHA256 = (
 V12_SMOKE_RUNTIME_SHA256 = (
     "21661e6b936bbeaa5983b66c669d67a4ffb846c1e534cdc9e6563856f039978e"
 )
-FROZEN_RUNTIME_SHA256 = (
+V13_RUNTIME_SHA256 = (
     "613e78129d1f600f9690a9fe3dad18c2f9f7515c247958e0215a1f0d4ef7a693"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V13_SMOKE_RUNTIME_SHA256 = (
     "5f70c7b117be7a5f425e9cd19b421cbc7958a4904daf7336b2989eea4fce641e"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "1aacea1a7c7e72158df7661514acdc26f474fd4292eed9b108ecabc645c604e6"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "82b5f4bf0f90b93f34e374b96f09de55b8a2953a9ef83d2e533d3a16362be6d3"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -284,6 +295,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -317,11 +329,32 @@ def _uses_explicit_phase_edge_eligibility(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return responsive is not None and (
-        responsive.marker_completeness_witness,
-        responsive.causal_timeout_eligibility,
-    ) == (
-        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
-        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+        responsive.marker_completeness_witness
+        in {
+            RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+            RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
+        }
+        and responsive.causal_timeout_eligibility
+        == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+    )
+
+
+def _uses_source_bound_contribution_opportunities(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and responsive.marker_completeness_witness
+        == RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
+    )
+
+
+def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
     )
 
 
@@ -494,6 +527,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             runtime_sha256=V12_RUNTIME_SHA256,
             smoke_runtime_sha256=V12_SMOKE_RUNTIME_SHA256,
         ),
+        V13_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V13_MANIFEST_ID,
+            manifest_sha256=V13_MANIFEST_SHA256,
+            plan_sha256=V13_PLAN_SHA256,
+            runtime_sha256=V13_RUNTIME_SHA256,
+            smoke_runtime_sha256=V13_SMOKE_RUNTIME_SHA256,
+        ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
             manifest_sha256=FROZEN_MANIFEST_SHA256,
@@ -578,6 +618,51 @@ class FaultMarker:
     contribution_ordinal: int | None = None
     contribution_role: str | None = None
     role_contribution_ordinal: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FaultContributionOpportunity:
+    source_replica: int
+    relative_path: str
+    line_number: int
+    source_sequence: int
+    event_monotonic_ns: int
+    line_sha256: str
+    actor: int
+    epoch_number: int
+    tree_id: int
+    epoch_digest: str
+    block_hash: str
+    view_generation: int
+    physical_role: str
+    parent_replica: int
+    expected_message_type: str
+    cohort: str
+    window: str
+    window_start_ns: int
+    window_end_ns: int
+    decision_monotonic_ns: int
+    contribution_ordinal: int
+    role_contribution_ordinal: int
+    scheduled_action: str
+    responsive_omission_period: int
+    fault_threshold: int
+    hard_actor_count: int
+    responsive_degraded_actor_count: int
+    fault_mode: str
+
+    @property
+    def proposal_key(self) -> tuple[int, int, str, str]:
+        return (
+            self.epoch_number,
+            self.tree_id,
+            self.epoch_digest,
+            self.block_hash,
+        )
+
+    @property
+    def identity(self) -> tuple[int, int, int, str, str]:
+        return (self.actor, *self.proposal_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2341,7 +2426,7 @@ def _validate_runtime_slot(
             artifact_identity.update(
                 {
                     "marker_completeness_witness": (
-                        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+                        responsive_contract.marker_completeness_witness
                     ),
                     "causal_timeout_eligibility": (
                         RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
@@ -2356,6 +2441,8 @@ def _validate_runtime_slot(
             "slot_id": expected.slot_id,
             "slot_nonce": expected.slot_nonce,
         }
+    if manifest.cleanup_contract is not None:
+        artifact_identity["cleanup_contract"] = manifest.cleanup_contract
     checks = {
         "schema_version": 1,
         "artifact_id": "slot-runtime-"
@@ -2427,7 +2514,7 @@ def _validate_runtime_slot(
             expected_tiered.update(
                 {
                     "marker_completeness_witness": (
-                        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+                        responsive_contract.marker_completeness_witness
                     ),
                     "causal_timeout_eligibility": (
                         RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
@@ -2438,6 +2525,11 @@ def _validate_runtime_slot(
             _fail("runtime tiered cohort contract differs from independent derivation")
     elif "tiered_cohorts" in runtime:
         _fail("legacy runtime unexpectedly carries tiered cohort semantics")
+    if manifest.cleanup_contract is None:
+        if "cleanup_contract" in runtime:
+            _fail("legacy runtime unexpectedly carries a cleanup contract")
+    elif runtime.get("cleanup_contract") != manifest.cleanup_contract:
+        _fail("runtime cleanup contract differs from the frozen manifest")
     timers = manifest.common_timers
     config = _mapping(runtime.get("main_config"), "runtime main_config")
     expected_lines = {
@@ -2499,6 +2591,7 @@ def _validate_runtime_slot(
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -3800,6 +3893,369 @@ def _fault_markers(
     return tuple(markers)
 
 
+def _fault_contribution_opportunities(
+    replica_events: Mapping[int, Sequence[_NativeEvent]],
+) -> tuple[FaultContributionOpportunity, ...]:
+    """Parse prospective source-bound contribution opportunities exactly."""
+
+    expected_payload_fields = {
+        "actor",
+        "proposal",
+        "view_generation",
+        "physical_role",
+        "parent_replica",
+        "expected_message_type",
+        "cohort",
+        "diagnostic_window",
+        "window_start_monotonic_ns",
+        "window_end_monotonic_ns",
+        "decision_monotonic_ns",
+        "contribution_ordinal",
+        "role_contribution_ordinal",
+        "scheduled_action",
+        "responsive_omission_period",
+        "fault_threshold",
+        "hard_actor_count",
+        "responsive_degraded_actor_count",
+        "fault_mode",
+    }
+    expected_proposal_fields = {
+        "epoch_number",
+        "tree_id",
+        "epoch_digest",
+        "block_hash",
+    }
+    opportunities: list[FaultContributionOpportunity] = []
+    seen: set[tuple[int, int, int, str, str]] = set()
+
+    def uint64(value: object, label: str, *, minimum: int = 0) -> int:
+        parsed = _integer(value, label, minimum)
+        if parsed > _UINT64_MAX:
+            _fail(f"{label} exceeds its unsigned 64-bit bound")
+        return parsed
+
+    for replica_id, events in replica_events.items():
+        for event in events:
+            if event.event_type != "fault.contribution_opportunity":
+                continue
+            label = f"{event.relative_path}:{event.line_number}"
+            payload = event.payload
+            _fields(
+                payload,
+                expected_payload_fields,
+                f"{label} fault contribution opportunity payload schema",
+            )
+            proposal = _mapping(
+                payload["proposal"],
+                f"{label} fault contribution opportunity proposal",
+            )
+            _fields(
+                proposal,
+                expected_proposal_fields,
+                f"{label} fault contribution opportunity proposal schema",
+            )
+            actor = uint64(payload["actor"], f"{label} actor")
+            if (
+                event.source_kind != "replica"
+                or event.source_id != f"replica-{actor}"
+                or replica_id != actor
+            ):
+                _fail(
+                    "fault contribution opportunity source actor differs from "
+                    "its exact replica stream"
+                )
+            view_generation = uint64(
+                payload["view_generation"],
+                f"{label} view generation",
+                minimum=1,
+            )
+            physical_role = _string(
+                payload["physical_role"], f"{label} physical role"
+            )
+            expected_message_type = _string(
+                payload["expected_message_type"],
+                f"{label} expected message type",
+            )
+            cohort = _string(payload["cohort"], f"{label} cohort")
+            action = _string(
+                payload["scheduled_action"], f"{label} scheduled action"
+            )
+            if physical_role not in {"internal", "leaf"}:
+                _fail("fault contribution opportunity physical role is invalid")
+            if expected_message_type not in {"aggregate_relay", "direct_vote"}:
+                _fail("fault contribution opportunity expected message type is invalid")
+            if cohort not in {"hard", "responsive_degraded"}:
+                _fail("fault contribution opportunity cohort is invalid")
+            if action not in {"forward", "omit_aggregate", "omit_direct_vote"}:
+                _fail("fault contribution opportunity scheduled action is invalid")
+            fault_mode = _string(payload["fault_mode"], f"{label} fault mode")
+            if fault_mode != _TIERED_OMISSION_MODE_V2:
+                _fail("fault contribution opportunity mode is not the v14 schedule")
+            window_start_ns = uint64(
+                payload["window_start_monotonic_ns"],
+                f"{label} window start",
+                minimum=1,
+            )
+            window_end_ns = uint64(
+                payload["window_end_monotonic_ns"],
+                f"{label} window end",
+                minimum=1,
+            )
+            decision_ns = uint64(
+                payload["decision_monotonic_ns"],
+                f"{label} decision timestamp",
+                minimum=1,
+            )
+            if not window_start_ns <= decision_ns < window_end_ns:
+                _fail(
+                    "fault contribution opportunity decision timestamp is outside "
+                    "its exact diagnostic window"
+                )
+            hard_actor_count = uint64(
+                payload["hard_actor_count"],
+                f"{label} hard actor count",
+                minimum=1,
+            )
+            responsive_actor_count = uint64(
+                payload["responsive_degraded_actor_count"],
+                f"{label} responsive-degraded actor count",
+                minimum=1,
+            )
+            fault_threshold = uint64(
+                payload["fault_threshold"],
+                f"{label} fault threshold",
+                minimum=1,
+            )
+            if hard_actor_count + responsive_actor_count != fault_threshold:
+                _fail(
+                    "fault contribution opportunity cohort counts do not equal "
+                    "the fault threshold"
+                )
+            opportunity = FaultContributionOpportunity(
+                source_replica=replica_id,
+                relative_path=event.relative_path,
+                line_number=event.line_number,
+                source_sequence=event.source_sequence,
+                event_monotonic_ns=event.monotonic_ns,
+                line_sha256=event.line_sha256,
+                actor=actor,
+                epoch_number=uint64(
+                    proposal["epoch_number"], f"{label} proposal epoch"
+                ),
+                tree_id=uint64(proposal["tree_id"], f"{label} proposal tree"),
+                epoch_digest=_digest(
+                    proposal["epoch_digest"], f"{label} proposal epoch digest"
+                ),
+                block_hash=_digest(
+                    proposal["block_hash"], f"{label} proposal block hash"
+                ),
+                view_generation=view_generation,
+                physical_role=physical_role,
+                parent_replica=uint64(
+                    payload["parent_replica"], f"{label} physical parent"
+                ),
+                expected_message_type=expected_message_type,
+                cohort=cohort,
+                window=_string(
+                    payload["diagnostic_window"], f"{label} diagnostic window"
+                ),
+                window_start_ns=window_start_ns,
+                window_end_ns=window_end_ns,
+                decision_monotonic_ns=decision_ns,
+                contribution_ordinal=uint64(
+                    payload["contribution_ordinal"],
+                    f"{label} contribution ordinal",
+                ),
+                role_contribution_ordinal=uint64(
+                    payload["role_contribution_ordinal"],
+                    f"{label} role contribution ordinal",
+                ),
+                scheduled_action=action,
+                responsive_omission_period=uint64(
+                    payload["responsive_omission_period"],
+                    f"{label} responsive omission period",
+                    minimum=2,
+                ),
+                fault_threshold=fault_threshold,
+                hard_actor_count=hard_actor_count,
+                responsive_degraded_actor_count=responsive_actor_count,
+                fault_mode=fault_mode,
+            )
+            if opportunity.identity in seen:
+                _fail(
+                    "fault contribution opportunity contains a duplicate actor/"
+                    "ProposalKey identity"
+                )
+            seen.add(opportunity.identity)
+            opportunities.append(opportunity)
+    return tuple(opportunities)
+
+
+def _validate_fault_contribution_opportunity_bijection(
+    *,
+    markers: Sequence[FaultMarker],
+    opportunities: Sequence[FaultContributionOpportunity],
+    fault_actor_ids: Sequence[int],
+    phase_windows: Mapping[str, tuple[int, int, int]],
+    phase_configurations: Sequence[
+        tuple[str, int, str, Mapping[int, Tree]]
+    ],
+) -> None:
+    """Prove exact v14 event/marker pairing and per-phase actor coverage."""
+
+    actors = frozenset(fault_actor_ids)
+    marker_by_identity: dict[tuple[int, int, int, str, str], FaultMarker] = {}
+    for marker in markers:
+        identity = (
+            marker.actor,
+            marker.epoch_number,
+            marker.tree_id,
+            marker.epoch_digest,
+            marker.block_hash,
+        )
+        if identity in marker_by_identity:
+            _fail("v14 contribution pairing contains a duplicate KAURI_FAULT marker")
+        marker_by_identity[identity] = marker
+    opportunity_by_identity: dict[
+        tuple[int, int, int, str, str], FaultContributionOpportunity
+    ] = {}
+    for opportunity in opportunities:
+        if opportunity.identity in opportunity_by_identity:
+            _fail("v14 contribution pairing contains a duplicate structured event")
+        opportunity_by_identity[opportunity.identity] = opportunity
+
+    marker_only = set(marker_by_identity) - set(opportunity_by_identity)
+    event_only = set(opportunity_by_identity) - set(marker_by_identity)
+    if marker_only:
+        _fail(
+            "v14 contribution pairing has marker-only actor/ProposalKey "
+            f"identities: {sorted(marker_only)}"
+        )
+    if event_only:
+        _fail(
+            "v14 contribution pairing has event-only actor/ProposalKey "
+            f"identities: {sorted(event_only)}"
+        )
+
+    configurations: dict[tuple[int, str], Mapping[int, Tree]] = {}
+    for phase, epoch_number, epoch_digest, trees in phase_configurations:
+        if phase not in phase_windows:
+            _fail(f"v14 contribution pairing lacks the {phase} phase window")
+        key = (epoch_number, epoch_digest)
+        previous = configurations.setdefault(key, trees)
+        if previous != trees:
+            _fail("v14 contribution pairing configuration topology is ambiguous")
+
+    for identity, marker in marker_by_identity.items():
+        opportunity = opportunity_by_identity[identity]
+        if marker.actor not in actors or opportunity.actor not in actors:
+            _fail("v14 contribution pairing references an unscheduled actor")
+        shared_marker = (
+            marker.source_replica,
+            marker.actor,
+            marker.epoch_number,
+            marker.tree_id,
+            marker.epoch_digest,
+            marker.block_hash,
+            marker.fault_mode,
+            marker.window,
+            marker.window_start_ns,
+            marker.window_end_ns,
+            marker.monotonic_ns,
+            marker.cohort,
+            marker.action,
+            marker.contribution_ordinal,
+            marker.role_contribution_ordinal,
+            marker.responsive_omission_period,
+            marker.fault_threshold,
+            marker.hard_actor_count,
+            marker.responsive_degraded_actor_count,
+        )
+        shared_event = (
+            opportunity.source_replica,
+            opportunity.actor,
+            opportunity.epoch_number,
+            opportunity.tree_id,
+            opportunity.epoch_digest,
+            opportunity.block_hash,
+            opportunity.fault_mode,
+            opportunity.window,
+            opportunity.window_start_ns,
+            opportunity.window_end_ns,
+            opportunity.decision_monotonic_ns,
+            opportunity.cohort,
+            opportunity.scheduled_action,
+            opportunity.contribution_ordinal,
+            opportunity.role_contribution_ordinal,
+            opportunity.responsive_omission_period,
+            opportunity.fault_threshold,
+            opportunity.hard_actor_count,
+            opportunity.responsive_degraded_actor_count,
+        )
+        if shared_event != shared_marker:
+            _fail(
+                "v14 contribution opportunity and KAURI_FAULT shared fields drifted"
+            )
+        trees = configurations.get(
+            (opportunity.epoch_number, opportunity.epoch_digest)
+        )
+        tree = None if trees is None else trees.get(opportunity.tree_id)
+        if tree is None or opportunity.actor not in tree.members:
+            _fail(
+                "v14 contribution opportunity references an unknown exact "
+                "configuration/tree actor"
+            )
+        position = tree.members.index(opportunity.actor)
+        if position == 0:
+            _fail("v14 contribution opportunity actor is a physical root")
+        leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+        expected_role = "internal" if position < leaf_start else "leaf"
+        expected_parent = tree.members[(position - 1) // tree.fanout]
+        expected_message_type = (
+            "aggregate_relay" if expected_role == "internal" else "direct_vote"
+        )
+        if opportunity.physical_role != expected_role:
+            _fail(
+                "v14 contribution opportunity physical role differs from the "
+                "exact epoch tree"
+            )
+        if opportunity.parent_replica != expected_parent:
+            _fail(
+                "v14 contribution opportunity physical parent differs from the "
+                "exact epoch tree"
+            )
+        if opportunity.expected_message_type != expected_message_type:
+            _fail(
+                "v14 contribution opportunity message type differs from its "
+                "exact physical role"
+            )
+
+    for phase, epoch_number, epoch_digest, trees in phase_configurations:
+        start_ns, end_ns, bucket_count = phase_windows[phase]
+        span_ns = end_ns - start_ns
+        if bucket_count <= 2 or span_ns <= 0 or span_ns % bucket_count:
+            _fail(f"{phase} cannot derive its frozen interior bucket boundary")
+        bucket_width_ns = span_ns // bucket_count
+        interior_start = start_ns + bucket_width_ns
+        interior_end = end_ns - bucket_width_ns
+        for actor in sorted(actors):
+            represented = any(
+                opportunity.actor == actor
+                and opportunity.epoch_number == epoch_number
+                and opportunity.epoch_digest == epoch_digest
+                and opportunity.tree_id in trees
+                and interior_start
+                <= opportunity.decision_monotonic_ns
+                < interior_end
+                for opportunity in opportunities
+            )
+            if not represented:
+                _incomplete(
+                    f"{phase} scheduled actor {actor} lacks a source-bound "
+                    "contribution opportunity in the frozen interior"
+                )
+
+
 def _response_attempt_arm_markers(
     slot_root: Path,
     paths_by_replica: Mapping[int, Sequence[str]],
@@ -4620,6 +5076,7 @@ def _validate_role_scoped_epoch1_internal_opportunities(
 def validate_fault_causality(
     *,
     markers: Sequence[FaultMarker],
+    contribution_opportunities: Sequence[FaultContributionOpportunity] = (),
     arm_markers: Sequence[ResponseAttemptArmMarker] = (),
     replica_events: Mapping[int, Sequence[_NativeEvent]],
     actor_ids: Sequence[int],
@@ -4653,6 +5110,7 @@ def validate_fault_causality(
     epoch1_selection_ns: int | None = None,
     epoch2_selection_ns: int | None = None,
     responsive_omission_period: int = _V8_RESPONSIVE_OMISSION_PERIOD,
+    source_bound_contribution_opportunities: bool = False,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
@@ -4732,7 +5190,25 @@ def validate_fault_causality(
         and epoch2_phase[0] < epoch2_phase[1] <= window_end_ns
     ):
         _fail("fault causality phase windows are outside their exact live bounds")
-    if tiered:
+    phase_configurations = (
+        ("fault_evidence", 0, initial_epoch_digest, tree_by_id),
+        ("epoch1_stable", 1, epoch1_digest, epoch1_tree_by_id),
+        ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
+    )
+    if source_bound_contribution_opportunities:
+        if not role_scoped:
+            _fail(
+                "source-bound contribution opportunities require the role-scoped "
+                "tiered fault schedule"
+            )
+        _validate_fault_contribution_opportunity_bijection(
+            markers=markers,
+            opportunities=contribution_opportunities,
+            fault_actor_ids=tuple(all_fault_actors),
+            phase_windows=phase_windows,
+            phase_configurations=phase_configurations,
+        )
+    elif tiered:
         _validate_tiered_observed_marker_completeness(
             markers,
             fault_actor_ids=tuple(all_fault_actors),
@@ -4743,13 +5219,9 @@ def validate_fault_causality(
                 else None
             ),
             phase_windows=phase_windows,
-            phase_configurations=(
-                ("fault_evidence", 0, initial_epoch_digest, tree_by_id),
-                ("epoch1_stable", 1, epoch1_digest, epoch1_tree_by_id),
-                ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
-            ),
+            phase_configurations=phase_configurations,
         )
-    if fault_mode in {
+    if not source_bound_contribution_opportunities and fault_mode in {
         "persistent_selected_omission_v1",
         *_TIERED_OMISSION_MODES,
     }:
@@ -4761,11 +5233,7 @@ def validate_fault_causality(
             ),
             actor_ids=actors,
             phase_windows=phase_windows,
-            phase_configurations=(
-                ("fault_evidence", 0, initial_epoch_digest, tree_by_id),
-                ("epoch1_stable", 1, epoch1_digest, epoch1_tree_by_id),
-                ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
-            ),
+            phase_configurations=phase_configurations,
         )
     def outstanding_timeout_index(
         records: Sequence[_EvidenceRecord],
@@ -5913,6 +6381,7 @@ def _validate_cleanup_ledger(
     expected: _ExpectedSlot,
     manager_events: Sequence[_NativeEvent],
     drain_complete_ns: int,
+    strict_sigint_contract: bool = False,
 ) -> None:
     loaded = _read_json(slot_root, CLEANUP_LEDGER_FILENAME)
     assert loaded is not None
@@ -6011,6 +6480,11 @@ def _validate_cleanup_ledger(
     def credible_cleanup_exit(row: Mapping[str, Any]) -> bool:
         signal_number = row["signal_number"]
         returncode = row["returncode"]
+        if strict_sigint_contract:
+            return signal_number == signal.SIGINT and returncode in (
+                0,
+                -signal.SIGINT,
+            )
         if signal_number in (signal.SIGINT, signal.SIGTERM):
             return returncode in (0, -signal_number)
         if signal_number == signal.SIGKILL:
@@ -6025,7 +6499,8 @@ def _validate_cleanup_ledger(
             or row["exit_authorization"] is not None
             or not credible_cleanup_exit(row)
         ):
-            _fail("cleanup ledger replica lifecycle drifted")
+            qualifier = " under the SIGINT-only contract" if strict_sigint_contract else ""
+            _fail(f"cleanup ledger replica lifecycle drifted{qualifier}")
     manager = by_name["adaptive-manager"]
     if manager["replica_id"] is not None:
         _fail("cleanup ledger manager replica identity drifted")
@@ -6041,7 +6516,11 @@ def _validate_cleanup_ledger(
             manager["exit_authorization"] is not None
             or not credible_cleanup_exit(manager)
         ):
-            _fail("cleaned-up manager carries an invalid exit authorization")
+            qualifier = " under the SIGINT-only contract" if strict_sigint_contract else ""
+            _fail(
+                "cleaned-up manager carries an invalid exit authorization"
+                f"{qualifier}"
+            )
     else:
         _fail("cleanup ledger manager lifecycle is not accepted")
 
@@ -7634,6 +8113,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             expected=expected,
             manager_events=manager_events,
             drain_complete_ns=cutoff_times["epoch2_drain_complete"],
+            strict_sigint_contract=_uses_strict_sigint_cleanup(manifest),
         )
         _validate_native_transitions(
             manager_events=manager_events,
@@ -7664,6 +8144,14 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             for replica_id in range(expected.replica_count)
         }
         markers = _fault_markers(slot_root, paths_by_replica)
+        source_bound_contribution_opportunities = (
+            _uses_source_bound_contribution_opportunities(manifest)
+        )
+        contribution_opportunities = (
+            _fault_contribution_opportunities(replica_events)
+            if source_bound_contribution_opportunities
+            else ()
+        )
         arm_markers = (
             _response_attempt_arm_markers(slot_root, paths_by_replica)
             if manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
@@ -7700,6 +8188,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         )
         internal_cross_commit_witness_count = validate_fault_causality(
             markers=markers,
+            contribution_opportunities=contribution_opportunities,
             arm_markers=arm_markers,
             replica_events=replica_events,
             actor_ids=expected.actor_ids,
@@ -7770,6 +8259,9 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 responsive_contract.omission_period
                 if responsive_contract is not None
                 else _V8_RESPONSIVE_OMISSION_PERIOD
+            ),
+            source_bound_contribution_opportunities=(
+                source_bound_contribution_opportunities
             ),
         )
 

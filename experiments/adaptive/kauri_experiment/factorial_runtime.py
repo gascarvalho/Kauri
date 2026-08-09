@@ -15,10 +15,12 @@ import string
 from typing import Any
 
 from .factorial_manifest import (
+    EXECUTION_CLEANUP_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
     V10_MANIFEST_ID,
     V11_MANIFEST_ID,
     V12_MANIFEST_ID,
+    V13_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -29,6 +31,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1,
     ResponsivenessPolicyContract,
@@ -47,11 +50,17 @@ V12_RUNTIME_SHA256 = (
 V12_SMOKE_RUNTIME_SHA256 = (
     "21661e6b936bbeaa5983b66c669d67a4ffb846c1e534cdc9e6563856f039978e"
 )
-FROZEN_RUNTIME_SHA256 = (
+V13_RUNTIME_SHA256 = (
     "613e78129d1f600f9690a9fe3dad18c2f9f7515c247958e0215a1f0d4ef7a693"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V13_SMOKE_RUNTIME_SHA256 = (
     "5f70c7b117be7a5f425e9cd19b421cbc7958a4904daf7336b2989eea4fce641e"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "1aacea1a7c7e72158df7661514acdc26f474fd4292eed9b108ecabc645c604e6"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "82b5f4bf0f90b93f34e374b96f09de55b8a2953a9ef83d2e533d3a16362be6d3"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -456,12 +465,15 @@ class SlotRuntimeSpec(_Document):
     process_logs: ProcessLogContract
     manager_argv_template: ManagerArgvTemplate
     replica_argv_templates: tuple[ReplicaProcessSpec, ...]
+    cleanup_contract: str | None = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
         document["fault_window"] = self.fault_window.as_document()
         document["epoch1_placement"] = self.epoch1_placement.as_document()
         document["epoch2_placement"] = self.epoch2_placement.as_document()
+        if self.cleanup_contract is None:
+            document.pop("cleanup_contract")
         if self.tiered_cohorts is None:
             document.pop("tiered_cohorts")
         else:
@@ -653,6 +665,15 @@ def _tiered_cohort_contract(
             RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
             RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
             RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+        ),
+        (
+            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+            RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+            RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+            RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
             RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
         ),
     }:
@@ -1122,6 +1143,8 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
                     ),
                 }
             )
+    if slot.cleanup_contract is not None:
+        identity["cleanup_contract"] = slot.cleanup_contract
     return SlotRuntimeSpec(
         schema_version=1,
         artifact_id=f"slot-runtime-{_digest(identity)[:24]}",
@@ -1165,6 +1188,7 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
         replica_argv_templates=_replica_argv_templates(
             slot, main_config, structured_events, tiered_cohorts
         ),
+        cleanup_contract=slot.cleanup_contract,
     )
 
 
@@ -1423,6 +1447,15 @@ def runtime_preflight(
     if len({slot.artifact_id for slot in runtime.slots}) != len(runtime.slots):
         raise FactorialManifestError("slot runtime artifact IDs are not unique")
     for slot in runtime.slots:
+        expected_cleanup_contract = (
+            EXECUTION_CLEANUP_CONTRACT_V1
+            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            else None
+        )
+        if slot.cleanup_contract != expected_cleanup_contract:
+            raise FactorialManifestError(
+                f"slot cleanup contract drifted: {slot.slot_id}"
+            )
         manager_template = slot.manager_argv_template.argv
         policy = slot.responsiveness_policy
         expected_residencies_ms = (
@@ -1501,11 +1534,10 @@ def runtime_preflight(
                     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
                     RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
                     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
-                    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+                    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
                 )
-                if runtime.manifest_id
-                in {V11_MANIFEST_ID, V12_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                if runtime.manifest_id == FROZEN_MANIFEST_ID
                 else (
                     (
                         RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
@@ -1513,22 +1545,35 @@ def runtime_preflight(
                         RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
                         RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
                         RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
-                        None,
-                        None,
+                        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+                        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
                     )
-                    if runtime.manifest_id == V10_MANIFEST_ID
+                    if runtime.manifest_id
+                    in {V11_MANIFEST_ID, V12_MANIFEST_ID, V13_MANIFEST_ID}
                     else (
                         (
                             RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
                             RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
-                            None,
-                            None,
-                            None,
+                            RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+                            RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+                            RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
                             None,
                             None,
                         )
-                        if runtime.manifest_id == V9_MANIFEST_ID
-                        else (None, None, None, None, None, None, None)
+                        if runtime.manifest_id == V10_MANIFEST_ID
+                        else (
+                            (
+                                RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                                RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            if runtime.manifest_id == V9_MANIFEST_ID
+                            else (None, None, None, None, None, None, None)
+                        )
                     )
                 )
             )
@@ -1540,6 +1585,7 @@ def runtime_preflight(
                     V10_MANIFEST_ID,
                     V11_MANIFEST_ID,
                     V12_MANIFEST_ID,
+                    V13_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -1547,7 +1593,7 @@ def runtime_preflight(
             expected_tiered_mode = (
                 "tiered_persistent_responsive_omission_v2"
                 if runtime.manifest_id
-                in {V12_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                in {V12_MANIFEST_ID, V13_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else "tiered_persistent_responsive_omission_v1"
             )
             expected_responsive_schedule = _responsive_actor_schedule(
@@ -1824,6 +1870,8 @@ __all__ = (
     "V11_SMOKE_RUNTIME_SHA256",
     "V12_RUNTIME_SHA256",
     "V12_SMOKE_RUNTIME_SHA256",
+    "V13_RUNTIME_SHA256",
+    "V13_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

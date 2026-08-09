@@ -119,14 +119,23 @@ V12_SEMANTIC_SHA256 = (
 )
 V12_PLAN_SHA256 = "1025a7eca7c41e0c5619e9ad357c07709b0ffe66addbc14ba3cd2592f121d298"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v13"
-FROZEN_MANIFEST_SHA256 = (
+V13_MANIFEST_ID = "shape-placement-factorial-v13"
+V13_MANIFEST_SHA256 = (
     "546ce4a3bfecfe62678926f8a0d71cc8ce7db771ed5dd347ef42d15ba39af36b"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V13_SEMANTIC_SHA256 = (
     "3676585af0ff9afe4e36a66e692ab8b604495188fa40afaaff75e5c574b3c629"
 )
-FROZEN_PLAN_SHA256 = "bbca567114a12034fd41318c856a15eda66bf2cf2efe076398978ca1164bc7ed"
+V13_PLAN_SHA256 = "bbca567114a12034fd41318c856a15eda66bf2cf2efe076398978ca1164bc7ed"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v14"
+FROZEN_MANIFEST_SHA256 = (
+    "f2e03faf00749f8098c9e6e136b5d82a657d8239858ff3571b636ef781bedc08"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "9611a2b61343c73fc99fea12d8aca097369328301f9a0b92b23a93eb619b9de1"
+)
+FROZEN_PLAN_SHA256 = "674ee1227c70f9aa3d08fe060583adf7ae47fd167d5ba7decaa14e5edd5c4653"
 
 RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1 = (
     "retain_unanswered_exact_parent_child_attempt_across_consensus_commit_until_"
@@ -150,12 +159,33 @@ RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1 = (
 RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1 = (
     "exact_proposal_root_local_aggregation_activity_in_frozen_interior_v1"
 )
+RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2 = (
+    "source_bound_fault_contribution_opportunity_to_kauri_fault_exact_"
+    "bijection_with_per_phase_actor_nonvacuity_v2"
+)
 RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1 = (
     "exact_parent_attempt_absolute_deadline_strictly_before_selecting_transition_v1"
 )
 RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1 = (
     "omit_every_41st_unique_non_root_contribution_per_exact_epoch_identity_"
     "physical_role_stream_v1"
+)
+EXECUTION_CLEANUP_CONTRACT_V1 = (
+    "replicas_sigint_only_manager_sigint_or_exact_terminal_authorized_zero_v1"
+)
+BREAKTHROUGH_STRUCTURAL_GATE_V4 = (
+    "all_n31_f5_p_ps_slots_validate_source_bound_fault_contribution_"
+    "opportunity_to_kauri_fault_exact_bijection_with_per_phase_actor_"
+    "nonvacuity_and_tiered_markers_match_hard_and_every_41st_unique_non_"
+    "root_responsive_degraded_omission_schedule_and_each_hard_actor_has_f_"
+    "plus_1_distinct_exact_role_bound_timeout_reporters_and_at_least_one_"
+    "internal_omit_aggregate_proof_and_each_responsive_degraded_actor_has_"
+    "its_own_exact_reporter_local_epoch1_internal_omit_aggregate_cross_"
+    "commit_witness_and_responsive_degraded_replicas_rank_below_every_fast_"
+    "replica_and_epoch1_places_every_responsive_degraded_replica_as_a_root_"
+    "and_exposes_each_in_an_internal_role_and_epoch2_roots_equal_top_q_fast_"
+    "replicas_with_only_fast_replicas_in_root_and_internal_roles_and_all_f_"
+    "worse_replicas_as_physical_leaves_and_only_hard_cohort_wait_exempt_v4"
 )
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
@@ -468,6 +498,7 @@ class FrozenFactorialManifest:
     execution_outcome_dependent_order: bool
     execution_authorized: bool
     execution_receipt_required: bool
+    cleanup_contract: str | None = None
 
     def blocks_for(self, replica_count: int, initial_fanout: int) -> int:
         for override_n, override_fanout, blocks in self.repetition_overrides:
@@ -501,6 +532,7 @@ class FactorialSlot(_Document):
     common_timers: CommonTimers
     ports: PortAllocation
     result_path: str
+    cleanup_contract: str | None = None
     responsive_degraded_actor_ids: tuple[int, ...] = ()
     fast_replica_ids: tuple[int, ...] = ()
     max_omissions_per_proposal: int | None = None
@@ -509,6 +541,8 @@ class FactorialSlot(_Document):
         document = _Document.as_document(self)
         document["byzantine"] = self.byzantine.as_document()
         document["common_timers"] = self.common_timers.as_document()
+        if self.cleanup_contract is None:
+            document.pop("cleanup_contract")
         if self.byzantine.responsive_degradation is None:
             document.pop("responsive_degraded_actor_ids")
             document.pop("fast_replica_ids")
@@ -771,6 +805,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
@@ -780,6 +815,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     causal_measurement = manifest_id in {
@@ -787,17 +823,20 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     explicit_causal_windows = manifest_id in {
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     explicit_causal_edge_eligibility = manifest_id in {
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     persistent = manifest_id in {
@@ -812,6 +851,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
@@ -825,6 +865,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V10_MANIFEST_ID,
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
+        V13_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -843,7 +884,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
     )
     expected_policy_version = (
         "shape25-direct-vote-responsiveness-v2"
-        if manifest_id == FROZEN_MANIFEST_ID
+        if manifest_id in {V13_MANIFEST_ID, FROZEN_MANIFEST_ID}
         else "shape25-sensitive-responsiveness-v1"
     )
     if responsiveness.get("policy_version") != expected_policy_version:
@@ -877,11 +918,14 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
     )
     expected_minimum_attempts = (
         60
-        if manifest_id in {V12_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        if manifest_id in {V12_MANIFEST_ID, V13_MANIFEST_ID, FROZEN_MANIFEST_ID}
         else (41 if causal_measurement else 32)
     )
     expected_trailing_timeout_streak = (
-        7 if manifest_id in {V12_MANIFEST_ID, FROZEN_MANIFEST_ID} else 2
+        7
+        if manifest_id
+        in {V12_MANIFEST_ID, V13_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        else 2
     )
     if (
         attempt_window != 128
@@ -938,7 +982,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if any(3 > (replica_count - 1) // 3 for replica_count in replica_counts):
         _error("fixed campaign actor count must not exceed derived f")
-    if manifest_id in {V12_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest_id in {V12_MANIFEST_ID, V13_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         expected_mode = "tiered_persistent_responsive_omission_v2"
     elif tiered:
         expected_mode = "tiered_persistent_responsive_omission_v1"
@@ -1037,7 +1081,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             or vector.get("selected_actor") != computed_actor
         ):
             _error("actor rotation vector disagrees with the FNV-1a reference")
-    if manifest_id in {V12_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest_id in {V12_MANIFEST_ID, V13_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         expected_responsive_schedule = RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1
     elif causal_measurement:
         expected_responsive_schedule = (
@@ -1119,7 +1163,11 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             != expected_responsive_period
         ):
             _error("responsive-degradation semantics differ from frozen profile")
-        if manifest_id in {V12_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+        if manifest_id in {
+            V12_MANIFEST_ID,
+            V13_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }:
             rate_eligible_timeout_counts = {
                 attempt_count: max(
                     timeout_count
@@ -1226,9 +1274,14 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             != RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
         ):
             _error("responsive-degradation causal linkage windows drifted")
+        expected_marker_completeness_witness = (
+            RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
+            if manifest_id == FROZEN_MANIFEST_ID
+            else RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+        )
         if explicit_causal_edge_eligibility and (
             responsive.get("marker_completeness_witness")
-            != RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+            != expected_marker_completeness_witness
             or responsive.get("causal_timeout_eligibility")
             != RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
         ):
@@ -1450,30 +1503,34 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
     }
     if tiered:
         breakthrough_structural_gate = (
-            "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_"
-            "and_every_41st_unique_non_root_responsive_degraded_omission_"
-            "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_role_"
-            "bound_timeout_reporters_and_at_least_one_internal_omit_aggregate_"
-            "proof_and_each_responsive_degraded_actor_has_its_own_exact_"
-            "reporter_local_epoch1_internal_omit_aggregate_cross_commit_"
-            "witness_and_responsive_degraded_replicas_rank_below_every_fast_"
-            "replica_and_epoch1_places_every_responsive_degraded_replica_as_a_"
-            "root_and_exposes_each_in_an_internal_role_and_epoch2_roots_equal_"
-            "top_q_fast_replicas_with_only_fast_replicas_in_root_and_internal_"
-            "roles_and_all_f_worse_replicas_as_physical_leaves_and_only_hard_"
-            "cohort_wait_exempt_v3"
-            if causal_measurement
+            BREAKTHROUGH_STRUCTURAL_GATE_V4
+            if manifest_id == FROZEN_MANIFEST_ID
             else (
                 "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_"
-                "and_every_32nd_unique_non_root_responsive_degraded_omission_"
-                "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_"
-                "role_bound_timeout_reporters_and_at_least_one_internal_"
-                "omit_aggregate_proof_and_responsive_degraded_replicas_rank_"
-                "below_every_fast_replica_and_epoch1_places_every_responsive_"
-                "degraded_replica_as_a_root_and_exposes_each_in_an_internal_"
-                "role_and_epoch2_roots_equal_top_q_fast_replicas_with_only_"
-                "fast_replicas_in_root_and_internal_roles_and_all_f_worse_"
-                "replicas_as_physical_leaves_and_only_hard_cohort_wait_exempt_v2"
+                "and_every_41st_unique_non_root_responsive_degraded_omission_"
+                "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_role_"
+                "bound_timeout_reporters_and_at_least_one_internal_omit_aggregate_"
+                "proof_and_each_responsive_degraded_actor_has_its_own_exact_"
+                "reporter_local_epoch1_internal_omit_aggregate_cross_commit_"
+                "witness_and_responsive_degraded_replicas_rank_below_every_fast_"
+                "replica_and_epoch1_places_every_responsive_degraded_replica_as_a_"
+                "root_and_exposes_each_in_an_internal_role_and_epoch2_roots_equal_"
+                "top_q_fast_replicas_with_only_fast_replicas_in_root_and_internal_"
+                "roles_and_all_f_worse_replicas_as_physical_leaves_and_only_hard_"
+                "cohort_wait_exempt_v3"
+                if causal_measurement
+                else (
+                    "all_n31_f5_p_ps_slots_validate_tiered_markers_match_hard_"
+                    "and_every_32nd_unique_non_root_responsive_degraded_omission_"
+                    "schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_"
+                    "role_bound_timeout_reporters_and_at_least_one_internal_"
+                    "omit_aggregate_proof_and_responsive_degraded_replicas_rank_"
+                    "below_every_fast_replica_and_epoch1_places_every_responsive_"
+                    "degraded_replica_as_a_root_and_exposes_each_in_an_internal_"
+                    "role_and_epoch2_roots_equal_top_q_fast_replicas_with_only_"
+                    "fast_replicas_in_root_and_internal_roles_and_all_f_worse_"
+                    "replicas_as_physical_leaves_and_only_hard_cohort_wait_exempt_v2"
+                )
             )
         )
         expected_claim_scope.update(
@@ -1596,6 +1653,14 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         or execution.get("automatic_retries") != 0
         or execution.get("replacement_policy") != "none"
         or execution.get("outcome_dependent_order") is not False
+        or execution.get("cleanup_contract")
+        != (
+            EXECUTION_CLEANUP_CONTRACT_V1
+            if manifest_id == FROZEN_MANIFEST_ID
+            else None
+        )
+        or ("cleanup_contract" in execution)
+        is not (manifest_id == FROZEN_MANIFEST_ID)
         or scheduling.get("outcome_dependent_order") is not False
         or resources.get("max_parallel_slots") != 1
     ):
@@ -1620,7 +1685,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v13 may carry the compact "
+            "only shape-placement-factorial-v3 through v14 may carry the compact "
             "snapshot format field"
         )
 
@@ -1638,6 +1703,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V10_MANIFEST_ID: V10_SEMANTIC_SHA256,
         V11_MANIFEST_ID: V11_SEMANTIC_SHA256,
         V12_MANIFEST_ID: V12_SEMANTIC_SHA256,
+        V13_MANIFEST_ID: V13_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -1925,6 +1991,7 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         execution_outcome_dependent_order=execution["outcome_dependent_order"],
         execution_authorized=document["execution_authorized"],
         execution_receipt_required=document["execution_receipt_required"],
+        cleanup_contract=execution.get("cleanup_contract"),
     )
 
 
@@ -1943,6 +2010,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V10_MANIFEST_ID: V10_MANIFEST_SHA256,
         V11_MANIFEST_ID: V11_MANIFEST_SHA256,
         V12_MANIFEST_ID: V12_MANIFEST_SHA256,
+        V13_MANIFEST_ID: V13_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -2337,6 +2405,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
                             common_timers=manifest.common_timers,
                             ports=ports,
                             result_path=f"{manifest.results_root}/{slot_id}",
+                            cleanup_contract=manifest.cleanup_contract,
                             responsive_degraded_actor_ids=(
                                 tiered_cohorts.responsive_degraded_actor_ids
                                 if tiered_cohorts is not None
@@ -2409,6 +2478,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V10_MANIFEST_ID: (V10_MANIFEST_SHA256, V10_PLAN_SHA256),
         V11_MANIFEST_ID: (V11_MANIFEST_SHA256, V11_PLAN_SHA256),
         V12_MANIFEST_ID: (V12_MANIFEST_SHA256, V12_PLAN_SHA256),
+        V13_MANIFEST_ID: (V13_MANIFEST_SHA256, V13_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -2427,6 +2497,8 @@ def canonical_plan_bytes(plan: FactorialPlan) -> bytes:
 
 
 __all__ = (
+    "BREAKTHROUGH_STRUCTURAL_GATE_V4",
+    "EXECUTION_CLEANUP_CONTRACT_V1",
     "EXPECTED_ARM_CODES",
     "EXPECTED_BLOCK_COUNT",
     "EXPECTED_CANDIDATE_FANOUTS",
@@ -2443,6 +2515,7 @@ __all__ = (
     "RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1",
     "RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1",
     "RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1",
+    "RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2",
     "RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1",
     "RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1",
     "LEGACY_MANIFEST_ID",
@@ -2493,6 +2566,10 @@ __all__ = (
     "V12_MANIFEST_SHA256",
     "V12_PLAN_SHA256",
     "V12_SEMANTIC_SHA256",
+    "V13_MANIFEST_ID",
+    "V13_MANIFEST_SHA256",
+    "V13_PLAN_SHA256",
+    "V13_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",
