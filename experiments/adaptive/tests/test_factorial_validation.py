@@ -43,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v10.json"
+)
+V9_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v9.json"
 )
 V8_MANIFEST_PATH = (
@@ -250,7 +253,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v9_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v10_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -264,7 +267,8 @@ def test_validator_retains_exact_v1_through_v9_artifact_identities() -> None:
             (6, V6_MANIFEST_PATH),
             (7, V7_MANIFEST_PATH),
             (8, V8_MANIFEST_PATH),
-            (9, MANIFEST_PATH),
+            (9, V9_MANIFEST_PATH),
+            (10, MANIFEST_PATH),
         )
     }
 
@@ -289,9 +293,15 @@ def test_validator_retains_exact_v1_through_v9_artifact_identities() -> None:
     assert identities[8].manifest_sha256 == validation.V8_MANIFEST_SHA256
     assert identities[8].runtime_sha256 == validation.V8_RUNTIME_SHA256
     assert identities[8].smoke_runtime_sha256 == validation.V8_SMOKE_RUNTIME_SHA256
-    assert identities[9].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[9].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
-    assert identities[9].smoke_runtime_sha256 == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    assert identities[9].manifest_sha256 == validation.V9_MANIFEST_SHA256
+    assert identities[9].runtime_sha256 == validation.V9_RUNTIME_SHA256
+    assert identities[9].smoke_runtime_sha256 == validation.V9_SMOKE_RUNTIME_SHA256
+    assert identities[10].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[10].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[10].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
 
 
 @pytest.mark.parametrize(
@@ -302,6 +312,7 @@ def test_validator_retains_exact_v1_through_v9_artifact_identities() -> None:
         V6_MANIFEST_PATH,
         V7_MANIFEST_PATH,
         V8_MANIFEST_PATH,
+        V9_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -321,8 +332,19 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_causal_measurement_contract_but_accepts_v8() -> None:
-    for manifest_path in (V8_MANIFEST_PATH, MANIFEST_PATH):
+def test_validator_requires_v9_v10_causal_contracts_but_accepts_v8() -> None:
+    explicit_v10_fields = {
+        "causal_timeout_provenance_window": (
+            validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
+        ),
+        "causal_internal_witness_candidates": (
+            validation.RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1
+        ),
+        "causal_selection_linkage_window": (
+            validation.RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
+        ),
+    }
+    for manifest_path in (V8_MANIFEST_PATH, V9_MANIFEST_PATH, MANIFEST_PATH):
         manifest = load_frozen_manifest(manifest_path)
         runtime = build_factorial_runtime(build_factorial_plan(manifest))
         expected_by_id = {
@@ -340,6 +362,9 @@ def test_validator_requires_v9_causal_measurement_contract_but_accepts_v8() -> N
         if manifest_path == V8_MANIFEST_PATH:
             assert "pending_attempt_retention" not in document["tiered_cohorts"]
             assert "causal_timeout_linkage" not in document["tiered_cohorts"]
+            assert not set(explicit_v10_fields).intersection(
+                document["tiered_cohorts"]
+            )
             continue
 
         assert document["tiered_cohorts"]["pending_attempt_retention"] == (
@@ -348,16 +373,65 @@ def test_validator_requires_v9_causal_measurement_contract_but_accepts_v8() -> N
         assert document["tiered_cohorts"]["causal_timeout_linkage"] == (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
         )
-        del document["tiered_cohorts"]["pending_attempt_retention"]
+        if manifest_path == V9_MANIFEST_PATH:
+            assert not set(explicit_v10_fields).intersection(
+                document["tiered_cohorts"]
+            )
+        else:
+            assert {
+                field: document["tiered_cohorts"][field]
+                for field in explicit_v10_fields
+            } == explicit_v10_fields
+
+        drifted = copy.deepcopy(document)
+        del drifted["tiered_cohorts"]["pending_attempt_retention"]
         with pytest.raises(
             FactorialValidationError,
             match="tiered cohort contract",
         ):
             validation._validate_runtime_slot(
-                document,
+                drifted,
                 expected_by_id[slot.slot_id],
                 manifest,
             )
+
+
+def test_only_v10_routes_through_explicit_causal_linkage_windows() -> None:
+    assert not validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V9_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(MANIFEST_PATH)
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "causal_timeout_provenance_window",
+        "causal_internal_witness_candidates",
+        "causal_selection_linkage_window",
+    ),
+)
+def test_validator_requires_each_explicit_v10_causal_linkage_field(
+    field: str,
+) -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    slot = runtime.slots[0]
+    document = json.loads(json.dumps(slot.as_document()))
+    del document["tiered_cohorts"][field]
+
+    with pytest.raises(FactorialValidationError, match="tiered cohort contract"):
+        validation._validate_runtime_slot(
+            document,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
 
 
 def _compact_snapshot_audit() -> dict[str, object]:
@@ -1632,6 +1706,251 @@ def _v9_cross_commit_witness_fixture() -> dict[str, object]:
     }
 
 
+def _epoch1_causal_prefix_fixture() -> dict[str, object]:
+    actor = 2
+    epoch1_digest = "11" * 32
+    tree = Tree(
+        tree_id=0,
+        fanout=2,
+        pipeline_stretch=2,
+        members=(0, 1, actor),
+        wait_exempt=(),
+    )
+    markers = tuple(
+        FaultMarker(
+            source_replica=actor,
+            line_number=index,
+            fault_mode="tiered_persistent_responsive_omission_v1",
+            epoch_number=1,
+            tree_id=tree.tree_id,
+            epoch_digest=epoch1_digest,
+            block_hash=f"{height:064x}",
+            window="causal-prefix-window",
+            window_start_ns=100,
+            window_end_ns=10_000,
+            actor=actor,
+            action="omit_direct_vote",
+            monotonic_ns=marker_ns,
+            raw_line_sha256=f"{index:064x}",
+            cohort="responsive_degraded",
+            hard_actor_count=0,
+            responsive_degraded_actor_count=1,
+            fault_threshold=1,
+            max_omissions_per_proposal=1,
+            responsive_omission_period=41,
+            contribution_ordinal=41,
+        )
+        for index, (height, marker_ns) in enumerate(
+            ((900, 2_000), (901, 4_000)),
+            start=1,
+        )
+    )
+
+    def timeout(
+        marker: FaultMarker,
+        *,
+        ingestion_sequence: int,
+        observation_id: str,
+        reporter_ns: int,
+    ) -> validation._EvidenceRecord:
+        return validation._EvidenceRecord(
+            ingestion_sequence=ingestion_sequence,
+            acceptance_monotonic_ns=reporter_ns + 10,
+            observation_id=observation_id,
+            reporter_id=0,
+            target_id=actor,
+            epoch_number=marker.epoch_number,
+            tree_id=marker.tree_id,
+            epoch_digest=marker.epoch_digest,
+            block_hash=marker.block_hash,
+            message_type="direct_vote",
+            outcome="timeout",
+            response_duration_us=0,
+            deadline_duration_us=100,
+            reporter_monotonic_ns=reporter_ns,
+            reporter_sequence=ingestion_sequence,
+            signer_set=(),
+        )
+
+    accepted_epoch1 = (
+        timeout(
+            markers[0],
+            ingestion_sequence=1,
+            observation_id="a" * 64,
+            reporter_ns=2_500,
+        ),
+        timeout(
+            markers[1],
+            ingestion_sequence=2,
+            observation_id="b" * 64,
+            reporter_ns=4_500,
+        ),
+        timeout(
+            markers[1],
+            ingestion_sequence=3,
+            observation_id="c" * 64,
+            reporter_ns=4_600,
+        ),
+    )
+    replica_events = {
+        0: tuple(
+            _commit_event(
+                index,
+                marker.monotonic_ns + 100,
+                899 + index,
+                epoch_number=1,
+                epoch_digest=epoch1_digest,
+                tree_id=tree.tree_id,
+            )
+            for index, marker in enumerate(markers, start=1)
+        )
+    }
+    return {
+        "markers": markers,
+        "replica_events": replica_events,
+        "actor_ids": (),
+        "fault_mode": "tiered_persistent_responsive_omission_v1",
+        "max_omissions_per_proposal": 1,
+        "initial_epoch_digest": "00" * 32,
+        "initial_trees": (tree,),
+        "window_id": "causal-prefix-window",
+        "window_start_ns": 100,
+        "window_end_ns": 10_000,
+        "epoch1_command_ns": 900,
+        "epoch1_activation_ns": 1_000,
+        "epoch2_command_ns": 9_000,
+        "epoch1_digest": epoch1_digest,
+        "epoch1_trees": (tree,),
+        "epoch2_digest": "22" * 32,
+        "epoch2_trees": (tree,),
+        "phase_windows": {
+            "baseline": (100, 150, 1),
+            "fault_evidence": (200, 800, 1),
+            "epoch1_stable": (1_200, 8_000, 1),
+            "epoch2_stable": (9_200, 9_800, 1),
+        },
+        "required_reporters": 1,
+        "accepted_epoch1": accepted_epoch1,
+        "epoch1_baseline_cutoff": 2,
+        "epoch1_current_cutoff": 3,
+        "responsive_degraded_actor_ids": (actor,),
+    }
+
+
+def _skip_tiered_schedule_shape_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        validation,
+        "_validate_fault_marker_schedule",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_tiered_observed_marker_completeness",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_persistent_interior_proposals",
+        lambda *a, **k: None,
+    )
+
+
+def test_epoch1_causality_uses_full_prefix_and_selection_uses_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+
+    assert validate_fault_causality(
+        **_epoch1_causal_prefix_fixture(),
+        explicit_causal_linkage_windows=True,
+    ) == 0
+
+
+def test_v9_epoch1_causality_retains_its_frozen_suffix_interpretation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="responsive-degraded omission has no exact outstanding raw timeout",
+    ):
+        validate_fault_causality(**_epoch1_causal_prefix_fixture())
+
+
+def test_v9_cross_commit_receives_the_full_epoch1_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    captured_sequences: set[int] = set()
+
+    def capture_cross_commit_prefix(**arguments: object) -> tuple[int, ...]:
+        timeout_index = arguments["epoch1_timeout_index"]
+        assert isinstance(timeout_index, dict)
+        captured_sequences.update(
+            record.ingestion_sequence
+            for records in timeout_index.values()
+            for record in records
+        )
+        return (2,)
+
+    monkeypatch.setattr(
+        validation,
+        "_validate_v9_cross_commit_retention_witnesses",
+        capture_cross_commit_prefix,
+    )
+    arguments = _epoch1_causal_prefix_fixture()
+
+    assert validate_fault_causality(
+        **{
+            **arguments,
+            "require_cross_commit_retention_witnesses": True,
+            "explicit_causal_linkage_windows": True,
+        }
+    ) == 1
+    assert captured_sequences == {1, 2, 3}
+
+
+def test_epoch1_causality_rejects_missing_prebaseline_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    arguments = _epoch1_causal_prefix_fixture()
+    accepted = arguments["accepted_epoch1"]
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="responsive-degraded omission has no exact outstanding raw timeout",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "accepted_epoch1": accepted[1:],
+                "explicit_causal_linkage_windows": True,
+            }
+        )
+
+
+def test_epoch1_selection_linkage_rejects_missing_suffix_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    arguments = _epoch1_causal_prefix_fixture()
+    accepted = arguments["accepted_epoch1"]
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="performance-selection evidence",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "accepted_epoch1": accepted[:2],
+                "explicit_causal_linkage_windows": True,
+            }
+        )
+
+
 def test_v9_proposal_commit_identity_binds_the_replica_event_stream() -> None:
     event = _commit_event(
         1,
@@ -1671,6 +1990,80 @@ def test_v9_cross_commit_retention_witness_requires_every_degraded_actor() -> No
     with pytest.raises(FactorialValidationError, match=r"cross-commit.*\[5\]"):
         validation._validate_v9_cross_commit_retention_witnesses(
             **{**arguments, "authoritative_commit_ns": commit_times}
+        )
+
+
+def test_v9_cross_commit_race_does_not_erase_strict_actor_witnesses() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+    valid_marker = arguments["markers"][0]
+    valid_arm = arguments["arm_markers"][0]
+    raced_marker = replace(
+        valid_marker,
+        line_number=99,
+        block_hash="ff" * 32,
+        monotonic_ns=valid_marker.monotonic_ns + 1_000_000,
+        raw_line_sha256="fe" * 32,
+    )
+    raced_arm = replace(
+        valid_arm,
+        line_number=99,
+        block_hash=raced_marker.block_hash,
+        start_monotonic_ns=raced_marker.monotonic_ns + 100_000,
+        absolute_deadline_ns=raced_marker.monotonic_ns + 600_000,
+        raw_line_sha256="fd" * 32,
+    )
+    proposal_key = raced_arm.proposal_key
+    timeout_key = (raced_marker.actor, *proposal_key)
+    timeout_index = dict(arguments["epoch1_timeout_index"])
+    timeout_index[timeout_key] = (
+        replace(
+            next(iter(timeout_index.values()))[0],
+            observation_id="fc" * 32,
+            target_id=raced_marker.actor,
+            epoch_number=raced_marker.epoch_number,
+            tree_id=raced_marker.tree_id,
+            epoch_digest=raced_marker.epoch_digest,
+            block_hash=raced_marker.block_hash,
+            reporter_id=raced_arm.reporter_id,
+            message_type=raced_arm.expected_message_type,
+            reporter_monotonic_ns=raced_arm.absolute_deadline_ns,
+            acceptance_monotonic_ns=raced_arm.absolute_deadline_ns + 10,
+        ),
+    )
+    authoritative = dict(arguments["authoritative_commit_ns"])
+    authoritative[proposal_key] = raced_marker.monotonic_ns + 50_000
+    proposal_commits = {
+        replica_id: dict(commits)
+        for replica_id, commits in arguments[
+            "proposal_commit_ns_by_replica"
+        ].items()
+    }
+    proposal_commits[raced_arm.reporter_id][proposal_key] = (
+        raced_marker.monotonic_ns + 200_000,
+    )
+
+    assert validation._validate_v9_cross_commit_retention_witnesses(
+        **{
+            **arguments,
+            "markers": (*arguments["markers"], raced_marker),
+            "arm_markers": (*arguments["arm_markers"], raced_arm),
+            "authoritative_commit_ns": authoritative,
+            "proposal_commit_ns_by_replica": proposal_commits,
+            "epoch1_timeout_index": timeout_index,
+            "order_failures_are_nonwitness_candidates": True,
+        }
+    ) == (2, 5)
+
+    with pytest.raises(FactorialValidationError, match="arm ordering"):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "markers": (*arguments["markers"], raced_marker),
+                "arm_markers": (*arguments["arm_markers"], raced_arm),
+                "authoritative_commit_ns": authoritative,
+                "proposal_commit_ns_by_replica": proposal_commits,
+                "epoch1_timeout_index": timeout_index,
+            }
         )
 
 
@@ -1747,7 +2140,7 @@ def test_v9_cross_commit_retention_rejects_post_commit_arm() -> None:
         ),
     )
 
-    with pytest.raises(FactorialValidationError, match="arm ordering"):
+    with pytest.raises(FactorialValidationError, match=r"cross-commit.*\[2\]"):
         validation._validate_v9_cross_commit_retention_witnesses(
             **{
                 **arguments,

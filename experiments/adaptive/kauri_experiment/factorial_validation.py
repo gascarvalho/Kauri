@@ -59,6 +59,9 @@ from .factorial_manifest import (
     LEGACY_MANIFEST_ID,
     LEGACY_MANIFEST_SHA256,
     LEGACY_PLAN_SHA256,
+    RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+    RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     V2_MANIFEST_ID,
@@ -82,6 +85,9 @@ from .factorial_manifest import (
     V8_MANIFEST_ID,
     V8_MANIFEST_SHA256,
     V8_PLAN_SHA256,
+    V9_MANIFEST_ID,
+    V9_MANIFEST_SHA256,
+    V9_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -155,11 +161,17 @@ V8_RUNTIME_SHA256 = (
 V8_SMOKE_RUNTIME_SHA256 = (
     "bd0bf9291e4b34a229be6ce5a5e09ffe7a34964199a0ea21696ab750ddab8e0b"
 )
-FROZEN_RUNTIME_SHA256 = (
+V9_RUNTIME_SHA256 = (
     "a0ed61f9e27546467c82a33b2412ee117b701fe48054fc35303a172da0309096"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V9_SMOKE_RUNTIME_SHA256 = (
     "a6733bb8705a34d82b02cc2bdf0596b12a08da57e57f9e12dd1968e6135a31d2"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "ad3167be5ad69dac53cdbefa8b5be283a1f018cd2d25a5b369e949d8ce1e531a"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "e39506e410b2c05507c9dd1e0c8eaab874b4f740c29ba8b0ea85c17c1b896123"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -230,13 +242,31 @@ _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
 )
 _V8_RESPONSIVE_OMISSION_PERIOD = 32
 _RESPONSIVE_OMISSION_PERIOD = 41
+_CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
+    {V9_MANIFEST_ID, FROZEN_MANIFEST_ID}
+)
 
 
 def _expected_responsive_omission_period(manifest_id: str) -> int:
     return (
         _RESPONSIVE_OMISSION_PERIOD
-        if manifest_id == FROZEN_MANIFEST_ID
+        if manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
         else _V8_RESPONSIVE_OMISSION_PERIOD
+    )
+
+
+def _uses_explicit_causal_linkage_windows(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return responsive is not None and (
+        responsive.causal_timeout_provenance_window,
+        responsive.causal_internal_witness_candidates,
+        responsive.causal_selection_linkage_window,
+    ) == (
+        RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+        RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+        RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     )
 
 
@@ -372,6 +402,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=V8_PLAN_SHA256,
             runtime_sha256=V8_RUNTIME_SHA256,
             smoke_runtime_sha256=V8_SMOKE_RUNTIME_SHA256,
+        ),
+        V9_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V9_MANIFEST_ID,
+            manifest_sha256=V9_MANIFEST_SHA256,
+            plan_sha256=V9_PLAN_SHA256,
+            runtime_sha256=V9_RUNTIME_SHA256,
+            smoke_runtime_sha256=V9_SMOKE_RUNTIME_SHA256,
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -2154,7 +2191,10 @@ def _validate_runtime_slot(
     runtime: Mapping[str, Any], expected: _ExpectedSlot, manifest: FrozenFactorialManifest
 ) -> None:
     tiered = manifest.byzantine.mode == _TIERED_OMISSION_MODE
-    causal_measurement = manifest.manifest_id == FROZEN_MANIFEST_ID
+    causal_measurement = (
+        manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
+    )
+    explicit_causal_linkage = _uses_explicit_causal_linkage_windows(manifest)
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -2182,6 +2222,20 @@ def _validate_runtime_slot(
                     ),
                     "causal_timeout_linkage": (
                         RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1
+                    ),
+                }
+            )
+        if explicit_causal_linkage:
+            artifact_identity.update(
+                {
+                    "causal_timeout_provenance_window": (
+                        RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
+                    ),
+                    "causal_internal_witness_candidates": (
+                        RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1
+                    ),
+                    "causal_selection_linkage_window": (
+                        RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
                     ),
                 }
             )
@@ -2248,6 +2302,20 @@ def _validate_runtime_slot(
                     ),
                 }
             )
+        if explicit_causal_linkage:
+            expected_tiered.update(
+                {
+                    "causal_timeout_provenance_window": (
+                        RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
+                    ),
+                    "causal_internal_witness_candidates": (
+                        RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1
+                    ),
+                    "causal_selection_linkage_window": (
+                        RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
+                    ),
+                }
+            )
         if dict(_mapping(runtime.get("tiered_cohorts"), "runtime tiered cohorts")) != expected_tiered:
             _fail("runtime tiered cohort contract differs from independent derivation")
     elif "tiered_cohorts" in runtime:
@@ -2309,6 +2377,7 @@ def _validate_runtime_slot(
         V6_MANIFEST_ID,
         V7_MANIFEST_ID,
         V8_MANIFEST_ID,
+        V9_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -4073,6 +4142,7 @@ def _validate_v9_cross_commit_retention_witnesses(
     ],
     epoch2_selection_ns: int,
     require_each_degraded_actor_internal_witness: bool = False,
+    order_failures_are_nonwitness_candidates: bool = False,
 ) -> tuple[int, ...]:
     """Bind each proof to its parent-local commit and authoritative commit."""
 
@@ -4201,13 +4271,14 @@ def _validate_v9_cross_commit_retention_witnesses(
         local_commit_ns = local_commit_times[0]
         if type(local_commit_ns) is not int or local_commit_ns <= 0:
             _fail("v9 cross-commit reporter-local commit timestamp is invalid")
+        strict_order_witness = False
         for timeout in exact_timeouts:
             if timeout.deadline_duration_us != arm.deadline_duration_us:
                 _fail(
                     "v9 cross-commit timeout duration differs from its exact arm "
                     "duration"
                 )
-            if not (
+            if (
                 arm.start_monotonic_ns
                 <= marker.monotonic_ns
                 < local_commit_ns
@@ -4216,13 +4287,17 @@ def _validate_v9_cross_commit_retention_witnesses(
                 <= timeout.acceptance_monotonic_ns
                 < epoch2_selection_ns
             ):
-                _fail(
-                    "v9 cross-commit arm ordering for actor "
-                    f"[{marker.actor}] reporter [{expected_reporter}] is not "
-                    "start <= fault marker "
-                    "< reporter-local commit < absolute deadline <= timeout "
-                    "reporter <= timeout acceptance < Epoch2 selection"
-                )
+                strict_order_witness = True
+        if not strict_order_witness:
+            if order_failures_are_nonwitness_candidates:
+                continue
+            _fail(
+                "v9 cross-commit arm ordering for actor "
+                f"[{marker.actor}] reporter [{expected_reporter}] is not "
+                "start <= fault marker "
+                "< reporter-local commit < absolute deadline <= timeout "
+                "reporter <= timeout acceptance < Epoch2 selection"
+            )
         witnessed.add(marker.actor)
         if internal_role:
             internal_witnessed.add(marker.actor)
@@ -4282,6 +4357,7 @@ def validate_fault_causality(
     epoch1_current_cutoff: int = 0,
     require_cross_commit_retention_witnesses: bool = False,
     require_each_degraded_actor_internal_witness: bool = False,
+    explicit_causal_linkage_windows: bool = False,
     responsive_omission_period: int = _V8_RESPONSIVE_OMISSION_PERIOD,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
@@ -4410,7 +4486,7 @@ def validate_fault_causality(
             ].append(record)
         return {key: tuple(value) for key, value in grouped.items()}
 
-    timeout_indexes = {
+    causal_timeout_indexes = {
         0: outstanding_timeout_index(
             accepted_epoch0,
             lower=baseline_cutoff,
@@ -4418,10 +4494,19 @@ def validate_fault_causality(
         ),
         1: outstanding_timeout_index(
             accepted_epoch1,
-            lower=epoch1_baseline_cutoff,
+            lower=(
+                0
+                if explicit_causal_linkage_windows
+                else epoch1_baseline_cutoff
+            ),
             upper=epoch1_current_cutoff,
         ),
     }
+    epoch1_selection_timeout_index = outstanding_timeout_index(
+        accepted_epoch1,
+        lower=epoch1_baseline_cutoff,
+        upper=epoch1_current_cutoff,
+    )
     causal_reporters: dict[int, set[int]] = defaultdict(set)
     internal_actors: set[int] = set()
     epoch1_leaf_actors: set[int] = set()
@@ -4502,16 +4587,17 @@ def validate_fault_causality(
         ):
             epoch2_leaf_actors.add(marker.actor)
         expected_reporter = tree.members[(position - 1) // tree.fanout]
-        matched_timeouts = timeout_indexes.get(marker.epoch_number, {}).get(
-            (
-                marker.actor,
-                marker.epoch_number,
-                marker.tree_id,
-                marker.epoch_digest,
-                marker.block_hash,
-            ),
-            (),
+        timeout_key = (
+            marker.actor,
+            marker.epoch_number,
+            marker.tree_id,
+            marker.epoch_digest,
+            marker.block_hash,
         )
+        matched_timeouts = causal_timeout_indexes.get(
+            marker.epoch_number,
+            {},
+        ).get(timeout_key, ())
         decision_deadline = configuration[2]
         exact_timeouts = [
             timeout
@@ -4536,7 +4622,19 @@ def validate_fault_causality(
                     "timeout before the selecting transition"
                 )
             if marker.epoch_number == 1:
-                degraded_evidence_bound_actors.add(marker.actor)
+                selection_timeouts = epoch1_selection_timeout_index.get(
+                    timeout_key,
+                    (),
+                )
+                if any(
+                    timeout.message_type == expected_message_type
+                    and timeout.reporter_id == expected_reporter
+                    and marker.monotonic_ns < timeout.reporter_monotonic_ns
+                    <= timeout.acceptance_monotonic_ns
+                    < decision_deadline
+                    for timeout in selection_timeouts
+                ):
+                    degraded_evidence_bound_actors.add(marker.actor)
         elif (
             marker.epoch_number == 0
             and fault_phase[0] <= marker.monotonic_ns < fault_phase[1]
@@ -4560,10 +4658,13 @@ def validate_fault_causality(
             authoritative_commit_ns=authoritative_commit_ns,
             proposal_commit_ns_by_replica=proposal_commit_ns_by_replica,
             epoch1_trees=epoch1_tree_by_id,
-            epoch1_timeout_index=timeout_indexes[1],
+            epoch1_timeout_index=causal_timeout_indexes[1],
             epoch2_selection_ns=epoch2_command_ns,
             require_each_degraded_actor_internal_witness=(
                 require_each_degraded_actor_internal_witness
+            ),
+            order_failures_are_nonwitness_candidates=(
+                explicit_causal_linkage_windows
             ),
         )
     elif require_each_degraded_actor_internal_witness:
@@ -7155,7 +7256,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         markers = _fault_markers(slot_root, paths_by_replica)
         arm_markers = (
             _response_attempt_arm_markers(slot_root, paths_by_replica)
-            if manifest.manifest_id == FROZEN_MANIFEST_ID
+            if manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
             else ()
         )
         cycle_snapshots = {
@@ -7175,7 +7276,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             manifest, expected
         )
         primary_internal_witness_gate = (
-            manifest.manifest_id == FROZEN_MANIFEST_ID
+            manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
             and campaign_member
             and expected.replica_count
             == manifest.claim_scope.placement_headline_replica_count
@@ -7231,10 +7332,13 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 1,
             ),
             require_cross_commit_retention_witnesses=(
-                manifest.manifest_id == FROZEN_MANIFEST_ID
+                manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
             ),
             require_each_degraded_actor_internal_witness=(
                 primary_internal_witness_gate
+            ),
+            explicit_causal_linkage_windows=(
+                _uses_explicit_causal_linkage_windows(manifest)
             ),
             responsive_omission_period=(
                 responsive_contract.omission_period
@@ -7800,7 +7904,7 @@ def _breakthrough_hierarchy_summary(
             scope.breakthrough_structural_required_slot_count or 0
         ),
         require_each_degraded_actor_internal_cross_commit=(
-            manifest.manifest_id == FROZEN_MANIFEST_ID
+            manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
         ),
     )
 

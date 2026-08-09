@@ -16,10 +16,14 @@ from typing import Any
 
 from .factorial_manifest import (
     FROZEN_MANIFEST_ID,
+    V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
     FactorialSlot,
+    RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+    RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     ResponsivenessPolicyContract,
     derive_tiered_cohorts,
@@ -221,10 +225,19 @@ class TieredCohortContract(_Document):
     epoch1_responsive_degraded_internal_role_exposure_required: bool
     pending_attempt_retention: str | None = None
     causal_timeout_linkage: str | None = None
+    causal_timeout_provenance_window: str | None = None
+    causal_internal_witness_candidates: str | None = None
+    causal_selection_linkage_window: str | None = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
-        for field in ("pending_attempt_retention", "causal_timeout_linkage"):
+        for field in (
+            "pending_attempt_retention",
+            "causal_timeout_linkage",
+            "causal_timeout_provenance_window",
+            "causal_internal_witness_candidates",
+            "causal_selection_linkage_window",
+        ):
             if document[field] is None:
                 document.pop(field)
         return document
@@ -557,12 +570,25 @@ def _tiered_cohort_contract(
     measurement_contract = (
         responsive.pending_attempt_retention,
         responsive.causal_timeout_linkage,
+        responsive.causal_timeout_provenance_window,
+        responsive.causal_internal_witness_candidates,
+        responsive.causal_selection_linkage_window,
     )
     if measurement_contract not in {
-        (None, None),
+        (None, None, None, None, None),
         (
             RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
             RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+            None,
+            None,
+            None,
+        ),
+        (
+            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+            RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+            RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
         ),
     }:
         raise FactorialManifestError(
@@ -570,11 +596,7 @@ def _tiered_cohort_contract(
         )
     expected_responsive_period = (
         41
-        if measurement_contract
-        == (
-            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
-            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
-        )
+        if measurement_contract[0] == RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
         else 32
     )
     expected_fast = tuple(
@@ -610,6 +632,15 @@ def _tiered_cohort_contract(
         epoch1_responsive_degraded_internal_role_exposure_required=True,
         pending_attempt_retention=responsive.pending_attempt_retention,
         causal_timeout_linkage=responsive.causal_timeout_linkage,
+        causal_timeout_provenance_window=(
+            responsive.causal_timeout_provenance_window
+        ),
+        causal_internal_witness_candidates=(
+            responsive.causal_internal_witness_candidates
+        ),
+        causal_selection_linkage_window=(
+            responsive.causal_selection_linkage_window
+        ),
     )
 
 
@@ -984,6 +1015,20 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
                     ),
                     "causal_timeout_linkage": (
                         tiered_cohorts.causal_timeout_linkage
+                    ),
+                }
+            )
+        if tiered_cohorts.causal_timeout_provenance_window is not None:
+            identity.update(
+                {
+                    "causal_timeout_provenance_window": (
+                        tiered_cohorts.causal_timeout_provenance_window
+                    ),
+                    "causal_internal_witness_candidates": (
+                        tiered_cohorts.causal_internal_witness_candidates
+                    ),
+                    "causal_selection_linkage_window": (
+                        tiered_cohorts.causal_selection_linkage_window
                     ),
                 }
             )
@@ -1363,12 +1408,27 @@ def runtime_preflight(
                 (
                     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
                     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+                    RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+                    RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
                 )
                 if runtime.manifest_id == FROZEN_MANIFEST_ID
-                else (None, None)
+                else (
+                    (
+                        RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                        RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                        None,
+                        None,
+                        None,
+                    )
+                    if runtime.manifest_id == V9_MANIFEST_ID
+                    else (None, None, None, None, None)
+                )
             )
             expected_responsive_period = (
-                41 if runtime.manifest_id == FROZEN_MANIFEST_ID else 32
+                41
+                if runtime.manifest_id in {V9_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                else 32
             )
             if (
                 tiered.mode != "tiered_persistent_responsive_omission_v1"
@@ -1397,6 +1457,9 @@ def runtime_preflight(
                 or (
                     tiered.pending_attempt_retention,
                     tiered.causal_timeout_linkage,
+                    tiered.causal_timeout_provenance_window,
+                    tiered.causal_internal_witness_candidates,
+                    tiered.causal_selection_linkage_window,
                 )
                 != expected_measurement_contract
                 or not slot.epoch1_placement.only_hard_cohort_is_wait_exempt
