@@ -17,6 +17,7 @@
 #include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/configuration.h"
 #include "hotstuff/evidence_reputation.h"
+#include "hotstuff/experiment_byzantine_adapter.h"
 
 namespace hotstuff
 {
@@ -97,6 +98,36 @@ struct CommitObservedStructuredEvent
     std::optional<uint256_t> parent_hash;
     std::uint64_t transaction_count{0};
     std::uint64_t commit_batch_index{0};
+};
+
+/**
+ * Prospective ground truth for one cached experiment-only contribution
+ * decision. This record is observational and grants no voting, transport,
+ * fault-selection, or epoch authority.
+ */
+struct FaultContributionOpportunityStructuredEvent
+{
+    ReplicaID actor{0};
+    ProposalKey proposal;
+    std::uint64_t view_generation{0};
+    ExperimentReplicaRole physical_role{ExperimentReplicaRole::root};
+    ReplicaID parent_replica{0};
+    ExpectedMessageType expected_message_type{
+        ExpectedMessageType::direct_vote};
+    ExperimentOmissionCohort cohort{ExperimentOmissionCohort::none};
+    std::string diagnostic_window;
+    std::uint64_t window_start_monotonic_ns{0};
+    std::uint64_t window_end_monotonic_ns{0};
+    std::uint64_t decision_monotonic_ns{0};
+    std::uint64_t contribution_ordinal{0};
+    std::uint64_t role_contribution_ordinal{0};
+    ExperimentOmissionAction scheduled_action{
+        ExperimentOmissionAction::forward};
+    std::size_t responsive_omission_period{0};
+    std::size_t fault_threshold{0};
+    std::size_t hard_actor_count{0};
+    std::size_t responsive_degraded_actor_count{0};
+    std::string fault_mode;
 };
 
 /** Exact schedule installed after one adaptive-v2 command commits. */
@@ -234,7 +265,8 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV2EvidenceSnapshotStructuredEvent,
     AdaptiveV2ManagerSessionTerminalStructuredEvent,
     EvidenceObservationAcceptedStructuredEvent,
-    AdaptiveV2ShapeDecisionStructuredEvent>;
+    AdaptiveV2ShapeDecisionStructuredEvent,
+    FaultContributionOpportunityStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -333,6 +365,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_session_terminal,
     evidence_observation_accepted,
     adaptive_v2_shape_decision,
+    fault_contribution_opportunity,
 };
 
 StructuredEventType structured_event_type(

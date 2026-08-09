@@ -203,6 +203,39 @@ protected:
     void state_machine_execute(const Finality &) override {}
 };
 
+class RecordingOpportunityAuditEmitter final
+    : public AuditStructuredEventEmitter
+{
+public:
+    explicit RecordingOpportunityAuditEmitter(
+        std::vector<std::string> *order = nullptr)
+        : order_(order)
+    {}
+
+    void emit_audit(
+        const AuditStructuredEventPayload &payload) noexcept override
+    {
+        try
+        {
+            const auto *event = std::get_if<
+                FaultContributionOpportunityStructuredEvent>(&payload);
+            if (event == nullptr)
+                return;
+            events.push_back(*event);
+            if (order_ != nullptr)
+                order_->push_back("opportunity");
+        }
+        catch (...)
+        {
+        }
+    }
+
+    std::vector<FaultContributionOpportunityStructuredEvent> events;
+
+private:
+    std::vector<std::string> *order_{nullptr};
+};
+
 uint256_t digest(const std::string &label)
 {
     return DataStream(label).get_hash();
@@ -820,6 +853,417 @@ TEST_CASE(
     CHECK(markers[7].role_contribution_ordinal == 2);
     CHECK(markers[7].action ==
           ExperimentOmissionAction::omit_direct_vote);
+}
+
+TEST_CASE(
+    "native tiered decisions emit exact contribution opportunities once",
+    "[adaptive-v2][experiment][fault-opportunity][runtime-integration]"
+    "[intentional-red]")
+{
+    SECTION("responsive internal and leaf forward then omit")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1,
+            2,
+            bytearray_t{},
+            NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1),
+            event_context,
+            0,
+            HotStuffBase::Net::Config(),
+            NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        std::vector<std::string> order;
+        RecordingOpportunityAuditEmitter emitter(&order);
+        std::vector<ExperimentOmissionMarker> markers;
+        auto options = tiered_v2_options(2, 2);
+        options.omission_marker_emitter =
+            [&markers, &order](const ExperimentOmissionMarker &marker)
+            {
+                order.push_back("marker");
+                markers.push_back(marker);
+            };
+        runtime.bind_structured_event_emitters(nullptr, nullptr, &emitter);
+        runtime.configure_experiment_byzantine_faults(std::move(options));
+
+        const ConfigurationId exact_configuration{
+            7, 3, digest("opportunity-responsive-epoch")};
+        const auto internal = tree(ExperimentReplicaRole::internal, 2);
+        const auto leaf = tree(ExperimentReplicaRole::leaf, 2);
+        const ProposalKey internal_forward{
+            exact_configuration, digest("opportunity-internal-forward")};
+        const ProposalKey internal_omit{
+            exact_configuration, digest("opportunity-internal-omit")};
+        const ProposalKey leaf_forward{
+            exact_configuration, digest("opportunity-leaf-forward")};
+        const ProposalKey leaf_omit{
+            exact_configuration, digest("opportunity-leaf-omit")};
+        using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+        Access::seed_view_generation(runtime, internal_forward, 17);
+        Access::seed_view_generation(runtime, internal_omit, 18);
+        Access::seed_view_generation(runtime, leaf_forward, 19);
+        Access::seed_view_generation(runtime, leaf_omit, 20);
+
+        CHECK_FALSE(Access::consume_aggregate(
+            runtime, internal_forward, internal));
+        CHECK_FALSE(Access::consume_aggregate(
+            runtime, internal_forward, internal));
+        CHECK(Access::consume_aggregate(
+            runtime, internal_omit, internal));
+        CHECK(Access::consume_aggregate(
+            runtime, internal_omit, internal));
+        CHECK_FALSE(Access::consume_direct_vote(
+            runtime, leaf_forward, leaf));
+        CHECK_FALSE(Access::consume_direct_vote(
+            runtime, leaf_forward, leaf));
+        CHECK(Access::consume_direct_vote(runtime, leaf_omit, leaf));
+        CHECK(Access::consume_direct_vote(runtime, leaf_omit, leaf));
+
+        REQUIRE(emitter.events.size() == 4);
+        REQUIRE(markers.size() == 4);
+        CHECK(order == std::vector<std::string>{
+                           "opportunity", "marker",
+                           "opportunity", "marker",
+                           "opportunity", "marker",
+                           "opportunity", "marker"});
+
+        const auto &first = emitter.events[0];
+        CHECK(first.actor == 2);
+        CHECK(first.proposal == internal_forward);
+        CHECK(first.view_generation == 17);
+        CHECK(first.physical_role == ExperimentReplicaRole::internal);
+        CHECK(first.parent_replica == 0);
+        CHECK(first.expected_message_type ==
+              ExpectedMessageType::aggregate_relay);
+        CHECK(first.cohort ==
+              ExperimentOmissionCohort::responsive_degraded);
+        CHECK(first.scheduled_action == ExperimentOmissionAction::forward);
+        CHECK(first.contribution_ordinal == 1);
+        CHECK(first.role_contribution_ordinal == 1);
+        CHECK(first.diagnostic_window == "native-runtime-window");
+        CHECK(first.window_start_monotonic_ns == 1);
+        CHECK(first.window_end_monotonic_ns ==
+              std::numeric_limits<std::uint64_t>::max());
+        CHECK(first.decision_monotonic_ns == markers[0].monotonic_ns);
+        CHECK(first.decision_monotonic_ns >=
+              first.window_start_monotonic_ns);
+        CHECK(first.decision_monotonic_ns <
+              first.window_end_monotonic_ns);
+        CHECK(first.responsive_omission_period == 2);
+        CHECK(first.fault_threshold == 10);
+        CHECK(first.hard_actor_count == 1);
+        CHECK(first.responsive_degraded_actor_count == 1);
+        CHECK(first.fault_mode ==
+              "tiered_persistent_responsive_omission_v2");
+
+        CHECK(emitter.events[1].proposal == internal_omit);
+        CHECK(emitter.events[1].scheduled_action ==
+              ExperimentOmissionAction::omit_aggregate);
+        CHECK(emitter.events[1].contribution_ordinal == 2);
+        CHECK(emitter.events[1].role_contribution_ordinal == 2);
+        CHECK(emitter.events[2].proposal == leaf_forward);
+        CHECK(emitter.events[2].physical_role ==
+              ExperimentReplicaRole::leaf);
+        CHECK(emitter.events[2].expected_message_type ==
+              ExpectedMessageType::direct_vote);
+        CHECK(emitter.events[2].scheduled_action ==
+              ExperimentOmissionAction::forward);
+        CHECK(emitter.events[2].contribution_ordinal == 3);
+        CHECK(emitter.events[2].role_contribution_ordinal == 1);
+        CHECK(emitter.events[3].proposal == leaf_omit);
+        CHECK(emitter.events[3].scheduled_action ==
+              ExperimentOmissionAction::omit_direct_vote);
+        CHECK(emitter.events[3].contribution_ordinal == 4);
+        CHECK(emitter.events[3].role_contribution_ordinal == 2);
+    }
+
+    SECTION("hard internal and leaf actions remain persistent")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1,
+            1,
+            bytearray_t{},
+            NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1),
+            event_context,
+            0,
+            HotStuffBase::Net::Config(),
+            NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        RecordingOpportunityAuditEmitter emitter;
+        runtime.bind_structured_event_emitters(nullptr, nullptr, &emitter);
+        runtime.configure_experiment_byzantine_faults(
+            tiered_v2_options(1, 41));
+        const ConfigurationId exact_configuration{
+            7, 3, digest("opportunity-hard-epoch")};
+        const ProposalKey internal_key{
+            exact_configuration, digest("opportunity-hard-internal")};
+        const ProposalKey leaf_key{
+            exact_configuration, digest("opportunity-hard-leaf")};
+        using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+        Access::seed_view_generation(runtime, internal_key, 21);
+        Access::seed_view_generation(runtime, leaf_key, 22);
+
+        CHECK(Access::consume_aggregate(
+            runtime,
+            internal_key,
+            tree(ExperimentReplicaRole::internal, 1)));
+        CHECK(Access::consume_direct_vote(
+            runtime,
+            leaf_key,
+            tree(ExperimentReplicaRole::leaf, 1)));
+
+        REQUIRE(emitter.events.size() == 2);
+        CHECK(emitter.events[0].cohort == ExperimentOmissionCohort::hard);
+        CHECK(emitter.events[0].scheduled_action ==
+              ExperimentOmissionAction::omit_aggregate);
+        CHECK(emitter.events[0].contribution_ordinal == 0);
+        CHECK(emitter.events[0].role_contribution_ordinal == 0);
+        CHECK(emitter.events[1].cohort == ExperimentOmissionCohort::hard);
+        CHECK(emitter.events[1].scheduled_action ==
+              ExperimentOmissionAction::omit_direct_vote);
+        CHECK(emitter.events[1].contribution_ordinal == 0);
+        CHECK(emitter.events[1].role_contribution_ordinal == 0);
+    }
+}
+
+TEST_CASE(
+    "contribution opportunity exclusions never alter the fault decision",
+    "[adaptive-v2][experiment][fault-opportunity][exclusions]"
+    "[intentional-red]")
+{
+    SECTION("roots and nonactors emit nothing")
+    {
+        EventContext root_context;
+        TestHotStuff root_runtime(
+            1, 2, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1), root_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        RecordingOpportunityAuditEmitter root_emitter;
+        root_runtime.bind_structured_event_emitters(
+            nullptr, nullptr, &root_emitter);
+        root_runtime.configure_experiment_byzantine_faults(
+            tiered_v2_options(2, 2));
+        const ProposalKey root_key{
+            ConfigurationId{7, 3, digest("opportunity-root-epoch")},
+            digest("opportunity-root")};
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            root_runtime, root_key, 23);
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    root_runtime,
+                    root_key,
+                    tree(ExperimentReplicaRole::root, 2)));
+        CHECK(root_emitter.events.empty());
+
+        EventContext nonactor_context;
+        TestHotStuff nonactor_runtime(
+            1, 3, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1), nonactor_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        RecordingOpportunityAuditEmitter nonactor_emitter;
+        nonactor_runtime.bind_structured_event_emitters(
+            nullptr, nullptr, &nonactor_emitter);
+        nonactor_runtime.configure_experiment_byzantine_faults(
+            tiered_v2_options(3, 2));
+        const ProposalKey nonactor_key{
+            ConfigurationId{7, 3, digest("opportunity-nonactor-epoch")},
+            digest("opportunity-nonactor")};
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            nonactor_runtime, nonactor_key, 24);
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    nonactor_runtime,
+                    nonactor_key,
+                    tree(ExperimentReplicaRole::internal, 3)));
+        CHECK(nonactor_emitter.events.empty());
+    }
+
+    SECTION("outside-window and capacity decisions emit nothing new")
+    {
+        EventContext outside_context;
+        TestHotStuff outside_runtime(
+            1, 2, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1), outside_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        RecordingOpportunityAuditEmitter outside_emitter;
+        auto outside_options = tiered_v2_options(2, 2);
+        outside_options.rotating_omission->window_start_monotonic_ns =
+            std::numeric_limits<std::uint64_t>::max() - 1;
+        outside_options.rotating_omission->window_end_monotonic_ns =
+            std::numeric_limits<std::uint64_t>::max();
+        outside_runtime.bind_structured_event_emitters(
+            nullptr, nullptr, &outside_emitter);
+        outside_runtime.configure_experiment_byzantine_faults(
+            std::move(outside_options));
+        const ProposalKey outside_key{
+            ConfigurationId{7, 3, digest("opportunity-outside-epoch")},
+            digest("opportunity-outside")};
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            outside_runtime, outside_key, 25);
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    outside_runtime,
+                    outside_key,
+                    tree(ExperimentReplicaRole::internal, 2)));
+        CHECK(outside_emitter.events.empty());
+
+        EventContext capacity_context;
+        TestHotStuff capacity_runtime(
+            1, 2, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1), capacity_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        RecordingOpportunityAuditEmitter capacity_emitter;
+        std::vector<ExperimentOmissionMarker> capacity_markers;
+        auto capacity_options = tiered_v2_options(2, 2);
+        capacity_options.rotating_omission->maximum_contexts = 1;
+        capacity_options.omission_marker_emitter =
+            [&capacity_markers](const ExperimentOmissionMarker &marker)
+            { capacity_markers.push_back(marker); };
+        capacity_runtime.bind_structured_event_emitters(
+            nullptr, nullptr, &capacity_emitter);
+        capacity_runtime.configure_experiment_byzantine_faults(
+            std::move(capacity_options));
+        const ConfigurationId capacity_configuration{
+            7, 3, digest("opportunity-capacity-epoch")};
+        const ProposalKey retained{
+            capacity_configuration, digest("opportunity-capacity-retained")};
+        const ProposalKey rejected{
+            capacity_configuration, digest("opportunity-capacity-rejected")};
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            capacity_runtime, retained, 26);
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            capacity_runtime, rejected, 27);
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    capacity_runtime,
+                    retained,
+                    tree(ExperimentReplicaRole::internal, 2)));
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    capacity_runtime,
+                    rejected,
+                    tree(ExperimentReplicaRole::internal, 2)));
+        REQUIRE(capacity_emitter.events.size() == 1);
+        REQUIRE(capacity_markers.size() == 2);
+        CHECK(capacity_markers.back().action ==
+              ExperimentOmissionAction::capacity_exhausted);
+    }
+
+    SECTION("missing emitter and throwing marker callback preserve action")
+    {
+        EventContext no_hook_context;
+        TestHotStuff no_hook_runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1), no_hook_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        std::vector<ExperimentOmissionMarker> no_hook_markers;
+        no_hook_runtime.configure_experiment_byzantine_faults(
+            tiered_v2_options(1, 41, &no_hook_markers));
+        const ProposalKey no_hook_key{
+            ConfigurationId{7, 3, digest("opportunity-no-hook-epoch")},
+            digest("opportunity-no-hook")};
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            no_hook_runtime, no_hook_key, 28);
+        CHECK(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    no_hook_runtime,
+                    no_hook_key,
+                    tree(ExperimentReplicaRole::internal, 1)));
+        REQUIRE(no_hook_markers.size() == 1);
+
+        EventContext throwing_context;
+        TestHotStuff throwing_runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1), throwing_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        RecordingOpportunityAuditEmitter throwing_emitter;
+        auto throwing_options = tiered_v2_options(1, 41);
+        throwing_options.omission_marker_emitter =
+            [](const ExperimentOmissionMarker &)
+            { throw std::runtime_error("injected marker callback failure"); };
+        throwing_runtime.bind_structured_event_emitters(
+            nullptr, nullptr, &throwing_emitter);
+        throwing_runtime.configure_experiment_byzantine_faults(
+            std::move(throwing_options));
+        const ProposalKey throwing_key{
+            ConfigurationId{7, 3, digest("opportunity-throwing-epoch")},
+            digest("opportunity-throwing")};
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            throwing_runtime, throwing_key, 29);
+        bool consumed = false;
+        CHECK_NOTHROW(
+            consumed = ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    throwing_runtime,
+                    throwing_key,
+                    tree(ExperimentReplicaRole::internal, 1)));
+        CHECK(consumed);
+        REQUIRE(throwing_emitter.events.size() == 1);
+    }
+
+    SECTION("tiered v1 keeps its marker callback and emits no opportunity")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 2, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        RecordingOpportunityAuditEmitter emitter;
+        std::vector<ExperimentOmissionMarker> markers;
+        runtime.bind_structured_event_emitters(nullptr, nullptr, &emitter);
+        runtime.configure_experiment_byzantine_faults(
+            tiered_options(2, 2, &markers));
+        const ProposalKey key{
+            ConfigurationId{7, 3, digest("opportunity-v1-epoch")},
+            digest("opportunity-v1-internal")};
+        ExperimentByzantineRuntimeIntegrationTestAccess::seed_view_generation(
+            runtime, key, 30);
+
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    runtime,
+                    key,
+                    tree(ExperimentReplicaRole::internal, 2)));
+        CHECK_FALSE(
+            ExperimentByzantineRuntimeIntegrationTestAccess::
+                consume_aggregate(
+                    runtime,
+                    key,
+                    tree(ExperimentReplicaRole::internal, 2)));
+
+        CHECK(emitter.events.empty());
+        REQUIRE(markers.size() == 1);
+        CHECK_FALSE(markers.front().view_generation.has_value());
+        CHECK_FALSE(markers.front().physical_parent.has_value());
+        CHECK_FALSE(markers.front().expected_message_type.has_value());
+        CHECK(markers.front().physical_role ==
+              ExperimentReplicaRole::root);
+
+        const auto encoded =
+            format_experiment_omission_marker(markers.front());
+        CHECK(encoded.find("view_generation=") == std::string::npos);
+        CHECK(encoded.find("physical_parent=") == std::string::npos);
+        CHECK(encoded.find("expected_message_type=") ==
+              std::string::npos);
+        CHECK(encoded.find("physical_role=") == std::string::npos);
+    }
 }
 
 } // namespace

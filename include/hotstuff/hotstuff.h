@@ -18,6 +18,7 @@
 #ifndef _HOTSTUFF_CORE_H
 #define _HOTSTUFF_CORE_H
 
+#include <deque>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -54,6 +55,26 @@ namespace hotstuff
 
     const double ent_waiting_timeout = 10;
     const double double_inf = 1e10;
+
+    namespace detail
+    {
+        /**
+         * Consume the local pipelined prefix made redundant by a delivered
+         * descendant. This is only the structural queue gate: callers must
+         * first authenticate the candidate's exact active proposal identity
+         * and verify its fixed-quorum certificate.
+         *
+         * A candidate at the queue head consumes only itself. A later
+         * candidate consumes the prefix through itself only when every
+         * skipped entry is a delivered first-parent ancestor. Candidates not
+         * in the local pipeline are publishable without queue mutation.
+         */
+        bool consume_delivered_ancestor_piped_prefix(
+            std::deque<uint256_t> &piped,
+            std::deque<uint256_t> &ready,
+            const block_t &candidate,
+            EntityStorage &storage);
+    }
 
     /**
      * Kauri tree
@@ -1660,6 +1681,8 @@ namespace hotstuff
             const char *reason = nullptr) noexcept;
         void emit_active_configuration_event(
             const ConfigurationId &configuration) noexcept;
+        void emit_fault_contribution_opportunity(
+            const ExperimentOmissionMarker &marker) noexcept;
         void emit_committed_block_event(
             const block_t &blk,
             const std::optional<ProposalKey> &committed_key,

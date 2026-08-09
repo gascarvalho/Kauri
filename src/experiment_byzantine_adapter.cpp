@@ -225,6 +225,7 @@ struct ExperimentByzantineAdapter::State
         std::uint64_t contribution_ordinal{0};
         ExperimentReplicaRole contribution_role{ExperimentReplicaRole::root};
         std::uint64_t role_contribution_ordinal{0};
+        ExperimentReplicaRole physical_role{ExperimentReplicaRole::root};
     };
 
     struct RoleContributionOrdinals
@@ -471,6 +472,7 @@ struct ExperimentByzantineAdapter::State
         }
 
         ScheduledDecisionState decision;
+        decision.physical_role = role;
         const bool inside_window =
             monotonic_ns >= scheduled.window_start_monotonic_ns &&
             monotonic_ns < scheduled.window_end_monotonic_ns;
@@ -580,6 +582,20 @@ struct ExperimentByzantineAdapter::State
         }
     }
 
+    void populate_role_scoped_marker_identity(
+        ExperimentOmissionMarker &marker,
+        const ExperimentByzantineContext &context,
+        ExperimentReplicaRole role) const
+    {
+        const auto &scheduled = *options.rotating_omission;
+        if (!is_role_scoped_tiered_omission_mode(scheduled.mode))
+            return;
+        marker.view_generation = context.view_generation;
+        marker.physical_parent = context.physical_parent;
+        marker.expected_message_type = context.expected_message_type;
+        marker.physical_role = role;
+    }
+
     void emit_scheduled_capacity_marker(
         const ExperimentByzantineContext &context,
         ExperimentReplicaRole role,
@@ -605,6 +621,7 @@ struct ExperimentByzantineAdapter::State
             monotonic_ns};
         populate_tiered_marker(
             marker, local_actor_cohort(), 0, role, 0);
+        populate_role_scoped_marker_identity(marker, context, role);
         options.omission_marker_emitter(marker);
     }
 
@@ -634,6 +651,8 @@ struct ExperimentByzantineAdapter::State
             decision.contribution_ordinal,
             decision.contribution_role,
             decision.role_contribution_ordinal);
+        populate_role_scoped_marker_identity(
+            marker, context, decision.physical_role);
         options.omission_marker_emitter(marker);
     }
 

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "hotstuff/configuration.h"
+#include "hotstuff/evidence.h"
 
 namespace hotstuff
 {
@@ -22,6 +23,9 @@ struct ExperimentByzantineContext final
 {
     ProposalKey proposal;
     std::string diagnostic_window;
+    std::optional<std::uint64_t> view_generation;
+    std::optional<ReplicaID> physical_parent;
+    std::optional<ExpectedMessageType> expected_message_type;
 };
 
 enum class ExperimentDirectVoteDisposition
@@ -87,6 +91,10 @@ struct ExperimentOmissionMarker final
     std::uint64_t contribution_ordinal{0};
     ExperimentReplicaRole contribution_role{ExperimentReplicaRole::root};
     std::uint64_t role_contribution_ordinal{0};
+    std::optional<std::uint64_t> view_generation;
+    std::optional<ReplicaID> physical_parent;
+    std::optional<ExpectedMessageType> expected_message_type;
+    ExperimentReplicaRole physical_role{ExperimentReplicaRole::root};
 };
 
 std::string format_experiment_omission_marker(

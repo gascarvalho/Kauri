@@ -20,6 +20,8 @@
 
 #include "catch.hpp"
 #include "hotstuff/configuration.h"
+#include "hotstuff/hotstuff.h"
+#include "support/commit_rule_fixture.h"
 #include "support/fake_clock.h"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
@@ -2060,4 +2062,167 @@ TEST_CASE("multitree leader liveness honors constructor configuration",
     CHECK(compact.find("timeout(20)") == std::string::npos);
     CHECK(compact.find("prop_delay(0)") == std::string::npos);
     CHECK(compact.find("timeout=20;") == std::string::npos);
+}
+
+TEST_CASE("a later descendant QC consumes the stalled pipelined prefix",
+          "[l07][pipeline][qc-supersession][descendant]"
+          "[intentional-red]")
+{
+    hotstuff::test::CommitRuleCore core;
+    const auto genesis = core.get_genesis();
+    const auto predecessor = core.add_block(genesis, genesis);
+    const auto descendant = core.add_block(predecessor, predecessor);
+    const auto retained = core.add_block(descendant, descendant);
+    std::deque<hotstuff::uint256_t> piped{
+        predecessor->get_hash(), descendant->get_hash()};
+    std::deque<hotstuff::uint256_t> ready{
+        predecessor->get_hash(), descendant->get_hash(),
+        retained->get_hash()};
+
+    REQUIRE(hotstuff::detail::consume_delivered_ancestor_piped_prefix(
+        piped, ready, descendant, *core.storage));
+
+    CHECK(piped.empty());
+    REQUIRE(ready.size() == 1);
+    CHECK(ready.front() == retained->get_hash());
+}
+
+TEST_CASE("a later fork QC cannot consume the pipelined head",
+          "[l07][pipeline][qc-supersession][fork][safety]"
+          "[intentional-red]")
+{
+    hotstuff::test::CommitRuleCore core;
+    const auto genesis = core.get_genesis();
+    const auto predecessor = core.add_block(genesis, genesis);
+    const auto competing_parent = core.add_block(genesis, genesis);
+    const auto fork = core.add_block(competing_parent, competing_parent);
+    std::deque<hotstuff::uint256_t> piped{
+        predecessor->get_hash(), fork->get_hash()};
+    std::deque<hotstuff::uint256_t> ready{fork->get_hash()};
+    const auto original_piped = piped;
+    const auto original_ready = ready;
+
+    CHECK_FALSE(
+        hotstuff::detail::consume_delivered_ancestor_piped_prefix(
+            piped, ready, fork, *core.storage));
+
+    CHECK(piped == original_piped);
+    CHECK(ready == original_ready);
+}
+
+TEST_CASE("pipelined QC queue cleanup covers one and two async blocks",
+          "[l07][pipeline][qc-supersession][queue-cleanup]"
+          "[intentional-red]")
+{
+    SECTION("one queued block publishes directly")
+    {
+        hotstuff::test::CommitRuleCore core;
+        const auto block =
+            core.add_block(core.get_genesis(), core.get_genesis());
+        std::deque<hotstuff::uint256_t> piped{block->get_hash()};
+        std::deque<hotstuff::uint256_t> ready{block->get_hash()};
+
+        REQUIRE(
+            hotstuff::detail::consume_delivered_ancestor_piped_prefix(
+                piped, ready, block, *core.storage));
+        CHECK(piped.empty());
+        CHECK(ready.empty());
+    }
+
+    SECTION("two queued blocks publish the ready descendant")
+    {
+        hotstuff::test::CommitRuleCore core;
+        const auto genesis = core.get_genesis();
+        const auto first = core.add_block(genesis, genesis);
+        const auto second = core.add_block(first, first);
+        std::deque<hotstuff::uint256_t> piped{
+            first->get_hash(), second->get_hash()};
+        std::deque<hotstuff::uint256_t> ready{second->get_hash()};
+
+        REQUIRE(
+            hotstuff::detail::consume_delivered_ancestor_piped_prefix(
+                piped, ready, second, *core.storage));
+        CHECK(piped.empty());
+        CHECK(ready.empty());
+    }
+}
+
+TEST_CASE("a superseded predecessor remains eligible for a late QC",
+          "[l07][pipeline][qc-supersession][late-predecessor]"
+          "[intentional-red]")
+{
+    hotstuff::test::CommitRuleCore core;
+    const auto genesis = core.get_genesis();
+    const auto predecessor = core.add_block(genesis, genesis);
+    const auto descendant = core.add_block(predecessor, predecessor);
+    std::deque<hotstuff::uint256_t> piped{
+        predecessor->get_hash(), descendant->get_hash()};
+    std::deque<hotstuff::uint256_t> ready;
+
+    REQUIRE(hotstuff::detail::consume_delivered_ancestor_piped_prefix(
+        piped, ready, descendant, *core.storage));
+    REQUIRE(piped.empty());
+    REQUIRE(hotstuff::detail::consume_delivered_ancestor_piped_prefix(
+        piped, ready, predecessor, *core.storage));
+    CHECK(piped.empty());
+    CHECK(ready.empty());
+}
+
+TEST_CASE("exact root QC supersession stays synchronous and fail closed",
+          "[l07][pipeline][qc-supersession][integration]"
+          "[intentional-red]")
+{
+    const auto hotstuff = read_source("src/hotstuff.cpp");
+    const auto finish = source_slice(
+        hotstuff,
+        "void HotStuffBase::try_finish_exact_context",
+        "void HotStuffBase::local_vote_authorized");
+    const auto publish = source_slice(
+        hotstuff,
+        "bool HotStuffBase::publish_exact_root_qc",
+        "void HotStuffBase::drain_ready_piped_qcs");
+
+    const auto eligibility = finish.find(
+        "proposal_contexts->clone_publishable_root_qc(lease)");
+    const auto verify = finish.find("final_qc->verify(config)");
+    const auto publication = finish.find("publish_exact_root_qc");
+    const auto revalidate = publish.find("proposal_contexts->revalidate");
+    const auto queued = publish.find("queued_behind_head");
+    const auto active = publish.find("active_configuration", queued);
+    const auto active_guard = publish.rfind(
+        "if (queued_behind_head)", active);
+    const auto consume = publish.find(
+        "consume_delivered_ancestor_piped_prefix");
+    const auto update = publish.find("update_hqc");
+    const auto resolve = publish.find("on_qc_finish");
+    const auto success = publish.rfind("return true");
+
+    REQUIRE(eligibility != std::string::npos);
+    REQUIRE(verify != std::string::npos);
+    REQUIRE(publication != std::string::npos);
+    REQUIRE(revalidate != std::string::npos);
+    REQUIRE(queued != std::string::npos);
+    REQUIRE(active != std::string::npos);
+    REQUIRE(active_guard != std::string::npos);
+    REQUIRE(consume != std::string::npos);
+    REQUIRE(update != std::string::npos);
+    REQUIRE(resolve != std::string::npos);
+    REQUIRE(success != std::string::npos);
+    CHECK(eligibility < verify);
+    CHECK(verify < publication);
+    CHECK(revalidate < queued);
+    CHECK(queued <= active_guard);
+    CHECK(active_guard < active);
+    CHECK(active < consume);
+    CHECK(count_occurrences(
+              publish,
+              "proposal_contexts->active_configuration()") == 1);
+    CHECK(publish.find("frozen_global_quorum") == std::string::npos);
+    CHECK(publish.find("->has_n(") == std::string::npos);
+    CHECK(publish.find("config.nmajority") == std::string::npos);
+    CHECK(consume < update);
+    CHECK(update < resolve);
+    CHECK(resolve < success);
+    CHECK(publish.find("timeout") == std::string::npos);
+    CHECK(publish.find("transition(") == std::string::npos);
 }

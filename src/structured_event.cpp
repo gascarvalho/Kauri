@@ -390,6 +390,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 6:
             type = StructuredEventType::adaptive_v2_shape_decision;
             return true;
+        case 7:
+            type = StructuredEventType::fault_contribution_opportunity;
+            return true;
         default:
             return false;
     }
@@ -478,6 +481,146 @@ const char *expected_message_type_name(
             return "leader_progress";
     }
     return nullptr;
+}
+
+const char *experiment_replica_role_name(
+    ExperimentReplicaRole role) noexcept
+{
+    switch (role)
+    {
+        case ExperimentReplicaRole::root:
+            return "root";
+        case ExperimentReplicaRole::internal:
+            return "internal";
+        case ExperimentReplicaRole::leaf:
+            return "leaf";
+    }
+    return nullptr;
+}
+
+const char *experiment_omission_cohort_name(
+    ExperimentOmissionCohort cohort) noexcept
+{
+    switch (cohort)
+    {
+        case ExperimentOmissionCohort::none:
+            return "none";
+        case ExperimentOmissionCohort::hard:
+            return "hard";
+        case ExperimentOmissionCohort::responsive_degraded:
+            return "responsive_degraded";
+    }
+    return nullptr;
+}
+
+const char *experiment_omission_action_name(
+    ExperimentOmissionAction action) noexcept
+{
+    switch (action)
+    {
+        case ExperimentOmissionAction::forward:
+            return "forward";
+        case ExperimentOmissionAction::omit_aggregate:
+            return "omit_aggregate";
+        case ExperimentOmissionAction::omit_direct_vote:
+            return "omit_direct_vote";
+        case ExperimentOmissionAction::capacity_exhausted:
+            return "capacity_exhausted";
+    }
+    return nullptr;
+}
+
+bool contribution_source_matches_actor(
+    const StructuredEventConfig &config,
+    ReplicaID actor) noexcept
+{
+    if (config.source.kind != StructuredEventSourceKind::replica)
+        return false;
+    try
+    {
+        return config.source.logical_id ==
+               "replica-" + std::to_string(actor);
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bool valid_fault_contribution_opportunity(
+    const FaultContributionOpportunityStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    if (!contribution_source_matches_actor(config, event.actor) ||
+        event.fault_mode !=
+            "tiered_persistent_responsive_omission_v2" ||
+        event.proposal.configuration.epoch_digest == uint256_t{} ||
+        event.proposal.block_hash == uint256_t{} ||
+        event.view_generation == 0 ||
+        event.physical_role == ExperimentReplicaRole::root ||
+        event.parent_replica == event.actor ||
+        event.cohort == ExperimentOmissionCohort::none ||
+        !valid_identity(event.diagnostic_window) ||
+        event.diagnostic_window.size() >
+            config.limits.maximum_identity_bytes ||
+        event.fault_mode.size() > config.limits.maximum_identity_bytes ||
+        event.window_start_monotonic_ns == 0 ||
+        event.window_end_monotonic_ns <=
+            event.window_start_monotonic_ns ||
+        event.decision_monotonic_ns <
+            event.window_start_monotonic_ns ||
+        event.decision_monotonic_ns >=
+            event.window_end_monotonic_ns ||
+        event.responsive_omission_period < 2 ||
+        event.fault_threshold == 0 || event.hard_actor_count == 0 ||
+        event.responsive_degraded_actor_count == 0 ||
+        event.hard_actor_count >
+            std::numeric_limits<std::size_t>::max() -
+                event.responsive_degraded_actor_count ||
+        event.hard_actor_count +
+                event.responsive_degraded_actor_count >
+            event.fault_threshold)
+        return false;
+
+    const bool internal =
+        event.physical_role == ExperimentReplicaRole::internal;
+    const bool leaf = event.physical_role == ExperimentReplicaRole::leaf;
+    if (!internal && !leaf)
+        return false;
+
+    const auto expected_message_type =
+        internal ? ExpectedMessageType::aggregate_relay
+                 : ExpectedMessageType::direct_vote;
+    if (event.expected_message_type != expected_message_type)
+        return false;
+
+    const auto omission_action =
+        internal ? ExperimentOmissionAction::omit_aggregate
+                 : ExperimentOmissionAction::omit_direct_vote;
+    if (event.scheduled_action != ExperimentOmissionAction::forward &&
+        event.scheduled_action != omission_action)
+        return false;
+
+    if (event.cohort == ExperimentOmissionCohort::hard)
+        return event.contribution_ordinal == 0 &&
+               event.role_contribution_ordinal == 0 &&
+               event.scheduled_action == omission_action;
+
+    if (event.cohort !=
+            ExperimentOmissionCohort::responsive_degraded ||
+        event.contribution_ordinal == 0 ||
+        event.role_contribution_ordinal == 0 ||
+        event.role_contribution_ordinal > event.contribution_ordinal)
+        return false;
+
+    const bool scheduled_omission =
+        event.role_contribution_ordinal %
+                event.responsive_omission_period ==
+            0;
+    const auto expected_action =
+        scheduled_omission ? omission_action
+                           : ExperimentOmissionAction::forward;
+    return event.scheduled_action == expected_action;
 }
 
 const char *reputation_outcome_name(
@@ -971,6 +1114,12 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                 std::get<AdaptiveV2ShapeDecisionStructuredEvent>(
                     payload),
                 config);
+        case 7:
+            return valid_fault_contribution_opportunity(
+                std::get<
+                    FaultContributionOpportunityStructuredEvent>(
+                        payload),
+                config);
         default:
             return false;
     }
@@ -1225,6 +1374,57 @@ void append_commit_observed_payload(
     builder.append_integer(event.transaction_count);
     builder.append(",\"commit_batch_index\":");
     builder.append_integer(event.commit_batch_index);
+    builder.append('}');
+}
+
+void append_fault_contribution_opportunity_payload(
+    JsonLineBuilder &builder,
+    const FaultContributionOpportunityStructuredEvent &event)
+{
+    builder.append("{\"actor\":");
+    builder.append_integer(event.actor);
+    builder.append(",\"proposal\":{");
+    append_configuration(builder, event.proposal.configuration);
+    builder.append(",\"block_hash\":");
+    builder.append_escaped(event.proposal.block_hash.to_hex());
+    builder.append("},\"view_generation\":");
+    builder.append_integer(event.view_generation);
+    builder.append(",\"physical_role\":");
+    builder.append_escaped(
+        experiment_replica_role_name(event.physical_role));
+    builder.append(",\"parent_replica\":");
+    builder.append_integer(event.parent_replica);
+    builder.append(",\"expected_message_type\":");
+    builder.append_escaped(
+        expected_message_type_name(event.expected_message_type));
+    builder.append(",\"cohort\":");
+    builder.append_escaped(
+        experiment_omission_cohort_name(event.cohort));
+    builder.append(",\"diagnostic_window\":");
+    builder.append_escaped(event.diagnostic_window);
+    builder.append(",\"window_start_monotonic_ns\":");
+    builder.append_integer(event.window_start_monotonic_ns);
+    builder.append(",\"window_end_monotonic_ns\":");
+    builder.append_integer(event.window_end_monotonic_ns);
+    builder.append(",\"decision_monotonic_ns\":");
+    builder.append_integer(event.decision_monotonic_ns);
+    builder.append(",\"contribution_ordinal\":");
+    builder.append_integer(event.contribution_ordinal);
+    builder.append(",\"role_contribution_ordinal\":");
+    builder.append_integer(event.role_contribution_ordinal);
+    builder.append(",\"scheduled_action\":");
+    builder.append_escaped(
+        experiment_omission_action_name(event.scheduled_action));
+    builder.append(",\"responsive_omission_period\":");
+    builder.append_integer(event.responsive_omission_period);
+    builder.append(",\"fault_threshold\":");
+    builder.append_integer(event.fault_threshold);
+    builder.append(",\"hard_actor_count\":");
+    builder.append_integer(event.hard_actor_count);
+    builder.append(",\"responsive_degraded_actor_count\":");
+    builder.append_integer(event.responsive_degraded_actor_count);
+    builder.append(",\"fault_mode\":");
+    builder.append_escaped(event.fault_mode);
     builder.append('}');
 }
 
@@ -1768,6 +1968,12 @@ std::string serialize_audit_event(
                 builder,
                 std::get<AdaptiveV2ShapeDecisionStructuredEvent>(event));
             break;
+        case 7:
+            append_fault_contribution_opportunity_payload(
+                builder,
+                std::get<
+                    FaultContributionOpportunityStructuredEvent>(event));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -2264,6 +2470,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "evidence.observation_accepted";
         case StructuredEventType::adaptive_v2_shape_decision:
             return "adaptive_v2_shape_decision";
+        case StructuredEventType::fault_contribution_opportunity:
+            return "fault.contribution_opportunity";
         default:
             break;
     }

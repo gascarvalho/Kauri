@@ -3261,11 +3261,16 @@ namespace hotstuff
         const auto scheduled_monotonic_ns =
             scheduled_omission_monotonic_now_ns(
                 experiment_byzantine_adapter.get());
+        ExperimentByzantineContext context{
+            key,
+            experiment_diagnostic_window};
+        context.view_generation = proposal_view_generation(key);
+        context.physical_parent = tree.parent;
+        context.expected_message_type =
+            ExpectedMessageType::direct_vote;
         const auto disposition = experiment_byzantine_adapter
                                      ->consume_outbound_direct_vote(
-            ExperimentByzantineContext{
-                key,
-                experiment_diagnostic_window},
+            context,
             ExperimentReplicaRole::leaf,
             scheduled_monotonic_ns);
         if (disposition == ExperimentDirectVoteDisposition::forward)
@@ -3307,8 +3312,12 @@ namespace hotstuff
     {
         if (experiment_byzantine_adapter == nullptr)
             return false;
-        const ExperimentByzantineContext context{
+        ExperimentByzantineContext context{
             key, experiment_diagnostic_window};
+        context.view_generation = proposal_view_generation(key);
+        context.physical_parent = tree.parent;
+        context.expected_message_type =
+            ExpectedMessageType::aggregate_relay;
         const auto omission_monotonic_ns =
             scheduled_omission_monotonic_now_ns(
                 experiment_byzantine_adapter.get());
@@ -5765,6 +5774,55 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::emit_fault_contribution_opportunity(
+        const ExperimentOmissionMarker &marker) noexcept
+    {
+        if (audit_event_emitter == nullptr || marker.actor != get_id() ||
+            marker.action == ExperimentOmissionAction::capacity_exhausted ||
+            marker.physical_role == ExperimentReplicaRole::root ||
+            !marker.view_generation.has_value() ||
+            !marker.physical_parent.has_value() ||
+            !marker.expected_message_type.has_value() ||
+            marker.fault_mode !=
+                "tiered_persistent_responsive_omission_v2")
+            return;
+        try
+        {
+            FaultContributionOpportunityStructuredEvent event;
+            event.actor = marker.actor;
+            event.proposal = marker.proposal;
+            event.view_generation = *marker.view_generation;
+            event.physical_role = marker.physical_role;
+            event.parent_replica = *marker.physical_parent;
+            event.expected_message_type =
+                *marker.expected_message_type;
+            event.cohort = marker.cohort;
+            event.diagnostic_window = marker.diagnostic_window;
+            event.window_start_monotonic_ns =
+                marker.window_start_monotonic_ns;
+            event.window_end_monotonic_ns =
+                marker.window_end_monotonic_ns;
+            event.decision_monotonic_ns = marker.monotonic_ns;
+            event.contribution_ordinal = marker.contribution_ordinal;
+            event.role_contribution_ordinal =
+                marker.role_contribution_ordinal;
+            event.scheduled_action = marker.action;
+            event.responsive_omission_period =
+                marker.responsive_omission_period;
+            event.fault_threshold = marker.fault_threshold;
+            event.hard_actor_count = marker.hard_actor_count;
+            event.responsive_degraded_actor_count =
+                marker.responsive_degraded_actor_count;
+            event.fault_mode = marker.fault_mode;
+            audit_event_emitter->emit_audit(
+                AuditStructuredEventPayload{std::move(event)});
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
+        }
+    }
+
     void HotStuffBase::emit_committed_block_event(
         const block_t &blk,
         const std::optional<ProposalKey> &committed_key,
@@ -6116,13 +6174,91 @@ namespace hotstuff
         try_finish_exact_context(lease);
     }
 
+    namespace detail
+    {
+        namespace
+        {
+            bool is_delivered_first_parent_ancestor(
+                const block_t &maybe_ancestor,
+                const block_t &descendant)
+            {
+                if (maybe_ancestor == nullptr || descendant == nullptr ||
+                    !maybe_ancestor->is_delivered() ||
+                    !descendant->is_delivered() ||
+                    maybe_ancestor->get_height() >=
+                        descendant->get_height())
+                    return false;
+
+                block_t cursor = descendant;
+                while (cursor != nullptr &&
+                       cursor->get_height() >
+                           maybe_ancestor->get_height())
+                {
+                    const auto &parents = cursor->get_parents();
+                    if (parents.empty() || parents.front() == nullptr ||
+                        !parents.front()->is_delivered() ||
+                        parents.front()->get_height() >=
+                            cursor->get_height())
+                        return false;
+                    cursor = parents.front();
+                }
+                return cursor == maybe_ancestor;
+            }
+        }
+
+        bool consume_delivered_ancestor_piped_prefix(
+            std::deque<uint256_t> &piped,
+            std::deque<uint256_t> &ready,
+            const block_t &candidate,
+            EntityStorage &storage)
+        {
+            if (candidate == nullptr || !candidate->is_delivered())
+                return false;
+
+            const auto candidate_position = std::find(
+                piped.begin(), piped.end(), candidate->get_hash());
+            if (candidate_position == piped.end())
+                return true;
+
+            for (auto queued = piped.begin();
+                 queued != candidate_position; ++queued)
+            {
+                const auto predecessor = storage.find_blk(*queued);
+                if (!is_delivered_first_parent_ancestor(
+                        predecessor, candidate))
+                    return false;
+            }
+
+            std::vector<uint256_t> consumed(
+                piped.begin(), std::next(candidate_position));
+            piped.erase(piped.begin(), std::next(candidate_position));
+            ready.erase(
+                std::remove_if(
+                    ready.begin(), ready.end(),
+                    [&consumed](const uint256_t &hash)
+                    {
+                        return std::find(
+                                   consumed.begin(), consumed.end(), hash) !=
+                               consumed.end();
+                    }),
+                ready.end());
+            return true;
+        }
+    }
+
     bool HotStuffBase::publish_exact_root_qc(
         const ProposalContextLease &lease,
         quorum_cert_bt final_qc)
     {
-        auto block = storage->find_blk(lease.key().block_hash);
-        if (block == nullptr || !block->delivered || final_qc == nullptr ||
+        if (!proposal_contexts->revalidate(lease) ||
+            lease.tree().parent.has_value())
+            return false;
+        if (final_qc == nullptr ||
             final_qc->get_proposal_key() != lease.key())
+            return false;
+
+        auto block = storage->find_blk(lease.key().block_hash);
+        if (block == nullptr || !block->delivered)
             return false;
         if (block->self_qc != nullptr &&
             block->self_qc->get_proposal_key() != lease.key())
@@ -6131,21 +6267,29 @@ namespace hotstuff
         block->self_qc = final_qc->clone();
         const auto piped = std::find(
             piped_queue.begin(), piped_queue.end(), lease.key().block_hash);
-        if (piped != piped_queue.end() &&
-            (piped_queue.empty() ||
-             piped_queue.front() != lease.key().block_hash))
+        const bool queued_behind_head =
+            piped != piped_queue.end() && piped != piped_queue.begin();
+        bool active_supersession = true;
+        if (queued_behind_head)
         {
-            if (std::find(
-                    rdy_queue.begin(),
-                    rdy_queue.end(),
+            const auto active_configuration =
+                proposal_contexts->active_configuration();
+            active_supersession =
+                active_configuration.has_value() &&
+                *active_configuration == lease.key().configuration;
+        }
+        if (!active_supersession ||
+            !detail::consume_delivered_ancestor_piped_prefix(
+                piped_queue, rdy_queue, block, *storage))
+        {
+            if (queued_behind_head &&
+                std::find(
+                    rdy_queue.begin(), rdy_queue.end(),
                     lease.key().block_hash) == rdy_queue.end())
                 rdy_queue.push_back(lease.key().block_hash);
             return false;
         }
 
-        if (!piped_queue.empty() &&
-            piped_queue.front() == lease.key().block_hash)
-            piped_queue.pop_front();
         const auto ready = std::find(
             rdy_queue.begin(), rdy_queue.end(), lease.key().block_hash);
         if (ready != rdy_queue.end())
@@ -10094,15 +10238,39 @@ namespace hotstuff
             auto configured_marker_emitter =
                 std::move(options.omission_marker_emitter);
             options.omission_marker_emitter =
-                [configured_marker_emitter =
+                [this,
+                 configured_marker_emitter =
                      std::move(configured_marker_emitter)](
                     const ExperimentOmissionMarker &marker)
                 {
-                    if (configured_marker_emitter)
-                        configured_marker_emitter(marker);
-                    const auto encoded =
-                        format_experiment_omission_marker(marker);
-                    HOTSTUFF_LOG_INFO("%s", encoded.c_str());
+                    if (marker.fault_mode !=
+                        "tiered_persistent_responsive_omission_v2")
+                    {
+                        if (configured_marker_emitter)
+                            configured_marker_emitter(marker);
+                        const auto encoded =
+                            format_experiment_omission_marker(marker);
+                        HOTSTUFF_LOG_INFO("%s", encoded.c_str());
+                        return;
+                    }
+                    emit_fault_contribution_opportunity(marker);
+                    try
+                    {
+                        if (configured_marker_emitter)
+                            configured_marker_emitter(marker);
+                    }
+                    catch (...)
+                    {
+                    }
+                    try
+                    {
+                        const auto encoded =
+                            format_experiment_omission_marker(marker);
+                        HOTSTUFF_LOG_INFO("%s", encoded.c_str());
+                    }
+                    catch (...)
+                    {
+                    }
                 };
         }
         auto diagnostic_window = options.diagnostic_window;

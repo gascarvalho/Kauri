@@ -540,8 +540,12 @@ using hotstuff::EpochLifecycleEvent;
 using hotstuff::EpochLifecycleTransition;
 using hotstuff::EvidenceObservationAcceptedStructuredEvent;
 using hotstuff::EvidenceReputationAuditUpdate;
+using hotstuff::ExperimentOmissionAction;
+using hotstuff::ExperimentOmissionCohort;
+using hotstuff::ExperimentReplicaRole;
 using hotstuff::ExclusiveFileStructuredEventOutput;
 using hotstuff::ExpectedMessageType;
+using hotstuff::FaultContributionOpportunityStructuredEvent;
 using hotstuff::MonotonicRawStructuredEventClock;
 using hotstuff::ProcessLifecycleEvent;
 using hotstuff::ProcessLifecycleState;
@@ -668,6 +672,33 @@ CommitObservedStructuredEvent commit_observed_event()
         digest("observed-committed-parent"),
         7,
         2};
+}
+
+FaultContributionOpportunityStructuredEvent contribution_opportunity_event()
+{
+    FaultContributionOpportunityStructuredEvent event;
+    event.actor = 2;
+    event.proposal = ProposalKey{
+        configuration(7, 3, "opportunity-epoch"),
+        digest("opportunity-block")};
+    event.view_generation = 19;
+    event.physical_role = ExperimentReplicaRole::internal;
+    event.parent_replica = 0;
+    event.expected_message_type = ExpectedMessageType::aggregate_relay;
+    event.cohort = ExperimentOmissionCohort::responsive_degraded;
+    event.diagnostic_window = "factorial-window-1";
+    event.window_start_monotonic_ns = 100;
+    event.window_end_monotonic_ns = 200;
+    event.decision_monotonic_ns = 150;
+    event.contribution_ordinal = 81;
+    event.role_contribution_ordinal = 41;
+    event.scheduled_action = ExperimentOmissionAction::omit_aggregate;
+    event.responsive_omission_period = 41;
+    event.fault_threshold = 10;
+    event.hard_actor_count = 3;
+    event.responsive_degraded_actor_count = 7;
+    event.fault_mode = "tiered_persistent_responsive_omission_v2";
+    return event;
 }
 
 EpochCommandCommittedStructuredEvent epoch_command_event()
@@ -1814,8 +1845,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 7,
-        "the audit capability also admits shape decisions");
+        std::variant_size<AuditStructuredEventPayload>::value == 8,
+        "the audit capability also admits contribution opportunities");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -1841,6 +1872,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<6, AuditStructuredEventPayload>,
             AdaptiveV2ShapeDecisionStructuredEvent>::value,
         "the seventh audit payload is the pure shape decision");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<7, AuditStructuredEventPayload>,
+            FaultContributionOpportunityStructuredEvent>::value,
+        "the eighth audit payload is a prospective contribution");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -4672,4 +4708,117 @@ TEST_CASE("V13 allocation prefixes expose either one whole event or none",
     CAPTURE(complete_prefixes);
     REQUIRE(injected_failures > 0);
     REQUIRE(complete_prefixes > 0);
+}
+
+TEST_CASE(
+    "fault contribution opportunity serializes exact prospective identity",
+    "[adaptive-v2][experiment][fault-opportunity][structured-event]"
+    "[intentional-red]")
+{
+    const auto event = contribution_opportunity_event();
+    const AuditStructuredEventPayload payload{event};
+    CHECK(hotstuff::structured_event_type(payload) ==
+          StructuredEventType::fault_contribution_opportunity);
+    CHECK(std::string(hotstuff::structured_event_type_name(
+              StructuredEventType::fault_contribution_opportunity)) ==
+          "fault.contribution_opportunity");
+
+    auto config = event_config();
+    config.source.logical_id = "replica-2";
+    config.designated_commit_observer.reset();
+    FakeClock clock({500});
+    MemoryOutput output;
+    StructuredEventSink sink(config, clock, output);
+    sink.emit_audit(payload);
+    sink.drain();
+
+    const auto record = rendered(output);
+    CHECK(record.find("\"event_type\":\"fault.contribution_opportunity\"") !=
+          std::string::npos);
+    CHECK(record.find("\"source_id\":\"replica-2\"") !=
+          std::string::npos);
+    CHECK(record.find("\"actor\":2") != std::string::npos);
+    CHECK(record.find("\"epoch_number\":7") != std::string::npos);
+    CHECK(record.find("\"tree_id\":3") != std::string::npos);
+    CHECK(record.find(event.proposal.configuration.epoch_digest.to_hex()) !=
+          std::string::npos);
+    CHECK(record.find(event.proposal.block_hash.to_hex()) !=
+          std::string::npos);
+    CHECK(record.find("\"view_generation\":19") != std::string::npos);
+    CHECK(record.find("\"physical_role\":\"internal\"") !=
+          std::string::npos);
+    CHECK(record.find("\"parent_replica\":0") != std::string::npos);
+    CHECK(record.find("\"expected_message_type\":\"aggregate_relay\"") !=
+          std::string::npos);
+    CHECK(record.find("\"cohort\":\"responsive_degraded\"") !=
+          std::string::npos);
+    CHECK(record.find("\"diagnostic_window\":\"factorial-window-1\"") !=
+          std::string::npos);
+    CHECK(record.find("\"window_start_monotonic_ns\":100") !=
+          std::string::npos);
+    CHECK(record.find("\"window_end_monotonic_ns\":200") !=
+          std::string::npos);
+    CHECK(record.find("\"decision_monotonic_ns\":150") !=
+          std::string::npos);
+    CHECK(record.find("\"contribution_ordinal\":81") !=
+          std::string::npos);
+    CHECK(record.find("\"role_contribution_ordinal\":41") !=
+          std::string::npos);
+    CHECK(record.find("\"scheduled_action\":\"omit_aggregate\"") !=
+          std::string::npos);
+    CHECK(record.find("\"responsive_omission_period\":41") !=
+          std::string::npos);
+    CHECK(record.find("\"fault_threshold\":10") != std::string::npos);
+    CHECK(record.find("\"hard_actor_count\":3") != std::string::npos);
+    CHECK(record.find("\"responsive_degraded_actor_count\":7") !=
+          std::string::npos);
+    CHECK(record.find(
+              "\"fault_mode\":\"tiered_persistent_responsive_omission_v2\"") !=
+          std::string::npos);
+    CHECK(sink.health().complete_records == 1);
+
+    auto mismatched_source = config;
+    mismatched_source.source.logical_id = "replica-3";
+    FakeClock rejected_clock({501});
+    MemoryOutput rejected_output;
+    StructuredEventSink rejected_sink(
+        mismatched_source, rejected_clock, rejected_output);
+    rejected_sink.emit_audit(payload);
+    const auto rejected = rejected_sink.health();
+    CHECK_FALSE(rejected.healthy);
+    CHECK(rejected.stopped);
+    CHECK(rejected.first_failure ==
+          StructuredEventFailure::invalid_payload);
+    CHECK(rejected.last_assigned_sequence == 0);
+    CHECK(rejected_output.bytes().empty());
+
+    const auto rejects = [&config](
+                             FaultContributionOpportunityStructuredEvent
+                                 invalid) {
+        FakeClock invalid_clock({502});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            config, invalid_clock, invalid_output);
+        invalid_sink.emit_audit(
+            AuditStructuredEventPayload{std::move(invalid)});
+        const auto failed = invalid_sink.health();
+        return !failed.healthy && failed.stopped &&
+               failed.first_failure ==
+                   StructuredEventFailure::invalid_payload &&
+               failed.last_assigned_sequence == 0 &&
+               invalid_output.bytes().empty();
+    };
+
+    auto contradictory_forward = event;
+    contradictory_forward.scheduled_action =
+        ExperimentOmissionAction::forward;
+    CHECK(rejects(std::move(contradictory_forward)));
+
+    auto contradictory_omission = event;
+    contradictory_omission.role_contribution_ordinal = 40;
+    CHECK(rejects(std::move(contradictory_omission)));
+
+    auto impossible_role_ordinal = event;
+    impossible_role_ordinal.role_contribution_ordinal = 82;
+    CHECK(rejects(std::move(impossible_role_ordinal)));
 }
