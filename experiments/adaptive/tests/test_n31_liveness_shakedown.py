@@ -8,7 +8,7 @@ factorial denominator or make a thesis performance claim.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import importlib
 import inspect
@@ -21,12 +21,22 @@ import pytest
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-PROFILE_PATH = (
+V1_PROFILE_PATH = (
     REPOSITORY
     / "experiments"
     / "adaptive"
     / "profiles"
     / "n31-f5-p-liveness-shakedown-v1.json"
+)
+V2_PROFILE_PATH = V1_PROFILE_PATH.with_name(
+    "n31-f5-p-liveness-shakedown-v2.json"
+)
+PROFILE_PATH = V1_PROFILE_PATH
+V1_PROFILE_SHA256 = (
+    "906a62db3c3fc636acc9961c9cd65c23625b2eb75ff39f6d49f3c21fc5845b6f"
+)
+V2_PROFILE_SHA256 = (
+    "a1dd1e1c53c7ba01b0f7410e60bf13d409742d5cd5be8423e8403d22d31a3d28"
 )
 SOURCE_MANIFEST_PATH = (
     REPOSITORY
@@ -93,6 +103,11 @@ APPROVAL_RECEIPT_SHA256 = hashlib.sha256(
         sort_keys=True,
     ).encode()
 ).hexdigest()
+V2_APPROVAL_RECEIPT = {
+    **APPROVAL_RECEIPT,
+    "scope": "n31_f5_p_liveness_shakedown_non_claim_v2",
+    "profile_id": "n31-f5-p-liveness-shakedown-v2",
+}
 FAST_ROOTS = (
     11,
     14,
@@ -303,7 +318,7 @@ def _complete_sigint_cleanup_rows() -> list[dict[str, object]]:
 def test_frozen_profile_is_exactly_the_v13_slot_066_p_contract(profile: Any) -> None:
     module = _module()
     document = _profile_document(profile)
-    assert profile.profile_sha256 == module.SHIPPED_PROFILE_SHA256
+    assert profile.profile_sha256 == V1_PROFILE_SHA256
     assert hashlib.sha256(SOURCE_MANIFEST_PATH.read_bytes()).hexdigest() == (
         SOURCE_MANIFEST_SHA256
     )
@@ -386,6 +401,238 @@ def test_frozen_profile_is_exactly_the_v13_slot_066_p_contract(profile: Any) -> 
             "apply_shape_selection": False,
         },
     ]
+
+
+def test_v2_release_is_the_exact_pinned_profile_id_delta() -> None:
+    module = _module()
+    v1 = json.loads(V1_PROFILE_PATH.read_bytes())
+    v2 = json.loads(V2_PROFILE_PATH.read_bytes())
+    assert hashlib.sha256(V1_PROFILE_PATH.read_bytes()).hexdigest() == (
+        V1_PROFILE_SHA256
+    )
+    assert hashlib.sha256(V2_PROFILE_PATH.read_bytes()).hexdigest() == (
+        V2_PROFILE_SHA256
+    )
+    assert v1.pop("profile_id") == "n31-f5-p-liveness-shakedown-v1"
+    assert v2.pop("profile_id") == "n31-f5-p-liveness-shakedown-v2"
+    assert v2 == v1
+    assert module.load_frozen_profile(V1_PROFILE_PATH).profile_sha256 == (
+        V1_PROFILE_SHA256
+    )
+    assert module.load_frozen_profile(V2_PROFILE_PATH).profile_sha256 == (
+        V2_PROFILE_SHA256
+    )
+
+
+def test_release_registry_pins_distinct_roots_and_approval_scopes() -> None:
+    releases = {
+        release.profile_id: release for release in _module().SHIPPED_RELEASES
+    }
+    v1 = releases["n31-f5-p-liveness-shakedown-v1"]
+    v2 = releases["n31-f5-p-liveness-shakedown-v2"]
+    assert v1.canonical_results_relative_path == Path(
+        "results/n31-f5-p-liveness-shakedown-v1"
+    )
+    assert v2.canonical_results_relative_path == Path(
+        "results/n31-f5-p-liveness-shakedown-v2"
+    )
+    assert v1.approval_scope == (
+        "n31_f5_p_liveness_shakedown_non_claim_v1"
+    )
+    assert v2.approval_scope == (
+        "n31_f5_p_liveness_shakedown_non_claim_v2"
+    )
+
+
+@pytest.mark.parametrize("profile_path", (V1_PROFILE_PATH, V2_PROFILE_PATH))
+def test_known_profile_id_still_requires_its_exact_release_hash(
+    tmp_path: Path,
+    profile_path: Path,
+) -> None:
+    mutated = tmp_path / profile_path.name
+    mutated.write_bytes(profile_path.read_bytes() + b" ")
+    with pytest.raises(
+        _module().N31LivenessShakedownError,
+        match="profile bytes",
+    ):
+        _module().load_frozen_profile(mutated)
+
+
+def test_swapped_profile_id_and_release_hash_are_rejected(profile: Any) -> None:
+    module = _module()
+    swapped = replace(
+        profile,
+        profile_id="n31-f5-p-liveness-shakedown-v2",
+    )
+    with pytest.raises(
+        module.N31LivenessShakedownError,
+        match="release identity",
+    ):
+        module.build_approval_receipt(
+            swapped,
+            approval_reference="must reject swapped identity",
+            approved_utc="2026-08-09T12:00:00Z",
+            kauri_revision=REVISION,
+            build_provenance_sha256=BUILD_PROVENANCE_SHA256,
+        )
+
+
+def test_v1_approval_cannot_authorize_v2() -> None:
+    module = _module()
+    profile = module.load_frozen_profile(V2_PROFILE_PATH)
+    with pytest.raises(module.N31LivenessShakedownError, match="approval"):
+        module.preflight_from_documents(
+            profile,
+            current_revision=REVISION,
+            build_provenance=BUILD_PROVENANCE,
+            approval_receipt=APPROVAL_RECEIPT,
+        )
+
+
+def test_v1_and_v2_attempt_caps_are_independent(tmp_path: Path) -> None:
+    module = _module()
+    for release_offset, release in enumerate(module.SHIPPED_RELEASES):
+        root = tmp_path / release.canonical_results_relative_path.name
+        for ordinal in range(2):
+            digit = str(ordinal + 1)
+            module.allocate_attempt_directory(
+                root,
+                timestamp_utc=f"20260809T12000{ordinal}.000000Z",
+                process_id=4100 + release_offset,
+                attempt_uuid=(
+                    f"{digit * 8}-{digit * 4}-4{digit * 3}-8{digit * 3}-"
+                    f"{digit * 12}"
+                ),
+            )
+        with pytest.raises(
+            module.N31LivenessShakedownError,
+            match="two attempts",
+        ):
+            module.allocate_attempt_directory(
+                root,
+                timestamp_utc="20260809T120002.000000Z",
+                process_id=4100 + release_offset,
+                attempt_uuid="33333333-3333-4333-8333-333333333333",
+            )
+
+
+@pytest.mark.parametrize("profile_path", (V1_PROFILE_PATH, V2_PROFILE_PATH))
+def test_live_preflight_rejects_arbitrary_roots_before_launch(
+    tmp_path: Path,
+    profile_path: Path,
+) -> None:
+    module = _module()
+    with pytest.raises(
+        module.N31LivenessShakedownError,
+        match="canonical result root",
+    ):
+        module.preflight(
+            profile_path=profile_path,
+            repository=REPOSITORY,
+            results_root=tmp_path / "arbitrary",
+            approval_receipt_path=tmp_path / "external-approval.json",
+        )
+
+
+def test_v2_attempt_archives_exact_selected_bytes_and_metadata(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    profile = module.load_frozen_profile(V2_PROFILE_PATH)
+    receipt = module.preflight_from_documents(
+        profile,
+        current_revision=REVISION,
+        build_provenance=BUILD_PROVENANCE,
+        approval_receipt=V2_APPROVAL_RECEIPT,
+    )
+
+    def stop(*_args: object) -> None:
+        raise RuntimeError("stop")
+
+    attempt, verdict = module._run_attempt_once(
+        profile=profile,
+        preflight_receipt=receipt,
+        approval_receipt=V2_APPROVAL_RECEIPT,
+        results_root=tmp_path / "v2",
+        pair_id=PAIR_ID,
+        execute_attempt=stop,
+        timestamp_utc="20260809T120000.000000Z",
+        process_id=4101,
+        attempt_uuid="11111111-1111-4111-8111-111111111111",
+    )
+    assert verdict == "INCOMPLETE"
+    assert (attempt / "profile.json").read_bytes() == V2_PROFILE_PATH.read_bytes()
+    for name in ("attempt.json", "preflight-receipt.json", "terminal.json"):
+        assert json.loads((attempt / name).read_bytes())["profile_id"] == (
+            profile.profile_id
+        )
+    approval = json.loads((attempt / "approval-receipt.json").read_bytes())
+    assert approval["scope"] == "n31_f5_p_liveness_shakedown_non_claim_v2"
+
+
+def test_timeout_launch_and_cleanup_artifacts_use_selected_profile_id(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    profile_id = "n31-f5-p-liveness-shakedown-v2"
+    source = module._source_slot()
+    offsets = {
+        relative: 0
+        for replica_id in range(source.runtime.replica_count)
+        for relative in (
+            source.runtime.process_logs.replica_stdout_relative_paths[replica_id],
+            source.runtime.process_logs.replica_stderr_relative_paths[replica_id],
+        )
+    }
+    capture = module._timeout_capture_document(
+        profile_id=profile_id,
+        first_common_commit_ns=1,
+        observation_deadline_ns=2,
+        start_offsets=offsets,
+        end_offsets=offsets,
+    )
+    diagnostics = tmp_path / "raw/diagnostics"
+    diagnostics.mkdir(parents=True)
+    (diagnostics / "leader-timeout-window.json").write_bytes(
+        module._canonical_json_bytes(capture, newline=True)
+    )
+    assert module._read_timeout_capture(
+        source.runtime,
+        tmp_path,
+        profile_id=profile_id,
+        first_common_commit_ns=1,
+        observation_deadline_ns=2,
+    ) == (offsets, offsets)
+    launch = module._launch_document(
+        source,
+        SimpleNamespace(
+            redaction_key_id="a" * 16,
+            redacted_manager_argv=("manager",),
+            redacted_replica_argv=(),
+        ),
+        profile_id=profile_id,
+        pair_id=PAIR_ID,
+        attempt_ordinal=1,
+        anchor_ns=1,
+    )
+    assert launch["profile_id"] == profile_id
+    module._write_cleanup_artifacts(
+        tmp_path,
+        (),
+        (),
+        profile_id=profile_id,
+        cleanup_started_ns=1,
+        cleanup_complete=False,
+        streams_closed=False,
+        ports_clear=False,
+        final_events_complete=False,
+        error="test",
+    )
+    for path in (
+        tmp_path / "cleanup-ledger.json",
+        diagnostics / "cleanup-samples.json",
+    ):
+        assert json.loads(path.read_bytes())["profile_id"] == profile_id
 
 
 def test_profile_is_non_claim_and_permits_only_two_one_shot_attempts(
@@ -1009,6 +1256,60 @@ def test_run_pair_rejects_post_first_identity_substitution(
     assert len(tuple(root.glob("attempt-*"))) == 1
 
 
+def test_validate_pair_rejects_mixed_v1_v2_profile_bytes(
+    tmp_path: Path,
+    profile: Any,
+) -> None:
+    module = _module()
+    root = tmp_path / "pair"
+
+    def stop(*_args: object) -> None:
+        raise RuntimeError("stop")
+
+    attempts = module.run_pair(
+        profile=profile,
+        preflight_receipt=module.preflight_from_documents(
+            profile,
+            current_revision=REVISION,
+            build_provenance=BUILD_PROVENANCE,
+            approval_receipt=APPROVAL_RECEIPT,
+        ),
+        approval_receipt=APPROVAL_RECEIPT,
+        results_root=root,
+        execute_attempt=stop,
+        pair_uuid=PAIR_ID,
+        attempt_identities=(
+            (
+                "20260809T120000.000000Z",
+                4101,
+                "11111111-1111-4111-8111-111111111111",
+            ),
+            (
+                "20260809T120001.000000Z",
+                4101,
+                "22222222-2222-4222-8222-222222222222",
+            ),
+        ),
+    )
+    second = attempts[1][0]
+    (second / "profile.json").write_bytes(V2_PROFILE_PATH.read_bytes())
+    (second / "evidence-seal.json").unlink()
+    second_seal = module.create_evidence_seal(second)
+    ledger_path = root / "pair-ledger.json"
+    ledger = json.loads(ledger_path.read_bytes())
+    ledger["attempts"][1]["evidence_seal_sha256"] = second_seal
+    ledger_path.write_bytes(
+        module._canonical_json_bytes(ledger, newline=True)
+    )
+    (root / "evidence-seal.json").unlink()
+    module.create_evidence_seal(root)
+    with pytest.raises(
+        module.N31LivenessShakedownError,
+        match="mixed liveness profile",
+    ):
+        module.validate_pair(root, approval_receipt=APPROVAL_RECEIPT)
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -1110,6 +1411,7 @@ def test_validate_pair_rejects_internal_launch_provenance_mutation(
         launch = module._launch_document(
             source,
             materialized,
+            profile_id=profile.profile_id,
             pair_id=PAIR_ID,
             attempt_ordinal=ordinal,
             anchor_ns=anchor_ns,
@@ -2351,6 +2653,16 @@ def test_cli_exposes_only_preflight_run_validate_and_requires_approval(
 
     with pytest.raises(SystemExit):
         cli._arguments(["campaign"])
+
+
+def test_cli_preflight_and_run_default_to_v2_release() -> None:
+    cli = _cli()
+    for command in ("preflight", "run"):
+        args = cli._arguments([command])
+        assert args.profile == V2_PROFILE_PATH
+        assert args.results_root == (
+            REPOSITORY / "results/n31-f5-p-liveness-shakedown-v2"
+        )
 
 
 def test_cli_validate_forwards_preserved_pair_without_launch(

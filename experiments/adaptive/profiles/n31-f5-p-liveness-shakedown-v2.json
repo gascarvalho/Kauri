@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "profile_id": "n31-f5-p-liveness-shakedown-v2",
+  "frozen": true,
+  "diagnostic_only": true,
+  "source": {
+    "manifest_id": "shape-placement-factorial-v13",
+    "manifest_sha256": "546ce4a3bfecfe62678926f8a0d71cc8ce7db771ed5dd347ef42d15ba39af36b",
+    "plan_sha256": "bbca567114a12034fd41318c856a15eda66bf2cf2efe076398978ca1164bc7ed",
+    "slot_id": "slot-066-n31-f5-b05-P",
+    "slot_ordinal": 66,
+    "block_id": "n31-f5-b05",
+    "arm_code": "P",
+    "scientific_seed": 41735
+  },
+  "consensus": {
+    "replica_count": 31,
+    "fault_threshold": 10,
+    "quorum": 21,
+    "initial_fanout": 5,
+    "pipeline_stretch": 2,
+    "tree_count": 21
+  },
+  "adaptation": {
+    "placement": true,
+    "shape": false,
+    "candidate_fanouts": [2, 3, 5],
+    "epoch_fanout_policy": "one_uniform_fanout_per_epoch",
+    "pipeline_policy": "fixed_first_slice"
+  },
+  "fault_cohorts": {
+    "mode": "tiered_persistent_responsive_omission_v2",
+    "hard_actor_ids": [22, 25, 29],
+    "responsive_degraded_actor_ids": [1, 2, 3, 5, 7, 8, 16],
+    "responsive_omission_period": 41,
+    "hard_actions": {
+      "root": "normal",
+      "internal": "omit_aggregate",
+      "leaf": "omit_direct_vote"
+    }
+  },
+  "workload": {
+    "block_size": 1000,
+    "piped_latency_ms": 1,
+    "tree_switch_period_blocks": 1
+  },
+  "responsiveness_policy": {
+    "policy_version": "shape25-direct-vote-responsiveness-v2",
+    "attempt_window": 128,
+    "minimum_attempts": 60,
+    "minimum_response_rate_ppm": 950000,
+    "maximum_timeout_rate_ppm": 50000,
+    "trailing_timeout_streak": 7,
+    "latency_percentile_basis_points": 5000
+  },
+  "timers": {
+    "global_worst_candidate_depth": 4,
+    "aggregation_timeout_ms_per_depth": 125,
+    "leader_progress_timeout_ms_per_depth": 5000,
+    "leader_activation_grace_ms": 1000,
+    "activation_delay_blocks": 5,
+    "transition_convergence_deadline_s": 20,
+    "schedule_slack_s": 30,
+    "drain_margin_s": 20,
+    "startup_timeout_s": 120,
+    "hard_timeout_s": 500
+  },
+  "transitions": [
+    {
+      "successor_epoch": 1,
+      "policy_intent": "fault_containment",
+      "minimum_post_baseline_observation_ms": 180000,
+      "minimum_predecessor_residency_ms": 0,
+      "apply_shape_selection": false
+    },
+    {
+      "successor_epoch": 2,
+      "policy_intent": "performance_optimization",
+      "minimum_post_baseline_observation_ms": 0,
+      "minimum_predecessor_residency_ms": 30000,
+      "apply_shape_selection": false
+    }
+  ],
+  "fault_window": {
+    "start_after_prelaunch_anchor_s": 150,
+    "duration_s": 300,
+    "maximum_omissions_per_proposal": 10
+  },
+  "phase_windows": {
+    "bucket_width_s": 5,
+    "baseline_bucket_count": 6,
+    "fault_evidence_bucket_count": 6,
+    "epoch1_stable_bucket_count": 6,
+    "epoch2_stable_bucket_count": 6
+  },
+  "ports": {
+    "peer_base": 31600,
+    "client_base": 32600,
+    "manager": 33600
+  },
+  "attempt_policy": {
+    "maximum_attempts": 2,
+    "attempts_per_invocation": 2,
+    "automatic_retries": 0,
+    "replacement_policy": "none",
+    "outcome_dependent_launch": false
+  },
+  "evidence_scope": {
+    "claim_eligible": false,
+    "campaign_member": false,
+    "denominator_contribution": 0,
+    "figure_eligible": false
+  },
+  "observation": {
+    "anchor": "first_common_epoch2_commit",
+    "duration_s": 45,
+    "required_selected_root_count": 21,
+    "require_every_selected_root_exercised": true
+  }
+}

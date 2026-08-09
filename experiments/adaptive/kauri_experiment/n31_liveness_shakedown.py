@@ -60,22 +60,57 @@ from .profiled_fault_archive import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-DEFAULT_PROFILE_PATH = (
-    REPOSITORY
-    / "experiments/adaptive/profiles/n31-f5-p-liveness-shakedown-v1.json"
+
+
+@dataclass(frozen=True, slots=True)
+class N31LivenessShakedownRelease:
+    profile_id: str
+    profile_path: Path
+    profile_sha256: str
+    canonical_results_relative_path: Path
+    approval_scope: str
+
+
+SHIPPED_RELEASES = (
+    N31LivenessShakedownRelease(
+        profile_id="n31-f5-p-liveness-shakedown-v1",
+        profile_path=(
+            REPOSITORY
+            / "experiments/adaptive/profiles/n31-f5-p-liveness-shakedown-v1.json"
+        ),
+        profile_sha256=(
+            "906a62db3c3fc636acc9961c9cd65c23625b2eb75ff39f6d49f3c21fc5845b6f"
+        ),
+        canonical_results_relative_path=Path(
+            "results/n31-f5-p-liveness-shakedown-v1"
+        ),
+        approval_scope="n31_f5_p_liveness_shakedown_non_claim_v1",
+    ),
+    N31LivenessShakedownRelease(
+        profile_id="n31-f5-p-liveness-shakedown-v2",
+        profile_path=(
+            REPOSITORY
+            / "experiments/adaptive/profiles/n31-f5-p-liveness-shakedown-v2.json"
+        ),
+        profile_sha256=(
+            "a1dd1e1c53c7ba01b0f7410e60bf13d409742d5cd5be8423e8403d22d31a3d28"
+        ),
+        canonical_results_relative_path=Path(
+            "results/n31-f5-p-liveness-shakedown-v2"
+        ),
+        approval_scope="n31_f5_p_liveness_shakedown_non_claim_v2",
+    ),
 )
+DEFAULT_RELEASE = SHIPPED_RELEASES[-1]
+DEFAULT_PROFILE_PATH = DEFAULT_RELEASE.profile_path
 SOURCE_MANIFEST_RELATIVE_PATH = Path(
     "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
 )
-PROFILE_ID = "n31-f5-p-liveness-shakedown-v1"
+PROFILE_ID = DEFAULT_RELEASE.profile_id
 SOURCE_SLOT_ID = "slot-066-n31-f5-b05-P"
-CANONICAL_RESULTS_RELATIVE_PATH = Path(
-    "results/n31-f5-p-liveness-shakedown-v1"
-)
-SHIPPED_PROFILE_SHA256 = (
-    "906a62db3c3fc636acc9961c9cd65c23625b2eb75ff39f6d49f3c21fc5845b6f"
-)
-APPROVAL_SCOPE = "n31_f5_p_liveness_shakedown_non_claim_v1"
+CANONICAL_RESULTS_RELATIVE_PATH = DEFAULT_RELEASE.canonical_results_relative_path
+SHIPPED_PROFILE_SHA256 = DEFAULT_RELEASE.profile_sha256
+APPROVAL_SCOPE = DEFAULT_RELEASE.approval_scope
 VERDICTS = frozenset({"REPRODUCED", "NOT_REPRODUCED", "INCOMPLETE"})
 FROZEN_REPLICA_COUNT = 31
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -118,6 +153,15 @@ class N31LivenessShakedownError(RuntimeError):
     """The diagnostic attempt cannot be trusted or executed safely."""
 
 
+def _release_for_profile_id(profile_id: object) -> N31LivenessShakedownRelease:
+    for release in SHIPPED_RELEASES:
+        if profile_id == release.profile_id:
+            return release
+    raise N31LivenessShakedownError(
+        "profile id is not a shipped liveness release"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FrozenN31LivenessProfile:
     schema_version: int
@@ -139,6 +183,36 @@ class FrozenN31LivenessProfile:
     evidence_scope: dict[str, object]
     observation: dict[str, object]
     profile_sha256: str
+
+
+def _release_for_profile(
+    profile: FrozenN31LivenessProfile,
+) -> N31LivenessShakedownRelease:
+    release = _release_for_profile_id(profile.profile_id)
+    if profile.profile_sha256 != release.profile_sha256:
+        raise N31LivenessShakedownError(
+            "profile release identity is inconsistent"
+        )
+    return release
+
+
+def _shipped_profile_bytes(profile: FrozenN31LivenessProfile) -> bytes:
+    release = _release_for_profile(profile)
+    try:
+        payload = release.profile_path.read_bytes()
+    except OSError as error:
+        raise N31LivenessShakedownError(
+            f"cannot read shipped profile: {error}"
+        ) from error
+    document = _json_object(payload, "shipped profile")
+    if (
+        document.get("profile_id") != release.profile_id
+        or _sha256_bytes(payload) != release.profile_sha256
+    ):
+        raise N31LivenessShakedownError(
+            "shipped profile release bytes drifted"
+        )
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,12 +459,13 @@ def load_frozen_profile(path: Path = DEFAULT_PROFILE_PATH) -> FrozenN31LivenessP
         payload = Path(path).read_bytes()
     except OSError as error:
         raise N31LivenessShakedownError(f"cannot read profile: {error}") from error
+    document = _json_object(payload, "profile")
+    release = _release_for_profile_id(document.get("profile_id"))
     digest = _sha256_bytes(payload)
-    if digest != SHIPPED_PROFILE_SHA256:
+    if digest != release.profile_sha256:
         raise N31LivenessShakedownError(
             "profile bytes differ from the shipped liveness shakedown profile"
         )
-    document = _json_object(payload, "profile")
     expected_fields = {
         "schema_version",
         "profile_id",
@@ -415,7 +490,7 @@ def load_frozen_profile(path: Path = DEFAULT_PROFILE_PATH) -> FrozenN31LivenessP
         raise N31LivenessShakedownError("profile schema drifted")
     if (
         document["schema_version"] != 1
-        or document["profile_id"] != PROFILE_ID
+        or document["profile_id"] != release.profile_id
         or document["frozen"] is not True
         or document["diagnostic_only"] is not True
         or document["attempt_policy"]
@@ -518,9 +593,10 @@ def _validate_approval_contract(
             "approval receipt revision/build identity is invalid"
         )
     approval = _approval_document(approval_receipt)
+    release = _release_for_profile(profile)
     required = {
         "schema_version": 1,
-        "scope": APPROVAL_SCOPE,
+        "scope": release.approval_scope,
         "authorized_by": "thesis_author",
         "profile_id": profile.profile_id,
         "kauri_revision": revision,
@@ -576,10 +652,11 @@ def build_approval_receipt(
 ) -> dict[str, object]:
     """Build the exact external thesis-author receipt for this two-run scope."""
 
+    release = _release_for_profile(profile)
     return _approval_document(
         {
             "schema_version": 1,
-            "scope": APPROVAL_SCOPE,
+            "scope": release.approval_scope,
             "authorized_by": "thesis_author",
             "approval_reference": approval_reference,
             "approved_utc": approved_utc,
@@ -660,6 +737,7 @@ def preflight(
     """Perform the read-only source/build/port/approval gate for one pair."""
 
     profile = load_frozen_profile(profile_path)
+    release = _release_for_profile(profile)
     repository = Path(repository).resolve()
     build_directory = (
         repository / "build-adaptive"
@@ -672,7 +750,9 @@ def preflight(
         else Path(build_provenance_path).resolve()
     )
     results_root = Path(results_root).resolve()
-    canonical_results_root = (repository / CANONICAL_RESULTS_RELATIVE_PATH).resolve()
+    canonical_results_root = (
+        repository / release.canonical_results_relative_path
+    ).resolve()
     if results_root != canonical_results_root:
         raise N31LivenessShakedownError(
             "live shakedown uses one canonical result root for the two-attempt cap"
@@ -725,6 +805,7 @@ def prepare_approval_receipt(
     """Create the external approval receipt after the exact live preflight."""
 
     profile = load_frozen_profile(profile_path)
+    release = _release_for_profile(profile)
     repository = Path(repository).resolve()
     build_directory = (
         repository / "build-adaptive"
@@ -737,7 +818,9 @@ def prepare_approval_receipt(
         else Path(build_provenance_path).resolve()
     )
     results_root = Path(results_root).resolve()
-    if results_root != (repository / CANONICAL_RESULTS_RELATIVE_PATH).resolve():
+    if results_root != (
+        repository / release.canonical_results_relative_path
+    ).resolve():
         raise N31LivenessShakedownError(
             "live shakedown uses one canonical result root for the two-attempt cap"
         )
@@ -1355,7 +1438,10 @@ def _run_attempt_once(
         attempt_uuid=attempt_uuid,
     )
     ordinal = _attempt_ordinal(attempt_directory)
-    _write_exclusive(attempt_directory / "profile.json", DEFAULT_PROFILE_PATH.read_bytes())
+    _write_exclusive(
+        attempt_directory / "profile.json",
+        _shipped_profile_bytes(profile),
+    )
     _write_exclusive(
         attempt_directory / "approval-receipt.json",
         _canonical_json_bytes(approval, newline=True),
@@ -2166,6 +2252,7 @@ def _read_leader_timeouts(
 
 def _timeout_capture_document(
     *,
+    profile_id: str,
     first_common_commit_ns: int,
     observation_deadline_ns: int,
     start_offsets: Mapping[str, int],
@@ -2194,7 +2281,7 @@ def _timeout_capture_document(
         }
     return {
         "schema_version": 1,
-        "profile_id": PROFILE_ID,
+        "profile_id": profile_id,
         "source_slot_id": SOURCE_SLOT_ID,
         "capture_rule": "pre_anchor_search_through_observation_deadline_v1",
         "first_common_commit_ns": first_common_commit_ns,
@@ -2207,6 +2294,7 @@ def _read_timeout_capture(
     spec: SlotRuntimeSpec,
     attempt_directory: Path,
     *,
+    profile_id: str,
     first_common_commit_ns: int,
     observation_deadline_ns: int,
 ) -> tuple[dict[str, int], dict[str, int]]:
@@ -2229,7 +2317,7 @@ def _read_timeout_capture(
             "ranges",
         }
         or document.get("schema_version") != 1
-        or document.get("profile_id") != PROFILE_ID
+        or document.get("profile_id") != profile_id
         or document.get("source_slot_id") != SOURCE_SLOT_ID
         or document.get("capture_rule")
         != "pre_anchor_search_through_observation_deadline_v1"
@@ -2735,6 +2823,7 @@ def _observe_liveness_window(
         attempt_directory / "raw/diagnostics/leader-timeout-window.json",
         _canonical_json_bytes(
             _timeout_capture_document(
+                profile_id=profile.profile_id,
                 first_common_commit_ns=first_ns,
                 observation_deadline_ns=deadline_ns,
                 start_offsets=offsets,
@@ -3175,13 +3264,14 @@ def _launch_document(
     source: SourceSlot,
     materialized: Any,
     *,
+    profile_id: str,
     pair_id: str,
     attempt_ordinal: int,
     anchor_ns: int,
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "profile_id": PROFILE_ID,
+        "profile_id": profile_id,
         "source_slot_id": SOURCE_SLOT_ID,
         "pair_id": pair_id,
         "source_runtime_artifact_id": source.runtime.artifact_id,
@@ -3214,6 +3304,7 @@ def _write_cleanup_artifacts(
     cleanup_rows: Sequence[Mapping[str, object]],
     sample_rows: Sequence[Mapping[str, object]],
     *,
+    profile_id: str,
     cleanup_started_ns: int,
     cleanup_complete: bool,
     streams_closed: bool,
@@ -3226,7 +3317,7 @@ def _write_cleanup_artifacts(
         _canonical_json_bytes(
             {
                 "schema_version": 1,
-                "profile_id": PROFILE_ID,
+                "profile_id": profile_id,
                 "attempts": list(sample_rows),
             },
             newline=True,
@@ -3237,7 +3328,7 @@ def _write_cleanup_artifacts(
         _canonical_json_bytes(
             {
                 "schema_version": 1,
-                "profile_id": PROFILE_ID,
+                "profile_id": profile_id,
                 "cleanup_started_monotonic_ns": cleanup_started_ns,
                 "cleanup_complete": cleanup_complete,
                 "streams_closed": streams_closed,
@@ -3278,7 +3369,10 @@ def _execute_live_attempt(
 
     repository = repository.resolve()
     results_root = results_root.resolve()
-    if results_root != (repository / CANONICAL_RESULTS_RELATIVE_PATH).resolve():
+    release = _release_for_profile(profile)
+    if results_root != (
+        repository / release.canonical_results_relative_path
+    ).resolve():
         raise N31LivenessShakedownError(
             "live shakedown cannot move outside its canonical two-attempt root"
         )
@@ -3404,6 +3498,7 @@ def _execute_live_attempt(
         launch_document = _launch_document(
             source,
             materialized,
+            profile_id=profile.profile_id,
             pair_id=pair_id,
             attempt_ordinal=attempt_ordinal,
             anchor_ns=anchor_ns,
@@ -3555,6 +3650,7 @@ def _execute_live_attempt(
             execution_root,
             cleanup_rows,
             sample_rows,
+            profile_id=profile.profile_id,
             cleanup_started_ns=cleanup_started_ns,
             cleanup_complete=cleanup_complete,
             streams_closed=streams_closed,
@@ -3839,6 +3935,7 @@ def _validate_complete_live_capture(
     start_offsets, end_offsets = _read_timeout_capture(
         source.runtime,
         root,
+        profile_id=profile.profile_id,
         first_common_commit_ns=first_ns,
         observation_deadline_ns=deadline_ns,
     )
@@ -4396,6 +4493,7 @@ def _validate_attempt_launch_provenance(
     if launch != _launch_document(
         source,
         materialized,
+        profile_id=profile.profile_id,
         pair_id=pair_id,
         attempt_ordinal=ordinal,
         anchor_ns=int(launch["shared_raw_clock_anchor_ns"]),
@@ -4671,6 +4769,20 @@ def validate_pair(
         )
     pair_id = _canonical_pair_uuid(str(started.get("pair_id")))
     profile = load_frozen_profile(attempts[0] / "profile.json")
+    if any(
+        (
+            candidate.profile_id,
+            candidate.profile_sha256,
+        )
+        != (profile.profile_id, profile.profile_sha256)
+        for candidate in (
+            load_frozen_profile(attempt / "profile.json")
+            for attempt in attempts[1:]
+        )
+    ):
+        raise N31LivenessShakedownError(
+            "sealed pair contains mixed liveness profile releases"
+        )
     intended_attempts = _validated_intended_attempts(
         started.get("intended_attempts")
     )
@@ -4798,7 +4910,9 @@ __all__ = (
     "APPROVAL_SCOPE",
     "DEFAULT_PROFILE_PATH",
     "FrozenN31LivenessProfile",
+    "N31LivenessShakedownRelease",
     "N31LivenessShakedownError",
+    "SHIPPED_RELEASES",
     "SHIPPED_PROFILE_SHA256",
     "VERDICTS",
     "allocate_attempt_directory",
