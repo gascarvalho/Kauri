@@ -16,6 +16,9 @@ from experiments.adaptive.kauri_experiment import factorial_runtime
 from experiments.adaptive.kauri_experiment import factorial_validation
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FactorialManifestError,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
+    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+    V10_PLAN_SHA256,
     V9_PLAN_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
@@ -33,12 +36,17 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
 from experiments.adaptive.kauri_experiment.factorial_validation import (
     FROZEN_RUNTIME_SHA256,
     FROZEN_SMOKE_RUNTIME_SHA256,
+    V10_RUNTIME_SHA256,
+    V10_SMOKE_RUNTIME_SHA256,
     V9_RUNTIME_SHA256,
     V9_SMOKE_RUNTIME_SHA256,
 )
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v11.json"
+)
+V10_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v10.json"
 )
 V9_MANIFEST_PATH = (
@@ -152,6 +160,12 @@ def test_matched_arms_share_the_frozen_cutoff_and_transition_contracts(
     )
     assert tiered.causal_selection_linkage_window == (
         "epoch1_manager_ingestion_sequence_baseline_exclusive_current_inclusive_v1"
+    )
+    assert tiered.marker_completeness_witness == (
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+    )
+    assert tiered.causal_timeout_eligibility == (
+        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
     )
 
 
@@ -638,7 +652,9 @@ def test_two_epoch_sequence_and_artifact_identity_are_deterministic(
     assert len({transition.artifact_id for transition in first.transitions}) == 2
 
 
-def test_slot_artifact_identity_seals_all_three_tiered_cohorts(frozen_plan) -> None:
+def test_slot_artifact_identity_seals_tiered_cohorts_and_v11_evidence_rules(
+    frozen_plan,
+) -> None:
     slot = next(
         slot
         for slot in frozen_plan.slots
@@ -667,6 +683,23 @@ def test_slot_artifact_identity_seals_all_three_tiered_cohorts(frozen_plan) -> N
     changed = build_slot_runtime(changed_slot)
     assert changed.artifact_id != original.artifact_id
     assert changed.tiered_cohorts != original.tiered_cohorts
+
+    responsive = slot.byzantine.responsive_degradation
+    assert responsive is not None
+    changed_contract_slot = replace(
+        slot,
+        byzantine=replace(
+            slot.byzantine,
+            responsive_degradation=replace(
+                responsive,
+                marker_completeness_witness=None,
+                causal_timeout_eligibility=None,
+            ),
+        ),
+    )
+    changed_contract = build_slot_runtime(changed_contract_slot)
+    assert changed_contract.artifact_id != original.artifact_id
+    assert changed_contract.tiered_cohorts != original.tiered_cohorts
 
 
 def test_runtime_contract_has_no_duplicate_transition_fields_or_bare_config_lines(
@@ -960,9 +993,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V7_MANIFEST_PATH,
         V8_MANIFEST_PATH,
         V9_MANIFEST_PATH,
+        V10_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v10_and_refuses_prior_production(
+def test_cli_defaults_to_v11_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -975,7 +1009,7 @@ def test_cli_defaults_to_v10_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v9 are validation-only" in refusal["reason"]
+    assert "v1 through v10 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1055,5 +1089,26 @@ def test_v9_runtime_identities_remain_exact_without_v10_linkage_fields() -> None
         "causal_timeout_provenance_window" not in slot["tiered_cohorts"]
         and "causal_internal_witness_candidates" not in slot["tiered_cohorts"]
         and "causal_selection_linkage_window" not in slot["tiered_cohorts"]
+        for slot in document["slots"]
+    )
+
+
+def test_v10_runtime_identity_remains_exact_without_v11_edge_fields() -> None:
+    manifest = load_frozen_manifest(V10_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    encoded = canonical_runtime_bytes(runtime)
+
+    assert plan.plan_sha256 == V10_PLAN_SHA256
+    assert hashlib.sha256(encoded).hexdigest() == V10_RUNTIME_SHA256
+    smoke = factorial_execution.build_n7_ps_smoke_slot(plan.slots[0])
+    smoke_payload = factorial_execution._canonical_json_bytes(
+        smoke.runtime.as_document()
+    )
+    assert hashlib.sha256(smoke_payload).hexdigest() == V10_SMOKE_RUNTIME_SHA256
+    document = json.loads(encoded)
+    assert all(
+        "marker_completeness_witness" not in slot["tiered_cohorts"]
+        and "causal_timeout_eligibility" not in slot["tiered_cohorts"]
         for slot in document["slots"]
     )

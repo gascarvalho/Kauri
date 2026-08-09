@@ -92,14 +92,23 @@ V9_SEMANTIC_SHA256 = (
 )
 V9_PLAN_SHA256 = "36ba999a4e585ee5203f1a0acbdecc728815ad1a44bf5d43b11f10a7df57c2f6"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v10"
-FROZEN_MANIFEST_SHA256 = (
+V10_MANIFEST_ID = "shape-placement-factorial-v10"
+V10_MANIFEST_SHA256 = (
     "3d661c652133be1873c203e85d6dc6cde2279c6877f6f74544696aa22d300856"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V10_SEMANTIC_SHA256 = (
     "0c7694677823b65fbd6369c729aca3bc39e3997f2fed5f7a74af4a67a620c91e"
 )
-FROZEN_PLAN_SHA256 = "38b1881e3841f7aad76d5c3a0097d99b9e4c96326dda7a4046cb1b13bd5c4d2c"
+V10_PLAN_SHA256 = "38b1881e3841f7aad76d5c3a0097d99b9e4c96326dda7a4046cb1b13bd5c4d2c"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v11"
+FROZEN_MANIFEST_SHA256 = (
+    "ddb7dc1c18af85028242754114a8f04222087088d0bb33adad6def5e18028993"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "5877e24974c7d626340ac4729dd5917dafe5c119d0f0cc11aba18149fd181c6b"
+)
+FROZEN_PLAN_SHA256 = "ce0d379f2b8795b0938d1185c604c182c848cbf71c4e0c582c73ad3f8a2a37c0"
 
 RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1 = (
     "retain_unanswered_exact_parent_child_attempt_across_consensus_commit_until_"
@@ -119,6 +128,12 @@ RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1 = (
 )
 RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1 = (
     "epoch1_manager_ingestion_sequence_baseline_exclusive_current_inclusive_v1"
+)
+RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1 = (
+    "exact_proposal_root_local_aggregation_activity_in_frozen_interior_v1"
+)
+RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1 = (
+    "exact_parent_attempt_absolute_deadline_strictly_before_selecting_transition_v1"
 )
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
@@ -189,6 +204,8 @@ class ResponsiveDegradationContract(_Document):
     causal_timeout_provenance_window: str | None = None
     causal_internal_witness_candidates: str | None = None
     causal_selection_linkage_window: str | None = None
+    marker_completeness_witness: str | None = None
+    causal_timeout_eligibility: str | None = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
@@ -198,6 +215,8 @@ class ResponsiveDegradationContract(_Document):
             "causal_timeout_provenance_window",
             "causal_internal_witness_candidates",
             "causal_selection_linkage_window",
+            "marker_completeness_witness",
+            "causal_timeout_eligibility",
         ):
             if document[field] is None:
                 document.pop(field)
@@ -727,12 +746,26 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V7_MANIFEST_ID,
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
+        V10_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
-    tiered = manifest_id in {V8_MANIFEST_ID, V9_MANIFEST_ID, FROZEN_MANIFEST_ID}
-    causal_measurement = manifest_id in {V9_MANIFEST_ID, FROZEN_MANIFEST_ID}
-    explicit_causal_windows = manifest_id == FROZEN_MANIFEST_ID
+    tiered = manifest_id in {
+        V8_MANIFEST_ID,
+        V9_MANIFEST_ID,
+        V10_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }
+    causal_measurement = manifest_id in {
+        V9_MANIFEST_ID,
+        V10_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }
+    explicit_causal_windows = manifest_id in {
+        V10_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }
+    explicit_causal_edge_eligibility = manifest_id == FROZEN_MANIFEST_ID
     persistent = manifest_id in {
         V2_MANIFEST_ID,
         V3_MANIFEST_ID,
@@ -742,6 +775,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V7_MANIFEST_ID,
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
+        V10_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
@@ -752,6 +786,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V7_MANIFEST_ID,
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
+        V10_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -990,6 +1025,13 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                     "causal_selection_linkage_window",
                 }
             )
+        if explicit_causal_edge_eligibility:
+            expected_responsive_fields.update(
+                {
+                    "marker_completeness_witness",
+                    "causal_timeout_eligibility",
+                }
+            )
         if set(responsive) != expected_responsive_fields:
             _error("responsive-degradation contract fields are not frozen")
         if (
@@ -1071,6 +1113,13 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             != RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
         ):
             _error("responsive-degradation causal linkage windows drifted")
+        if explicit_causal_edge_eligibility and (
+            responsive.get("marker_completeness_witness")
+            != RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+            or responsive.get("causal_timeout_eligibility")
+            != RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+        ):
+            _error("responsive-degradation causal edge eligibility drifted")
         responsive_vectors = _array(
             responsive.get("actor_selection_vectors"),
             "byzantine.responsive_degradation.actor_selection_vectors",
@@ -1458,7 +1507,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v10 may carry the compact "
+            "only shape-placement-factorial-v3 through v11 may carry the compact "
             "snapshot format field"
         )
 
@@ -1473,6 +1522,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V7_MANIFEST_ID: V7_SEMANTIC_SHA256,
         V8_MANIFEST_ID: V8_SEMANTIC_SHA256,
         V9_MANIFEST_ID: V9_SEMANTIC_SHA256,
+        V10_MANIFEST_ID: V10_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -1704,6 +1754,16 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
                             "causal_selection_linkage_window"
                         )
                     ),
+                    marker_completeness_witness=(
+                        byzantine["responsive_degradation"].get(
+                            "marker_completeness_witness"
+                        )
+                    ),
+                    causal_timeout_eligibility=(
+                        byzantine["responsive_degradation"].get(
+                            "causal_timeout_eligibility"
+                        )
+                    ),
                 )
                 if "responsive_degradation" in byzantine
                 else None
@@ -1765,6 +1825,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V7_MANIFEST_ID: V7_MANIFEST_SHA256,
         V8_MANIFEST_ID: V8_MANIFEST_SHA256,
         V9_MANIFEST_ID: V9_MANIFEST_SHA256,
+        V10_MANIFEST_ID: V10_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -2228,6 +2289,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V7_MANIFEST_ID: (V7_MANIFEST_SHA256, V7_PLAN_SHA256),
         V8_MANIFEST_ID: (V8_MANIFEST_SHA256, V8_PLAN_SHA256),
         V9_MANIFEST_ID: (V9_MANIFEST_SHA256, V9_PLAN_SHA256),
+        V10_MANIFEST_ID: (V10_MANIFEST_SHA256, V10_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -2257,9 +2319,11 @@ __all__ = (
     "FROZEN_PLAN_SHA256",
     "FROZEN_SEMANTIC_SHA256",
     "RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1",
+    "RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1",
     "RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1",
     "RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1",
     "RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1",
+    "RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1",
     "RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1",
     "LEGACY_MANIFEST_ID",
     "LEGACY_MANIFEST_SHA256",
@@ -2297,6 +2361,10 @@ __all__ = (
     "V9_MANIFEST_SHA256",
     "V9_PLAN_SHA256",
     "V9_SEMANTIC_SHA256",
+    "V10_MANIFEST_ID",
+    "V10_MANIFEST_SHA256",
+    "V10_PLAN_SHA256",
+    "V10_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",

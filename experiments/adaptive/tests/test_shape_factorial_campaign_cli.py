@@ -33,7 +33,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v10.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v11.json"
+V10_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v10.json"
+)
 V9_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v9.json"
 )
@@ -181,6 +184,7 @@ def _slot_validation(
         (V7_MANIFEST, "v7"),
         (V8_MANIFEST, "v8"),
         (V9_MANIFEST, "v9"),
+        (V10_MANIFEST, "v10"),
     ),
 )
 @pytest.mark.parametrize("command", ("plan", "preflight", "smoke", "run"))
@@ -207,8 +211,8 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1 through v9 are validation-only; "
-            "plan, preflight, smoke, and run require shape-placement-factorial-v10"
+            "shape-placement-factorial-v1 through v10 are validation-only; "
+            "plan, preflight, smoke, and run require shape-placement-factorial-v11"
         ),
         "status": "REJECT",
     }
@@ -279,7 +283,7 @@ def test_smoke_preflight_rejects_runtime_identity_drift(
     ) == 2
     refusal = json.loads(capsys.readouterr().err)
     assert refusal == {
-        "reason": "smoke runtime bytes differ from the exact frozen v10 identity",
+        "reason": "smoke runtime bytes differ from the exact frozen v11 identity",
         "status": "REJECT",
     }
 
@@ -296,6 +300,7 @@ def test_smoke_preflight_rejects_runtime_identity_drift(
         (V7_MANIFEST, "v7"),
         (V8_MANIFEST, "v8"),
         (V9_MANIFEST, "v9"),
+        (V10_MANIFEST, "v10"),
     ),
 )
 def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
@@ -362,6 +367,7 @@ def test_prior_validate_smoke_uses_preserved_artifacts_without_rederiving(
         (V7_MANIFEST, "v7"),
         (V8_MANIFEST, "v8"),
         (V9_MANIFEST, "v9"),
+        (V10_MANIFEST, "v10"),
     ),
 )
 def test_prior_validate_campaign_uses_preserved_artifacts_without_rederiving(
@@ -427,7 +433,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v10").exists()
+    assert not (repository / "results/shape-placement-factorial-v11").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -452,7 +458,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v10").exists()
+    assert not (repository / "results/shape-placement-factorial-v11").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -478,7 +484,7 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v10-smoke"
+        repository / "results/shape-placement-factorial-v11-smoke"
     ).exists()
 
 
@@ -514,7 +520,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v10-smoke"
+        repository / "results/shape-placement-factorial-v11-smoke"
     ).exists()
 
 
@@ -574,7 +580,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v10-smoke"
+        / "results/shape-placement-factorial-v11-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"

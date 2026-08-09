@@ -61,8 +61,10 @@ from .factorial_manifest import (
     LEGACY_PLAN_SHA256,
     RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
@@ -88,6 +90,9 @@ from .factorial_manifest import (
     V9_MANIFEST_ID,
     V9_MANIFEST_SHA256,
     V9_PLAN_SHA256,
+    V10_MANIFEST_ID,
+    V10_MANIFEST_SHA256,
+    V10_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -167,11 +172,17 @@ V9_RUNTIME_SHA256 = (
 V9_SMOKE_RUNTIME_SHA256 = (
     "a6733bb8705a34d82b02cc2bdf0596b12a08da57e57f9e12dd1968e6135a31d2"
 )
-FROZEN_RUNTIME_SHA256 = (
+V10_RUNTIME_SHA256 = (
     "ad3167be5ad69dac53cdbefa8b5be283a1f018cd2d25a5b369e949d8ce1e531a"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V10_SMOKE_RUNTIME_SHA256 = (
     "e39506e410b2c05507c9dd1e0c8eaab874b4f740c29ba8b0ea85c17c1b896123"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "5a8674342f4f7c954e71b0ead0b027b7792c1be279445f107a98b5726f6f82d4"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "dc4e13ac0ed9f333f72003c0c49e6ab7820024d3533cd07b0fd6013f8a34a3e6"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -243,7 +254,7 @@ _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
 _V8_RESPONSIVE_OMISSION_PERIOD = 32
 _RESPONSIVE_OMISSION_PERIOD = 41
 _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
-    {V9_MANIFEST_ID, FROZEN_MANIFEST_ID}
+    {V9_MANIFEST_ID, V10_MANIFEST_ID, FROZEN_MANIFEST_ID}
 )
 
 
@@ -267,6 +278,19 @@ def _uses_explicit_causal_linkage_windows(
         RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
         RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
         RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+    )
+
+
+def _uses_explicit_phase_edge_eligibility(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return responsive is not None and (
+        responsive.marker_completeness_witness,
+        responsive.causal_timeout_eligibility,
+    ) == (
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
+        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     )
 
 
@@ -409,6 +433,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             plan_sha256=V9_PLAN_SHA256,
             runtime_sha256=V9_RUNTIME_SHA256,
             smoke_runtime_sha256=V9_SMOKE_RUNTIME_SHA256,
+        ),
+        V10_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V10_MANIFEST_ID,
+            manifest_sha256=V10_MANIFEST_SHA256,
+            plan_sha256=V10_PLAN_SHA256,
+            runtime_sha256=V10_RUNTIME_SHA256,
+            smoke_runtime_sha256=V10_SMOKE_RUNTIME_SHA256,
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
@@ -798,6 +829,8 @@ class _HierarchyProof:
     epoch2_constrained_leaf_count: int = 0
     epoch2_fast_position_count: int = 0
     epoch2_fast_position_required_count: int = 0
+    epoch1_selection_ns: int = 0
+    epoch2_selection_ns: int = 0
     full_gate_passed: bool | None = None
 
 
@@ -2195,6 +2228,9 @@ def _validate_runtime_slot(
         manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
     )
     explicit_causal_linkage = _uses_explicit_causal_linkage_windows(manifest)
+    explicit_phase_edge_eligibility = (
+        _uses_explicit_phase_edge_eligibility(manifest)
+    )
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -2236,6 +2272,17 @@ def _validate_runtime_slot(
                     ),
                     "causal_selection_linkage_window": (
                         RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
+                    ),
+                }
+            )
+        if explicit_phase_edge_eligibility:
+            artifact_identity.update(
+                {
+                    "marker_completeness_witness": (
+                        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+                    ),
+                    "causal_timeout_eligibility": (
+                        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
                     ),
                 }
             )
@@ -2316,6 +2363,17 @@ def _validate_runtime_slot(
                     ),
                 }
             )
+        if explicit_phase_edge_eligibility:
+            expected_tiered.update(
+                {
+                    "marker_completeness_witness": (
+                        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+                    ),
+                    "causal_timeout_eligibility": (
+                        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+                    ),
+                }
+            )
         if dict(_mapping(runtime.get("tiered_cohorts"), "runtime tiered cohorts")) != expected_tiered:
             _fail("runtime tiered cohort contract differs from independent derivation")
     elif "tiered_cohorts" in runtime:
@@ -2378,6 +2436,7 @@ def _validate_runtime_slot(
         V7_MANIFEST_ID,
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
+        V10_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -3969,6 +4028,10 @@ def _validate_tiered_observed_marker_completeness(
     proposal_observations: Mapping[
         tuple[int, int, str, str], Mapping[int, Sequence[int]]
     ],
+    root_aggregation_observations: Mapping[
+        tuple[int, int, str, str], Mapping[int, Sequence[int]]
+    ]
+    | None = None,
     phase_windows: Mapping[str, tuple[int, int, int]],
     phase_configurations: Sequence[
         tuple[str, int, str, Mapping[int, Tree]]
@@ -3976,11 +4039,14 @@ def _validate_tiered_observed_marker_completeness(
 ) -> None:
     """Bind every fully observed interior contribution to one audit marker.
 
-    A proposal is eligible for this completeness proof only when every
-    non-root fault actor has an actor-local native proposal/commit witness in
-    the frozen interior. For each such proposal the required marker set is
-    derived from the exact tree, so deleting a whole context or a trailing
-    marker cannot pass through marker-to-proposal checks alone.
+    Legacy profiles qualify a proposal when every non-root fault actor has an
+    actor-local native proposal/commit witness in the frozen interior.  The
+    explicit phase-edge profile instead qualifies it from the exact tree
+    root's aggregation activity.  A later commit is deliberately not a proxy
+    for the earlier outbound-contribution decision.  For each qualified
+    proposal the required marker set is derived from the exact tree, so
+    deleting a whole context or a trailing marker cannot pass through
+    marker-to-proposal checks alone.
     """
 
     actors = frozenset(fault_actor_ids)
@@ -4004,7 +4070,12 @@ def _validate_tiered_observed_marker_completeness(
         interior_start = start_ns + bucket_width_ns
         interior_end = end_ns - bucket_width_ns
         represented = 0
-        for proposal, observer_times in proposal_observations.items():
+        observations = (
+            proposal_observations
+            if root_aggregation_observations is None
+            else root_aggregation_observations
+        )
+        for proposal, observer_times in observations.items():
             epoch, tree_id, digest, _ = proposal
             if epoch != epoch_number or digest != epoch_digest:
                 continue
@@ -4018,13 +4089,21 @@ def _validate_tiered_observed_marker_completeness(
                 for actor in actors
                 if tree.members.index(actor) != 0
             }
-            if not expected or not all(
-                any(
-                    interior_start <= monotonic_ns < interior_end
-                    for monotonic_ns in observer_times.get(actor, ())
+            if root_aggregation_observations is None:
+                fully_observed = all(
+                    any(
+                        interior_start <= monotonic_ns < interior_end
+                        for monotonic_ns in observer_times.get(actor, ())
+                    )
+                    for actor in expected
                 )
-                for actor in expected
-            ):
+            else:
+                root_id = tree.members[0]
+                fully_observed = any(
+                    interior_start <= monotonic_ns < interior_end
+                    for monotonic_ns in observer_times.get(root_id, ())
+                )
+            if not expected or not fully_observed:
                 continue
             actual = {marker.actor for marker in grouped.get(proposal, ())}
             if actual != expected:
@@ -4358,6 +4437,9 @@ def validate_fault_causality(
     require_cross_commit_retention_witnesses: bool = False,
     require_each_degraded_actor_internal_witness: bool = False,
     explicit_causal_linkage_windows: bool = False,
+    explicit_phase_edge_eligibility: bool = False,
+    epoch1_selection_ns: int | None = None,
+    epoch2_selection_ns: int | None = None,
     responsive_omission_period: int = _V8_RESPONSIVE_OMISSION_PERIOD,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
@@ -4384,6 +4466,9 @@ def validate_fault_causality(
         dict[tuple[int, int, str, str], list[int]],
     ] = defaultdict(lambda: defaultdict(list))
     proposal_observations: dict[
+        tuple[int, int, str, str], dict[int, list[int]]
+    ] = defaultdict(lambda: defaultdict(list))
+    root_aggregation_observations: dict[
         tuple[int, int, str, str], dict[int, list[int]]
     ] = defaultdict(lambda: defaultdict(list))
     for replica_id, events in replica_events.items():
@@ -4415,6 +4500,10 @@ def validate_fault_causality(
             proposal_observations[identity[:4]][replica_id].append(
                 event.monotonic_ns
             )
+            if event.event_type.startswith("aggregation."):
+                root_aggregation_observations[identity[:4]][replica_id].append(
+                    event.monotonic_ns
+                )
     tree_by_id = {tree.tree_id: tree for tree in initial_trees}
     epoch1_tree_by_id = {tree.tree_id: tree for tree in epoch1_trees}
     epoch2_tree_by_id = {tree.tree_id: tree for tree in epoch2_trees}
@@ -4435,6 +4524,11 @@ def validate_fault_causality(
             markers,
             fault_actor_ids=tuple(all_fault_actors),
             proposal_observations=proposal_observations,
+            root_aggregation_observations=(
+                root_aggregation_observations
+                if explicit_phase_edge_eligibility
+                else None
+            ),
             phase_windows=phase_windows,
             phase_configurations=(
                 ("fault_evidence", 0, initial_epoch_digest, tree_by_id),
@@ -4512,9 +4606,59 @@ def validate_fault_causality(
     epoch1_leaf_actors: set[int] = set()
     epoch2_leaf_actors: set[int] = set()
     degraded_evidence_bound_actors: set[int] = set()
+    arms_by_identity: dict[
+        tuple[int, int, int, int, str, str, str], ResponseAttemptArmMarker
+    ] = {}
+    if explicit_phase_edge_eligibility:
+        for arm in arm_markers:
+            if arm.source_replica != arm.reporter_id:
+                _fail(
+                    "causal timeout eligibility arm source differs from its "
+                    "reporter"
+                )
+            if (
+                arm.start_monotonic_ns <= 0
+                or arm.deadline_duration_us <= 0
+                or arm.absolute_deadline_ns <= 0
+                or arm.deadline_duration_us > _UINT64_MAX // 1_000
+                or arm.start_monotonic_ns
+                > _UINT64_MAX - arm.deadline_duration_us * 1_000
+                or arm.absolute_deadline_ns
+                != arm.start_monotonic_ns + arm.deadline_duration_us * 1_000
+            ):
+                _fail(
+                    "causal timeout eligibility arm absolute deadline does not "
+                    "equal start plus duration"
+                )
+            if arm.identity in arms_by_identity:
+                _fail(
+                    "causal timeout eligibility contains a duplicate/rearmed "
+                    "exact parent response-attempt arm"
+                )
+            arms_by_identity[arm.identity] = arm
+    if explicit_phase_edge_eligibility:
+        if not (
+            type(epoch1_selection_ns) is int
+            and type(epoch2_selection_ns) is int
+            and window_start_ns < epoch1_selection_ns < epoch1_command_ns
+            and epoch1_activation_ns < epoch2_selection_ns < epoch2_command_ns
+        ):
+            _fail(
+                "causal timeout eligibility lacks the exact pre-command "
+                "selection timestamps"
+            )
+        selection_deadlines = {
+            0: epoch1_selection_ns,
+            1: epoch2_selection_ns,
+        }
+    else:
+        selection_deadlines = {
+            0: epoch1_command_ns,
+            1: epoch2_command_ns,
+        }
     configurations = {
-        0: (initial_epoch_digest, tree_by_id, epoch1_command_ns),
-        1: (epoch1_digest, epoch1_tree_by_id, epoch2_command_ns),
+        0: (initial_epoch_digest, tree_by_id, selection_deadlines[0]),
+        1: (epoch1_digest, epoch1_tree_by_id, selection_deadlines[1]),
         2: (epoch2_digest, epoch2_tree_by_id, window_end_ns),
     }
     for marker in markers:
@@ -4594,27 +4738,61 @@ def validate_fault_causality(
             marker.epoch_digest,
             marker.block_hash,
         )
-        matched_timeouts = causal_timeout_indexes.get(
-            marker.epoch_number,
-            {},
-        ).get(timeout_key, ())
         decision_deadline = configuration[2]
-        exact_timeouts = [
-            timeout
-            for timeout in matched_timeouts
-            if (
-            timeout.message_type == expected_message_type
-            and timeout.reporter_id == expected_reporter
-            and marker.monotonic_ns < timeout.reporter_monotonic_ns
-            <= timeout.acceptance_monotonic_ns
-            < decision_deadline
-            )
-        ]
         if not (
             marker.epoch_number in (0, 1)
             and marker.monotonic_ns < decision_deadline
         ):
             continue
+        exact_arm: ResponseAttemptArmMarker | None = None
+        if explicit_phase_edge_eligibility and marker.actor in degraded:
+            arm_identity = (
+                expected_reporter,
+                marker.actor,
+                marker.epoch_number,
+                marker.tree_id,
+                marker.epoch_digest,
+                marker.block_hash,
+                expected_message_type,
+            )
+            exact_arm = arms_by_identity.get(arm_identity)
+            if exact_arm is None:
+                _fail(
+                    "causal timeout eligibility lacks the exact parent "
+                    "response-attempt arm"
+                )
+            if exact_arm.absolute_deadline_ns >= decision_deadline:
+                continue
+        matched_timeouts = causal_timeout_indexes.get(
+            marker.epoch_number,
+            {},
+        ).get(timeout_key, ())
+        exact_timeouts = [
+            timeout
+            for timeout in matched_timeouts
+            if (
+                timeout.message_type == expected_message_type
+                and timeout.reporter_id == expected_reporter
+                and marker.monotonic_ns < timeout.reporter_monotonic_ns
+                <= timeout.acceptance_monotonic_ns
+                < decision_deadline
+                and (
+                    exact_arm is None
+                    or (
+                        timeout.deadline_duration_us
+                        == exact_arm.deadline_duration_us
+                        # The child adapter and parent callback run in separate
+                        # processes.  The exact child omission may therefore
+                        # precede the parent's arm by a few milliseconds; the
+                        # ProposalKey/role binding and original deadline, not
+                        # cross-process callback order, define this attempt.
+                        and marker.monotonic_ns
+                        < exact_arm.absolute_deadline_ns
+                        <= timeout.reporter_monotonic_ns
+                    )
+                )
+            )
+        ]
         if marker.actor in degraded:
             if not exact_timeouts:
                 _fail(
@@ -4626,13 +4804,12 @@ def validate_fault_causality(
                     timeout_key,
                     (),
                 )
+                selection_observation_ids = {
+                    timeout.observation_id for timeout in selection_timeouts
+                }
                 if any(
-                    timeout.message_type == expected_message_type
-                    and timeout.reporter_id == expected_reporter
-                    and marker.monotonic_ns < timeout.reporter_monotonic_ns
-                    <= timeout.acceptance_monotonic_ns
-                    < decision_deadline
-                    for timeout in selection_timeouts
+                    timeout.observation_id in selection_observation_ids
+                    for timeout in exact_timeouts
                 ):
                     degraded_evidence_bound_actors.add(marker.actor)
         elif (
@@ -4659,7 +4836,7 @@ def validate_fault_causality(
             proposal_commit_ns_by_replica=proposal_commit_ns_by_replica,
             epoch1_trees=epoch1_tree_by_id,
             epoch1_timeout_index=causal_timeout_indexes[1],
-            epoch2_selection_ns=epoch2_command_ns,
+            epoch2_selection_ns=selection_deadlines[1],
             require_each_degraded_actor_internal_witness=(
                 require_each_degraded_actor_internal_witness
             ),
@@ -7000,6 +7177,8 @@ def _validate_adaptation_cycles(
             epoch2_fast_position_required_count=(
                 epoch2_fast_position_required_count
             ),
+            epoch1_selection_ns=shape_events[0].monotonic_ns,
+            epoch2_selection_ns=shape_events[1].monotonic_ns,
             full_gate_passed=full_gate_passed,
         ),
     )
@@ -7285,6 +7464,9 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             and expected.arm_code in {"P", "PS"}
         )
         responsive_contract = manifest.byzantine.responsive_degradation
+        explicit_phase_edge_eligibility = (
+            _uses_explicit_phase_edge_eligibility(manifest)
+        )
         internal_cross_commit_witness_count = validate_fault_causality(
             markers=markers,
             arm_markers=arm_markers,
@@ -7339,6 +7521,19 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             ),
             explicit_causal_linkage_windows=(
                 _uses_explicit_causal_linkage_windows(manifest)
+            ),
+            explicit_phase_edge_eligibility=(
+                explicit_phase_edge_eligibility
+            ),
+            epoch1_selection_ns=(
+                hierarchy.epoch1_selection_ns
+                if explicit_phase_edge_eligibility
+                else None
+            ),
+            epoch2_selection_ns=(
+                hierarchy.epoch2_selection_ns
+                if explicit_phase_edge_eligibility
+                else None
             ),
             responsive_omission_period=(
                 responsive_contract.omission_period

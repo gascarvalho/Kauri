@@ -16,10 +16,13 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
     FROZEN_PLAN_SHA256,
+    FROZEN_SEMANTIC_SHA256,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
@@ -45,6 +48,10 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     V9_MANIFEST_SHA256,
     V9_PLAN_SHA256,
     V9_SEMANTIC_SHA256,
+    V10_MANIFEST_ID,
+    V10_MANIFEST_SHA256,
+    V10_PLAN_SHA256,
+    V10_SEMANTIC_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -65,6 +72,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v11.json"
+)
+V10_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v10.json"
 )
 V9_MANIFEST_PATH = (
@@ -121,6 +131,16 @@ def test_loader_binds_the_exact_duplicate_free_manifest_bytes(tmp_path: Path) ->
     assert hashlib.sha256(MANIFEST_PATH.read_bytes()).hexdigest() == (
         FROZEN_MANIFEST_SHA256
     )
+    assert hashlib.sha256(
+        json.dumps(
+            json.loads(MANIFEST_PATH.read_bytes()),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    ).hexdigest() == FROZEN_SEMANTIC_SHA256
     assert manifest.evidence_snapshot_format == "digest_commitment_v2"
 
     changed = tmp_path / "changed.json"
@@ -304,7 +324,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v10/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v11/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -372,6 +392,12 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
     )
     assert responsive.causal_selection_linkage_window == (
         RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
+    )
+    assert responsive.marker_completeness_witness == (
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+    )
+    assert responsive.causal_timeout_eligibility == (
+        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
     )
 
     actors_by_block: dict[str, tuple[int, ...]] = {}
@@ -563,6 +589,20 @@ def test_tiered_schema_rejects_observer_injection_schedule_and_bound_drift() -> 
     document = _mutable_document()
     del document["byzantine"]["responsive_degradation"][  # type: ignore[index]
         "causal_timeout_linkage"
+    ]
+    with pytest.raises(FactorialManifestError, match="fields"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    document["byzantine"]["responsive_degradation"][  # type: ignore[index]
+        "marker_completeness_witness"
+    ] = "commit_observation_only"
+    with pytest.raises(FactorialManifestError, match="causal edge eligibility"):
+        parse_manifest_bytes(_encoded(document))
+
+    document = _mutable_document()
+    del document["byzantine"]["responsive_degradation"][  # type: ignore[index]
+        "causal_timeout_eligibility"
     ]
     with pytest.raises(FactorialManifestError, match="fields"):
         parse_manifest_bytes(_encoded(document))
@@ -1193,7 +1233,22 @@ def test_v9_adds_causal_measurement_and_predeclared_breakthrough_corrections() -
 
 
 def test_v10_only_adds_explicit_causal_linkage_windows_to_v9() -> None:
-    v10_document = json.loads(MANIFEST_PATH.read_bytes())
+    v10 = load_frozen_manifest(V10_MANIFEST_PATH)
+    assert v10.manifest_id == V10_MANIFEST_ID
+    assert v10.manifest_sha256 == V10_MANIFEST_SHA256
+    assert build_factorial_plan(v10).plan_sha256 == V10_PLAN_SHA256
+    assert hashlib.sha256(
+        json.dumps(
+            json.loads(V10_MANIFEST_PATH.read_bytes()),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    ).hexdigest() == V10_SEMANTIC_SHA256
+
+    v10_document = json.loads(V10_MANIFEST_PATH.read_bytes())
     v9_document = json.loads(V9_MANIFEST_PATH.read_bytes())
 
     assert v10_document.pop("manifest_id") == "shape-placement-factorial-v10"
@@ -1216,6 +1271,29 @@ def test_v10_only_adds_explicit_causal_linkage_windows_to_v9() -> None:
         RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1
     )
     assert v10_document == v9_document
+
+
+def test_v11_only_adds_exact_causal_edge_eligibility_to_v10() -> None:
+    v11_document = json.loads(MANIFEST_PATH.read_bytes())
+    v10_document = json.loads(V10_MANIFEST_PATH.read_bytes())
+
+    assert v11_document.pop("manifest_id") == "shape-placement-factorial-v11"
+    assert v10_document.pop("manifest_id") == "shape-placement-factorial-v10"
+    assert v11_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v11"
+    )
+    assert v10_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v10"
+    )
+
+    responsive = v11_document["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    assert responsive.pop("marker_completeness_witness") == (  # type: ignore[union-attr]
+        RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
+    )
+    assert responsive.pop("causal_timeout_eligibility") == (  # type: ignore[union-attr]
+        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+    )
+    assert v11_document == v10_document
 
 
 def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:
