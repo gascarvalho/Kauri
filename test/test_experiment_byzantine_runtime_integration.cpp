@@ -263,6 +263,18 @@ ExperimentByzantineOptions tiered_options(
     return options;
 }
 
+ExperimentByzantineOptions tiered_v2_options(
+    ReplicaID local_replica,
+    std::size_t responsive_period = 41,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr)
+{
+    auto options = tiered_options(
+        local_replica, responsive_period, markers);
+    options.rotating_omission->mode =
+        "tiered_persistent_responsive_omission_v2";
+    return options;
+}
+
 ProposalKey selected_proposal(
     ReplicaID actor,
     const std::string &label)
@@ -707,6 +719,107 @@ TEST_CASE(
     CHECK(markers[0].contribution_ordinal == 0);
     CHECK(markers[1].cohort == ExperimentOmissionCohort::hard);
     CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
+}
+
+TEST_CASE(
+    "native hooks share tiered v2 epoch role clocks across tree rotations",
+    "[adaptive-v2][experiment][byzantine][tiered-v2][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        2,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    std::vector<ExperimentOmissionMarker> markers;
+    runtime.configure_experiment_byzantine_faults(
+        tiered_v2_options(2, 2, &markers));
+
+    const ConfigurationId active{7, 3, digest("tiered-v2-native-active")};
+    const ConfigurationId active_other_tree{
+        7, 4, active.epoch_digest};
+    const ConfigurationId predecessor{
+        6, 3, digest("tiered-v2-native-predecessor")};
+    const ConfigurationId predecessor_other_tree{
+        6, 4, predecessor.epoch_digest};
+    const ConfigurationId future{
+        8, 3, digest("tiered-v2-native-future")};
+    const ConfigurationId future_other_tree{
+        8, 4, future.epoch_digest};
+    const auto internal = tree(ExperimentReplicaRole::internal, 2);
+    const auto leaf = tree(ExperimentReplicaRole::leaf, 2);
+
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime,
+            ProposalKey{active, digest("tiered-v2-native-active-internal-1")},
+            internal));
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime,
+            ProposalKey{
+                predecessor,
+                digest("tiered-v2-native-predecessor-internal-1")},
+            internal));
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+            runtime,
+            ProposalKey{future, digest("tiered-v2-native-future-internal-1")},
+            internal));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime,
+        ProposalKey{
+            active_other_tree,
+            digest("tiered-v2-native-active-internal-2")},
+        internal));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime,
+        ProposalKey{
+            predecessor_other_tree,
+            digest("tiered-v2-native-predecessor-internal-2")},
+        internal));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
+        runtime,
+        ProposalKey{
+            future_other_tree,
+            digest("tiered-v2-native-future-internal-2")},
+        internal));
+
+    CHECK_FALSE(
+        ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+            runtime,
+            ProposalKey{
+                active_other_tree,
+                digest("tiered-v2-native-active-leaf-1")},
+            leaf));
+    CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
+        runtime,
+        ProposalKey{active, digest("tiered-v2-native-active-leaf-2")},
+        leaf));
+
+    REQUIRE(markers.size() == 8);
+    for (std::size_t index = 0; index < markers.size(); ++index)
+        CHECK(markers[index].contribution_ordinal == index + 1);
+    CHECK(markers[0].contribution_role == ExperimentReplicaRole::internal);
+    CHECK(markers[0].role_contribution_ordinal == 1);
+    CHECK(markers[1].role_contribution_ordinal == 1);
+    CHECK(markers[2].role_contribution_ordinal == 1);
+    CHECK(markers[3].role_contribution_ordinal == 2);
+    CHECK(markers[3].action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(markers[4].role_contribution_ordinal == 2);
+    CHECK(markers[5].role_contribution_ordinal == 2);
+    CHECK(markers[6].contribution_role == ExperimentReplicaRole::leaf);
+    CHECK(markers[6].role_contribution_ordinal == 1);
+    CHECK(markers[7].contribution_role == ExperimentReplicaRole::leaf);
+    CHECK(markers[7].role_contribution_ordinal == 2);
+    CHECK(markers[7].action ==
+          ExperimentOmissionAction::omit_direct_vote);
 }
 
 } // namespace

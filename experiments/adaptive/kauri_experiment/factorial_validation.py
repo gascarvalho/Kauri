@@ -93,6 +93,9 @@ from .factorial_manifest import (
     V10_MANIFEST_ID,
     V10_MANIFEST_SHA256,
     V10_PLAN_SHA256,
+    V11_MANIFEST_ID,
+    V11_MANIFEST_SHA256,
+    V11_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -178,11 +181,17 @@ V10_RUNTIME_SHA256 = (
 V10_SMOKE_RUNTIME_SHA256 = (
     "e39506e410b2c05507c9dd1e0c8eaab874b4f740c29ba8b0ea85c17c1b896123"
 )
-FROZEN_RUNTIME_SHA256 = (
+V11_RUNTIME_SHA256 = (
     "5a8674342f4f7c954e71b0ead0b027b7792c1be279445f107a98b5726f6f82d4"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V11_SMOKE_RUNTIME_SHA256 = (
     "dc4e13ac0ed9f333f72003c0c49e6ab7820024d3533cd07b0fd6013f8a34a3e6"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "fc65a289fa6bf574eae2cc37ac4117f352a9d499cf2d7d32d422cda67835dbfb"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "21661e6b936bbeaa5983b66c669d67a4ffb846c1e534cdc9e6563856f039978e"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -244,7 +253,11 @@ _HEX_DIGITS = frozenset("0123456789abcdef")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _REDACTION = re.compile(r"hmac-sha256:([A-Za-z0-9_.-]{1,64}):([0-9a-f]{64})")
-_TIERED_OMISSION_MODE = "tiered_persistent_responsive_omission_v1"
+_TIERED_OMISSION_MODE_V1 = "tiered_persistent_responsive_omission_v1"
+_TIERED_OMISSION_MODE_V2 = "tiered_persistent_responsive_omission_v2"
+_TIERED_OMISSION_MODES = frozenset(
+    {_TIERED_OMISSION_MODE_V1, _TIERED_OMISSION_MODE_V2}
+)
 _RESPONSIVE_DEGRADED_SELECTOR_DOMAIN = (
     "kauri.shape25.responsive-degraded.v1"
 )
@@ -254,7 +267,7 @@ _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
 _V8_RESPONSIVE_OMISSION_PERIOD = 32
 _RESPONSIVE_OMISSION_PERIOD = 41
 _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
-    {V9_MANIFEST_ID, V10_MANIFEST_ID, FROZEN_MANIFEST_ID}
+    {V9_MANIFEST_ID, V10_MANIFEST_ID, V11_MANIFEST_ID, FROZEN_MANIFEST_ID}
 )
 
 
@@ -319,6 +332,14 @@ _TIERED_FAULT_MARKER = re.compile(
     r"responsive_degraded_actor_count=(\d+) fault_threshold=(\d+) "
     r"max_omissions_per_proposal=(\d+) responsive_omission_period=(\d+) "
     r"contribution_ordinal=(\d+)\s*$"
+)
+_ROLE_SCOPED_TIERED_FAULT_MARKER = re.compile(
+    _FAULT_MARKER_PREFIX
+    + r" cohort=(hard|responsive_degraded) hard_actor_count=(\d+) "
+    r"responsive_degraded_actor_count=(\d+) fault_threshold=(\d+) "
+    r"max_omissions_per_proposal=(\d+) responsive_omission_period=(\d+) "
+    r"contribution_ordinal=(\d+) contribution_role=(internal|leaf) "
+    r"role_contribution_ordinal=(\d+)\s*$"
 )
 _RESPONSE_ATTEMPT_ARM_MARKER = re.compile(
     r"(?:^|\s)KAURI_EVIDENCE response_attempt_armed "
@@ -441,6 +462,13 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             runtime_sha256=V10_RUNTIME_SHA256,
             smoke_runtime_sha256=V10_SMOKE_RUNTIME_SHA256,
         ),
+        V11_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V11_MANIFEST_ID,
+            manifest_sha256=V11_MANIFEST_SHA256,
+            plan_sha256=V11_PLAN_SHA256,
+            runtime_sha256=V11_RUNTIME_SHA256,
+            smoke_runtime_sha256=V11_SMOKE_RUNTIME_SHA256,
+        ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
             manifest_sha256=FROZEN_MANIFEST_SHA256,
@@ -523,6 +551,8 @@ class FaultMarker:
     max_omissions_per_proposal: int | None = None
     responsive_omission_period: int | None = None
     contribution_ordinal: int | None = None
+    contribution_role: str | None = None
+    role_contribution_ordinal: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -879,11 +909,12 @@ def _effective_omission_contract(
     window_suffix = {
         "rotating_intermittent_omission_v1": "rotating-omission-v1",
         "persistent_selected_omission_v1": "persistent-omission-v1",
-        _TIERED_OMISSION_MODE: "tiered-responsive-omission-v1",
+        _TIERED_OMISSION_MODE_V1: "tiered-responsive-omission-v1",
+        _TIERED_OMISSION_MODE_V2: "tiered-responsive-omission-v2",
     }.get(manifest.byzantine.mode)
     if window_suffix is None:
         _fail("manifest Byzantine omission mode is unknown")
-    if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+    if manifest.byzantine.mode in _TIERED_OMISSION_MODES:
         max_omissions = expected.f
     elif (
         expected.slot_id == EXCLUDED_SMOKE_SLOT_ID
@@ -1857,7 +1888,7 @@ def _expected_slots(manifest: FrozenFactorialManifest) -> tuple[_ExpectedSlot, .
                 block_id = f"n{replica_count}-f{fanout}-b{block_index:02d}"
                 block_execution_ordinal, order = scheduled[block_id]
                 scientific_seed = manifest.scientific_seed_base + block_ordinal
-                if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+                if manifest.byzantine.mode in _TIERED_OMISSION_MODES:
                     (
                         actor_ids,
                         responsive_degraded_actor_ids,
@@ -1939,7 +1970,7 @@ def _expected_excluded_smoke(
         (candidate, _tree_depth(replica_count, candidate))
         for candidate in manifest.candidate_fanouts
     )
-    if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+    if manifest.byzantine.mode in _TIERED_OMISSION_MODES:
         actor_ids, responsive_degraded_actor_ids, fast_replica_ids = (
             _derive_tiered_cohorts(replica_count, 1, scientific_seed)
         )
@@ -2036,7 +2067,7 @@ def _load_static_contracts(
         ):
             _fail("frozen actor-selection vector failed independent recomputation")
     responsive_contract = manifest.byzantine.responsive_degradation
-    if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+    if manifest.byzantine.mode in _TIERED_OMISSION_MODES:
         expected_responsive_period = _expected_responsive_omission_period(
             manifest.manifest_id
         )
@@ -2146,7 +2177,7 @@ def _load_static_contracts(
             "pipeline_stretch": derived.pipeline_stretch,
             "byzantine_actor_ids": list(derived.actor_ids),
         }
-        if manifest.byzantine.mode == _TIERED_OMISSION_MODE:
+        if manifest.byzantine.mode in _TIERED_OMISSION_MODES:
             exact.update(
                 {
                     "responsive_degraded_actor_ids": list(
@@ -2223,7 +2254,7 @@ def _load_static_contracts(
 def _validate_runtime_slot(
     runtime: Mapping[str, Any], expected: _ExpectedSlot, manifest: FrozenFactorialManifest
 ) -> None:
-    tiered = manifest.byzantine.mode == _TIERED_OMISSION_MODE
+    tiered = manifest.byzantine.mode in _TIERED_OMISSION_MODES
     causal_measurement = (
         manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
     )
@@ -2235,6 +2266,8 @@ def _validate_runtime_slot(
         manifest.manifest_id
     )
     if tiered:
+        responsive_contract = manifest.byzantine.responsive_degradation
+        assert responsive_contract is not None
         artifact_identity = {
             "arm_code": expected.arm_code,
             "block_id": expected.block_id,
@@ -2250,6 +2283,10 @@ def _validate_runtime_slot(
             "slot_id": expected.slot_id,
             "slot_nonce": expected.slot_nonce,
         }
+        if manifest.byzantine.mode == _TIERED_OMISSION_MODE_V2:
+            artifact_identity["responsive_actor_schedule"] = (
+                responsive_contract.actor_schedule
+            )
         if causal_measurement:
             artifact_identity.update(
                 {
@@ -2318,10 +2355,8 @@ def _validate_runtime_slot(
     if any(runtime.get(key) != value for key, value in checks.items()):
         _fail("runtime slot identity/consensus fields drifted")
     if tiered:
-        responsive_contract = manifest.byzantine.responsive_degradation
-        assert responsive_contract is not None
         expected_tiered = {
-            "mode": _TIERED_OMISSION_MODE,
+            "mode": manifest.byzantine.mode,
             "hard_actor_ids": list(expected.actor_ids),
             "responsive_degraded_actor_ids": list(
                 expected.responsive_degraded_actor_ids
@@ -2437,6 +2472,7 @@ def _validate_runtime_slot(
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
         V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -3633,10 +3669,18 @@ def _fault_markers(
                             line = raw.decode("utf-8", errors="strict").rstrip("\r\n")
                         except UnicodeDecodeError as error:
                             raise _Reject(f"{relative}:{line_number} fault marker is not UTF-8") from error
-                        pattern = (
-                            _TIERED_FAULT_MARKER
-                            if f"fault={_TIERED_OMISSION_MODE}" in line
-                            else _LEGACY_FAULT_MARKER
+                        if f"fault={_TIERED_OMISSION_MODE_V2}" in line:
+                            pattern = _ROLE_SCOPED_TIERED_FAULT_MARKER
+                        elif f"fault={_TIERED_OMISSION_MODE_V1}" in line:
+                            pattern = _TIERED_FAULT_MARKER
+                        else:
+                            pattern = _LEGACY_FAULT_MARKER
+                        tiered_pattern = pattern in {
+                            _TIERED_FAULT_MARKER,
+                            _ROLE_SCOPED_TIERED_FAULT_MARKER,
+                        }
+                        role_scoped_pattern = (
+                            pattern is _ROLE_SCOPED_TIERED_FAULT_MARKER
                         )
                         matches = tuple(pattern.finditer(line))
                         if len(matches) != 1:
@@ -3659,37 +3703,47 @@ def _fault_markers(
                             raw_line_sha256=_sha256(raw),
                             cohort=(
                                 match.group(12)
-                                if pattern is _TIERED_FAULT_MARKER
+                                if tiered_pattern
                                 else None
                             ),
                             hard_actor_count=(
                                 int(match.group(13))
-                                if pattern is _TIERED_FAULT_MARKER
+                                if tiered_pattern
                                 else None
                             ),
                             responsive_degraded_actor_count=(
                                 int(match.group(14))
-                                if pattern is _TIERED_FAULT_MARKER
+                                if tiered_pattern
                                 else None
                             ),
                             fault_threshold=(
                                 int(match.group(15))
-                                if pattern is _TIERED_FAULT_MARKER
+                                if tiered_pattern
                                 else None
                             ),
                             max_omissions_per_proposal=(
                                 int(match.group(16))
-                                if pattern is _TIERED_FAULT_MARKER
+                                if tiered_pattern
                                 else None
                             ),
                             responsive_omission_period=(
                                 int(match.group(17))
-                                if pattern is _TIERED_FAULT_MARKER
+                                if tiered_pattern
                                 else None
                             ),
                             contribution_ordinal=(
                                 int(match.group(18))
-                                if pattern is _TIERED_FAULT_MARKER
+                                if tiered_pattern
+                                else None
+                            ),
+                            contribution_role=(
+                                match.group(19)
+                                if role_scoped_pattern
+                                else None
+                            ),
+                            role_contribution_ordinal=(
+                                int(match.group(20))
+                                if role_scoped_pattern
                                 else None
                             ),
                         )
@@ -3881,14 +3935,17 @@ def _validate_fault_marker_schedule(
         "max_omissions_per_proposal",
         "responsive_omission_period",
         "contribution_ordinal",
+        "contribution_role",
+        "role_contribution_ordinal",
     )
     if fault_mode not in {
         "rotating_intermittent_omission_v1",
         "persistent_selected_omission_v1",
-        _TIERED_OMISSION_MODE,
+        *_TIERED_OMISSION_MODES,
     }:
         _fail("fault causality mode is not a known omission schedule")
-    tiered = fault_mode == _TIERED_OMISSION_MODE
+    tiered = fault_mode in _TIERED_OMISSION_MODES
+    role_scoped = fault_mode == _TIERED_OMISSION_MODE_V2
     if tiered:
         if (
             not hard
@@ -3944,17 +4001,56 @@ def _validate_fault_marker_schedule(
             if observed_audit != expected_audit:
                 _fail("tiered fault marker audit fields drifted")
             ordinal = marker.contribution_ordinal
+            role = marker.contribution_role
+            role_ordinal = marker.role_contribution_ordinal
+            if role_scoped:
+                if role not in {"internal", "leaf"} or type(role_ordinal) is not int:
+                    _fail("role-scoped tiered marker role audit fields drifted")
+            elif role is not None or role_ordinal is not None:
+                _fail("v1 tiered marker unexpectedly carries v2 role audit fields")
             if cohort == "hard":
                 if ordinal != 0 or marker.action == "forward":
                     _fail("hard markers must persistently omit with ordinal zero")
+                if role_scoped:
+                    expected_action = (
+                        "omit_aggregate" if role == "internal" else "omit_direct_vote"
+                    )
+                    if role_ordinal != 0 or marker.action != expected_action:
+                        _fail("hard role-scoped marker differs from its role/action")
             else:
                 if type(ordinal) is not int or ordinal <= 0:
                     _fail("responsive-degraded marker ordinal must be positive")
-                should_omit = ordinal % responsive_omission_period == 0
-                if (marker.action != "forward") is not should_omit:
+                schedule_ordinal = role_ordinal if role_scoped else ordinal
+                assert isinstance(schedule_ordinal, int)
+                if schedule_ordinal <= 0:
                     _fail(
-                        "responsive-degraded marker action is not the exact "
-                        "every-"
+                        "responsive-degraded role contribution ordinal must be positive"
+                    )
+                should_omit = schedule_ordinal % responsive_omission_period == 0
+                expected_action = None
+                if role_scoped:
+                    expected_action = (
+                        "omit_aggregate"
+                        if role == "internal"
+                        else "omit_direct_vote"
+                    )
+                if (
+                    (not should_omit and marker.action != "forward")
+                    or (
+                        should_omit
+                        and (
+                            marker.action == "forward"
+                            or (
+                                role_scoped
+                                and marker.action != expected_action
+                            )
+                        )
+                    )
+                ):
+                    qualifier = " role/action" if role_scoped else ""
+                    _fail(
+                        "responsive-degraded marker"
+                        f"{qualifier} is not the exact every-"
                         f"{_ordinal_label(responsive_omission_period)} schedule"
                     )
                 degraded_by_actor[marker.actor].append(marker)
@@ -4019,6 +4115,28 @@ def _validate_fault_marker_schedule(
             _incomplete(
                 f"responsive-degraded actor {actor} never reaches an omission ordinal"
             )
+        if role_scoped:
+            markers_by_configuration_role: dict[
+                tuple[int, str, str], list[FaultMarker]
+            ] = defaultdict(list)
+            for marker in actor_markers:
+                assert marker.contribution_role is not None
+                markers_by_configuration_role[
+                    (
+                        marker.epoch_number,
+                        marker.epoch_digest,
+                        marker.contribution_role,
+                    )
+                ].append(marker)
+            for identity, role_markers in markers_by_configuration_role.items():
+                role_ordinals = [
+                    marker.role_contribution_ordinal for marker in role_markers
+                ]
+                if role_ordinals != list(range(1, len(role_markers) + 1)):
+                    _fail(
+                        "responsive-degraded per-configuration role contribution "
+                        f"ordinals are not contiguous from one: {identity}"
+                    )
 
 
 def _validate_tiered_observed_marker_completeness(
@@ -4405,6 +4523,66 @@ def _validate_v9_cross_commit_retention_witnesses(
     return tuple(sorted(internal_witnessed))
 
 
+def _validate_role_scoped_epoch1_internal_opportunities(
+    *,
+    markers: Sequence[FaultMarker],
+    responsive_degraded_actor_ids: Sequence[int],
+    epoch1_digest: str,
+    epoch1_trees: Mapping[int, Tree],
+    epoch2_selection_ns: int,
+    responsive_omission_period: int,
+) -> None:
+    """Require enough pre-selection internal attempts to reach role ordinal 41."""
+
+    degraded = frozenset(responsive_degraded_actor_ids)
+    if (
+        not degraded
+        or type(epoch2_selection_ns) is not int
+        or epoch2_selection_ns <= 0
+        or responsive_omission_period <= 0
+    ):
+        _fail("role-scoped Epoch1 opportunity contract is invalid")
+    opportunities: dict[int, set[tuple[int, int, str, str]]] = defaultdict(set)
+    for marker in markers:
+        if (
+            marker.actor not in degraded
+            or marker.epoch_number != 1
+            or marker.monotonic_ns >= epoch2_selection_ns
+        ):
+            continue
+        if marker.epoch_digest != epoch1_digest:
+            _fail("role-scoped Epoch1 opportunity uses the wrong configuration")
+        tree = epoch1_trees.get(marker.tree_id)
+        if tree is None or marker.actor not in tree.members:
+            _fail("role-scoped Epoch1 opportunity has no exact physical tree role")
+        position = tree.members.index(marker.actor)
+        leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+        if 0 < position < leaf_start:
+            if marker.contribution_role != "internal":
+                _fail(
+                    "role-scoped Epoch1 internal opportunity lacks its audited "
+                    "physical role"
+                )
+            opportunities[marker.actor].add(
+                (
+                    marker.epoch_number,
+                    marker.tree_id,
+                    marker.epoch_digest,
+                    marker.block_hash,
+                )
+            )
+    missing = {
+        actor: responsive_omission_period - len(opportunities.get(actor, set()))
+        for actor in degraded
+        if len(opportunities.get(actor, set())) < responsive_omission_period
+    }
+    if missing:
+        _incomplete(
+            "responsive-degraded actors do not reach the frozen pre-selection "
+            f"Epoch1 internal opportunity count: {missing}"
+        )
+
+
 def validate_fault_causality(
     *,
     markers: Sequence[FaultMarker],
@@ -4447,7 +4625,8 @@ def validate_fault_causality(
     actors = tuple(sorted(actor_ids))
     degraded = tuple(sorted(responsive_degraded_actor_ids))
     all_fault_actors = frozenset((*actors, *degraded))
-    tiered = fault_mode == _TIERED_OMISSION_MODE
+    tiered = fault_mode in _TIERED_OMISSION_MODES
+    role_scoped = fault_mode == _TIERED_OMISSION_MODE_V2
     if not markers:
         _incomplete("native logs contain no KAURI_FAULT proposal markers")
     _validate_fault_marker_schedule(
@@ -4536,7 +4715,10 @@ def validate_fault_causality(
                 ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
             ),
         )
-    if fault_mode in {"persistent_selected_omission_v1", _TIERED_OMISSION_MODE}:
+    if fault_mode in {
+        "persistent_selected_omission_v1",
+        *_TIERED_OMISSION_MODES,
+    }:
         _validate_persistent_interior_proposals(
             (
                 tuple(marker for marker in markers if marker.actor in set(actors))
@@ -4705,6 +4887,12 @@ def validate_fault_causality(
             _fail("root actors must not emit omission-schedule markers")
         leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
         is_internal = position < leaf_start
+        expected_contribution_role = "internal" if is_internal else "leaf"
+        if role_scoped and marker.contribution_role != expected_contribution_role:
+            _fail(
+                "role-scoped tiered marker contribution role differs from its "
+                "independently derived physical tree role"
+            )
         expected_action = "omit_aggregate" if is_internal else "omit_direct_vote"
         expected_message_type = "aggregate_relay" if is_internal else "direct_vote"
         if marker.action != "forward" and marker.action != expected_action:
@@ -4824,6 +5012,15 @@ def validate_fault_causality(
             causal_reporters[marker.actor].add(expected_reporter)
             if is_internal:
                 internal_actors.add(marker.actor)
+    if role_scoped:
+        _validate_role_scoped_epoch1_internal_opportunities(
+            markers=markers,
+            responsive_degraded_actor_ids=degraded,
+            epoch1_digest=epoch1_digest,
+            epoch1_trees=epoch1_tree_by_id,
+            epoch2_selection_ns=selection_deadlines[1],
+            responsive_omission_period=responsive_omission_period,
+        )
     internal_retention_witnesses: tuple[int, ...] = ()
     if require_cross_commit_retention_witnesses:
         if not tiered:
@@ -7379,7 +7576,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         demoted_replica_ids = tuple(sorted(set(epoch1_roots) - set(epoch2_roots)))
         placement_changed = bool(promoted_replica_ids and demoted_replica_ids)
         if (
-            manifest.byzantine.mode == _TIERED_OMISSION_MODE
+            manifest.byzantine.mode in _TIERED_OMISSION_MODES
             and expected.placement_adaptation
         ):
             expected_demoted = expected.responsive_degraded_actor_ids

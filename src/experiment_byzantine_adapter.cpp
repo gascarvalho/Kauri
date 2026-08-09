@@ -7,6 +7,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace hotstuff
@@ -53,8 +54,10 @@ constexpr const char *kRotatingOmissionMode =
     "rotating_intermittent_omission_v1";
 constexpr const char *kPersistentOmissionMode =
     "persistent_selected_omission_v1";
-constexpr const char *kTieredOmissionMode =
+constexpr const char *kTieredOmissionModeV1 =
     "tiered_persistent_responsive_omission_v1";
+constexpr const char *kTieredOmissionModeV2 =
+    "tiered_persistent_responsive_omission_v2";
 
 bool is_rotating_omission_mode(const std::string &mode) noexcept
 {
@@ -68,7 +71,12 @@ bool is_persistent_omission_mode(const std::string &mode) noexcept
 
 bool is_tiered_omission_mode(const std::string &mode) noexcept
 {
-    return mode == kTieredOmissionMode;
+    return mode == kTieredOmissionModeV1 || mode == kTieredOmissionModeV2;
+}
+
+bool is_role_scoped_tiered_omission_mode(const std::string &mode) noexcept
+{
+    return mode == kTieredOmissionModeV2;
 }
 
 bool is_scheduled_omission_mode(const std::string &mode) noexcept
@@ -104,6 +112,20 @@ const char *omission_action_name(ExperimentOmissionAction action) noexcept
         return "omit_direct_vote";
     case ExperimentOmissionAction::capacity_exhausted:
         return "capacity_exhausted";
+    }
+    return "unknown";
+}
+
+const char *replica_role_name(ExperimentReplicaRole role) noexcept
+{
+    switch (role)
+    {
+    case ExperimentReplicaRole::root:
+        return "root";
+    case ExperimentReplicaRole::internal:
+        return "internal";
+    case ExperimentReplicaRole::leaf:
+        return "leaf";
     }
     return "unknown";
 }
@@ -162,7 +184,7 @@ std::string format_experiment_omission_marker(
             << " actor=" << marker.actor
             << " action=" << omission_action_name(marker.action)
             << " monotonic_ns=" << marker.monotonic_ns;
-    if (marker.fault_mode == kTieredOmissionMode)
+    if (is_tiered_omission_mode(marker.fault_mode))
     {
         encoded << " cohort=" << omission_cohort_name(marker.cohort)
                 << " hard_actor_count=" << marker.hard_actor_count
@@ -175,6 +197,11 @@ std::string format_experiment_omission_marker(
                 << marker.responsive_omission_period
                 << " contribution_ordinal="
                 << marker.contribution_ordinal;
+        if (is_role_scoped_tiered_omission_mode(marker.fault_mode))
+            encoded << " contribution_role="
+                    << replica_role_name(marker.contribution_role)
+                    << " role_contribution_ordinal="
+                    << marker.role_contribution_ordinal;
     }
     return encoded.str();
 }
@@ -196,6 +223,27 @@ struct ExperimentByzantineAdapter::State
         ExperimentOmissionCohort cohort{ExperimentOmissionCohort::none};
         bool auditable{false};
         std::uint64_t contribution_ordinal{0};
+        ExperimentReplicaRole contribution_role{ExperimentReplicaRole::root};
+        std::uint64_t role_contribution_ordinal{0};
+    };
+
+    struct RoleContributionOrdinals
+    {
+        std::uint64_t internal{0};
+        std::uint64_t leaf{0};
+    };
+
+    struct EpochContributionIdentity
+    {
+        std::uint32_t epoch_number{0};
+        uint256_t epoch_digest;
+
+        bool operator<(
+            const EpochContributionIdentity &other) const noexcept
+        {
+            return std::tie(epoch_number, epoch_digest) <
+                   std::tie(other.epoch_number, other.epoch_digest);
+        }
     };
 
     explicit State(ExperimentByzantineOptions configured)
@@ -418,7 +466,7 @@ struct ExperimentByzantineAdapter::State
         const auto &scheduled = *options.rotating_omission;
         if (scheduled_decisions.size() >= scheduled.maximum_contexts)
         {
-            emit_scheduled_capacity_marker(context, monotonic_ns);
+            emit_scheduled_capacity_marker(context, role, monotonic_ns);
             return nullptr;
         }
 
@@ -434,6 +482,8 @@ struct ExperimentByzantineAdapter::State
                 decision.cohort != ExperimentOmissionCohort::none;
             if (decision.auditable)
             {
+                if (is_role_scoped_tiered_omission_mode(scheduled.mode))
+                    decision.contribution_role = role;
                 bool omit =
                     decision.cohort == ExperimentOmissionCohort::hard;
                 if (decision.cohort ==
@@ -443,14 +493,43 @@ struct ExperimentByzantineAdapter::State
                         std::numeric_limits<std::uint64_t>::max())
                     {
                         emit_scheduled_capacity_marker(
-                            context, monotonic_ns);
+                            context, role, monotonic_ns);
                         return nullptr;
                     }
                     decision.contribution_ordinal =
                         ++responsive_contribution_ordinal;
-                    omit = decision.contribution_ordinal %
-                               scheduled.responsive_omission_period ==
-                           0;
+                    if (is_role_scoped_tiered_omission_mode(scheduled.mode))
+                    {
+                        auto &role_ordinals =
+                            responsive_epoch_role_contribution_ordinals
+                                [EpochContributionIdentity{
+                                    context.proposal.configuration
+                                        .epoch_number,
+                                    context.proposal.configuration
+                                        .epoch_digest}];
+                        auto &role_ordinal =
+                            role == ExperimentReplicaRole::internal
+                                ? role_ordinals.internal
+                                : role_ordinals.leaf;
+                        if (role_ordinal ==
+                            std::numeric_limits<std::uint64_t>::max())
+                        {
+                            --responsive_contribution_ordinal;
+                            emit_scheduled_capacity_marker(
+                                context, role, monotonic_ns);
+                            return nullptr;
+                        }
+                        decision.role_contribution_ordinal = ++role_ordinal;
+                        omit = decision.role_contribution_ordinal %
+                                   scheduled.responsive_omission_period ==
+                               0;
+                    }
+                    else
+                    {
+                        omit = decision.contribution_ordinal %
+                                   scheduled.responsive_omission_period ==
+                               0;
+                    }
                 }
                 if (omit && role == ExperimentReplicaRole::internal)
                     decision.action =
@@ -477,7 +556,9 @@ struct ExperimentByzantineAdapter::State
     void populate_tiered_marker(
         ExperimentOmissionMarker &marker,
         ExperimentOmissionCohort cohort,
-        std::uint64_t contribution_ordinal) const
+        std::uint64_t contribution_ordinal,
+        ExperimentReplicaRole contribution_role,
+        std::uint64_t role_contribution_ordinal) const
     {
         const auto &scheduled = *options.rotating_omission;
         if (!is_tiered_omission_mode(scheduled.mode))
@@ -492,18 +573,27 @@ struct ExperimentByzantineAdapter::State
         marker.responsive_omission_period =
             scheduled.responsive_omission_period;
         marker.contribution_ordinal = contribution_ordinal;
+        if (is_role_scoped_tiered_omission_mode(scheduled.mode))
+        {
+            marker.contribution_role = contribution_role;
+            marker.role_contribution_ordinal = role_contribution_ordinal;
+        }
     }
 
     void emit_scheduled_capacity_marker(
         const ExperimentByzantineContext &context,
+        ExperimentReplicaRole role,
         std::uint64_t monotonic_ns)
     {
+        const auto &scheduled = *options.rotating_omission;
+        if (is_role_scoped_tiered_omission_mode(scheduled.mode) &&
+            role == ExperimentReplicaRole::root)
+            return;
         if (scheduled_capacity_marker_emitted)
             return;
         scheduled_capacity_marker_emitted = true;
         if (!options.omission_marker_emitter)
             return;
-        const auto &scheduled = *options.rotating_omission;
         ExperimentOmissionMarker marker{
             context.proposal,
             context.diagnostic_window,
@@ -514,7 +604,7 @@ struct ExperimentByzantineAdapter::State
             scheduled.window_end_monotonic_ns,
             monotonic_ns};
         populate_tiered_marker(
-            marker, local_actor_cohort(), 0);
+            marker, local_actor_cohort(), 0, role, 0);
         options.omission_marker_emitter(marker);
     }
 
@@ -539,7 +629,11 @@ struct ExperimentByzantineAdapter::State
             scheduled.window_end_monotonic_ns,
             monotonic_ns};
         populate_tiered_marker(
-            marker, decision.cohort, decision.contribution_ordinal);
+            marker,
+            decision.cohort,
+            decision.contribution_ordinal,
+            decision.contribution_role,
+            decision.role_contribution_ordinal);
         options.omission_marker_emitter(marker);
     }
 
@@ -555,6 +649,10 @@ struct ExperimentByzantineAdapter::State
         direct_vote_omissions;
     std::map<ProposalKey, ScheduledDecisionState> scheduled_decisions;
     std::uint64_t responsive_contribution_ordinal{0};
+    // Tree rotations in one epoch share the two physical-role streams. Late
+    // predecessor and future epochs remain isolated by number plus digest.
+    std::map<EpochContributionIdentity, RoleContributionOrdinals>
+        responsive_epoch_role_contribution_ordinals;
     std::size_t scheduled_fault_threshold{0};
     bool scheduled_capacity_marker_emitted{false};
 };

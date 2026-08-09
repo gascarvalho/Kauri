@@ -3856,7 +3856,10 @@ def build_n7_ps_smoke_slot(
     )
     tiered = (
         template.byzantine.mode
-        == "tiered_persistent_responsive_omission_v1"
+        in {
+            "tiered_persistent_responsive_omission_v1",
+            "tiered_persistent_responsive_omission_v2",
+        }
         and template.byzantine.responsive_degradation is not None
     )
     if tiered:

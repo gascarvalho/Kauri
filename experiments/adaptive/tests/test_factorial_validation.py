@@ -43,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v12.json"
+)
+V11_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v11.json"
 )
 V10_MANIFEST_PATH = (
@@ -256,7 +259,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v11_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v12_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -272,7 +275,8 @@ def test_validator_retains_exact_v1_through_v11_artifact_identities() -> None:
             (8, V8_MANIFEST_PATH),
             (9, V9_MANIFEST_PATH),
             (10, V10_MANIFEST_PATH),
-            (11, MANIFEST_PATH),
+            (11, V11_MANIFEST_PATH),
+            (12, MANIFEST_PATH),
         )
     }
 
@@ -306,10 +310,16 @@ def test_validator_retains_exact_v1_through_v11_artifact_identities() -> None:
         identities[10].smoke_runtime_sha256
         == validation.V10_SMOKE_RUNTIME_SHA256
     )
-    assert identities[11].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[11].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[11].manifest_sha256 == validation.V11_MANIFEST_SHA256
+    assert identities[11].runtime_sha256 == validation.V11_RUNTIME_SHA256
     assert (
         identities[11].smoke_runtime_sha256
+        == validation.V11_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[12].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[12].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[12].smoke_runtime_sha256
         == validation.FROZEN_SMOKE_RUNTIME_SHA256
     )
 
@@ -324,6 +334,7 @@ def test_validator_retains_exact_v1_through_v11_artifact_identities() -> None:
         V8_MANIFEST_PATH,
         V9_MANIFEST_PATH,
         V10_MANIFEST_PATH,
+        V11_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -343,7 +354,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v11_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v12_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -367,6 +378,7 @@ def test_validator_requires_v9_through_v11_causal_contracts_but_accepts_v8() -> 
         V8_MANIFEST_PATH,
         V9_MANIFEST_PATH,
         V10_MANIFEST_PATH,
+        V11_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -409,7 +421,7 @@ def test_validator_requires_v9_through_v11_causal_contracts_but_accepts_v8() -> 
                 field: document["tiered_cohorts"][field]
                 for field in explicit_v10_fields
             } == explicit_v10_fields
-        if manifest_path == MANIFEST_PATH:
+        if manifest_path in (V11_MANIFEST_PATH, MANIFEST_PATH):
             assert {
                 field: document["tiered_cohorts"][field]
                 for field in explicit_v11_fields
@@ -432,7 +444,7 @@ def test_validator_requires_v9_through_v11_causal_contracts_but_accepts_v8() -> 
             )
 
 
-def test_only_v10_and_v11_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v12_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -440,13 +452,19 @@ def test_only_v10_and_v11_route_through_explicit_causal_linkage_windows() -> Non
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V11_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_only_v11_routes_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_and_v12_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V11_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
@@ -461,7 +479,10 @@ def test_only_v11_routes_through_explicit_phase_edge_eligibility() -> None:
         "causal_selection_linkage_window",
     ),
 )
-@pytest.mark.parametrize("manifest_path", (V10_MANIFEST_PATH, MANIFEST_PATH))
+@pytest.mark.parametrize(
+    "manifest_path",
+    (V10_MANIFEST_PATH, V11_MANIFEST_PATH, MANIFEST_PATH),
+)
 def test_validator_requires_each_explicit_causal_linkage_field(
     field: str,
     manifest_path: Path,
@@ -491,22 +512,26 @@ def test_validator_requires_each_explicit_causal_linkage_field(
 def test_validator_requires_each_explicit_v11_phase_edge_field(
     field: str,
 ) -> None:
-    manifest = load_frozen_manifest(MANIFEST_PATH)
-    runtime = build_factorial_runtime(build_factorial_plan(manifest))
-    expected_by_id = {
-        expected.slot_id: expected
-        for expected in validation._expected_slots(manifest)
-    }
-    slot = runtime.slots[0]
-    document = json.loads(json.dumps(slot.as_document()))
-    del document["tiered_cohorts"][field]
+    for manifest_path in (V11_MANIFEST_PATH, MANIFEST_PATH):
+        manifest = load_frozen_manifest(manifest_path)
+        runtime = build_factorial_runtime(build_factorial_plan(manifest))
+        expected_by_id = {
+            expected.slot_id: expected
+            for expected in validation._expected_slots(manifest)
+        }
+        slot = runtime.slots[0]
+        document = json.loads(json.dumps(slot.as_document()))
+        del document["tiered_cohorts"][field]
 
-    with pytest.raises(FactorialValidationError, match="tiered cohort contract"):
-        validation._validate_runtime_slot(
-            document,
-            expected_by_id[slot.slot_id],
-            manifest,
-        )
+        with pytest.raises(
+            FactorialValidationError,
+            match="tiered cohort contract",
+        ):
+            validation._validate_runtime_slot(
+                document,
+                expected_by_id[slot.slot_id],
+                manifest,
+            )
 
 
 def _compact_snapshot_audit() -> dict[str, object]:
@@ -1552,11 +1577,14 @@ def _tiered_marker(
     ordinal: int,
     block_ordinal: int,
     action: str,
+    fault_mode: str = "tiered_persistent_responsive_omission_v1",
+    contribution_role: str | None = None,
+    role_contribution_ordinal: int | None = None,
 ) -> FaultMarker:
     return FaultMarker(
         source_replica=actor,
         line_number=block_ordinal,
-        fault_mode="tiered_persistent_responsive_omission_v1",
+        fault_mode=fault_mode,
         epoch_number=1,
         tree_id=4,
         epoch_digest="11" * 32,
@@ -1575,6 +1603,8 @@ def _tiered_marker(
         max_omissions_per_proposal=4,
         responsive_omission_period=41,
         contribution_ordinal=ordinal,
+        contribution_role=contribution_role,
+        role_contribution_ordinal=role_contribution_ordinal,
     )
 
 
@@ -1632,6 +1662,39 @@ def test_tiered_marker_parser_requires_exact_appended_audit_fields(
         validation._fault_markers(tmp_path, {2: ("replica.log",)})
 
 
+def test_role_scoped_tiered_marker_parser_requires_exact_role_fields(
+    tmp_path: Path,
+) -> None:
+    line = (
+        "KAURI_FAULT fault=tiered_persistent_responsive_omission_v2 "
+        "proposal_epoch=1 proposal_tree=4 proposal_epoch_digest={digest} "
+        "proposal_block_hash={block} window=tiered-window "
+        "window_start_monotonic_ns=100 window_end_monotonic_ns=10000 "
+        "actor=2 action=forward monotonic_ns=201 "
+        "cohort=responsive_degraded hard_actor_count=3 "
+        "responsive_degraded_actor_count=1 fault_threshold=4 "
+        "max_omissions_per_proposal=4 responsive_omission_period=41 "
+        "contribution_ordinal=1 contribution_role=internal "
+        "role_contribution_ordinal=1\n"
+    ).format(digest="11" * 32, block=f"{1:064x}")
+    log = tmp_path / "replica.log"
+    log.write_text(line, encoding="utf-8")
+
+    marker = validation._fault_markers(tmp_path, {2: ("replica.log",)})[0]
+    assert marker.fault_mode == "tiered_persistent_responsive_omission_v2"
+    assert marker.contribution_ordinal == 1
+    assert marker.contribution_role == "internal"
+    assert marker.role_contribution_ordinal == 1
+
+    for missing in (
+        " contribution_role=internal",
+        " role_contribution_ordinal=1",
+    ):
+        log.write_text(line.replace(missing, ""), encoding="utf-8")
+        with pytest.raises(FactorialValidationError, match="malformed"):
+            validation._fault_markers(tmp_path, {2: ("replica.log",)})
+
+
 def test_tiered_marker_schedule_proves_exact_period_ordinals_and_f_bound() -> None:
     markers = _valid_tiered_markers()
     arguments = {
@@ -1672,6 +1735,168 @@ def test_tiered_marker_schedule_proves_exact_period_ordinals_and_f_bound() -> No
     with pytest.raises(FactorialValidationError, match="omission bound"):
         validation._validate_fault_marker_schedule(
             (*markers, replace(markers[-1], line_number=999)),
+            **arguments,
+        )
+
+
+def _valid_role_scoped_tiered_markers() -> tuple[FaultMarker, ...]:
+    markers: list[FaultMarker] = []
+    for global_ordinal in range(1, 83):
+        contribution_role = "internal" if global_ordinal % 2 else "leaf"
+        role_ordinal = (global_ordinal + 1) // 2
+        action = "forward"
+        if role_ordinal % 41 == 0:
+            action = (
+                "omit_aggregate"
+                if contribution_role == "internal"
+                else "omit_direct_vote"
+            )
+        markers.append(
+            _tiered_marker(
+                actor=2,
+                cohort="responsive_degraded",
+                ordinal=global_ordinal,
+                block_ordinal=global_ordinal,
+                action=action,
+                fault_mode="tiered_persistent_responsive_omission_v2",
+                contribution_role=contribution_role,
+                role_contribution_ordinal=role_ordinal,
+            )
+        )
+    markers.extend(
+        _tiered_marker(
+            actor=actor,
+            cohort="hard",
+            ordinal=0,
+            block_ordinal=82,
+            action="omit_direct_vote",
+            fault_mode="tiered_persistent_responsive_omission_v2",
+            contribution_role="leaf",
+            role_contribution_ordinal=0,
+        )
+        for actor in (9, 10, 12)
+    )
+    return tuple(markers)
+
+
+def test_role_scoped_tiered_schedule_proves_global_and_per_role_ordinals() -> None:
+    markers = _valid_role_scoped_tiered_markers()
+    arguments = {
+        "actor_ids": (9, 10, 12),
+        "responsive_degraded_actor_ids": (2,),
+        "fault_mode": "tiered_persistent_responsive_omission_v2",
+        "fault_threshold": 4,
+        "max_omissions_per_proposal": 4,
+        "responsive_omission_period": 41,
+    }
+    validation._validate_fault_marker_schedule(markers, **arguments)
+
+    reset_in_new_configuration = replace(
+        markers[0],
+        line_number=83,
+        epoch_number=2,
+        epoch_digest="22" * 32,
+        block_hash=f"{83:064x}",
+        monotonic_ns=283,
+        contribution_ordinal=83,
+        contribution_role="internal",
+        role_contribution_ordinal=1,
+    )
+    validation._validate_fault_marker_schedule(
+        (*markers[:-3], reset_in_new_configuration, *markers[-3:]),
+        **arguments,
+    )
+
+    with pytest.raises(FactorialValidationError, match="role.*contiguous"):
+        validation._validate_fault_marker_schedule(
+            (
+                *markers[:4],
+                replace(markers[4], role_contribution_ordinal=4),
+                *markers[5:],
+            ),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="role/action"):
+        validation._validate_fault_marker_schedule(
+            (
+                *markers[:80],
+                replace(markers[80], contribution_role="leaf"),
+                *markers[81:],
+            ),
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="role audit fields"):
+        validation._validate_fault_marker_schedule(
+            (replace(markers[0], contribution_role=None), *markers[1:]),
+            **arguments,
+        )
+
+
+def test_v1_tiered_schedule_rejects_v2_role_fields() -> None:
+    markers = _valid_tiered_markers()
+    with pytest.raises(FactorialValidationError, match="v1.*role audit"):
+        validation._validate_fault_marker_schedule(
+            (
+                replace(
+                    markers[0],
+                    contribution_role="internal",
+                    role_contribution_ordinal=1,
+                ),
+                *markers[1:],
+            ),
+            actor_ids=(9, 10, 12),
+            responsive_degraded_actor_ids=(2,),
+            fault_mode="tiered_persistent_responsive_omission_v1",
+            fault_threshold=4,
+            max_omissions_per_proposal=4,
+            responsive_omission_period=41,
+        )
+
+
+def test_role_scoped_schedule_requires_41_epoch1_internal_opportunities() -> None:
+    actor = 2
+    digest = "11" * 32
+    tree = Tree(
+        tree_id=4,
+        fanout=2,
+        pipeline_stretch=2,
+        members=(0, actor, 1, 3, 4, 5, 6),
+        wait_exempt=(),
+    )
+    markers = tuple(
+        _tiered_marker(
+            actor=actor,
+            cohort="responsive_degraded",
+            ordinal=ordinal,
+            block_ordinal=ordinal,
+            action="omit_aggregate" if ordinal == 41 else "forward",
+            fault_mode="tiered_persistent_responsive_omission_v2",
+            contribution_role="internal",
+            role_contribution_ordinal=ordinal,
+        )
+        for ordinal in range(1, 42)
+    )
+    arguments = {
+        "responsive_degraded_actor_ids": (actor,),
+        "epoch1_digest": digest,
+        "epoch1_trees": {tree.tree_id: tree},
+        "epoch2_selection_ns": 1_000,
+        "responsive_omission_period": 41,
+    }
+
+    validation._validate_role_scoped_epoch1_internal_opportunities(
+        markers=markers,
+        **arguments,
+    )
+
+    with pytest.raises(FactorialValidationError, match="internal opportunity count"):
+        validation._validate_role_scoped_epoch1_internal_opportunities(
+            markers=markers[:40],
+            **arguments,
+        )
+    with pytest.raises(FactorialValidationError, match="audited physical role"):
+        validation._validate_role_scoped_epoch1_internal_opportunities(
+            markers=(replace(markers[0], contribution_role="leaf"), *markers[1:]),
             **arguments,
         )
 
@@ -1939,6 +2164,52 @@ def test_epoch1_causality_uses_full_prefix_and_selection_uses_suffix(
         **_epoch1_causal_prefix_fixture(),
         explicit_causal_linkage_windows=True,
     ) == 0
+
+
+def test_role_scoped_causality_binds_marker_role_to_physical_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        validation,
+        "_validate_role_scoped_epoch1_internal_opportunities",
+        lambda **arguments: observed.append(arguments),
+    )
+    arguments = _epoch1_causal_prefix_fixture()
+    markers = tuple(
+        replace(
+            marker,
+            fault_mode="tiered_persistent_responsive_omission_v2",
+            contribution_role="leaf",
+            role_contribution_ordinal=index,
+        )
+        for index, marker in enumerate(arguments["markers"], start=1)
+    )
+    arguments.update(
+        {
+            "markers": markers,
+            "fault_mode": "tiered_persistent_responsive_omission_v2",
+        }
+    )
+
+    assert validate_fault_causality(
+        **arguments,
+        explicit_causal_linkage_windows=True,
+    ) == 0
+    assert len(observed) == 1
+
+    with pytest.raises(FactorialValidationError, match="physical tree role"):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "markers": (
+                    replace(markers[0], contribution_role="internal"),
+                    *markers[1:],
+                ),
+            },
+            explicit_causal_linkage_windows=True,
+        )
 
 
 def test_v9_epoch1_causality_retains_its_frozen_suffix_interpretation(

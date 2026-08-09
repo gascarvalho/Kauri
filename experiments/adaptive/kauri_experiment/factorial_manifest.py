@@ -101,14 +101,23 @@ V10_SEMANTIC_SHA256 = (
 )
 V10_PLAN_SHA256 = "38b1881e3841f7aad76d5c3a0097d99b9e4c96326dda7a4046cb1b13bd5c4d2c"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v11"
-FROZEN_MANIFEST_SHA256 = (
+V11_MANIFEST_ID = "shape-placement-factorial-v11"
+V11_MANIFEST_SHA256 = (
     "ddb7dc1c18af85028242754114a8f04222087088d0bb33adad6def5e18028993"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V11_SEMANTIC_SHA256 = (
     "5877e24974c7d626340ac4729dd5917dafe5c119d0f0cc11aba18149fd181c6b"
 )
-FROZEN_PLAN_SHA256 = "ce0d379f2b8795b0938d1185c604c182c848cbf71c4e0c582c73ad3f8a2a37c0"
+V11_PLAN_SHA256 = "ce0d379f2b8795b0938d1185c604c182c848cbf71c4e0c582c73ad3f8a2a37c0"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v12"
+FROZEN_MANIFEST_SHA256 = (
+    "48cf75f68691804c96cc3a5f35e5430b5b57aa62c6178dbc45e3959f60cd8c6a"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "accc776a797283b89847ca3a278a72a1080d76719584795f474e2ea0268b943c"
+)
+FROZEN_PLAN_SHA256 = "1025a7eca7c41e0c5619e9ad357c07709b0ffe66addbc14ba3cd2592f121d298"
 
 RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1 = (
     "retain_unanswered_exact_parent_child_attempt_across_consensus_commit_until_"
@@ -134,6 +143,10 @@ RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1 = (
 )
 RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1 = (
     "exact_parent_attempt_absolute_deadline_strictly_before_selecting_transition_v1"
+)
+RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1 = (
+    "omit_every_41st_unique_non_root_contribution_per_exact_epoch_identity_"
+    "physical_role_stream_v1"
 )
 EXPECTED_REPLICA_COUNTS = (13, 22, 31)
 EXPECTED_INITIAL_FANOUTS = (2, 3, 5)
@@ -747,6 +760,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
         V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
@@ -754,18 +768,24 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
         V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     causal_measurement = manifest_id in {
         V9_MANIFEST_ID,
         V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     explicit_causal_windows = manifest_id in {
         V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
-    explicit_causal_edge_eligibility = manifest_id == FROZEN_MANIFEST_ID
+    explicit_causal_edge_eligibility = manifest_id in {
+        V11_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }
     persistent = manifest_id in {
         V2_MANIFEST_ID,
         V3_MANIFEST_ID,
@@ -776,6 +796,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
         V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
@@ -787,6 +808,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
         V10_MANIFEST_ID,
+        V11_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -832,13 +854,20 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         responsiveness.get("latency_percentile_basis_points"),
         "responsiveness_policy.latency_percentile_basis_points",
     )
-    expected_minimum_attempts = 41 if causal_measurement else 32
+    expected_minimum_attempts = (
+        60
+        if manifest_id == FROZEN_MANIFEST_ID
+        else (41 if causal_measurement else 32)
+    )
+    expected_trailing_timeout_streak = (
+        7 if manifest_id == FROZEN_MANIFEST_ID else 2
+    )
     if (
         attempt_window != 128
         or minimum_attempts != expected_minimum_attempts
         or minimum_response_rate_ppm != 950_000
         or maximum_timeout_rate_ppm != 50_000
-        or trailing_timeout_streak != 2
+        or trailing_timeout_streak != expected_trailing_timeout_streak
         or latency_percentile_basis_points != 5_000
     ):
         _error("responsiveness policy must equal the frozen sensitive profile")
@@ -888,15 +917,14 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if any(3 > (replica_count - 1) // 3 for replica_count in replica_counts):
         _error("fixed campaign actor count must not exceed derived f")
-    expected_mode = (
-        "tiered_persistent_responsive_omission_v1"
-        if tiered
-        else (
-            "persistent_selected_omission_v1"
-            if persistent
-            else "rotating_intermittent_omission_v1"
-        )
-    )
+    if manifest_id == FROZEN_MANIFEST_ID:
+        expected_mode = "tiered_persistent_responsive_omission_v2"
+    elif tiered:
+        expected_mode = "tiered_persistent_responsive_omission_v1"
+    elif persistent:
+        expected_mode = "persistent_selected_omission_v1"
+    else:
+        expected_mode = "rotating_intermittent_omission_v1"
     if byzantine.get("mode") != expected_mode:
         _error(f"{manifest_id} requires Byzantine mode {expected_mode}")
     if byzantine.get("actions") != {
@@ -988,15 +1016,18 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             or vector.get("selected_actor") != computed_actor
         ):
             _error("actor rotation vector disagrees with the FNV-1a reference")
-    expected_responsive_schedule = (
-        "omit_every_41st_unique_non_root_contribution_per_"
-        "responsive_degraded_actor_v2"
-        if causal_measurement
-        else (
+    if manifest_id == FROZEN_MANIFEST_ID:
+        expected_responsive_schedule = RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1
+    elif causal_measurement:
+        expected_responsive_schedule = (
+            "omit_every_41st_unique_non_root_contribution_per_"
+            "responsive_degraded_actor_v2"
+        )
+    else:
+        expected_responsive_schedule = (
             "omit_every_32nd_unique_non_root_contribution_per_"
             "responsive_degraded_actor_v1"
         )
-    )
     expected_responsive_period = 41 if causal_measurement else 32
     if tiered:
         responsive = _mapping(
@@ -1067,7 +1098,68 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             != expected_responsive_period
         ):
             _error("responsive-degradation semantics differ from frozen profile")
-        if causal_measurement:
+        if manifest_id == FROZEN_MANIFEST_ID:
+            rate_eligible_timeout_counts = {
+                attempt_count: max(
+                    timeout_count
+                    for timeout_count in range(attempt_count + 1)
+                    if timeout_count * 1_000_000 // attempt_count
+                    <= maximum_timeout_rate_ppm
+                )
+                for attempt_count in range(minimum_attempts, attempt_window + 1)
+            }
+            maximum_rate_eligible_timeout_count = max(
+                rate_eligible_timeout_counts.values()
+            )
+            if (
+                rate_eligible_timeout_counts.get(119) != 5
+                or any(
+                    rate_eligible_timeout_counts.get(attempt_count) != 6
+                    for attempt_count in range(120, 129)
+                )
+                or maximum_rate_eligible_timeout_count != 6
+                or trailing_timeout_streak
+                != maximum_rate_eligible_timeout_count + 1
+            ):
+                _error(
+                    "role-scoped trailing timeout streak must be one above the "
+                    "maximum timeout count accepted by the rate gate"
+                )
+            worst_omissions_by_attempt_count: dict[int, int] = {}
+            for attempt_count in range(minimum_attempts, attempt_window + 1):
+                maximum_combined_omissions = max(
+                    sum(
+                        (stream_attempts + expected_responsive_period - 1)
+                        // expected_responsive_period
+                        for stream_attempts in (
+                            internal_attempts,
+                            attempt_count - internal_attempts,
+                        )
+                        if stream_attempts
+                    )
+                    for internal_attempts in range(attempt_count + 1)
+                )
+                worst_omissions_by_attempt_count[attempt_count] = (
+                    maximum_combined_omissions
+                )
+                if (
+                    maximum_combined_omissions * 1_000_000
+                    > maximum_timeout_rate_ppm * attempt_count
+                ):
+                    _error(
+                        "role-scoped responsive omission schedule can exceed the "
+                        "frozen timeout ceiling"
+                    )
+            if (
+                worst_omissions_by_attempt_count.get(60) != 3
+                or worst_omissions_by_attempt_count.get(84) != 4
+                or worst_omissions_by_attempt_count.get(125) != 5
+            ):
+                _error(
+                    "role-scoped omission ceilings must bind at 3/60, 4/84, "
+                    "and 5/125"
+                )
+        elif causal_measurement:
             cycle_lengths = {
                 cycle
                 for replica_count in (*replica_counts, 7)
@@ -1507,7 +1599,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v11 may carry the compact "
+            "only shape-placement-factorial-v3 through v12 may carry the compact "
             "snapshot format field"
         )
 
@@ -1523,6 +1615,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V8_MANIFEST_ID: V8_SEMANTIC_SHA256,
         V9_MANIFEST_ID: V9_SEMANTIC_SHA256,
         V10_MANIFEST_ID: V10_SEMANTIC_SHA256,
+        V11_MANIFEST_ID: V11_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -1826,6 +1919,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V8_MANIFEST_ID: V8_MANIFEST_SHA256,
         V9_MANIFEST_ID: V9_MANIFEST_SHA256,
         V10_MANIFEST_ID: V10_MANIFEST_SHA256,
+        V11_MANIFEST_ID: V11_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -2290,6 +2384,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V8_MANIFEST_ID: (V8_MANIFEST_SHA256, V8_PLAN_SHA256),
         V9_MANIFEST_ID: (V9_MANIFEST_SHA256, V9_PLAN_SHA256),
         V10_MANIFEST_ID: (V10_MANIFEST_SHA256, V10_PLAN_SHA256),
+        V11_MANIFEST_ID: (V11_MANIFEST_SHA256, V11_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -2325,6 +2420,7 @@ __all__ = (
     "RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1",
     "RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1",
     "RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1",
+    "RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1",
     "LEGACY_MANIFEST_ID",
     "LEGACY_MANIFEST_SHA256",
     "LEGACY_PLAN_SHA256",
@@ -2365,6 +2461,10 @@ __all__ = (
     "V10_MANIFEST_SHA256",
     "V10_PLAN_SHA256",
     "V10_SEMANTIC_SHA256",
+    "V11_MANIFEST_ID",
+    "V11_MANIFEST_SHA256",
+    "V11_PLAN_SHA256",
+    "V11_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",

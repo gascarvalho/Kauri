@@ -19,12 +19,17 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     V10_PLAN_SHA256,
+    V11_PLAN_SHA256,
     V9_PLAN_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
+    FROZEN_RUNTIME_SHA256,
+    FROZEN_SMOKE_RUNTIME_SHA256,
     ManagerSecretMaterial,
+    V11_RUNTIME_SHA256,
+    V11_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     build_slot_runtime,
     build_smoke_metadata,
@@ -34,8 +39,6 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     runtime_preflight,
 )
 from experiments.adaptive.kauri_experiment.factorial_validation import (
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
     V10_RUNTIME_SHA256,
     V10_SMOKE_RUNTIME_SHA256,
     V9_RUNTIME_SHA256,
@@ -44,6 +47,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v12.json"
+)
+V11_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v11.json"
 )
 V10_MANIFEST_PATH = (
@@ -139,6 +145,11 @@ def test_matched_arms_share_the_frozen_cutoff_and_transition_contracts(
     assert len(tiered.fast_replica_ids) == specs[0].q
     assert tiered.max_omissions_per_proposal == specs[0].f
     assert tiered.responsive_omission_period == 41
+    assert tiered.mode == "tiered_persistent_responsive_omission_v2"
+    assert tiered.responsive_actor_schedule == (
+        "omit_every_41st_unique_non_root_contribution_per_exact_"
+        "epoch_identity_physical_role_stream_v1"
+    )
     assert tiered.observer_isolation == (
         "replica_0_reserved_authoritative_commit_observer_v1"
     )
@@ -577,7 +588,7 @@ def test_replica_argv_materialization_uses_one_shared_raw_clock_anchor(
         )
         assert _option(argv, "--experiment-byzantine-mode") == slot.byzantine.mode
         assert _option(argv, "--experiment-byzantine-window") == (
-            f"{slot.block_id}-tiered-responsive-omission-v1"
+            f"{slot.block_id}-tiered-responsive-omission-v2"
         )
         assert _option(argv, "--experiment-rotating-omission-actors") == ",".join(
             map(str, slot.byzantine_actor_ids)
@@ -652,8 +663,9 @@ def test_two_epoch_sequence_and_artifact_identity_are_deterministic(
     assert len({transition.artifact_id for transition in first.transitions}) == 2
 
 
-def test_slot_artifact_identity_seals_tiered_cohorts_and_v11_evidence_rules(
+def test_slot_artifact_identity_seals_tiered_cohorts_and_v12_evidence_rules(
     frozen_plan,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slot = next(
         slot
@@ -700,6 +712,20 @@ def test_slot_artifact_identity_seals_tiered_cohorts_and_v11_evidence_rules(
     changed_contract = build_slot_runtime(changed_contract_slot)
     assert changed_contract.artifact_id != original.artifact_id
     assert changed_contract.tiered_cohorts != original.tiered_cohorts
+
+    tiered = original.tiered_cohorts
+    assert tiered is not None
+    changed_schedule = replace(
+        tiered,
+        responsive_actor_schedule=f"{tiered.responsive_actor_schedule}-drift",
+    )
+    monkeypatch.setattr(
+        factorial_runtime,
+        "_tiered_cohort_contract",
+        lambda _slot: changed_schedule,
+    )
+    schedule_changed = build_slot_runtime(slot)
+    assert schedule_changed.artifact_id != original.artifact_id
 
 
 def test_runtime_contract_has_no_duplicate_transition_fields_or_bare_config_lines(
@@ -994,9 +1020,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V8_MANIFEST_PATH,
         V9_MANIFEST_PATH,
         V10_MANIFEST_PATH,
+        V11_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v11_and_refuses_prior_production(
+def test_cli_defaults_to_v12_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1009,7 +1036,7 @@ def test_cli_defaults_to_v11_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v10 are validation-only" in refusal["reason"]
+    assert "v1 through v11 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1110,5 +1137,31 @@ def test_v10_runtime_identity_remains_exact_without_v11_edge_fields() -> None:
     assert all(
         "marker_completeness_witness" not in slot["tiered_cohorts"]
         and "causal_timeout_eligibility" not in slot["tiered_cohorts"]
+        for slot in document["slots"]
+    )
+
+
+def test_v11_runtime_identities_remain_exact_without_v12_role_scoping() -> None:
+    manifest = load_frozen_manifest(V11_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    encoded = canonical_runtime_bytes(runtime)
+
+    assert plan.plan_sha256 == V11_PLAN_SHA256
+    assert hashlib.sha256(encoded).hexdigest() == V11_RUNTIME_SHA256
+    smoke = factorial_execution.build_n7_ps_smoke_slot(plan.slots[0])
+    smoke_payload = factorial_execution._canonical_json_bytes(
+        smoke.runtime.as_document()
+    )
+    assert hashlib.sha256(smoke_payload).hexdigest() == V11_SMOKE_RUNTIME_SHA256
+    document = json.loads(encoded)
+    assert all(
+        slot["tiered_cohorts"]["mode"]
+        == "tiered_persistent_responsive_omission_v1"
+        and slot["tiered_cohorts"]["responsive_actor_schedule"]
+        == (
+            "omit_every_41st_unique_non_root_contribution_per_responsive_"
+            "degraded_actor_v2"
+        )
         for slot in document["slots"]
     )

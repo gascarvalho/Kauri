@@ -85,6 +85,8 @@ struct ExperimentOmissionMarker final
     std::size_t max_omissions_per_proposal{0};
     std::size_t responsive_omission_period{0};
     std::uint64_t contribution_ordinal{0};
+    ExperimentReplicaRole contribution_role{ExperimentReplicaRole::root};
+    std::uint64_t role_contribution_ordinal{0};
 };
 
 std::string format_experiment_omission_marker(

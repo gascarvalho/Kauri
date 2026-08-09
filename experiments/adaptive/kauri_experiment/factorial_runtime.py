@@ -17,6 +17,7 @@ from typing import Any
 from .factorial_manifest import (
     FROZEN_MANIFEST_ID,
     V10_MANIFEST_ID,
+    V11_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -28,8 +29,22 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+    RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1,
     ResponsivenessPolicyContract,
     derive_tiered_cohorts,
+)
+
+V11_RUNTIME_SHA256 = (
+    "5a8674342f4f7c954e71b0ead0b027b7792c1be279445f107a98b5726f6f82d4"
+)
+V11_SMOKE_RUNTIME_SHA256 = (
+    "dc4e13ac0ed9f333f72003c0c49e6ab7820024d3533cd07b0fd6013f8a34a3e6"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "fc65a289fa6bf574eae2cc37ac4117f352a9d499cf2d7d32d422cda67835dbfb"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "21661e6b936bbeaa5983b66c669d67a4ffb846c1e534cdc9e6563856f039978e"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -556,6 +571,24 @@ def _shape_invocation(slot: FactorialSlot) -> ShapeInvocationContract:
     )
 
 
+def _responsive_actor_schedule(mode: str, omission_period: int) -> str:
+    if mode == "tiered_persistent_responsive_omission_v2":
+        return RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1
+    if mode != "tiered_persistent_responsive_omission_v1":
+        raise FactorialManifestError("unknown tiered Byzantine omission mode")
+    if omission_period == 41:
+        return (
+            "omit_every_41st_unique_non_root_contribution_per_responsive_"
+            "degraded_actor_v2"
+        )
+    if omission_period == 32:
+        return (
+            "omit_every_32nd_unique_non_root_contribution_per_responsive_"
+            "degraded_actor_v1"
+        )
+    raise FactorialManifestError("unknown responsive omission period")
+
+
 def _tiered_cohort_contract(
     slot: FactorialSlot,
 ) -> TieredCohortContract | None:
@@ -566,7 +599,10 @@ def _tiered_cohort_contract(
                 "legacy Byzantine mode cannot carry tiered cohort identities"
             )
         return None
-    if slot.byzantine.mode != "tiered_persistent_responsive_omission_v1":
+    if slot.byzantine.mode not in {
+        "tiered_persistent_responsive_omission_v1",
+        "tiered_persistent_responsive_omission_v2",
+    }:
         raise FactorialManifestError(
             "responsive-degradation contract requires the frozen tiered mode"
         )
@@ -621,6 +657,10 @@ def _tiered_cohort_contract(
         if measurement_contract[0] == RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
         else 32
     )
+    expected_responsive_schedule = _responsive_actor_schedule(
+        slot.byzantine.mode,
+        expected_responsive_period,
+    )
     expected_fast = tuple(
         member for member in range(slot.replica_count) if member not in worse
     )
@@ -634,6 +674,7 @@ def _tiered_cohort_contract(
         or any(actor < slot.q or actor >= slot.replica_count for actor in hard)
         or any(actor < 1 or actor >= slot.q for actor in degraded)
         or responsive.omission_period != expected_responsive_period
+        or responsive.actor_schedule != expected_responsive_schedule
         or slot.maximum_omissions_per_proposal != slot.f
     ):
         raise FactorialManifestError("slot tiered cohort derivation drifted")
@@ -941,6 +982,9 @@ def _replica_argv_templates(
         "tiered_persistent_responsive_omission_v1": (
             "tiered-responsive-omission-v1"
         ),
+        "tiered_persistent_responsive_omission_v2": (
+            "tiered-responsive-omission-v2"
+        ),
     }.get(slot.byzantine.mode)
     if window_suffix is None:
         raise FactorialManifestError("unknown Byzantine omission mode")
@@ -1031,6 +1075,10 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
                 ),
             }
         )
+        if tiered_cohorts.mode == "tiered_persistent_responsive_omission_v2":
+            identity["responsive_actor_schedule"] = (
+                tiered_cohorts.responsive_actor_schedule
+            )
         if tiered_cohorts.pending_attempt_retention is not None:
             identity.update(
                 {
@@ -1449,7 +1497,7 @@ def runtime_preflight(
                     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
                 )
-                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                if runtime.manifest_id in {V11_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else (
                     (
                         RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
@@ -1479,11 +1527,25 @@ def runtime_preflight(
             expected_responsive_period = (
                 41
                 if runtime.manifest_id
-                in {V9_MANIFEST_ID, V10_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                in {
+                    V9_MANIFEST_ID,
+                    V10_MANIFEST_ID,
+                    V11_MANIFEST_ID,
+                    FROZEN_MANIFEST_ID,
+                }
                 else 32
             )
+            expected_tiered_mode = (
+                "tiered_persistent_responsive_omission_v2"
+                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                else "tiered_persistent_responsive_omission_v1"
+            )
+            expected_responsive_schedule = _responsive_actor_schedule(
+                expected_tiered_mode,
+                expected_responsive_period,
+            )
             if (
-                tiered.mode != "tiered_persistent_responsive_omission_v1"
+                tiered.mode != expected_tiered_mode
                 or hard != slot.actor_ids
                 or len(hard) != expected_hard_count
                 or hard != expected_cohorts.hard_actor_ids
@@ -1497,6 +1559,8 @@ def runtime_preflight(
                 or any(actor < slot.q for actor in hard)
                 or any(actor < 1 or actor >= slot.q for actor in degraded)
                 or tiered.responsive_omission_period != expected_responsive_period
+                or tiered.responsive_actor_schedule
+                != expected_responsive_schedule
                 or tiered.max_omissions_per_proposal != slot.f
                 or not tiered.hard_cohort_wait_exempt
                 or tiered.responsive_degraded_cohort_wait_exempt
@@ -1537,6 +1601,9 @@ def runtime_preflight(
                 argv = process.argv
                 if (
                     argv.count("--experiment-rotating-omission-actors") != 1
+                    or argv.count("--experiment-byzantine-mode") != 1
+                    or argv[argv.index("--experiment-byzantine-mode") + 1]
+                    != expected_tiered_mode
                     or argv[
                         argv.index("--experiment-rotating-omission-actors") + 1
                     ]
@@ -1727,6 +1794,8 @@ __all__ = (
     "CausalAcceptanceContract",
     "CutoffContract",
     "FactorialRuntimePlan",
+    "FROZEN_RUNTIME_SHA256",
+    "FROZEN_SMOKE_RUNTIME_SHA256",
     "FaultWindowContract",
     "ManagerArgvTemplate",
     "ManagerSecretMaterial",
@@ -1741,6 +1810,8 @@ __all__ = (
     "TransitionContract",
     "TransitionRequestContract",
     "TransitionSequenceContract",
+    "V11_RUNTIME_SHA256",
+    "V11_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

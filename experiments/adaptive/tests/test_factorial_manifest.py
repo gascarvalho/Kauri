@@ -52,6 +52,10 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     V10_MANIFEST_SHA256,
     V10_PLAN_SHA256,
     V10_SEMANTIC_SHA256,
+    V11_MANIFEST_ID,
+    V11_MANIFEST_SHA256,
+    V11_PLAN_SHA256,
+    V11_SEMANTIC_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -72,6 +76,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v12.json"
+)
+V11_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v11.json"
 )
 V10_MANIFEST_PATH = (
@@ -324,7 +331,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v11/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v12/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -336,7 +343,7 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
     manifest = _manifest()
     plan = build_factorial_plan(manifest)
 
-    assert manifest.byzantine.mode == "tiered_persistent_responsive_omission_v1"
+    assert manifest.byzantine.mode == "tiered_persistent_responsive_omission_v2"
     assert manifest.byzantine.actor_count == 3
     assert manifest.byzantine.actor_count_rule == "fixed_3_bounded_by_derived_f"
     assert manifest.byzantine.actor_selection == (
@@ -376,7 +383,7 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
     )
     assert responsive.actor_schedule == (
         "omit_every_41st_unique_non_root_contribution_per_"
-        "responsive_degraded_actor_v2"
+        "exact_epoch_identity_physical_role_stream_v1"
     )
     assert responsive.omission_period == 41
     assert (
@@ -529,28 +536,52 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
     assert len(set(repeated_actor_sets.values())) > 1
 
 
-def test_causal_responsive_schedule_is_coprime_and_never_exceeds_five_percent() -> None:
+def test_role_scoped_schedule_conservatively_never_exceeds_five_percent() -> None:
     manifest = _manifest()
     responsive = manifest.byzantine.responsive_degradation
     assert responsive is not None
     period = responsive.omission_period
-    cycle_lengths = {
-        cycle
-        for replica_count in (*manifest.replica_counts, 7)
-        for cycle in (
-            replica_count - 1,
-            2 * ((replica_count - 1) // 3),
-        )
-    }
-
     assert period == 41
-    assert all(math.gcd(period, cycle) == 1 for cycle in cycle_lengths)
-    assert all(
-        math.ceil(attempt_count / period) / attempt_count <= 0.05
+    worst_by_attempt_count = {
+        attempt_count: max(
+            (
+                (math.ceil(internal_attempts / period) if internal_attempts else 0)
+                + (math.ceil(leaf_attempts / period) if leaf_attempts else 0)
+            )
+            / attempt_count
+            for internal_attempts in range(attempt_count + 1)
+            for leaf_attempts in (attempt_count - internal_attempts,)
+        )
         for attempt_count in range(
             manifest.responsiveness_policy.minimum_attempts,
             manifest.responsiveness_policy.attempt_window + 1,
         )
+    }
+
+    assert worst_by_attempt_count[60] == 3 / 60
+    assert worst_by_attempt_count[84] == 4 / 84
+    assert worst_by_attempt_count[125] == 5 / 125
+    assert all(rate <= 0.05 for rate in worst_by_attempt_count.values())
+    rate_eligible_timeout_counts = {
+        attempt_count: max(
+            timeout_count
+            for timeout_count in range(attempt_count + 1)
+            if timeout_count * 1_000_000 // attempt_count
+            <= manifest.responsiveness_policy.maximum_timeout_rate_ppm
+        )
+        for attempt_count in range(
+            manifest.responsiveness_policy.minimum_attempts,
+            manifest.responsiveness_policy.attempt_window + 1,
+        )
+    }
+    maximum_rate_eligible_timeout_count = max(
+        rate_eligible_timeout_counts.values()
+    )
+    assert rate_eligible_timeout_counts[119] == 5
+    assert all(rate_eligible_timeout_counts[count] == 6 for count in range(120, 129))
+    assert maximum_rate_eligible_timeout_count == 6
+    assert manifest.responsiveness_policy.trailing_timeout_streak == (
+        maximum_rate_eligible_timeout_count + 1
     )
 
 
@@ -803,10 +834,10 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
         "attempt_window": 128,
         "latency_percentile_basis_points": 5000,
         "maximum_timeout_rate_ppm": 50000,
-        "minimum_attempts": 41,
+        "minimum_attempts": 60,
         "minimum_response_rate_ppm": 950000,
         "policy_version": "shape25-sensitive-responsiveness-v1",
-        "trailing_timeout_streak": 2,
+        "trailing_timeout_streak": 7,
     }
     assert all(
         slot.responsiveness_policy == manifest.responsiveness_policy
@@ -901,7 +932,7 @@ def test_fault_window_timing_is_mechanical_and_hard_timeout_feasible(
         ("minimum_attempts", 40),
         ("minimum_response_rate_ppm", 949_999),
         ("maximum_timeout_rate_ppm", 50_001),
-        ("trailing_timeout_streak", 3),
+        ("trailing_timeout_streak", 2),
         ("latency_percentile_basis_points", 4_999),
     ),
 )
@@ -1274,7 +1305,22 @@ def test_v10_only_adds_explicit_causal_linkage_windows_to_v9() -> None:
 
 
 def test_v11_only_adds_exact_causal_edge_eligibility_to_v10() -> None:
-    v11_document = json.loads(MANIFEST_PATH.read_bytes())
+    v11 = load_frozen_manifest(V11_MANIFEST_PATH)
+    assert v11.manifest_id == V11_MANIFEST_ID
+    assert v11.manifest_sha256 == V11_MANIFEST_SHA256
+    assert build_factorial_plan(v11).plan_sha256 == V11_PLAN_SHA256
+    assert hashlib.sha256(
+        json.dumps(
+            json.loads(V11_MANIFEST_PATH.read_bytes()),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    ).hexdigest() == V11_SEMANTIC_SHA256
+
+    v11_document = json.loads(V11_MANIFEST_PATH.read_bytes())
     v10_document = json.loads(V10_MANIFEST_PATH.read_bytes())
 
     assert v11_document.pop("manifest_id") == "shape-placement-factorial-v11"
@@ -1294,6 +1340,42 @@ def test_v11_only_adds_exact_causal_edge_eligibility_to_v10() -> None:
         RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
     )
     assert v11_document == v10_document
+
+
+def test_v12_only_changes_the_role_scoped_omission_contract_from_v11() -> None:
+    v12_document = json.loads(MANIFEST_PATH.read_bytes())
+    v11_document = json.loads(V11_MANIFEST_PATH.read_bytes())
+
+    assert v12_document.pop("manifest_id") == "shape-placement-factorial-v12"
+    assert v11_document.pop("manifest_id") == "shape-placement-factorial-v11"
+    assert v12_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v12"
+    )
+    assert v11_document["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v11"
+    )
+    assert v12_document["byzantine"].pop("mode") == (  # type: ignore[index]
+        "tiered_persistent_responsive_omission_v2"
+    )
+    assert v11_document["byzantine"].pop("mode") == (  # type: ignore[index]
+        "tiered_persistent_responsive_omission_v1"
+    )
+    v12_responsive = v12_document["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    v11_responsive = v11_document["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    assert v12_responsive.pop("actor_schedule") == (  # type: ignore[union-attr]
+        "omit_every_41st_unique_non_root_contribution_per_exact_"
+        "epoch_identity_physical_role_stream_v1"
+    )
+    assert v11_responsive.pop("actor_schedule") == (  # type: ignore[union-attr]
+        "omit_every_41st_unique_non_root_contribution_per_responsive_"
+        "degraded_actor_v2"
+    )
+    assert v12_document["responsiveness_policy"].pop("minimum_attempts") == 60  # type: ignore[index]
+    assert v11_document["responsiveness_policy"].pop("minimum_attempts") == 41  # type: ignore[index]
+    assert v12_document["responsiveness_policy"].pop("trailing_timeout_streak") == 7  # type: ignore[index]
+    assert v11_document["responsiveness_policy"].pop("trailing_timeout_streak") == 2  # type: ignore[index]
+
+    assert v12_document == v11_document
 
 
 def test_actor_rotation_vectors_bind_the_native_fnv1a_contract() -> None:

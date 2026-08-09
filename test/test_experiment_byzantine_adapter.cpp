@@ -338,6 +338,19 @@ ExperimentByzantineOptions tiered_omission_options(
     return options;
 }
 
+ExperimentByzantineOptions tiered_v2_omission_options(
+    ReplicaID local_replica,
+    std::size_t responsive_period = 41,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr,
+    std::vector<std::string> *encoded_markers = nullptr)
+{
+    auto options = tiered_omission_options(
+        local_replica, responsive_period, markers, encoded_markers);
+    options.rotating_omission->mode =
+        "tiered_persistent_responsive_omission_v2";
+    return options;
+}
+
 ExperimentByzantineOptions campaign_tiered_omission_options(
     ReplicaID local_replica,
     std::vector<ExperimentOmissionMarker> *markers = nullptr,
@@ -434,6 +447,53 @@ std::map<std::string, std::string> parse_tiered_marker_fields(
         "max_omissions_per_proposal",
         "responsive_omission_period",
         "contribution_ordinal"};
+    std::istringstream input(encoded);
+    std::map<std::string, std::string> fields;
+    std::string token;
+    if (!(input >> token) || token != "KAURI_FAULT")
+        throw std::invalid_argument("missing KAURI_FAULT marker prefix");
+    while (input >> token)
+    {
+        const auto separator = token.find('=');
+        if (separator == std::string::npos || separator == 0 ||
+            separator + 1 == token.size())
+            throw std::invalid_argument("malformed marker field");
+        const auto key = token.substr(0, separator);
+        if (fields.size() >= expected_order.size() ||
+            key != expected_order[fields.size()])
+            throw std::invalid_argument("unexpected marker field order");
+        if (!fields.emplace(key, token.substr(separator + 1)).second)
+            throw std::invalid_argument("duplicate marker field");
+    }
+    if (fields.size() != expected_order.size())
+        throw std::invalid_argument("incomplete marker fields");
+    return fields;
+}
+
+std::map<std::string, std::string> parse_tiered_v2_marker_fields(
+    const std::string &encoded)
+{
+    const std::vector<std::string> expected_order{
+        "fault",
+        "proposal_epoch",
+        "proposal_tree",
+        "proposal_epoch_digest",
+        "proposal_block_hash",
+        "window",
+        "window_start_monotonic_ns",
+        "window_end_monotonic_ns",
+        "actor",
+        "action",
+        "monotonic_ns",
+        "cohort",
+        "hard_actor_count",
+        "responsive_degraded_actor_count",
+        "fault_threshold",
+        "max_omissions_per_proposal",
+        "responsive_omission_period",
+        "contribution_ordinal",
+        "contribution_role",
+        "role_contribution_ordinal"};
     std::istringstream input(encoded);
     std::map<std::string, std::string> fields;
     std::string token;
@@ -1710,6 +1770,305 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "tiered v2 responsive omissions use independent internal and leaf ordinals",
+    "[adaptive-v2][experiment][byzantine][tiered-v2][schedule]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    ExperimentByzantineAdapter adapter(
+        tiered_v2_omission_options(2, 41, &markers, &encoded_markers));
+    const auto exact_configuration = configuration(
+        7, 3, "tiered-v2-role-epoch");
+
+    for (std::uint32_t ordinal = 1; ordinal <= 40; ++ordinal)
+    {
+        const auto internal = context(
+            "tiered-v2-internal-forward-" + std::to_string(ordinal),
+            exact_configuration,
+            "factorial-window-1");
+        CHECK_FALSE(adapter.consume_outbound_aggregate(
+            internal, ExperimentReplicaRole::internal, 150));
+
+        const auto leaf = context(
+            "tiered-v2-leaf-forward-" + std::to_string(ordinal),
+            exact_configuration,
+            "factorial-window-1");
+        CHECK(
+            adapter.consume_outbound_direct_vote(
+                leaf, ExperimentReplicaRole::leaf, 150) ==
+            ExperimentDirectVoteDisposition::forward);
+    }
+    REQUIRE(markers.size() == 80);
+    CHECK(markers.back().contribution_ordinal == 80);
+    CHECK(markers.back().contribution_role == ExperimentReplicaRole::leaf);
+    CHECK(markers.back().role_contribution_ordinal == 40);
+
+    const auto internal_41 = context(
+        "tiered-v2-internal-omit-41",
+        exact_configuration,
+        "factorial-window-1");
+    CHECK(adapter.consume_outbound_aggregate(
+        internal_41, ExperimentReplicaRole::internal, 151));
+    CHECK(adapter.consume_outbound_aggregate(
+        internal_41, ExperimentReplicaRole::internal, 152));
+    REQUIRE(markers.size() == 81);
+    CHECK(markers.back().contribution_ordinal == 81);
+    CHECK(markers.back().contribution_role ==
+          ExperimentReplicaRole::internal);
+    CHECK(markers.back().role_contribution_ordinal == 41);
+    CHECK(markers.back().action == ExperimentOmissionAction::omit_aggregate);
+
+    const auto leaf_41 = context(
+        "tiered-v2-leaf-omit-41",
+        exact_configuration,
+        "factorial-window-1");
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            leaf_41, ExperimentReplicaRole::leaf, 153) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            leaf_41, ExperimentReplicaRole::leaf, 154) ==
+        ExperimentDirectVoteDisposition::omit_repeat);
+    REQUIRE(markers.size() == 82);
+    CHECK(markers.back().contribution_ordinal == 82);
+    CHECK(markers.back().contribution_role == ExperimentReplicaRole::leaf);
+    CHECK(markers.back().role_contribution_ordinal == 41);
+    CHECK(markers.back().action ==
+          ExperimentOmissionAction::omit_direct_vote);
+
+    REQUIRE(encoded_markers.size() == markers.size());
+    const auto internal_fields =
+        parse_tiered_v2_marker_fields(encoded_markers[80]);
+    CHECK(
+        internal_fields.at("fault") ==
+        "tiered_persistent_responsive_omission_v2");
+    CHECK(internal_fields.at("contribution_ordinal") == "81");
+    CHECK(internal_fields.at("contribution_role") == "internal");
+    CHECK(internal_fields.at("role_contribution_ordinal") == "41");
+    const auto leaf_fields =
+        parse_tiered_v2_marker_fields(encoded_markers[81]);
+    CHECK(leaf_fields.at("contribution_ordinal") == "82");
+    CHECK(leaf_fields.at("contribution_role") == "leaf");
+    CHECK(leaf_fields.at("role_contribution_ordinal") == "41");
+}
+
+TEST_CASE(
+    "tiered v2 role ordinals share an epoch across trees and isolate epochs",
+    "[adaptive-v2][experiment][byzantine][tiered-v2][identity]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    ExperimentByzantineAdapter adapter(
+        tiered_v2_omission_options(2, 2, &markers));
+    const auto active = configuration(7, 3, "tiered-v2-active");
+    auto active_other_tree = active;
+    active_other_tree.tree_id = 4;
+    const auto active_other_digest =
+        configuration(7, 5, "tiered-v2-active-other-digest");
+    auto active_other_digest_tree = active_other_digest;
+    active_other_digest_tree.tree_id = 6;
+    const auto predecessor = configuration(6, 3, "tiered-v2-predecessor");
+    auto predecessor_other_tree = predecessor;
+    predecessor_other_tree.tree_id = 4;
+    const auto future = configuration(8, 3, "tiered-v2-future");
+    auto future_other_tree = future;
+    future_other_tree.tree_id = 4;
+
+    const auto internal_call =
+        [&adapter](
+            const ConfigurationId &exact_configuration,
+            const std::string &label,
+            std::uint64_t monotonic_ns)
+        {
+            return adapter.consume_outbound_aggregate(
+                context(
+                    label,
+                    exact_configuration,
+                    "factorial-window-1"),
+                ExperimentReplicaRole::internal,
+                monotonic_ns);
+        };
+
+    CHECK_FALSE(internal_call(active, "active-tree-3-1", 150));
+    CHECK(internal_call(active_other_tree, "active-tree-4-2", 151));
+    CHECK_FALSE(internal_call(
+        active_other_digest,
+        "active-other-digest-tree-5-1",
+        152));
+    CHECK_FALSE(internal_call(predecessor, "predecessor-tree-3-1", 153));
+    CHECK_FALSE(internal_call(future, "future-tree-3-1", 154));
+    CHECK(internal_call(
+        active_other_digest_tree,
+        "active-other-digest-tree-6-2",
+        155));
+    CHECK(internal_call(
+        predecessor_other_tree,
+        "predecessor-tree-4-2",
+        156));
+    CHECK(internal_call(future_other_tree, "future-tree-4-2", 157));
+    CHECK_FALSE(internal_call(active, "active-tree-3-3", 158));
+
+    REQUIRE(markers.size() == 9);
+    for (std::size_t index = 0; index < markers.size(); ++index)
+        CHECK(markers[index].contribution_ordinal == index + 1);
+    CHECK(markers[0].role_contribution_ordinal == 1);
+    CHECK(markers[1].role_contribution_ordinal == 2);
+    CHECK(markers[1].action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(markers[2].role_contribution_ordinal == 1);
+    CHECK(markers[3].role_contribution_ordinal == 1);
+    CHECK(markers[4].role_contribution_ordinal == 1);
+    CHECK(markers[5].role_contribution_ordinal == 2);
+    CHECK(markers[6].role_contribution_ordinal == 2);
+    CHECK(markers[7].role_contribution_ordinal == 2);
+    CHECK(markers[8].role_contribution_ordinal == 3);
+    CHECK(markers[8].proposal.configuration == active);
+    CHECK(markers[8].action == ExperimentOmissionAction::forward);
+}
+
+TEST_CASE(
+    "tiered v2 hard markers carry physical roles with zero role ordinal",
+    "[adaptive-v2][experiment][byzantine][tiered-v2][hard]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    ExperimentByzantineAdapter adapter(
+        tiered_v2_omission_options(1, 41, &markers, &encoded_markers));
+    const auto exact_configuration = configuration(
+        7, 3, "tiered-v2-hard-epoch");
+
+    CHECK(adapter.consume_outbound_aggregate(
+        context(
+            "tiered-v2-hard-internal",
+            exact_configuration,
+            "factorial-window-1"),
+        ExperimentReplicaRole::internal,
+        150));
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            context(
+                "tiered-v2-hard-leaf",
+                exact_configuration,
+                "factorial-window-1"),
+            ExperimentReplicaRole::leaf,
+            151) == ExperimentDirectVoteDisposition::omit_first);
+
+    REQUIRE(markers.size() == 2);
+    CHECK(markers[0].contribution_ordinal == 0);
+    CHECK(markers[0].contribution_role == ExperimentReplicaRole::internal);
+    CHECK(markers[0].role_contribution_ordinal == 0);
+    CHECK(markers[1].contribution_ordinal == 0);
+    CHECK(markers[1].contribution_role == ExperimentReplicaRole::leaf);
+    CHECK(markers[1].role_contribution_ordinal == 0);
+    CHECK(
+        parse_tiered_v2_marker_fields(encoded_markers[0])
+            .at("contribution_role") == "internal");
+    CHECK(
+        parse_tiered_v2_marker_fields(encoded_markers[1])
+            .at("contribution_role") == "leaf");
+}
+
+TEST_CASE(
+    "tiered v2 capacity markers wait for a physical contribution role",
+    "[adaptive-v2][experiment][byzantine][tiered-v2][capacity]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    auto options =
+        tiered_v2_omission_options(2, 41, &markers, &encoded_markers);
+    options.rotating_omission->maximum_contexts = 1;
+    ExperimentByzantineAdapter adapter(std::move(options));
+    const auto exact_configuration = configuration(
+        7, 3, "tiered-v2-capacity-epoch");
+
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        context(
+            "tiered-v2-capacity-retained",
+            exact_configuration,
+            "factorial-window-1"),
+        ExperimentReplicaRole::internal,
+        150));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        context(
+            "tiered-v2-capacity-root",
+            exact_configuration,
+            "factorial-window-1"),
+        ExperimentReplicaRole::root,
+        151));
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            context(
+                "tiered-v2-capacity-leaf",
+                exact_configuration,
+                "factorial-window-1"),
+            ExperimentReplicaRole::leaf,
+            152) == ExperimentDirectVoteDisposition::forward);
+
+    REQUIRE(markers.size() == 2);
+    CHECK(markers[1].action ==
+          ExperimentOmissionAction::capacity_exhausted);
+    CHECK(markers[1].contribution_role == ExperimentReplicaRole::leaf);
+    CHECK(markers[1].role_contribution_ordinal == 0);
+    const auto fields =
+        parse_tiered_v2_marker_fields(encoded_markers[1]);
+    CHECK(fields.at("contribution_role") == "leaf");
+    CHECK(fields.at("role_contribution_ordinal") == "0");
+}
+
+TEST_CASE(
+    "tiered v1 keeps its global schedule and exact marker bytes",
+    "[adaptive-v2][experiment][byzantine][tiered][compatibility]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    std::vector<std::string> encoded_markers;
+    ExperimentByzantineAdapter adapter(
+        tiered_omission_options(2, 2, &markers, &encoded_markers));
+    const auto exact_configuration = configuration(
+        7, 3, "tiered-v1-compatibility");
+    const auto first = context(
+        "tiered-v1-internal-1",
+        exact_configuration,
+        "factorial-window-1");
+    const auto second = context(
+        "tiered-v1-leaf-2",
+        exact_configuration,
+        "factorial-window-1");
+
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        first, ExperimentReplicaRole::internal, 150));
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            second, ExperimentReplicaRole::leaf, 151) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    REQUIRE(markers.size() == 2);
+    CHECK(markers[0].contribution_ordinal == 1);
+    CHECK(markers[0].action == ExperimentOmissionAction::forward);
+    CHECK(markers[1].contribution_ordinal == 2);
+    CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
+
+    REQUIRE(encoded_markers.size() == 2);
+    const auto expected_first =
+        std::string("KAURI_FAULT") +
+        " fault=tiered_persistent_responsive_omission_v1" +
+        " proposal_epoch=7 proposal_tree=3" +
+        " proposal_epoch_digest=" +
+        hotstuff::get_hex(first.proposal.configuration.epoch_digest) +
+        " proposal_block_hash=" + hotstuff::get_hex(first.proposal.block_hash) +
+        " window=factorial-window-1" +
+        " window_start_monotonic_ns=100" +
+        " window_end_monotonic_ns=200 actor=2 action=forward" +
+        " monotonic_ns=150 cohort=responsive_degraded" +
+        " hard_actor_count=1 responsive_degraded_actor_count=1" +
+        " fault_threshold=10 max_omissions_per_proposal=2" +
+        " responsive_omission_period=2 contribution_ordinal=1";
+    CHECK(encoded_markers[0] == expected_first);
+    CHECK(encoded_markers[0].find("contribution_role=") ==
+          std::string::npos);
+    CHECK(encoded_markers[0].find("role_contribution_ordinal=") ==
+          std::string::npos);
+    CHECK(parse_tiered_marker_fields(encoded_markers[0]).size() == 18);
+}
+
+TEST_CASE(
     "experiment omission emits one exact marker with a positive raw timestamp",
     "[adaptive-v2][experiment][byzantine][clock]")
 {
@@ -1974,6 +2333,9 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         parser.find("tiered_persistent_responsive_omission_v1") !=
+        std::string::npos);
+    CHECK(
+        parser.find("tiered_persistent_responsive_omission_v2") !=
         std::string::npos);
     CHECK(
         parser.find("raw_responsive_degraded_omission_actors") !=
