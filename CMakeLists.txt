@@ -41,6 +41,17 @@ include(CTest)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/salticidae/cmake/Modules/")
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules)
 
+include(PrepareSalticidaeTlsLogging)
+# Keep the pinned third-party checkout clean while compiling the audited TLS
+# logging correction and compiler format checks from a generated build overlay.
+set(KAURI_SALTICIDAE_OVERLAY_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/kauri-salticidae-overlay")
+kauri_prepare_salticidae_tls_logging(
+    "${CMAKE_CURRENT_SOURCE_DIR}/salticidae"
+    "${KAURI_SALTICIDAE_OVERLAY_DIR}"
+    KAURI_SALTICIDAE_CONN_SOURCE
+    KAURI_SALTICIDAE_OVERLAY_INCLUDE_DIR)
+
 # BLS extra:
 set(sodium_USE_STATIC_LIBS TRUE)
 find_package(sodium REQUIRED)
@@ -109,6 +120,7 @@ FetchContent_MakeAvailable(relic)
 add_subdirectory(bls/src)
 
 include_directories(
+        ${KAURI_SALTICIDAE_OVERLAY_INCLUDE_DIR}
         ${INCLUDE_DIRECTORIES}
         salticidae/include
         ${CMAKE_CURRENT_BINARY_DIR}/include
@@ -145,6 +157,39 @@ if(NOT TARGET ssl)
         INTERFACE_LINK_LIBRARIES OpenSSL::SSL)
 endif()
 add_subdirectory(salticidae)
+
+get_target_property(_salticidae_sources salticidae SOURCES)
+get_target_property(_salticidae_source_dir salticidae SOURCE_DIR)
+set(_salticidae_sources_without_conn)
+set(_salticidae_conn_source_count 0)
+foreach(_salticidae_source IN LISTS _salticidae_sources)
+    get_filename_component(
+        _salticidae_source_absolute
+        "${_salticidae_source}"
+        ABSOLUTE
+        BASE_DIR "${_salticidae_source_dir}")
+    if(_salticidae_source_absolute STREQUAL
+       "${CMAKE_CURRENT_SOURCE_DIR}/salticidae/src/conn.cpp")
+        math(EXPR _salticidae_conn_source_count
+            "${_salticidae_conn_source_count} + 1")
+    else()
+        list(APPEND _salticidae_sources_without_conn "${_salticidae_source}")
+    endif()
+endforeach()
+if(NOT _salticidae_conn_source_count EQUAL 1)
+    message(FATAL_ERROR
+        "Expected exactly one pinned Salticidae conn.cpp target source")
+endif()
+set_property(
+    TARGET salticidae
+    PROPERTY SOURCES ${_salticidae_sources_without_conn})
+target_sources(salticidae PRIVATE "${KAURI_SALTICIDAE_CONN_SOURCE}")
+# The pinned debug-only log surface has unrelated legacy format warnings.
+# Keep those warnings visible without turning that supported mode into an error.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND
+   NOT SALTICIDAE_DEBUG_LOG)
+    target_compile_options(salticidae PRIVATE -Werror=format)
+endif()
 
 find_package(Threads REQUIRED)
 

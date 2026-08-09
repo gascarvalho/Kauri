@@ -27,6 +27,16 @@ function(add_kauri_catch_test target source)
 endfunction()
 
 add_kauri_catch_test(test_test_support test_test_support.cpp)
+add_kauri_catch_test(
+    test_salticidae_tls_logging
+    test_salticidae_tls_logging.cpp)
+target_compile_definitions(
+    test_salticidae_tls_logging PRIVATE
+    KAURI_SALTICIDAE_CONN_SOURCE="${KAURI_SALTICIDAE_CONN_SOURCE}"
+    KAURI_SALTICIDAE_UTIL_HEADER="${KAURI_SALTICIDAE_OVERLAY_INCLUDE_DIR}/salticidae/util.h")
+set_tests_properties(
+    test_salticidae_tls_logging PROPERTIES
+    LABELS "unit;adaptive;network;regression")
 add_kauri_catch_test(test_client_opcodes test_client_opcodes.cpp)
 set_tests_properties(
     test_client_opcodes PROPERTIES
