@@ -245,6 +245,22 @@ struct AdaptiveV2ShapeDecisionStructuredEvent
     ShapeDecisionRecord decision;
 };
 
+/**
+ * Manager-owned proof that actor-blind post-fault evidence covered every
+ * canonical predecessor tree before fault-containment selection.
+ */
+struct AdaptiveV2FaultContainmentCoverageReadyStructuredEvent
+{
+    std::uint64_t cycle_ordinal{0};
+    std::string transition_artifact_id;
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::uint64_t fault_evidence_start_monotonic_ns{0};
+    std::uint64_t evidence_cutoff{0};
+    std::vector<std::uint32_t> required_tree_ids;
+    std::vector<std::uint32_t> observed_tree_ids;
+};
+
 /** Canonical JSON object containing every independently scored candidate. */
 std::string serialize_adaptive_v2_shape_decision_payload(
     const AdaptiveV2ShapeDecisionStructuredEvent &event,
@@ -292,7 +308,8 @@ using AuditStructuredEventPayload = std::variant<
     EvidenceObservationAcceptedStructuredEvent,
     AdaptiveV2ShapeDecisionStructuredEvent,
     FaultContributionOpportunityStructuredEvent,
-    RootQcQueueBlockedStructuredEvent>;
+    RootQcQueueBlockedStructuredEvent,
+    AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -393,6 +410,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_shape_decision,
     fault_contribution_opportunity,
     pipeline_root_qc_queue_blocked,
+    adaptive_v2_fault_containment_coverage_ready,
 };
 
 StructuredEventType structured_event_type(

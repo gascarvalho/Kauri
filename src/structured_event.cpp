@@ -396,6 +396,10 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 8:
             type = StructuredEventType::pipeline_root_qc_queue_blocked;
             return true;
+        case 9:
+            type = StructuredEventType::
+                adaptive_v2_fault_containment_coverage_ready;
+            return true;
         default:
             return false;
     }
@@ -1103,6 +1107,34 @@ bool valid_shape_decision_payload(
         valid_shape_decision_record(event.decision);
 }
 
+bool valid_fault_containment_coverage_ready_payload(
+    const AdaptiveV2FaultContainmentCoverageReadyStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    if (config.source.kind !=
+            StructuredEventSourceKind::adaptation_manager ||
+        event.transition_artifact_id.empty() ||
+        !valid_utf8(event.transition_artifact_id) ||
+        event.transition_artifact_id.size() >
+            config.limits.maximum_identity_bytes ||
+        event.predecessor_epoch_digest == uint256_t{} ||
+        event.fault_evidence_start_monotonic_ns == 0 ||
+        event.evidence_cutoff == 0 ||
+        event.required_tree_ids.empty() ||
+        event.required_tree_ids.size() >
+            kMaximumAdaptationEvidenceRecords ||
+        event.required_tree_ids != event.observed_tree_ids)
+    {
+        return false;
+    }
+    return std::adjacent_find(
+               event.required_tree_ids.begin(),
+               event.required_tree_ids.end(),
+               [](std::uint32_t left, std::uint32_t right) {
+                   return left >= right;
+               }) == event.required_tree_ids.end();
+}
+
 bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                          const StructuredEventConfig &config) noexcept
 {
@@ -1156,6 +1188,12 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
         case 8:
             return valid_root_qc_queue_blocked(
                 std::get<RootQcQueueBlockedStructuredEvent>(payload),
+                config);
+        case 9:
+            return valid_fault_containment_coverage_ready_payload(
+                std::get<
+                    AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>(
+                        payload),
                 config);
         default:
             return false;
@@ -1601,6 +1639,46 @@ void append_observation_accepted_payload(
         first = false;
     }
     builder.append("]}}");
+}
+
+void append_u32_ids(
+    JsonLineBuilder &builder,
+    const std::vector<std::uint32_t> &values)
+{
+    builder.append('[');
+    bool first = true;
+    for (const auto value : values)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append_integer(value);
+        first = false;
+    }
+    builder.append(']');
+}
+
+void append_fault_containment_coverage_ready_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2FaultContainmentCoverageReadyStructuredEvent &event)
+{
+    builder.append("{\"cycle_ordinal\":");
+    builder.append_integer(event.cycle_ordinal);
+    builder.append(",\"transition_artifact_id\":");
+    builder.append_escaped(event.transition_artifact_id);
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(event.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(event.predecessor_epoch_digest.to_hex());
+    builder.append(",\"fault_evidence_start_monotonic_ns\":");
+    builder.append_integer(
+        event.fault_evidence_start_monotonic_ns);
+    builder.append(",\"evidence_cutoff\":");
+    builder.append_integer(event.evidence_cutoff);
+    builder.append(",\"required_tree_ids\":");
+    append_u32_ids(builder, event.required_tree_ids);
+    builder.append(",\"observed_tree_ids\":");
+    append_u32_ids(builder, event.observed_tree_ids);
+    builder.append('}');
 }
 
 void append_evidence_snapshot_payload(
@@ -2055,6 +2133,13 @@ std::string serialize_audit_event(
             append_root_qc_queue_blocked_payload(
                 builder,
                 std::get<RootQcQueueBlockedStructuredEvent>(event));
+            break;
+        case 9:
+            append_fault_containment_coverage_ready_payload(
+                builder,
+                std::get<
+                    AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>(
+                        event));
             break;
         default:
             throw std::bad_variant_access{};
@@ -2556,6 +2641,9 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "fault.contribution_opportunity";
         case StructuredEventType::pipeline_root_qc_queue_blocked:
             return "pipeline.root_qc_queue_blocked";
+        case StructuredEventType::
+            adaptive_v2_fault_containment_coverage_ready:
+            return "adaptive_v2.fault_containment_coverage_ready";
         default:
             break;
     }

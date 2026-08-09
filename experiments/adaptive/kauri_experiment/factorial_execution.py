@@ -34,6 +34,7 @@ from .factorial_manifest import (
     FactorialArm,
     FactorialManifestError,
     FactorialSlot,
+    PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     PortAllocation,
     build_factorial_plan,
     derive_actor_ids,
@@ -185,6 +186,18 @@ class N7SmokeSlot:
     figure_eligible: bool = False
     denominator_contribution: int = 0
     actor_count_rule: str = "fixed_1_hard_actor_smoke_only"
+
+
+@dataclass(frozen=True, slots=True)
+class N31CoverageSmokeSlot:
+    """Excluded N=31 precontainment-coverage proof using campaign slot 066."""
+
+    slot: FactorialSlot
+    runtime: SlotRuntimeSpec
+    campaign_member: bool = False
+    figure_eligible: bool = False
+    denominator_contribution: int = 0
+    source_campaign_slot_id: str = "slot-066-n31-f5-b05-P"
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,7 +1008,11 @@ def build_execution_authorization_receipt(
 ) -> bytes:
     """Create the explicit thesis-author receipt required before launch."""
 
-    if scope not in {"excluded_n7_smoke", "shape25_campaign"}:
+    if scope not in {
+        "excluded_n7_smoke",
+        "excluded_n31_coverage_smoke",
+        "shape25_campaign",
+    }:
         raise FactorialExecutionError("execution authorization scope is invalid")
     if not isinstance(approval_reference, str) or not approval_reference.strip():
         raise FactorialExecutionError("execution approval reference is required")
@@ -1150,7 +1167,15 @@ def _bind_execution_authorization(
         raise FactorialExecutionError("execution authorization receipt schema drifted")
     manifest = load_frozen_manifest_bytes(static_artifacts["manifest.json"])
     plan = build_factorial_plan(manifest)
-    expected_scope = "shape25_campaign" if campaign_member else "excluded_n7_smoke"
+    expected_scope = (
+        "shape25_campaign"
+        if campaign_member
+        else (
+            "excluded_n7_smoke"
+            if slot.replica_count == 7
+            else "excluded_n31_coverage_smoke"
+        )
+    )
     expected_slots = (
         [planned.slot_id for planned in plan.slots]
         if campaign_member
@@ -1651,26 +1676,40 @@ def _bind_static_artifacts(
     expected_runtime_bytes = _canonical_json_bytes(spec.as_document())
     if normalized["runtime.json"] != expected_runtime_bytes:
         raise FactorialExecutionError(
-            "runtime.json does not match the exact direct N=7 runtime document"
+            "runtime.json does not match the exact direct excluded-smoke runtime document"
         )
-    smoke_matches = []
-    for template in plan.slots:
-        try:
-            candidate = build_n7_ps_smoke_slot(
-                template,
-                scientific_seed=slot.scientific_seed,
-                peer_base=slot.ports.peer_base,
-                client_base=slot.ports.client_base,
-                manager_port=slot.ports.manager,
-                result_path=slot.result_path,
-            )
-        except FactorialExecutionError:
-            continue
-        if candidate.slot == slot and candidate.runtime == spec:
-            smoke_matches.append(candidate)
-    if not smoke_matches:
+    smoke_matches: list[N7SmokeSlot | N31CoverageSmokeSlot] = []
+    if slot.replica_count == 7:
+        for template in plan.slots:
+            try:
+                candidate = build_n7_ps_smoke_slot(
+                    template,
+                    scientific_seed=slot.scientific_seed,
+                    peer_base=slot.ports.peer_base,
+                    client_base=slot.ports.client_base,
+                    manager_port=slot.ports.manager,
+                    result_path=slot.result_path,
+                )
+            except FactorialExecutionError:
+                continue
+            if candidate.slot == slot and candidate.runtime == spec:
+                smoke_matches.append(candidate)
+    elif slot.replica_count == 31:
+        for template in plan.slots:
+            try:
+                candidate = build_n31_coverage_smoke_slot(
+                    template,
+                    result_path=slot.result_path,
+                )
+            except FactorialExecutionError:
+                continue
+            if candidate.slot == slot and candidate.runtime == spec:
+                smoke_matches.append(candidate)
+    if not smoke_matches or (
+        slot.replica_count == 31 and len(smoke_matches) != 1
+    ):
         raise FactorialExecutionError(
-            "supplied N=7 slot is not derivable from the exact frozen plan"
+            "supplied excluded smoke is not derivable from the exact frozen plan"
         )
     return normalized
 
@@ -2035,7 +2074,12 @@ def materialize_launch(
             row["crt"] for row in identities.tls[: spec.replica_count]
         ),
     )
-    manager_template = materialize_manager_argv(spec, slot_directory, secrets)
+    manager_template = materialize_manager_argv(
+        spec,
+        slot_directory,
+        secrets,
+        shared_raw_clock_anchor_ns=shared_raw_clock_anchor_ns,
+    )
     manager_argv = (str(binaries.manager), *manager_template[1:])
     replica_templates = materialize_replica_argv(
         spec,
@@ -3246,6 +3290,29 @@ def _launch_receipt(
         spec.fault_window.start_after_prelaunch_anchor_s * NANOSECONDS_PER_SECOND
     )
     end_ns = start_ns + spec.fault_window.duration_s * NANOSECONDS_PER_SECOND
+    manager_argv = materialized.redacted_manager_argv
+    evidence_start_option = "--fault-containment-evidence-start-monotonic-ns"
+    coverage_option = "--fault-containment-required-tree-coverage"
+    coverage_enabled = (
+        spec.causal_acceptance.precontainment_fault_coverage_gate
+        == PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+    )
+    if coverage_enabled:
+        if (
+            manager_argv.count(evidence_start_option) != 1
+            or manager_argv[manager_argv.index(evidence_start_option) + 1]
+            != str(start_ns)
+            or manager_argv.count(coverage_option) != 1
+            or manager_argv[manager_argv.index(coverage_option) + 1]
+            != str(spec.replica_count)
+        ):
+            raise FactorialExecutionError(
+                "launch receipt cannot seal drifted precontainment coverage argv"
+            )
+    elif evidence_start_option in manager_argv or coverage_option in manager_argv:
+        raise FactorialExecutionError(
+            "legacy launch receipt must not seal precontainment coverage argv"
+        )
     return {
         "schema_version": 1,
         "slot_id": spec.slot_id,
@@ -3628,8 +3695,10 @@ def execute_slot_once(
         raise FactorialExecutionError("slot/preflight result-root identity mismatch")
     if campaign_member and slot.replica_count not in (13, 22, 31):
         raise FactorialExecutionError("campaign slot has an excluded replica count")
-    if not campaign_member and slot.replica_count != 7:
-        raise FactorialExecutionError("only the N=7 smoke may be non-campaign")
+    if not campaign_member and slot.replica_count not in {7, 31}:
+        raise FactorialExecutionError(
+            "only the exact N=7 or N=31 coverage smoke may be non-campaign"
+        )
     static_artifacts = _bind_static_artifacts(
         slot,
         spec,
@@ -4159,6 +4228,94 @@ def build_n7_ps_smoke_slot(
     )
 
 
+def build_n31_coverage_smoke_slot(
+    template: FactorialSlot,
+    *,
+    result_path: str | None = None,
+) -> N31CoverageSmokeSlot:
+    """Derive the excluded N=31 coverage smoke from exact campaign slot 066."""
+
+    if not isinstance(template, FactorialSlot):
+        raise FactorialExecutionError(
+            "N=31 coverage smoke requires one frozen slot template"
+        )
+    responsive = template.byzantine.responsive_degradation
+    expected_campaign_path = (
+        "results/shape-placement-factorial-v15/slot-066-n31-f5-b05-P"
+    )
+    if (
+        template.slot_id != "slot-066-n31-f5-b05-P"
+        or template.result_path != expected_campaign_path
+        or template.ordinal != 66
+        or template.execution_ordinal != 1
+        or template.block_id != "n31-f5-b05"
+        or template.block_index != 5
+        or template.blocks_in_cell != 5
+        or template.block_execution_ordinal != 1
+        or template.arm_execution_position != 1
+        or template.scientific_seed != 41_735
+        or template.replica_count != 31
+        or template.f != 10
+        or template.q != 21
+        or template.tree_count != 21
+        or template.initial_fanout != 5
+        or template.candidate_fanouts != (2, 3, 5)
+        or template.arm_code != "P"
+        or not template.placement_adaptation
+        or template.shape_adaptation
+        or template.byzantine_actor_ids != (22, 25, 29)
+        or template.responsive_degraded_actor_ids != (1, 2, 3, 5, 7, 8, 16)
+        or template.fast_replica_ids
+        != (
+            0,
+            4,
+            6,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            17,
+            18,
+            19,
+            20,
+            21,
+            23,
+            24,
+            26,
+            27,
+            28,
+            30,
+        )
+        or template.maximum_omissions_per_proposal != 10
+        or template.ports
+        != PortAllocation(peer_base=31_600, client_base=32_600, manager=33_600)
+        or responsive is None
+        or responsive.precontainment_fault_coverage_gate
+        != PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+    ):
+        raise FactorialExecutionError(
+            "N=31 coverage smoke must derive from exact v15 campaign slot 066"
+        )
+    expected_result_path = (
+        "results/shape-placement-factorial-v15-coverage-smoke/"
+        "slot-066-n31-f5-b05-P"
+    )
+    if result_path is None:
+        result_path = expected_result_path
+    if result_path != expected_result_path:
+        raise FactorialExecutionError(
+            "N=31 coverage smoke result path must be the exact canonical root"
+        )
+    smoke = replace(template, result_path=result_path)
+    return N31CoverageSmokeSlot(
+        slot=smoke,
+        runtime=build_slot_runtime(smoke),
+    )
+
+
 __all__ = (
     "ExecutionBinaries",
     "ExecutionPreflight",
@@ -4167,9 +4324,11 @@ __all__ = (
     "IncompleteFactorialSlot",
     "MaterializedLaunch",
     "N7SmokeSlot",
+    "N31CoverageSmokeSlot",
     "SlotExecutionResult",
     "build_execution_authorization_receipt",
     "build_n7_ps_smoke_slot",
+    "build_n31_coverage_smoke_slot",
     "execute_slot_once",
     "generate_identities",
     "materialize_launch",

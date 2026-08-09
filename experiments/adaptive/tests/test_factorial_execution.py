@@ -31,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
 
 
 @pytest.fixture(scope="module")
@@ -410,6 +410,23 @@ def test_static_artifacts_bind_exact_campaign_and_direct_smoke_documents(
         smoke.slot,
         smoke.runtime,
         _smoke_static_artifacts(smoke),
+        campaign_member=False,
+    )
+
+    plan = build_factorial_plan(load_frozen_manifest(MANIFEST))
+    first = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    coverage = execution.build_n31_coverage_smoke_slot(first)
+    coverage_artifacts = {
+        "manifest.json": MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": execution._canonical_json_bytes(
+            coverage.runtime.as_document()
+        ),
+    }
+    execution._bind_static_artifacts(
+        coverage.slot,
+        coverage.runtime,
+        coverage_artifacts,
         campaign_member=False,
     )
 
@@ -1381,7 +1398,7 @@ def _write_cycle2_terminal(spec: Any, slot_directory: Path) -> None:
 
 def _direct_preflight(
     tmp_path: Path,
-    smoke: execution.N7SmokeSlot,
+    smoke: execution.N7SmokeSlot | execution.N31CoverageSmokeSlot,
 ) -> execution.ExecutionPreflight:
     binaries = _binaries(tmp_path / "bin")
     root = tmp_path / Path(smoke.slot.result_path).parent
@@ -2183,6 +2200,70 @@ def test_execution_authorization_is_required_and_exact(
             build_provenance_sha256=hashlib.sha256(
                 execution._canonical_json_bytes(preflight.build_provenance)
             ).hexdigest(),
+        )
+
+
+def test_n31_coverage_smoke_authorization_is_separate_and_exact(
+    tmp_path: Path,
+) -> None:
+    plan = build_factorial_plan(load_frozen_manifest(MANIFEST))
+    first = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    coverage = execution.build_n31_coverage_smoke_slot(first)
+    artifacts = {
+        "manifest.json": MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": execution._canonical_json_bytes(
+            coverage.runtime.as_document()
+        ),
+    }
+    preflight = _direct_preflight(tmp_path, coverage)
+    digest = hashlib.sha256(
+        execution._canonical_json_bytes(preflight.build_provenance)
+    ).hexdigest()
+    receipt = execution.build_execution_authorization_receipt(
+        scope="excluded_n31_coverage_smoke",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-04T00:00:00+00:00",
+        kauri_revision=preflight.revision,
+        slot_ids=(coverage.slot.slot_id,),
+        result_root=Path(coverage.slot.result_path).parent.as_posix(),
+        static_artifacts=artifacts,
+        build_provenance_sha256=digest,
+    )
+
+    bound = execution._bind_execution_authorization(
+        receipt,
+        slot=coverage.slot,
+        preflight=preflight,
+        static_artifacts=artifacts,
+        campaign_member=False,
+    )
+
+    assert bound["scope"] == "excluded_n31_coverage_smoke"
+    assert bound["slot_ids"] == ["slot-066-n31-f5-b05-P"]
+    assert bound["result_root"] == (
+        "results/shape-placement-factorial-v15-coverage-smoke"
+    )
+    assert bound["automatic_retries"] == 0
+    assert bound["replacement_policy"] == "none"
+
+    wrong_scope = execution.build_execution_authorization_receipt(
+        scope="excluded_n7_smoke",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-04T00:00:00+00:00",
+        kauri_revision=preflight.revision,
+        slot_ids=(coverage.slot.slot_id,),
+        result_root=Path(coverage.slot.result_path).parent.as_posix(),
+        static_artifacts=artifacts,
+        build_provenance_sha256=digest,
+    )
+    with pytest.raises(execution.FactorialExecutionError, match="not exact"):
+        execution._bind_execution_authorization(
+            wrong_scope,
+            slot=coverage.slot,
+            preflight=preflight,
+            static_artifacts=artifacts,
+            campaign_member=False,
         )
 
 

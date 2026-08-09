@@ -25,6 +25,8 @@ using hotstuff::AdaptiveV2ReplicaScore;
 using hotstuff::AdaptiveV2SelectionConfig;
 using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
+using hotstuff::AdaptiveV2FaultContainmentCoverageStatus;
+using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::ConfigurationId;
 using hotstuff::EpochDefinitionInput;
@@ -69,7 +71,11 @@ std::uint32_t tree_id(ReplicaID reporter, ReplicaID target)
 std::vector<EpochTreeDefinition> all_reporter_target_trees()
 {
     std::vector<EpochTreeDefinition> trees;
-    trees.reserve(kReplicaCount * (kReplicaCount - 1));
+    trees.reserve(kReplicaCount * (kReplicaCount - 1) + 2);
+    trees.push_back(EpochTreeDefinition{
+        0, 2, 2, {0, 1, 2, 3, 4, 5, 6}, {}});
+    trees.push_back(EpochTreeDefinition{
+        1, 2, 2, {1, 2, 3, 4, 5, 6, 0}, {}});
     for (const auto reporter : fixed_membership())
     {
         for (const auto target : fixed_membership())
@@ -261,11 +267,13 @@ struct Fixture
         return value;
     }
 
-    void late(const ResponseObservation &timeout_observation)
+    void late(
+        const ResponseObservation &timeout_observation,
+        std::uint64_t response_duration_us = 150)
     {
         auto value = timeout_observation;
         value.outcome = ResponseOutcome::late;
-        value.response_duration_us = 150;
+        value.response_duration_us = response_duration_us;
         value.signer_set = {value.observed_replica_id};
         value.reporter_monotonic_ns = ++monotonic_clock * 1'000;
         value.reporter_sequence =
@@ -288,6 +296,96 @@ struct Fixture
             reporter, target, ResponseOutcome::on_time);
         value.response_duration_us = response_duration_us;
         ingest(value);
+    }
+
+    const EpochTreeDefinition &tree(std::uint32_t id) const
+    {
+        const auto *const definition =
+            epochs.find_epoch(epoch.epoch_number);
+        if (definition == nullptr)
+            throw std::logic_error("missing fixture epoch");
+        const auto &trees = definition->trees();
+        const auto found = std::find_if(
+            trees.begin(), trees.end(),
+            [id](const auto &value) { return value.tree_id == id; });
+        if (found == trees.end())
+            throw std::logic_error("missing fixture tree");
+        return *found;
+    }
+
+    ResponseObservation direct_vote_for_proposal(
+        const ProposalKey &proposal,
+        std::optional<std::pair<ReplicaID, ReplicaID>> avoid =
+            std::nullopt)
+    {
+        const auto &definition = tree(
+            proposal.configuration.tree_id);
+        const auto first_leaf =
+            ((definition.members_breadth_first.size() - 2) /
+             definition.fanout) + 1;
+        for (std::size_t position = first_leaf;
+             position < definition.members_breadth_first.size();
+             ++position)
+        {
+            const auto parent_position =
+                (position - 1) / definition.fanout;
+            const auto reporter =
+                definition.members_breadth_first[parent_position];
+            const auto observed =
+                definition.members_breadth_first[position];
+            if (avoid.has_value() &&
+                avoid->first == reporter &&
+                avoid->second == observed)
+            {
+                continue;
+            }
+            ResponseObservation value;
+            value.reporter_id = reporter;
+            value.observed_replica_id = observed;
+            value.configuration = proposal.configuration;
+            value.block_hash = proposal.block_hash;
+            value.expected_message_type =
+                ExpectedMessageType::direct_vote;
+            value.outcome = ResponseOutcome::on_time;
+            value.response_duration_us = 50;
+            value.deadline_duration_us = 100;
+            value.reporter_monotonic_ns =
+                ++monotonic_clock * 1'000;
+            value.reporter_sequence =
+                ++reporter_sequences[reporter];
+            value.signer_set = {observed};
+            value.observation_id =
+                hotstuff::compute_response_observation_id(
+                    value.attempt_identity());
+            window.admit(value.proposal_key());
+            return value;
+        }
+        throw std::logic_error(
+            "fixture tree lacks a distinct direct-vote edge");
+    }
+
+    void cover_tree(std::uint32_t id)
+    {
+        const ProposalKey proposal{
+            ConfigurationId{
+                epoch.epoch_number, id, epoch.epoch_digest},
+            digest("coverage-tree-" + std::to_string(id))};
+        ingest(direct_vote_for_proposal(proposal));
+    }
+
+    void anchor_timeout_proposal(
+        const ResponseObservation &timeout_observation)
+    {
+        ingest(direct_vote_for_proposal(
+            timeout_observation.proposal_key(),
+            std::make_pair(
+                timeout_observation.reporter_id,
+                timeout_observation.observed_replica_id)));
+    }
+
+    void advance_monotonic_clock(std::uint64_t ticks)
+    {
+        monotonic_clock = std::max(monotonic_clock, ticks);
     }
 
     void baseline_all()
@@ -382,6 +480,37 @@ const AdaptiveV2CandidateAudit *candidate(
     return nullptr;
 }
 
+AcceptedEvidenceRecord containment_coverage_record(
+    std::uint64_t ingestion_sequence,
+    std::uint32_t tree,
+    const AdaptationEpochId &epoch,
+    std::uint64_t reporter_monotonic_ns,
+    std::uint64_t response_duration_us,
+    ReplicaID reporter = 0,
+    ReplicaID observed = 1)
+{
+    ResponseObservation observation;
+    observation.reporter_id = reporter;
+    observation.observed_replica_id = observed;
+    observation.configuration = {
+        epoch.epoch_number, tree, epoch.epoch_digest};
+    observation.block_hash = digest(
+        "fault-containment-coverage-" +
+        std::to_string(ingestion_sequence));
+    observation.expected_message_type =
+        ExpectedMessageType::direct_vote;
+    observation.outcome = ResponseOutcome::on_time;
+    observation.response_duration_us = response_duration_us;
+    observation.deadline_duration_us = 100;
+    observation.reporter_monotonic_ns = reporter_monotonic_ns;
+    observation.reporter_sequence = ingestion_sequence;
+    observation.signer_set = {observed};
+    observation.observation_id =
+        hotstuff::compute_response_observation_id(
+            observation.attempt_identity());
+    return {ingestion_sequence, std::move(observation)};
+}
+
 static_assert(
     std::is_same<
         decltype(std::declval<const AdaptiveV2ByzantineSelection &>()
@@ -415,6 +544,236 @@ TEST_CASE(
     CHECK(selector.score_trajectory()[0].delta == 1);
     CHECK(selector.score_trajectory()[1].delta == -1);
     CHECK(selector.healthy());
+}
+
+TEST_CASE(
+    "fault containment coverage requires every canonical post-fault tree",
+    "[adaptive-v2][selection][fault-containment][coverage]")
+{
+    constexpr std::uint64_t fault_open_ns = 1'000'000;
+    constexpr std::uint32_t required_tree_count = 13;
+    const AdaptationEpochId epoch{
+        0, digest("fault-containment-coverage-epoch")};
+    std::vector<AcceptedEvidenceRecord> records;
+    for (std::uint32_t tree = 0; tree < required_tree_count; ++tree)
+    {
+        records.push_back(containment_coverage_record(
+            records.size() + 1,
+            tree,
+            epoch,
+            fault_open_ns + 2'000'000 + tree,
+            1'000));
+    }
+
+    SECTION("thirteen-tree gate rejects an incomplete prefix")
+    {
+        const auto result =
+            hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+                records,
+                epoch,
+                records.size() - 1,
+                fault_open_ns,
+                required_tree_count);
+        CHECK(result.status ==
+              AdaptiveV2FaultContainmentCoverageStatus::incomplete);
+        CHECK(result.required_tree_ids.size() == required_tree_count);
+        CHECK(result.observed_tree_ids ==
+              std::vector<std::uint32_t>{
+                  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    }
+
+    SECTION("all exact tree IDs pass once and duplicates add nothing")
+    {
+        auto duplicate = records.front();
+        duplicate.ingestion_sequence = records.size() + 1;
+        duplicate.observation.reporter_id = 4;
+        duplicate.observation.observed_replica_id = 5;
+        duplicate.observation.reporter_sequence = 1;
+        duplicate.observation.observation_id =
+            hotstuff::compute_response_observation_id(
+                duplicate.observation.attempt_identity());
+        records.push_back(std::move(duplicate));
+
+        const auto result =
+            hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+                records,
+                epoch,
+                records.size(),
+                fault_open_ns,
+                required_tree_count);
+        CHECK(result.status ==
+              AdaptiveV2FaultContainmentCoverageStatus::ready);
+        CHECK(result.required_tree_ids == result.observed_tree_ids);
+        CHECK(result.observed_tree_ids.size() == required_tree_count);
+    }
+
+    SECTION("response completion after fault-open does not admit a pre-fault attempt")
+    {
+        records.front().observation.reporter_monotonic_ns =
+            fault_open_ns + 1'000'000;
+        records.front().observation.response_duration_us = 1'000;
+        const auto result =
+            hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+                records,
+                epoch,
+                records.size(),
+                fault_open_ns,
+                required_tree_count);
+        CHECK(result.status ==
+              AdaptiveV2FaultContainmentCoverageStatus::incomplete);
+        CHECK(std::find(
+                  result.observed_tree_ids.begin(),
+                  result.observed_tree_ids.end(),
+                  0) == result.observed_tree_ids.end());
+    }
+
+    SECTION("a valid sub-microsecond response keeps the conservative boundary")
+    {
+        records.front().observation.reporter_monotonic_ns =
+            fault_open_ns + 999;
+        records.front().observation.response_duration_us = 0;
+        const auto result =
+            hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+                records,
+                epoch,
+                records.size(),
+                fault_open_ns,
+                required_tree_count);
+        CHECK(result.status ==
+              AdaptiveV2FaultContainmentCoverageStatus::ready);
+        CHECK(result.required_tree_ids == result.observed_tree_ids);
+    }
+
+    SECTION("changing actor identities cannot change tree readiness")
+    {
+        const auto original =
+            hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+                records,
+                epoch,
+                records.size(),
+                fault_open_ns,
+                required_tree_count);
+        for (auto &record : records)
+        {
+            record.observation.reporter_id = 5;
+            record.observation.observed_replica_id = 6;
+            record.observation.observation_id =
+                hotstuff::compute_response_observation_id(
+                    record.observation.attempt_identity());
+        }
+        const auto mutated =
+            hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+                records,
+                epoch,
+                records.size(),
+                fault_open_ns,
+                required_tree_count);
+        CHECK(mutated.status == original.status);
+        CHECK(mutated.required_tree_ids == original.required_tree_ids);
+        CHECK(mutated.observed_tree_ids == original.observed_tree_ids);
+    }
+}
+
+TEST_CASE(
+    "N31 containment coverage cannot be confused with Q21",
+    "[adaptive-v2][selection][fault-containment][n31]")
+{
+    constexpr std::uint64_t fault_open_ns = 5'000'000;
+    const AdaptationEpochId epoch{
+        0, digest("fault-containment-n31-epoch")};
+    std::vector<AcceptedEvidenceRecord> records;
+    for (std::uint32_t tree = 0; tree < 31; ++tree)
+    {
+        records.push_back(containment_coverage_record(
+            records.size() + 1,
+            tree,
+            epoch,
+            fault_open_ns + 2'000'000 + tree,
+            1'000));
+    }
+
+    const auto q21_prefix =
+        hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+            records, epoch, 21, fault_open_ns, 31);
+    CHECK(q21_prefix.status ==
+          AdaptiveV2FaultContainmentCoverageStatus::incomplete);
+    CHECK(q21_prefix.observed_tree_ids.size() == 21);
+    CHECK(q21_prefix.required_tree_ids.size() == 31);
+
+    const auto n31_prefix =
+        hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+            records, epoch, 31, fault_open_ns, 31);
+    CHECK(n31_prefix.status ==
+          AdaptiveV2FaultContainmentCoverageStatus::ready);
+    CHECK(n31_prefix.observed_tree_ids.size() == 31);
+}
+
+TEST_CASE(
+    "guarded selection uses only exact post-fault proposal keys",
+    "[adaptive-v2][selection][fault-containment][reporter-guard]")
+{
+    constexpr std::uint64_t fault_open_ns = 100'000;
+    Fixture fixture;
+    fixture.baseline_all();
+    auto config = selection_config(3, 1, 128);
+    config.required_nonresponsive = 1;
+    config.fault_containment_evidence_start_monotonic_ns =
+        fault_open_ns;
+    config.fault_containment_required_tree_coverage = 7;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    REQUIRE(selector.freeze_baseline(
+                fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    // Delayed callbacks for pre-fault proposal keys may arrive after the
+    // boundary. Their reporter timestamps cannot qualify those keys.
+    fixture.advance_monotonic_clock(200);
+    fixture.timeout(2, 0);
+    fixture.timeout(3, 0);
+    fixture.timeout(4, 0);
+    for (std::uint32_t tree = 0; tree < 7; ++tree)
+        fixture.cover_tree(tree);
+
+    const auto unqualified = selector.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(unqualified.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(unqualified.eligible_candidates.empty());
+
+    fixture.advance_monotonic_clock(400);
+    std::vector<ResponseObservation> qualifying_timeouts;
+    for (const auto reporter : std::vector<ReplicaID>{2, 3, 4})
+    {
+        auto timeout = fixture.timeout(reporter, 0);
+        fixture.anchor_timeout_proposal(timeout);
+        qualifying_timeouts.push_back(std::move(timeout));
+    }
+
+    const auto selected = selector.select_through(
+        fixture.ledger->high_watermark());
+    REQUIRE(selected.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(selected.selected_replicas ==
+          std::vector<ReplicaID>{0});
+    REQUIRE(selected.eligible_candidates.size() == 1);
+    CHECK(selected.eligible_candidates.front().qualifying_reporters ==
+          std::vector<ReplicaID>{2, 3, 4});
+
+    fixture.late(qualifying_timeouts.front(), 1'000'000);
+    for (std::size_t index = 1;
+         index < qualifying_timeouts.size();
+         ++index)
+    {
+        fixture.late(qualifying_timeouts[index]);
+    }
+    const auto compensated = selector.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(compensated.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(compensated.eligible_candidates.empty());
 }
 
 TEST_CASE(

@@ -22,6 +22,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     load_frozen_manifest,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
+    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
     FROZEN_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
 )
@@ -33,7 +34,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
+V14_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
+)
 V13_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v13.json"
 )
@@ -197,9 +201,12 @@ def _slot_validation(
         (V11_MANIFEST, "v11"),
         (V12_MANIFEST, "v12"),
         (V13_MANIFEST, "v13"),
+        (V14_MANIFEST, "v14"),
     ),
 )
-@pytest.mark.parametrize("command", ("plan", "preflight", "smoke", "run"))
+@pytest.mark.parametrize(
+    "command", ("plan", "preflight", "smoke", "coverage-smoke", "run")
+)
 def test_prior_manifest_is_validation_only_before_any_result_claim(
     command: str,
     manifest_path: Path,
@@ -215,7 +222,7 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
         "--repository",
         str(repository),
     ]
-    if command in {"smoke", "run"}:
+    if command in {"smoke", "coverage-smoke", "run"}:
         arguments.extend(("--approval-reference", "must remain unused"))
 
     assert cli.main(arguments) == 2
@@ -223,14 +230,18 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1 through v13 are validation-only; "
-            "plan, preflight, smoke, and run require shape-placement-factorial-v14"
+            "shape-placement-factorial-v1 through v14 are validation-only; "
+            "production commands require shape-placement-factorial-v15"
         ),
         "status": "REJECT",
     }
     assert not (repository / f"results/shape-placement-factorial-{version}").exists()
     assert not (
         repository / f"results/shape-placement-factorial-{version}-smoke"
+    ).exists()
+    assert not (
+        repository
+        / f"results/shape-placement-factorial-{version}-coverage-smoke"
     ).exists()
 
 
@@ -295,9 +306,43 @@ def test_smoke_preflight_rejects_runtime_identity_drift(
     ) == 2
     refusal = json.loads(capsys.readouterr().err)
     assert refusal == {
-        "reason": "smoke runtime bytes differ from the exact frozen v14 identity",
+        "reason": "smoke runtime bytes differ from the exact frozen v15 identity",
         "status": "REJECT",
     }
+
+
+def test_coverage_smoke_preflight_validates_exact_n31_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    repository.mkdir()
+    monkeypatch.setattr(
+        cli.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=20_000_000_000),
+    )
+
+    assert cli.main(
+        [
+            "preflight",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--preflight-target",
+            "coverage-smoke",
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "PASS"
+    assert result["target"] == "coverage-smoke"
+    assert result["slot_count"] == 1
+    assert result["runtime_id"].startswith("slot-runtime-")
+    assert result["runtime_sha256"] == FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+    assert result["launch_permitted"] is False
 
 
 @pytest.mark.parametrize(
@@ -449,7 +494,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v14").exists()
+    assert not (repository / "results/shape-placement-factorial-v15").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -474,7 +519,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v14").exists()
+    assert not (repository / "results/shape-placement-factorial-v15").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -500,7 +545,34 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v14-smoke"
+        repository / "results/shape-placement-factorial-v15-smoke"
+    ).exists()
+
+
+def test_coverage_smoke_runtime_identity_drift_rejects_before_result_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    monkeypatch.setattr(cli, "_direct_runtime_bytes", lambda _runtime: b"{}\n")
+
+    assert cli.main(
+        [
+            "coverage-smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "must remain unused",
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert "coverage-smoke runtime bytes differ" in refusal["reason"]
+    assert not (
+        repository / "results/shape-placement-factorial-v15-coverage-smoke"
     ).exists()
 
 
@@ -536,7 +608,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v14-smoke"
+        repository / "results/shape-placement-factorial-v15-smoke"
     ).exists()
 
 
@@ -596,7 +668,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v14-smoke"
+        / "results/shape-placement-factorial-v15-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"
@@ -677,6 +749,141 @@ def test_smoke_accepts_an_existing_exact_authorization_receipt(
     assert observed["receipt"] == receipt
 
 
+def test_coverage_smoke_requires_independently_passing_n7_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+    monkeypatch.setattr(
+        cli,
+        "_require_validated_smoke",
+        lambda _root, **_kwargs: (_ for _ in ()).throw(
+            factorial_execution.FactorialExecutionError(
+                "canonical excluded N=7 smoke did not independently validate PASS"
+            )
+        ),
+    )
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("coverage launch must not start before the N=7 gate")
+
+    monkeypatch.setattr(cli, "preserve_build_evidence", forbidden)
+    monkeypatch.setattr(cli, "execute_slot_once", forbidden)
+
+    assert cli.main(
+        [
+            "coverage-smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "test thesis-author approval",
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert refusal["status"] == "REJECT"
+    assert "N=7 smoke" in refusal["reason"]
+    assert not (
+        repository / "results/shape-placement-factorial-v15-coverage-smoke"
+    ).exists()
+
+
+def test_coverage_smoke_uses_exact_first_slot_and_separate_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    frozen_contract,
+) -> None:
+    plan, _ = frozen_contract
+    repository = tmp_path / "Kauri"
+    observed: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+
+    def require_n7(root: Path, **kwargs: Any) -> None:
+        observed["n7_root"] = root
+        observed["n7_gate"] = kwargs
+
+    monkeypatch.setattr(cli, "_require_validated_smoke", require_n7)
+
+    def execute(slot, spec, **kwargs: Any):
+        observed["slot"] = slot
+        observed["spec"] = spec
+        observed["campaign_member"] = kwargs["campaign_member"]
+        observed["authorization"] = json.loads(kwargs["authorization_receipt"])
+        return factorial_execution.SlotExecutionResult(
+            slot_directory=kwargs["preflight"].slot_directory,
+            outcome="PASS",
+            reason=None,
+            launch_count=slot.replica_count + 1,
+            phase_cutoffs={},
+            cleanup_ledger=(),
+        )
+
+    monkeypatch.setattr(cli, "execute_slot_once", execute)
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: _slot_validation(
+            path.name, outcome="PASS", campaign_member=False
+        ),
+    )
+
+    assert cli.main(
+        [
+            "coverage-smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "test thesis-author approval",
+            "--approved-utc",
+            "2026-08-04T00:00:00+00:00",
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    first = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    assert observed["slot"] == replace(
+        first,
+        result_path=(
+            "results/shape-placement-factorial-v15-coverage-smoke/"
+            "slot-066-n31-f5-b05-P"
+        ),
+    )
+    assert observed["spec"].replica_count == 31
+    assert observed["spec"].tree_count == 21
+    assert observed["campaign_member"] is False
+    authorization = observed["authorization"]
+    assert authorization["scope"] == "excluded_n31_coverage_smoke"
+    assert authorization["slot_ids"] == ["slot-066-n31-f5-b05-P"]
+    assert authorization["result_root"] == (
+        "results/shape-placement-factorial-v15-coverage-smoke"
+    )
+    assert authorization["automatic_retries"] == 0
+    assert authorization["replacement_policy"] == "none"
+    assert authorization["static_artifacts_sha256"] == {
+        "manifest.json": FROZEN_MANIFEST_SHA256,
+        "plan.json": FROZEN_PLAN_SHA256,
+        "runtime.json": FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+    }
+    assert observed["n7_root"] == (
+        repository / "results/shape-placement-factorial-v15-smoke"
+    )
+    assert (
+        repository
+        / "results/shape-placement-factorial-v15-coverage-smoke"
+        / cli.COVERAGE_SMOKE_AUTHORIZATION_FILENAME
+    ).read_bytes() == cli._canonical_json_bytes(authorization)
+    assert result["validation"]["outcome"] == "PASS"
+    assert result["campaign_member"] is False
+    assert result["figure_eligible"] is False
+
+
 def test_campaign_requires_independently_passing_excluded_smoke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -714,6 +921,53 @@ def test_campaign_requires_independently_passing_excluded_smoke(
 
     assert refusal["status"] == "REJECT"
     assert "N=7 smoke" in refusal["reason"]
+
+
+def test_campaign_requires_independently_passing_n31_coverage_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "Kauri"
+    monkeypatch.setattr(cli, "_preflight", _preflight)
+    monkeypatch.setattr(
+        cli, "_require_validated_smoke", lambda _root, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        cli,
+        "_require_validated_coverage_smoke",
+        lambda _root, **_kwargs: (_ for _ in ()).throw(
+            factorial_execution.FactorialExecutionError(
+                "canonical excluded N=31 coverage smoke did not independently "
+                "validate PASS"
+            )
+        ),
+    )
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("campaign launch must not start before both smoke gates")
+
+    monkeypatch.setattr(cli, "preserve_build_evidence", forbidden)
+    monkeypatch.setattr(cli, "execute_slot_once", forbidden)
+
+    assert cli.main(
+        [
+            "run",
+            "--manifest",
+            str(MANIFEST),
+            "--repository",
+            str(repository),
+            "--approval-reference",
+            "test thesis-author approval",
+        ]
+    ) == 2
+    refusal = json.loads(capsys.readouterr().err)
+
+    assert refusal["status"] == "REJECT"
+    assert "N=31 coverage smoke" in refusal["reason"]
+    assert not (
+        repository / "results/shape-placement-factorial-v15"
+    ).exists()
 
 
 def test_campaign_smoke_gate_binds_exact_revision_and_build(
@@ -791,6 +1045,81 @@ def test_campaign_smoke_gate_binds_exact_revision_and_build(
         )
 
 
+def test_campaign_coverage_smoke_gate_binds_exact_revision_build_and_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coverage_root = tmp_path / "coverage-smoke"
+    slot_root = coverage_root / "slot-066-n31-f5-b05-P"
+    (slot_root / "runtime").mkdir(parents=True)
+    build_provenance = {"schema_version": 1, "revision": REVISION}
+    expected_static_hashes = {
+        "manifest.json": FROZEN_MANIFEST_SHA256,
+        "plan.json": FROZEN_PLAN_SHA256,
+        "runtime.json": FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+    }
+    authorization_path = slot_root / "execution-authorization.json"
+    authorization_path.write_bytes(
+        cli._canonical_json_bytes(
+            {
+                "kauri_revision": REVISION,
+                "static_artifacts_sha256": expected_static_hashes,
+            }
+        )
+    )
+    (slot_root / "runtime/exact-build-provenance.json").write_bytes(
+        cli._canonical_json_bytes(build_provenance)
+    )
+    monkeypatch.setattr(
+        cli,
+        "validate_slot",
+        lambda path: _slot_validation(
+            path.name, outcome="PASS", campaign_member=False
+        ),
+    )
+
+    result = cli._require_validated_coverage_smoke(
+        coverage_root,
+        expected_revision=REVISION,
+        expected_build_provenance=build_provenance,
+        expected_static_artifacts_sha256=expected_static_hashes,
+    )
+
+    assert result.outcome == "PASS"
+    with pytest.raises(
+        factorial_execution.FactorialExecutionError,
+        match="exact revision and build",
+    ):
+        cli._require_validated_coverage_smoke(
+            coverage_root,
+            expected_revision="b" * 40,
+            expected_build_provenance=build_provenance,
+            expected_static_artifacts_sha256=expected_static_hashes,
+        )
+
+    authorization_path.write_bytes(
+        cli._canonical_json_bytes(
+            {
+                "kauri_revision": REVISION,
+                "static_artifacts_sha256": {
+                    **expected_static_hashes,
+                    "runtime.json": FROZEN_SMOKE_RUNTIME_SHA256,
+                },
+            }
+        )
+    )
+    with pytest.raises(
+        factorial_execution.FactorialExecutionError,
+        match="frozen static artifacts",
+    ):
+        cli._require_validated_coverage_smoke(
+            coverage_root,
+            expected_revision=REVISION,
+            expected_build_provenance=build_provenance,
+            expected_static_artifacts_sha256=expected_static_hashes,
+        )
+
+
 def test_campaign_uses_exact_execution_order_and_stops_without_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -805,6 +1134,9 @@ def test_campaign_uses_exact_execution_order_and_stops_without_retry(
     monkeypatch.setattr(cli, "_preflight", _preflight)
     monkeypatch.setattr(
         cli, "_require_validated_smoke", lambda _root, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        cli, "_require_validated_coverage_smoke", lambda _root, **_kwargs: None
     )
     original_publish_summary = cli.publish_campaign_summary
 
@@ -913,6 +1245,9 @@ def test_campaign_does_not_launch_next_slot_after_preflight_drift(
     executed: list[str] = []
     monkeypatch.setattr(
         cli, "_require_validated_smoke", lambda _root, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        cli, "_require_validated_coverage_smoke", lambda _root, **_kwargs: None
     )
 
     def drifting_preflight(slot, **kwargs: Any):
@@ -1024,6 +1359,7 @@ def test_validation_commands_accept_explicit_relocated_roots_read_only(
 ) -> None:
     relocated_campaign = tmp_path / "archive" / "campaign"
     relocated_smoke = tmp_path / "archive" / "smoke"
+    relocated_coverage_smoke = tmp_path / "archive" / "coverage-smoke"
     campaign_calls: list[Path] = []
     smoke_calls: list[Path] = []
     monkeypatch.setattr(
@@ -1066,13 +1402,25 @@ def test_validation_commands_accept_explicit_relocated_roots_read_only(
         ]
     ) == 0
     capsys.readouterr()
+    assert cli.main(
+        [
+            "validate-coverage-smoke",
+            "--manifest",
+            str(MANIFEST),
+            "--coverage-smoke-results-root",
+            str(relocated_coverage_smoke),
+        ]
+    ) == 0
+    capsys.readouterr()
 
     assert campaign_calls == [relocated_campaign.resolve()]
     assert smoke_calls == [
-        relocated_smoke.resolve() / "smoke-n7-f2-PS"
+        relocated_smoke.resolve() / "smoke-n7-f2-PS",
+        relocated_coverage_smoke.resolve() / "slot-066-n31-f5-b05-P",
     ]
     assert not relocated_campaign.exists()
     assert not relocated_smoke.exists()
+    assert not relocated_coverage_smoke.exists()
 
 
 @pytest.mark.parametrize(
@@ -1080,6 +1428,10 @@ def test_validation_commands_accept_explicit_relocated_roots_read_only(
     (
         ("validate-campaign", "--campaign-results-root"),
         ("validate-smoke", "--smoke-results-root"),
+        (
+            "validate-coverage-smoke",
+            "--coverage-smoke-results-root",
+        ),
     ),
 )
 def test_validation_rejects_a_symlink_result_root(

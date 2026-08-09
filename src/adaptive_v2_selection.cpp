@@ -70,6 +70,14 @@ ValidatedSelectionInputs validate_inputs(
         throw std::invalid_argument(
             "adaptive-v2 reputation bounds are invalid");
     }
+    if ((config.fault_containment_evidence_start_monotonic_ns == 0) !=
+            (config.fault_containment_required_tree_coverage == 0) ||
+        config.fault_containment_required_tree_coverage >
+            kMaximumAdaptationEvidenceRecords)
+    {
+        throw std::invalid_argument(
+            "adaptive-v2 fault-containment coverage bounds are invalid");
+    }
 
     // Reuse the authoritative snapshot builder's membership, epoch, and
     // policy validation instead of maintaining a divergent validation copy.
@@ -90,6 +98,120 @@ bool is_member(
 {
     return std::binary_search(
         membership.begin(), membership.end(), replica_id);
+}
+
+bool conservative_duration_started_at_or_after(
+    std::uint64_t reporter_monotonic_ns,
+    std::uint64_t duration_us,
+    std::uint64_t lower_bound_ns) noexcept
+{
+    if (lower_bound_ns == 0)
+        return true;
+    if (duration_us >
+            (std::numeric_limits<std::uint64_t>::max() - 999U) /
+                1'000U)
+    {
+        return false;
+    }
+    const auto conservative_elapsed_ns =
+        duration_us * 1'000U + 999U;
+    return reporter_monotonic_ns >= conservative_elapsed_ns &&
+        reporter_monotonic_ns - conservative_elapsed_ns >=
+            lower_bound_ns;
+}
+
+bool post_fault_direct_vote_proposal_anchor(
+    const ResponseObservation &observation,
+    std::uint64_t lower_bound_ns) noexcept
+{
+    return observation.outcome == ResponseOutcome::on_time &&
+        observation.expected_message_type ==
+            ExpectedMessageType::direct_vote &&
+        conservative_duration_started_at_or_after(
+            observation.reporter_monotonic_ns,
+            observation.response_duration_us,
+            lower_bound_ns);
+}
+
+struct PostFaultProposalCoverage
+{
+    AdaptiveV2FaultContainmentCoverage audit;
+    std::set<ProposalKey> proposal_keys;
+};
+
+PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    std::uint64_t fault_evidence_start_monotonic_ns,
+    const std::vector<std::uint32_t> &required_tree_ids)
+{
+    PostFaultProposalCoverage result;
+    result.audit.fault_evidence_start_monotonic_ns =
+        fault_evidence_start_monotonic_ns;
+    result.audit.evidence_cutoff = evidence_cutoff;
+    if (fault_evidence_start_monotonic_ns == 0 &&
+        required_tree_ids.empty())
+    {
+        result.audit.status =
+            AdaptiveV2FaultContainmentCoverageStatus::disabled;
+        return result;
+    }
+    if (fault_evidence_start_monotonic_ns == 0 ||
+        required_tree_ids.empty() ||
+        required_tree_ids.size() > kMaximumAdaptationEvidenceRecords ||
+        current_epoch.epoch_digest == uint256_t{} ||
+        std::adjacent_find(
+            required_tree_ids.begin(),
+            required_tree_ids.end(),
+            [](std::uint32_t left, std::uint32_t right) {
+                return left >= right;
+            }) != required_tree_ids.end())
+    {
+        result.audit.status =
+            AdaptiveV2FaultContainmentCoverageStatus::invalid;
+        return result;
+    }
+
+    result.audit.required_tree_ids = required_tree_ids;
+
+    std::set<std::uint32_t> observed_tree_ids;
+    for (const auto &record : accepted)
+    {
+        if (record.ingestion_sequence == 0 ||
+            record.ingestion_sequence > evidence_cutoff)
+        {
+            continue;
+        }
+        const auto &observation = record.observation;
+        if (observation.configuration.epoch_number !=
+                current_epoch.epoch_number ||
+            observation.configuration.epoch_digest !=
+                current_epoch.epoch_digest ||
+            !post_fault_direct_vote_proposal_anchor(
+                observation,
+                fault_evidence_start_monotonic_ns))
+        {
+            continue;
+        }
+        result.proposal_keys.insert(observation.proposal_key());
+        if (std::binary_search(
+                required_tree_ids.begin(),
+                required_tree_ids.end(),
+                observation.configuration.tree_id))
+        {
+            observed_tree_ids.insert(
+                observation.configuration.tree_id);
+        }
+    }
+    result.audit.observed_tree_ids.assign(
+        observed_tree_ids.begin(), observed_tree_ids.end());
+    result.audit.status =
+        result.audit.observed_tree_ids ==
+                result.audit.required_tree_ids
+            ? AdaptiveV2FaultContainmentCoverageStatus::ready
+            : AdaptiveV2FaultContainmentCoverageStatus::incomplete;
+    return result;
 }
 
 enum class PrefixStatus : std::uint8_t
@@ -331,6 +453,7 @@ TimeoutReplayStatus replay_post_baseline_timeouts(
     std::uint64_t baseline_cutoff,
     std::uint64_t evidence_cutoff,
     std::size_t capacity,
+    const std::set<ProposalKey> *eligible_proposals,
     TargetTimeoutCounts &counts) noexcept
 {
     try
@@ -348,8 +471,18 @@ TimeoutReplayStatus replay_post_baseline_timeouts(
             const auto &observation = record.observation;
             if (observation.outcome == ResponseOutcome::on_time)
                 continue;
+            if (eligible_proposals != nullptr &&
+                eligible_proposals->find(observation.proposal_key()) ==
+                    eligible_proposals->end())
+            {
+                continue;
+            }
             if (observation.outcome == ResponseOutcome::late)
             {
+                // A late record has the exact immutable attempt identity of
+                // its timeout. Once their proposal key is independently
+                // anchored post-fault, the response must compensate the
+                // replayed timeout even when it arrives much later.
                 const auto found = outstanding.find(
                     observation.observation_id);
                 if (found != outstanding.end())
@@ -549,6 +682,74 @@ bool candidate_ranks_before(
 }
 
 } // namespace
+
+AdaptiveV2FaultContainmentCoverage
+evaluate_adaptive_v2_fault_containment_coverage(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    std::uint64_t fault_evidence_start_monotonic_ns,
+    std::uint32_t required_tree_count) noexcept
+{
+    try
+    {
+        std::vector<std::uint32_t> required_tree_ids;
+        required_tree_ids.reserve(required_tree_count);
+        for (std::uint32_t tree_id = 0;
+             tree_id < required_tree_count;
+             ++tree_id)
+        {
+            required_tree_ids.push_back(tree_id);
+        }
+        return evaluate_post_fault_proposal_coverage(
+                   accepted,
+                   current_epoch,
+                   evidence_cutoff,
+                   fault_evidence_start_monotonic_ns,
+                   required_tree_ids)
+            .audit;
+    }
+    catch (...)
+    {
+        AdaptiveV2FaultContainmentCoverage result;
+        result.status =
+            AdaptiveV2FaultContainmentCoverageStatus::invalid;
+        result.fault_evidence_start_monotonic_ns =
+            fault_evidence_start_monotonic_ns;
+        result.evidence_cutoff = evidence_cutoff;
+        return result;
+    }
+}
+
+AdaptiveV2FaultContainmentCoverage
+evaluate_adaptive_v2_fault_containment_coverage(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    std::uint64_t fault_evidence_start_monotonic_ns,
+    const std::vector<std::uint32_t> &required_tree_ids) noexcept
+{
+    try
+    {
+        return evaluate_post_fault_proposal_coverage(
+                   accepted,
+                   current_epoch,
+                   evidence_cutoff,
+                   fault_evidence_start_monotonic_ns,
+                   required_tree_ids)
+            .audit;
+    }
+    catch (...)
+    {
+        AdaptiveV2FaultContainmentCoverage result;
+        result.status =
+            AdaptiveV2FaultContainmentCoverageStatus::invalid;
+        result.fault_evidence_start_monotonic_ns =
+            fault_evidence_start_monotonic_ns;
+        result.evidence_cutoff = evidence_cutoff;
+        return result;
+    }
+}
 
 struct AdaptiveV2ByzantineSelection::State
 {
@@ -1005,12 +1206,61 @@ AdaptiveV2ByzantineSelection::select_through(
             selection_status(prefix.status), evidence_cutoff);
     }
 
+    PostFaultProposalCoverage fault_coverage;
+    try
+    {
+        std::vector<std::uint32_t> required_tree_ids;
+        required_tree_ids.reserve(
+            state.config
+                .fault_containment_required_tree_coverage);
+        for (std::uint32_t tree_id = 0;
+             tree_id < state.config
+                           .fault_containment_required_tree_coverage;
+             ++tree_id)
+        {
+            required_tree_ids.push_back(tree_id);
+        }
+        fault_coverage = evaluate_post_fault_proposal_coverage(
+            accepted,
+            state.current_epoch,
+            evidence_cutoff,
+            state.config
+                .fault_containment_evidence_start_monotonic_ns,
+            required_tree_ids);
+    }
+    catch (...)
+    {
+        state.healthy = false;
+        return state.result(
+            AdaptiveV2SelectionStatus::capacity_exceeded,
+            evidence_cutoff);
+    }
+    if (fault_coverage.audit.status ==
+        AdaptiveV2FaultContainmentCoverageStatus::invalid)
+    {
+        state.healthy = false;
+        return state.result(
+            AdaptiveV2SelectionStatus::invalid_state,
+            evidence_cutoff);
+    }
+    if (fault_coverage.audit.status ==
+        AdaptiveV2FaultContainmentCoverageStatus::incomplete)
+    {
+        return state.result(
+            AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
+            evidence_cutoff);
+    }
+
     TargetTimeoutCounts timeout_counts;
     const auto replay = replay_post_baseline_timeouts(
         accepted,
         state.baseline_cutoff,
         evidence_cutoff,
         state.config.maximum_post_baseline_timeout_attempts,
+        fault_coverage.audit.status ==
+                AdaptiveV2FaultContainmentCoverageStatus::ready
+            ? &fault_coverage.proposal_keys
+            : nullptr,
         timeout_counts);
     if (replay != TimeoutReplayStatus::replayed)
     {

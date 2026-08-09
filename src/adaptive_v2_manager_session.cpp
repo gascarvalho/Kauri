@@ -517,6 +517,15 @@ bool AdaptiveV2ManagerSession::begin_cycle(
         auto frozen_policy = policy;
         auto controller_config = state.config.controller;
         controller_config.transition_policy = frozen_policy;
+        if (frozen_policy.intent != TreePolicyKind::fault_containment ||
+            state.next_cycle_ordinal != 0 ||
+            state.ingress.current_epoch().epoch_number() != 0)
+        {
+            controller_config.selection
+                .fault_containment_evidence_start_monotonic_ns = 0;
+            controller_config.selection
+                .fault_containment_required_tree_coverage = 0;
+        }
         controller_config.shape_adaptation_enabled =
             frozen_policy.apply_shape_selection;
         auto controller =

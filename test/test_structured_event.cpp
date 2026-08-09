@@ -523,6 +523,7 @@ using hotstuff::AdaptiveStructuredEventEmitter;
 using hotstuff::AdaptiveV2ConvergenceStructuredEvent;
 using hotstuff::AdaptiveV2ConvergenceTransition;
 using hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent;
+using hotstuff::AdaptiveV2FaultContainmentCoverageReadyStructuredEvent;
 using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ManagerCycleOutcome;
 using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
@@ -820,6 +821,22 @@ AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event()
     event.evidence_snapshot_id = digest("selected-evidence-snapshot");
     event.accepted_prefix_count = 2;
     event.eligible_ranking = {2, 3, 4, 5, 6};
+    return event;
+}
+
+AdaptiveV2FaultContainmentCoverageReadyStructuredEvent
+fault_containment_coverage_ready_event()
+{
+    AdaptiveV2FaultContainmentCoverageReadyStructuredEvent event;
+    event.cycle_ordinal = 0;
+    event.transition_artifact_id = "e0-to-e1-containment";
+    event.predecessor_epoch_number = 0;
+    event.predecessor_epoch_digest =
+        digest("fault-containment-coverage-epoch");
+    event.fault_evidence_start_monotonic_ns = 900'000;
+    event.evidence_cutoff = 313;
+    event.required_tree_ids = {3, 7, 12, 29, 30};
+    event.observed_tree_ids = {3, 7, 12, 29, 30};
     return event;
 }
 
@@ -1868,8 +1885,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 9,
-        "the audit capability appends pipeline blockage evidence");
+        std::variant_size<AuditStructuredEventPayload>::value == 10,
+        "the audit capability appends containment coverage evidence");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -1905,6 +1922,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<8, AuditStructuredEventPayload>,
             RootQcQueueBlockedStructuredEvent>::value,
         "the ninth audit payload is an exact blocked root QC");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<9, AuditStructuredEventPayload>,
+            AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>::value,
+        "the tenth audit payload is exact containment tree coverage");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -1956,6 +1978,15 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
     CHECK(std::string(
               hotstuff::structured_event_type_name(shape_type)) ==
           "adaptive_v2_shape_decision");
+
+    const auto coverage_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{
+            fault_containment_coverage_ready_event()});
+    CHECK(coverage_type == StructuredEventType::
+          adaptive_v2_fault_containment_coverage_ready);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(coverage_type)) ==
+          "adaptive_v2.fault_containment_coverage_ready");
 }
 
 TEST_CASE("AE01 serializes exact command and accepted reputation identities",
@@ -2135,6 +2166,41 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
             "\"signer_set\":[0,1]}}}\n";
 
         FakeClock clock({7002});
+        MemoryOutput output;
+        StructuredEventSink sink(
+            manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+    }
+
+    SECTION("fault containment coverage readiness has exact source-bound JSON")
+    {
+        const auto event = fault_containment_coverage_ready_event();
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7003,"
+            "\"event_type\":\"adaptive_v2.fault_containment_coverage_ready\","
+            "\"payload\":{"
+            "\"cycle_ordinal\":0,"
+            "\"transition_artifact_id\":\"e0-to-e1-containment\","
+            "\"predecessor_epoch_number\":0,"
+            "\"predecessor_epoch_digest\":\"" +
+            event.predecessor_epoch_digest.to_hex() + "\","
+            "\"fault_evidence_start_monotonic_ns\":900000,"
+            "\"evidence_cutoff\":313,"
+            "\"required_tree_ids\":[3,7,12,29,30],"
+            "\"observed_tree_ids\":[3,7,12,29,30]}}\n";
+
+        FakeClock clock({7003});
         MemoryOutput output;
         StructuredEventSink sink(
             manager_event_config(), clock, output);
@@ -2517,6 +2583,33 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
               std::string::npos);
         CHECK(rendered(output).find("\"signer_set\":[]") !=
               std::string::npos);
+    }
+
+    SECTION("fault containment coverage event is exact complete and manager-owned")
+    {
+        CHECK(rejects(
+            event_config(), fault_containment_coverage_ready_event()));
+
+        auto invalid = fault_containment_coverage_ready_event();
+        invalid.fault_evidence_start_monotonic_ns = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = fault_containment_coverage_ready_event();
+        invalid.evidence_cutoff = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = fault_containment_coverage_ready_event();
+        invalid.required_tree_ids.pop_back();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = fault_containment_coverage_ready_event();
+        invalid.observed_tree_ids[1] = invalid.observed_tree_ids[0];
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = fault_containment_coverage_ready_event();
+        invalid.required_tree_ids = {3, 3, 12};
+        invalid.observed_tree_ids = invalid.required_tree_ids;
+        CHECK(rejects(manager_event_config(), invalid));
     }
 
     SECTION("evidence snapshot is a bounded signed prefix commitment")

@@ -17,10 +17,12 @@ from experiments.adaptive.kauri_experiment import factorial_validation
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     EXECUTION_CLEANUP_CONTRACT_V1,
     FactorialManifestError,
+    PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     V13_PLAN_SHA256,
+    V14_PLAN_SHA256,
     V10_PLAN_SHA256,
     V11_PLAN_SHA256,
     V12_PLAN_SHA256,
@@ -38,6 +40,8 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     V12_SMOKE_RUNTIME_SHA256,
     V13_RUNTIME_SHA256,
     V13_SMOKE_RUNTIME_SHA256,
+    V14_RUNTIME_SHA256,
+    V14_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     build_slot_runtime,
     build_smoke_metadata,
@@ -55,6 +59,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
+)
+V14_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
 )
 V13_MANIFEST_PATH = (
@@ -325,6 +332,15 @@ def test_causal_sequence_requires_independent_raw_actor_role_proof(
             ),
             "pre_epoch1_required_action": "omit_aggregate",
             "pre_epoch1_required_role": "internal",
+            "precontainment_coverage_ready_event_type": (
+                "adaptive_v2.fault_containment_coverage_ready"
+            ),
+            "precontainment_fault_coverage_gate": (
+                PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+            ),
+            "precontainment_required_tree_coverage_rule": (
+                "all_exact_predecessor_tree_ids_v1"
+            ),
             "proof_source": "independent_raw_artifact_validation",
         }
 
@@ -467,7 +483,12 @@ def test_manager_materialization_supplies_hex_and_absolute_slot_paths(
         ),
     )
     template_document = json.dumps(spec.as_document(), sort_keys=True)
-    argv = materialize_manager_argv(spec, slot_directory, secrets)
+    argv = materialize_manager_argv(
+        spec,
+        slot_directory,
+        secrets,
+        shared_raw_clock_anchor_ns=7_000_000_000,
+    )
 
     assert str(tmp_path) not in template_document
     assert secrets.issuer_private_key_hex not in template_document
@@ -1048,9 +1069,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
+        V14_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v14_and_refuses_prior_production(
+def test_cli_defaults_to_v15_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1063,7 +1085,7 @@ def test_cli_defaults_to_v14_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v13 are validation-only" in refusal["reason"]
+    assert "v1 through v14 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1237,3 +1259,26 @@ def test_v13_runtime_identities_remain_exact_without_v14_contracts() -> None:
         and "cleanup_contract" not in slot
         for slot in document["slots"]
     )
+
+
+def test_v14_runtime_identities_remain_exact_without_v15_coverage_gate() -> None:
+    manifest = load_frozen_manifest(V14_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+
+    assert plan.plan_sha256 == V14_PLAN_SHA256
+    assert runtime.runtime_sha256 == V14_RUNTIME_SHA256
+    smoke = factorial_execution.build_n7_ps_smoke_slot(plan.slots[0])
+    assert hashlib.sha256(
+        factorial_execution._canonical_json_bytes(smoke.runtime.as_document())
+    ).hexdigest() == V14_SMOKE_RUNTIME_SHA256
+    for slot in runtime.slots:
+        assert "--fault-containment-evidence-start-monotonic-ns" not in (
+            slot.manager_argv_template.argv
+        )
+        assert "--fault-containment-required-tree-coverage" not in (
+            slot.manager_argv_template.argv
+        )
+        assert (
+            slot.causal_acceptance.precontainment_fault_coverage_gate is None
+        )

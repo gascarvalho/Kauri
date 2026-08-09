@@ -17,10 +17,12 @@ from typing import Any
 from .factorial_manifest import (
     EXECUTION_CLEANUP_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
+    PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     V10_MANIFEST_ID,
     V11_MANIFEST_ID,
     V12_MANIFEST_ID,
     V13_MANIFEST_ID,
+    V14_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -56,11 +58,20 @@ V13_RUNTIME_SHA256 = (
 V13_SMOKE_RUNTIME_SHA256 = (
     "5f70c7b117be7a5f425e9cd19b421cbc7958a4904daf7336b2989eea4fce641e"
 )
-FROZEN_RUNTIME_SHA256 = (
+V14_RUNTIME_SHA256 = (
     "1aacea1a7c7e72158df7661514acdc26f474fd4292eed9b108ecabc645c604e6"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V14_SMOKE_RUNTIME_SHA256 = (
     "82b5f4bf0f90b93f34e374b96f09de55b8a2953a9ef83d2e533d3a16362be6d3"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "97a6222f8d51aca78cbaa64ada641cc0227614c217e0f2f734144e21315c734c"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "b2593316eb97bb683dc5156490ebcc20fb2f58d70b57b0953a14c28b896d6d48"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "e5ce14245c9c225ac748c66e1447151eda802397f9bf9f84e5378bf09de99209"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -73,6 +84,13 @@ _SLOT_DIRECTORY_TOKEN = "{{slot_directory}}"
 _MANAGER_TLS_PRIVATE_KEY_TOKEN = "{{manager_tls_private_key_der_hex}}"
 _MANAGER_TLS_CERTIFICATE_TOKEN = "{{manager_tls_certificate_der_hex}}"
 _ISSUER_PRIVATE_KEY_TOKEN = "{{epoch_issuer_private_key_hex}}"
+_FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
+    "{{fault_containment_evidence_start_monotonic_ns}}"
+)
+_FAULT_CONTAINMENT_COVERAGE_READY_EVENT = (
+    "adaptive_v2.fault_containment_coverage_ready"
+)
+_FAULT_CONTAINMENT_TREE_COVERAGE_RULE = "all_exact_predecessor_tree_ids_v1"
 _REQUIRED_EVENTS = (
     "baseline_stable",
     "fault_window_open",
@@ -264,6 +282,7 @@ class TieredCohortContract(_Document):
     causal_selection_linkage_window: str | None = None
     marker_completeness_witness: str | None = None
     causal_timeout_eligibility: str | None = None
+    precontainment_fault_coverage_gate: str | None = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
@@ -275,6 +294,7 @@ class TieredCohortContract(_Document):
             "causal_selection_linkage_window",
             "marker_completeness_witness",
             "causal_timeout_eligibility",
+            "precontainment_fault_coverage_gate",
         ):
             if document[field] is None:
                 document.pop(field)
@@ -291,6 +311,20 @@ class CausalAcceptanceContract(_Document):
     post_containment_wait_exempt: bool
     post_containment_actor_coverage_rule: str
     declared_or_synthetic_outcomes_accepted: bool
+    precontainment_fault_coverage_gate: str | None = None
+    precontainment_coverage_ready_event_type: str | None = None
+    precontainment_required_tree_coverage_rule: str | None = None
+
+    def as_document(self) -> dict[str, object]:
+        document = _Document.as_document(self)
+        for field in (
+            "precontainment_fault_coverage_gate",
+            "precontainment_coverage_ready_event_type",
+            "precontainment_required_tree_coverage_rule",
+        ):
+            if document[field] is None:
+                document.pop(field)
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -470,6 +504,7 @@ class SlotRuntimeSpec(_Document):
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
         document["fault_window"] = self.fault_window.as_document()
+        document["causal_acceptance"] = self.causal_acceptance.as_document()
         document["epoch1_placement"] = self.epoch1_placement.as_document()
         document["epoch2_placement"] = self.epoch2_placement.as_document()
         if self.cleanup_contract is None:
@@ -680,6 +715,13 @@ def _tiered_cohort_contract(
         raise FactorialManifestError(
             "responsive-degradation measurement contract drifted"
         )
+    if responsive.precontainment_fault_coverage_gate not in {
+        None,
+        PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
+    }:
+        raise FactorialManifestError(
+            "responsive-degradation precontainment coverage gate drifted"
+        )
     expected_responsive_period = (
         41
         if measurement_contract[0] == RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1
@@ -734,6 +776,9 @@ def _tiered_cohort_contract(
         ),
         marker_completeness_witness=responsive.marker_completeness_witness,
         causal_timeout_eligibility=responsive.causal_timeout_eligibility,
+        precontainment_fault_coverage_gate=(
+            responsive.precontainment_fault_coverage_gate
+        ),
     )
 
 
@@ -758,7 +803,13 @@ def _placement_contract(
     )
 
 
-def _causal_acceptance() -> CausalAcceptanceContract:
+def _causal_acceptance(
+    coverage_gate: str | None,
+) -> CausalAcceptanceContract:
+    if coverage_gate not in {None, PRECONTAINMENT_FAULT_COVERAGE_GATE_V1}:
+        raise FactorialManifestError(
+            "causal acceptance precontainment coverage gate drifted"
+        )
     return CausalAcceptanceContract(
         proof_source="independent_raw_artifact_validation",
         pre_epoch1_required_role="internal",
@@ -768,6 +819,17 @@ def _causal_acceptance() -> CausalAcceptanceContract:
         post_containment_wait_exempt=True,
         post_containment_actor_coverage_rule="every_declared_actor",
         declared_or_synthetic_outcomes_accepted=False,
+        precontainment_fault_coverage_gate=coverage_gate,
+        precontainment_coverage_ready_event_type=(
+            _FAULT_CONTAINMENT_COVERAGE_READY_EVENT
+            if coverage_gate is not None
+            else None
+        ),
+        precontainment_required_tree_coverage_rule=(
+            _FAULT_CONTAINMENT_TREE_COVERAGE_RULE
+            if coverage_gate is not None
+            else None
+        ),
     )
 
 
@@ -953,6 +1015,20 @@ def _manager_argv_template(
         "--responsiveness-latency-percentile-basis-points",
         str(slot.responsiveness_policy.latency_percentile_basis_points),
     ]
+    responsive = slot.byzantine.responsive_degradation
+    if (
+        responsive is not None
+        and responsive.precontainment_fault_coverage_gate
+        == PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+    ):
+        command.extend(
+            (
+                "--fault-containment-evidence-start-monotonic-ns",
+                _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN,
+                "--fault-containment-required-tree-coverage",
+                str(slot.replica_count),
+            )
+        )
     for transition in transitions:
         command.extend(
             (
@@ -1143,6 +1219,10 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
                     ),
                 }
             )
+        if tiered_cohorts.precontainment_fault_coverage_gate is not None:
+            identity["precontainment_fault_coverage_gate"] = (
+                tiered_cohorts.precontainment_fault_coverage_gate
+            )
     if slot.cleanup_contract is not None:
         identity["cleanup_contract"] = slot.cleanup_contract
     return SlotRuntimeSpec(
@@ -1170,7 +1250,11 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
         fault_window=_fault_window(slot),
         cutoff_contract=_cutoff_contract(slot),
         shape_invocation=_shape_invocation(slot),
-        causal_acceptance=_causal_acceptance(),
+        causal_acceptance=_causal_acceptance(
+            tiered_cohorts.precontainment_fault_coverage_gate
+            if tiered_cohorts is not None
+            else None
+        ),
         epoch1_placement=_placement_contract(
             epoch1_policy, tiered=tiered_cohorts is not None
         ),
@@ -1196,6 +1280,8 @@ def materialize_manager_argv(
     spec: SlotRuntimeSpec,
     absolute_slot_directory: str | Path,
     secrets: ManagerSecretMaterial,
+    *,
+    shared_raw_clock_anchor_ns: int | None = None,
 ) -> tuple[str, ...]:
     """Bind a manager template to an absolute slot root and supplied secrets."""
 
@@ -1211,6 +1297,51 @@ def materialize_manager_argv(
     if len(secrets.replica_tls_certificate_der_hex) != spec.replica_count:
         raise FactorialManifestError(
             "manager secret material must cover the exact replica membership"
+        )
+    manager_template = spec.manager_argv_template.argv
+    coverage_enabled = (
+        spec.causal_acceptance.precontainment_fault_coverage_gate
+        == PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+    )
+    coverage_options = (
+        "--fault-containment-evidence-start-monotonic-ns",
+        "--fault-containment-required-tree-coverage",
+    )
+    if coverage_enabled:
+        if (
+            type(shared_raw_clock_anchor_ns) is not int
+            or shared_raw_clock_anchor_ns < 0
+            or shared_raw_clock_anchor_ns > _MAXIMUM_MONOTONIC_NS
+        ):
+            raise FactorialManifestError(
+                "v15 manager argv requires the shared CLOCK_MONOTONIC_RAW anchor"
+            )
+        evidence_start_ns = shared_raw_clock_anchor_ns + (
+            spec.fault_window.start_after_prelaunch_anchor_s
+            * _NANOSECONDS_PER_SECOND
+        )
+        if evidence_start_ns > _MAXIMUM_MONOTONIC_NS:
+            raise FactorialManifestError(
+                "fault-containment evidence start exceeds uint64"
+            )
+        if (
+            manager_template.count(coverage_options[0]) != 1
+            or manager_template.count(coverage_options[1]) != 1
+            or manager_template[
+                manager_template.index(coverage_options[0]) + 1
+            ]
+            != _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN
+            or manager_template[
+                manager_template.index(coverage_options[1]) + 1
+            ]
+            != str(spec.replica_count)
+        ):
+            raise FactorialManifestError(
+                "v15 manager precontainment coverage argv drifted"
+            )
+    elif any(option in manager_template for option in coverage_options):
+        raise FactorialManifestError(
+            "legacy manager argv must not carry v15 precontainment coverage options"
         )
     replacements = {
         _SLOT_DIRECTORY_TOKEN: str(slot_directory),
@@ -1228,6 +1359,10 @@ def materialize_manager_argv(
             exact_bytes=32,
         ),
     }
+    if coverage_enabled:
+        replacements[_FAULT_CONTAINMENT_EVIDENCE_START_TOKEN] = str(
+            evidence_start_ns
+        )
     for replica_id, certificate in enumerate(secrets.replica_tls_certificate_der_hex):
         replacements[_replica_certificate_token(replica_id)] = _canonical_hex(
             certificate,
@@ -1235,7 +1370,7 @@ def materialize_manager_argv(
         )
 
     materialized: list[str] = []
-    for argument in spec.manager_argv_template.argv:
+    for argument in manager_template:
         value = argument
         for token, replacement in replacements.items():
             value = value.replace(token, replacement)
@@ -1449,7 +1584,7 @@ def runtime_preflight(
     for slot in runtime.slots:
         expected_cleanup_contract = (
             EXECUTION_CLEANUP_CONTRACT_V1
-            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            if runtime.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         if slot.cleanup_contract != expected_cleanup_contract:
@@ -1537,7 +1672,7 @@ def runtime_preflight(
                     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
                 )
-                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                if runtime.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else (
                     (
                         RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
@@ -1549,7 +1684,11 @@ def runtime_preflight(
                         RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
                     )
                     if runtime.manifest_id
-                    in {V11_MANIFEST_ID, V12_MANIFEST_ID, V13_MANIFEST_ID}
+                    in {
+                        V11_MANIFEST_ID,
+                        V12_MANIFEST_ID,
+                        V13_MANIFEST_ID,
+                    }
                     else (
                         (
                             RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
@@ -1586,6 +1725,7 @@ def runtime_preflight(
                     V11_MANIFEST_ID,
                     V12_MANIFEST_ID,
                     V13_MANIFEST_ID,
+                    V14_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -1593,7 +1733,12 @@ def runtime_preflight(
             expected_tiered_mode = (
                 "tiered_persistent_responsive_omission_v2"
                 if runtime.manifest_id
-                in {V12_MANIFEST_ID, V13_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                in {
+                    V12_MANIFEST_ID,
+                    V13_MANIFEST_ID,
+                    V14_MANIFEST_ID,
+                    FROZEN_MANIFEST_ID,
+                }
                 else "tiered_persistent_responsive_omission_v1"
             )
             expected_responsive_schedule = _responsive_actor_schedule(
@@ -1636,6 +1781,12 @@ def runtime_preflight(
                     tiered.causal_timeout_eligibility,
                 )
                 != expected_measurement_contract
+                or tiered.precontainment_fault_coverage_gate
+                != (
+                    PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+                    if runtime.manifest_id == FROZEN_MANIFEST_ID
+                    else None
+                )
                 or not slot.epoch1_placement.only_hard_cohort_is_wait_exempt
                 or slot.epoch1_placement.all_worse_replicas_are_physical_leaves
                 or slot.epoch1_placement.root_and_internal_roles_are_fast_only
@@ -1826,7 +1977,38 @@ def runtime_preflight(
             raise FactorialManifestError(
                 "canonical replica argv templates contain absolute clock values"
             )
-        if slot.causal_acceptance != _causal_acceptance():
+        coverage_options = (
+            "--fault-containment-evidence-start-monotonic-ns",
+            "--fault-containment-required-tree-coverage",
+        )
+        expected_coverage_enabled = runtime.manifest_id == FROZEN_MANIFEST_ID
+        if (
+            (manager_template.count(coverage_options[0]) == 1)
+            is not expected_coverage_enabled
+            or (manager_template.count(coverage_options[1]) == 1)
+            is not expected_coverage_enabled
+            or (
+                expected_coverage_enabled
+                and (
+                    manager_template[
+                        manager_template.index(coverage_options[0]) + 1
+                    ]
+                    != _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN
+                    or manager_template[
+                        manager_template.index(coverage_options[1]) + 1
+                    ]
+                    != str(slot.replica_count)
+                )
+            )
+        ):
+            raise FactorialManifestError(
+                f"slot precontainment manager argv drifted: {slot.slot_id}"
+            )
+        if slot.causal_acceptance != _causal_acceptance(
+            PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+            if expected_coverage_enabled
+            else None
+        ):
             raise FactorialManifestError(
                 f"slot lacks the frozen raw causal acceptance gate: {slot.slot_id}"
             )
@@ -1850,6 +2032,7 @@ __all__ = (
     "CausalAcceptanceContract",
     "CutoffContract",
     "FactorialRuntimePlan",
+    "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
     "FROZEN_RUNTIME_SHA256",
     "FROZEN_SMOKE_RUNTIME_SHA256",
     "FaultWindowContract",
@@ -1872,6 +2055,8 @@ __all__ = (
     "V12_SMOKE_RUNTIME_SHA256",
     "V13_RUNTIME_SHA256",
     "V13_SMOKE_RUNTIME_SHA256",
+    "V14_RUNTIME_SHA256",
+    "V14_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

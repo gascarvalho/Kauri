@@ -231,10 +231,12 @@ TEST_CASE(
         "structured-event-output",
         "structured-event-commit-observer-id",
         "structured-event-commit-observer-instance"}};
-    const std::array<const char *, 3> manager_options{{
+    const std::array<const char *, 5> manager_options{{
         "structured-event-run-id",
         "structured-event-source-instance",
-        "structured-event-output"}};
+        "structured-event-output",
+        "fault-containment-evidence-start-monotonic-ns",
+        "fault-containment-required-tree-coverage"}};
 
     const auto app_help = run_program(KAURI_HOTSTUFF_APP_PATH, {"--help"});
     REQUIRE(app_help.status == 0);
@@ -714,5 +716,75 @@ TEST_CASE(
         CHECK(publish < failed_rotation_return);
         CHECK(failed_rotation_return < reset);
         CHECK(reset < continue_after_reset);
+    }
+
+    SECTION(
+        "containment coverage gates selection and emits one ready event")
+    {
+        const auto gate = function_body(
+            manager, "bool fault_containment_coverage_ready(");
+        REQUIRE_FALSE(gate.empty());
+
+        const auto containment = gate.find(
+            "TreePolicyKind::fault_containment");
+        const auto epoch_zero = gate.find(
+            "request.predecessor_epoch_number != 0");
+        const auto first_cycle = gate.find(
+            "request_sequence_.cursor() != 0");
+        const auto current_epoch = gate.find(
+            "session_.ingress().current_epoch()");
+        const auto epoch_trees = gate.find("epoch.trees()");
+        const auto ready_latch = gate.find(
+            "fault_containment_coverage_ready_emitted");
+        const auto no_emit = gate.find("if (!emit_ready_event)");
+        const auto emit = gate.find("emit_audit(", no_emit);
+        const auto event = gate.find(
+            "AdaptiveV2FaultContainmentCoverageReadyStructuredEvent",
+            emit);
+        const auto drain = gate.find("drain()", event);
+        const auto latch_set = gate.find(
+            "fault_containment_coverage_ready_emitted = true", drain);
+        REQUIRE(containment != std::string::npos);
+        REQUIRE(epoch_zero != std::string::npos);
+        REQUIRE(first_cycle != std::string::npos);
+        REQUIRE(current_epoch != std::string::npos);
+        REQUIRE(epoch_trees != std::string::npos);
+        REQUIRE(ready_latch != std::string::npos);
+        REQUIRE(no_emit != std::string::npos);
+        REQUIRE(event != std::string::npos);
+        REQUIRE(emit != std::string::npos);
+        REQUIRE(drain != std::string::npos);
+        REQUIRE(latch_set != std::string::npos);
+        CHECK(containment < current_epoch);
+        CHECK(epoch_zero < current_epoch);
+        CHECK(first_cycle < current_epoch);
+        CHECK(current_epoch < epoch_trees);
+        CHECK(ready_latch < no_emit);
+        CHECK(no_emit < emit);
+        CHECK(emit < event);
+        CHECK(event < drain);
+        CHECK(drain < latch_set);
+        CHECK(count_occurrences(gate, "emit_audit(") == 1);
+        CHECK(count_occurrences(
+                  gate,
+                  "fault_containment_coverage_ready_emitted = true") ==
+              1);
+
+        const auto coverage_check = evaluate.find(
+            "fault_containment_coverage_ready(");
+        const auto select = evaluate.find("session_.evaluate()",
+                                          coverage_check);
+        const auto ready_emit = evaluate.find(
+            "fault_containment_coverage_ready(",
+            select + std::string("session_.evaluate()").size());
+        const auto scores = evaluate.find(
+            "emit_new_score_trajectory()", ready_emit);
+        REQUIRE(coverage_check != std::string::npos);
+        REQUIRE(select != std::string::npos);
+        REQUIRE(ready_emit != std::string::npos);
+        REQUIRE(scores != std::string::npos);
+        CHECK(coverage_check < select);
+        CHECK(select < ready_emit);
+        CHECK(ready_emit < scores);
     }
 }

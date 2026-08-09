@@ -28,6 +28,7 @@ from experiments.adaptive.kauri_experiment.factorial_execution import (  # noqa:
     append_campaign_ledger_record,
     build_campaign_execution_contract,
     build_execution_authorization_receipt,
+    build_n31_coverage_smoke_slot,
     build_n7_ps_smoke_slot,
     execute_slot_once,
     preserve_build_evidence,
@@ -46,6 +47,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (  # noqa: 
     load_frozen_manifest,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (  # noqa: E402
+    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
     FROZEN_RUNTIME_SHA256,
     FROZEN_SMOKE_RUNTIME_SHA256,
     FactorialRuntimePlan,
@@ -65,10 +67,13 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v14.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v15.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
+COVERAGE_SMOKE_AUTHORIZATION_FILENAME = (
+    "coverage-smoke-execution-authorization.json"
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -79,8 +84,10 @@ def _parser() -> argparse.ArgumentParser:
             "plan",
             "preflight",
             "smoke",
+            "coverage-smoke",
             "run",
             "validate-smoke",
+            "validate-coverage-smoke",
             "validate-campaign",
         ),
     )
@@ -90,8 +97,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--build-provenance", type=Path)
     parser.add_argument("--campaign-results-root", type=Path)
     parser.add_argument("--smoke-results-root", type=Path)
+    parser.add_argument("--coverage-smoke-results-root", type=Path)
     parser.add_argument(
-        "--preflight-target", choices=("campaign", "smoke"), default="campaign"
+        "--preflight-target",
+        choices=("campaign", "smoke", "coverage-smoke"),
+        default="campaign",
     )
     authorization = parser.add_mutually_exclusive_group()
     authorization.add_argument(
@@ -163,7 +173,7 @@ def _resolve_result_roots(
     *,
     manifest_id: str,
     results_root: str,
-) -> tuple[Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path]:
     repository = arguments.repository.resolve()
     campaign_root = (
         arguments.campaign_results_root.absolute()
@@ -179,31 +189,50 @@ def _resolve_result_roots(
         if arguments.smoke_results_root is not None
         else repository / smoke_results_relative
     )
+    coverage_smoke_results_relative = Path(
+        f"results/shape-placement-factorial-{manifest_suffix}-coverage-smoke"
+    )
+    coverage_smoke_root = (
+        arguments.coverage_smoke_results_root.absolute()
+        if arguments.coverage_smoke_results_root is not None
+        else repository / coverage_smoke_results_relative
+    )
     expected_campaign_root = (repository / results_root).absolute()
     expected_smoke_root = (repository / smoke_results_relative).absolute()
+    expected_coverage_smoke_root = (
+        repository / coverage_smoke_results_relative
+    ).absolute()
     if campaign_root.is_symlink():
         raise FactorialExecutionError("campaign results root must not be a symlink")
     if smoke_root.is_symlink():
         raise FactorialExecutionError("smoke results root must not be a symlink")
+    if coverage_smoke_root.is_symlink():
+        raise FactorialExecutionError(
+            "coverage-smoke results root must not be a symlink"
+        )
     return (
         repository,
         campaign_root,
         smoke_root,
+        coverage_smoke_root,
         expected_campaign_root,
         expected_smoke_root,
+        expected_coverage_smoke_root,
     )
 
 
 def _paths(
     arguments: argparse.Namespace,
     runtime: FactorialRuntimePlan,
-) -> tuple[Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     (
         repository,
         campaign_root,
         smoke_root,
+        coverage_smoke_root,
         expected_campaign_root,
         expected_smoke_root,
+        expected_coverage_smoke_root,
     ) = _resolve_result_roots(
         arguments,
         manifest_id=runtime.manifest_id,
@@ -237,21 +266,35 @@ def _paths(
         raise FactorialExecutionError(
             f"smoke results root must be exact: {expected_smoke_root}"
         )
-    return repository, build_directory, build_provenance, campaign_root, smoke_root
+    if coverage_smoke_root != expected_coverage_smoke_root:
+        raise FactorialExecutionError(
+            "coverage-smoke results root must be exact: "
+            f"{expected_coverage_smoke_root}"
+        )
+    return (
+        repository,
+        build_directory,
+        build_provenance,
+        campaign_root,
+        smoke_root,
+        coverage_smoke_root,
+    )
 
 
 def _validation_roots(
     arguments: argparse.Namespace,
     manifest: FrozenFactorialManifest,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     """Resolve preserved roots without deriving a new plan or runtime."""
 
     (
         _,
         campaign_root,
         smoke_root,
+        coverage_smoke_root,
         expected_campaign_root,
         expected_smoke_root,
+        expected_coverage_smoke_root,
     ) = _resolve_result_roots(
         arguments,
         manifest_id=manifest.manifest_id,
@@ -268,7 +311,15 @@ def _validation_roots(
         raise FactorialExecutionError(
             f"smoke results root must be exact: {expected_smoke_root}"
         )
-    return campaign_root, smoke_root
+    if (
+        arguments.command != "validate-coverage-smoke"
+        and coverage_smoke_root != expected_coverage_smoke_root
+    ):
+        raise FactorialExecutionError(
+            "coverage-smoke results root must be exact: "
+            f"{expected_coverage_smoke_root}"
+        )
+    return campaign_root, smoke_root, coverage_smoke_root
 
 
 def _require_frozen_artifacts(
@@ -276,21 +327,21 @@ def _require_frozen_artifacts(
     plan: FactorialPlan,
     runtime: FactorialRuntimePlan,
 ) -> bytes:
-    """Fail before any result claim if producer bytes drift from v14."""
+    """Fail before any result claim if producer bytes drift from v15."""
 
     if (
         manifest.manifest_id != FROZEN_MANIFEST_ID
         or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
     ):
-        raise FactorialExecutionError("campaign production requires exact frozen v14")
+        raise FactorialExecutionError("campaign production requires exact frozen v15")
     if plan.plan_sha256 != FROZEN_PLAN_SHA256:
         raise FactorialExecutionError(
-            "campaign plan bytes differ from the exact frozen v14 identity"
+            "campaign plan bytes differ from the exact frozen v15 identity"
         )
     payload = canonical_runtime_bytes(runtime)
     if _sha256(payload) != FROZEN_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "campaign runtime bytes differ from the exact frozen v14 identity"
+            "campaign runtime bytes differ from the exact frozen v15 identity"
         )
     return payload
 
@@ -472,6 +523,51 @@ def _require_validated_smoke(
     return result
 
 
+def _require_validated_coverage_smoke(
+    coverage_smoke_root: Path,
+    *,
+    expected_revision: str,
+    expected_build_provenance: Mapping[str, object],
+    expected_static_artifacts_sha256: Mapping[str, str],
+) -> SlotValidationResult:
+    slot_root = coverage_smoke_root / "slot-066-n31-f5-b05-P"
+    result = validate_slot(slot_root)
+    if not (
+        result.outcome == "PASS"
+        and result.integrity_valid
+        and not result.campaign_member
+        and not result.figure_eligible
+    ):
+        raise FactorialExecutionError(
+            "campaign launch requires the canonical excluded N=31 coverage "
+            "smoke to independently validate PASS"
+        )
+    authorization, _ = _read_canonical_json(
+        slot_root / "execution-authorization.json",
+        "coverage-smoke execution authorization",
+    )
+    build_provenance, _ = _read_canonical_json(
+        slot_root / "runtime/exact-build-provenance.json",
+        "coverage-smoke build provenance",
+    )
+    if (
+        authorization.get("kauri_revision") != expected_revision
+        or build_provenance != dict(expected_build_provenance)
+    ):
+        raise FactorialExecutionError(
+            "campaign launch requires the passing N=31 coverage smoke from "
+            "this exact revision and build provenance"
+        )
+    if authorization.get("static_artifacts_sha256") != dict(
+        expected_static_artifacts_sha256
+    ):
+        raise FactorialExecutionError(
+            "campaign launch requires the passing N=31 coverage smoke from "
+            "the exact frozen static artifacts"
+        )
+    return result
+
+
 def _validation_document(result: SlotValidationResult) -> dict[str, object]:
     return {
         "outcome": result.outcome,
@@ -647,7 +743,7 @@ def _run_smoke(
     smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
     if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "smoke runtime bytes differ from the exact frozen v14 identity"
+            "smoke runtime bytes differ from the exact frozen v15 identity"
         )
     _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
@@ -707,6 +803,102 @@ def _run_smoke(
     )
 
 
+def _run_coverage_smoke(
+    arguments: argparse.Namespace,
+    *,
+    plan: FactorialPlan,
+    runtime: FactorialRuntimePlan,
+    repository: Path,
+    build_directory: Path,
+    build_provenance: Path,
+    smoke_root: Path,
+    coverage_smoke_root: Path,
+) -> tuple[int, dict[str, object]]:
+    _require_authorization_input(arguments)
+    first = next(
+        (slot for slot in plan.slots if slot.execution_ordinal == 1),
+        None,
+    )
+    if first is None:
+        raise FactorialExecutionError(
+            "coverage smoke requires the exact first campaign slot"
+        )
+    coverage = build_n31_coverage_smoke_slot(first)
+    coverage_runtime_payload = _direct_runtime_bytes(coverage.runtime)
+    if _sha256(coverage_runtime_payload) != FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256:
+        raise FactorialExecutionError(
+            "coverage-smoke runtime bytes differ from the exact frozen v15 identity"
+        )
+    _require_fresh_result_root(coverage_smoke_root, "coverage-smoke")
+    artifacts = _static_artifacts(
+        arguments.manifest.resolve(),
+        plan,
+        coverage_runtime_payload,
+    )
+    preflight = _preflight(
+        coverage.slot,
+        repository=repository,
+        build_directory=build_directory,
+        build_provenance=build_provenance,
+        result_root=coverage_smoke_root,
+        minimum_free_bytes=runtime.minimum_free_bytes,
+    )
+    _require_validated_smoke(
+        smoke_root,
+        expected_revision=preflight.revision,
+        expected_build_provenance=preflight.build_provenance,
+        expected_static_artifacts_sha256={
+            "manifest.json": FROZEN_MANIFEST_SHA256,
+            "plan.json": FROZEN_PLAN_SHA256,
+            "runtime.json": FROZEN_SMOKE_RUNTIME_SHA256,
+        },
+    )
+    authorization_payload, authorization = _authorization_receipt(
+        arguments,
+        scope="excluded_n31_coverage_smoke",
+        preflight=preflight,
+        slot_ids=(coverage.slot.slot_id,),
+        static_artifacts=artifacts,
+    )
+    preserve_build_evidence(
+        coverage_smoke_root,
+        preflight.build_provenance,
+        initial_files={
+            COVERAGE_SMOKE_AUTHORIZATION_FILENAME: authorization_payload
+        },
+    )
+    execution = execute_slot_once(
+        coverage.slot,
+        coverage.runtime,
+        preflight=preflight,
+        static_artifacts=artifacts,
+        authorization_receipt=authorization_payload,
+        campaign_member=False,
+    )
+    validation = validate_slot(execution.slot_directory)
+    accepted = (
+        execution.outcome == "PASS"
+        and validation.outcome == "PASS"
+        and validation.integrity_valid
+        and not validation.campaign_member
+        and not validation.figure_eligible
+    )
+    return (
+        0 if accepted else 1,
+        {
+            "command": "coverage-smoke",
+            "slot_directory": str(execution.slot_directory),
+            "execution_outcome": execution.outcome,
+            "execution_reason": execution.reason,
+            "validation": _validation_document(validation),
+            "authorization_id": authorization["authorization_id"],
+            "authorization_sha256": _sha256(authorization_payload),
+            "campaign_member": False,
+            "figure_eligible": False,
+        },
+    )
+
+
 def _run_campaign(
     arguments: argparse.Namespace,
     *,
@@ -717,6 +909,7 @@ def _run_campaign(
     build_provenance: Path,
     campaign_root: Path,
     smoke_root: Path,
+    coverage_smoke_root: Path,
     runtime_payload: bytes,
 ) -> tuple[int, dict[str, object]]:
     _require_authorization_input(arguments)
@@ -742,6 +935,16 @@ def _run_campaign(
             "manifest.json": FROZEN_MANIFEST_SHA256,
             "plan.json": FROZEN_PLAN_SHA256,
             "runtime.json": FROZEN_SMOKE_RUNTIME_SHA256,
+        },
+    )
+    _require_validated_coverage_smoke(
+        coverage_smoke_root,
+        expected_revision=first_preflight.revision,
+        expected_build_provenance=first_preflight.build_provenance,
+        expected_static_artifacts_sha256={
+            "manifest.json": FROZEN_MANIFEST_SHA256,
+            "plan.json": FROZEN_PLAN_SHA256,
+            "runtime.json": FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
         },
     )
     authorization_payload, authorization = _authorization_receipt(
@@ -912,14 +1115,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         manifest_path = arguments.manifest.resolve()
         manifest = load_frozen_manifest(manifest_path)
-        if arguments.command in {"validate-smoke", "validate-campaign"}:
-            campaign_root, smoke_root = _validation_roots(arguments, manifest)
+        if arguments.command in {
+            "validate-smoke",
+            "validate-coverage-smoke",
+            "validate-campaign",
+        }:
+            campaign_root, smoke_root, coverage_smoke_root = _validation_roots(
+                arguments, manifest
+            )
             if arguments.command == "validate-smoke":
                 result = validate_slot(smoke_root / "smoke-n7-f2-PS")
                 _emit(
                     {
                         "command": "validate-smoke",
                         "slot_directory": str(smoke_root / "smoke-n7-f2-PS"),
+                        "validation": asdict(result),
+                        "figure_eligible": False,
+                    },
+                    stream=sys.stdout,
+                )
+                return 0 if (
+                    result.outcome == "PASS"
+                    and result.integrity_valid
+                    and not result.campaign_member
+                    and not result.figure_eligible
+                ) else 1
+            if arguments.command == "validate-coverage-smoke":
+                slot_directory = (
+                    coverage_smoke_root / "slot-066-n31-f5-b05-P"
+                )
+                result = validate_slot(slot_directory)
+                _emit(
+                    {
+                        "command": "validate-coverage-smoke",
+                        "slot_directory": str(slot_directory),
                         "validation": asdict(result),
                         "figure_eligible": False,
                     },
@@ -953,15 +1182,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) else 1
         if manifest.manifest_id != FROZEN_MANIFEST_ID:
             raise FactorialExecutionError(
-                "shape-placement-factorial-v1 through v13 are validation-only; "
-                "plan, preflight, smoke, and run require shape-placement-factorial-v14"
+                "shape-placement-factorial-v1 through v14 are validation-only; "
+                "production commands require shape-placement-factorial-v15"
             )
         plan = build_factorial_plan(manifest)
         runtime = build_factorial_runtime(plan)
         runtime_payload = _require_frozen_artifacts(manifest, plan, runtime)
-        repository, build_directory, build_provenance, campaign_root, smoke_root = (
-            _paths(arguments, runtime)
-        )
+        (
+            repository,
+            build_directory,
+            build_provenance,
+            campaign_root,
+            smoke_root,
+            coverage_smoke_root,
+        ) = _paths(arguments, runtime)
         if arguments.command == "plan":
             print(runtime_payload.decode("ascii"), end="")
             return 0
@@ -976,7 +1210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target_runtime_sha256 = _sha256(smoke_runtime_payload)
                 if target_runtime_sha256 != FROZEN_SMOKE_RUNTIME_SHA256:
                     raise FactorialExecutionError(
-                        "smoke runtime bytes differ from the exact frozen v14 identity"
+                        "smoke runtime bytes differ from the exact frozen v15 identity"
                     )
                 preflight_root = smoke_root
                 target_runtime_id = smoke.runtime.artifact_id
@@ -985,6 +1219,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                     runtime_id=f"{runtime.manifest_id}-excluded-n7-smoke-preflight-v1",
                     results_root=Path(smoke.slot.result_path).parent.as_posix(),
                     slots=(smoke.runtime,),
+                )
+            elif arguments.preflight_target == "coverage-smoke":
+                first = next(
+                    slot for slot in plan.slots if slot.execution_ordinal == 1
+                )
+                coverage = build_n31_coverage_smoke_slot(first)
+                coverage_runtime_payload = _direct_runtime_bytes(coverage.runtime)
+                target_runtime_sha256 = _sha256(coverage_runtime_payload)
+                if (
+                    target_runtime_sha256
+                    != FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+                ):
+                    raise FactorialExecutionError(
+                        "coverage-smoke runtime bytes differ from the exact "
+                        "frozen v15 identity"
+                    )
+                preflight_root = coverage_smoke_root
+                target_runtime_id = coverage.runtime.artifact_id
+                preflight_runtime = replace(
+                    runtime,
+                    runtime_id=(
+                        f"{runtime.manifest_id}-excluded-n31-coverage-"
+                        "smoke-preflight-v1"
+                    ),
+                    results_root=Path(coverage.slot.result_path).parent.as_posix(),
+                    slots=(coverage.runtime,),
                 )
             pure = runtime_preflight(
                 preflight_runtime,
@@ -1018,6 +1278,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 build_provenance=build_provenance,
                 smoke_root=smoke_root,
             )
+        elif arguments.command == "coverage-smoke":
+            code, result = _run_coverage_smoke(
+                arguments,
+                plan=plan,
+                runtime=runtime,
+                repository=repository,
+                build_directory=build_directory,
+                build_provenance=build_provenance,
+                smoke_root=smoke_root,
+                coverage_smoke_root=coverage_smoke_root,
+            )
         else:
             code, result = _run_campaign(
                 arguments,
@@ -1028,6 +1299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 build_provenance=build_provenance,
                 campaign_root=campaign_root,
                 smoke_root=smoke_root,
+                coverage_smoke_root=coverage_smoke_root,
                 runtime_payload=runtime_payload,
             )
         _emit(result, stream=sys.stdout)

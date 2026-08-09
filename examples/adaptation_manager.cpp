@@ -152,6 +152,7 @@ struct CycleAuditContext
     std::uint64_t current_evidence_cutoff{0};
     bool shape_decision_emitted{false};
     bool evidence_snapshot_emitted{false};
+    bool fault_containment_coverage_ready_emitted{false};
 };
 
 struct ManagerOptions
@@ -181,6 +182,8 @@ struct ManagerOptions
     std::vector<std::uint32_t> shape_candidate_fanouts{2, 3, 5};
     std::uint64_t shape_deterministic_seed{kSnapshotSeed};
     bool shape_adaptation_enabled{false};
+    std::uint64_t fault_containment_evidence_start_monotonic_ns{0};
+    std::uint32_t fault_containment_required_tree_coverage{0};
     std::vector<TransitionRequest> transition_requests;
     std::string structured_event_run_id;
     std::string structured_event_source_instance;
@@ -822,6 +825,10 @@ AdaptiveV2ManagerControllerConfig manager_controller_config(
     config.selection.responsiveness_policy =
         options.responsiveness_policy;
     config.selection.snapshot_seed = kSnapshotSeed;
+    config.selection.fault_containment_evidence_start_monotonic_ns =
+        options.fault_containment_evidence_start_monotonic_ns;
+    config.selection.fault_containment_required_tree_coverage =
+        options.fault_containment_required_tree_coverage;
     config.reputation_limits.maximum_audit_updates =
         options.runtime_shape.ingress_limits.evidence_store
             .maximum_accepted_records;
@@ -1168,6 +1175,10 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValStr::create("41719");
     auto opt_shape_adaptation_enabled =
         Config::OptValFlag::create(false);
+    auto opt_fault_containment_evidence_start_monotonic_ns =
+        Config::OptValStr::create("0");
+    auto opt_fault_containment_required_tree_coverage =
+        Config::OptValStr::create("0");
     auto opt_transition_requests = Config::OptValStrVec::create();
     auto opt_bundle_outputs = Config::OptValStrVec::create();
     auto opt_structured_event_run_id = Config::OptValStr::create();
@@ -1242,6 +1253,14 @@ ManagerOptions parse_options(int argc, char **argv)
         "shape-adaptation-enabled",
         opt_shape_adaptation_enabled,
         Config::SWITCH_ON);
+    config.add_opt(
+        "fault-containment-evidence-start-monotonic-ns",
+        opt_fault_containment_evidence_start_monotonic_ns,
+        Config::SET_VAL);
+    config.add_opt(
+        "fault-containment-required-tree-coverage",
+        opt_fault_containment_required_tree_coverage,
+        Config::SET_VAL);
     config.add_opt(
         "transition-request", opt_transition_requests, Config::APPEND);
     config.add_opt(
@@ -1439,6 +1458,27 @@ ManagerOptions parse_options(int argc, char **argv)
     }
     options.shape_adaptation_enabled =
         opt_shape_adaptation_enabled->get();
+    options.fault_containment_evidence_start_monotonic_ns =
+        parse_unsigned<std::uint64_t>(
+            opt_fault_containment_evidence_start_monotonic_ns->get(),
+            "fault containment evidence start monotonic ns",
+            false);
+    options.fault_containment_required_tree_coverage =
+        parse_unsigned<std::uint32_t>(
+            opt_fault_containment_required_tree_coverage->get(),
+            "fault containment required tree coverage",
+            false);
+    const bool fault_coverage_enabled =
+        options.fault_containment_evidence_start_monotonic_ns != 0;
+    if (fault_coverage_enabled !=
+            (options.fault_containment_required_tree_coverage != 0) ||
+        (fault_coverage_enabled &&
+         options.fault_containment_required_tree_coverage !=
+             options.membership.size()))
+    {
+        throw std::invalid_argument(
+            "fault containment coverage requires a nonzero timestamp and the exact predecessor tree count");
+    }
 
     const auto &raw_transition_requests =
         opt_transition_requests->get();
@@ -2662,6 +2702,111 @@ private:
         }
     }
 
+    bool fault_containment_coverage_ready(
+        const TransitionRequest &request,
+        std::uint64_t evidence_cutoff,
+        bool emit_ready_event) noexcept
+    {
+        if (options_
+                .fault_containment_evidence_start_monotonic_ns == 0 ||
+            request.policy.intent != TreePolicyKind::fault_containment ||
+            request_sequence_.cursor() != 0 ||
+            request.predecessor_epoch_number != 0)
+        {
+            return true;
+        }
+        if (cycle_audits_.empty() ||
+            request_sequence_.cursor() != cycle_audits_.size() - 1)
+        {
+            fail("fault_containment_coverage_has_no_cycle");
+            return false;
+        }
+        auto &cycle = cycle_audits_.back();
+        if (cycle.fault_containment_coverage_ready_emitted)
+            return true;
+
+        try
+        {
+            const auto &epoch = session_.ingress().current_epoch();
+            std::vector<std::uint32_t> required_tree_ids;
+            required_tree_ids.reserve(epoch.trees().size());
+            for (const auto &tree : epoch.trees())
+                required_tree_ids.push_back(tree.tree_id);
+            std::sort(
+                required_tree_ids.begin(), required_tree_ids.end());
+            if (required_tree_ids.size() !=
+                    options_
+                        .fault_containment_required_tree_coverage ||
+                std::adjacent_find(
+                    required_tree_ids.begin(),
+                    required_tree_ids.end()) !=
+                    required_tree_ids.end())
+            {
+                fail("fault_containment_coverage_tree_set_mismatch");
+                return false;
+            }
+
+            const auto coverage = hotstuff::
+                evaluate_adaptive_v2_fault_containment_coverage(
+                    session_.ingress().ledger().accepted(),
+                    hotstuff::AdaptationEpochId{
+                        epoch.epoch_number(), epoch.epoch_digest()},
+                    evidence_cutoff,
+                    options_
+                        .fault_containment_evidence_start_monotonic_ns,
+                    required_tree_ids);
+            if (coverage.status ==
+                hotstuff::AdaptiveV2FaultContainmentCoverageStatus::
+                    incomplete)
+            {
+                return false;
+            }
+            if (coverage.status !=
+                hotstuff::AdaptiveV2FaultContainmentCoverageStatus::ready)
+            {
+                fail("fault_containment_coverage_invalid");
+                return false;
+            }
+
+            if (!emit_ready_event)
+                return true;
+
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("fault_containment_coverage_drain_failed");
+                return false;
+            }
+            structured_event_sink_.emit_audit(
+                hotstuff::AuditStructuredEventPayload{
+                    hotstuff::
+                        AdaptiveV2FaultContainmentCoverageReadyStructuredEvent{
+                            static_cast<std::uint64_t>(
+                                request_sequence_.cursor()),
+                            request.transition_artifact_id,
+                            epoch.epoch_number(),
+                            epoch.epoch_digest(),
+                            coverage
+                                .fault_evidence_start_monotonic_ns,
+                            coverage.evidence_cutoff,
+                            coverage.required_tree_ids,
+                            coverage.observed_tree_ids}});
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("fault_containment_coverage_emit_failed");
+                return false;
+            }
+            cycle.fault_containment_coverage_ready_emitted = true;
+            return true;
+        }
+        catch (...)
+        {
+            fail("fault_containment_coverage_internal_failure");
+            return false;
+        }
+    }
+
     void evaluate()
     {
         if (failed_ || request_sequence_.shutdown_eligible() ||
@@ -2680,8 +2825,30 @@ private:
         last_evaluated_ready_members_ = readiness.ready_members;
         last_evaluated_evidence_cutoff_ = evidence_cutoff;
         refresh_cycle_audit();
+        const auto *request = current_transition_request();
+        const auto controller = session_.controller_audit();
+        if (request == nullptr)
+        {
+            fail("missing_transition_request_before_evaluation");
+            return;
+        }
+        if (controller.has_value() && controller->baseline_frozen &&
+            !fault_containment_coverage_ready(
+                *request, evidence_cutoff, false))
+        {
+            return;
+        }
         const auto status = session_.evaluate();
         refresh_cycle_audit();
+        if ((status ==
+                 AdaptiveV2ManagerControllerStatus::successor_ready ||
+             status ==
+                 AdaptiveV2ManagerControllerStatus::already_ready) &&
+            !fault_containment_coverage_ready(
+                *request, evidence_cutoff, true))
+        {
+            return;
+        }
         emit_new_score_trajectory();
         if (failed_)
             return;
@@ -2713,7 +2880,7 @@ private:
             status != AdaptiveV2ManagerControllerStatus::already_ready)
             return;
 
-        const auto *request = current_transition_request();
+        request = current_transition_request();
         const auto *bundle = session_.successor_bundle();
         if (request == nullptr || bundle == nullptr)
         {

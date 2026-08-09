@@ -67,6 +67,10 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     V13_MANIFEST_SHA256,
     V13_PLAN_SHA256,
     V13_SEMANTIC_SHA256,
+    V14_MANIFEST_ID,
+    V14_MANIFEST_SHA256,
+    V14_PLAN_SHA256,
+    V14_SEMANTIC_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     canonical_plan_bytes,
@@ -87,6 +91,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
+)
+V14_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
 )
 V13_MANIFEST_PATH = (
@@ -348,7 +355,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v14/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v15/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -1431,10 +1438,15 @@ def test_v13_only_changes_direct_vote_scoring_identity_from_v12() -> None:
 
 
 def test_v14_only_freezes_source_bound_markers_and_cleanup_from_v13() -> None:
-    v14 = load_frozen_manifest(MANIFEST_PATH)
+    v14 = load_frozen_manifest(V14_MANIFEST_PATH)
     v13 = load_frozen_manifest(V13_MANIFEST_PATH)
 
-    assert v14.manifest_id == FROZEN_MANIFEST_ID
+    assert v14.manifest_id == V14_MANIFEST_ID
+    assert v14.manifest_sha256 == V14_MANIFEST_SHA256
+    assert build_factorial_plan(v14).plan_sha256 == V14_PLAN_SHA256
+    assert V14_SEMANTIC_SHA256 == (
+        "9611a2b61343c73fc99fea12d8aca097369328301f9a0b92b23a93eb619b9de1"
+    )
     assert v13.manifest_id == V13_MANIFEST_ID
     assert v13.manifest_sha256 == V13_MANIFEST_SHA256
     assert build_factorial_plan(v13).plan_sha256 == V13_PLAN_SHA256
@@ -1449,7 +1461,7 @@ def test_v14_only_freezes_source_bound_markers_and_cleanup_from_v13() -> None:
         + b"\n"
     ).hexdigest() == V13_SEMANTIC_SHA256
 
-    v14_document = json.loads(MANIFEST_PATH.read_bytes())
+    v14_document = json.loads(V14_MANIFEST_PATH.read_bytes())
     v13_document = json.loads(V13_MANIFEST_PATH.read_bytes())
     assert v14_document.pop("manifest_id") == "shape-placement-factorial-v14"
     assert v13_document.pop("manifest_id") == "shape-placement-factorial-v13"

@@ -1831,6 +1831,103 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "performance optimization clears containment-only coverage gating",
+    "[adaptive-v2][manager-session][fault-containment][optimization][regression]")
+{
+    auto config = session_config();
+    config.controller.selection
+        .fault_containment_evidence_start_monotonic_ns =
+        std::numeric_limits<std::uint64_t>::max() - 1;
+    config.controller.selection
+        .fault_containment_required_tree_coverage = 7;
+    Fixture fixture(std::move(config));
+
+    REQUIRE(fixture.session.begin_cycle(optimization_policy()));
+    CHECK(fixture.session.evaluate() ==
+          AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+    fixture.ready_all();
+    fixture.responsive_baseline();
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    fixture.persistent_timeouts();
+
+    CHECK(fixture.session.evaluate() ==
+          AdaptiveV2ManagerControllerStatus::successor_ready);
+    CHECK(fixture.session.successor_bundle() != nullptr);
+}
+
+TEST_CASE(
+    "later containment cycles clear epoch-zero coverage gating",
+    "[adaptive-v2][manager-session][fault-containment][recurring][regression]")
+{
+    auto config = session_config();
+    config.controller.selection
+        .fault_containment_evidence_start_monotonic_ns =
+        std::numeric_limits<std::uint64_t>::max() - 1;
+    config.controller.selection
+        .fault_containment_required_tree_coverage = 7;
+    Fixture fixture(std::move(config));
+
+    REQUIRE(fixture.session.begin_cycle(optimization_policy()));
+    CHECK(fixture.session.evaluate() ==
+          AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+    fixture.ready_all();
+    fixture.responsive_baseline();
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    fixture.persistent_timeouts();
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.session.successor_bundle() != nullptr);
+    const auto first_identity = identity_for(
+        *fixture.session.successor_bundle(), 1'800, "command-1800");
+    REQUIRE(fixture.session.start_convergence(180));
+    for (const auto source : kSurvivors)
+    {
+        CHECK(fixture.session.observe_commit(
+                  source,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      source,
+                      first_identity}) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+        CHECK(fixture.session.observe_activation(
+                  source,
+                  AdaptiveV2EpochActivatedObservation{
+                      hotstuff::
+                          kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      source,
+                      first_identity,
+                      first_identity.successor_epoch_number,
+                      first_identity.successor_epoch_digest}) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+    }
+    REQUIRE(fixture.session.consume_ready_and_rotate());
+    REQUIRE(
+        fixture.session.ingress().current_epoch().epoch_number() == 1);
+
+    REQUIRE(fixture.session.begin_cycle(containment_policy()));
+    CHECK(fixture.session.evaluate() ==
+          (fixture.session.ingress().operationally_ready()
+               ? AdaptiveV2ManagerControllerStatus::
+                     awaiting_responsive_baseline
+               : AdaptiveV2ManagerControllerStatus::awaiting_readiness));
+    fixture.ready_all();
+    fixture.responsive_baseline();
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    fixture.responsive_optimization_suffix();
+
+    CHECK(fixture.session.evaluate() ==
+          AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.session.successor_bundle() != nullptr);
+    CHECK(fixture.session.successor_bundle()
+              ->command()
+              .payload.successor_epoch_number == 2);
+}
+
+TEST_CASE(
     "each transition policy independently controls shape application",
     "[adaptive-v2][manager-session][shape25][shape-factor][n7]")
 {

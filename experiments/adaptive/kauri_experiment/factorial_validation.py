@@ -68,6 +68,7 @@ from .factorial_manifest import (
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+    PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
     V2_PLAN_SHA256,
@@ -104,6 +105,9 @@ from .factorial_manifest import (
     V13_MANIFEST_ID,
     V13_MANIFEST_SHA256,
     V13_PLAN_SHA256,
+    V14_MANIFEST_ID,
+    V14_MANIFEST_SHA256,
+    V14_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -126,6 +130,9 @@ CAMPAIGN_AUTHORIZATION_FILENAME = "campaign-authorization.json"
 CAMPAIGN_CONTRACT_FILENAME = "campaign-execution-contract.json"
 CAMPAIGN_LEDGER_FILENAME = "campaign-attempt-ledger.jsonl"
 CAMPAIGN_SUMMARY_FILENAME = "campaign-execution-summary.json"
+COVERAGE_SMOKE_AUTHORIZATION_FILENAME = (
+    "coverage-smoke-execution-authorization.json"
+)
 BUILD_EVIDENCE_DIRECTORY = "build-evidence"
 _BUILD_EVIDENCE_GROUPS = {
     "binaries": "binaries",
@@ -135,6 +142,10 @@ MANAGER_EVENTS_FILENAME = "raw/adaptive-manager.jsonl"
 REPLICA_EVENTS_PATTERN = "raw/replica-{replica_id}.jsonl"
 REPLICA_STDERR_PATTERN = "raw/process/replica-{replica_id}.stderr.log"
 EXCLUDED_SMOKE_SLOT_ID = "smoke-n7-f2-PS"
+EXCLUDED_COVERAGE_SMOKE_SLOT_ID = "slot-066-n31-f5-b05-P"
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v15-coverage-smoke"
+)
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
 )
@@ -207,11 +218,20 @@ V13_RUNTIME_SHA256 = (
 V13_SMOKE_RUNTIME_SHA256 = (
     "5f70c7b117be7a5f425e9cd19b421cbc7958a4904daf7336b2989eea4fce641e"
 )
-FROZEN_RUNTIME_SHA256 = (
+V14_RUNTIME_SHA256 = (
     "1aacea1a7c7e72158df7661514acdc26f474fd4292eed9b108ecabc645c604e6"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V14_SMOKE_RUNTIME_SHA256 = (
     "82b5f4bf0f90b93f34e374b96f09de55b8a2953a9ef83d2e533d3a16362be6d3"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "97a6222f8d51aca78cbaa64ada641cc0227614c217e0f2f734144e21315c734c"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "b2593316eb97bb683dc5156490ebcc20fb2f58d70b57b0953a14c28b896d6d48"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "e5ce14245c9c225ac748c66e1447151eda802397f9bf9f84e5378bf09de99209"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -289,6 +309,13 @@ _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
 )
 _V8_RESPONSIVE_OMISSION_PERIOD = 32
 _RESPONSIVE_OMISSION_PERIOD = 41
+_FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
+    "{{fault_containment_evidence_start_monotonic_ns}}"
+)
+_FAULT_CONTAINMENT_COVERAGE_EVENT_TYPE = (
+    "adaptive_v2.fault_containment_coverage_ready"
+)
+_FAULT_CONTAINMENT_TREE_COVERAGE_RULE = "all_exact_predecessor_tree_ids_v1"
 _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
     {
         V9_MANIFEST_ID,
@@ -296,6 +323,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
         V13_MANIFEST_ID,
+        V14_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -344,7 +372,7 @@ def _uses_source_bound_contribution_opportunities(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and responsive.marker_completeness_witness
         == RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
@@ -353,8 +381,20 @@ def _uses_source_bound_contribution_opportunities(
 
 def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V14_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
+    )
+
+
+def _uses_precontainment_fault_coverage(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and responsive.precontainment_fault_coverage_gate
+        == PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
     )
 
 
@@ -439,6 +479,7 @@ class _FrozenArtifactIdentity:
     plan_sha256: str
     runtime_sha256: str
     smoke_runtime_sha256: str
+    coverage_smoke_runtime_sha256: str | None = None
 
 
 def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
@@ -534,12 +575,22 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             runtime_sha256=V13_RUNTIME_SHA256,
             smoke_runtime_sha256=V13_SMOKE_RUNTIME_SHA256,
         ),
+        V14_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V14_MANIFEST_ID,
+            manifest_sha256=V14_MANIFEST_SHA256,
+            plan_sha256=V14_PLAN_SHA256,
+            runtime_sha256=V14_RUNTIME_SHA256,
+            smoke_runtime_sha256=V14_SMOKE_RUNTIME_SHA256,
+        ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
             manifest_sha256=FROZEN_MANIFEST_SHA256,
             plan_sha256=FROZEN_PLAN_SHA256,
             runtime_sha256=FROZEN_RUNTIME_SHA256,
             smoke_runtime_sha256=FROZEN_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
         ),
     }
     identity = identities.get(manifest_id)
@@ -971,6 +1022,9 @@ class _HierarchyProof:
     epoch2_fast_position_required_count: int = 0
     epoch1_selection_ns: int = 0
     epoch2_selection_ns: int = 0
+    epoch0_fault_qualifying_proposal_keys: frozenset[
+        tuple[int, int, str, str]
+    ] = frozenset()
     full_gate_passed: bool | None = None
 
 
@@ -1006,6 +1060,7 @@ class _EvidenceRecord:
     reporter_monotonic_ns: int
     reporter_sequence: int
     signer_set: tuple[int, ...]
+    acceptance_source_sequence: int = 0
 
 
 def _fail(message: str) -> None:
@@ -2150,6 +2205,36 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
         _fail("plan execution schedule differs from independent derivation")
 
 
+def _is_excluded_coverage_smoke_slot(
+    slot_root: Path,
+    *,
+    manifest_id: str = FROZEN_MANIFEST_ID,
+) -> bool:
+    if (
+        manifest_id != FROZEN_MANIFEST_ID
+        or slot_root.name != EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    ):
+        return False
+    runtime_path = slot_root / RUNTIME_FILENAME
+    try:
+        if (
+            runtime_path.is_file()
+            and not runtime_path.is_symlink()
+            and runtime_path.stat().st_size <= _MAX_JSON_BYTES
+        ):
+            runtime_sha256 = _sha256(runtime_path.read_bytes())
+            if runtime_sha256 == FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256:
+                return True
+            if runtime_sha256 == FROZEN_RUNTIME_SHA256:
+                return False
+    except OSError:
+        pass
+    return (
+        slot_root.parent.name
+        == Path(EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT).name
+    )
+
+
 def _load_static_contracts(
     slot_root: Path,
 ) -> tuple[FrozenFactorialManifest, dict[str, Any], dict[str, Any], _ExpectedSlot, str]:
@@ -2251,6 +2336,33 @@ def _load_static_contracts(
         runtime, runtime_payload = loaded_runtime
         if _sha256(runtime_payload) != identity.smoke_runtime_sha256:
             _fail("runtime.json drifted from the exact frozen N=7 smoke identity")
+        _validate_runtime_slot(runtime, expected, manifest)
+        return manifest, plan, runtime, expected, _sha256(runtime_payload)
+    coverage_smoke = _is_excluded_coverage_smoke_slot(
+        slot_root,
+        manifest_id=manifest.manifest_id,
+    )
+    if coverage_smoke:
+        expected = expected_by_id.get(EXCLUDED_COVERAGE_SMOKE_SLOT_ID)
+        if expected is None:
+            _fail("coverage smoke slot is absent from the frozen campaign plan")
+        loaded_runtime = _read_json(slot_root, RUNTIME_FILENAME)
+        assert loaded_runtime is not None
+        runtime, runtime_payload = loaded_runtime
+        if (
+            identity.coverage_smoke_runtime_sha256 is None
+            or _sha256(runtime_payload)
+            != identity.coverage_smoke_runtime_sha256
+        ):
+            _fail(
+                "runtime.json drifted from the exact frozen N=31 coverage "
+                "smoke identity"
+            )
+        if runtime.get("result_path") != (
+            f"{EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT}/"
+            f"{EXCLUDED_COVERAGE_SMOKE_SLOT_ID}"
+        ):
+            _fail("coverage smoke runtime result path drifted")
         _validate_runtime_slot(runtime, expected, manifest)
         return manifest, plan, runtime, expected, _sha256(runtime_payload)
     if slot_root.name not in expected_by_id:
@@ -2433,6 +2545,10 @@ def _validate_runtime_slot(
                     ),
                 }
             )
+        if _uses_precontainment_fault_coverage(manifest):
+            artifact_identity["precontainment_fault_coverage_gate"] = (
+                PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+            )
     else:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -2521,6 +2637,10 @@ def _validate_runtime_slot(
                     ),
                 }
             )
+        if _uses_precontainment_fault_coverage(manifest):
+            expected_tiered["precontainment_fault_coverage_gate"] = (
+                PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+            )
         if dict(_mapping(runtime.get("tiered_cohorts"), "runtime tiered cohorts")) != expected_tiered:
             _fail("runtime tiered cohort contract differs from independent derivation")
     elif "tiered_cohorts" in runtime:
@@ -2530,6 +2650,36 @@ def _validate_runtime_slot(
             _fail("legacy runtime unexpectedly carries a cleanup contract")
     elif runtime.get("cleanup_contract") != manifest.cleanup_contract:
         _fail("runtime cleanup contract differs from the frozen manifest")
+    expected_causal_acceptance: dict[str, object] = {
+        "proof_source": "independent_raw_artifact_validation",
+        "pre_epoch1_required_role": "internal",
+        "pre_epoch1_required_action": "omit_aggregate",
+        "pre_epoch1_actor_coverage_rule": (
+            "each_declared_actor_has_source_bound_marker"
+        ),
+        "post_containment_required_role": "leaf",
+        "post_containment_wait_exempt": True,
+        "post_containment_actor_coverage_rule": "every_declared_actor",
+        "declared_or_synthetic_outcomes_accepted": False,
+    }
+    if _uses_precontainment_fault_coverage(manifest):
+        expected_causal_acceptance.update(
+            {
+                "precontainment_fault_coverage_gate": (
+                    PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+                ),
+                "precontainment_coverage_ready_event_type": (
+                    _FAULT_CONTAINMENT_COVERAGE_EVENT_TYPE
+                ),
+                "precontainment_required_tree_coverage_rule": (
+                    _FAULT_CONTAINMENT_TREE_COVERAGE_RULE
+                ),
+            }
+        )
+    if dict(
+        _mapping(runtime.get("causal_acceptance"), "runtime causal acceptance")
+    ) != expected_causal_acceptance:
+        _fail("runtime causal acceptance contract drifted")
     timers = manifest.common_timers
     config = _mapping(runtime.get("main_config"), "runtime main_config")
     expected_lines = {
@@ -2592,6 +2742,7 @@ def _validate_runtime_slot(
         V11_MANIFEST_ID,
         V12_MANIFEST_ID,
         V13_MANIFEST_ID,
+        V14_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -2760,10 +2911,37 @@ def _validate_runtime_slot(
         and manager_argv.index("--required-nonresponsive") + 1 < len(manager_argv)
         else None
     )
+    coverage_enabled = _uses_precontainment_fault_coverage(manifest)
+    coverage_start_option = (
+        "--fault-containment-evidence-start-monotonic-ns"
+    )
+    coverage_count_option = "--fault-containment-required-tree-coverage"
+    coverage_options_valid = (
+        manager_argv.count(coverage_start_option) == 1
+        and manager_argv.index(coverage_start_option) + 1 < len(manager_argv)
+        and manager_argv[
+            manager_argv.index(coverage_start_option) + 1
+        ]
+        == _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN
+        and manager_argv.count(coverage_count_option) == 1
+        and manager_argv.index(coverage_count_option) + 1 < len(manager_argv)
+        and manager_argv[
+            manager_argv.index(coverage_count_option) + 1
+        ]
+        == str(expected.replica_count)
+    )
     if (
         manager_argv.count("--transition-request") != 2
         or manager_argv.count("--bundle-output") != 2
         or required_nonresponsive != str(len(expected.actor_ids))
+        or coverage_options_valid is not coverage_enabled
+        or (
+            not coverage_enabled
+            and (
+                coverage_start_option in manager_argv
+                or coverage_count_option in manager_argv
+            )
+        )
     ):
         _fail("manager template does not carry exactly two transition requests")
     replica_templates = _array(runtime.get("replica_argv_templates"), "runtime replica argv templates")
@@ -2967,6 +3145,7 @@ def _evidence_record(event: _NativeEvent, membership: set[int]) -> _EvidenceReco
         reporter_monotonic_ns=reporter_monotonic,
         reporter_sequence=reporter_sequence,
         signer_set=signers,
+        acceptance_source_sequence=event.source_sequence,
     )
 
 
@@ -3030,6 +3209,273 @@ def _accepted_evidence(
             attempts[record.observation_id] = record
         grouped[epoch_id] = records
     return {key: tuple(value) for key, value in grouped.items()}
+
+
+def _conservative_attempt_started_at_or_after(
+    *,
+    reporter_monotonic_ns: int,
+    duration_us: int,
+    lower_bound_ns: int,
+) -> bool:
+    if (
+        type(reporter_monotonic_ns) is not int
+        or reporter_monotonic_ns <= 0
+        or reporter_monotonic_ns > _UINT64_MAX
+        or type(duration_us) is not int
+        or duration_us < 0
+        or duration_us > (_UINT64_MAX - 999) // 1_000
+        or type(lower_bound_ns) is not int
+        or lower_bound_ns <= 0
+        or lower_bound_ns > _UINT64_MAX
+    ):
+        return False
+    conservative_elapsed_ns = duration_us * 1_000 + 999
+    return (
+        reporter_monotonic_ns >= conservative_elapsed_ns
+        and reporter_monotonic_ns - conservative_elapsed_ns
+        >= lower_bound_ns
+    )
+
+
+def _qualifying_fault_proposal_keys(
+    records: Sequence[_EvidenceRecord],
+    *,
+    epoch_number: int,
+    epoch_digest: str,
+    evidence_cutoff: int,
+    fault_open_ns: int,
+) -> frozenset[tuple[int, int, str, str]]:
+    """Rebuild the actor-blind post-fault direct-vote ProposalKey set."""
+
+    if (
+        type(epoch_number) is not int
+        or epoch_number < 0
+        or epoch_number > (1 << 32) - 1
+        or type(evidence_cutoff) is not int
+        or evidence_cutoff <= 0
+        or evidence_cutoff > _UINT64_MAX
+        or type(fault_open_ns) is not int
+        or fault_open_ns <= 0
+        or fault_open_ns > _UINT64_MAX
+    ):
+        _fail("fault containment coverage bounds are invalid")
+    expected_digest = _digest(
+        epoch_digest, "fault containment predecessor epoch digest"
+    )
+    qualifying: set[tuple[int, int, str, str]] = set()
+    for record in records:
+        if (
+            record.ingestion_sequence <= 0
+            or record.ingestion_sequence > evidence_cutoff
+            or record.epoch_number != epoch_number
+            or record.epoch_digest != expected_digest
+            or record.outcome != "on_time"
+            or record.message_type != "direct_vote"
+        ):
+            continue
+        if not _conservative_attempt_started_at_or_after(
+            reporter_monotonic_ns=record.reporter_monotonic_ns,
+            duration_us=record.response_duration_us,
+            lower_bound_ns=fault_open_ns,
+        ):
+            continue
+        qualifying.add(
+            (
+                record.epoch_number,
+                record.tree_id,
+                record.epoch_digest,
+                record.block_hash,
+            )
+        )
+    return frozenset(qualifying)
+
+
+def _strict_u32_ids(value: object, label: str) -> tuple[int, ...]:
+    ids = tuple(
+        _integer(item, label)
+        for item in _array(value, label)
+    )
+    if (
+        not ids
+        or any(item > (1 << 32) - 1 for item in ids)
+        or tuple(sorted(set(ids))) != ids
+    ):
+        _fail(f"{label} must be a nonempty strictly increasing uint32 array")
+    return ids
+
+
+def _validate_fault_containment_coverage_ready(
+    *,
+    manager_events: Sequence[_NativeEvent],
+    accepted_epoch0: Sequence[_EvidenceRecord],
+    predecessor_epoch_digest: str,
+    predecessor_trees: Sequence[Tree],
+    fault_open_ns: int,
+    transition_artifact_id: str,
+    selection_current_cutoff: int,
+    epoch1_selection_ns: int,
+    epoch1_selection_source_sequence: int,
+) -> frozenset[tuple[int, int, str, str]]:
+    """Validate the one source-bound v15 coverage-ready manager event."""
+
+    events = tuple(
+        event
+        for event in manager_events
+        if event.event_type == _FAULT_CONTAINMENT_COVERAGE_EVENT_TYPE
+    )
+    if len(events) != 1:
+        _fail(
+            "v15 requires exactly one fault-containment coverage-ready event"
+        )
+    event = events[0]
+    if (
+        event.source_kind != "adaptation_manager"
+        or event.source_id != "adaptive-manager"
+    ):
+        _fail("fault-containment coverage-ready event is not manager-owned")
+    if not (
+        0 < fault_open_ns <= event.monotonic_ns <= epoch1_selection_ns
+        and event.source_sequence < epoch1_selection_source_sequence
+    ):
+        if event.monotonic_ns < fault_open_ns:
+            _fail("fault-containment coverage-ready event predates the fault window")
+        _fail("fault-containment coverage-ready event is not before Epoch1 selection")
+
+    payload = event.payload
+    _fields(
+        payload,
+        {
+            "cycle_ordinal",
+            "transition_artifact_id",
+            "predecessor_epoch_number",
+            "predecessor_epoch_digest",
+            "fault_evidence_start_monotonic_ns",
+            "evidence_cutoff",
+            "required_tree_ids",
+            "observed_tree_ids",
+        },
+        "fault-containment coverage-ready payload",
+    )
+    digest = _digest(
+        payload["predecessor_epoch_digest"],
+        "fault-containment coverage predecessor digest",
+    )
+    cycle_ordinal = _integer(
+        payload["cycle_ordinal"],
+        "fault-containment coverage cycle ordinal",
+    )
+    if cycle_ordinal > _UINT64_MAX:
+        _fail("fault-containment coverage cycle ordinal exceeds uint64")
+    predecessor_epoch_number = _integer(
+        payload["predecessor_epoch_number"],
+        "fault-containment coverage predecessor epoch number",
+    )
+    if predecessor_epoch_number > (1 << 32) - 1:
+        _fail(
+            "fault-containment coverage predecessor epoch number exceeds uint32"
+        )
+    fault_evidence_start_ns = _integer(
+        payload["fault_evidence_start_monotonic_ns"],
+        "fault-containment coverage evidence start",
+        1,
+    )
+    if fault_evidence_start_ns > _UINT64_MAX:
+        _fail("fault-containment coverage evidence start exceeds uint64")
+    cutoff = _integer(
+        payload["evidence_cutoff"],
+        "fault-containment coverage evidence cutoff",
+        1,
+    )
+    if cutoff > _UINT64_MAX:
+        _fail("fault-containment coverage evidence cutoff exceeds uint64")
+    if (
+        cycle_ordinal != 0
+        or payload["transition_artifact_id"] != transition_artifact_id
+        or predecessor_epoch_number != 0
+        or digest != predecessor_epoch_digest
+    ):
+        _fail("fault-containment coverage event differs from the exact predecessor")
+    if fault_evidence_start_ns != fault_open_ns:
+        _fail("fault-containment coverage event differs from the sealed fault-open")
+    if cutoff != selection_current_cutoff:
+        _fail(
+            "fault-containment coverage event cutoff differs from the exact "
+            "Epoch1 selection cutoff"
+        )
+
+    required_tree_ids = _strict_u32_ids(
+        payload["required_tree_ids"],
+        "fault-containment required tree IDs",
+    )
+    observed_tree_ids = _strict_u32_ids(
+        payload["observed_tree_ids"],
+        "fault-containment observed tree IDs",
+    )
+    expected_tree_ids = tuple(sorted(tree.tree_id for tree in predecessor_trees))
+    if (
+        len(set(expected_tree_ids)) != len(expected_tree_ids)
+        or len(expected_tree_ids) != len(predecessor_trees)
+        or required_tree_ids != expected_tree_ids
+    ):
+        _fail(
+            "fault-containment required tree IDs differ from every exact "
+            "predecessor tree"
+        )
+
+    prefix = tuple(
+        record
+        for record in accepted_epoch0
+        if record.ingestion_sequence <= cutoff
+    )
+    if (
+        not prefix
+        or max(record.ingestion_sequence for record in prefix) != cutoff
+        or any(
+            record.acceptance_source_sequence <= 0
+            or record.acceptance_source_sequence >= event.source_sequence
+            or record.acceptance_monotonic_ns > event.monotonic_ns
+            for record in prefix
+        )
+    ):
+        _fail(
+            "fault-containment coverage cutoff is not the exact source-bound "
+            "accepted prefix"
+        )
+    if any(
+        record.ingestion_sequence > cutoff
+        and record.acceptance_source_sequence < event.source_sequence
+        for record in accepted_epoch0
+    ):
+        _fail("fault-containment coverage event uses a stale evidence cutoff")
+
+    qualifying = _qualifying_fault_proposal_keys(
+        accepted_epoch0,
+        epoch_number=0,
+        epoch_digest=predecessor_epoch_digest,
+        evidence_cutoff=cutoff,
+        fault_open_ns=fault_open_ns,
+    )
+    qualifying_tree_ids = tuple(sorted({key[1] for key in qualifying}))
+    if any(tree_id not in set(expected_tree_ids) for tree_id in qualifying_tree_ids):
+        _fail("fault-containment qualifying evidence references a wrong tree")
+    if (
+        observed_tree_ids != required_tree_ids
+        or observed_tree_ids != qualifying_tree_ids
+    ):
+        _fail(
+            "fault-containment observed tree IDs differ from independently "
+            "reconstructed post-fault coverage"
+        )
+
+    # Recompute the ProposalKey eligibility through the selection cutoff.  It
+    # is intentionally not trusted from the earlier audit event.
+    return _qualifying_fault_proposal_keys(
+        accepted_epoch0,
+        epoch_number=0,
+        epoch_digest=predecessor_epoch_digest,
+        evidence_cutoff=selection_current_cutoff,
+        fault_open_ns=fault_open_ns,
+    )
 
 
 def _snapshot_records(
@@ -5073,6 +5519,72 @@ def _validate_role_scoped_epoch1_internal_opportunities(
         )
 
 
+def _outstanding_timeout_index(
+    records: Sequence[_EvidenceRecord],
+    *,
+    lower: int,
+    upper: int,
+    eligible_proposal_keys: Collection[tuple[int, int, str, str]] | None = None,
+) -> dict[tuple[int, int, int, str, str], tuple[_EvidenceRecord, ...]]:
+    eligible = (
+        None
+        if eligible_proposal_keys is None
+        else frozenset(eligible_proposal_keys)
+    )
+    outstanding: dict[str, _EvidenceRecord] = {}
+    for record in records:
+        if not lower < record.ingestion_sequence <= upper:
+            continue
+        proposal_key = (
+            record.epoch_number,
+            record.tree_id,
+            record.epoch_digest,
+            record.block_hash,
+        )
+        if eligible is not None and proposal_key not in eligible:
+            continue
+        if record.outcome == "timeout":
+            outstanding[record.observation_id] = record
+        elif record.outcome == "late":
+            outstanding.pop(record.observation_id, None)
+    grouped: dict[
+        tuple[int, int, int, str, str], list[_EvidenceRecord]
+    ] = defaultdict(list)
+    for record in outstanding.values():
+        grouped[
+            (
+                record.target_id,
+                record.epoch_number,
+                record.tree_id,
+                record.epoch_digest,
+                record.block_hash,
+            )
+        ].append(record)
+    return {key: tuple(value) for key, value in grouped.items()}
+
+
+def _is_epoch0_hard_causal_candidate(
+    *,
+    proposal_key: tuple[int, int, str, str],
+    marker_monotonic_ns: int,
+    fault_phase: tuple[int, int],
+    fault_open_ns: int,
+    epoch1_selection_ns: int,
+    qualifying_proposal_keys: Collection[
+        tuple[int, int, str, str]
+    ]
+    | None,
+) -> bool:
+    if proposal_key[0] != 0:
+        return False
+    if qualifying_proposal_keys is None:
+        return fault_phase[0] <= marker_monotonic_ns < fault_phase[1]
+    return (
+        fault_open_ns <= marker_monotonic_ns < epoch1_selection_ns
+        and proposal_key in qualifying_proposal_keys
+    )
+
+
 def validate_fault_causality(
     *,
     markers: Sequence[FaultMarker],
@@ -5111,6 +5623,10 @@ def validate_fault_causality(
     epoch2_selection_ns: int | None = None,
     responsive_omission_period: int = _V8_RESPONSIVE_OMISSION_PERIOD,
     source_bound_contribution_opportunities: bool = False,
+    epoch0_qualifying_proposal_keys: Collection[
+        tuple[int, int, str, str]
+    ]
+    | None = None,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
@@ -5235,42 +5751,21 @@ def validate_fault_causality(
             phase_windows=phase_windows,
             phase_configurations=phase_configurations,
         )
-    def outstanding_timeout_index(
-        records: Sequence[_EvidenceRecord],
-        *,
-        lower: int,
-        upper: int,
-    ) -> dict[tuple[int, int, int, str, str], tuple[_EvidenceRecord, ...]]:
-        outstanding: dict[str, _EvidenceRecord] = {}
-        for record in records:
-            if not lower < record.ingestion_sequence <= upper:
-                continue
-            if record.outcome == "timeout":
-                outstanding[record.observation_id] = record
-            elif record.outcome == "late":
-                outstanding.pop(record.observation_id, None)
-        grouped: dict[
-            tuple[int, int, int, str, str], list[_EvidenceRecord]
-        ] = defaultdict(list)
-        for record in outstanding.values():
-            grouped[
-                (
-                    record.target_id,
-                    record.epoch_number,
-                    record.tree_id,
-                    record.epoch_digest,
-                    record.block_hash,
-                )
-            ].append(record)
-        return {key: tuple(value) for key, value in grouped.items()}
-
+    qualifying_epoch0 = (
+        None
+        if epoch0_qualifying_proposal_keys is None
+        else frozenset(epoch0_qualifying_proposal_keys)
+    )
+    if qualifying_epoch0 is not None and not qualifying_epoch0:
+        _fail("v15 fault containment has no qualifying post-fault ProposalKeys")
     causal_timeout_indexes = {
-        0: outstanding_timeout_index(
+        0: _outstanding_timeout_index(
             accepted_epoch0,
             lower=baseline_cutoff,
             upper=current_cutoff,
+            eligible_proposal_keys=qualifying_epoch0,
         ),
-        1: outstanding_timeout_index(
+        1: _outstanding_timeout_index(
             accepted_epoch1,
             lower=(
                 0
@@ -5280,7 +5775,7 @@ def validate_fault_causality(
             upper=epoch1_current_cutoff,
         ),
     }
-    epoch1_selection_timeout_index = outstanding_timeout_index(
+    epoch1_selection_timeout_index = _outstanding_timeout_index(
         accepted_epoch1,
         lower=epoch1_baseline_cutoff,
         upper=epoch1_current_cutoff,
@@ -5502,9 +5997,13 @@ def validate_fault_causality(
                     for timeout in exact_timeouts
                 ):
                     degraded_evidence_bound_actors.add(marker.actor)
-        elif (
-            marker.epoch_number == 0
-            and fault_phase[0] <= marker.monotonic_ns < fault_phase[1]
+        elif _is_epoch0_hard_causal_candidate(
+            proposal_key=identity,
+            marker_monotonic_ns=marker.monotonic_ns,
+            fault_phase=fault_phase,
+            fault_open_ns=window_start_ns,
+            epoch1_selection_ns=selection_deadlines[0],
+            qualifying_proposal_keys=qualifying_epoch0,
         ):
             if not exact_timeouts:
                 _fail(
@@ -5813,6 +6312,11 @@ def _validate_slot_receipt(
     expected_manager: list[str] = []
     for value in manager_template:
         rendered = value.replace(slot_token, str(recorded_slot_root))
+        if _uses_precontainment_fault_coverage(manifest):
+            rendered = rendered.replace(
+                _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN,
+                str(window_start),
+            )
         for token, secret in secret_values.items():
             rendered = rendered.replace(token, redact(secret))
         if "{{" in rendered or "}}" in rendered:
@@ -5824,6 +6328,37 @@ def _validate_slot_receipt(
     )
     if manager_argv != tuple(expected_manager):
         _fail("manager argv is not the reproducibly redacted runtime template")
+    coverage_start_option = (
+        "--fault-containment-evidence-start-monotonic-ns"
+    )
+    coverage_count_option = "--fault-containment-required-tree-coverage"
+    coverage_enabled = _uses_precontainment_fault_coverage(manifest)
+    if coverage_enabled:
+        if (
+            manager_argv.count(coverage_start_option) != 1
+            or manager_argv.count(coverage_count_option) != 1
+            or manager_argv.index(coverage_start_option) + 1
+            >= len(manager_argv)
+            or manager_argv.index(coverage_count_option) + 1
+            >= len(manager_argv)
+            or manager_argv[
+                manager_argv.index(coverage_start_option) + 1
+            ]
+            != str(window_start)
+            or manager_argv[
+                manager_argv.index(coverage_count_option) + 1
+            ]
+            != str(expected.replica_count)
+        ):
+            _fail(
+                "manager argv does not bind the exact fault-open and full "
+                "predecessor tree coverage"
+            )
+    elif (
+        coverage_start_option in manager_argv
+        or coverage_count_option in manager_argv
+    ):
+        _fail("legacy manager argv unexpectedly enables fault coverage")
     validate_manager_blinding(manager_argv, ())
     return (
         anchor,
@@ -5989,13 +6524,25 @@ def _validate_execution_authorization(
         _string(_mapping(item, "plan slot").get("slot_id"), "plan slot ID")
         for item in _array(plan.get("slots"), "plan slots")
     ]
-    expected_scope = "shape25_campaign" if campaign_member else "excluded_n7_smoke"
-    expected_slots = planned_ids if campaign_member else [expected.slot_id]
-    expected_result_root = (
-        manifest.results_root
-        if campaign_member
-        else f"{manifest.results_root}-smoke"
+    coverage_smoke = _is_excluded_coverage_smoke_slot(
+        slot_root,
+        manifest_id=manifest.manifest_id,
     )
+    if campaign_member:
+        expected_scope = "shape25_campaign"
+        expected_slots = planned_ids
+        expected_result_root = manifest.results_root
+        root_authorization_filename: str | None = None
+    elif coverage_smoke:
+        expected_scope = "excluded_n31_coverage_smoke"
+        expected_slots = [expected.slot_id]
+        expected_result_root = EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+        root_authorization_filename = COVERAGE_SMOKE_AUTHORIZATION_FILENAME
+    else:
+        expected_scope = "excluded_n7_smoke"
+        expected_slots = [expected.slot_id]
+        expected_result_root = f"{manifest.results_root}-smoke"
+        root_authorization_filename = SMOKE_AUTHORIZATION_FILENAME
     static_hashes = _mapping(
         document["static_artifacts_sha256"], "authorization static hashes"
     )
@@ -6042,11 +6589,14 @@ def _validate_execution_authorization(
     if not campaign_member:
         root_authorization = _read_bytes(
             slot_root.parent,
-            SMOKE_AUTHORIZATION_FILENAME,
+            root_authorization_filename,
         )
         assert root_authorization is not None
         if root_authorization != payload:
-            _fail("smoke root authorization differs from the slot authorization")
+            _fail(
+                "excluded smoke root authorization differs from the slot "
+                "authorization"
+            )
     return document, payload
 
 
@@ -7587,11 +8137,25 @@ def _validate_guarded_actor_evidence(
     current_cutoff: int,
     actor_ids: Sequence[int],
     required_reporters: int,
+    eligible_proposal_keys: Collection[tuple[int, int, str, str]] | None = None,
 ) -> None:
+    eligible = (
+        None
+        if eligible_proposal_keys is None
+        else frozenset(eligible_proposal_keys)
+    )
     outstanding: dict[str, _EvidenceRecord] = {}
     for record in records:
         if not baseline_cutoff < record.ingestion_sequence <= current_cutoff:
             continue
+        if eligible is not None:
+            if (
+                record.epoch_number,
+                record.tree_id,
+                record.epoch_digest,
+                record.block_hash,
+            ) not in eligible:
+                continue
         if record.outcome == "timeout":
             if record.observation_id in outstanding:
                 _fail("guard evidence duplicates a post-baseline timeout")
@@ -7647,6 +8211,9 @@ def _validate_adaptation_cycles(
     epoch2_constrained_leaf_count = 0
     epoch2_fast_position_count = 0
     epoch2_fast_position_required_count = 0
+    epoch0_fault_qualifying_proposal_keys: frozenset[
+        tuple[int, int, str, str]
+    ] = frozenset()
     for cycle in range(2):
         transition = _mapping(runtime_transitions[cycle], f"runtime transition {cycle}")
         request = _mapping(transition.get("request"), f"runtime transition {cycle} request")
@@ -7669,6 +8236,7 @@ def _validate_adaptation_cycles(
 
         snapshot_event = snapshot_events[cycle]
         snapshot = snapshot_event.payload
+        shape_event = shape_events[cycle]
         if _validate_snapshot_audit_schema(
             snapshot,
             evidence_snapshot_format=manifest.evidence_snapshot_format,
@@ -7705,6 +8273,22 @@ def _validate_adaptation_cycles(
             for record in epoch_records
         ):
             _fail("cycle-0 baseline evidence does not strictly predate the fault window")
+        if cycle == 0 and _uses_precontainment_fault_coverage(manifest):
+            epoch0_fault_qualifying_proposal_keys = (
+                _validate_fault_containment_coverage_ready(
+                    manager_events=manager_events,
+                    accepted_epoch0=epoch_records,
+                    predecessor_epoch_digest=predecessor_digest,
+                    predecessor_trees=predecessor_trees,
+                    fault_open_ns=cutoff_times["fault_window_open"],
+                    transition_artifact_id=artifact_id,
+                    selection_current_cutoff=current_cutoff,
+                    epoch1_selection_ns=shape_event.monotonic_ns,
+                    epoch1_selection_source_sequence=(
+                        shape_event.source_sequence
+                    ),
+                )
+            )
         full_prefix = _snapshot_records(
             epoch_records,
             baseline_cutoff=baseline_cutoff,
@@ -7752,6 +8336,11 @@ def _validate_adaptation_cycles(
                 current_cutoff=current_cutoff,
                 actor_ids=expected.actor_ids,
                 required_reporters=expected.f + 1,
+                eligible_proposal_keys=(
+                    epoch0_fault_qualifying_proposal_keys
+                    if _uses_precontainment_fault_coverage(manifest)
+                    else None
+                ),
             )
         computed_snapshot_id = _snapshot_id(
             selected_records,
@@ -7813,7 +8402,6 @@ def _validate_adaptation_cycles(
                 ),
             )
 
-        shape_event = shape_events[cycle]
         shape_payload = shape_event.payload
         _fields(
             shape_payload,
@@ -7889,6 +8477,9 @@ def _validate_adaptation_cycles(
             ),
             epoch1_selection_ns=shape_events[0].monotonic_ns,
             epoch2_selection_ns=shape_events[1].monotonic_ns,
+            epoch0_fault_qualifying_proposal_keys=(
+                epoch0_fault_qualifying_proposal_keys
+            ),
             full_gate_passed=full_gate_passed,
         ),
     )
@@ -7899,12 +8490,22 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
 
     slot_root = Path(slot_directory)
     slot_id = slot_root.name
-    campaign_member = slot_id != EXCLUDED_SMOKE_SLOT_ID
+    coverage_smoke = _is_excluded_coverage_smoke_slot(slot_root)
+    campaign_member = (
+        slot_id != EXCLUDED_SMOKE_SLOT_ID and not coverage_smoke
+    )
     expected: _ExpectedSlot | None = None
     try:
         if slot_root.is_symlink() or not slot_root.is_dir():
             _incomplete("slot directory is absent or is not a regular directory")
         manifest, plan, runtime, expected, runtime_sha256 = _load_static_contracts(slot_root)
+        coverage_smoke = _is_excluded_coverage_smoke_slot(
+            slot_root,
+            manifest_id=manifest.manifest_id,
+        )
+        campaign_member = (
+            slot_id != EXCLUDED_SMOKE_SLOT_ID and not coverage_smoke
+        )
         authorization, authorization_bytes = _validate_execution_authorization(
             slot_root,
             manifest=manifest,
@@ -8175,7 +8776,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
         )
         primary_internal_witness_gate = (
             manifest.manifest_id in _CAUSAL_MEASUREMENT_MANIFEST_IDS
-            and campaign_member
+            and (campaign_member or coverage_smoke)
             and expected.replica_count
             == manifest.claim_scope.placement_headline_replica_count
             and expected.initial_fanout
@@ -8262,6 +8863,11 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             ),
             source_bound_contribution_opportunities=(
                 source_bound_contribution_opportunities
+            ),
+            epoch0_qualifying_proposal_keys=(
+                hierarchy.epoch0_fault_qualifying_proposal_keys
+                if _uses_precontainment_fault_coverage(manifest)
+                else None
             ),
         )
 

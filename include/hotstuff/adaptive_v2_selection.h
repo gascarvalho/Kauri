@@ -28,7 +28,54 @@ struct AdaptiveV2SelectionConfig
     std::size_t maximum_post_baseline_timeout_attempts{4096};
     AdaptationPolicy responsiveness_policy;
     std::uint64_t snapshot_seed{0};
+    /**
+     * Optional prospective fault-window anchor. Zero preserves the legacy
+     * v1-v14 selection behavior. When enabled, it must be paired with the
+     * exact canonical predecessor tree count below.
+     */
+    std::uint64_t fault_containment_evidence_start_monotonic_ns{0};
+    std::uint32_t fault_containment_required_tree_coverage{0};
 };
+
+enum class AdaptiveV2FaultContainmentCoverageStatus : std::uint8_t
+{
+    disabled = 1,
+    incomplete,
+    ready,
+    invalid,
+};
+
+/** Actor-blind audit of exact post-fault predecessor-tree coverage. */
+struct AdaptiveV2FaultContainmentCoverage
+{
+    AdaptiveV2FaultContainmentCoverageStatus status{
+        AdaptiveV2FaultContainmentCoverageStatus::disabled};
+    std::uint64_t fault_evidence_start_monotonic_ns{0};
+    std::uint64_t evidence_cutoff{0};
+    std::vector<std::uint32_t> required_tree_ids;
+    std::vector<std::uint32_t> observed_tree_ids;
+};
+
+/**
+ * Require one accepted on-time direct-vote proposal from every canonical
+ * tree. A proposal qualifies only when its conservative attempt-start lower
+ * bound is at or after the sealed CLOCK_MONOTONIC_RAW fault-open timestamp.
+ */
+AdaptiveV2FaultContainmentCoverage
+evaluate_adaptive_v2_fault_containment_coverage(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    std::uint64_t fault_evidence_start_monotonic_ns,
+    std::uint32_t required_tree_count) noexcept;
+
+AdaptiveV2FaultContainmentCoverage
+evaluate_adaptive_v2_fault_containment_coverage(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    std::uint64_t fault_evidence_start_monotonic_ns,
+    const std::vector<std::uint32_t> &required_tree_ids) noexcept;
 
 enum class AdaptiveV2SelectionStatus : std::uint8_t
 {

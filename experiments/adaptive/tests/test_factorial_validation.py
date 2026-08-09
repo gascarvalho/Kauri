@@ -43,6 +43,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v15.json"
+)
+V14_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
 )
 V13_MANIFEST_PATH = (
@@ -265,7 +268,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v14_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v15_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -284,7 +287,8 @@ def test_validator_retains_exact_v1_through_v14_artifact_identities() -> None:
             (11, V11_MANIFEST_PATH),
             (12, V12_MANIFEST_PATH),
             (13, V13_MANIFEST_PATH),
-            (14, MANIFEST_PATH),
+            (14, V14_MANIFEST_PATH),
+            (15, MANIFEST_PATH),
         )
     }
 
@@ -336,10 +340,16 @@ def test_validator_retains_exact_v1_through_v14_artifact_identities() -> None:
         identities[13].smoke_runtime_sha256
         == validation.V13_SMOKE_RUNTIME_SHA256
     )
-    assert identities[14].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[14].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[14].manifest_sha256 == validation.V14_MANIFEST_SHA256
+    assert identities[14].runtime_sha256 == validation.V14_RUNTIME_SHA256
     assert (
         identities[14].smoke_runtime_sha256
+        == validation.V14_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[15].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[15].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[15].smoke_runtime_sha256
         == validation.FROZEN_SMOKE_RUNTIME_SHA256
     )
 
@@ -357,6 +367,7 @@ def test_validator_retains_exact_v1_through_v14_artifact_identities() -> None:
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
+        V14_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -376,7 +387,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v14_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v15_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -403,6 +414,7 @@ def test_validator_requires_v9_through_v14_causal_contracts_but_accepts_v8() -> 
         V11_MANIFEST_PATH,
         V12_MANIFEST_PATH,
         V13_MANIFEST_PATH,
+        V14_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -455,7 +467,7 @@ def test_validator_requires_v9_through_v14_causal_contracts_but_accepts_v8() -> 
                 for field in explicit_v11_fields
             } == explicit_v11_fields
         else:
-            if manifest_path == MANIFEST_PATH:
+            if manifest_path in (V14_MANIFEST_PATH, MANIFEST_PATH):
                 assert document["tiered_cohorts"][
                     "marker_completeness_witness"
                 ] == validation.RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
@@ -4895,12 +4907,17 @@ def _relocated_receipt_fixture(
             row["crt"] for row in tls[: spec.replica_count]
         ),
     )
+    anchor = 1_000_000_000
     manager = execution._redact_manager_argv(
-        materialize_manager_argv(spec, original_slot, secrets),
+        materialize_manager_argv(
+            spec,
+            original_slot,
+            secrets,
+            shared_raw_clock_anchor_ns=anchor,
+        ),
         key=redaction_key,
         key_id=hashlib.sha256(redaction_key).hexdigest()[:16],
     )
-    anchor = 1_000_000_000
     replicas = materialize_replica_argv(spec, original_slot, anchor)
     start = anchor + spec.fault_window.start_after_prelaunch_anchor_s * 1_000_000_000
     end = start + spec.fault_window.duration_s * 1_000_000_000
@@ -4990,6 +5007,98 @@ def test_smoke_slot_authorization_must_match_the_claimed_root_envelope(
             runtime_sha256=hashlib.sha256(runtime_bytes).hexdigest(),
             campaign_member=False,
         )
+
+
+def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None:
+    campaign = (
+        Path("results/shape-placement-factorial-v15")
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
+    coverage = (
+        Path(validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
+
+    assert not validation._is_excluded_coverage_smoke_slot(campaign)
+    assert validation._is_excluded_coverage_smoke_slot(coverage)
+    assert not validation._is_excluded_coverage_smoke_slot(
+        coverage,
+        manifest_id=validation.V14_MANIFEST_ID,
+    )
+
+
+def test_n31_coverage_smoke_relocates_by_exact_runtime_and_authorization(
+    tmp_path: Path,
+) -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    source_slot = next(
+        slot
+        for slot in plan.slots
+        if slot.slot_id == validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(source_slot)
+    runtime_bytes = execution._canonical_json_bytes(
+        coverage.runtime.as_document()
+    )
+    static_artifacts = {
+        validation.MANIFEST_FILENAME: MANIFEST_PATH.read_bytes(),
+        validation.PLAN_FILENAME: plan.canonical_bytes,
+        validation.RUNTIME_FILENAME: runtime_bytes,
+    }
+    authorization = execution.build_execution_authorization_receipt(
+        scope="excluded_n31_coverage_smoke",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-09T00:00:00+00:00",
+        kauri_revision="ab" * 20,
+        slot_ids=(coverage.slot.slot_id,),
+        result_root=validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        static_artifacts=static_artifacts,
+        build_provenance_sha256="cd" * 32,
+    )
+    result_root = tmp_path / "renamed-coverage-smoke-archive"
+    slot_root = result_root / coverage.slot.slot_id
+    slot_root.mkdir(parents=True)
+    (slot_root / validation.MANIFEST_FILENAME).write_bytes(
+        static_artifacts[validation.MANIFEST_FILENAME]
+    )
+    (slot_root / validation.PLAN_FILENAME).write_bytes(
+        static_artifacts[validation.PLAN_FILENAME]
+    )
+    (slot_root / validation.RUNTIME_FILENAME).write_bytes(runtime_bytes)
+    (slot_root / validation.AUTHORIZATION_FILENAME).write_bytes(authorization)
+    (
+        result_root / validation.COVERAGE_SMOKE_AUTHORIZATION_FILENAME
+    ).write_bytes(authorization)
+    (
+        loaded_manifest,
+        loaded_plan,
+        _,
+        expected,
+        runtime_sha256,
+    ) = validation._load_static_contracts(slot_root)
+    assert loaded_manifest == manifest
+    assert loaded_plan == json.loads(plan.canonical_bytes)
+    assert runtime_sha256 == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+    assert validation._is_excluded_coverage_smoke_slot(
+        slot_root,
+        manifest_id=manifest.manifest_id,
+    )
+
+    document, _ = validation._validate_execution_authorization(
+        slot_root,
+        manifest=loaded_manifest,
+        expected=expected,
+        plan=loaded_plan,
+        runtime_sha256=runtime_sha256,
+        campaign_member=False,
+    )
+
+    assert document["scope"] == "excluded_n31_coverage_smoke"
+    assert document["slot_ids"] == [coverage.slot.slot_id]
+    assert document["result_root"] == (
+        validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    )
 
 
 def _attach_relocated_build_evidence(
@@ -5108,6 +5217,37 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
             recovered_slot,
             revision="12" * 20,
             recorded_repository=original_repository,
+        )
+
+
+@pytest.mark.parametrize(
+    ("option", "replacement"),
+    (
+        ("--fault-containment-evidence-start-monotonic-ns", "1"),
+        ("--fault-containment-required-tree-coverage", "21"),
+    ),
+)
+def test_v15_receipt_rejects_fault_open_or_q_sized_manager_coverage(
+    tmp_path: Path,
+    option: str,
+    replacement: str,
+) -> None:
+    recovered, _, receipt, expected, runtime, authorization = (
+        _relocated_receipt_fixture(tmp_path)
+    )
+    argv = list(receipt["manager_argv"])
+    argv[argv.index(option) + 1] = replacement
+    receipt["manager_argv"] = argv
+
+    with pytest.raises(FactorialValidationError, match="manager argv"):
+        validation._validate_slot_receipt(
+            receipt,
+            slot_root=recovered,
+            manifest=load_frozen_manifest(MANIFEST_PATH),
+            expected=expected,
+            runtime=runtime,
+            runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
+            authorization_bytes=authorization,
         )
 
 
@@ -5457,6 +5597,395 @@ def test_cross_run_jsonl_evidence_is_rejected(tmp_path: Path) -> None:
             source_id="replica-0",
             source_instance="slot-replica-0",
         )
+
+
+def _coverage_evidence_record(
+    *,
+    sequence: int,
+    tree_id: int,
+    epoch_digest: str,
+    fault_open_ns: int,
+    reporter_id: int = 0,
+    target_id: int = 1,
+    outcome: str = "on_time",
+    message_type: str = "direct_vote",
+) -> validation._EvidenceRecord:
+    duration_us = 100
+    return validation._EvidenceRecord(
+        ingestion_sequence=sequence,
+        acceptance_monotonic_ns=fault_open_ns + 1_000_000 + sequence,
+        observation_id=f"{sequence:064x}",
+        reporter_id=reporter_id,
+        target_id=target_id,
+        epoch_number=0,
+        tree_id=tree_id,
+        epoch_digest=epoch_digest,
+        block_hash=f"{10_000 + sequence:064x}",
+        message_type=message_type,
+        outcome=outcome,
+        response_duration_us=duration_us if outcome == "on_time" else 0,
+        deadline_duration_us=1_000,
+        reporter_monotonic_ns=(
+            fault_open_ns + duration_us * 1_000 + 999 + sequence
+        ),
+        reporter_sequence=sequence,
+        signer_set=(target_id,) if outcome == "on_time" else (),
+        acceptance_source_sequence=sequence,
+    )
+
+
+def _coverage_ready_event(
+    *,
+    records: tuple[validation._EvidenceRecord, ...],
+    epoch_digest: str,
+    fault_open_ns: int,
+    transition_artifact_id: str,
+) -> validation._NativeEvent:
+    tree_ids = sorted({record.tree_id for record in records})
+    return validation._NativeEvent(
+        relative_path=validation.MANAGER_EVENTS_FILENAME,
+        line_number=100,
+        source_kind="adaptation_manager",
+        source_id="adaptive-manager",
+        source_instance="slot-adaptive-manager",
+        source_sequence=100,
+        monotonic_ns=fault_open_ns + 2_000_000,
+        event_type="adaptive_v2.fault_containment_coverage_ready",
+        payload={
+            "cycle_ordinal": 0,
+            "transition_artifact_id": transition_artifact_id,
+            "predecessor_epoch_number": 0,
+            "predecessor_epoch_digest": epoch_digest,
+            "fault_evidence_start_monotonic_ns": fault_open_ns,
+            "evidence_cutoff": len(records),
+            "required_tree_ids": tree_ids,
+            "observed_tree_ids": tree_ids,
+        },
+        line_sha256="ab" * 32,
+    )
+
+
+def test_v15_coverage_ready_rebuilds_every_exact_predecessor_tree_and_key() -> None:
+    epoch_digest = "11" * 32
+    fault_open_ns = 1_000_000_000
+    trees = tuple(Tree(tree_id, 5, 2, tuple(range(13)), ()) for tree_id in range(13))
+    records = tuple(
+        _coverage_evidence_record(
+            sequence=tree_id + 1,
+            tree_id=tree_id,
+            epoch_digest=epoch_digest,
+            fault_open_ns=fault_open_ns,
+        )
+        for tree_id in range(13)
+    )
+    event = _coverage_ready_event(
+        records=records,
+        epoch_digest=epoch_digest,
+        fault_open_ns=fault_open_ns,
+        transition_artifact_id="transition-0",
+    )
+
+    qualifying = validation._validate_fault_containment_coverage_ready(
+        manager_events=(event,),
+        accepted_epoch0=records,
+        predecessor_epoch_digest=epoch_digest,
+        predecessor_trees=trees,
+        fault_open_ns=fault_open_ns,
+        transition_artifact_id="transition-0",
+        selection_current_cutoff=len(records),
+        epoch1_selection_ns=event.monotonic_ns + 1,
+        epoch1_selection_source_sequence=event.source_sequence + 1,
+    )
+
+    assert len(qualifying) == 13
+    assert {key[1] for key in qualifying} == set(range(13))
+
+
+def test_v15_coverage_ready_rejects_an_earlier_full_n_cutoff() -> None:
+    epoch_digest = "11" * 32
+    fault_open_ns = 1_000_000_000
+    trees = tuple(Tree(tree_id, 5, 2, tuple(range(13)), ()) for tree_id in range(13))
+    event_records = tuple(
+        _coverage_evidence_record(
+            sequence=tree_id + 1,
+            tree_id=tree_id,
+            epoch_digest=epoch_digest,
+            fault_open_ns=fault_open_ns,
+        )
+        for tree_id in range(13)
+    )
+    event = _coverage_ready_event(
+        records=event_records,
+        epoch_digest=epoch_digest,
+        fault_open_ns=fault_open_ns,
+        transition_artifact_id="transition-0",
+    )
+    later = replace(
+        _coverage_evidence_record(
+            sequence=14,
+            tree_id=0,
+            epoch_digest=epoch_digest,
+            fault_open_ns=fault_open_ns,
+        ),
+        acceptance_monotonic_ns=event.monotonic_ns + 1,
+        acceptance_source_sequence=event.source_sequence + 1,
+    )
+
+    with pytest.raises(FactorialValidationError, match="selection cutoff"):
+        validation._validate_fault_containment_coverage_ready(
+            manager_events=(event,),
+            accepted_epoch0=(*event_records, later),
+            predecessor_epoch_digest=epoch_digest,
+            predecessor_trees=trees,
+            fault_open_ns=fault_open_ns,
+            transition_artifact_id="transition-0",
+            selection_current_cutoff=14,
+            epoch1_selection_ns=event.monotonic_ns + 2,
+            epoch1_selection_source_sequence=event.source_sequence + 2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing", "exactly one"),
+        ("duplicate", "exactly one"),
+        ("pre_window", "fault window"),
+        ("post_selection", "before Epoch1 selection"),
+        ("wrong_epoch", "predecessor"),
+        ("wrong_digest", "predecessor"),
+        ("wrong_start", "fault-open"),
+        ("wrong_cutoff", "cutoff"),
+        ("partial_13_tree", "tree IDs"),
+        ("wrong_observed", "tree IDs"),
+        ("boolean_cycle", "cycle ordinal"),
+        ("overflow_cycle", "cycle ordinal exceeds uint64"),
+        ("boolean_epoch", "predecessor epoch number"),
+        ("overflow_epoch", "predecessor epoch number exceeds uint32"),
+        ("floating_start", "evidence start"),
+        ("overflow_start", "evidence start exceeds uint64"),
+        ("extra_field", "field set"),
+    ),
+)
+def test_v15_coverage_ready_rejects_nonexact_event(
+    mutation: str,
+    message: str,
+) -> None:
+    epoch_digest = "11" * 32
+    fault_open_ns = 1_000_000_000
+    trees = tuple(Tree(tree_id, 5, 2, tuple(range(13)), ()) for tree_id in range(13))
+    records = tuple(
+        _coverage_evidence_record(
+            sequence=tree_id + 1,
+            tree_id=tree_id,
+            epoch_digest=epoch_digest,
+            fault_open_ns=fault_open_ns,
+        )
+        for tree_id in range(13)
+    )
+    event = _coverage_ready_event(
+        records=records,
+        epoch_digest=epoch_digest,
+        fault_open_ns=fault_open_ns,
+        transition_artifact_id="transition-0",
+    )
+    events = [event]
+    payload = dict(event.payload)
+    selection_ns = event.monotonic_ns + 10
+    selection_sequence = event.source_sequence + 1
+    if mutation == "missing":
+        events = []
+    elif mutation == "duplicate":
+        events.append(replace(event, source_sequence=101, line_number=101))
+    elif mutation == "pre_window":
+        events[0] = replace(event, monotonic_ns=fault_open_ns - 1)
+    elif mutation == "post_selection":
+        selection_sequence = event.source_sequence
+    elif mutation == "wrong_epoch":
+        payload["predecessor_epoch_number"] = 1
+    elif mutation == "wrong_digest":
+        payload["predecessor_epoch_digest"] = "22" * 32
+    elif mutation == "wrong_start":
+        payload["fault_evidence_start_monotonic_ns"] = fault_open_ns + 1
+    elif mutation == "wrong_cutoff":
+        payload["evidence_cutoff"] = len(records) - 1
+    elif mutation == "partial_13_tree":
+        payload["required_tree_ids"] = list(range(12))
+        payload["observed_tree_ids"] = list(range(12))
+    elif mutation == "wrong_observed":
+        payload["observed_tree_ids"] = list(range(12))
+    elif mutation == "boolean_cycle":
+        payload["cycle_ordinal"] = False
+    elif mutation == "overflow_cycle":
+        payload["cycle_ordinal"] = validation._UINT64_MAX + 1
+    elif mutation == "boolean_epoch":
+        payload["predecessor_epoch_number"] = False
+    elif mutation == "overflow_epoch":
+        payload["predecessor_epoch_number"] = 1 << 32
+    elif mutation == "floating_start":
+        payload["fault_evidence_start_monotonic_ns"] = float(fault_open_ns)
+    elif mutation == "overflow_start":
+        payload["fault_evidence_start_monotonic_ns"] = validation._UINT64_MAX + 1
+    elif mutation == "extra_field":
+        payload["actor_ids"] = [9, 10, 12]
+    if mutation in {
+        "wrong_epoch",
+        "wrong_digest",
+        "wrong_start",
+        "wrong_cutoff",
+        "partial_13_tree",
+        "wrong_observed",
+        "boolean_cycle",
+        "overflow_cycle",
+        "boolean_epoch",
+        "overflow_epoch",
+        "floating_start",
+        "overflow_start",
+        "extra_field",
+    }:
+        events[0] = replace(event, payload=payload)
+
+    with pytest.raises(FactorialValidationError, match=message):
+        validation._validate_fault_containment_coverage_ready(
+            manager_events=tuple(events),
+            accepted_epoch0=records,
+            predecessor_epoch_digest=epoch_digest,
+            predecessor_trees=trees,
+            fault_open_ns=fault_open_ns,
+            transition_artifact_id="transition-0",
+            selection_current_cutoff=len(records),
+            epoch1_selection_ns=selection_ns,
+            epoch1_selection_source_sequence=selection_sequence,
+        )
+
+
+def test_v15_coverage_uses_conservative_attempt_start_and_is_actor_blind() -> None:
+    epoch_digest = "11" * 32
+    fault_open_ns = 1_000_000_000
+    valid = _coverage_evidence_record(
+        sequence=1,
+        tree_id=0,
+        epoch_digest=epoch_digest,
+        fault_open_ns=fault_open_ns,
+    )
+    pre_fault = replace(
+        valid,
+        reporter_monotonic_ns=(
+            fault_open_ns + valid.response_duration_us * 1_000 + 998
+        ),
+    )
+    zero_duration = replace(
+        valid,
+        response_duration_us=0,
+        reporter_monotonic_ns=fault_open_ns + 999,
+    )
+    zero_duration_pre_fault = replace(
+        zero_duration,
+        reporter_monotonic_ns=fault_open_ns + 998,
+    )
+    negative_duration = replace(valid, response_duration_us=-1)
+    overflow = replace(valid, response_duration_us=validation._UINT64_MAX)
+    wrong_message = replace(valid, message_type="aggregate_relay")
+    wrong_epoch = replace(valid, epoch_number=1)
+    for nonqualifying in (
+        pre_fault,
+        zero_duration_pre_fault,
+        negative_duration,
+        overflow,
+        wrong_message,
+        wrong_epoch,
+    ):
+        assert not validation._qualifying_fault_proposal_keys(
+            (nonqualifying,),
+            epoch_number=0,
+            epoch_digest=epoch_digest,
+            evidence_cutoff=1,
+            fault_open_ns=fault_open_ns,
+        )
+
+    assert validation._qualifying_fault_proposal_keys(
+        (zero_duration,),
+        epoch_number=0,
+        epoch_digest=epoch_digest,
+        evidence_cutoff=1,
+        fault_open_ns=fault_open_ns,
+    )
+    original = validation._qualifying_fault_proposal_keys(
+        (valid,),
+        epoch_number=0,
+        epoch_digest=epoch_digest,
+        evidence_cutoff=1,
+        fault_open_ns=fault_open_ns,
+    )
+    actor_mutated = validation._qualifying_fault_proposal_keys(
+        (replace(valid, reporter_id=7, target_id=8),),
+        epoch_number=0,
+        epoch_digest=epoch_digest,
+        evidence_cutoff=1,
+        fault_open_ns=fault_open_ns,
+    )
+    assert actor_mutated == original
+
+
+def test_v15_guard_rejects_timeout_reuse_from_a_nonqualifying_proposal() -> None:
+    epoch_digest = "11" * 32
+    fault_open_ns = 1_000_000_000
+    record = replace(
+        _coverage_evidence_record(
+            sequence=2,
+            tree_id=0,
+            epoch_digest=epoch_digest,
+            fault_open_ns=fault_open_ns,
+            reporter_id=4,
+            target_id=9,
+        ),
+        observation_id="33" * 32,
+        outcome="timeout",
+        response_duration_us=0,
+        deadline_duration_us=100,
+        reporter_monotonic_ns=fault_open_ns + 100 * 1_000 + 999,
+        signer_set=(),
+    )
+    other_key = (
+        record.epoch_number,
+        record.tree_id,
+        record.epoch_digest,
+        "44" * 32,
+    )
+
+    with pytest.raises(FactorialValidationError, match="lacks.*reporters"):
+        validation._validate_guarded_actor_evidence(
+            (record,),
+            baseline_cutoff=1,
+            current_cutoff=2,
+            actor_ids=(9,),
+            required_reporters=1,
+            eligible_proposal_keys={other_key},
+        )
+
+
+def test_v15_hard_causal_window_extends_to_selection_only_for_qualifying_keys() -> None:
+    key = (0, 17, "11" * 32, "22" * 32)
+    arguments = {
+        "proposal_key": key,
+        "marker_monotonic_ns": 450,
+        "fault_phase": (100, 400),
+        "fault_open_ns": 100,
+        "epoch1_selection_ns": 500,
+    }
+
+    assert not validation._is_epoch0_hard_causal_candidate(
+        **arguments,
+        qualifying_proposal_keys=None,
+    )
+    assert validation._is_epoch0_hard_causal_candidate(
+        **arguments,
+        qualifying_proposal_keys={key},
+    )
+    assert not validation._is_epoch0_hard_causal_candidate(
+        **arguments,
+        qualifying_proposal_keys={(0, 18, key[2], key[3])},
+    )
 
 
 def test_on_time_evidence_at_deadline_is_rejected() -> None:
