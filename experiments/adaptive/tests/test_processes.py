@@ -363,6 +363,7 @@ def test_sigkill_batch_failure_exposes_ordered_per_action_truth_and_reserves_all
     assert results[0].outcome.returncode == -int(signal.SIGKILL)
     assert results[0].error is None
     assert "did not exit from SIGKILL" in results[1].error
+    assert registry.injected_sigkill_replica_ids == frozenset({0})
     assert signals == [
         (100, int(signal.SIGKILL)),
         (101, int(signal.SIGKILL)),
@@ -403,6 +404,7 @@ def test_sigkill_singleton_delegates_to_batch_at_most_once() -> None:
 
     assert outcome.fault_id == "crash-0"
     assert outcome.returncode == -int(signal.SIGKILL)
+    assert registry.injected_sigkill_replica_ids == frozenset({0})
     with pytest.raises(RuntimeError, match="already"):
         registry.sigkill_replica_groups(
             (("crash-0-retry", 0),),
@@ -439,6 +441,61 @@ def test_cleanup_is_idempotent_and_only_signals_registered_groups() -> None:
     assert signals == [(100, int(signal.SIGINT))]
     assert unrelated.poll() is None
     assert all(pgid != unrelated.pid for pgid, _ in signals)
+
+
+def test_cleanup_samples_after_sigint_timeout_before_sigterm_and_keeps_cleaning() -> None:
+    processes = _processes()
+    process = FakeProcess(pid=100, wait_result=-int(signal.SIGTERM))
+    operations: list[tuple[str, int]] = []
+    last_signal: int | None = None
+
+    def killpg(pgid: int, signal_number: int) -> None:
+        nonlocal last_signal
+        assert pgid == process.pid
+        last_signal = signal_number
+        operations.append(("signal", signal_number))
+        if signal_number == int(signal.SIGTERM):
+            process.returncode = -signal_number
+
+    def wait_for_exit(managed: FakeProcess, timeout: float) -> int:
+        assert managed is process
+        assert timeout == 0.01
+        operations.append(("wait", int(last_signal or 0)))
+        if last_signal == int(signal.SIGINT):
+            raise subprocess.TimeoutExpired("replica-0", timeout)
+        assert managed.returncode is not None
+        return managed.returncode
+
+    def sample(record: object) -> object:
+        assert record.pid == process.pid
+        operations.append(("sample", process.pid))
+        raise RuntimeError("sample unavailable")
+
+    registry = processes.ProcessRegistry(
+        getpgid=lambda pid: pid,
+        killpg=killpg,
+        get_launcher_pgid=lambda: 9999,
+        wait_for_exit=wait_for_exit,
+        cleanup_escalation_hook=sample,
+    )
+    registry.register(
+        name="replica-0",
+        replica_id=0,
+        process=process,
+    )
+
+    outcomes = registry.cleanup(timeout_s=0.01)
+
+    assert operations == [
+        ("signal", int(signal.SIGINT)),
+        ("wait", int(signal.SIGINT)),
+        ("sample", process.pid),
+        ("signal", int(signal.SIGTERM)),
+        ("wait", int(signal.SIGTERM)),
+    ]
+    assert outcomes[0].signal_number == int(signal.SIGTERM)
+    assert registry.cleanup_escalations[0].status == "failed"
+    assert registry.cleanup_escalations[0].error == "sample unavailable"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")

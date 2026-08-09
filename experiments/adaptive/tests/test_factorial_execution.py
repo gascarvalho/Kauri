@@ -23,6 +23,7 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     canonical_runtime_bytes,
 )
 from experiments.adaptive.kauri_experiment.processes import (
+    CleanupEscalationOutcome,
     CleanupOutcome,
     ProcessRecord,
 )
@@ -2845,9 +2846,17 @@ def test_cleanup_classifies_only_terminal_authorized_zero_manager_exit(
     (
         (int(signal.SIGINT), 0, "expected_cleanup"),
         (int(signal.SIGINT), -int(signal.SIGINT), "expected_cleanup"),
-        (int(signal.SIGTERM), 0, "expected_cleanup"),
-        (int(signal.SIGTERM), -int(signal.SIGTERM), "expected_cleanup"),
-        (int(signal.SIGKILL), -int(signal.SIGKILL), "expected_cleanup"),
+        (int(signal.SIGTERM), 0, "unexpected_cleanup_escalation"),
+        (
+            int(signal.SIGTERM),
+            -int(signal.SIGTERM),
+            "unexpected_cleanup_escalation",
+        ),
+        (
+            int(signal.SIGKILL),
+            -int(signal.SIGKILL),
+            "unexpected_cleanup_escalation",
+        ),
         (int(signal.SIGKILL), 0, "unexpected_cleanup_exit"),
         (int(signal.SIGTERM), 7, "unexpected_cleanup_exit"),
         (99, -99, "unexpected_cleanup_exit"),
@@ -2876,6 +2885,184 @@ def test_cleanup_requires_a_credible_signal_returncode_pair(
     )
 
     assert rows[0]["classification"] == expected_classification
+
+
+def test_cleanup_distinguishes_an_injected_hard_process_fault() -> None:
+    process = _FakeProcess(
+        pid=31_100,
+        returncode=-int(signal.SIGKILL),
+    )
+    record = ProcessRecord("replica-0", 0, process.pid, process.pid, process)
+
+    rows = execution._cleanup_ledger(
+        (record,),
+        (),
+        cleanup_started_ns=32_100,
+        injected_replica_ids=frozenset({0}),
+    )
+
+    assert rows[0]["classification"] == "expected_injected_fault"
+    assert rows[0]["signal_number"] is None
+    assert rows[0]["returncode"] == -int(signal.SIGKILL)
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "expected_status", "invoked"),
+    (
+        ("darwin", "captured", True),
+        ("linux", "unsupported_platform", False),
+    ),
+)
+def test_cleanup_sampler_is_platform_aware_and_uses_exact_sample_command(
+    tmp_path: Path,
+    platform_name: str,
+    expected_status: str,
+    invoked: bool,
+) -> None:
+    process = _FakeProcess(pid=31_200)
+    record = ProcessRecord("replica-0", 0, process.pid, process.pid, process)
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        commands.append(tuple(command))
+        output = Path(command[command.index("-file") + 1])
+        output.write_text("sample evidence\n")
+        assert kwargs["check"] is False
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    result = execution._capture_cleanup_sample(
+        record,
+        slot_directory=tmp_path,
+        platform_name=platform_name,
+        run_command=run,
+    )
+
+    assert result.status == expected_status
+    assert bool(commands) is invoked
+    if invoked:
+        expected_path = tmp_path / "raw/diagnostics/replica-0.sample.txt"
+        assert commands == [
+            (
+                "/usr/bin/sample",
+                str(process.pid),
+                "5",
+                "1",
+                "-mayDie",
+                "-fullPaths",
+                "-file",
+                str(expected_path),
+            )
+        ]
+        assert result.artifact_relative_path == (
+            "raw/diagnostics/replica-0.sample.txt"
+        )
+    else:
+        assert result.artifact_relative_path is None
+
+
+def test_cleanup_sampling_failure_is_recorded_and_does_not_skip_escalation(
+    tmp_path: Path,
+    template_slot,
+) -> None:
+    smoke = execution.build_n7_ps_smoke_slot(template_slot)
+    preflight = _direct_preflight(tmp_path, smoke)
+    next_pid = 31_300
+    commands: list[tuple[str, ...]] = []
+
+    class EscalatingRegistry(_FakeRegistry):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.hook = kwargs["cleanup_escalation_hook"]
+            self.cleanup_escalations: tuple[CleanupEscalationOutcome, ...] = ()
+
+        def cleanup(self, *, timeout_s: float) -> tuple[CleanupOutcome, ...]:
+            del timeout_s
+            self.cleanup_calls += 1
+            rows: list[CleanupOutcome] = []
+            diagnostics: list[CleanupEscalationOutcome] = []
+            for record in self.records:
+                signal_number = int(signal.SIGINT)
+                if record.name == "replica-0":
+                    probe = self.hook(record)
+                    diagnostics.append(
+                        CleanupEscalationOutcome(
+                            name=record.name,
+                            replica_id=record.replica_id,
+                            pid=record.pid,
+                            pgid=record.pgid,
+                            after_signal_number=int(signal.SIGINT),
+                            before_signal_number=int(signal.SIGTERM),
+                            status=probe.status,
+                            artifact_relative_path=probe.artifact_relative_path,
+                            error=probe.error,
+                        )
+                    )
+                    signal_number = int(signal.SIGTERM)
+                record.process.returncode = -signal_number
+                rows.append(
+                    CleanupOutcome(
+                        record.name,
+                        record.replica_id,
+                        record.pid,
+                        record.pgid,
+                        signal_number,
+                        -signal_number,
+                    )
+                )
+            self.cleanup_escalations = tuple(diagnostics)
+            return tuple(rows)
+
+    registry: EscalatingRegistry | None = None
+
+    def registry_factory(**kwargs: Any) -> EscalatingRegistry:
+        nonlocal registry
+        registry = EscalatingRegistry(**kwargs)
+        return registry
+
+    def popen(_command: Any, **_kwargs: Any) -> _FakeProcess:
+        nonlocal next_pid
+        next_pid += 1
+        return _FakeProcess(next_pid)
+
+    def failing_sample(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        commands.append(tuple(command))
+        output = Path(command[command.index("-file") + 1])
+        output.write_text("partial sample evidence\n")
+        return SimpleNamespace(returncode=1, stdout="", stderr="sample denied")
+
+    result = execution.execute_slot_once(
+        smoke.slot,
+        smoke.runtime,
+        preflight=preflight,
+        static_artifacts=_smoke_static_artifacts(smoke),
+        authorization_receipt=_smoke_authorization(smoke, preflight),
+        campaign_member=False,
+        raw_now_ns=lambda: 31_400,
+        wall_now=lambda: "2026-08-04T00:00:00+00:00",
+        run_command=_identity_command,
+        sample_run_command=failing_sample,
+        cleanup_sample_platform="darwin",
+        popen_factory=popen,
+        registry_factory=registry_factory,
+        observer=_fake_phases,
+        sleep=lambda _seconds: None,
+        wait_ports_clear=lambda _ports, _timeout: None,
+    )
+
+    assert commands
+    assert result.outcome == "INCOMPLETE"
+    assert result.reason == "cleanup ledger contains a non-expected process exit"
+    replica = next(row for row in result.cleanup_ledger if row["name"] == "replica-0")
+    assert replica["classification"] == "unexpected_cleanup_escalation"
+    diagnostics_path = (
+        result.slot_directory / "raw/diagnostics/cleanup-escalations.json"
+    )
+    diagnostics = json.loads(diagnostics_path.read_text())
+    assert diagnostics["attempts"][0]["status"] == "failed"
+    assert diagnostics["attempts"][0]["error"] == "sample exited with status 1: sample denied"
+    outcome = json.loads((result.slot_directory / "outcome.json").read_text())
+    assert "raw/diagnostics/cleanup-escalations.json" in outcome["sealed_files"]
+    assert "raw/diagnostics/replica-0.sample.txt" in outcome["sealed_files"]
 
 
 def test_bad_cleanup_returncode_makes_the_attempt_incomplete(

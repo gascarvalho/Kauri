@@ -98,6 +98,30 @@ class CleanupOutcome:
     returncode: int
 
 
+@dataclass(frozen=True, slots=True)
+class CleanupEscalationResult:
+    """Diagnostic result returned before cleanup advances past SIGINT."""
+
+    status: str
+    artifact_relative_path: str | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupEscalationOutcome:
+    """Identity-bound record of one pre-escalation diagnostic attempt."""
+
+    name: str
+    replica_id: int
+    pid: int
+    pgid: int
+    after_signal_number: int
+    before_signal_number: int
+    status: str
+    artifact_relative_path: str | None
+    error: str | None
+
+
 class ProcessRegistry:
     """Own the safe signalling boundary for launcher-created processes."""
 
@@ -115,12 +139,16 @@ class ProcessRegistry:
         get_launcher_pgid: Callable[[], int] = os.getpgrp,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         wait_for_exit: Callable[[ManagedProcess, float], int] | None = None,
+        cleanup_escalation_hook: (
+            Callable[[ProcessRecord], CleanupEscalationResult] | None
+        ) = None,
     ) -> None:
         self._getpgid = getpgid
         self._killpg = killpg
         self._get_launcher_pgid = get_launcher_pgid
         self._monotonic_ns = monotonic_ns
         self._wait_for_exit = wait_for_exit or self._default_wait_for_exit
+        self._cleanup_escalation_hook = cleanup_escalation_hook
 
         self._records_by_name: dict[str, ProcessRecord] = {}
         self._records_by_replica: dict[int, ProcessRecord] = {}
@@ -128,8 +156,10 @@ class ProcessRegistry:
         self._records_by_pgid: dict[int, ProcessRecord] = {}
         self._sigkill_fault_ids: set[str] = set()
         self._sigkill_replica_ids: set[int] = set()
+        self._confirmed_sigkill_replica_ids: set[int] = set()
         self._cleanup_started = False
         self._cleanup_outcomes: tuple[CleanupOutcome, ...] = ()
+        self._cleanup_escalations: tuple[CleanupEscalationOutcome, ...] = ()
 
     @staticmethod
     def _default_wait_for_exit(
@@ -143,6 +173,18 @@ class ProcessRegistry:
         """Return records in registration order."""
 
         return tuple(self._records_by_name.values())
+
+    @property
+    def injected_sigkill_replica_ids(self) -> frozenset[int]:
+        """Return replica identities reserved for deliberate hard faults."""
+
+        return frozenset(self._confirmed_sigkill_replica_ids)
+
+    @property
+    def cleanup_escalations(self) -> tuple[CleanupEscalationOutcome, ...]:
+        """Return diagnostics captured after SIGINT failed to stop a group."""
+
+        return self._cleanup_escalations
 
     def record_for_replica(self, replica_id: int) -> ProcessRecord:
         """Return a registered replica or fail without accepting raw PIDs."""
@@ -421,6 +463,9 @@ class ProcessRegistry:
                             signal_number=signal_number,
                             requested_monotonic_ns=requested_ns,
                         )
+                        self._confirmed_sigkill_replica_ids.add(
+                            record.replica_id
+                        )
                         continue
                 else:
                     error = (
@@ -456,6 +501,39 @@ class ProcessRegistry:
             if result.outcome is not None
         )
 
+    def _capture_cleanup_escalation(
+        self,
+        record: ProcessRecord,
+    ) -> CleanupEscalationOutcome:
+        hook = self._cleanup_escalation_hook
+        if hook is None:
+            raise RuntimeError("cleanup escalation hook is not configured")
+        try:
+            result = hook(record)
+            if not isinstance(result, CleanupEscalationResult):
+                raise TypeError(
+                    "cleanup escalation hook returned an invalid result"
+                )
+            if not result.status:
+                raise ValueError("cleanup escalation result status is empty")
+        except Exception as exc:
+            result = CleanupEscalationResult(
+                status="failed",
+                artifact_relative_path=None,
+                error=str(exc).strip() or type(exc).__name__,
+            )
+        return CleanupEscalationOutcome(
+            name=record.name,
+            replica_id=record.replica_id,
+            pid=record.pid,
+            pgid=record.pgid,
+            after_signal_number=int(signal.SIGINT),
+            before_signal_number=int(signal.SIGTERM),
+            status=result.status,
+            artifact_relative_path=result.artifact_relative_path,
+            error=result.error,
+        )
+
     def cleanup(self, *, timeout_s: float) -> tuple[CleanupOutcome, ...]:
         """Stop all still-live registered groups, escalating at most once."""
 
@@ -465,6 +543,7 @@ class ProcessRegistry:
         self._cleanup_started = True
 
         outcomes: list[CleanupOutcome] = []
+        escalations: list[CleanupEscalationOutcome] = []
         try:
             for signal_number in self._CLEANUP_SIGNALS:
                 active = [
@@ -474,6 +553,18 @@ class ProcessRegistry:
                 ]
                 if not active:
                     break
+
+                if (
+                    signal_number == int(signal.SIGTERM)
+                    and self._cleanup_escalation_hook is not None
+                ):
+                    for record in active:
+                        if record.process.poll() is not None:
+                            continue
+                        escalations.append(
+                            self._capture_cleanup_escalation(record)
+                        )
+                    self._cleanup_escalations = tuple(escalations)
 
                 signalled: list[ProcessRecord] = []
                 for record in active:
@@ -522,10 +613,13 @@ class ProcessRegistry:
                 )
 
             self._cleanup_outcomes = tuple(outcomes)
+            self._cleanup_escalations = tuple(escalations)
             return self._cleanup_outcomes
         finally:
             if not self._cleanup_outcomes:
                 self._cleanup_outcomes = tuple(outcomes)
+            if not self._cleanup_escalations:
+                self._cleanup_escalations = tuple(escalations)
 
     def _validate_group_shape(
         self,

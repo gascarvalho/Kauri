@@ -25,6 +25,7 @@ import signal
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from typing import IO, Any, Protocol
@@ -51,7 +52,13 @@ from .factorial_runtime import (
     materialize_manager_argv,
     materialize_replica_argv,
 )
-from .processes import CleanupOutcome, ProcessRecord, ProcessRegistry
+from .processes import (
+    CleanupEscalationOutcome,
+    CleanupEscalationResult,
+    CleanupOutcome,
+    ProcessRecord,
+    ProcessRegistry,
+)
 from . import profiled_fault_runtime as _legacy_runtime
 
 
@@ -65,6 +72,12 @@ MAX_TRANSACTION_COUNT = (1 << 64) - 1
 NANOSECONDS_PER_SECOND = 1_000_000_000
 DEFAULT_POLL_INTERVAL_S = 0.05
 DEFAULT_CLEANUP_TIMEOUT_S = 5.0
+CLEANUP_SAMPLE_DURATION_S = 5
+CLEANUP_SAMPLE_INTERVAL_MS = 1
+CLEANUP_SAMPLE_TIMEOUT_S = 15.0
+CLEANUP_DIAGNOSTICS_RELATIVE_PATH = Path(
+    "raw/diagnostics/cleanup-escalations.json"
+)
 BUILD_EVIDENCE_DIRECTORY = "build-evidence"
 CAMPAIGN_AUTHORIZATION_FILENAME = "campaign-authorization.json"
 CAMPAIGN_CONTRACT_FILENAME = "campaign-execution-contract.json"
@@ -3323,6 +3336,153 @@ def _final_expected_clean_exits(
     return {"adaptive-manager": terminal.reference()}
 
 
+def _capture_cleanup_sample(
+    record: ProcessRecord,
+    *,
+    slot_directory: Path,
+    platform_name: str,
+    run_command: Callable[..., Any],
+) -> CleanupEscalationResult:
+    """Capture one bounded macOS sample before cleanup escalates past SIGINT."""
+
+    if platform_name != "darwin":
+        return CleanupEscalationResult(
+            status="unsupported_platform",
+            artifact_relative_path=None,
+            error=f"/usr/bin/sample is unavailable on {platform_name}",
+        )
+    if Path(record.name).name != record.name or record.name in {".", ".."}:
+        return CleanupEscalationResult(
+            status="failed",
+            artifact_relative_path=None,
+            error="process name is unsafe for a diagnostic artifact",
+        )
+
+    relative_path = Path("raw/diagnostics") / f"{record.name}.sample.txt"
+    output_path = slot_directory / relative_path
+    diagnostic_directory = output_path.parent
+    try:
+        diagnostic_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as error:
+        return CleanupEscalationResult(
+            status="failed",
+            artifact_relative_path=None,
+            error=f"could not create sample directory: {error}",
+        )
+    if (
+        diagnostic_directory.is_symlink()
+        or not diagnostic_directory.is_dir()
+        or output_path.exists()
+        or output_path.is_symlink()
+    ):
+        return CleanupEscalationResult(
+            status="failed",
+            artifact_relative_path=None,
+            error="sample output path is unsafe or already exists",
+        )
+
+    command = [
+        "/usr/bin/sample",
+        str(record.pid),
+        str(CLEANUP_SAMPLE_DURATION_S),
+        str(CLEANUP_SAMPLE_INTERVAL_MS),
+        "-mayDie",
+        "-fullPaths",
+        "-file",
+        str(output_path),
+    ]
+    try:
+        completed = run_command(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=CLEANUP_SAMPLE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError) as error:
+        return CleanupEscalationResult(
+            status="failed",
+            artifact_relative_path=(
+                relative_path.as_posix()
+                if output_path.is_file() and not output_path.is_symlink()
+                else None
+            ),
+            error=f"could not invoke /usr/bin/sample: {error}",
+        )
+
+    returncode = getattr(completed, "returncode", None)
+    artifact_relative_path = (
+        relative_path.as_posix()
+        if output_path.is_file() and not output_path.is_symlink()
+        else None
+    )
+    if returncode != 0:
+        stderr = getattr(completed, "stderr", "")
+        stdout = getattr(completed, "stdout", "")
+        detail = stderr.strip() if isinstance(stderr, str) else ""
+        if not detail and isinstance(stdout, str):
+            detail = stdout.strip()
+        suffix = f": {detail[:2048]}" if detail else ""
+        return CleanupEscalationResult(
+            status="failed",
+            artifact_relative_path=artifact_relative_path,
+            error=f"sample exited with status {returncode}{suffix}",
+        )
+    if artifact_relative_path is None:
+        return CleanupEscalationResult(
+            status="failed",
+            artifact_relative_path=None,
+            error="sample exited successfully without a regular output file",
+        )
+    return CleanupEscalationResult(
+        status="captured",
+        artifact_relative_path=artifact_relative_path,
+        error=None,
+    )
+
+
+def _write_cleanup_escalation_diagnostics(
+    slot_directory: Path,
+    slot_id: str,
+    attempts: Sequence[CleanupEscalationOutcome],
+) -> None:
+    """Persist every pre-escalation probe so the terminal seal covers it."""
+
+    if not attempts:
+        return
+    rows: list[dict[str, object]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, CleanupEscalationOutcome):
+            raise FactorialExecutionError(
+                "cleanup escalation diagnostics contain an invalid row"
+            )
+        rows.append(
+            {
+                "name": attempt.name,
+                "replica_id": (
+                    attempt.replica_id if attempt.replica_id >= 0 else None
+                ),
+                "pid": attempt.pid,
+                "pgid": attempt.pgid,
+                "after_signal_number": attempt.after_signal_number,
+                "before_signal_number": attempt.before_signal_number,
+                "status": attempt.status,
+                "artifact_relative_path": attempt.artifact_relative_path,
+                "error": attempt.error,
+            }
+        )
+    _write_exclusive(
+        slot_directory / CLEANUP_DIAGNOSTICS_RELATIVE_PATH,
+        _canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "slot_id": slot_id,
+                "attempts": rows,
+            }
+        ),
+    )
+
+
 def _cleanup_ledger(
     records: Sequence[ProcessRecord],
     outcomes: Sequence[CleanupOutcome],
@@ -3330,6 +3490,7 @@ def _cleanup_ledger(
     cleanup_started_ns: int,
     expected_clean_exits: Mapping[str, Mapping[str, object]] | None = None,
     cleanup_completed: bool = True,
+    injected_replica_ids: Collection[int] = (),
 ) -> tuple[Mapping[str, object], ...]:
     by_name: dict[str, CleanupOutcome] = {}
     duplicate_outcome_names: set[str] = set()
@@ -3340,6 +3501,7 @@ def _cleanup_ledger(
     registered_names = {record.name for record in records}
     outcome_set_has_unknown_names = not set(by_name).issubset(registered_names)
     authorizations = expected_clean_exits or {}
+    injected = frozenset(injected_replica_ids)
     rows: list[Mapping[str, object]] = []
 
     def credible_cleanup(
@@ -3370,13 +3532,26 @@ def _cleanup_ledger(
         returncode = record.process.poll()
         authorization = authorizations.get(record.name)
         if (
+            outcome is None
+            and record.replica_id in injected
+            and returncode == -int(signal.SIGKILL)
+        ):
+            classification = "expected_injected_fault"
+        elif (
             outcome is not None
             and returncode is not None
             and record.name not in duplicate_outcome_names
             and not outcome_set_has_unknown_names
             and credible_cleanup(record, outcome, returncode)
         ):
-            classification = "expected_cleanup"
+            if (
+                record.replica_id >= 0
+                and outcome.signal_number
+                in (int(signal.SIGTERM), int(signal.SIGKILL))
+            ):
+                classification = "unexpected_cleanup_escalation"
+            else:
+                classification = "expected_cleanup"
         elif outcome is not None and returncode is not None:
             classification = "unexpected_cleanup_exit"
         elif authorization is not None and returncode == 0:
@@ -3438,6 +3613,8 @@ def execute_slot_once(
         _legacy_runtime.wait_ports_clear
     ),
     cleanup_timeout_s: float = DEFAULT_CLEANUP_TIMEOUT_S,
+    sample_run_command: Callable[..., Any] = subprocess.run,
+    cleanup_sample_platform: str = sys.platform,
 ) -> SlotExecutionResult:
     """Execute and preserve exactly one slot attempt with no retry path."""
 
@@ -3530,7 +3707,15 @@ def execute_slot_once(
     records: list[ProcessRecord] = []
     spawned: list[SpawnedProcess] = []
     launch_count = 0
-    registry = registry_factory(monotonic_ns=raw_now_ns)
+    registry = registry_factory(
+        monotonic_ns=raw_now_ns,
+        cleanup_escalation_hook=lambda record: _capture_cleanup_sample(
+            record,
+            slot_directory=preflight.slot_directory,
+            platform_name=cleanup_sample_platform,
+            run_command=sample_run_command,
+        ),
+    )
     anchor_ns: int | None = None
     hard_deadline_ns: int | None = None
 
@@ -3699,6 +3884,16 @@ def execute_slot_once(
             cleanup_completed = True
         except (Exception, KeyboardInterrupt) as error:
             cleanup_error = str(error) or type(error).__name__
+        try:
+            _write_cleanup_escalation_diagnostics(
+                slot_directory,
+                spec.slot_id,
+                tuple(getattr(registry, "cleanup_escalations", ())),
+            )
+        except (FactorialExecutionError, OSError, ValueError) as error:
+            cleanup_error = cleanup_error or (
+                f"cleanup diagnostic persistence failed: {error}"
+            )
         streams_closed = True
         for launched in spawned:
             for stream in (launched.stdout, launched.stderr):
@@ -3733,8 +3928,17 @@ def execute_slot_once(
             cleanup_started_ns=cleanup_started_ns,
             expected_clean_exits=expected_clean_exits,
             cleanup_completed=cleanup_completed,
+            injected_replica_ids=getattr(
+                registry,
+                "injected_sigkill_replica_ids",
+                (),
+            ),
         )
-        accepted_cleanup_classes = {"expected_cleanup", "expected_clean_exit"}
+        accepted_cleanup_classes = {
+            "expected_cleanup",
+            "expected_clean_exit",
+            "expected_injected_fault",
+        }
         if cleanup_completed and any(
             row["classification"] not in accepted_cleanup_classes
             for row in cleanup_rows

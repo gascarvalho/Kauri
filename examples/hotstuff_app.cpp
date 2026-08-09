@@ -188,6 +188,68 @@ struct ReplicaStructuredEventOptions
     std::string output_path;
 };
 
+static const char *structured_event_failure_name(
+    hotstuff::StructuredEventFailure failure) noexcept
+{
+    using Failure = hotstuff::StructuredEventFailure;
+    switch (failure)
+    {
+    case Failure::none:
+        return "none";
+    case Failure::invalid_configuration:
+        return "invalid_configuration";
+    case Failure::identity_too_large:
+        return "identity_too_large";
+    case Failure::invalid_payload:
+        return "invalid_payload";
+    case Failure::reentrant_call:
+        return "reentrant_call";
+    case Failure::allocation_failure:
+        return "allocation_failure";
+    case Failure::line_too_large:
+        return "line_too_large";
+    case Failure::queue_full:
+        return "queue_full";
+    case Failure::clock_regression:
+        return "clock_regression";
+    case Failure::sequence_exhausted:
+        return "sequence_exhausted";
+    case Failure::write_failure:
+        return "write_failure";
+    case Failure::close_failure:
+        return "close_failure";
+    case Failure::clock_failure:
+        return "clock_failure";
+    case Failure::sync_failure:
+        return "sync_failure";
+    }
+    return "unknown";
+}
+
+static void log_replica_structured_event_health(
+    const char *stage,
+    const hotstuff::StructuredEventHealth &health)
+{
+    std::cerr
+        << "KAURI_REPLICA_STRUCTURED_EVENT_HEALTH stage=" << stage
+        << " healthy=" << (health.healthy ? 1 : 0)
+        << " stopped=" << (health.stopped ? 1 : 0)
+        << " first_failure="
+        << structured_event_failure_name(health.first_failure)
+        << " first_failure_code="
+        << static_cast<unsigned int>(health.first_failure)
+        << " last_sequence=" << health.last_assigned_sequence
+        << " has_last_monotonic_ns="
+        << (health.has_last_monotonic_ns ? 1 : 0)
+        << " last_monotonic_ns=" << health.last_monotonic_ns
+        << " queued_events=" << health.queued_events
+        << " queued_bytes=" << health.queued_bytes
+        << " complete_records=" << health.complete_records
+        << " dropped_records=" << health.dropped_records
+        << " interrupted_tail=" << (health.interrupted_tail ? 1 : 0)
+        << std::endl;
+}
+
 template<typename Value>
 Value parse_adaptive_v2_unsigned(
     const std::string &raw_value,
@@ -1481,6 +1543,8 @@ int main(int argc, char **argv)
                     structured_event_sink.value().health();
                 if (!health.healthy)
                 {
+                    log_replica_structured_event_health("sink_failure_pre_stop",
+                                                        health);
                     structured_event_failed = true;
                     papp->stop();
                     return;
@@ -1673,15 +1737,23 @@ void HotStuffApp::stop()
     }
     if (req_thread.joinable())
     {
+        std::cerr << "KAURI_REPLICA_STOP stage=req_join_begin replica="
+                  << get_id() << std::endl;
         req_tcall->async_call([this](salticidae::ThreadCall::Handle &)
                               { req_ec.stop(); });
         req_thread.join();
+        std::cerr << "KAURI_REPLICA_STOP stage=req_join_end replica="
+                  << get_id() << std::endl;
     }
     if (resp_thread.joinable())
     {
+        std::cerr << "KAURI_REPLICA_STOP stage=resp_join_begin replica="
+                  << get_id() << std::endl;
         resp_tcall->async_call([this](salticidae::ThreadCall::Handle &)
                                { resp_ec.stop(); });
         resp_thread.join();
+        std::cerr << "KAURI_REPLICA_STOP stage=resp_join_end replica="
+                  << get_id() << std::endl;
     }
     ec.stop();
 }
