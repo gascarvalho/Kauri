@@ -74,6 +74,20 @@ namespace hotstuff
             std::deque<uint256_t> &ready,
             const block_t &candidate,
             EntityStorage &storage);
+
+        /**
+         * Snapshot exact, read-only evidence for a root QC publication that
+         * the caller has already determined is blocked behind the pipeline
+         * head. Missing or contradictory retained state yields no event.
+         */
+        std::optional<RootQcQueueBlockedStructuredEvent>
+        make_root_qc_queue_blocked_event(
+            const ProposalContextLease &candidate_lease,
+            const ProposalContextLifecycle &proposal_contexts,
+            const std::deque<uint256_t> &piped,
+            const block_t &candidate,
+            EntityStorage &storage,
+            ReplicaID observer_replica);
     }
 
     /**
@@ -1683,6 +1697,9 @@ namespace hotstuff
             const ConfigurationId &configuration) noexcept;
         void emit_fault_contribution_opportunity(
             const ExperimentOmissionMarker &marker) noexcept;
+        void emit_root_qc_queue_blocked_event(
+            const ProposalContextLease &candidate_lease,
+            const block_t &candidate) noexcept;
         void emit_committed_block_event(
             const block_t &blk,
             const std::optional<ProposalKey> &committed_key,

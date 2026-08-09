@@ -6244,6 +6244,135 @@ namespace hotstuff
                 ready.end());
             return true;
         }
+
+        std::optional<RootQcQueueBlockedStructuredEvent>
+        make_root_qc_queue_blocked_event(
+            const ProposalContextLease &candidate_lease,
+            const ProposalContextLifecycle &proposal_contexts,
+            const std::deque<uint256_t> &piped,
+            const block_t &candidate,
+            EntityStorage &storage,
+            ReplicaID observer_replica)
+        {
+            if (candidate == nullptr || piped.size() < 2 ||
+                candidate_lease.key().block_hash !=
+                    candidate->get_hash() ||
+                candidate_lease.tree().parent.has_value() ||
+                candidate_lease.tree().root != observer_replica ||
+                candidate_lease.tree().local_replica != observer_replica)
+                return std::nullopt;
+
+            const auto active =
+                proposal_contexts.active_configuration();
+            if (!active.has_value() ||
+                *active != candidate_lease.key().configuration ||
+                !proposal_contexts.revalidate(candidate_lease))
+                return std::nullopt;
+
+            const auto candidate_position = std::find(
+                piped.begin(), piped.end(), candidate->get_hash());
+            if (candidate_position != std::next(piped.begin()))
+                return std::nullopt;
+
+            const auto head_hash = piped.front();
+            const auto &parent_hashes =
+                candidate->get_parent_hashes();
+            if (parent_hashes.empty() ||
+                parent_hashes.front() != head_hash)
+                return std::nullopt;
+
+            const auto head = storage.find_blk(head_hash);
+            if (head == nullptr || head->get_hash() != head_hash ||
+                head->get_height() ==
+                    std::numeric_limits<std::uint32_t>::max() ||
+                candidate->get_height() != head->get_height() + 1)
+                return std::nullopt;
+
+            const ProposalKey head_key{
+                candidate_lease.key().configuration, head_hash};
+            const auto head_lease =
+                proposal_contexts.acquire_open_context(head_key);
+            if (!head_lease.has_value() ||
+                head_lease->tree().parent.has_value() ||
+                head_lease->tree().root != observer_replica ||
+                head_lease->tree().local_replica != observer_replica ||
+                head_lease->generation() >=
+                    candidate_lease.generation())
+                return std::nullopt;
+
+            const auto head_snapshot =
+                proposal_contexts.snapshot(head_key);
+            const auto candidate_snapshot = proposal_contexts.snapshot(
+                candidate_lease.key());
+            const auto head_quorum =
+                proposal_contexts.frozen_global_quorum(*head_lease);
+            const auto candidate_quorum =
+                proposal_contexts.frozen_global_quorum(candidate_lease);
+            if (!head_snapshot.has_value() ||
+                !candidate_snapshot.has_value() ||
+                !head_quorum.has_value() ||
+                !candidate_quorum.has_value() ||
+                *head_quorum != *candidate_quorum ||
+                *candidate_quorum == 0 ||
+                head_snapshot->verified_signers.size() >=
+                    *candidate_quorum ||
+                candidate_snapshot->verified_signers.size() <
+                    *candidate_quorum)
+                return std::nullopt;
+
+            RootQcQueueBlockedStructuredEvent event;
+            event.configuration = candidate_lease.key().configuration;
+            event.observer_replica = observer_replica;
+            event.global_quorum = *candidate_quorum;
+            event.queue_head_position = 0;
+            event.queued_candidate_position = 1;
+            event.queue_head_context_generation =
+                head_lease->generation();
+            event.queued_candidate_context_generation =
+                candidate_lease.generation();
+            event.queue_head_block_height = head->get_height();
+            event.queue_head_block_hash = head_hash;
+            event.queued_candidate_block_height =
+                candidate->get_height();
+            event.queued_candidate_block_hash =
+                candidate->get_hash();
+            event.queued_candidate_parent_hash =
+                parent_hashes.front();
+            event.queue_head_signer_count =
+                head_snapshot->verified_signers.size();
+            event.queued_candidate_signer_count =
+                candidate_snapshot->verified_signers.size();
+            event.queued_candidate_qc_ready = true;
+            event.queued_candidate_qc_published = false;
+            return event;
+        }
+    }
+
+    void HotStuffBase::emit_root_qc_queue_blocked_event(
+        const ProposalContextLease &candidate_lease,
+        const block_t &candidate) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            audit_event_emitter == nullptr)
+            return;
+        try
+        {
+            auto event = detail::make_root_qc_queue_blocked_event(
+                candidate_lease,
+                *proposal_contexts,
+                piped_queue,
+                candidate,
+                *storage,
+                get_id());
+            if (!event.has_value())
+                return;
+            audit_event_emitter->emit_audit(
+                AuditStructuredEventPayload{std::move(*event)});
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
+        }
     }
 
     bool HotStuffBase::publish_exact_root_qc(
@@ -6278,10 +6407,14 @@ namespace hotstuff
                 active_configuration.has_value() &&
                 *active_configuration == lease.key().configuration;
         }
-        if (!active_supersession ||
-            !detail::consume_delivered_ancestor_piped_prefix(
-                piped_queue, rdy_queue, block, *storage))
+        const bool prefix_consumed =
+            active_supersession &&
+            detail::consume_delivered_ancestor_piped_prefix(
+                piped_queue, rdy_queue, block, *storage);
+        if (!prefix_consumed)
         {
+            if (queued_behind_head && active_supersession)
+                emit_root_qc_queue_blocked_event(lease, block);
             if (queued_behind_head &&
                 std::find(
                     rdy_queue.begin(), rdy_queue.end(),

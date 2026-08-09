@@ -344,6 +344,30 @@ hotstuff::ConfigurationId configuration(
     return hotstuff::ConfigurationId{epoch, tree, digest(label)};
 }
 
+hotstuff::ProposalTreeSnapshot root_tree_snapshot()
+{
+    hotstuff::ProposalTreeSnapshot tree;
+    tree.local_replica = 0;
+    tree.root = 0;
+    tree.parent = std::nullopt;
+    tree.direct_children = {1, 2};
+    tree.assigned_subtree = {0, 1, 2, 3, 4, 5, 6};
+    tree.child_subtrees = {
+        {1, {1, 3, 4}},
+        {2, {2, 5, 6}}};
+    tree.fanout = 2;
+    tree.pipeline_stretch = 2;
+    return tree;
+}
+
+hotstuff::ProposalContextMetadata root_context_metadata(
+    const hotstuff::ProposalKey &key,
+    std::size_t global_quorum = 5)
+{
+    return hotstuff::ProposalContextMetadata{
+        key, root_tree_snapshot(), global_quorum};
+}
+
 hotstuff::LeaderViewId view(
     const hotstuff::ConfigurationId &config,
     std::uint64_t generation,
@@ -2168,6 +2192,80 @@ TEST_CASE("a superseded predecessor remains eligible for a late QC",
     CHECK(ready.empty());
 }
 
+TEST_CASE("blocked root QC evidence uses both retained exact contexts",
+          "[l07][pipeline][root-qc-queue-blocked][context]"
+          "[intentional-red]")
+{
+    hotstuff::test::CommitRuleCore core;
+    const auto genesis = core.get_genesis();
+    const auto head = core.add_block(genesis, genesis);
+    const auto candidate = core.add_block(head, head);
+    const auto active = configuration(2, 0, "blocked-root-qc");
+    const hotstuff::ProposalKey head_key{active, head->get_hash()};
+    const hotstuff::ProposalKey candidate_key{
+        active, candidate->get_hash()};
+
+    hotstuff::ProposalContextLifecycle contexts;
+    const auto head_lease = contexts.admit_local(
+        root_context_metadata(head_key));
+    const auto candidate_lease = contexts.admit_local(
+        root_context_metadata(candidate_key));
+    REQUIRE(head_lease.has_value());
+    REQUIRE(candidate_lease.has_value());
+    contexts.activate_configuration(active);
+
+    REQUIRE(contexts.record_local_signer(*head_lease));
+    REQUIRE(contexts.record_verified_aggregate(
+        *head_lease, 1, std::set<hotstuff::ReplicaID>{1, 3, 4}));
+    REQUIRE(contexts.record_local_signer(*candidate_lease));
+    REQUIRE(contexts.record_verified_aggregate(
+        *candidate_lease,
+        1,
+        std::set<hotstuff::ReplicaID>{1, 3, 4}));
+    REQUIRE(contexts.record_verified_aggregate(
+        *candidate_lease, 2, std::set<hotstuff::ReplicaID>{2}));
+
+    const std::deque<hotstuff::uint256_t> piped{
+        head->get_hash(), candidate->get_hash()};
+    const auto event =
+        hotstuff::detail::make_root_qc_queue_blocked_event(
+            *candidate_lease,
+            contexts,
+            piped,
+            candidate,
+            *core.storage,
+            0);
+    REQUIRE(event.has_value());
+    CHECK(event->configuration == active);
+    CHECK(event->observer_replica == 0);
+    CHECK(event->global_quorum == 5);
+    CHECK(event->queue_head_position == 0);
+    CHECK(event->queued_candidate_position == 1);
+    CHECK(event->queue_head_context_generation ==
+          head_lease->generation());
+    CHECK(event->queued_candidate_context_generation ==
+          candidate_lease->generation());
+    CHECK(event->queue_head_block_height == head->get_height());
+    CHECK(event->queue_head_block_hash == head->get_hash());
+    CHECK(event->queued_candidate_block_height ==
+          candidate->get_height());
+    CHECK(event->queued_candidate_block_hash ==
+          candidate->get_hash());
+    CHECK(event->queued_candidate_parent_hash == head->get_hash());
+    CHECK(event->queue_head_signer_count == 4);
+    CHECK(event->queued_candidate_signer_count == 5);
+    CHECK(event->queued_candidate_qc_ready);
+    CHECK_FALSE(event->queued_candidate_qc_published);
+
+    CHECK_FALSE(hotstuff::detail::make_root_qc_queue_blocked_event(
+        *candidate_lease,
+        contexts,
+        piped,
+        candidate,
+        *core.storage,
+        1));
+}
+
 TEST_CASE("exact root QC supersession stays synchronous and fail closed",
           "[l07][pipeline][qc-supersession][integration]"
           "[intentional-red]")
@@ -2193,6 +2291,9 @@ TEST_CASE("exact root QC supersession stays synchronous and fail closed",
         "if (queued_behind_head)", active);
     const auto consume = publish.find(
         "consume_delivered_ancestor_piped_prefix");
+    const auto blocked_evidence = publish.find(
+        "emit_root_qc_queue_blocked_event");
+    const auto ready_queue = publish.find("rdy_queue.push_back");
     const auto update = publish.find("update_hqc");
     const auto resolve = publish.find("on_qc_finish");
     const auto success = publish.rfind("return true");
@@ -2205,6 +2306,8 @@ TEST_CASE("exact root QC supersession stays synchronous and fail closed",
     REQUIRE(active != std::string::npos);
     REQUIRE(active_guard != std::string::npos);
     REQUIRE(consume != std::string::npos);
+    REQUIRE(blocked_evidence != std::string::npos);
+    REQUIRE(ready_queue != std::string::npos);
     REQUIRE(update != std::string::npos);
     REQUIRE(resolve != std::string::npos);
     REQUIRE(success != std::string::npos);
@@ -2220,9 +2323,24 @@ TEST_CASE("exact root QC supersession stays synchronous and fail closed",
     CHECK(publish.find("frozen_global_quorum") == std::string::npos);
     CHECK(publish.find("->has_n(") == std::string::npos);
     CHECK(publish.find("config.nmajority") == std::string::npos);
+    CHECK(consume < blocked_evidence);
+    CHECK(blocked_evidence < ready_queue);
     CHECK(consume < update);
     CHECK(update < resolve);
     CHECK(resolve < success);
     CHECK(publish.find("timeout") == std::string::npos);
     CHECK(publish.find("transition(") == std::string::npos);
+
+    const auto evidence = source_slice(
+        hotstuff,
+        "void HotStuffBase::emit_root_qc_queue_blocked_event",
+        "bool HotStuffBase::publish_exact_root_qc");
+    CHECK(contains_in_order(
+        evidence,
+        {"epoch_protocol_mode != EpochProtocolMode::adaptive_v2",
+         "make_root_qc_queue_blocked_event(",
+         "audit_event_emitter->emit_audit("}));
+    CHECK(evidence.find("final_qc->verify") == std::string::npos);
+    CHECK(evidence.find("->has_n(") == std::string::npos);
+    CHECK(evidence.find("config.nmajority") == std::string::npos);
 }

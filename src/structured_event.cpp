@@ -393,6 +393,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 7:
             type = StructuredEventType::fault_contribution_opportunity;
             return true;
+        case 8:
+            type = StructuredEventType::pipeline_root_qc_queue_blocked;
+            return true;
         default:
             return false;
     }
@@ -530,16 +533,16 @@ const char *experiment_omission_action_name(
     return nullptr;
 }
 
-bool contribution_source_matches_actor(
+bool replica_source_matches(
     const StructuredEventConfig &config,
-    ReplicaID actor) noexcept
+    ReplicaID replica) noexcept
 {
     if (config.source.kind != StructuredEventSourceKind::replica)
         return false;
     try
     {
         return config.source.logical_id ==
-               "replica-" + std::to_string(actor);
+               "replica-" + std::to_string(replica);
     }
     catch (...)
     {
@@ -551,7 +554,7 @@ bool valid_fault_contribution_opportunity(
     const FaultContributionOpportunityStructuredEvent &event,
     const StructuredEventConfig &config) noexcept
 {
-    if (!contribution_source_matches_actor(config, event.actor) ||
+    if (!replica_source_matches(config, event.actor) ||
         event.fault_mode !=
             "tiered_persistent_responsive_omission_v2" ||
         event.proposal.configuration.epoch_digest == uint256_t{} ||
@@ -621,6 +624,36 @@ bool valid_fault_contribution_opportunity(
         scheduled_omission ? omission_action
                            : ExperimentOmissionAction::forward;
     return event.scheduled_action == expected_action;
+}
+
+bool valid_root_qc_queue_blocked(
+    const RootQcQueueBlockedStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    if (!replica_source_matches(config, event.observer_replica) ||
+        event.configuration.epoch_digest == uint256_t{} ||
+        event.global_quorum == 0 || event.queue_head_position != 0 ||
+        event.queued_candidate_position != 1 ||
+        event.queue_head_context_generation == 0 ||
+        event.queued_candidate_context_generation <=
+            event.queue_head_context_generation ||
+        event.queue_head_block_height == 0 ||
+        event.queue_head_block_height ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        event.queued_candidate_block_height !=
+            event.queue_head_block_height + 1 ||
+        event.queue_head_block_hash == uint256_t{} ||
+        event.queued_candidate_block_hash == uint256_t{} ||
+        event.queued_candidate_block_hash ==
+            event.queue_head_block_hash ||
+        event.queued_candidate_parent_hash !=
+            event.queue_head_block_hash ||
+        event.queue_head_signer_count >= event.global_quorum ||
+        event.queued_candidate_signer_count < event.global_quorum)
+        return false;
+
+    return event.queued_candidate_qc_ready &&
+           !event.queued_candidate_qc_published;
 }
 
 const char *reputation_outcome_name(
@@ -1120,6 +1153,10 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                     FaultContributionOpportunityStructuredEvent>(
                         payload),
                 config);
+        case 8:
+            return valid_root_qc_queue_blocked(
+                std::get<RootQcQueueBlockedStructuredEvent>(payload),
+                config);
         default:
             return false;
     }
@@ -1425,6 +1462,46 @@ void append_fault_contribution_opportunity_payload(
     builder.append_integer(event.responsive_degraded_actor_count);
     builder.append(",\"fault_mode\":");
     builder.append_escaped(event.fault_mode);
+    builder.append('}');
+}
+
+void append_root_qc_queue_blocked_payload(
+    JsonLineBuilder &builder,
+    const RootQcQueueBlockedStructuredEvent &event)
+{
+    builder.append('{');
+    append_configuration(builder, event.configuration);
+    builder.append(",\"observer_replica\":");
+    builder.append_integer(event.observer_replica);
+    builder.append(",\"global_quorum\":");
+    builder.append_integer(event.global_quorum);
+    builder.append(",\"queue_head_position\":");
+    builder.append_integer(event.queue_head_position);
+    builder.append(",\"queued_candidate_position\":");
+    builder.append_integer(event.queued_candidate_position);
+    builder.append(",\"queue_head_context_generation\":");
+    builder.append_integer(event.queue_head_context_generation);
+    builder.append(",\"queued_candidate_context_generation\":");
+    builder.append_integer(event.queued_candidate_context_generation);
+    builder.append(",\"queue_head_block_height\":");
+    builder.append_integer(event.queue_head_block_height);
+    builder.append(",\"queue_head_block_hash\":");
+    builder.append_escaped(event.queue_head_block_hash.to_hex());
+    builder.append(",\"queued_candidate_block_height\":");
+    builder.append_integer(event.queued_candidate_block_height);
+    builder.append(",\"queued_candidate_block_hash\":");
+    builder.append_escaped(event.queued_candidate_block_hash.to_hex());
+    builder.append(",\"queued_candidate_parent_hash\":");
+    builder.append_escaped(event.queued_candidate_parent_hash.to_hex());
+    builder.append(",\"queue_head_signer_count\":");
+    builder.append_integer(event.queue_head_signer_count);
+    builder.append(",\"queued_candidate_signer_count\":");
+    builder.append_integer(event.queued_candidate_signer_count);
+    builder.append(",\"queued_candidate_qc_ready\":");
+    builder.append(event.queued_candidate_qc_ready ? "true" : "false");
+    builder.append(",\"queued_candidate_qc_published\":");
+    builder.append(
+        event.queued_candidate_qc_published ? "true" : "false");
     builder.append('}');
 }
 
@@ -1974,6 +2051,11 @@ std::string serialize_audit_event(
                 std::get<
                     FaultContributionOpportunityStructuredEvent>(event));
             break;
+        case 8:
+            append_root_qc_queue_blocked_payload(
+                builder,
+                std::get<RootQcQueueBlockedStructuredEvent>(event));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -2472,6 +2554,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2_shape_decision";
         case StructuredEventType::fault_contribution_opportunity:
             return "fault.contribution_opportunity";
+        case StructuredEventType::pipeline_root_qc_queue_blocked:
+            return "pipeline.root_qc_queue_blocked";
         default:
             break;
     }

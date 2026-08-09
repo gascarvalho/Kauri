@@ -550,6 +550,7 @@ using hotstuff::MonotonicRawStructuredEventClock;
 using hotstuff::ProcessLifecycleEvent;
 using hotstuff::ProcessLifecycleState;
 using hotstuff::ProposalKey;
+using hotstuff::RootQcQueueBlockedStructuredEvent;
 using hotstuff::RequiredBranchSignerGap;
 using hotstuff::ReputationEvidenceAppliedStructuredEvent;
 using hotstuff::ReplicaID;
@@ -698,6 +699,28 @@ FaultContributionOpportunityStructuredEvent contribution_opportunity_event()
     event.hard_actor_count = 3;
     event.responsive_degraded_actor_count = 7;
     event.fault_mode = "tiered_persistent_responsive_omission_v2";
+    return event;
+}
+
+RootQcQueueBlockedStructuredEvent root_qc_queue_blocked_event()
+{
+    RootQcQueueBlockedStructuredEvent event;
+    event.configuration = configuration(2, 0, "blocked-qc-epoch");
+    event.observer_replica = 0;
+    event.global_quorum = 21;
+    event.queue_head_position = 0;
+    event.queued_candidate_position = 1;
+    event.queue_head_context_generation = 40;
+    event.queued_candidate_context_generation = 41;
+    event.queue_head_block_height = 100;
+    event.queue_head_block_hash = digest("blocked-qc-head");
+    event.queued_candidate_block_height = 101;
+    event.queued_candidate_block_hash = digest("blocked-qc-candidate");
+    event.queued_candidate_parent_hash = event.queue_head_block_hash;
+    event.queue_head_signer_count = 20;
+    event.queued_candidate_signer_count = 21;
+    event.queued_candidate_qc_ready = true;
+    event.queued_candidate_qc_published = false;
     return event;
 }
 
@@ -1845,8 +1868,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 8,
-        "the audit capability also admits contribution opportunities");
+        std::variant_size<AuditStructuredEventPayload>::value == 9,
+        "the audit capability appends pipeline blockage evidence");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -1877,6 +1900,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<7, AuditStructuredEventPayload>,
             FaultContributionOpportunityStructuredEvent>::value,
         "the eighth audit payload is a prospective contribution");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<8, AuditStructuredEventPayload>,
+            RootQcQueueBlockedStructuredEvent>::value,
+        "the ninth audit payload is an exact blocked root QC");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -4821,4 +4849,108 @@ TEST_CASE(
     auto impossible_role_ordinal = event;
     impossible_role_ordinal.role_contribution_ordinal = 82;
     CHECK(rejects(std::move(impossible_role_ordinal)));
+}
+
+TEST_CASE(
+    "blocked root QC serializes exact source-bound queue evidence",
+    "[adaptive-v2][pipeline][root-qc-queue-blocked][structured-event]"
+    "[intentional-red]")
+{
+    const auto event = root_qc_queue_blocked_event();
+    const AuditStructuredEventPayload payload{event};
+    CHECK(hotstuff::kStructuredEventSchemaVersion == 1);
+    CHECK(hotstuff::structured_event_type(payload) ==
+          StructuredEventType::pipeline_root_qc_queue_blocked);
+    CHECK(std::string(hotstuff::structured_event_type_name(
+              StructuredEventType::pipeline_root_qc_queue_blocked)) ==
+          "pipeline.root_qc_queue_blocked");
+
+    auto config = event_config();
+    config.source.logical_id = "replica-0";
+    config.designated_commit_observer.reset();
+    FakeClock clock({600});
+    MemoryOutput output;
+    StructuredEventSink sink(config, clock, output);
+    sink.emit_audit(payload);
+    sink.shutdown();
+
+    const auto expected =
+        "{\"event_schema_version\":1,"
+        "\"run_id\":\"run-structured-event\","
+        "\"source_kind\":\"replica\","
+        "\"source_id\":\"replica-0\","
+        "\"source_instance\":\"spawn-9\","
+        "\"source_sequence\":1,"
+        "\"source_monotonic_ns\":600,"
+        "\"event_type\":\"pipeline.root_qc_queue_blocked\","
+        "\"payload\":{"
+        "\"epoch_number\":2,"
+        "\"tree_id\":0,"
+        "\"epoch_digest\":\"" +
+        event.configuration.epoch_digest.to_hex() + "\","
+        "\"observer_replica\":0,"
+        "\"global_quorum\":21,"
+        "\"queue_head_position\":0,"
+        "\"queued_candidate_position\":1,"
+        "\"queue_head_context_generation\":40,"
+        "\"queued_candidate_context_generation\":41,"
+        "\"queue_head_block_height\":100,"
+        "\"queue_head_block_hash\":\"" +
+        event.queue_head_block_hash.to_hex() + "\","
+        "\"queued_candidate_block_height\":101,"
+        "\"queued_candidate_block_hash\":\"" +
+        event.queued_candidate_block_hash.to_hex() + "\","
+        "\"queued_candidate_parent_hash\":\"" +
+        event.queued_candidate_parent_hash.to_hex() + "\","
+        "\"queue_head_signer_count\":20,"
+        "\"queued_candidate_signer_count\":21,"
+        "\"queued_candidate_qc_ready\":true,"
+        "\"queued_candidate_qc_published\":false}}\n";
+    CHECK(rendered(output) == expected);
+    CHECK(sink.health().healthy);
+    CHECK(sink.health().complete_records == 1);
+
+    const auto rejects = [](StructuredEventConfig invalid_config,
+                            RootQcQueueBlockedStructuredEvent invalid) {
+        FakeClock invalid_clock({601});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            std::move(invalid_config), invalid_clock, invalid_output);
+        invalid_sink.emit_audit(
+            AuditStructuredEventPayload{std::move(invalid)});
+        const auto failed = invalid_sink.health();
+        return !failed.healthy && failed.stopped &&
+               failed.first_failure ==
+                   StructuredEventFailure::invalid_payload &&
+               failed.last_assigned_sequence == 0 &&
+               invalid_output.bytes().empty();
+    };
+
+    auto mismatched_source = config;
+    mismatched_source.source.logical_id = "replica-1";
+    CHECK(rejects(std::move(mismatched_source), event));
+
+    auto invalid = event;
+    invalid.queue_head_signer_count = invalid.global_quorum;
+    CHECK(rejects(config, std::move(invalid)));
+
+    invalid = event;
+    invalid.queued_candidate_signer_count = invalid.global_quorum - 1;
+    CHECK(rejects(config, std::move(invalid)));
+
+    invalid = event;
+    invalid.queued_candidate_position = 2;
+    CHECK(rejects(config, std::move(invalid)));
+
+    invalid = event;
+    invalid.queued_candidate_parent_hash = digest("wrong-parent");
+    CHECK(rejects(config, std::move(invalid)));
+
+    invalid = event;
+    invalid.queued_candidate_qc_ready = false;
+    CHECK(rejects(config, std::move(invalid)));
+
+    invalid = event;
+    invalid.queued_candidate_qc_published = true;
+    CHECK(rejects(config, std::move(invalid)));
 }

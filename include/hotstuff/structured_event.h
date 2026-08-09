@@ -130,6 +130,31 @@ struct FaultContributionOpportunityStructuredEvent
     std::string fault_mode;
 };
 
+/**
+ * Exact replica-local witness that a fixed-quorum root QC was ready but its
+ * later pipelined proposal could not publish through the current queue head.
+ * This payload is observational and grants no consensus authority.
+ */
+struct RootQcQueueBlockedStructuredEvent
+{
+    ConfigurationId configuration;
+    ReplicaID observer_replica{0};
+    std::size_t global_quorum{0};
+    std::size_t queue_head_position{0};
+    std::size_t queued_candidate_position{0};
+    std::uint64_t queue_head_context_generation{0};
+    std::uint64_t queued_candidate_context_generation{0};
+    std::uint64_t queue_head_block_height{0};
+    uint256_t queue_head_block_hash;
+    std::uint64_t queued_candidate_block_height{0};
+    uint256_t queued_candidate_block_hash;
+    uint256_t queued_candidate_parent_hash;
+    std::size_t queue_head_signer_count{0};
+    std::size_t queued_candidate_signer_count{0};
+    bool queued_candidate_qc_ready{false};
+    bool queued_candidate_qc_published{false};
+};
+
 /** Exact schedule installed after one adaptive-v2 command commits. */
 struct EpochCommandCommittedStructuredEvent
 {
@@ -266,7 +291,8 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV2ManagerSessionTerminalStructuredEvent,
     EvidenceObservationAcceptedStructuredEvent,
     AdaptiveV2ShapeDecisionStructuredEvent,
-    FaultContributionOpportunityStructuredEvent>;
+    FaultContributionOpportunityStructuredEvent,
+    RootQcQueueBlockedStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -366,6 +392,7 @@ enum class StructuredEventType : std::uint8_t
     evidence_observation_accepted,
     adaptive_v2_shape_decision,
     fault_contribution_opportunity,
+    pipeline_root_qc_queue_blocked,
 };
 
 StructuredEventType structured_event_type(
