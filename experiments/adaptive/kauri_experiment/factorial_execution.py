@@ -35,6 +35,7 @@ from .factorial_manifest import (
     FactorialManifestError,
     FactorialSlot,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
+    PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     PortAllocation,
@@ -2601,6 +2602,50 @@ def _single_manager_event(
     return matches[0] if matches else None
 
 
+def _manager_selection_event(
+    streams: Mapping[str, Sequence[_Event]],
+    *,
+    cycle_ordinal: int,
+    precontainment_shape_evaluation_contract: str | None,
+) -> _Event | None:
+    """Bind each cycle to its exact frozen manager-selection anchor."""
+
+    if precontainment_shape_evaluation_contract not in {
+        None,
+        PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
+    }:
+        raise FactorialExecutionError(
+            "manager selection has an unknown precontainment shape contract"
+        )
+    preserves_initial_shape = (
+        cycle_ordinal == 0
+        and precontainment_shape_evaluation_contract
+        == PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+    )
+    if preserves_initial_shape:
+        if (
+            _single_manager_event(
+                streams,
+                event_type="adaptive_v2_shape_decision",
+                cycle_ordinal=cycle_ordinal,
+            )
+            is not None
+        ):
+            raise FactorialExecutionError(
+                "shape-preserving cycle 0 emitted a shape-v1 decision"
+            )
+        return _single_manager_event(
+            streams,
+            event_type="adaptive_v2_evidence_snapshot",
+            cycle_ordinal=cycle_ordinal,
+        )
+    return _single_manager_event(
+        streams,
+        event_type="adaptive_v2_shape_decision",
+        cycle_ordinal=cycle_ordinal,
+    )
+
+
 def _successful_manager_terminal(
     streams: Mapping[str, Sequence[_Event]],
     *,
@@ -2666,6 +2711,9 @@ def observe_slot_phases(
             "transition observer has an unknown manager-selection clock bound"
         )
     expected_clean_exits: set[str] = set()
+    precontainment_shape_contract = (
+        spec.causal_acceptance.precontainment_shape_evaluation_contract
+    )
 
     def authorize_clean_exit(record: ProcessRecord) -> bool:
         if record.name in expected_clean_exits:
@@ -2809,16 +2857,19 @@ def observe_slot_phases(
     stable_events: dict[int, tuple[_Event, Mapping[str, object], int]] = {}
     phase_configurations: dict[int, tuple[int, str]] = {}
     for cycle, epoch in ((0, 1), (1, 2)):
+
         def manager_selection() -> _Event | None:
             current = streams()
-            return _single_manager_event(
+            return _manager_selection_event(
                 current,
-                event_type="adaptive_v2_shape_decision",
                 cycle_ordinal=cycle,
+                precontainment_shape_evaluation_contract=(
+                    precontainment_shape_contract
+                ),
             )
 
         def transition_ready(
-            selected_shape: _Event | None = None,
+            selected_anchor: _Event | None = None,
         ) -> tuple[_Event, _Event, _Event] | None:
             current = streams()
             command = _replica_transition_barrier(
@@ -2833,32 +2884,39 @@ def observe_slot_phases(
                 event_type="epoch.activated",
                 epoch=epoch,
             )
-            shape = _single_manager_event(
+            selection = _manager_selection_event(
                 current,
-                event_type="adaptive_v2_shape_decision",
                 cycle_ordinal=cycle,
+                precontainment_shape_evaluation_contract=(
+                    precontainment_shape_contract
+                ),
             )
             terminal = _successful_manager_terminal(
                 current,
                 cycle_ordinal=cycle,
             )
-            if selected_shape is not None and shape != selected_shape:
+            if selected_anchor is not None and selection != selected_anchor:
                 raise FactorialExecutionError(
                     f"epoch-{epoch} manager selection identity changed"
                 )
-            if command is None or activation is None or shape is None or terminal is None:
+            if (
+                command is None
+                or activation is None
+                or selection is None
+                or terminal is None
+            ):
                 return None
             if cycle == 0 and command.timestamp_ns < fault_evidence_end:
                 raise FactorialExecutionError(
                     "epoch-1 command occurred before the frozen fault-evidence window ended"
                 )
-            return command, activation, shape
+            return command, activation, selection
 
         if observation_bound_rule == (
             "shared_slot_hard_deadline_until_manager_selection_v1"
         ):
-            shape = _wait_until(
-                f"manager shape selection for epoch-{epoch}",
+            selection = _wait_until(
+                f"manager selection anchor for epoch-{epoch}",
                 manager_selection,
                 phase_timeout_s=_remaining_hard_deadline_s(
                     hard_deadline_ns, raw_now_ns
@@ -2871,14 +2929,14 @@ def observe_slot_phases(
                 expected_clean_exits=expected_clean_exits,
                 clean_exit_authorizer=authorize_clean_exit,
             )
-            if not isinstance(shape, _Event):
+            if not isinstance(selection, _Event):
                 raise FactorialExecutionError(
                     f"epoch-{epoch} manager selection is malformed"
                 )
             command, activation, _ = _wait_until(
                 f"exact epoch-{epoch} command, terminal, and activation "
                 "after manager selection",
-                lambda: transition_ready(shape),
+                lambda: transition_ready(selection),
                 phase_timeout_s=(
                     spec.fault_window.transition_convergence_deadline_s
                     + spec.fault_window.schedule_slack_s
@@ -2892,8 +2950,9 @@ def observe_slot_phases(
                 clean_exit_authorizer=authorize_clean_exit,
             )
         else:
-            command, activation, shape = _wait_until(
-                f"exact epoch-{epoch} command, shape decision, terminal, and activation",
+            command, activation, selection = _wait_until(
+                f"exact epoch-{epoch} command, manager selection, terminal, "
+                "and activation",
                 transition_ready,
                 phase_timeout_s=(
                     spec.fault_window.transition_convergence_deadline_s
@@ -2907,7 +2966,7 @@ def observe_slot_phases(
                 expected_clean_exits=expected_clean_exits,
                 clean_exit_authorizer=authorize_clean_exit,
             )
-        transition_events[epoch] = (command, activation, shape)
+        transition_events[epoch] = (command, activation, selection)
         activated_epoch, _, activated_digest, _ = _epoch_activation_identity(
             activation
         )
@@ -4245,12 +4304,19 @@ def build_n31_coverage_smoke_slot(
     frozen_campaign_paths = {
         "results/shape-placement-factorial-v15/slot-066-n31-f5-b05-P": "v15",
         "results/shape-placement-factorial-v16/slot-066-n31-f5-b05-P": "v16",
+        "results/shape-placement-factorial-v17/slot-066-n31-f5-b05-P": "v17",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
         "v15": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
         "v16": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        "v17": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     }.get(manifest_version)
+    expected_shape_evaluation_contract = (
+        PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+        if manifest_version == "v17"
+        else None
+    )
     if (
         manifest_version is None
         or template.slot_id != "slot-066-n31-f5-b05-P"
@@ -4310,6 +4376,8 @@ def build_n31_coverage_smoke_slot(
         != PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
         or responsive.causal_timeout_eligibility
         != expected_timeout_eligibility
+        or responsive.precontainment_shape_evaluation_contract
+        != expected_shape_evaluation_contract
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "

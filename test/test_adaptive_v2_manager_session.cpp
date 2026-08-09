@@ -1434,11 +1434,7 @@ void verify_bounded_execution_audit_contract()
         CHECK(controller->score_trajectory.size() <=
               session_config().controller.reputation_limits
                   .maximum_audit_updates);
-        REQUIRE(controller->shape_decision.has_value());
-        CHECK(hotstuff::valid_shape_decision_record(
-            *controller->shape_decision));
-        CHECK(controller->shape_decision->evidence_cutoff ==
-              controller->current_cutoff);
+        CHECK_FALSE(controller->shape_decision.has_value());
 
         auto convergence = read_only.convergence_audit();
         REQUIRE(convergence.has_value());
@@ -1935,6 +1931,8 @@ TEST_CASE(
     disabled_config.controller.shape_adaptation_enabled = true;
     disabled_config.controller.shape_selection.candidate_fanouts =
         {5, 2, 3, 5};
+    const auto disabled_fanout =
+        disabled_config.controller.placement.shape.fanout;
     Fixture disabled(std::move(disabled_config));
     auto disabled_policy = containment_policy();
     disabled_policy.apply_shape_selection = false;
@@ -1943,17 +1941,12 @@ TEST_CASE(
 
     const auto disabled_audit = disabled.session.controller_audit();
     REQUIRE(disabled_audit.has_value());
-    REQUIRE(disabled_audit->shape_decision.has_value());
-    const auto &disabled_decision = *disabled_audit->shape_decision;
-    REQUIRE(disabled_decision.selected_fanout !=
-            disabled_decision.current_fanout);
-    CHECK(disabled_decision.applied_fanout ==
-          disabled_decision.current_fanout);
+    CHECK_FALSE(disabled_audit->shape_decision.has_value());
     REQUIRE(disabled.session.successor_bundle() != nullptr);
     for (const auto &tree :
          disabled.session.successor_bundle()->definition().trees)
     {
-        CHECK(tree.fanout == disabled_decision.current_fanout);
+        CHECK(tree.fanout == disabled_fanout);
     }
 
     auto enabled_config = session_config();
@@ -1970,10 +1963,6 @@ TEST_CASE(
     REQUIRE(enabled_audit.has_value());
     REQUIRE(enabled_audit->shape_decision.has_value());
     const auto &enabled_decision = *enabled_audit->shape_decision;
-    CHECK(enabled_decision.selected_fanout ==
-          disabled_decision.selected_fanout);
-    CHECK(enabled_decision.current_fanout ==
-          disabled_decision.current_fanout);
     CHECK(enabled_decision.applied_fanout ==
           enabled_decision.selected_fanout);
     REQUIRE(enabled.session.successor_bundle() != nullptr);

@@ -1490,8 +1490,123 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "controller maps a production N-tree predecessor to a Q-tree successor",
-    "[shape25][adaptive-v2][manager-controller][shape-v1][n7]")
+    "initial containment preserves shape without latency evidence when "
+    "shape selection is disabled",
+    "[shape25][adaptive-v2][manager-controller][shape-v1][n7]"
+    "[containment]")
+{
+    Fixture fixture;
+    fixture.freeze_baseline();
+    for (std::size_t attempt_window = 0;
+         attempt_window < 6;
+         ++attempt_window)
+    {
+        fixture.persistent_timeouts(0);
+        fixture.persistent_timeouts(1);
+    }
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    REQUIRE(fixture.controller->selection_audit()->snapshot != nullptr);
+    for (const auto replica_id : std::vector<ReplicaID>{0, 1})
+    {
+        const auto *entry = ranking_entry(
+            *fixture.controller->selection_audit()->snapshot,
+            replica_id);
+        REQUIRE(entry != nullptr);
+        CHECK(entry->classification ==
+              ResponsivenessClass::nonresponsive);
+        CHECK_FALSE(entry->latency_percentile_us.has_value());
+    }
+    CHECK(fixture.controller->shape_decision() == nullptr);
+
+    const auto *bundle = fixture.controller->successor_bundle();
+    REQUIRE(bundle != nullptr);
+    for (const auto &tree : bundle->definition().trees)
+    {
+        CHECK(tree.fanout == fixture.config.placement.shape.fanout);
+        CHECK(tree.pipeline_stretch ==
+              fixture.config.placement.shape.pipeline_stretch);
+        CHECK(tree.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+    }
+}
+
+TEST_CASE(
+    "initial containment remains fail closed without latency evidence when "
+    "shape selection is enabled",
+    "[shape25][adaptive-v2][manager-controller][shape-v1][n7]"
+    "[containment][fail-closed]")
+{
+    Fixture fixture;
+    fixture.controller.reset();
+    fixture.config.transition_policy.apply_shape_selection = true;
+    fixture.config.shape_adaptation_enabled = true;
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+    fixture.freeze_baseline();
+    for (std::size_t attempt_window = 0;
+         attempt_window < 6;
+         ++attempt_window)
+    {
+        fixture.persistent_timeouts(0);
+        fixture.persistent_timeouts(1);
+    }
+
+    CHECK(fixture.controller->evaluate() ==
+          AdaptiveV2ManagerControllerStatus::unhealthy);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    REQUIRE(fixture.controller->selection_audit()->snapshot != nullptr);
+    for (const auto replica_id : std::vector<ReplicaID>{0, 1})
+    {
+        const auto *entry = ranking_entry(
+            *fixture.controller->selection_audit()->snapshot,
+            replica_id);
+        REQUIRE(entry != nullptr);
+        CHECK(entry->classification ==
+              ResponsivenessClass::nonresponsive);
+        CHECK_FALSE(entry->latency_percentile_us.has_value());
+    }
+    CHECK(fixture.controller->shape_decision() == nullptr);
+    CHECK(fixture.controller->successor_bundle() == nullptr);
+    CHECK_FALSE(fixture.controller->healthy());
+}
+
+TEST_CASE(
+    "initial containment rejects a configured shape that does not match "
+    "the predecessor",
+    "[shape25][adaptive-v2][manager-controller][shape-preservation][n7]"
+    "[containment][fail-closed]")
+{
+    Fixture fixture;
+    fixture.controller.reset();
+    SECTION("fanout")
+    {
+        fixture.config.placement.shape.fanout = 3;
+    }
+    SECTION("pipeline stretch")
+    {
+        fixture.config.placement.shape.pipeline_stretch = 3;
+    }
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+    fixture.freeze_baseline();
+    fixture.persistent_timeouts(5);
+    fixture.persistent_timeouts(6);
+
+    CHECK(fixture.controller->evaluate() ==
+          AdaptiveV2ManagerControllerStatus::unhealthy);
+    CHECK(fixture.controller->shape_decision() == nullptr);
+    CHECK(fixture.controller->successor_bundle() == nullptr);
+    CHECK_FALSE(fixture.controller->healthy());
+}
+
+TEST_CASE(
+    "initial containment maps N trees to Q while preserving configured shape",
+    "[shape25][adaptive-v2][manager-controller][shape-preservation][n7]")
 {
     Fixture fixture;
     fixture.freeze_baseline();
@@ -1500,20 +1615,8 @@ TEST_CASE(
 
     REQUIRE(fixture.controller->evaluate() ==
             AdaptiveV2ManagerControllerStatus::successor_ready);
-    REQUIRE(fixture.controller->shape_decision() != nullptr);
-    const auto decision = *fixture.controller->shape_decision();
-    CHECK(decision.evidence_cutoff ==
-          fixture.controller->current_cutoff());
-    CHECK(decision.selected_fanout == 5);
-    CHECK(decision.applied_fanout == 2);
-    CHECK(decision.fixed_pipeline_stretch == 2);
+    CHECK(fixture.controller->shape_decision() == nullptr);
     CHECK(fixture.ingress.current_epoch().trees().size() == 7);
-    CHECK(decision.predecessor_tree_count == 7);
-    CHECK(decision.tree_count ==
-          fixture.ingress.quorum_metadata().quorum);
-    CHECK(decision.reference_tree_rule ==
-          hotstuff::kShapeV1ReferenceTreeRule);
-    CHECK(hotstuff::valid_shape_decision_record(decision));
 
     const auto *bundle = fixture.controller->successor_bundle();
     REQUIRE(bundle != nullptr);
@@ -1521,8 +1624,10 @@ TEST_CASE(
           fixture.ingress.quorum_metadata().quorum);
     for (const auto &tree : bundle->definition().trees)
     {
-        CHECK(tree.fanout == decision.current_fanout);
-        CHECK(tree.pipeline_stretch == 2);
+        CHECK(tree.fanout ==
+              fixture.config.placement.shape.fanout);
+        CHECK(tree.pipeline_stretch ==
+              fixture.config.placement.shape.pipeline_stretch);
         CHECK(tree.wait_exempt_leaves ==
               std::vector<ReplicaID>{5, 6});
     }
@@ -1530,19 +1635,16 @@ TEST_CASE(
     fixture.record(2, 0, ResponseOutcome::on_time, "after-shape-cutoff");
     CHECK(fixture.controller->evaluate() ==
           AdaptiveV2ManagerControllerStatus::already_ready);
-    REQUIRE(fixture.controller->shape_decision() != nullptr);
-    CHECK(fixture.controller->shape_decision()->decision_digest ==
-          decision.decision_digest);
-    CHECK(fixture.controller->shape_decision()->evidence_cutoff ==
-          decision.evidence_cutoff);
+    CHECK(fixture.controller->shape_decision() == nullptr);
 }
 
 TEST_CASE(
-    "shape factor controls application without entering shape-v1",
+    "shape factor enables shape-v1 application for initial containment",
     "[shape25][adaptive-v2][manager-controller][shape-factor][n7]")
 {
     Fixture fixture;
     fixture.controller.reset();
+    fixture.config.transition_policy.apply_shape_selection = true;
     fixture.config.shape_adaptation_enabled = true;
     fixture.config.shape_selection.candidate_fanouts = {5, 2, 3, 5};
     fixture.controller =

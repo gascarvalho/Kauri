@@ -70,6 +70,7 @@ from .factorial_manifest import (
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
+    PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
     V2_PLAN_SHA256,
@@ -112,6 +113,9 @@ from .factorial_manifest import (
     V15_MANIFEST_ID,
     V15_MANIFEST_SHA256,
     V15_PLAN_SHA256,
+    V16_MANIFEST_ID,
+    V16_MANIFEST_SHA256,
+    V16_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -150,8 +154,11 @@ EXCLUDED_COVERAGE_SMOKE_SLOT_ID = "slot-066-n31-f5-b05-P"
 V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v15-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V16_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v16-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v17-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -240,14 +247,23 @@ V15_SMOKE_RUNTIME_SHA256 = (
 V15_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "e5ce14245c9c225ac748c66e1447151eda802397f9bf9f84e5378bf09de99209"
 )
-FROZEN_RUNTIME_SHA256 = (
+V16_RUNTIME_SHA256 = (
     "f79b565f53fe5f0ec950be14ae1c0e1d0faf4d9c2ef955f759aa3e1de1de70da"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V16_SMOKE_RUNTIME_SHA256 = (
     "0e5e239655b166eb6b1ebee91c8a34105d586a3e288f90b79217e52fdffde67c"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V16_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "e466b66c35795d671aae050831870aba45e89ecf4f4c68033185e2b8ecb89e2a"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "4de3d25cc3f6ed0325e39cc670c27d5db67c3facb7bb081bf8f93707094c0fac"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "28aa251fb7a21296eec0ef3b49f9e1c6c68dc30d4cda83998f9ee1559896ae07"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "7c4a5b7be38b7e985326e3c2286cac71891c2dc32488087064b4f85566d81d70"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -341,6 +357,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V13_MANIFEST_ID,
         V14_MANIFEST_ID,
         V15_MANIFEST_ID,
+        V16_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -392,7 +409,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V16_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
@@ -405,7 +422,12 @@ def _uses_source_bound_contribution_opportunities(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V14_MANIFEST_ID, V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V14_MANIFEST_ID,
+            V15_MANIFEST_ID,
+            V16_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and responsive.marker_completeness_witness
         == RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2
@@ -415,7 +437,12 @@ def _uses_source_bound_contribution_opportunities(
 def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
     return (
         manifest.manifest_id
-        in {V14_MANIFEST_ID, V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V14_MANIFEST_ID,
+            V15_MANIFEST_ID,
+            V16_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
     )
 
@@ -425,10 +452,27 @@ def _uses_precontainment_fault_coverage(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V15_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V15_MANIFEST_ID, V16_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and responsive.precontainment_fault_coverage_gate
         == PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+    )
+
+
+def _uses_precontainment_shape_preservation(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and getattr(
+            responsive,
+            "precontainment_shape_evaluation_contract",
+            None,
+        )
+        == PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
     )
 
 
@@ -624,6 +668,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V15_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V15_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V16_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V16_MANIFEST_ID,
+            manifest_sha256=V16_MANIFEST_SHA256,
+            plan_sha256=V16_PLAN_SHA256,
+            runtime_sha256=V16_RUNTIME_SHA256,
+            smoke_runtime_sha256=V16_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V16_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2260,6 +2314,11 @@ def _is_excluded_coverage_smoke_slot(
             V15_COVERAGE_SMOKE_RUNTIME_SHA256,
             V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V16_MANIFEST_ID: (
+            V16_RUNTIME_SHA256,
+            V16_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V16_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2296,6 +2355,8 @@ def _is_excluded_coverage_smoke_slot(
 def _coverage_smoke_result_root(manifest_id: str) -> str:
     if manifest_id == V15_MANIFEST_ID:
         return V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V16_MANIFEST_ID:
+        return V16_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -2616,6 +2677,10 @@ def _validate_runtime_slot(
             artifact_identity["precontainment_fault_coverage_gate"] = (
                 PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
             )
+        if _uses_precontainment_shape_preservation(manifest):
+            artifact_identity[
+                "precontainment_shape_evaluation_contract"
+            ] = PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
     else:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -2743,6 +2808,10 @@ def _validate_runtime_slot(
                 ),
             }
         )
+    if _uses_precontainment_shape_preservation(manifest):
+        expected_causal_acceptance[
+            "precontainment_shape_evaluation_contract"
+        ] = PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
     if dict(
         _mapping(runtime.get("causal_acceptance"), "runtime causal acceptance")
     ) != expected_causal_acceptance:
@@ -2811,6 +2880,7 @@ def _validate_runtime_slot(
         V13_MANIFEST_ID,
         V14_MANIFEST_ID,
         V15_MANIFEST_ID,
+        V16_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -8028,6 +8098,7 @@ def _validate_native_transitions(
     expected_convergence_deadline_s: int,
     transition_observation_bound_rule: str,
     cutoff_times: Mapping[str, int],
+    manifest: FrozenFactorialManifest,
 ) -> None:
     if len(bundles) != 2:
         _fail("slot does not contain exactly two decoded successor bundles")
@@ -8112,6 +8183,19 @@ def _validate_native_transitions(
     ]
     if len(terminals) != 2:
         _fail("manager did not emit exactly two actual transition terminals")
+    selection_events, _ = _adaptation_cycle_event_contract(
+        snapshot_events=tuple(
+            event
+            for event in manager_events
+            if event.event_type == "adaptive_v2_evidence_snapshot"
+        ),
+        shape_events=tuple(
+            event
+            for event in manager_events
+            if event.event_type == "adaptive_v2_shape_decision"
+        ),
+        manifest=manifest,
+    )
     for cycle, event in enumerate(terminals):
         payload = event.payload
         _fields(
@@ -8149,17 +8233,9 @@ def _validate_native_transitions(
             ),
             None,
         )
-        shape_events = [
-            candidate
-            for candidate in manager_events
-            if candidate.event_type == "adaptive_v2_shape_decision"
-            and candidate.payload.get("cycle_ordinal") == cycle
-        ]
-        if len(shape_events) != 1:
-            _fail("manager convergence start boundary is absent or duplicated")
-        shape_event = shape_events[0]
+        selection_event = selection_events[cycle]
         _validate_transition_terminal_deadline(
-            shape_ns=shape_event.monotonic_ns,
+            shape_ns=selection_event.monotonic_ns,
             terminal_ns=event.monotonic_ns,
             observation_bound_rule=transition_observation_bound_rule,
             convergence_deadline_s=expected_convergence_deadline_s,
@@ -8248,6 +8324,76 @@ def _validate_guarded_actor_evidence(
             )
 
 
+def _adaptation_cycle_event_contract(
+    *,
+    snapshot_events: Sequence[_NativeEvent],
+    shape_events: Sequence[_NativeEvent],
+    manifest: FrozenFactorialManifest,
+) -> tuple[tuple[_NativeEvent, _NativeEvent], dict[int, _NativeEvent]]:
+    def by_cycle(
+        events: Sequence[_NativeEvent],
+        *,
+        label: str,
+    ) -> dict[int, _NativeEvent]:
+        result: dict[int, _NativeEvent] = {}
+        for event in events:
+            cycle = _integer(
+                event.payload.get("cycle_ordinal"),
+                f"{label} cycle ordinal",
+            )
+            if cycle not in (0, 1) or cycle in result:
+                _fail(f"manager {label} events are duplicated or rebound")
+            result[cycle] = event
+        return result
+
+    snapshots_by_cycle = by_cycle(snapshot_events, label="evidence snapshot")
+    if set(snapshots_by_cycle) != {0, 1}:
+        _fail("manager did not emit exactly one evidence snapshot per cycle")
+
+    shapes_by_cycle = by_cycle(shape_events, label="shape decision")
+    if _uses_precontainment_shape_preservation(manifest):
+        if set(shapes_by_cycle) != {1}:
+            _fail(
+                "manager must emit zero cycle-0 shape decisions and one "
+                "cycle-1 shape decision"
+            )
+        return (
+            (snapshots_by_cycle[0], shapes_by_cycle[1]),
+            shapes_by_cycle,
+        )
+
+    if set(shapes_by_cycle) != {0, 1}:
+        _fail("manager did not emit exactly one shape decision per cycle")
+    return (
+        (shapes_by_cycle[0], shapes_by_cycle[1]),
+        shapes_by_cycle,
+    )
+
+
+def _validated_precontainment_preserved_fanout(
+    predecessor_trees: Sequence[Tree],
+    *,
+    configured_fanout: int,
+) -> int:
+    configured = _integer(
+        configured_fanout,
+        "configured current fanout",
+        1,
+    )
+    if not predecessor_trees:
+        _fail("precontainment predecessor has no trees")
+    fanouts = {
+        _integer(tree.fanout, "precontainment predecessor fanout", 1)
+        for tree in predecessor_trees
+    }
+    if len(fanouts) != 1:
+        _fail("precontainment predecessor does not have a uniform predecessor fanout")
+    preserved = next(iter(fanouts))
+    if preserved != configured:
+        _fail("precontainment predecessor differs from configured current fanout")
+    return preserved
+
+
 def _validate_adaptation_cycles(
     *,
     slot_root: Path,
@@ -8275,8 +8421,11 @@ def _validate_adaptation_cycles(
     shape_events = [
         event for event in manager_events if event.event_type == "adaptive_v2_shape_decision"
     ]
-    if len(snapshot_events) != 2 or len(shape_events) != 2:
-        _fail("manager did not emit exactly two evidence snapshots and shape decisions")
+    selection_events, shape_events_by_cycle = _adaptation_cycle_event_contract(
+        snapshot_events=snapshot_events,
+        shape_events=shape_events,
+        manifest=manifest,
+    )
     runtime_transitions = _array(runtime.get("transitions"), "runtime transitions")
     predecessor_digest = initial_epoch_digest
     predecessor_trees = tuple(initial_trees)
@@ -8310,9 +8459,13 @@ def _validate_adaptation_cycles(
         ):
             _fail("successor bundle does not continue the exact predecessor chain")
 
-        snapshot_event = snapshot_events[cycle]
+        snapshot_event = next(
+            event
+            for event in snapshot_events
+            if event.payload.get("cycle_ordinal") == cycle
+        )
         snapshot = snapshot_event.payload
-        shape_event = shape_events[cycle]
+        selection_event = selection_events[cycle]
         if _validate_snapshot_audit_schema(
             snapshot,
             evidence_snapshot_format=manifest.evidence_snapshot_format,
@@ -8359,9 +8512,9 @@ def _validate_adaptation_cycles(
                     fault_open_ns=cutoff_times["fault_window_open"],
                     transition_artifact_id=artifact_id,
                     selection_current_cutoff=current_cutoff,
-                    epoch1_selection_ns=shape_event.monotonic_ns,
+                    epoch1_selection_ns=selection_event.monotonic_ns,
                     epoch1_selection_source_sequence=(
-                        shape_event.source_sequence
+                        selection_event.source_sequence
                     ),
                 )
             )
@@ -8478,37 +8631,59 @@ def _validate_adaptation_cycles(
                 ),
             )
 
-        shape_payload = shape_event.payload
-        _fields(
-            shape_payload,
-            {"cycle_ordinal", "transition_artifact_id", "decision"},
-            f"cycle-{cycle} shape event",
-        )
-        if (
-            shape_payload["cycle_ordinal"] != cycle
-            or shape_payload["transition_artifact_id"] != artifact_id
-        ):
-            _fail("shape decision is rebound to another transition")
-        apply_selected = cycle == 1 and expected.shape_adaptation
-        decision = validate_shape_decision(
-            _mapping(shape_payload["decision"], f"cycle-{cycle} shape decision"),
-            epoch_number=cycle,
-            epoch_digest=predecessor_digest,
-            trees=predecessor_trees,
-            scores=scores,
-            evidence_cutoff=current_cutoff,
-            candidate_fanouts=expected.candidate_fanouts,
-            tree_count=expected.q,
-            pipeline_stretch=expected.pipeline_stretch,
-            deterministic_seed=expected.scientific_seed,
-            apply_selected=apply_selected,
-        )
+        shape_event = shape_events_by_cycle.get(cycle)
+        if shape_event is None:
+            if (
+                cycle != 0
+                or not _uses_precontainment_shape_preservation(manifest)
+                or intent != "fault_containment"
+                or request.get("apply_shape_selection") is not False
+            ):
+                _fail("shape decision is absent outside v17 fault containment")
+            expected_fanout = _validated_precontainment_preserved_fanout(
+                predecessor_trees,
+                configured_fanout=expected.initial_fanout,
+            )
+        else:
+            shape_payload = shape_event.payload
+            _fields(
+                shape_payload,
+                {"cycle_ordinal", "transition_artifact_id", "decision"},
+                f"cycle-{cycle} shape event",
+            )
+            if (
+                shape_payload["cycle_ordinal"] != cycle
+                or shape_payload["transition_artifact_id"] != artifact_id
+            ):
+                _fail("shape decision is rebound to another transition")
+            apply_selected = cycle == 1 and expected.shape_adaptation
+            decision = validate_shape_decision(
+                _mapping(
+                    shape_payload["decision"],
+                    f"cycle-{cycle} shape decision",
+                ),
+                epoch_number=cycle,
+                epoch_digest=predecessor_digest,
+                trees=predecessor_trees,
+                scores=scores,
+                evidence_cutoff=current_cutoff,
+                candidate_fanouts=expected.candidate_fanouts,
+                tree_count=expected.q,
+                pipeline_stretch=expected.pipeline_stretch,
+                deterministic_seed=expected.scientific_seed,
+                apply_selected=apply_selected,
+            )
+            expected_fanout = _integer(
+                decision["applied_fanout"],
+                "applied fanout",
+                1,
+            )
         structure = _validate_successor_trees(
             bundle,
             expected=expected,
             actor_ids=expected.actor_ids,
             expected_roots=roots,
-            expected_fanout=_integer(decision["applied_fanout"], "applied fanout", 1),
+            expected_fanout=expected_fanout,
             cycle=cycle,
             intent=intent,
         )
@@ -8522,7 +8697,8 @@ def _validate_adaptation_cycles(
         bundles.append(bundle)
         predecessor_digest = bundle.epoch_digest
         predecessor_trees = bundle.trees
-    if cutoff_times["shape_v1_computed"] != shape_events[1].monotonic_ns:
+    cycle1_shape_event = shape_events_by_cycle[1]
+    if cutoff_times["shape_v1_computed"] != cycle1_shape_event.monotonic_ns:
         _fail("shape cutoff is not the actual second live selector event")
     validate_manager_blinding((), tuple(event.payload for event in manager_events))
     full_gate_passed: bool | None = None
@@ -8551,8 +8727,8 @@ def _validate_adaptation_cycles(
             epoch2_fast_position_required_count=(
                 epoch2_fast_position_required_count
             ),
-            epoch1_selection_ns=shape_events[0].monotonic_ns,
-            epoch2_selection_ns=shape_events[1].monotonic_ns,
+            epoch1_selection_ns=selection_events[0].monotonic_ns,
+            epoch2_selection_ns=selection_events[1].monotonic_ns,
             epoch0_fault_qualifying_proposal_keys=(
                 epoch0_fault_qualifying_proposal_keys
             ),
@@ -8806,6 +8982,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 manifest.common_timers.transition_observation_bound_rule
             ),
             cutoff_times=cutoff_times,
+            manifest=manifest,
         )
 
         logs = _mapping(runtime.get("process_logs"), "runtime process logs")

@@ -523,6 +523,49 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager accepts an absent shape decision only for initial "
+    "non-applying containment",
+    "[shape25][adaptive-v2][manager][shape-v1][wiring][containment]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    const auto emit = function_body(
+        manager, "void emit_shape_decision(");
+    REQUIRE_FALSE(emit.empty());
+    const auto compact = without_whitespace(emit);
+
+    CHECK(compact.find(
+              "request.predecessor_epoch_number==0&&"
+              "request.policy.intent=="
+              "hotstuff::TreePolicyKind::fault_containment&&"
+              "!request.policy.apply_shape_selection") !=
+          std::string::npos);
+    CHECK(contains_in_order(
+        emit,
+        {"if (preserves_initial_containment_shape)",
+         "predecessor.epoch_number() != 0",
+         "controller->shape_decision.has_value()",
+         "predecessor.trees().empty()",
+         "successor.trees.empty()",
+         "predecessor.trees().front().fanout",
+         "predecessor.trees().front().pipeline_stretch",
+         "predecessor.trees().begin()",
+         "successor.trees.begin()",
+         "if (!has_preserved_shape)",
+         "return;",
+         "AdaptiveV2ShapeDecisionStructuredEvent"}));
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(evaluate.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"write_exclusive_bundle(",
+         "emit_shape_decision(",
+         "emit_evidence_snapshot(",
+         "session_.start_convergence("}));
+}
+
+TEST_CASE(
     "manager bounds the adaptation target without changing derived quorum",
     "[shape25][adaptive-v2][manager][minority][configuration]")
 {

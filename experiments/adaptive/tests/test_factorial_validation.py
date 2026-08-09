@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +44,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v17.json"
+)
+V16_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v16.json"
 )
 V15_MANIFEST_PATH = (
@@ -271,7 +275,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v16_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v17_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -292,7 +296,8 @@ def test_validator_retains_exact_v1_through_v16_artifact_identities() -> None:
             (13, V13_MANIFEST_PATH),
             (14, V14_MANIFEST_PATH),
             (15, V15_MANIFEST_PATH),
-            (16, MANIFEST_PATH),
+            (16, V16_MANIFEST_PATH),
+            (17, MANIFEST_PATH),
         )
     }
 
@@ -361,15 +366,26 @@ def test_validator_retains_exact_v1_through_v16_artifact_identities() -> None:
         identities[15].coverage_smoke_runtime_sha256
         == validation.V15_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[16].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[16].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[16].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[16].manifest_sha256 == validation.V16_MANIFEST_SHA256
+    assert identities[16].plan_sha256 == validation.V16_PLAN_SHA256
+    assert identities[16].runtime_sha256 == validation.V16_RUNTIME_SHA256
     assert (
         identities[16].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V16_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[16].coverage_smoke_runtime_sha256
+        == validation.V16_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[17].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[17].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[17].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[17].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[17].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
 
@@ -389,6 +405,7 @@ def test_validator_retains_exact_v1_through_v16_artifact_identities() -> None:
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
         V15_MANIFEST_PATH,
+        V16_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -408,7 +425,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v16_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v17_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -437,6 +454,7 @@ def test_validator_requires_v9_through_v16_causal_contracts_but_accepts_v8() -> 
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
         V15_MANIFEST_PATH,
+        V16_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -492,6 +510,7 @@ def test_validator_requires_v9_through_v16_causal_contracts_but_accepts_v8() -> 
             if manifest_path in (
                 V14_MANIFEST_PATH,
                 V15_MANIFEST_PATH,
+                V16_MANIFEST_PATH,
                 MANIFEST_PATH,
             ):
                 assert document["tiered_cohorts"][
@@ -501,7 +520,7 @@ def test_validator_requires_v9_through_v16_causal_contracts_but_accepts_v8() -> 
                     "causal_timeout_eligibility"
                 ] == (
                     validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
-                    if manifest_path == MANIFEST_PATH
+                    if manifest_path in (V16_MANIFEST_PATH, MANIFEST_PATH)
                     else validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
                 )
             else:
@@ -522,7 +541,46 @@ def test_validator_requires_v9_through_v16_causal_contracts_but_accepts_v8() -> 
             )
 
 
-def test_v10_through_v16_route_through_explicit_causal_linkage_windows() -> None:
+def test_v17_runtime_mirrors_precontainment_shape_contract_only_in_causal_acceptance(
+) -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    slot = runtime.slots[0]
+    document = json.loads(json.dumps(slot.as_document()))
+    contract = validation.PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+
+    assert document["causal_acceptance"][
+        "precontainment_shape_evaluation_contract"
+    ] == contract
+    validation._validate_runtime_slot(
+        document,
+        expected_by_id[slot.slot_id],
+        manifest,
+    )
+
+    drifted = copy.deepcopy(document)
+    del drifted["causal_acceptance"][
+        "precontainment_shape_evaluation_contract"
+    ]
+    with pytest.raises(FactorialValidationError, match="causal acceptance contract"):
+        validation._validate_runtime_slot(
+            drifted,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+
+    v16 = load_frozen_manifest(V16_MANIFEST_PATH)
+    v16_runtime = build_factorial_runtime(build_factorial_plan(v16))
+    assert "precontainment_shape_evaluation_contract" not in (
+        v16_runtime.slots[0].causal_acceptance.as_document()
+    )
+
+
+def test_v10_through_v17_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -545,11 +603,14 @@ def test_v10_through_v16_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V15_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V16_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_through_v16_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v17_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
@@ -569,35 +630,47 @@ def test_v11_through_v16_route_through_explicit_phase_edge_eligibility() -> None
         load_frozen_manifest(V15_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V16_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_only_v16_uses_selection_visible_hard_timeout_witnesses() -> None:
+def test_v16_and_v17_use_selection_visible_hard_timeout_witnesses() -> None:
     assert not validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(V15_MANIFEST_PATH)
+    )
+    assert validation._uses_selection_visible_hard_timeout_witnesses(
+        load_frozen_manifest(V16_MANIFEST_PATH)
     )
     assert validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v14_through_v16_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
+def test_v14_through_v17_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
     v13 = load_frozen_manifest(V13_MANIFEST_PATH)
 
     assert not validation._uses_source_bound_contribution_opportunities(v13)
     assert not validation._uses_strict_sigint_cleanup(v13)
-    for manifest_path in (V14_MANIFEST_PATH, V15_MANIFEST_PATH, MANIFEST_PATH):
+    for manifest_path in (
+        V14_MANIFEST_PATH,
+        V15_MANIFEST_PATH,
+        V16_MANIFEST_PATH,
+        MANIFEST_PATH,
+    ):
         manifest = load_frozen_manifest(manifest_path)
         assert validation._uses_source_bound_contribution_opportunities(manifest)
         assert validation._uses_strict_sigint_cleanup(manifest)
 
 
-def test_validator_binds_v14_through_v16_cleanup_without_changing_v13() -> None:
+def test_validator_binds_v14_through_v17_cleanup_without_changing_v13() -> None:
     for manifest_path in (
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
         V15_MANIFEST_PATH,
+        V16_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -641,6 +714,7 @@ def test_validator_binds_v14_through_v16_cleanup_without_changing_v13() -> None:
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
         V15_MANIFEST_PATH,
+        V16_MANIFEST_PATH,
         MANIFEST_PATH,
     ),
 )
@@ -670,7 +744,7 @@ def test_validator_requires_each_explicit_causal_linkage_field(
     "field",
     ("marker_completeness_witness", "causal_timeout_eligibility"),
 )
-def test_validator_requires_each_explicit_v11_through_v16_phase_edge_field(
+def test_validator_requires_each_explicit_v11_through_v17_phase_edge_field(
     field: str,
 ) -> None:
     for manifest_path in (
@@ -679,6 +753,7 @@ def test_validator_requires_each_explicit_v11_through_v16_phase_edge_field(
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
         V15_MANIFEST_PATH,
+        V16_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1234,6 +1309,142 @@ def test_forged_selector_winner_is_rejected_even_with_refreshed_outer_digest() -
 
     with pytest.raises(FactorialValidationError, match="independent selector"):
         validate_shape_decision(forged, **arguments)
+
+
+def _cycle_audit_event(
+    event_type: str,
+    cycle: int,
+    sequence: int,
+) -> validation._NativeEvent:
+    return replace(
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=sequence,
+            monotonic_ns=sequence * 1_000,
+            event_type=event_type,
+            payload={"cycle_ordinal": cycle},
+        ),
+        source_kind="adaptation_manager",
+    )
+
+
+def _shape_contract_manifest(
+    value: str | None,
+    *,
+    manifest_id: str = validation.FROZEN_MANIFEST_ID,
+) -> SimpleNamespace:
+    responsive = SimpleNamespace()
+    if value is not None:
+        responsive.precontainment_shape_evaluation_contract = value
+    return SimpleNamespace(
+        manifest_id=manifest_id,
+        byzantine=SimpleNamespace(responsive_degradation=responsive)
+    )
+
+
+def test_v17_cycle_zero_selection_uses_snapshot_without_shape_v1() -> None:
+    contract = validation.PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+    snapshot_zero = _cycle_audit_event("adaptive_v2_evidence_snapshot", 0, 10)
+    snapshot_one = _cycle_audit_event("adaptive_v2_evidence_snapshot", 1, 20)
+    shape_one = _cycle_audit_event("adaptive_v2_shape_decision", 1, 21)
+
+    selection_events, shape_events = validation._adaptation_cycle_event_contract(
+        snapshot_events=(snapshot_zero, snapshot_one),
+        shape_events=(shape_one,),
+        manifest=_shape_contract_manifest(contract),
+    )
+
+    assert selection_events == (snapshot_zero, shape_one)
+    assert shape_events == {1: shape_one}
+
+
+def test_v17_rejects_any_cycle_zero_shape_v1_decision() -> None:
+    contract = validation.PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+    snapshots = (
+        _cycle_audit_event("adaptive_v2_evidence_snapshot", 0, 10),
+        _cycle_audit_event("adaptive_v2_evidence_snapshot", 1, 20),
+    )
+    shapes = (
+        _cycle_audit_event("adaptive_v2_shape_decision", 0, 11),
+        _cycle_audit_event("adaptive_v2_shape_decision", 1, 21),
+    )
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="zero cycle-0 shape decisions and one cycle-1 shape decision",
+    ):
+        validation._adaptation_cycle_event_contract(
+            snapshot_events=snapshots,
+            shape_events=shapes,
+            manifest=_shape_contract_manifest(contract),
+        )
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="zero cycle-0 shape decisions and one cycle-1 shape decision",
+    ):
+        validation._adaptation_cycle_event_contract(
+            snapshot_events=snapshots,
+            shape_events=(),
+            manifest=_shape_contract_manifest(contract),
+        )
+
+
+def test_v16_contract_still_requires_one_shape_v1_event_per_cycle() -> None:
+    snapshot_zero = _cycle_audit_event("adaptive_v2_evidence_snapshot", 0, 10)
+    snapshot_one = _cycle_audit_event("adaptive_v2_evidence_snapshot", 1, 20)
+    shape_zero = _cycle_audit_event("adaptive_v2_shape_decision", 0, 11)
+    shape_one = _cycle_audit_event("adaptive_v2_shape_decision", 1, 21)
+
+    selection_events, shape_events = validation._adaptation_cycle_event_contract(
+        snapshot_events=(snapshot_zero, snapshot_one),
+        shape_events=(shape_zero, shape_one),
+        manifest=_shape_contract_manifest(
+            None,
+            manifest_id=validation.V16_MANIFEST_ID,
+        ),
+    )
+
+    assert selection_events == (shape_zero, shape_one)
+    assert shape_events == {0: shape_zero, 1: shape_one}
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="exactly one shape decision per cycle",
+    ):
+        validation._adaptation_cycle_event_contract(
+            snapshot_events=(snapshot_zero, snapshot_one),
+            shape_events=(shape_one,),
+            manifest=_shape_contract_manifest(
+                validation.PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
+                manifest_id=validation.V16_MANIFEST_ID,
+            ),
+        )
+
+
+def test_precontainment_preserved_fanout_must_match_live_and_configured() -> None:
+    trees = (
+        Tree(0, 5, 2, (0, 1, 2, 3), ()),
+        Tree(1, 5, 2, (1, 2, 3, 0), ()),
+    )
+    assert (
+        validation._validated_precontainment_preserved_fanout(
+            trees,
+            configured_fanout=5,
+        )
+        == 5
+    )
+
+    with pytest.raises(FactorialValidationError, match="configured current fanout"):
+        validation._validated_precontainment_preserved_fanout(
+            trees,
+            configured_fanout=3,
+        )
+    with pytest.raises(FactorialValidationError, match="uniform predecessor fanout"):
+        validation._validated_precontainment_preserved_fanout(
+            (*trees[:1], replace(trees[1], fanout=3)),
+            configured_fanout=5,
+        )
 
 
 def test_duplicate_authoritative_commit_is_rejected() -> None:
@@ -3034,7 +3245,7 @@ def test_role_scoped_causality_binds_marker_role_to_physical_topology(
         )
 
 
-def test_v13_through_v16_causality_dispatch_keeps_structural_gates(
+def test_v13_through_v17_causality_dispatch_keeps_structural_gates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
@@ -5073,7 +5284,7 @@ def test_smoke_slot_authorization_must_match_the_claimed_root_envelope(
 
 def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None:
     campaign = (
-        Path("results/shape-placement-factorial-v16")
+        Path("results/shape-placement-factorial-v17")
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     )
     coverage = (
@@ -5084,6 +5295,10 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
         Path(validation.V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     )
+    v16_coverage = (
+        Path(validation.V16_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
 
     assert not validation._is_excluded_coverage_smoke_slot(campaign)
     assert validation._is_excluded_coverage_smoke_slot(coverage)
@@ -5091,8 +5306,16 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
         v15_coverage,
         manifest_id=validation.V15_MANIFEST_ID,
     )
+    assert validation._is_excluded_coverage_smoke_slot(
+        v16_coverage,
+        manifest_id=validation.V16_MANIFEST_ID,
+    )
     assert not validation._is_excluded_coverage_smoke_slot(
         v15_coverage,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v16_coverage,
         manifest_id=validation.FROZEN_MANIFEST_ID,
     )
     assert not validation._is_excluded_coverage_smoke_slot(

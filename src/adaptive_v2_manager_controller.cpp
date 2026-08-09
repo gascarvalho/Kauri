@@ -374,55 +374,84 @@ struct AdaptiveV2ManagerController::State
             return fail_closed();
         }
 
-        ShapeV1Input shape_input;
-        shape_input.epoch_number =
-            ingress.current_epoch().epoch_number();
-        shape_input.epoch_digest =
-            ingress.current_epoch().epoch_digest();
-        shape_input.current_trees =
-            ingress.current_epoch().trees();
-        shape_input.evidence_cutoff = snapshot.evidence_cutoff();
-        shape_input.candidate_fanouts =
-            config.shape_selection.candidate_fanouts;
-        shape_input.tree_count = config.placement.shape.tree_count;
-        shape_input.fixed_pipeline_stretch =
-            config.shape_selection.fixed_pipeline_stretch;
-        shape_input.deterministic_seed =
-            config.shape_selection.deterministic_seed;
-        shape_input.selector_version =
-            config.shape_selection.selector_version;
-        shape_input.tie_rule = config.shape_selection.tie_rule;
-        shape_input.reference_tree_rule =
-            config.shape_selection.reference_tree_rule;
-        shape_input.evidence.reserve(snapshot.ranking().size());
-        for (const auto &entry : snapshot.ranking())
-        {
-            shape_input.evidence.push_back(ShapeV1ReplicaEvidence{
-                entry.replica_id,
-                entry.classification,
-                entry.attempt_count,
-                entry.timeout_rate_ppm,
-                entry.latency_percentile_us});
-        }
-
-        auto decision = select_shape_v1(shape_input);
-        if (decision.status != ShapeV1Status::selected ||
-            !finalize_shape_v1_application(
-                decision, config.shape_adaptation_enabled))
-        {
-            return fail_closed();
-        }
         auto placement = config.placement;
-        placement.shape.fanout = decision.current_fanout;
-        if (placement.shape.tree_count != decision.tree_count ||
-            placement.shape.pipeline_stretch !=
-                decision.fixed_pipeline_stretch)
+        const auto preserve_initial_containment_shape =
+            ingress.current_epoch().epoch_number() == 0 &&
+            config.transition_policy.intent ==
+                TreePolicyKind::fault_containment &&
+            !config.transition_policy.apply_shape_selection;
+        if (preserve_initial_containment_shape)
         {
-            return fail_closed();
+            const auto &predecessor_trees =
+                ingress.current_epoch().trees();
+            if (predecessor_trees.empty() ||
+                !std::all_of(
+                    predecessor_trees.begin(),
+                    predecessor_trees.end(),
+                    [&placement](const auto &tree) {
+                        return tree.fanout ==
+                                placement.shape.fanout &&
+                            tree.pipeline_stretch ==
+                                placement.shape.pipeline_stretch;
+                    }))
+            {
+                return fail_closed();
+            }
         }
-        placement.shape.fanout = decision.applied_fanout;
-        shape_decision = std::make_unique<ShapeDecisionRecord>(
-            std::move(decision));
+        else
+        {
+            ShapeV1Input shape_input;
+            shape_input.epoch_number =
+                ingress.current_epoch().epoch_number();
+            shape_input.epoch_digest =
+                ingress.current_epoch().epoch_digest();
+            shape_input.current_trees =
+                ingress.current_epoch().trees();
+            shape_input.evidence_cutoff = snapshot.evidence_cutoff();
+            shape_input.candidate_fanouts =
+                config.shape_selection.candidate_fanouts;
+            shape_input.tree_count =
+                config.placement.shape.tree_count;
+            shape_input.fixed_pipeline_stretch =
+                config.shape_selection.fixed_pipeline_stretch;
+            shape_input.deterministic_seed =
+                config.shape_selection.deterministic_seed;
+            shape_input.selector_version =
+                config.shape_selection.selector_version;
+            shape_input.tie_rule = config.shape_selection.tie_rule;
+            shape_input.reference_tree_rule =
+                config.shape_selection.reference_tree_rule;
+            shape_input.evidence.reserve(snapshot.ranking().size());
+            for (const auto &entry : snapshot.ranking())
+            {
+                shape_input.evidence.push_back(
+                    ShapeV1ReplicaEvidence{
+                        entry.replica_id,
+                        entry.classification,
+                        entry.attempt_count,
+                        entry.timeout_rate_ppm,
+                        entry.latency_percentile_us});
+            }
+
+            auto decision = select_shape_v1(shape_input);
+            if (decision.status != ShapeV1Status::selected ||
+                !finalize_shape_v1_application(
+                    decision, config.shape_adaptation_enabled))
+            {
+                return fail_closed();
+            }
+            placement.shape.fanout = decision.current_fanout;
+            if (placement.shape.tree_count != decision.tree_count ||
+                placement.shape.pipeline_stretch !=
+                    decision.fixed_pipeline_stretch)
+            {
+                return fail_closed();
+            }
+            placement.shape.fanout = decision.applied_fanout;
+            shape_decision =
+                std::make_unique<ShapeDecisionRecord>(
+                    std::move(decision));
+        }
 
         auto built = build_adaptive_v2_successor_bundle(
             ingress.current_epoch(),
@@ -435,6 +464,20 @@ struct AdaptiveV2ManagerController::State
             config.bundle_limits);
         if (!built || built.bundle == nullptr)
             return fail_closed();
+        if (preserve_initial_containment_shape &&
+            (built.bundle->definition().trees.empty() ||
+             !std::all_of(
+                 built.bundle->definition().trees.begin(),
+                 built.bundle->definition().trees.end(),
+                 [&placement](const auto &tree) {
+                     return tree.fanout ==
+                             placement.shape.fanout &&
+                         tree.pipeline_stretch ==
+                             placement.shape.pipeline_stretch;
+                 })))
+        {
+            return fail_closed();
+        }
         successor = std::move(built.bundle);
         return AdaptiveV2ManagerControllerStatus::successor_ready;
     }

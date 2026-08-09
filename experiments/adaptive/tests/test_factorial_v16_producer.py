@@ -9,28 +9,27 @@ from pathlib import Path
 
 import pytest
 
-from experiments.adaptive import run_shape_factorial_campaign as cli
 from experiments.adaptive.kauri_experiment import factorial_execution as execution
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
-    FROZEN_MANIFEST_ID,
-    FROZEN_MANIFEST_SHA256,
-    FROZEN_PLAN_SHA256,
-    FROZEN_SEMANTIC_SHA256,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     V15_MANIFEST_ID,
     V15_MANIFEST_SHA256,
     V15_PLAN_SHA256,
     V15_SEMANTIC_SHA256,
+    V16_MANIFEST_ID,
+    V16_MANIFEST_SHA256,
+    V16_PLAN_SHA256,
+    V16_SEMANTIC_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
-    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
     V15_COVERAGE_SMOKE_RUNTIME_SHA256,
     V15_RUNTIME_SHA256,
     V15_SMOKE_RUNTIME_SHA256,
+    V16_COVERAGE_SMOKE_RUNTIME_SHA256,
+    V16_RUNTIME_SHA256,
+    V16_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     canonical_runtime_bytes,
 )
@@ -80,7 +79,7 @@ def test_v16_only_changes_identity_root_and_timeout_witness_contract() -> None:
     v16 = json.loads(V16_MANIFEST.read_bytes())
     v15 = json.loads(V15_MANIFEST.read_bytes())
 
-    assert v16.pop("manifest_id") == FROZEN_MANIFEST_ID == (
+    assert v16.pop("manifest_id") == V16_MANIFEST_ID == (
         "shape-placement-factorial-v16"
     )
     assert v15.pop("manifest_id") == V15_MANIFEST_ID == (
@@ -106,12 +105,12 @@ def test_v16_only_changes_identity_root_and_timeout_witness_contract() -> None:
 
 def test_v16_and_v15_all_six_static_identities_are_frozen() -> None:
     assert _runtime_identities(V16_MANIFEST) == (
-        FROZEN_MANIFEST_SHA256,
-        FROZEN_SEMANTIC_SHA256,
-        FROZEN_PLAN_SHA256,
-        FROZEN_RUNTIME_SHA256,
-        FROZEN_SMOKE_RUNTIME_SHA256,
-        FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        V16_MANIFEST_SHA256,
+        V16_SEMANTIC_SHA256,
+        V16_PLAN_SHA256,
+        V16_RUNTIME_SHA256,
+        V16_SMOKE_RUNTIME_SHA256,
+        V16_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
     assert _runtime_identities(V15_MANIFEST) == (
         V15_MANIFEST_SHA256,
@@ -123,14 +122,7 @@ def test_v16_and_v15_all_six_static_identities_are_frozen() -> None:
     )
 
 
-def test_v16_default_refuses_v15_production_and_keeps_ordered_smokes(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert cli.DEFAULT_MANIFEST == V16_MANIFEST
-    assert cli.main(["--manifest", str(V15_MANIFEST), "plan"]) == 2
-    refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v15 are validation-only" in refusal["reason"]
-
+def test_v16_keeps_historical_ordered_smokes() -> None:
     plan = build_factorial_plan(load_frozen_manifest(V16_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])
     first = next(slot for slot in plan.slots if slot.execution_ordinal == 1)

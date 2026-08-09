@@ -31,7 +31,7 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v16.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v17.json"
 
 
 @pytest.fixture(scope="module")
@@ -764,6 +764,78 @@ def test_observer_baseline_timeout_covers_remaining_prefault_delay(
     )
 
 
+def test_v17_manager_selection_stream_has_no_cycle0_shape_event() -> None:
+    contract = (
+        "epoch_zero_fault_containment_preserves_current_fanout_without_shape_v1_"
+        "decision_later_transition_retains_exact_shape_v1_v1"
+    )
+
+    def manager_event(event_type: str, cycle: int, sequence: int) -> execution._Event:
+        return execution._Event(
+            source="adaptive-manager",
+            relative_path="raw/adaptive-manager.jsonl",
+            line_number=sequence,
+            value={
+                "source_sequence": sequence,
+                "source_monotonic_ns": sequence * 1_000,
+                "event_type": event_type,
+                "payload": {"cycle_ordinal": cycle},
+            },
+            line_sha256=f"{sequence:064x}",
+        )
+
+    cycle0_snapshot = manager_event("adaptive_v2_evidence_snapshot", 0, 10)
+    cycle1_snapshot = manager_event("adaptive_v2_evidence_snapshot", 1, 20)
+    cycle1_shape = manager_event("adaptive_v2_shape_decision", 1, 21)
+    streams = {
+        "adaptive-manager": (
+            cycle0_snapshot,
+            cycle1_snapshot,
+            cycle1_shape,
+        )
+    }
+
+    assert execution._manager_selection_event(
+        streams,
+        cycle_ordinal=0,
+        precontainment_shape_evaluation_contract=contract,
+    ) == cycle0_snapshot
+    assert execution._manager_selection_event(
+        streams,
+        cycle_ordinal=1,
+        precontainment_shape_evaluation_contract=contract,
+    ) == cycle1_shape
+
+
+def test_v17_manager_selection_rejects_a_cycle0_shape_event() -> None:
+    contract = (
+        "epoch_zero_fault_containment_preserves_current_fanout_without_shape_v1_"
+        "decision_later_transition_retains_exact_shape_v1_v1"
+    )
+    shape = execution._Event(
+        source="adaptive-manager",
+        relative_path="raw/adaptive-manager.jsonl",
+        line_number=1,
+        value={
+            "source_sequence": 1,
+            "source_monotonic_ns": 1_000,
+            "event_type": "adaptive_v2_shape_decision",
+            "payload": {"cycle_ordinal": 0},
+        },
+        line_sha256="11" * 32,
+    )
+
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="cycle 0 emitted a shape-v1 decision",
+    ):
+        execution._manager_selection_event(
+            {"adaptive-manager": (shape,)},
+            cycle_ordinal=0,
+            precontainment_shape_evaluation_contract=contract,
+        )
+
+
 def test_observer_does_not_apply_convergence_deadline_before_manager_selection(
     tmp_path: Path,
     template_slot,
@@ -863,14 +935,19 @@ def test_observer_caps_post_selection_barrier_at_convergence_plus_slack(
         },
         line_sha256="11" * 32,
     )
-    shape_event = execution._Event(
+    selection_event_type = (
+        "adaptive_v2_evidence_snapshot"
+        if spec.causal_acceptance.precontainment_shape_evaluation_contract
+        else "adaptive_v2_shape_decision"
+    )
+    selection_event = execution._Event(
         source="adaptive-manager",
         relative_path=spec.structured_events.manager_output_relative_path,
         line_number=1,
         value={
             "source_sequence": 1,
             "source_monotonic_ns": now_ns,
-            "event_type": "adaptive_v2_shape_decision",
+            "event_type": selection_event_type,
             "payload": {"cycle_ordinal": 0},
         },
         line_sha256="33" * 32,
@@ -900,8 +977,8 @@ def test_observer_caps_post_selection_barrier_at_convergence_plus_slack(
             }
         if description.startswith("fixed fault-evidence window"):
             return True
-        if description.startswith("manager shape selection for epoch-1"):
-            return shape_event
+        if description.startswith("manager selection anchor for epoch-1"):
+            return selection_event
         observed_timeout_s = phase_timeout_s
         raise StopAfterSelection
 
@@ -2242,7 +2319,7 @@ def test_n31_coverage_smoke_authorization_is_separate_and_exact(
     assert bound["scope"] == "excluded_n31_coverage_smoke"
     assert bound["slot_ids"] == ["slot-066-n31-f5-b05-P"]
     assert bound["result_root"] == (
-        "results/shape-placement-factorial-v16-coverage-smoke"
+        "results/shape-placement-factorial-v17-coverage-smoke"
     )
     assert bound["automatic_retries"] == 0
     assert bound["replacement_policy"] == "none"

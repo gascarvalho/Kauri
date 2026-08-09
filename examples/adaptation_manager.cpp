@@ -2217,19 +2217,66 @@ private:
 
         auto &cycle = cycle_audits_.back();
         const auto controller = session_.controller_audit();
-        if (cycle.shape_decision_emitted ||
-            cycle.transition_artifact_id !=
+        if (cycle.transition_artifact_id !=
                 request.transition_artifact_id ||
-            !controller.has_value() ||
+            !controller.has_value())
+        {
+            throw std::logic_error(
+                "shape decision audit context was absent or rebound");
+        }
+
+        const auto &predecessor = session_.ingress().current_epoch();
+        const auto &successor = bundle.definition();
+        const auto preserves_initial_containment_shape =
+            request.predecessor_epoch_number == 0 &&
+            request.policy.intent ==
+                hotstuff::TreePolicyKind::fault_containment &&
+            !request.policy.apply_shape_selection;
+        if (preserves_initial_containment_shape)
+        {
+            if (predecessor.epoch_number() != 0 ||
+                cycle.shape_decision_emitted ||
+                controller->shape_decision.has_value() ||
+                predecessor.trees().empty() ||
+                successor.trees.empty())
+            {
+                throw std::logic_error(
+                    "initial containment shape audit was invalid");
+            }
+            const auto fanout =
+                predecessor.trees().front().fanout;
+            const auto pipeline_stretch =
+                predecessor.trees().front().pipeline_stretch;
+            const auto has_preserved_shape =
+                std::all_of(
+                    predecessor.trees().begin(),
+                    predecessor.trees().end(),
+                    [fanout, pipeline_stretch](const auto &tree) {
+                        return tree.fanout == fanout &&
+                            tree.pipeline_stretch == pipeline_stretch;
+                    }) &&
+                std::all_of(
+                    successor.trees.begin(),
+                    successor.trees.end(),
+                    [fanout, pipeline_stretch](const auto &tree) {
+                        return tree.fanout == fanout &&
+                            tree.pipeline_stretch == pipeline_stretch;
+                    });
+            if (!has_preserved_shape)
+            {
+                throw std::logic_error(
+                    "initial containment shape was not preserved");
+            }
+            return;
+        }
+        if (cycle.shape_decision_emitted ||
             !controller->shape_decision.has_value())
         {
             throw std::logic_error(
-                "shape decision was duplicated, absent, or rebound");
+                "shape decision was duplicated or absent");
         }
 
         const auto &decision = *controller->shape_decision;
-        const auto &predecessor = session_.ingress().current_epoch();
-        const auto &successor = bundle.definition();
         if (decision.epoch_number != predecessor.epoch_number() ||
             decision.epoch_digest != predecessor.epoch_digest() ||
             decision.evidence_cutoff != cycle.current_evidence_cutoff ||
