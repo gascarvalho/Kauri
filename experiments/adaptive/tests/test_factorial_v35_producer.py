@@ -176,15 +176,15 @@ def test_v34_identities_are_explicit_historical_aliases() -> None:
     )
 
 
-def test_v35_six_identities_are_frozen_after_semantic_ack() -> None:
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v35"
+def test_v35_six_identities_are_preserved_as_historical_aliases() -> None:
+    assert manifest_module.V35_MANIFEST_ID == "shape-placement-factorial-v35"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V35_MANIFEST_SHA256,
+        manifest_module.V35_SEMANTIC_SHA256,
+        manifest_module.V35_PLAN_SHA256,
+        runtime_module.V35_RUNTIME_SHA256,
+        runtime_module.V35_SMOKE_RUNTIME_SHA256,
+        runtime_module.V35_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         "28303487578594d7eac64aa1eda11ea891a85b8a6d6ff386d42e920dc8b82b95",
         "40422f2b8ac74e695fdfa18b687fce2b31b516f36bd2b6bfe51f53602bd4d0c8",
@@ -411,10 +411,10 @@ def test_v35_repair_runtime_and_execution_reject_self_consistent_v1_drift(
         )
 
 
-def test_v35_is_default_and_v34_is_validation_only(
+def test_v36_is_default_and_v35_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V35_MANIFEST
-    assert cli.main(["--manifest", str(V34_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v36.json"
+    assert cli.main(["--manifest", str(V35_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v34 are validation-only" in refusal["reason"]
+    assert "v1 through v35 are validation-only" in refusal["reason"]

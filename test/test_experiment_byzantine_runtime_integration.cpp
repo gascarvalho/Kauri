@@ -20,6 +20,8 @@ public:
     {
         std::optional<ProposalKey> key;
         std::optional<std::uint64_t> generation;
+        bool unavailable{false};
+        bool conflicted{false};
     };
 
     static bool consume_direct_vote(
@@ -182,7 +184,16 @@ public:
     {
         runtime.pending_adaptive_v2_commit =
             HotStuffBase::PendingAdaptiveV2Commit{
-                block_hash, std::move(committed_key), std::nullopt};
+                block_hash,
+                std::move(committed_key),
+                std::nullopt,
+                HotStuffBase::CommittedProposalIdentityDisposition::exact};
+    }
+
+    static void seed_convergence_identity(HotStuffBase &runtime)
+    {
+        runtime.adaptive_v2_committed_convergence_identity =
+            AdaptiveV2EpochChangeIdentity{};
     }
 
     static void report_committed(
@@ -266,6 +277,19 @@ public:
         return certificate;
     }
 
+    static void replace_commit_rule_certificate(
+        const block_t &block,
+        const quorum_cert_bt &replacement)
+    {
+        if (block == nullptr || block->get_qc() == nullptr ||
+            replacement == nullptr)
+            throw std::invalid_argument(
+                "commit-rule certificate replacement is incomplete");
+        DataStream encoded;
+        encoded << *replacement;
+        block->get_qc()->unserialize(encoded);
+    }
+
     static std::optional<ProposalKey> resolve_committed_key(
         const HotStuffBase &runtime,
         const block_t &block,
@@ -282,22 +306,95 @@ public:
         HotStuffBase &runtime,
         const block_t &block,
         const std::vector<ProposalKey> &closed_context_keys,
-        const quorum_cert_bt &verified_direct_certifier)
+        const quorum_cert_bt &verified_direct_certifier,
+        bool legal_qc_skipped_ancestor = false)
     {
-        const auto key = resolve_committed_key(
-            runtime,
-            block,
-            closed_context_keys,
-            verified_direct_certifier);
+        const auto provenance = verified_direct_certifier != nullptr
+            ? HotStuffBase::CommittedProposalIdentityProvenance::
+                  verified_direct_certifier
+            : legal_qc_skipped_ancestor
+                ? HotStuffBase::CommittedProposalIdentityProvenance::
+                      legal_qc_skipped_ancestor
+                : HotStuffBase::CommittedProposalIdentityProvenance::
+                      compatibility_unknown;
+        const auto resolution =
+            runtime.resolve_committed_proposal_identity(
+                block,
+                closed_context_keys,
+                verified_direct_certifier,
+                provenance);
+        const auto key = resolution.key;
         runtime.cache_adaptive_v2_commit(
             block,
-            key,
+            resolution,
             verified_direct_certifier != nullptr);
         if (!runtime.pending_adaptive_v2_commit.has_value())
             return {};
         return CachedCommitIdentity{
             runtime.pending_adaptive_v2_commit->committed_key,
-            runtime.pending_adaptive_v2_commit->view_generation};
+            runtime.pending_adaptive_v2_commit->view_generation,
+            runtime.pending_adaptive_v2_commit->identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    unavailable,
+            runtime.pending_adaptive_v2_commit->identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    conflicting};
+    }
+
+    static void report_and_post_commit(
+        HotStuffBase &runtime,
+        const block_t &block,
+        std::uint64_t commit_batch_index = 0)
+    {
+        runtime.report_adaptive_v2_committed(
+            runtime.pending_adaptive_v2_commit.has_value()
+                ? runtime.pending_adaptive_v2_commit->committed_key
+                : std::nullopt);
+        runtime.do_post_block_commit(block, commit_batch_index);
+    }
+
+    static block_t add_commit_rule_block(
+        HotStuffBase &runtime,
+        const ConfigurationId &configuration,
+        const block_t &parent,
+        const block_t &qc_reference,
+        const std::string &label)
+    {
+        if (parent == nullptr || qc_reference == nullptr)
+            throw std::invalid_argument(
+                "commit-rule block requires parent and QC reference");
+        auto certificate = qc_reference == runtime.get_genesis()
+            ? genesis_parent_certificate(runtime)
+            : direct_certifier(
+                  runtime,
+                  ProposalKey{configuration, qc_reference->get_hash()});
+        block_t block = new Block(
+            std::vector<block_t>{parent},
+            std::vector<uint256_t>{DataStream(label).get_hash()},
+            std::move(certificate),
+            bytearray_t{},
+            parent->get_height() + 1,
+            qc_reference,
+            nullptr);
+        runtime.storage->add_blk(block);
+        if (!runtime.HotStuffCore::on_deliver_blk(block))
+            throw std::runtime_error(
+                "commit-rule block delivery failed");
+        return block;
+    }
+
+    static void apply_update(HotStuffBase &runtime, const block_t &block)
+    {
+        runtime.update(block);
+    }
+
+    static void compatibility_consensus_and_post(
+        HotStuffBase &runtime,
+        const block_t &block,
+        std::uint64_t commit_batch_index = 0)
+    {
+        runtime.do_consensus(block);
+        runtime.do_post_block_commit(block, commit_batch_index);
     }
 
     static std::optional<std::uint64_t> view_generation(
@@ -383,6 +480,23 @@ public:
 
 private:
     std::vector<std::string> *order_{nullptr};
+};
+
+class RecordingProtocolEmitter final : public StructuredEventEmitter
+{
+public:
+    void emit(const StructuredEventPayload &payload) noexcept override
+    {
+        try
+        {
+            events.push_back(payload);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    std::vector<StructuredEventPayload> events;
 };
 
 uint256_t digest(const std::string &label)
@@ -658,6 +772,271 @@ TEST_CASE(
     CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
     CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
     CHECK(outbox->diagnostics().pending_reports == 0);
+}
+
+TEST_CASE(
+    "legal skipped-QC commit gaps emit an unavailable identity disposition",
+    "[adaptive-v2][evidence][commit][identity-unavailable][qc-skip][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 16);
+    RecordingProtocolEmitter emitter;
+    runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+
+    const auto genesis = runtime.get_genesis();
+    const auto block1 = Access::add_commit_rule_block(
+        runtime, configuration, genesis, genesis, "gap-1");
+    const auto block2 = Access::add_commit_rule_block(
+        runtime, configuration, block1, block1, "gap-2");
+    const auto block3 = Access::add_commit_rule_block(
+        runtime, configuration, block2, block1, "gap-3");
+    const auto block4 = Access::add_commit_rule_block(
+        runtime, configuration, block3, block1, "gap-4");
+    const auto block5 = Access::add_commit_rule_block(
+        runtime, configuration, block4, block3, "gap-5");
+    const auto block6 = Access::add_commit_rule_block(
+        runtime, configuration, block5, block3, "gap-6");
+    const auto block7 = Access::add_commit_rule_block(
+        runtime, configuration, block6, block5, "gap-7");
+    const auto block8 = Access::add_commit_rule_block(
+        runtime, configuration, block7, block7, "gap-8");
+    Access::seed_runtime_initialization(
+        runtime, ProposalKey{configuration, block1->get_hash()});
+    Access::seed_runtime_initialization(
+        runtime, ProposalKey{configuration, block3->get_hash()});
+
+    REQUIRE_NOTHROW(Access::apply_update(runtime, block8));
+    CHECK(Access::convergence_evidence_healthy(runtime));
+
+    REQUIRE(emitter.events.size() == 6);
+    const auto *observed1 =
+        std::get_if<CommitObservedStructuredEvent>(&emitter.events[0]);
+    const auto *committed1 =
+        std::get_if<CommitStructuredEvent>(&emitter.events[1]);
+    const auto *observed2 =
+        std::get_if<CommitObservedStructuredEvent>(&emitter.events[2]);
+    const auto *unavailable =
+        std::get_if<CommitIdentityUnavailableStructuredEvent>(
+            &emitter.events[3]);
+    const auto *observed3 =
+        std::get_if<CommitObservedStructuredEvent>(&emitter.events[4]);
+    const auto *committed3 =
+        std::get_if<CommitStructuredEvent>(&emitter.events[5]);
+    REQUIRE(observed1 != nullptr);
+    REQUIRE(committed1 != nullptr);
+    REQUIRE(observed2 != nullptr);
+    REQUIRE(unavailable != nullptr);
+    REQUIRE(observed3 != nullptr);
+    REQUIRE(committed3 != nullptr);
+    CHECK(observed1->block_hash == block1->get_hash());
+    CHECK(committed1->block_hash == block1->get_hash());
+    CHECK(observed2->block_hash == block2->get_hash());
+    CHECK(unavailable->block_height == block2->get_height());
+    CHECK(unavailable->block_hash == block2->get_hash());
+    REQUIRE(unavailable->parent_hash.has_value());
+    CHECK(*unavailable->parent_hash == block1->get_hash());
+    CHECK(unavailable->transaction_count == block2->get_cmds().size());
+    CHECK(unavailable->commit_batch_index == 1);
+    CHECK(unavailable->reason ==
+          CommitIdentityUnavailableReason::
+              no_authenticated_exact_identity_source);
+    CHECK_FALSE(unavailable->convergence_identity_pending);
+    CHECK(observed3->block_hash == block3->get_hash());
+    CHECK(committed3->block_hash == block3->get_hash());
+    runtime.bind_structured_event_emitters(nullptr, nullptr, nullptr);
+}
+
+TEST_CASE(
+    "unavailable and conflicting commit identities retain fail-closed convergence boundaries",
+    "[adaptive-v2][evidence][commit][identity-unavailable][fail-closed][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    RecordingProtocolEmitter emitter;
+    runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+
+    SECTION("missing identity while convergence is pending remains fatal")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto block =
+            indirect_commit_block(runtime, "pending-convergence-gap");
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        REQUIRE(cached.unavailable);
+        Access::seed_convergence_identity(runtime);
+
+        Access::report_and_post_commit(runtime, block);
+
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+        REQUIRE(emitter.events.size() == 1);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(
+                  &emitter.events.front()) != nullptr);
+    }
+
+    SECTION("an exact key without authenticated generation remains fatal")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto block =
+            indirect_commit_block(runtime, "missing-generation-gap");
+        const ProposalKey key{configuration, block->get_hash()};
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {key}, nullptr);
+        REQUIRE(cached.conflicted);
+
+        Access::report_and_post_commit(runtime, block);
+
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+        REQUIRE(emitter.events.size() == 1);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(
+                  &emitter.events[0]) != nullptr);
+    }
+
+    SECTION("the one-argument compatibility path cannot claim a legal QC skip")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto block =
+            indirect_commit_block(runtime, "compatibility-unknown-gap");
+
+        Access::compatibility_consensus_and_post(runtime, block);
+
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+        REQUIRE(emitter.events.size() == 1);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(
+                  &emitter.events.front()) != nullptr);
+    }
+
+    SECTION("conflicting exact sources remain fatal outside convergence")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto block = indirect_commit_block(runtime, "identity-conflict");
+        const ProposalKey proof_key{configuration, block->get_hash()};
+        const ProposalKey drifted_key{
+            ConfigurationId{
+                configuration.epoch_number,
+                configuration.tree_id,
+                digest("identity-conflict-drift")},
+            block->get_hash()};
+        const auto proof = Access::direct_certifier(runtime, proof_key);
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {drifted_key}, proof);
+        REQUIRE(cached.conflicted);
+
+        Access::report_and_post_commit(runtime, block);
+
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+        REQUIRE(emitter.events.size() == 1);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(
+                  &emitter.events.front()) != nullptr);
+    }
+
+    runtime.bind_structured_event_emitters(nullptr, nullptr, nullptr);
+}
+
+TEST_CASE(
+    "an unverified alternate certifier poisons evidence without emitting a gap event",
+    "[adaptive-v2][evidence][commit][identity-unavailable][qc-skip][negative][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 16);
+    RecordingProtocolEmitter emitter;
+    runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+
+    const auto genesis = runtime.get_genesis();
+    const auto block1 = Access::add_commit_rule_block(
+        runtime, configuration, genesis, genesis, "bad-skip-1");
+    const auto block2 = Access::add_commit_rule_block(
+        runtime, configuration, block1, block1, "bad-skip-2");
+    const auto block3 = Access::add_commit_rule_block(
+        runtime, configuration, block2, block1, "bad-skip-3");
+    const auto block4 = Access::add_commit_rule_block(
+        runtime, configuration, block3, block1, "bad-skip-4");
+    const auto block5 = Access::add_commit_rule_block(
+        runtime, configuration, block4, block3, "bad-skip-5");
+    const auto block6 = Access::add_commit_rule_block(
+        runtime, configuration, block5, block3, "bad-skip-6");
+    const auto block7 = Access::add_commit_rule_block(
+        runtime, configuration, block6, block5, "bad-skip-7");
+    const auto block8 = Access::add_commit_rule_block(
+        runtime, configuration, block7, block7, "bad-skip-8");
+    Access::replace_commit_rule_certificate(
+        block3,
+        Access::invalid_direct_certifier(
+            ProposalKey{configuration, block1->get_hash()}));
+    REQUIRE(block3->get_qc()->has_n(runtime.get_config().nmajority));
+    REQUIRE_FALSE(block3->get_qc()->verify(runtime.get_config()));
+    Access::seed_runtime_initialization(
+        runtime, ProposalKey{configuration, block1->get_hash()});
+    Access::seed_runtime_initialization(
+        runtime, ProposalKey{configuration, block3->get_hash()});
+
+    REQUIRE_NOTHROW(Access::apply_update(runtime, block8));
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(block2->get_decision() == 1);
+
+    std::size_t observed = 0;
+    std::size_t unavailable = 0;
+    std::size_t committed = 0;
+    for (const auto &event : emitter.events)
+    {
+        if (const auto *value =
+                std::get_if<CommitObservedStructuredEvent>(&event);
+            value != nullptr && value->block_hash == block2->get_hash())
+            ++observed;
+        if (const auto *value =
+                std::get_if<CommitIdentityUnavailableStructuredEvent>(
+                    &event);
+            value != nullptr && value->block_hash == block2->get_hash())
+            ++unavailable;
+        if (const auto *value =
+                std::get_if<CommitStructuredEvent>(&event);
+            value != nullptr && value->block_hash == block2->get_hash())
+            ++committed;
+    }
+    CHECK(observed == 1);
+    CHECK(unavailable == 0);
+    CHECK(committed == 0);
+    runtime.bind_structured_event_emitters(nullptr, nullptr, nullptr);
 }
 
 TEST_CASE(

@@ -618,9 +618,7 @@ TEST_CASE(
         source("src/hotstuff.cpp"));
     const auto consensus = function_body(
         implementation,
-        "void HotStuffBase::do_consensus(\n"
-        "        const block_t &blk,\n"
-        "        const quorum_cert_bt &verified_direct_certifier)");
+        "void HotStuffBase::do_consensus_with_identity_provenance(");
     const auto committed_history = function_body(
         implementation,
         "void HotStuffBase::record_committed_epoch_change_history(");
@@ -637,7 +635,7 @@ TEST_CASE(
         CHECK(contains_in_order(
             consensus,
             {"close_committed_block(",
-             "committed_proposal_key(",
+             "resolve_committed_proposal_identity(",
              "observe_authoritative_commit("}));
         CHECK(contains_in_order(
             committed_history,

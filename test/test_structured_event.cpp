@@ -323,11 +323,30 @@ struct CommitObservedStructuredEvent
     std::uint64_t commit_batch_index{0};
 };
 
+enum class CommitIdentityUnavailableReason : std::uint8_t
+{
+    no_authenticated_exact_identity_source = 1,
+};
+
+struct CommitIdentityUnavailableStructuredEvent
+{
+    std::uint64_t block_height{0};
+    uint256_t block_hash;
+    std::optional<uint256_t> parent_hash;
+    std::uint64_t transaction_count{0};
+    std::uint64_t commit_batch_index{0};
+    CommitIdentityUnavailableReason reason{
+        CommitIdentityUnavailableReason::
+            no_authenticated_exact_identity_source};
+    bool convergence_identity_pending{false};
+};
+
 using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
     CommitStructuredEvent,
-    CommitObservedStructuredEvent>;
+    CommitObservedStructuredEvent,
+    CommitIdentityUnavailableStructuredEvent>;
 
 enum class StructuredEventType : std::uint8_t
 {
@@ -344,6 +363,7 @@ enum class StructuredEventType : std::uint8_t
     epoch_activated,
     block_committed,
     block_commit_observed,
+    block_commit_identity_unavailable,
 };
 
 StructuredEventType structured_event_type(
@@ -533,6 +553,8 @@ using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AuditStructuredEventEmitter;
 using hotstuff::AuditStructuredEventPayload;
 using hotstuff::CommitObservedStructuredEvent;
+using hotstuff::CommitIdentityUnavailableReason;
+using hotstuff::CommitIdentityUnavailableStructuredEvent;
 using hotstuff::CommitStructuredEvent;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
@@ -674,6 +696,20 @@ CommitObservedStructuredEvent commit_observed_event()
         digest("observed-committed-parent"),
         7,
         2};
+}
+
+CommitIdentityUnavailableStructuredEvent
+commit_identity_unavailable_event()
+{
+    return CommitIdentityUnavailableStructuredEvent{
+        1234,
+        digest("unavailable-committed-block"),
+        digest("unavailable-committed-parent"),
+        7,
+        2,
+        CommitIdentityUnavailableReason::
+            no_authenticated_exact_identity_source,
+        false};
 }
 
 FaultContributionOpportunityStructuredEvent contribution_opportunity_event()
@@ -1499,7 +1535,33 @@ std::string expected_commit_observed_line(
         "\"transaction_count\":" +
             std::to_string(event.transaction_count) + ","
         "\"commit_batch_index\":" +
-            std::to_string(event.commit_batch_index) + "}}\n";
+        std::to_string(event.commit_batch_index) + "}}\n";
+}
+
+std::string expected_commit_identity_unavailable_line(
+    const CommitIdentityUnavailableStructuredEvent &event,
+    std::uint64_t sequence,
+    std::uint64_t monotonic_ns)
+{
+    return
+        "{\"event_schema_version\":1,"
+        "\"run_id\":\"run-structured-event\","
+        "\"source_kind\":\"replica\","
+        "\"source_id\":\"replica-2\","
+        "\"source_instance\":\"spawn-9\","
+        "\"source_sequence\":" + std::to_string(sequence) + ","
+        "\"source_monotonic_ns\":" + std::to_string(monotonic_ns) + ","
+        "\"event_type\":\"block.commit_identity_unavailable\","
+        "\"payload\":{"
+        "\"block_height\":" + std::to_string(event.block_height) + ","
+        "\"block_hash\":\"" + event.block_hash.to_hex() + "\","
+        "\"parent_hash\":\"" + event.parent_hash->to_hex() + "\","
+        "\"transaction_count\":" +
+            std::to_string(event.transaction_count) + ","
+        "\"commit_batch_index\":" +
+            std::to_string(event.commit_batch_index) + ","
+        "\"reason\":\"no_authenticated_exact_identity_source\","
+        "\"convergence_identity_pending\":false}}\n";
 }
 
 class TemporaryDirectory final
@@ -1601,8 +1663,8 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
     CHECK(KAURI_HAS_STRUCTURED_EVENT_API == 1);
     CHECK(hotstuff::kStructuredEventSchemaVersion == 1);
 
-    static_assert(std::variant_size<StructuredEventPayload>::value == 4,
-                  "protocol evidence has lifecycle and two commit payloads");
+    static_assert(std::variant_size<StructuredEventPayload>::value == 5,
+                  "protocol evidence has lifecycle and three commit payloads");
     static_assert(std::is_final<StructuredEventSink>::value,
                   "one owner controls the queue and output path");
     static_assert(!std::is_copy_constructible<StructuredEventSink>::value,
@@ -1749,6 +1811,23 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
               observed_names.begin(),
               observed_names.end(),
               "block.commit_observed") == observed_names.end());
+    observed_types.push_back(observed_type);
+    observed_names.emplace_back("block.commit_observed");
+
+    const auto unavailable_type = hotstuff::structured_event_type(
+        StructuredEventPayload{commit_identity_unavailable_event()});
+    CHECK(unavailable_type ==
+          StructuredEventType::block_commit_identity_unavailable);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(unavailable_type)) ==
+          "block.commit_identity_unavailable");
+    CHECK(std::find(
+              observed_types.begin(), observed_types.end(), unavailable_type) ==
+          observed_types.end());
+    CHECK(std::find(
+              observed_names.begin(),
+              observed_names.end(),
+              "block.commit_identity_unavailable") == observed_names.end());
 
 #if defined(HOTSTUFF_PROTO_LOG)
     INFO("the same structured contract is exercised with human logs enabled");
@@ -1773,7 +1852,7 @@ TEST_CASE("WE06-C04 maps every adaptive transition to one canonical event",
             StructuredEventSink>::value,
         "the bounded sink implements the separate adaptive capability");
     static_assert(
-        std::variant_size<StructuredEventPayload>::value == 4,
+        std::variant_size<StructuredEventPayload>::value == 5,
         "adaptive aggregation evidence stays outside protocol payloads");
 
     struct Mapping
@@ -3559,6 +3638,81 @@ TEST_CASE("adaptive commit witness serializes without proposal metadata",
         null_sink.shutdown();
         CHECK(rendered(null_output).find("\"parent_hash\":null") !=
               std::string::npos);
+    }
+}
+
+TEST_CASE(
+    "unavailable commit identity is a closed observer-agnostic disposition",
+    "[adaptive-v2][structured-event][commit-identity-unavailable][schema]")
+{
+    auto event = commit_identity_unavailable_event();
+    const auto expected =
+        expected_commit_identity_unavailable_line(event, 1, 1110);
+    FakeClock clock({1110});
+    MemoryOutput output;
+    StructuredEventSink sink(event_config(), clock, output);
+
+    sink.emit(StructuredEventPayload{event});
+    sink.shutdown();
+
+    CHECK(rendered(output) == expected);
+    CHECK(rendered(output).find("\"decision_proof\"") ==
+          std::string::npos);
+    CHECK(rendered(output).find("\"view_generation\"") ==
+          std::string::npos);
+    CHECK(rendered(output).find("\"designated_observer\"") ==
+          std::string::npos);
+    CHECK(rendered(output).find("\"identity_source\"") ==
+          std::string::npos);
+
+    SECTION("designated observer configuration cannot change the payload")
+    {
+        auto config = event_config();
+        config.designated_commit_observer = StructuredEventSource{
+            StructuredEventSourceKind::replica,
+            "another-replica",
+            "another-spawn"};
+        FakeClock mismatch_clock({1111});
+        MemoryOutput mismatch_output;
+        StructuredEventSink mismatch_sink(
+            config, mismatch_clock, mismatch_output);
+        mismatch_sink.emit(StructuredEventPayload{event});
+        mismatch_sink.shutdown();
+        CHECK(rendered(mismatch_output).find(
+                  "\"event_type\":\"block.commit_identity_unavailable\"") !=
+              std::string::npos);
+        CHECK(rendered(mismatch_output).find(
+                  "\"designated_observer\"") == std::string::npos);
+    }
+
+    SECTION("the sealed reason cannot drift")
+    {
+        event.reason = static_cast<CommitIdentityUnavailableReason>(2);
+        FakeClock invalid_clock({1112});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            event_config(), invalid_clock, invalid_output);
+        invalid_sink.emit(StructuredEventPayload{event});
+        const auto health = invalid_sink.health();
+        CHECK_FALSE(health.healthy);
+        CHECK(health.first_failure ==
+              StructuredEventFailure::invalid_payload);
+        CHECK(invalid_output.bytes().empty());
+    }
+
+    SECTION("a convergence-pending unavailable disposition is forbidden")
+    {
+        event.convergence_identity_pending = true;
+        FakeClock invalid_clock({1113});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            event_config(), invalid_clock, invalid_output);
+        invalid_sink.emit(StructuredEventPayload{event});
+        const auto health = invalid_sink.health();
+        CHECK_FALSE(health.healthy);
+        CHECK(health.first_failure ==
+              StructuredEventFailure::invalid_payload);
+        CHECK(invalid_output.bytes().empty());
     }
 }
 

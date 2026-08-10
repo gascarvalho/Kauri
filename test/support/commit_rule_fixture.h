@@ -35,6 +35,7 @@ struct CommitCallbackObservation
     uint256_t hash;
     std::optional<std::uint64_t> commit_batch_index;
     std::optional<ProposalKey> certifying_proposal;
+    CommitCertifierDisposition certifier_disposition;
 };
 
 class CommitRuleCore final : public HotStuffCore
@@ -110,9 +111,68 @@ public:
 
         auto replacement_key = block->get_qc()->get_proposal_key();
         replacement_key.block_hash = wrong_hash;
-        quorum_cert_bt replacement = create_quorum_cert(replacement_key);
+        quorum_cert_bt replacement = make_certificate(
+            replacement_key, get_config().nmajority);
         DataStream stream;
         stream << *replacement;
+        block->get_qc()->unserialize(stream);
+    }
+
+    void replace_qc_with_underquorum_certificate(const block_t &block)
+    {
+        if (!block || !block->get_qc() || get_config().nmajority == 0)
+            throw std::invalid_argument("test block requires a QC quorum");
+
+        quorum_cert_bt replacement = make_certificate(
+            block->get_qc()->get_proposal_key(),
+            get_config().nmajority - 1);
+        DataStream stream;
+        stream << *replacement;
+        block->get_qc()->unserialize(stream);
+    }
+
+    void clear_qc_after_delivery(const block_t &block)
+    {
+        if (!block || !block->get_qc() || !block->is_delivered())
+            throw std::invalid_argument(
+                "test block requires a delivered QC");
+
+        // Block exposes only a const diagnostic view of its certificate.
+        // This test-only mutation deliberately models retained delivery
+        // metadata whose certificate storage has become unavailable.
+        auto &certificate =
+            const_cast<quorum_cert_bt &>(block->get_qc());
+        certificate = nullptr;
+    }
+
+    void replace_qc_with_quorum_sized_invalid_signature(
+        const block_t &block)
+    {
+        if (!block || !block->get_qc() ||
+            get_config().nmajority == 0 ||
+            get_config().nmajority >= get_config().nreplicas)
+            throw std::invalid_argument(
+                "test block requires a spare invalid signer");
+
+        const auto key = block->get_qc()->get_proposal_key();
+        salticidae::Bits claimed(get_config().nreplicas);
+        claimed.clear();
+        for (ReplicaID signer = 0;
+             signer < get_config().nmajority;
+             ++signer)
+            claimed.set(signer);
+
+        const auto cryptographic_signer =
+            static_cast<ReplicaID>(get_config().nmajority);
+        auto private_key = make_bls_private_key(cryptographic_signer);
+        PartCertBLSAgg wrong_part(private_key, key);
+        const auto &wrong_signature =
+            dynamic_cast<const SigSecBLSAgg &>(wrong_part);
+
+        DataStream stream;
+        serialize_proposal_key(stream, key);
+        stream << claimed << true;
+        wrong_signature.SigSecBLSAgg::serialize(stream);
         block->get_qc()->unserialize(stream);
     }
 
@@ -181,17 +241,34 @@ protected:
             finality.cmd_height,
             finality.blk_hash,
             std::nullopt,
-            std::nullopt});
+            std::nullopt,
+            CommitCertifierDisposition::unproven});
     }
 
     void do_consensus(const block_t &block) override
     {
-        do_consensus(block, nullptr);
+        do_consensus(
+            block,
+            nullptr,
+            CommitCertifierDisposition::unproven);
     }
 
     void do_consensus(
         const block_t &block,
         const quorum_cert_bt &verified_direct_certifier) override
+    {
+        do_consensus(
+            block,
+            verified_direct_certifier,
+            verified_direct_certifier == nullptr
+                ? CommitCertifierDisposition::unproven
+                : CommitCertifierDisposition::verified_direct_certifier);
+    }
+
+    void do_consensus(
+        const block_t &block,
+        const quorum_cert_bt &verified_direct_certifier,
+        CommitCertifierDisposition certifier_disposition) override
     {
         callbacks_.push_back(CommitCallbackObservation{
             CommitCallbackKind::consensus,
@@ -201,7 +278,8 @@ protected:
             verified_direct_certifier == nullptr
                 ? std::nullopt
                 : std::optional<ProposalKey>{
-                      verified_direct_certifier->get_proposal_key()}});
+                      verified_direct_certifier->get_proposal_key()},
+            certifier_disposition});
         committed_.push_back(
             CommittedBlock{block->get_height(), block->get_hash()});
     }
@@ -215,7 +293,8 @@ protected:
             block->get_height(),
             block->get_hash(),
             commit_batch_index,
-            std::nullopt});
+            std::nullopt,
+            CommitCertifierDisposition::unproven});
     }
 
     void do_broadcast_proposal(const Proposal &) override {}
@@ -228,6 +307,26 @@ protected:
                               std::size_t) override {}
 
 private:
+    quorum_cert_bt make_certificate(const ProposalKey &key,
+                                    std::size_t signer_count)
+    {
+        if (signer_count > get_config().nreplicas)
+            throw std::invalid_argument("too many test certificate signers");
+
+        quorum_cert_bt certificate = create_quorum_cert(key);
+        auto &aggregate =
+            dynamic_cast<QuorumCertAggBLS &>(*certificate);
+        for (std::size_t index = 0; index < signer_count; ++index)
+        {
+            const auto signer = static_cast<ReplicaID>(index);
+            auto private_key = make_bls_private_key(signer);
+            PartCertBLSAgg part(private_key, key);
+            aggregate.add_part(get_config(), signer, part);
+        }
+        aggregate.compute();
+        return certificate;
+    }
+
     block_t make_block(const block_t &parent,
                        const block_t &qc_reference,
                        bool empty_commands)
@@ -241,7 +340,8 @@ private:
             const auto key = qc_reference == get_genesis()
                 ? genesis_certification_key(qc_reference->get_hash())
                 : make_test_proposal_key(qc_reference->get_hash());
-            certificate = create_quorum_cert(key);
+            certificate = make_certificate(
+                key, get_config().nmajority);
         }
         std::vector<uint256_t> commands;
         if (!empty_commands)

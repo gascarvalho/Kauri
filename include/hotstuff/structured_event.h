@@ -100,6 +100,29 @@ struct CommitObservedStructuredEvent
     std::uint64_t commit_batch_index{0};
 };
 
+enum class CommitIdentityUnavailableReason : std::uint8_t
+{
+    no_authenticated_exact_identity_source = 1,
+};
+
+/**
+ * Sealed disposition for a real commit whose exact proposal identity cannot
+ * be authenticated locally. It is emitted only outside a pending convergence
+ * identity and never substitutes for CommitStructuredEvent.
+ */
+struct CommitIdentityUnavailableStructuredEvent
+{
+    std::uint64_t block_height{0};
+    uint256_t block_hash;
+    std::optional<uint256_t> parent_hash;
+    std::uint64_t transaction_count{0};
+    std::uint64_t commit_batch_index{0};
+    CommitIdentityUnavailableReason reason{
+        CommitIdentityUnavailableReason::
+            no_authenticated_exact_identity_source};
+    bool convergence_identity_pending{false};
+};
+
 /**
  * Prospective ground truth for one cached experiment-only contribution
  * decision. This record is observational and grants no voting, transport,
@@ -297,7 +320,8 @@ using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
     CommitStructuredEvent,
-    CommitObservedStructuredEvent>;
+    CommitObservedStructuredEvent,
+    CommitIdentityUnavailableStructuredEvent>;
 
 using AuditStructuredEventPayload = std::variant<
     EpochCommandCommittedStructuredEvent,
@@ -411,6 +435,7 @@ enum class StructuredEventType : std::uint8_t
     fault_contribution_opportunity,
     pipeline_root_qc_queue_blocked,
     adaptive_v2_fault_containment_coverage_ready,
+    block_commit_identity_unavailable,
 };
 
 StructuredEventType structured_event_type(

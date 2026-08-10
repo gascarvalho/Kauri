@@ -2,6 +2,7 @@
 #include "support/commit_rule_fixture.h"
 
 using hotstuff::block_t;
+using hotstuff::CommitCertifierDisposition;
 using hotstuff::test::CommitCallbackKind;
 using hotstuff::test::CommitRuleCore;
 using hotstuff::test::add_direct_chain;
@@ -249,7 +250,7 @@ TEST_CASE(
     const block_t genesis = core.get_genesis();
     const block_t block1 = core.add_block(genesis, genesis);
     const block_t block2 = core.add_block(block1, block1);
-    const block_t block3 = core.add_block(block2, genesis);
+    const block_t block3 = core.add_block(block2, block1);
     const block_t block4 = core.add_block(block3, block1);
     const block_t block5 = core.add_block(block4, block3);
     const block_t block6 = core.add_block(block5, block3);
@@ -269,11 +270,114 @@ TEST_CASE(
     REQUIRE(last.kind == CommitCallbackKind::consensus);
     REQUIRE(first.certifying_proposal.has_value());
     CHECK(
+        first.certifier_disposition ==
+        CommitCertifierDisposition::verified_direct_certifier);
+    CHECK(
         first.certifying_proposal->block_hash == block1->get_hash());
     CHECK_FALSE(middle.certifying_proposal.has_value());
+    CHECK(
+        middle.certifier_disposition ==
+        CommitCertifierDisposition::legal_qc_skipped_ancestor);
     REQUIRE(last.certifying_proposal.has_value());
+    CHECK(
+        last.certifier_disposition ==
+        CommitCertifierDisposition::verified_direct_certifier);
     CHECK(last.certifying_proposal->block_hash == block3->get_hash());
     CHECK(core.committed()[0].hash == block1->get_hash());
     CHECK(core.committed()[1].hash == block2->get_hash());
     CHECK(core.committed()[2].hash == block3->get_hash());
+}
+
+TEST_CASE(
+    "missing or malformed queue certifiers remain explicitly unproven",
+    "[adaptive-v2][commit-rule][indirect][certifier][fail-closed]")
+{
+    enum class Fault
+    {
+        missing_qc,
+        object_hash_drift,
+        underquorum,
+        invalid_signature,
+        off_ancestry_qc,
+    };
+
+    const auto exercise = [](
+        CommitRuleCore &core,
+        Fault fault) {
+        const block_t genesis = core.get_genesis();
+        const block_t block1 = core.add_block(genesis, genesis);
+        const block_t off_ancestry =
+            fault == Fault::off_ancestry_qc
+                ? core.add_block(genesis, genesis)
+                : block_t{};
+        const block_t block2 = core.add_block(block1, block1);
+        const block_t block3 = core.add_block(
+            block2,
+            fault == Fault::off_ancestry_qc
+                ? off_ancestry
+                : block1);
+        const block_t block4 = core.add_block(block3, block1);
+        const block_t block5 = core.add_block(block4, block3);
+        const block_t block6 = core.add_block(block5, block3);
+        const block_t block7 = core.add_block(block6, block5);
+        const block_t block8 = core.add_block(block7, block7);
+
+        if (fault == Fault::missing_qc)
+            core.clear_qc_after_delivery(block3);
+        else if (fault == Fault::object_hash_drift)
+            core.corrupt_qc_object_hash(block3, genesis->get_hash());
+        else if (fault == Fault::underquorum)
+            core.replace_qc_with_underquorum_certificate(block3);
+        else if (fault == Fault::invalid_signature)
+            core.replace_qc_with_quorum_sized_invalid_signature(block3);
+        const bool certifier_has_quorum =
+            block3->get_qc() != nullptr &&
+            block3->get_qc()->has_n(core.get_config().nmajority);
+        const bool certifier_verifies =
+            block3->get_qc() != nullptr &&
+            block3->get_qc()->verify(core.get_config());
+        REQUIRE_NOTHROW(core.apply_update(block8));
+        const auto &callbacks = core.callbacks();
+        REQUIRE(callbacks.size() == 9);
+        CHECK(callbacks[3].hash == block2->get_hash());
+        CHECK_FALSE(callbacks[3].certifying_proposal.has_value());
+        CHECK(
+            callbacks[3].certifier_disposition ==
+            CommitCertifierDisposition::unproven);
+        return std::make_pair(
+            certifier_has_quorum, certifier_verifies);
+    };
+
+    const auto require_unproven = [&exercise](Fault fault) {
+        CommitRuleCore core;
+        return exercise(core, fault);
+    };
+
+    SECTION("a missing queue certifier QC is not a legal skip")
+    {
+        static_cast<void>(require_unproven(Fault::missing_qc));
+    }
+
+    SECTION("a QC object that drifts from its delivered reference is not a legal skip")
+    {
+        static_cast<void>(require_unproven(Fault::object_hash_drift));
+    }
+
+    SECTION("an underquorum alternate QC is not a legal skip")
+    {
+        const auto result = require_unproven(Fault::underquorum);
+        CHECK_FALSE(result.first);
+    }
+
+    SECTION("a quorum-sized invalid alternate QC is not a legal skip")
+    {
+        const auto result = require_unproven(Fault::invalid_signature);
+        REQUIRE(result.first);
+        CHECK_FALSE(result.second);
+    }
+
+    SECTION("an alternate QC outside the certifier ancestry is not a legal skip")
+    {
+        static_cast<void>(require_unproven(Fault::off_ancestry_qc));
+    }
 }

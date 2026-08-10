@@ -176,6 +176,38 @@ namespace hotstuff
                is_ancestor(certified, certifier);
     }
 
+    bool HotStuffCore::has_verified_legal_qc_skip(
+        const block_t &certifier,
+        const block_t &committed) const noexcept
+    {
+        try
+        {
+            if (!certifier || !certifier->delivered || !certifier->qc ||
+                !certifier->qc_ref || !certifier->qc_ref->delivered ||
+                !committed || !committed->delivered ||
+                certifier->qc_ref == committed)
+                return false;
+
+            const auto &alternate = certifier->qc_ref;
+            const auto &certificate_key =
+                certifier->qc->get_proposal_key();
+            return certifier->qc->get_obj_hash() == alternate->hash &&
+                   certificate_key.block_hash == alternate->hash &&
+                   alternate->height < certifier->height &&
+                   alternate->height < committed->height &&
+                   committed->height < certifier->height &&
+                   is_ancestor(alternate, certifier) &&
+                   is_ancestor(alternate, committed) &&
+                   is_ancestor(committed, certifier) &&
+                   certifier->qc->has_n(config.nmajority) &&
+                   certifier->qc->verify(config);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void HotStuffCore::update_hqc(const block_t &_hqc, const quorum_cert_bt &qc)
     {
         if (_hqc->height > hqc.first->height)
@@ -313,9 +345,23 @@ namespace hotstuff
                 : commit_queue[queue_index - 1];
             blk->decision = 1;
             if (has_valid_qc_ancestry(direct_certifier, blk))
-                do_consensus(blk, direct_certifier->qc);
+                do_consensus(
+                    blk,
+                    direct_certifier->qc,
+                    CommitCertifierDisposition::
+                        verified_direct_certifier);
+            else if (has_verified_legal_qc_skip(
+                         direct_certifier, blk))
+                do_consensus(
+                    blk,
+                    nullptr,
+                    CommitCertifierDisposition::
+                        legal_qc_skipped_ancestor);
             else
-                do_consensus(blk, nullptr);
+                do_consensus(
+                    blk,
+                    nullptr,
+                    CommitCertifierDisposition::unproven);
             LOG_PROTO("commit %s", std::string(*blk).c_str());
 
             // Clean piped_queue if the clock were undirectly committed 

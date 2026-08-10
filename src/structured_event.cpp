@@ -330,6 +330,17 @@ bool payload_type(const StructuredEventPayload &payload,
         case 3:
             type = StructuredEventType::block_commit_observed;
             return true;
+        case 4:
+        {
+            const auto &event =
+                std::get<CommitIdentityUnavailableStructuredEvent>(payload);
+            if (event.reason != CommitIdentityUnavailableReason::
+                                    no_authenticated_exact_identity_source ||
+                event.convergence_identity_pending)
+                return false;
+            type = StructuredEventType::block_commit_identity_unavailable;
+            return true;
+        }
         default:
             return false;
     }
@@ -1452,6 +1463,28 @@ void append_commit_observed_payload(
     builder.append('}');
 }
 
+void append_commit_identity_unavailable_payload(
+    JsonLineBuilder &builder,
+    const CommitIdentityUnavailableStructuredEvent &event)
+{
+    builder.append("{\"block_height\":");
+    builder.append_integer(event.block_height);
+    builder.append(",\"block_hash\":");
+    builder.append_escaped(event.block_hash.to_hex());
+    builder.append(",\"parent_hash\":");
+    if (event.parent_hash)
+        builder.append_escaped(event.parent_hash->to_hex());
+    else
+        builder.append("null");
+    builder.append(",\"transaction_count\":");
+    builder.append_integer(event.transaction_count);
+    builder.append(",\"commit_batch_index\":");
+    builder.append_integer(event.commit_batch_index);
+    builder.append(",\"reason\":");
+    builder.append_escaped("no_authenticated_exact_identity_source");
+    builder.append(",\"convergence_identity_pending\":false}");
+}
+
 void append_fault_contribution_opportunity_payload(
     JsonLineBuilder &builder,
     const FaultContributionOpportunityStructuredEvent &event)
@@ -2020,6 +2053,11 @@ std::string serialize_event(const StructuredEventConfig &config,
             append_commit_observed_payload(
                 builder,
                 std::get<CommitObservedStructuredEvent>(payload));
+            break;
+        case 4:
+            append_commit_identity_unavailable_payload(
+                builder,
+                std::get<CommitIdentityUnavailableStructuredEvent>(payload));
             break;
         default:
             throw std::bad_variant_access{};
@@ -2613,6 +2651,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "block.committed";
         case StructuredEventType::block_commit_observed:
             return "block.commit_observed";
+        case StructuredEventType::block_commit_identity_unavailable:
+            return "block.commit_identity_unavailable";
         case StructuredEventType::epoch_command_committed:
             return "epoch.command_committed";
         case StructuredEventType::reputation_evidence_applied:

@@ -529,10 +529,10 @@ def test_v25_is_validation_only_and_keeps_its_ordered_zero_retry_roots(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v35.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v36.json"
     assert cli.main(["--manifest", str(V25_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v34 are validation-only" in refusal["reason"]
+    assert "v1 through v35 are validation-only" in refusal["reason"]
 
     manifest = _parse_candidate(monkeypatch)
     plan = manifest_module.build_factorial_plan(manifest)

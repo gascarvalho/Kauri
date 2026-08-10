@@ -89,15 +89,19 @@ TEST_CASE("proposal retirement is reached from the deterministic commit loop",
         "b_exec=blk;");
     const auto decided = commit_loop.find("blk->decision=1;");
     const auto certified = commit_loop.find(
-        "do_consensus(blk,direct_certifier->qc);");
-    const auto fallback = commit_loop.find(
-        "do_consensus(blk,nullptr);");
+        "CommitCertifierDisposition::verified_direct_certifier");
+    const auto legal_skip = commit_loop.find(
+        "CommitCertifierDisposition::legal_qc_skipped_ancestor");
+    const auto unproven = commit_loop.find(
+        "CommitCertifierDisposition::unproven");
 
     REQUIRE(decided != std::string::npos);
     REQUIRE(certified != std::string::npos);
-    REQUIRE(fallback != std::string::npos);
+    REQUIRE(legal_skip != std::string::npos);
+    REQUIRE(unproven != std::string::npos);
     CHECK(decided < certified);
-    CHECK(certified < fallback);
+    CHECK(certified < legal_skip);
+    CHECK(legal_skip < unproven);
 }
 
 TEST_CASE("commit pruning and floor advancement are deterministically ordered",
@@ -107,9 +111,7 @@ TEST_CASE("commit pruning and floor advancement are deterministically ordered",
     const auto source = read_source("src/hotstuff.cpp");
     const auto consensus = without_whitespace(source_slice(
         source,
-        "void HotStuffBase::do_consensus(\n"
-        "        const block_t &blk,\n"
-        "        const quorum_cert_bt &verified_direct_certifier)",
+        "void HotStuffBase::do_consensus_with_identity_provenance(",
         "void HotStuffBase::do_decide"));
 
     const auto lifecycle_close = consensus.find(

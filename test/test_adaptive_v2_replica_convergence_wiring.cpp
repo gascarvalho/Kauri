@@ -190,9 +190,7 @@ TEST_CASE(
         implementation, "void HotStuffBase::do_post_block_commit(");
     const auto ordinary_commit = function_body(
         implementation,
-        "void HotStuffBase::do_consensus(\n"
-        "        const block_t &blk,\n"
-        "        const quorum_cert_bt &verified_direct_certifier)");
+        "void HotStuffBase::do_consensus_with_identity_provenance(");
     const auto enqueue_pending = function_body(
         implementation,
         "void HotStuffBase::enqueue_pending_adaptive_v2_commit_observation(");

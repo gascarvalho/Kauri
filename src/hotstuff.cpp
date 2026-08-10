@@ -5884,6 +5884,37 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::emit_commit_identity_unavailable_event(
+        const block_t &blk,
+        std::uint64_t commit_batch_index) noexcept
+    {
+        if (structured_event_emitter == nullptr || blk == nullptr)
+            return;
+        try
+        {
+            std::optional<uint256_t> parent_hash;
+            const auto &parent_hashes = blk->get_parent_hashes();
+            if (!parent_hashes.empty())
+                parent_hash = parent_hashes.front();
+            structured_event_emitter->emit(
+                StructuredEventPayload{
+                    CommitIdentityUnavailableStructuredEvent{
+                        blk->get_height(),
+                        blk->get_hash(),
+                        parent_hash,
+                        static_cast<std::uint64_t>(
+                            blk->get_cmds().size()),
+                        commit_batch_index,
+                        CommitIdentityUnavailableReason::
+                            no_authenticated_exact_identity_source,
+                        false}});
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
+        }
+    }
+
     void HotStuffBase::emit_epoch_command_committed_event(
         const block_t &blk,
         const AuthorizedEpochChange &command,
@@ -9408,15 +9439,48 @@ namespace hotstuff
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
+        if (!pending_adaptive_v2_commit.has_value())
+        {
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "authoritative_commit_identity_mismatched_or_conflicted");
+            return;
+        }
+        const auto &cached = *pending_adaptive_v2_commit;
+        if (cached.identity_disposition ==
+            CommittedProposalIdentityDisposition::unavailable)
+        {
+            const bool exact_unavailable =
+                !key.has_value() && !cached.committed_key.has_value() &&
+                !cached.view_generation.has_value();
+            if (!exact_unavailable)
+            {
+                pending_adaptive_v2_commit->identity_disposition =
+                    CommittedProposalIdentityDisposition::conflicting;
+                mark_adaptive_v2_convergence_evidence_unhealthy(
+                    "authoritative_commit_identity_mismatched_or_conflicted");
+                return;
+            }
+            if (adaptive_v2_committed_convergence_identity.has_value())
+            {
+                pending_adaptive_v2_commit->identity_disposition =
+                    CommittedProposalIdentityDisposition::conflicting;
+                mark_adaptive_v2_convergence_evidence_unhealthy(
+                    "authoritative_commit_identity_unavailable_while_"
+                    "convergence_pending");
+            }
+            return;
+        }
         const bool exact_authoritative_identity =
-            key.has_value() && pending_adaptive_v2_commit.has_value() &&
-            pending_adaptive_v2_commit->block_hash == key->block_hash &&
-            pending_adaptive_v2_commit->committed_key.has_value() &&
-            *pending_adaptive_v2_commit->committed_key == *key;
+            cached.identity_disposition ==
+                CommittedProposalIdentityDisposition::exact &&
+            key.has_value() && cached.block_hash == key->block_hash &&
+            cached.committed_key.has_value() &&
+            *cached.committed_key == *key &&
+            cached.view_generation.has_value();
         if (!exact_authoritative_identity)
         {
             mark_adaptive_v2_convergence_evidence_unhealthy(
-                "authoritative_commit_identity_missing_or_mismatched");
+                "authoritative_commit_identity_mismatched_or_conflicted");
             return;
         }
         if (adaptive_v2_reporting_outbox == nullptr)
@@ -11788,8 +11852,45 @@ namespace hotstuff
         const std::vector<ProposalKey> &committed_keys,
         const quorum_cert_bt &verified_direct_certifier) const
     {
+        return resolve_committed_proposal_identity(
+                   blk,
+                   committed_keys,
+                   verified_direct_certifier,
+                   verified_direct_certifier == nullptr
+                       ? CommittedProposalIdentityProvenance::
+                             compatibility_unknown
+                       : CommittedProposalIdentityProvenance::
+                             verified_direct_certifier)
+            .key;
+    }
+
+    HotStuffBase::CommittedProposalIdentityResolution
+    HotStuffBase::resolve_committed_proposal_identity(
+        const block_t &blk,
+        const std::vector<ProposalKey> &committed_keys,
+        const quorum_cert_bt &verified_direct_certifier,
+        CommittedProposalIdentityProvenance provenance) const
+    {
+        const bool exact_provenance =
+            (provenance == CommittedProposalIdentityProvenance::
+                               verified_direct_certifier &&
+             verified_direct_certifier != nullptr) ||
+            (provenance == CommittedProposalIdentityProvenance::
+                               legal_qc_skipped_ancestor &&
+             verified_direct_certifier == nullptr) ||
+            (provenance == CommittedProposalIdentityProvenance::
+                               compatibility_unknown &&
+             verified_direct_certifier == nullptr);
         if (blk == nullptr)
-            return std::nullopt;
+            return {
+                std::nullopt,
+                CommittedProposalIdentityDisposition::conflicting,
+                provenance};
+        if (!exact_provenance)
+            return {
+                std::nullopt,
+                CommittedProposalIdentityDisposition::conflicting,
+                provenance};
 
         std::optional<ProposalKey> resolved;
         const auto merge = [&blk, &resolved](
@@ -11812,23 +11913,46 @@ namespace hotstuff
                     !verified_direct_certifier->has_n(config.nmajority) ||
                     !verified_direct_certifier->verify(config) ||
                     !merge(certificate_key))
-                    return std::nullopt;
+                    return {
+                        std::nullopt,
+                        CommittedProposalIdentityDisposition::conflicting,
+                        provenance};
             }
 
             if (blk->self_qc != nullptr &&
                 !merge(blk->self_qc->get_proposal_key()))
-                return std::nullopt;
+                return {
+                    std::nullopt,
+                    CommittedProposalIdentityDisposition::conflicting,
+                    provenance};
 
             for (const auto &committed_key : committed_keys)
                 if (!merge(committed_key))
-                    return std::nullopt;
+                    return {
+                        std::nullopt,
+                        CommittedProposalIdentityDisposition::conflicting,
+                        provenance};
         }
         catch (...)
         {
-            return std::nullopt;
+            return {
+                std::nullopt,
+                CommittedProposalIdentityDisposition::conflicting,
+                provenance};
         }
 
-        return resolved;
+        if (!resolved.has_value())
+            return {
+                std::nullopt,
+                provenance == CommittedProposalIdentityProvenance::
+                                  legal_qc_skipped_ancestor
+                    ? CommittedProposalIdentityDisposition::unavailable
+                    : CommittedProposalIdentityDisposition::conflicting,
+                provenance};
+        return {
+            resolved,
+            CommittedProposalIdentityDisposition::exact,
+            provenance};
     }
 
     bool HotStuffBase::observe_proposal_view_generation(
@@ -12243,7 +12367,7 @@ namespace hotstuff
 
     void HotStuffBase::cache_adaptive_v2_commit(
         const block_t &blk,
-        const std::optional<ProposalKey> &committed_key,
+        const CommittedProposalIdentityResolution &identity,
         bool allow_runtime_generation_recovery) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
@@ -12251,40 +12375,86 @@ namespace hotstuff
         pending_adaptive_v2_commit.reset();
         if (blk == nullptr)
             return;
+        auto disposition = identity.disposition;
+        auto exact_key = identity.key;
+        std::optional<std::uint64_t> generation;
         try
         {
-            auto exact_key = committed_key;
-            std::optional<std::uint64_t> generation;
-            if (exact_key.has_value())
+            const bool exact_resolution =
+                disposition ==
+                    CommittedProposalIdentityDisposition::exact &&
+                exact_key.has_value() &&
+                exact_key->block_hash == blk->get_hash();
+            const bool unavailable_resolution =
+                disposition ==
+                    CommittedProposalIdentityDisposition::unavailable &&
+                !exact_key.has_value() &&
+                identity.provenance ==
+                    CommittedProposalIdentityProvenance::
+                        legal_qc_skipped_ancestor;
+            if (!exact_resolution && !unavailable_resolution)
+            {
+                disposition =
+                    CommittedProposalIdentityDisposition::conflicting;
+                exact_key.reset();
+            }
+            else if (exact_resolution)
             {
                 const auto existing =
                     proposal_view_generations.find(*exact_key);
                 if (existing != proposal_view_generations.end())
                 {
                     generation = existing->second;
+                    if (!generation.has_value())
+                        disposition =
+                            CommittedProposalIdentityDisposition::
+                                conflicting;
                 }
                 else if (allow_runtime_generation_recovery)
                 {
                     const auto runtime_generation =
                         find_exact_runtime_generation(
                             exact_key->configuration);
-                    if (runtime_generation.has_value() &&
-                        observe_proposal_view_generation(
-                            *exact_key, *runtime_generation))
+                    if (!runtime_generation.has_value())
+                    {
+                        disposition =
+                            CommittedProposalIdentityDisposition::
+                                conflicting;
+                    }
+                    else if (observe_proposal_view_generation(
+                                 *exact_key, *runtime_generation))
+                    {
                         generation = proposal_view_generation(*exact_key);
+                        if (!generation.has_value())
+                            disposition =
+                                CommittedProposalIdentityDisposition::
+                                    conflicting;
+                    }
+                    else
+                    {
+                        disposition =
+                            CommittedProposalIdentityDisposition::
+                                conflicting;
+                    }
                 }
-                if (!generation.has_value())
-                    exact_key.reset();
+                else
+                {
+                    disposition =
+                        CommittedProposalIdentityDisposition::conflicting;
+                }
             }
-            pending_adaptive_v2_commit.emplace(
-                PendingAdaptiveV2Commit{
-                    blk->get_hash(), exact_key, generation});
         }
         catch (...)
         {
-            // Observation failure affects evidence completeness only.
-            pending_adaptive_v2_commit.reset();
+            disposition =
+                CommittedProposalIdentityDisposition::conflicting;
+            generation.reset();
         }
+        if (disposition != CommittedProposalIdentityDisposition::exact)
+            exact_key.reset();
+        pending_adaptive_v2_commit.emplace(
+            PendingAdaptiveV2Commit{
+                blk->get_hash(), exact_key, generation, disposition});
     }
 
     std::optional<uint256_t>
@@ -12311,19 +12481,61 @@ namespace hotstuff
 
     void HotStuffBase::do_consensus(const block_t &blk)
     {
-        do_consensus(blk, nullptr);
+        do_consensus_with_identity_provenance(
+            blk,
+            nullptr,
+            CommittedProposalIdentityProvenance::compatibility_unknown);
     }
 
     void HotStuffBase::do_consensus(
         const block_t &blk,
         const quorum_cert_bt &verified_direct_certifier)
     {
+        do_consensus_with_identity_provenance(
+            blk,
+            verified_direct_certifier,
+            verified_direct_certifier == nullptr
+                ? CommittedProposalIdentityProvenance::
+                      compatibility_unknown
+                : CommittedProposalIdentityProvenance::
+                      verified_direct_certifier);
+    }
+
+    void HotStuffBase::do_consensus(
+        const block_t &blk,
+        const quorum_cert_bt &verified_direct_certifier,
+        CommitCertifierDisposition certifier_disposition)
+    {
+        auto provenance =
+            CommittedProposalIdentityProvenance::core_unproven;
+        if (certifier_disposition ==
+                CommitCertifierDisposition::verified_direct_certifier &&
+            verified_direct_certifier != nullptr)
+            provenance = CommittedProposalIdentityProvenance::
+                verified_direct_certifier;
+        else if (certifier_disposition ==
+                     CommitCertifierDisposition::
+                         legal_qc_skipped_ancestor &&
+                 verified_direct_certifier == nullptr)
+            provenance = CommittedProposalIdentityProvenance::
+                legal_qc_skipped_ancestor;
+
+        do_consensus_with_identity_provenance(
+            blk, verified_direct_certifier, provenance);
+    }
+
+    void HotStuffBase::do_consensus_with_identity_provenance(
+        const block_t &blk,
+        const quorum_cert_bt &verified_direct_certifier,
+        CommittedProposalIdentityProvenance provenance)
+    {
         record_committed_epoch_change_history(blk);
         retire_deferred_epoch_changes_for_block(blk->get_hash());
         const auto keys =
             proposal_contexts->close_committed_block(blk->get_hash());
-        const auto authoritative_key = committed_proposal_key(
-            blk, keys, verified_direct_certifier);
+        const auto identity = resolve_committed_proposal_identity(
+            blk, keys, verified_direct_certifier, provenance);
+        const auto &authoritative_key = identity.key;
         const auto committed_payload_digest =
             adaptive_v2_committed_epoch_change_payload_digest(blk);
         observe_authoritative_commit(
@@ -12332,7 +12544,7 @@ namespace hotstuff
         // copy optional evidence metadata before terminal cache cleanup.
         cache_adaptive_v2_commit(
             blk,
-            authoritative_key,
+            identity,
             verified_direct_certifier != nullptr);
         report_adaptive_v2_committed(
             pending_adaptive_v2_commit.has_value()
@@ -12398,16 +12610,26 @@ namespace hotstuff
 
         std::optional<ProposalKey> committed_key;
         std::optional<std::uint64_t> view_generation;
+        auto identity_disposition =
+            CommittedProposalIdentityDisposition::conflicting;
         if (pending_adaptive_v2_commit &&
             pending_adaptive_v2_commit->block_hash == blk->get_hash())
         {
             committed_key = pending_adaptive_v2_commit->committed_key;
             view_generation =
                 pending_adaptive_v2_commit->view_generation;
+            identity_disposition =
+                pending_adaptive_v2_commit->identity_disposition;
         }
         pending_adaptive_v2_commit.reset();
-        emit_committed_block_event(
-            blk, committed_key, view_generation, commit_batch_index);
+        if (identity_disposition ==
+            CommittedProposalIdentityDisposition::unavailable)
+            emit_commit_identity_unavailable_event(
+                blk, commit_batch_index);
+        else if (identity_disposition ==
+                 CommittedProposalIdentityDisposition::exact)
+            emit_committed_block_event(
+                blk, committed_key, view_generation, commit_batch_index);
 
         const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
             pending_committed_epoch_change.reset();

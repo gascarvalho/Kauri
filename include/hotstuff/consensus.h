@@ -39,6 +39,13 @@ namespace hotstuff
         rotated,
     };
 
+    enum class CommitCertifierDisposition : std::uint8_t
+    {
+        unproven = 0,
+        verified_direct_certifier,
+        legal_qc_skipped_ancestor,
+    };
+
     struct Proposal;
     struct Vote;
     struct Finality;
@@ -101,6 +108,10 @@ namespace hotstuff
 
         bool has_valid_qc_ancestry(const block_t &certifier,
                                    const block_t &certified) const;
+
+        bool has_verified_legal_qc_skip(
+            const block_t &certifier,
+            const block_t &committed) const noexcept;
 
         void on_qc_finish(const block_t &blk);
 
@@ -254,6 +265,18 @@ namespace hotstuff
         {
             static_cast<void>(verified_direct_certifier);
             do_consensus(blk);
+        }
+        /** Commit evidence classification produced at the exact commit-queue
+         * seam.  A legal QC skip is distinct from an absent or malformed
+         * certifier so evidence-aware implementations can fail closed without
+         * changing consensus authority. */
+        virtual void do_consensus(
+            const block_t &blk,
+            const quorum_cert_bt &verified_direct_certifier,
+            CommitCertifierDisposition certifier_disposition)
+        {
+            static_cast<void>(certifier_disposition);
+            do_consensus(blk, verified_direct_certifier);
         }
         /** Called once per committed block after all application decisions.
          * The index is zero-based within the current commit queue, ordered

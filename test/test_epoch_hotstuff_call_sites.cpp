@@ -64,9 +64,7 @@ std::string hotstuff_consensus_body(const std::string &contents)
 {
     return function_body(
         contents,
-        "void HotStuffBase::do_consensus(\n"
-        "        const block_t &blk,\n"
-        "        const quorum_cert_bt &verified_direct_certifier)");
+        "void HotStuffBase::do_consensus_with_identity_provenance(");
 }
 
 bool contains_all(
@@ -554,9 +552,10 @@ TEST_CASE(
     REQUIRE_FALSE(consensus.empty());
     CHECK(contains_in_order(
         consensus,
-        {"committed_proposal_key(",
+        {"resolve_committed_proposal_identity(",
          "blk, keys, verified_direct_certifier",
          "cache_adaptive_v2_commit(",
+         "identity",
          "verified_direct_certifier != nullptr",
          "report_adaptive_v2_committed("}));
     REQUIRE_FALSE(committed.empty());
@@ -760,7 +759,7 @@ TEST_CASE("adaptive commit markers retain the committed proposal configuration",
     CHECK(contains_in_order(
         consensus,
         {"close_committed_block(blk->get_hash())",
-         "committed_proposal_key(",
+         "resolve_committed_proposal_identity(",
          "record_adaptive_commit_marker(blk, authoritative_key)",
          "proposal_admission->retire_proposal(key)"}));
 }
@@ -774,39 +773,98 @@ TEST_CASE(
     const auto core = source("src/consensus.cpp");
     const auto implementation = source("src/hotstuff.cpp");
     const auto update = function_body(core, "void HotStuffCore::update(");
+    const auto legal_skip = function_body(
+        core, "bool HotStuffCore::has_verified_legal_qc_skip(");
     const auto commit = hotstuff_consensus_body(implementation);
+    const auto compatibility_commit = function_body(
+        implementation, "void HotStuffBase::do_consensus(const block_t &blk)");
+    const auto core_commit = function_body(
+        implementation,
+        "void HotStuffBase::do_consensus(\n"
+        "        const block_t &blk,\n"
+        "        const quorum_cert_bt &verified_direct_certifier)");
+    const auto classified_core_commit = function_body(
+        implementation,
+        "void HotStuffBase::do_consensus(\n"
+        "        const block_t &blk,\n"
+        "        const quorum_cert_bt &verified_direct_certifier,\n"
+        "        CommitCertifierDisposition certifier_disposition)");
     const auto resolve = function_body(
         implementation,
-        "std::optional<ProposalKey> HotStuffBase::committed_proposal_key(");
+        "HotStuffBase::resolve_committed_proposal_identity(");
     const auto cache = function_body(
         implementation, "void HotStuffBase::cache_adaptive_v2_commit(");
 
     CHECK(contains_all(
         consensus_header,
-        {"virtual void do_consensus(\n"
+        {"enum class CommitCertifierDisposition",
+         "virtual void do_consensus(\n"
          "            const block_t &blk,",
-         "const quorum_cert_bt &verified_direct_certifier)"}));
+         "const quorum_cert_bt &verified_direct_certifier,\n"
+         "            CommitCertifierDisposition certifier_disposition)"}));
     CHECK(contains_all(
         hotstuff_header,
         {"void do_consensus(const block_t &blk) override;",
-         "const quorum_cert_bt &verified_direct_certifier) override;"}));
+         "const quorum_cert_bt &verified_direct_certifier,\n"
+         "            CommitCertifierDisposition certifier_disposition) override;"}));
 
     REQUIRE_FALSE(update.empty());
     CHECK(contains_in_order(
         update,
         {"const block_t &direct_certifier = queue_index == 0",
          "has_valid_qc_ancestry(direct_certifier, blk)",
-         "do_consensus(blk, direct_certifier->qc)",
-         "do_consensus(blk, nullptr)"}));
+         "verified_direct_certifier",
+         "has_verified_legal_qc_skip(",
+         "legal_qc_skipped_ancestor",
+         "CommitCertifierDisposition::unproven"}));
+    REQUIRE_FALSE(legal_skip.empty());
+    CHECK(contains_in_order(
+        legal_skip,
+        {"!certifier->qc_ref->delivered",
+         "certifier->qc_ref == committed",
+         "certificate_key.block_hash == alternate->hash",
+         "alternate->height < committed->height",
+         "is_ancestor(alternate, certifier)",
+         "is_ancestor(alternate, committed)",
+         "is_ancestor(committed, certifier)",
+         "certifier->qc->has_n(config.nmajority)",
+         "certifier->qc->verify(config)"}));
+    CHECK(legal_skip.find("catch (...)") != std::string::npos);
 
     REQUIRE_FALSE(commit.empty());
+    REQUIRE_FALSE(compatibility_commit.empty());
+    CHECK(contains_in_order(
+        compatibility_commit,
+        {"do_consensus_with_identity_provenance(",
+         "nullptr",
+         "CommittedProposalIdentityProvenance::compatibility_unknown"}));
+    REQUIRE_FALSE(core_commit.empty());
+    CHECK(contains_in_order(
+        core_commit,
+        {"do_consensus_with_identity_provenance(",
+         "verified_direct_certifier == nullptr",
+         "compatibility_unknown",
+         "verified_direct_certifier"}));
+    REQUIRE_FALSE(classified_core_commit.empty());
+    CHECK(contains_in_order(
+        classified_core_commit,
+        {"CommittedProposalIdentityProvenance::core_unproven",
+         "CommitCertifierDisposition::verified_direct_certifier",
+         "verified_direct_certifier != nullptr",
+         "CommitCertifierDisposition::",
+         "legal_qc_skipped_ancestor",
+         "verified_direct_certifier == nullptr",
+         "CommittedProposalIdentityProvenance::",
+         "legal_qc_skipped_ancestor",
+         "do_consensus_with_identity_provenance("}));
     CHECK(contains_in_order(
         commit,
         {"proposal_contexts->close_committed_block(blk->get_hash())",
-         "committed_proposal_key(",
-         "blk, keys, verified_direct_certifier",
+         "resolve_committed_proposal_identity(",
+         "blk, keys, verified_direct_certifier, provenance",
+         "const auto &authoritative_key = identity.key",
          "cache_adaptive_v2_commit(",
-         "authoritative_key",
+         "identity",
          "verified_direct_certifier != nullptr"}));
 
     REQUIRE_FALSE(resolve.empty());
@@ -818,7 +876,12 @@ TEST_CASE(
          "verified_direct_certifier->verify(config)",
          "merge(certificate_key)",
          "blk->self_qc",
-         "for (const auto &committed_key : committed_keys)"}));
+         "for (const auto &committed_key : committed_keys)",
+         "if (!resolved.has_value())",
+         "legal_qc_skipped_ancestor",
+         "CommittedProposalIdentityDisposition::unavailable",
+         "CommittedProposalIdentityDisposition::conflicting",
+         "CommittedProposalIdentityDisposition::exact"}));
 
     REQUIRE_FALSE(cache.empty());
     const auto existing = cache.find(
@@ -835,7 +898,8 @@ TEST_CASE(
          "observe_proposal_view_generation(",
          "generation = proposal_view_generation(*exact_key)",
          "if (!generation.has_value())",
-         "exact_key.reset()"}));
+         "CommittedProposalIdentityDisposition::",
+         "conflicting"}));
 }
 
 TEST_CASE("adaptive v2 exposes one fail-closed pre-vote semantic gate",
@@ -1537,8 +1601,11 @@ TEST_CASE("committed epoch history owns one coherent exact head snapshot",
          "close_committed_block(blk->get_hash())"}));
     CHECK(contains_in_order(
         core,
-        {"do_consensus(blk, direct_certifier->qc);",
-         "do_consensus(blk, nullptr);",
+        {"CommitCertifierDisposition::",
+         "verified_direct_certifier",
+         "CommitCertifierDisposition::",
+         "legal_qc_skipped_ancestor",
+         "CommitCertifierDisposition::unproven",
          "b_exec = blk;"}));
 }
 
@@ -1785,7 +1852,8 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
 
     CHECK(contains_in_order(
         core,
-        {"do_consensus(blk, direct_certifier->qc);",
+        {"CommitCertifierDisposition::",
+         "verified_direct_certifier",
          "do_decide(Finality(",
          "do_post_block_commit(blk, commit_batch_index);"}));
 }
@@ -1803,6 +1871,9 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
         implementation, "void HotStuffBase::emit_committed_block_event(");
     const auto commit_observed_event = function_body(
         implementation, "void HotStuffBase::emit_commit_observed_event(");
+    const auto identity_unavailable_event = function_body(
+        implementation,
+        "void HotStuffBase::emit_commit_identity_unavailable_event(");
     const auto command_event = function_body(
         implementation,
         "void HotStuffBase::emit_epoch_command_committed_event(");
@@ -1891,6 +1962,25 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     CHECK(commit_observed_event.find("view_generation") ==
           std::string::npos);
 
+    REQUIRE_FALSE(identity_unavailable_event.empty());
+    CHECK(contains_all(
+        identity_unavailable_event,
+        {"structured_event_emitter == nullptr",
+         "blk == nullptr",
+         "blk->get_height()",
+         "blk->get_hash()",
+         "blk->get_parent_hashes()",
+         "blk->get_cmds().size()",
+         "commit_batch_index",
+         "CommitIdentityUnavailableStructuredEvent",
+         "no_authenticated_exact_identity_source",
+         "false",
+         "StructuredEventPayload"}));
+    CHECK(identity_unavailable_event.find("ProposalKey") ==
+          std::string::npos);
+    CHECK(identity_unavailable_event.find("designated_observer") ==
+          std::string::npos);
+
     REQUIRE_FALSE(observe_generation.empty());
     CHECK(contains_all(
         observe_generation,
@@ -1918,20 +2008,33 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     REQUIRE_FALSE(cache_commit.empty());
     CHECK(contains_all(
         cache_commit,
-        {"auto exact_key = committed_key",
+        {"auto disposition = identity.disposition",
+         "auto exact_key = identity.key",
          "proposal_view_generations.find(*exact_key)",
          "allow_runtime_generation_recovery",
          "find_exact_runtime_generation(",
          "observe_proposal_view_generation(",
          "proposal_view_generation(*exact_key)",
+         "CommittedProposalIdentityDisposition::unavailable",
+         "CommittedProposalIdentityDisposition::conflicting",
          "PendingAdaptiveV2Commit"}));
+    CHECK(count_occurrences(
+              cache_commit,
+              "CommittedProposalIdentityDisposition::unavailable") == 1);
+    CHECK(contains_in_order(
+        cache_commit,
+        {"unavailable_resolution",
+         "CommittedProposalIdentityDisposition::unavailable",
+         "!exact_key.has_value()",
+         "identity.provenance",
+         "legal_qc_skipped_ancestor"}));
     REQUIRE_FALSE(do_consensus.empty());
     CHECK(contains_in_order(
         do_consensus,
         {"record_committed_epoch_change_history(blk)",
          "retire_deferred_epoch_changes_for_block(blk->get_hash())",
          "close_committed_block(blk->get_hash())",
-         "committed_proposal_key(",
+         "resolve_committed_proposal_identity(",
          "cache_adaptive_v2_commit(",
          "verified_direct_certifier != nullptr",
          "forget_proposal_view_generation(key)",
@@ -1978,6 +2081,9 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     CHECK(count_occurrences(
               post_commit, "emit_committed_block_event(") == 1);
     CHECK(count_occurrences(
+              post_commit,
+              "emit_commit_identity_unavailable_event(") == 1);
+    CHECK(count_occurrences(
               post_commit, "emit_epoch_command_committed_event(") == 1);
     CHECK(contains_in_order(
         post_commit,
@@ -1988,7 +2094,12 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "committed_key = pending_adaptive_v2_commit->committed_key",
          "view_generation =",
          "pending_adaptive_v2_commit->view_generation",
+         "identity_disposition =",
+         "pending_adaptive_v2_commit->identity_disposition",
          "pending_adaptive_v2_commit.reset()",
+         "CommittedProposalIdentityDisposition::unavailable",
+         "emit_commit_identity_unavailable_event(",
+         "CommittedProposalIdentityDisposition::exact",
          "emit_committed_block_event(",
          "commit_batch_index",
          "record_committed_v2(command, blk->get_height())",
@@ -2095,7 +2206,7 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
     CHECK(contains_in_order(
         consensus,
         {"proposal_contexts->close_committed_block(",
-         "committed_proposal_key(",
+         "resolve_committed_proposal_identity(",
          "cache_adaptive_v2_commit("}));
     CHECK(consensus.find("rotate_adaptive_v2_after_commit(") ==
           std::string::npos);
@@ -2114,9 +2225,9 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
           std::string::npos);
     CHECK(contains_in_order(
         cache,
-        {"committed_key",
+        {"identity.key",
          "generation",
-         "blk->get_hash(), exact_key, generation"}));
+         "blk->get_hash(), exact_key, generation, disposition"}));
 
     REQUIRE_FALSE(post_commit.empty());
     CHECK(contains_in_order(
@@ -2732,10 +2843,19 @@ TEST_CASE(
     REQUIRE_FALSE(committed.empty());
     CHECK(contains_in_order(
         committed,
-        {"pending_adaptive_v2_commit.has_value()",
-         "pending_adaptive_v2_commit->committed_key.has_value()",
+        {"!pending_adaptive_v2_commit.has_value()",
          "mark_adaptive_v2_convergence_evidence_unhealthy(",
-         "authoritative_commit_identity_missing_or_mismatched"}));
+         "authoritative_commit_identity_mismatched_or_conflicted",
+         "CommittedProposalIdentityDisposition::unavailable",
+         "adaptive_v2_committed_convergence_identity.has_value()",
+         "CommittedProposalIdentityDisposition::conflicting",
+         "authoritative_commit_identity_unavailable_while_",
+         "convergence_pending",
+         "CommittedProposalIdentityDisposition::exact"}));
+    CHECK(count_occurrences(
+              committed,
+              "authoritative_commit_identity_mismatched_or_conflicted") ==
+          3);
 
     REQUIRE_FALSE(deadline.empty());
     CHECK(contains_in_order(

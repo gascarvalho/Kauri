@@ -1484,9 +1484,7 @@ TEST_CASE("QC and commit progress use one exact establishing certificate",
         "void HotStuffBase::try_finish_exact_context");
     const auto commit = source_slice(
         hotstuff,
-        "void HotStuffBase::do_consensus(\n"
-        "        const block_t &blk,\n"
-        "        const quorum_cert_bt &verified_direct_certifier)",
+        "void HotStuffBase::do_consensus_with_identity_provenance(",
         "void HotStuffBase::do_decide");
     const auto update = source_slice(
         consensus,

@@ -81,6 +81,7 @@ from .factorial_manifest import (
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
+    POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1,
     V2_MANIFEST_ID,
     V2_MANIFEST_SHA256,
     V2_PLAN_SHA256,
@@ -180,6 +181,9 @@ from .factorial_manifest import (
     V34_MANIFEST_ID,
     V34_MANIFEST_SHA256,
     V34_PLAN_SHA256,
+    V35_MANIFEST_ID,
+    V35_MANIFEST_SHA256,
+    V35_PLAN_SHA256,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     FrozenFactorialManifest,
@@ -261,6 +265,10 @@ V34_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
 )
+V35_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
@@ -329,8 +337,11 @@ V33_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V34_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v34-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v35-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v36-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -590,14 +601,23 @@ V34_SMOKE_RUNTIME_SHA256 = (
 V34_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "f79fa73e1af6c2be6b2284d9d9a0b56224dcca94c153f7e91e2220ae49266d5e"
 )
-FROZEN_RUNTIME_SHA256 = (
+V35_RUNTIME_SHA256 = (
     "05ffcdc81d0cd0ec8a264cd0d5545e88fbf14dba1569629e6ec0f02c3a16615c"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V35_SMOKE_RUNTIME_SHA256 = (
     "785abe70a6500a66c331e00dd81eeada1065457ff4dace4e6f9035b9006aaee6"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V35_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "4fa44f57128bc096c7fd40bbf9c054c184a273d07ca8f2bdc43fdda7c5e93ad2"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "5b088b4d3e2a0a484f2829664b94db6d51e32fb0e8a0bc904fdf342098a85c89"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "3ad3f26401c190827591351b21578e2b3ec088f0222e8262f2cfa6f29a402c7a"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "34df26b4aaff8c3f417d1634aa1e52e7f40551b8265c2830720456dc068acc81"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -696,6 +716,7 @@ _V27_HARD_TIMEOUT_S = 650
 _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S = 300
 _V33_TRANSITION_CONVERGENCE_DEADLINE_S = 30
 _V33_LEADER_PROGRESS_TIMEOUT_MS = 20_000
+_V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID = FROZEN_MANIFEST_ID
 _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
     "{{fault_containment_evidence_start_monotonic_ns}}"
 )
@@ -731,6 +752,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -753,6 +775,7 @@ def _v24_preselection_contract(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return None
@@ -880,6 +903,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -908,6 +932,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -944,6 +969,7 @@ def _uses_source_bound_contribution_opportunities(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -977,6 +1003,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -1010,6 +1037,7 @@ def _uses_precontainment_fault_coverage(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1043,6 +1071,7 @@ def _uses_precontainment_shape_preservation(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1079,6 +1108,7 @@ def _uses_precontainment_guarded_selection_contract(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1114,6 +1144,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V32_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V33_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V34_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V35_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -1148,6 +1179,7 @@ def _uses_source_bound_proposal_witness_contract(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1180,6 +1212,7 @@ def _uses_evidence_snapshot_selection_contract(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1209,6 +1242,7 @@ def _uses_inherited_consensus_wait_exempt_placement_contract(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1235,6 +1269,7 @@ def _uses_verified_response_duplicate_delivery_contract(
         V32_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V33_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V34_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        V35_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     }
     return (
@@ -1246,6 +1281,22 @@ def _uses_verified_response_duplicate_delivery_contract(
             None,
         )
         == expected_by_manifest[manifest.manifest_id]
+    )
+
+
+def _uses_post_final_convergence_unmatched_commit_evidence_contract(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and getattr(
+            responsive,
+            "post_final_convergence_unmatched_commit_evidence_contract",
+            None,
+        )
+        == POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1
     )
 
 
@@ -1669,6 +1720,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V34_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V34_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V35_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V35_MANIFEST_ID,
+            manifest_sha256=V35_MANIFEST_SHA256,
+            plan_sha256=V35_PLAN_SHA256,
+            runtime_sha256=V35_RUNTIME_SHA256,
+            smoke_runtime_sha256=V35_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V35_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -3399,6 +3460,8 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
 def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
     if manifest_id == FROZEN_MANIFEST_ID:
         return FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id == V35_MANIFEST_ID:
+        return V35_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V34_MANIFEST_ID:
         return V34_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V33_MANIFEST_ID:
@@ -3541,6 +3604,11 @@ def _is_excluded_coverage_smoke_slot(
             V34_COVERAGE_SMOKE_RUNTIME_SHA256,
             V34_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V35_MANIFEST_ID: (
+            V35_RUNTIME_SHA256,
+            V35_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -3615,6 +3683,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V33_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V34_MANIFEST_ID:
         return V34_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V35_MANIFEST_ID:
+        return V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -3647,6 +3717,7 @@ def _validate_v25_coverage_runtime_document(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fields.add("excluded_repair_smoke_probe")
@@ -3668,6 +3739,7 @@ def _validate_v25_coverage_runtime_document(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.get("schema_version") != 1
@@ -3715,6 +3787,7 @@ def _validate_v25_coverage_runtime_document(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         repair = validated[_coverage_smoke_slot_ids(manifest_id)[1]]
@@ -3859,6 +3932,7 @@ def _load_static_contracts(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             constituents = _validate_v25_coverage_runtime_document(
@@ -3996,6 +4070,7 @@ def _validate_v33_static_timing_contract(
     if manifest.manifest_id not in {
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return
@@ -4026,7 +4101,11 @@ def _expected_excluded_repair_observation_contract(
         V33_MANIFEST_ID,
     }:
         return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
-    if manifest_id in {V34_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest_id in {
+        V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
     return None
 
@@ -4049,6 +4128,7 @@ def _uses_excluded_repair_observation(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -4067,7 +4147,8 @@ def _v34_excluded_repair_fault_active_phase_contract(
     """Discriminate the authorized v34+ post-fault Epoch2 repair runtime."""
 
     if (
-        manifest.manifest_id not in {V34_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        not in {V34_MANIFEST_ID, V35_MANIFEST_ID, FROZEN_MANIFEST_ID}
         or not coverage_smoke
         or expected.slot_id != "slot-037-n31-f2-b04-00"
     ):
@@ -4178,6 +4259,11 @@ def _validate_runtime_slot(
     verified_response_duplicate_delivery = (
         _uses_verified_response_duplicate_delivery_contract(manifest)
     )
+    post_final_unmatched_commit_evidence = (
+        _uses_post_final_convergence_unmatched_commit_evidence_contract(
+            manifest
+        )
+    )
     responsive_contract_value = manifest.byzantine.responsive_degradation
     v28_repair_runtime = (
         manifest.manifest_id
@@ -4189,6 +4275,7 @@ def _validate_runtime_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected.slot_id == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
@@ -4206,6 +4293,15 @@ def _validate_runtime_slot(
         else getattr(
             responsive_contract_value,
             "verified_response_duplicate_delivery_contract",
+            None,
+        )
+    )
+    post_final_unmatched_commit_contract_value = (
+        None
+        if responsive_contract_value is None
+        else getattr(
+            responsive_contract_value,
+            "post_final_convergence_unmatched_commit_evidence_contract",
             None,
         )
     )
@@ -4253,6 +4349,7 @@ def _validate_runtime_slot(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and (
         manifest.byzantine.duration_s != _V27_FAULT_WINDOW_DURATION_S
@@ -4278,6 +4375,7 @@ def _validate_runtime_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -4301,6 +4399,7 @@ def _validate_runtime_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -4323,6 +4422,7 @@ def _validate_runtime_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -4344,6 +4444,7 @@ def _validate_runtime_slot(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
@@ -4362,6 +4463,7 @@ def _validate_runtime_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not inherited_wait_exempt_placement
@@ -4377,12 +4479,24 @@ def _validate_runtime_slot(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         if not verified_response_duplicate_delivery:
             _fail("verified response duplicate delivery contract drifted")
     elif duplicate_contract_value is not None:
         _fail("verified response duplicate delivery contract is v26-only or v27-only")
+    if manifest.manifest_id == FROZEN_MANIFEST_ID:
+        if not post_final_unmatched_commit_evidence:
+            _fail(
+                "v36 post-final-convergence unmatched commit evidence "
+                "contract drifted"
+            )
+    elif post_final_unmatched_commit_contract_value is not None:
+        _fail(
+            "post-final-convergence unmatched commit evidence contract "
+            "escaped exact frozen v36"
+        )
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -4475,6 +4589,7 @@ def _validate_runtime_slot(
                     V32_MANIFEST_ID,
                     V33_MANIFEST_ID,
                     V34_MANIFEST_ID,
+                    V35_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4496,6 +4611,10 @@ def _validate_runtime_slot(
             artifact_identity[
                 "verified_response_duplicate_delivery_contract"
             ] = duplicate_contract_value
+        if post_final_unmatched_commit_evidence:
+            artifact_identity[
+                "post_final_convergence_unmatched_commit_evidence_contract"
+            ] = POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1
         if manifest.manifest_id in {
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
@@ -4504,6 +4623,7 @@ def _validate_runtime_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity.update(
@@ -4532,6 +4652,7 @@ def _validate_runtime_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity["fault_window_duration_s"] = (
@@ -4727,6 +4848,7 @@ def _validate_runtime_slot(
                 V32_MANIFEST_ID,
                 V33_MANIFEST_ID,
                 V34_MANIFEST_ID,
+                V35_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4748,6 +4870,10 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "verified_response_duplicate_delivery_contract"
         ] = duplicate_contract_value
+    if post_final_unmatched_commit_evidence:
+        expected_causal_acceptance[
+            "post_final_convergence_unmatched_commit_evidence_contract"
+        ] = POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1
     if expected_repair_observation_contract is not None:
         expected_causal_acceptance.update(
             {
@@ -4853,6 +4979,7 @@ def _validate_runtime_slot(
         V32_MANIFEST_ID,
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -5022,6 +5149,7 @@ def _validate_runtime_slot(
     if manifest.manifest_id in {
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         deadline_option = "--convergence-deadline-seconds"
@@ -6231,6 +6359,8 @@ def _commit_payload(event: _NativeEvent, *, authoritative: bool) -> dict[str, An
         expected_fields |= {"designated_observer", "decision_proof", "view_generation"}
     _fields(payload, expected_fields, label)
     height = _integer(payload["block_height"], f"{label}.block_height", 1)
+    if height > _UINT64_MAX:
+        _fail(f"{label}.block_height exceeds the fixed uint64 bound")
     block_hash = _digest(payload["block_hash"], f"{label}.block_hash")
     parent = payload["parent_hash"]
     if parent is not None:
@@ -6241,6 +6371,8 @@ def _commit_payload(event: _NativeEvent, *, authoritative: bool) -> dict[str, An
     if transactions > _UINT64_MAX:
         _fail(f"{label}.transaction_count exceeds the fixed uint64 bound")
     batch_index = _integer(payload["commit_batch_index"], f"{label}.commit_batch_index")
+    if batch_index > _UINT64_MAX:
+        _fail(f"{label}.commit_batch_index exceeds the fixed uint64 bound")
     if event.event_type == "block.committed":
         if type(payload["designated_observer"]) is not bool:
             _fail(f"{label}.designated_observer must be boolean")
@@ -6262,7 +6394,12 @@ def _commit_payload(event: _NativeEvent, *, authoritative: bool) -> dict[str, An
             proof["epoch_digest"], f"{label}.decision_proof.epoch_digest"
         )
         if payload["view_generation"] is not None:
-            _integer(payload["view_generation"], f"{label}.view_generation")
+            view_generation = _integer(
+                payload["view_generation"],
+                f"{label}.view_generation",
+            )
+            if view_generation > _UINT64_MAX:
+                _fail(f"{label}.view_generation exceeds the fixed uint64 bound")
     return {
         "height": height,
         "hash": block_hash,
@@ -6274,6 +6411,333 @@ def _commit_payload(event: _NativeEvent, *, authoritative: bool) -> dict[str, An
         "tree_id": tree_id if event.event_type == "block.committed" else None,
         "epoch_digest": epoch_digest if event.event_type == "block.committed" else None,
     }
+
+
+def _commit_identity_key(commit: Mapping[str, Any]) -> tuple[int, str, str | None, int, int]:
+    return (
+        commit["height"],
+        commit["hash"],
+        commit["parent"],
+        commit["transactions"],
+        commit["batch_index"],
+    )
+
+
+def _commit_identity_unavailable_payload(
+    event: _NativeEvent,
+) -> tuple[int, str, str | None, int, int]:
+    """Parse the one exact structured v36 non-authoritative gap marker."""
+
+    label = f"{event.relative_path}:{event.line_number}.payload"
+    payload = event.payload
+    _fields(
+        payload,
+        {
+            "block_height",
+            "block_hash",
+            "parent_hash",
+            "transaction_count",
+            "commit_batch_index",
+            "reason",
+            "convergence_identity_pending",
+        },
+        label,
+    )
+    height = _integer(payload["block_height"], f"{label}.block_height", 1)
+    if height > _UINT64_MAX:
+        _fail(f"{label}.block_height exceeds the fixed uint64 bound")
+    block_hash = _digest(payload["block_hash"], f"{label}.block_hash")
+    parent = payload["parent_hash"]
+    if parent is not None:
+        parent = _digest(parent, f"{label}.parent_hash")
+    transactions = _integer(
+        payload["transaction_count"],
+        f"{label}.transaction_count",
+    )
+    if transactions > _UINT64_MAX:
+        _fail(f"{label}.transaction_count exceeds the fixed uint64 bound")
+    batch_index = _integer(
+        payload["commit_batch_index"],
+        f"{label}.commit_batch_index",
+    )
+    if batch_index > _UINT64_MAX:
+        _fail(f"{label}.commit_batch_index exceeds the fixed uint64 bound")
+    if payload["reason"] != "no_authenticated_exact_identity_source":
+        _fail(f"{label}.reason is not the exact v36 unavailable reason")
+    if payload["convergence_identity_pending"] is not False:
+        _fail(f"{label} is not an outside-convergence pending disposition")
+    return height, block_hash, parent, transactions, batch_index
+
+
+def _validate_manifest_commit_identity_unavailable(
+    manifest_id: str,
+    replica_events: Mapping[int, Sequence[_NativeEvent]],
+    *,
+    replica_count: int,
+    observer_id: str,
+    observer_instance: str,
+    final_cycle_terminal_ns: int | None,
+    hard_deadline_ns: int | None,
+) -> None:
+    """Validate the exact v36 post-terminal non-authoritative gap exception."""
+
+    marker_type = "block.commit_identity_unavailable"
+    has_marker = any(
+        event.event_type == marker_type
+        for events in replica_events.values()
+        for event in events
+    )
+    if manifest_id != _V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID:
+        if has_marker:
+            _fail(
+                "commit identity unavailable markers are only permitted by "
+                "exact frozen v36"
+            )
+        return
+
+    if set(replica_events) != set(range(replica_count)):
+        _fail(
+            "v36 commit identity gap evidence does not cover every configured "
+            "replica"
+        )
+    terminal_ns = _integer(
+        final_cycle_terminal_ns,
+        "v36 final adaptation cycle terminal timestamp",
+        1,
+    )
+    hard_ns = _integer(
+        hard_deadline_ns,
+        "v36 shared hard deadline timestamp",
+        1,
+    )
+    if terminal_ns >= hard_ns:
+        _fail("v36 final cycle terminal does not precede the hard deadline")
+    quorum = 2 * ((replica_count - 1) // 3) + 1
+    if replica_count < 1 or quorum > replica_count:
+        _fail("v36 commit identity gap quorum is not independently derivable")
+
+    observations: dict[
+        tuple[int, str, str | None, int, int],
+        dict[int, list[_NativeEvent]],
+    ] = defaultdict(lambda: defaultdict(list))
+    rich_commits: dict[
+        tuple[int, str, str | None, int, int],
+        dict[int, list[tuple[_NativeEvent, tuple[int, int, str, int]]]],
+    ] = defaultdict(lambda: defaultdict(list))
+    markers: dict[
+        tuple[int, str, str | None, int, int],
+        dict[int, list[_NativeEvent]],
+    ] = defaultdict(lambda: defaultdict(list))
+
+    for replica_id in range(replica_count):
+        events = replica_events[replica_id]
+        expected_source_id = f"replica-{replica_id}"
+        for index, event in enumerate(events):
+            if event.event_type not in {
+                "block.commit_observed",
+                "block.committed",
+                marker_type,
+            }:
+                continue
+            if (
+                event.source_kind != "replica"
+                or event.source_id != expected_source_id
+                or (
+                    event.source_id == observer_id
+                    and event.source_instance != observer_instance
+                )
+            ):
+                _fail("v36 commit identity evidence has an invalid exact reporter")
+
+            if event.event_type == "block.commit_observed":
+                commit = _commit_payload(event, authoritative=False)
+                observations[_commit_identity_key(commit)][replica_id].append(event)
+                continue
+            if event.event_type == "block.committed":
+                authoritative = event.source_id == observer_id
+                commit = _commit_payload(event, authoritative=authoritative)
+                generation = _integer(
+                    event.payload["view_generation"],
+                    "v36 rich commit view generation",
+                    1,
+                )
+                if generation > _UINT64_MAX:
+                    _fail("v36 rich commit view generation exceeds uint64")
+                rich_identity = (
+                    commit["epoch_number"],
+                    commit["tree_id"],
+                    commit["epoch_digest"],
+                    generation,
+                )
+                rich_commits[_commit_identity_key(commit)][replica_id].append(
+                    (event, rich_identity)
+                )
+                continue
+
+            marker_key = _commit_identity_unavailable_payload(event)
+            prior_markers = markers[marker_key][replica_id]
+            if prior_markers:
+                _fail("v36 commit identity unavailable marker is duplicated")
+            markers[marker_key][replica_id].append(event)
+            if event.source_id == observer_id:
+                _fail(
+                    "v36 commit identity unavailable marker was emitted by the "
+                    "designated observer"
+                )
+            if event.monotonic_ns <= terminal_ns:
+                _fail(
+                    "v36 commit identity unavailable marker does not strictly "
+                    "follow the final cycle terminal"
+                )
+            if event.monotonic_ns >= hard_ns:
+                _fail(
+                    "v36 commit identity unavailable marker does not strictly "
+                    "precede the shared hard deadline"
+                )
+            if index == 0:
+                _fail(
+                    "v36 commit identity unavailable marker is not the immediate "
+                    "same-source successor of an observation"
+                )
+            observation = events[index - 1]
+            if (
+                observation.event_type != "block.commit_observed"
+                or observation.source_kind != event.source_kind
+                or observation.source_id != event.source_id
+                or observation.source_instance != event.source_instance
+                or observation.relative_path != event.relative_path
+                or observation.source_sequence + 1 != event.source_sequence
+                or observation.line_number + 1 != event.line_number
+                or observation.monotonic_ns > event.monotonic_ns
+            ):
+                _fail(
+                    "v36 commit identity unavailable marker is not the immediate "
+                    "same-source successor of an observation"
+                )
+            observed_key = _commit_identity_key(
+                _commit_payload(observation, authoritative=False)
+            )
+            if observed_key != marker_key:
+                _fail(
+                    "v36 commit identity unavailable marker does not name the "
+                    "same observed commit tuple"
+                )
+
+    for key, markers_by_reporter in markers.items():
+        if set(observations.get(key, {})) != set(range(replica_count)):
+            _fail(
+                "v36 commit identity gap does not have the same observed commit "
+                "tuple at every configured replica"
+            )
+        if any(
+            len(observations[key][replica_id]) != 1
+            for replica_id in range(replica_count)
+        ):
+            _fail(
+                "v36 commit identity gap lacks exactly one observation at every "
+                "configured replica"
+            )
+        if any(
+            event.monotonic_ns >= hard_ns
+            for reporter_observations in observations[key].values()
+            for event in reporter_observations
+        ):
+            _fail(
+                "v36 commit identity gap matching observation does not strictly "
+                "precede the shared hard deadline"
+            )
+        for replica_id, reporter_markers in markers_by_reporter.items():
+            if len(reporter_markers) != 1:
+                _fail("v36 commit identity unavailable marker is duplicated")
+            if len(observations[key][replica_id]) != 1:
+                _fail(
+                    "v36 commit identity unavailable marker lacks exactly one "
+                    "same-source observation"
+                )
+
+        rich_by_reporter = rich_commits.get(key, {})
+        if len(rich_by_reporter) < quorum:
+            _fail(
+                "v36 commit identity gap lacks the independently derived rich "
+                "commit quorum"
+            )
+        if any(
+            event.monotonic_ns >= hard_ns
+            for reporter_proofs in rich_by_reporter.values()
+            for event, _identity in reporter_proofs
+        ):
+            _fail(
+                "v36 commit identity gap rich commit proof does not strictly "
+                "precede the shared hard deadline"
+            )
+        observer_reporter = next(
+            (
+                replica_id
+                for replica_id in range(replica_count)
+                if f"replica-{replica_id}" == observer_id
+            ),
+            None,
+        )
+        if observer_reporter is None or observer_reporter not in rich_by_reporter:
+            _fail(
+                "v36 commit identity gap lacks the designated observer rich proof"
+            )
+        canonical_identity = rich_by_reporter[observer_reporter][0][1]
+        if any(
+            proofs[0][1] != canonical_identity
+            for proofs in rich_by_reporter.values()
+        ):
+            _fail(
+                "v36 rich commit quorum has configuration/generation identity "
+                "drift"
+            )
+
+    all_keys = set(observations) | set(rich_commits) | set(markers)
+    for key in all_keys:
+        for replica_id in range(replica_count):
+            observed = observations.get(key, {}).get(replica_id, ())
+            rich = rich_commits.get(key, {}).get(replica_id, ())
+            unavailable = markers.get(key, {}).get(replica_id, ())
+            if len(observed) > 1:
+                _fail(
+                    "v36 commit identity tuple lacks exactly one reporter "
+                    "observation"
+                )
+            if len(rich) > 1:
+                _fail("v36 commit identity tuple duplicated a rich commit proof")
+            if rich and len(observed) != 1:
+                _fail(
+                    "v36 rich commit proof lacks exactly one same-source "
+                    "observation"
+                )
+            if rich and unavailable:
+                _fail(
+                    "v36 reporter emitted both rich and unavailable commit "
+                    "identity evidence"
+                )
+            if observed and not rich and not unavailable:
+                if f"replica-{replica_id}" == observer_id:
+                    _fail(
+                        "v36 designated observer commit observation lacks its "
+                        "rich commit proof"
+                    )
+                _fail(
+                    "v36 unpaired commit observation lacks its unavailable marker"
+                )
+
+
+def _final_adaptation_cycle_terminal_ns(
+    manager_events: Sequence[_NativeEvent],
+) -> int:
+    terminal_events = tuple(
+        event
+        for event in manager_events
+        if event.event_type == "adaptive_v2_session_terminal"
+        and event.payload.get("cycle_ordinal") == 1
+    )
+    if len(terminal_events) != 1:
+        _fail("v36 final adaptation cycle terminal is absent or duplicated")
+    return terminal_events[0].monotonic_ns
 
 
 def _validate_authoritative_observer_commit_completeness(
@@ -6397,9 +6861,9 @@ def _validate_authoritative_observer_commit_completeness(
 
 
 def _uses_authoritative_observer_commit_completeness(manifest_id: str) -> bool:
-    """Keep the prospective completeness gate scoped to exact frozen v35."""
+    """Keep the observer completeness gate across exact frozen v35+."""
 
-    return manifest_id == FROZEN_MANIFEST_ID
+    return manifest_id in {V35_MANIFEST_ID, FROZEN_MANIFEST_ID}
 
 
 def _validate_manifest_authoritative_observer_commit_completeness(
@@ -6410,7 +6874,7 @@ def _validate_manifest_authoritative_observer_commit_completeness(
     observer_instance: str,
     tree_ids_by_configuration: Mapping[tuple[int, str], Sequence[int]],
 ) -> None:
-    """Apply the independent completeness proof only to exact frozen v35."""
+    """Apply the independent completeness proof only to exact frozen v35+."""
 
     if not _uses_authoritative_observer_commit_completeness(manifest_id):
         return
@@ -10845,6 +11309,7 @@ def _validate_v28_excluded_repair_observation(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id
@@ -11350,6 +11815,7 @@ def _validate_v25_inherited_wait_exempt_placement_live_exercise(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or not coverage_smoke
@@ -12297,6 +12763,7 @@ def _validate_v28_verified_response_duplicate_probe(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -12826,7 +13293,12 @@ def _validate_native_transitions(
         )
     if (
         manifest.manifest_id
-        in {V33_MANIFEST_ID, V34_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V33_MANIFEST_ID,
+            V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and expected.replica_count == 31
     ):
         if hard_deadline_ns is None:
@@ -13367,6 +13839,7 @@ def _validate_v25_coverage_execution_lifecycle(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id not in coverage_slot_ids
@@ -13777,6 +14250,7 @@ def validate_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         )
     )
@@ -14098,6 +14572,31 @@ def validate_slot(
                 ),
             },
         )
+        _validate_manifest_commit_identity_unavailable(
+            manifest.manifest_id,
+            replica_events,
+            replica_count=expected.replica_count,
+            observer_id=_string(
+                event_contract.get("commit_observer_id"),
+                "commit observer ID",
+            ),
+            observer_instance=_string(
+                event_contract.get("commit_observer_instance"),
+                "commit observer instance",
+            ),
+            final_cycle_terminal_ns=(
+                _final_adaptation_cycle_terminal_ns(manager_events)
+                if manifest.manifest_id
+                == _V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID
+                else None
+            ),
+            hard_deadline_ns=(
+                hard_deadline_ns
+                if manifest.manifest_id
+                == _V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID
+                else None
+            ),
+        )
 
         logs = _mapping(runtime.get("process_logs"), "runtime process logs")
         for name in ("manager_stdout_relative_path", "manager_stderr_relative_path"):
@@ -14144,6 +14643,7 @@ def validate_slot(
             V32_MANIFEST_ID,
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             _validate_v28_verified_response_duplicate_probe(
@@ -14424,6 +14924,7 @@ def validate_slot(
                 V32_MANIFEST_ID,
                 V33_MANIFEST_ID,
                 V34_MANIFEST_ID,
+                V35_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         ):
