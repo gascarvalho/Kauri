@@ -167,6 +167,9 @@ from .factorial_manifest import (
     V30_MANIFEST_ID,
     V30_MANIFEST_SHA256,
     V30_PLAN_SHA256,
+    V31_MANIFEST_ID,
+    V31_MANIFEST_SHA256,
+    V31_PLAN_SHA256,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     FrozenFactorialManifest,
@@ -232,6 +235,10 @@ V30_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
 )
+V31_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
@@ -288,8 +295,11 @@ V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V30_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v30-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V31_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v31-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v32-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -513,14 +523,23 @@ V30_SMOKE_RUNTIME_SHA256 = (
 V30_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "14429819aefef1a4e664f3fd32837cf659a5a10203929526e1137bc392389862"
 )
-FROZEN_RUNTIME_SHA256 = (
+V31_RUNTIME_SHA256 = (
     "935e3f2418b3d24e4e535fcffb4ebc096eafe4ccc93f5468331e4c8d9552621c"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V31_SMOKE_RUNTIME_SHA256 = (
     "d7026d8577928eb4660dd54240f7ce014a77f46d037b67801a7c0c6764706203"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V31_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "2a01a9cfad5b5ca7df9dfe3ce9b58bf894f0a1e7da523423ba8b98b5177fafe1"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "5771dcfa48a4d6550231221b4a7dd409af190b6389797511c1e84419e1b4b395"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "5a27efa53d8324068c67ead555a304c77d7727d82b69bb1d84f4cc80b6d46e74"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "45da6535ee0bf9035b9f61375e03afd7737b6f0d8920431cb5f0248a58a06f86"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -648,6 +667,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -666,6 +686,7 @@ def _v24_preselection_contract(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return None
@@ -789,6 +810,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -813,6 +835,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -845,6 +868,7 @@ def _uses_source_bound_contribution_opportunities(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -874,6 +898,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -903,6 +928,7 @@ def _uses_precontainment_fault_coverage(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -932,6 +958,7 @@ def _uses_precontainment_shape_preservation(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -964,6 +991,7 @@ def _uses_precontainment_guarded_selection_contract(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -995,6 +1023,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V28_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V29_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V30_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V31_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -1025,6 +1054,7 @@ def _uses_source_bound_proposal_witness_contract(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1053,6 +1083,7 @@ def _uses_evidence_snapshot_selection_contract(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1078,6 +1109,7 @@ def _uses_inherited_consensus_wait_exempt_placement_contract(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1100,6 +1132,7 @@ def _uses_verified_response_duplicate_delivery_contract(
         V28_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V29_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V30_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        V31_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     }
     return (
@@ -1494,6 +1527,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V30_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V30_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V31_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V31_MANIFEST_ID,
+            manifest_sha256=V31_MANIFEST_SHA256,
+            plan_sha256=V31_PLAN_SHA256,
+            runtime_sha256=V31_RUNTIME_SHA256,
+            smoke_runtime_sha256=V31_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V31_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -3224,6 +3267,8 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
 def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
     if manifest_id == FROZEN_MANIFEST_ID:
         return FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id == V31_MANIFEST_ID:
+        return V31_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V30_MANIFEST_ID:
         return V30_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V29_MANIFEST_ID:
@@ -3338,6 +3383,11 @@ def _is_excluded_coverage_smoke_slot(
             V30_COVERAGE_SMOKE_RUNTIME_SHA256,
             V30_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V31_MANIFEST_ID: (
+            V31_RUNTIME_SHA256,
+            V31_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V31_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -3404,6 +3454,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V30_MANIFEST_ID:
         return V30_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V31_MANIFEST_ID:
+        return V31_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -3432,6 +3484,7 @@ def _validate_v25_coverage_runtime_document(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fields.add("excluded_repair_smoke_probe")
@@ -3449,6 +3502,7 @@ def _validate_v25_coverage_runtime_document(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.get("schema_version") != 1
@@ -3492,6 +3546,7 @@ def _validate_v25_coverage_runtime_document(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         repair = validated[_coverage_smoke_slot_ids(manifest_id)[1]]
@@ -3632,6 +3687,7 @@ def _load_static_contracts(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             constituents = _validate_v25_coverage_runtime_document(
@@ -3794,6 +3850,7 @@ def _validate_runtime_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected.slot_id == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
@@ -3836,6 +3893,7 @@ def _validate_runtime_slot(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         if (
@@ -3856,6 +3914,7 @@ def _validate_runtime_slot(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and (
         manifest.byzantine.duration_s != _V27_FAULT_WINDOW_DURATION_S
@@ -3877,6 +3936,7 @@ def _validate_runtime_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -3896,6 +3956,7 @@ def _validate_runtime_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -3914,6 +3975,7 @@ def _validate_runtime_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -3931,6 +3993,7 @@ def _validate_runtime_slot(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
@@ -3945,6 +4008,7 @@ def _validate_runtime_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not inherited_wait_exempt_placement
@@ -3956,6 +4020,7 @@ def _validate_runtime_slot(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         if not verified_response_duplicate_delivery:
@@ -4050,6 +4115,7 @@ def _validate_runtime_slot(
                     V28_MANIFEST_ID,
                     V29_MANIFEST_ID,
                     V30_MANIFEST_ID,
+                    V31_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4075,6 +4141,7 @@ def _validate_runtime_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity.update(
@@ -4099,6 +4166,7 @@ def _validate_runtime_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity["fault_window_duration_s"] = (
@@ -4290,6 +4358,7 @@ def _validate_runtime_slot(
                 V28_MANIFEST_ID,
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
+                V31_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4315,6 +4384,7 @@ def _validate_runtime_slot(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_causal_acceptance.update(
@@ -4417,6 +4487,7 @@ def _validate_runtime_slot(
         V28_MANIFEST_ID,
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -10213,6 +10284,7 @@ def _validate_v28_excluded_repair_observation(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id
@@ -10708,6 +10780,7 @@ def _validate_v25_inherited_wait_exempt_placement_live_exercise(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or not coverage_smoke
@@ -11610,6 +11683,7 @@ def _validate_v28_verified_response_duplicate_probe(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -11728,22 +11802,30 @@ def _validate_v28_verified_response_duplicate_probe(
         )
         if not relevant_guards:
             _fail("v28 slot037 response duplicate probe lacks its preceding guard")
-        guard = max(relevant_guards, key=lambda marker: marker.line_number)
-        if (
-            guard.identity != probe.identity
-            or guard.response_monotonic_ns != probe.response_monotonic_ns
-            or any(
-                marker.relative_path == probe.relative_path
-                and guard.line_number < marker.line_number < probe.line_number
-                and marker.identity == probe.identity
-                for marker in duplicate_markers
+        exact_guards = tuple(
+            marker
+            for marker in relevant_guards
+            if marker.identity == probe.identity
+            and marker.response_monotonic_ns == probe.response_monotonic_ns
+        )
+        if not exact_guards:
+            _fail("v28 slot037 response duplicate probe/guard identity drifted")
+        if len(exact_guards) != 1:
+            _fail(
+                "v28 slot037 response duplicate probe guard is absent or duplicated"
             )
-            or any(
-                marker.relative_path == probe.relative_path
-                and guard.line_number < marker.line_number < probe.line_number
-                and marker.identity == probe.identity
-                for marker in prior_probes
-            )
+        guard = exact_guards[0]
+        if any(
+            marker.relative_path == probe.relative_path
+            and guard.line_number < marker.line_number < probe.line_number
+            and marker.reporter_id == probe.reporter_id
+            and marker.child_id == probe.child_id
+            for marker in duplicate_markers
+        ) or any(
+            marker.relative_path == probe.relative_path
+            and guard.line_number < marker.line_number < probe.line_number
+            and marker.identity == probe.identity
+            for marker in prior_probes
         ):
             _fail("v28 slot037 response duplicate probe/guard identity drifted")
 
@@ -11788,10 +11870,11 @@ def _validate_v28_verified_response_duplicate_probe(
         )
         if (
             ingress.next_same_pair_begin_line is not None
-            and ingress.next_same_pair_begin_line < guard.line_number
+            and ingress.next_same_pair_begin_line < probe.line_number
         ):
             _fail(
-                "v28 slot037 response duplicate probe has an intervening relay begin"
+                "v28 slot037 response duplicate probe guard is not immediately "
+                "followed by its probe"
             )
         packed_generation = ingress.view_generation - 1
         generation_epoch = packed_generation >> 32
@@ -11802,25 +11885,75 @@ def _validate_v28_verified_response_duplicate_probe(
                 rotation_ordinal % len(predecessor_trees)
             ].tree_id
             != probe.tree_id
-            or guard.attempt_generation
-            != (ingress.view_generation & 0xFFFF_FFFF)
         ):
             _fail(
-                "v28 slot037 response duplicate probe guard/ingress generation drifted"
+                "v28 slot037 response duplicate probe ingress packed view identity "
+                "drifted"
             )
-        arm = next(
-            (
-                marker
-                for marker in arm_markers
-                if marker.identity == probe.identity
-                and marker.relative_path == probe.relative_path
-                and marker.line_number < ingress.begin_line_number
-                and marker.start_monotonic_ns <= probe.response_monotonic_ns
-            ),
-            None,
+        # The bridge attempt generation is an opaque positive reporter-local
+        # diagnostic.  It is not the packed runtime view generation carried by
+        # the authenticated ingress envelope.
+        if not 1 <= guard.attempt_generation <= _UINT64_MAX:
+            _fail(
+                "v28 slot037 response duplicate probe guard attempt generation "
+                "is outside its unsigned 64-bit bound"
+            )
+
+        commit_events = tuple(
+            event
+            for event in replica_events.get(probe.reporter_id, ())
+            if event.event_type == "block.committed"
+            and event.payload.get("block_hash") == probe.block_hash
         )
-        if arm is None:
-            _fail("v28 slot037 response duplicate probe lacks its exact arm")
+        if len(commit_events) != 1:
+            _fail(
+                "v28 slot037 response duplicate probe lacks one same-block "
+                "structured commit"
+            )
+        commit_event = commit_events[0]
+        commit = _commit_payload(
+            commit_event,
+            authoritative=probe.reporter_id == 0,
+        )
+        commit_view_generation = _integer(
+            commit_event.payload["view_generation"],
+            "v28 slot037 response duplicate probe structured commit view generation",
+            1,
+        )
+        if commit_view_generation > _UINT64_MAX:
+            _fail(
+                "v28 slot037 response duplicate probe structured commit view "
+                "generation exceeds its unsigned 64-bit bound"
+            )
+        if (
+            commit["hash"] != probe.block_hash
+            or commit["epoch_number"] != probe.epoch_number
+            or commit["tree_id"] != probe.tree_id
+            or commit["epoch_digest"] != probe.epoch_digest
+        ):
+            _fail(
+                "v28 slot037 response duplicate probe same-block structured "
+                "commit identity drifted"
+            )
+        if commit_view_generation != ingress.view_generation:
+            _fail(
+                "v28 slot037 response duplicate probe structured commit view "
+                "generation drifted"
+            )
+
+        exact_arms = tuple(
+            marker
+            for marker in arm_markers
+            if marker.identity == probe.identity
+            and marker.relative_path == probe.relative_path
+            and marker.line_number < ingress.begin_line_number
+            and marker.start_monotonic_ns <= probe.response_monotonic_ns
+        )
+        if len(exact_arms) != 1:
+            _fail(
+                "v28 slot037 response duplicate probe exact arm is absent or "
+                "duplicated"
+            )
 
         observations = tuple(
             record
@@ -12597,6 +12730,7 @@ def _validate_v25_coverage_execution_lifecycle(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id not in coverage_slot_ids
@@ -13003,6 +13137,7 @@ def validate_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         )
     )
@@ -13156,6 +13291,7 @@ def validate_slot(
                 V28_MANIFEST_ID,
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
+                V31_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             and coverage_smoke
@@ -13330,6 +13466,7 @@ def validate_slot(
             V28_MANIFEST_ID,
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             _validate_v28_verified_response_duplicate_probe(
@@ -13605,6 +13742,7 @@ def validate_slot(
                 V28_MANIFEST_ID,
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
+                V31_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         ):

@@ -66,8 +66,11 @@ V29_MANIFEST_PATH = (
 V30_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v30.json"
 )
-FROZEN_MANIFEST_PATH = (
+V31_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v31.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -429,15 +432,16 @@ def _v30_candidate_manifest(
 
 
 def _v31_candidate_manifest(
-    monkeypatch: pytest.MonkeyPatch,
+    _monkeypatch: pytest.MonkeyPatch,
+):
+    payload = V31_MANIFEST_PATH.read_bytes()
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v32_candidate_manifest(
+    _monkeypatch: pytest.MonkeyPatch,
 ):
     payload = FROZEN_MANIFEST_PATH.read_bytes()
-    semantic = _canonical(json.loads(payload))
-    monkeypatch.setattr(
-        manifest_module,
-        "FROZEN_SEMANTIC_SHA256",
-        hashlib.sha256(semantic).hexdigest(),
-    )
     return manifest_module.parse_manifest_bytes(payload)
 
 
@@ -607,7 +611,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v31_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v32_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -652,6 +656,9 @@ def test_validator_retains_exact_v1_through_v31_artifact_identities() -> None:
         validation.V30_MANIFEST_ID
     )
     identities[31] = validation._frozen_artifact_identity(
+        validation.V31_MANIFEST_ID
+    )
+    identities[32] = validation._frozen_artifact_identity(
         validation.FROZEN_MANIFEST_ID
     )
 
@@ -882,15 +889,26 @@ def test_validator_retains_exact_v1_through_v31_artifact_identities() -> None:
         identities[30].coverage_smoke_runtime_sha256
         == validation.V30_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[31].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[31].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[31].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[31].manifest_sha256 == validation.V31_MANIFEST_SHA256
+    assert identities[31].plan_sha256 == validation.V31_PLAN_SHA256
+    assert identities[31].runtime_sha256 == validation.V31_RUNTIME_SHA256
     assert (
         identities[31].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V31_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[31].coverage_smoke_runtime_sha256
+        == validation.V31_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[32].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[32].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[32].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[32].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[32].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
     assert validation._coverage_smoke_result_root(
@@ -918,8 +936,11 @@ def test_validator_retains_exact_v1_through_v31_artifact_identities() -> None:
         validation.V30_MANIFEST_ID
     ) == "results/shape-placement-factorial-v30-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V31_MANIFEST_ID
     ) == "results/shape-placement-factorial-v31-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v32-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -1075,8 +1096,8 @@ def test_validator_v30_identities_match_independent_artifact_recomputation() -> 
 
 
 def test_validator_v31_identities_match_independent_artifact_recomputation() -> None:
-    manifest_payload = FROZEN_MANIFEST_PATH.read_bytes()
-    manifest = load_frozen_manifest(FROZEN_MANIFEST_PATH)
+    manifest_payload = V31_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(V31_MANIFEST_PATH)
     plan = build_factorial_plan(manifest)
     runtime = build_factorial_runtime(plan)
     smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
@@ -1100,12 +1121,60 @@ def test_validator_v31_identities_match_independent_artifact_recomputation() -> 
         ).hexdigest(),
     )
     assert recomputed == (
-        manifest_module.FROZEN_MANIFEST_SHA256,
+        manifest_module.V31_MANIFEST_SHA256,
+        manifest_module.V31_SEMANTIC_SHA256,
+        manifest_module.V31_PLAN_SHA256,
+        validation.V31_RUNTIME_SHA256,
+        validation.V31_SMOKE_RUNTIME_SHA256,
+        validation.V31_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+
+
+def test_validator_v32_identities_match_independent_artifact_recomputation() -> None:
+    manifest_payload = FROZEN_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(FROZEN_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+    recomputed = (
+        hashlib.sha256(manifest_payload).hexdigest(),
+        hashlib.sha256(_canonical(json.loads(manifest_payload))).hexdigest(),
+        plan.plan_sha256,
+        hashlib.sha256(canonical_runtime_bytes(runtime)).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(smoke.runtime.as_document())
+        ).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest(),
+    )
+    expected = (
+        "cbc03d8c58b8192b70b5c0f8c0a504dc07076f8e78895a3a2c802b98658d691d",
+        "eb44b9c5c229db10fc967b7d3834029f8780c48f6ae4740b213a692c9af8cb42",
+        "3325d3d1b0b1bf2569686db9d28e3cc8d6cd6e9b6d6fc4ddf97e48b56c1bc2fa",
+        "5771dcfa48a4d6550231221b4a7dd409af190b6389797511c1e84419e1b4b395",
+        "5a27efa53d8324068c67ead555a304c77d7727d82b69bb1d84f4cc80b6d46e74",
+        "45da6535ee0bf9035b9f61375e03afd7737b6f0d8920431cb5f0248a58a06f86",
+    )
+
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v32"
+    assert recomputed == expected
+    assert expected == (
+        identity.manifest_sha256,
         manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        validation.FROZEN_RUNTIME_SHA256,
-        validation.FROZEN_SMOKE_RUNTIME_SHA256,
-        validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
     )
 
 
@@ -7033,6 +7102,42 @@ def _v26_duplicate_delivery_live_fixture(
         )
         for replica_id in range(expected.replica_count)
     }
+    reporter_events = replica_events[reporter]
+    replica_events[reporter] = (
+        reporter_events[0],
+        reporter_events[1],
+        _native_event(
+            source_id=f"replica-{reporter}",
+            sequence=3,
+            monotonic_ns=975,
+            event_type="block.committed",
+            payload={
+                "block_height": 75,
+                "block_hash": proposal_block_hash,
+                "parent_hash": "77" * 32,
+                "transaction_count": 1000,
+                "designated_observer": False,
+                "decision_proof": {
+                    "epoch_number": 1,
+                    "tree_id": tree_id,
+                    "epoch_digest": predecessor_digest,
+                    "block_hash": proposal_block_hash,
+                },
+                "view_generation": view_generation,
+                "commit_batch_index": 0,
+            },
+        ),
+        replace(
+            reporter_events[2],
+            line_number=4,
+            source_sequence=4,
+        ),
+        replace(
+            reporter_events[3],
+            line_number=5,
+            source_sequence=5,
+        ),
+    )
     convergence_payload = {
         "replica_id": None,
         "delivery_attempt": None,
@@ -7153,7 +7258,7 @@ def _v26_duplicate_delivery_live_fixture(
                 "KAURI_RESPONSE_EVIDENCE disposition=idempotent_duplicate "
                 f"reporter={reporter} child={child} epoch=1 tree={tree_id} "
                 f"digest={predecessor_digest} block={proposal_block_hash} "
-                "message_type=aggregate_relay attempt_generation=7 "
+                "message_type=aggregate_relay attempt_generation=2942 "
                 "response_monotonic_ns=900",
                 "KAURI_RELAY_INGRESS stage=result "
                 f"recipient={reporter} source_replica={child} root={reporter} "
@@ -7643,6 +7748,113 @@ def _v28_duplicate_probe_fixture(
     return arguments, log_path
 
 
+def test_v32_probe_accepts_opaque_bridge_generation_distinct_from_packed_view(
+    tmp_path: Path,
+) -> None:
+    arguments, _ = _v28_duplicate_probe_fixture(tmp_path)
+
+    assert validation._validate_v28_verified_response_duplicate_probe(**arguments)
+
+
+def test_v32_probe_accepts_same_packed_view_with_distinct_bridge_generations(
+    tmp_path: Path,
+) -> None:
+    arguments, _ = _v28_duplicate_probe_fixture(tmp_path)
+    reporter = 2
+    child = 7
+    tree_id = 6
+    response_ns = 901
+    view_generation = ((1 << 32) | tree_id) + 1
+    predecessor_digest = arguments["predecessor_epoch_digest"]
+    block_hash = "88" * 32
+    relative = f"raw/process/replica-{reporter}.stderr.log"
+    log_path = tmp_path / relative
+    log_path.write_text(
+        "\n".join(
+            (
+                "KAURI_EVIDENCE response_attempt_armed "
+                f"reporter={reporter} child={child} epoch=1 tree={tree_id} "
+                f"epoch_digest={predecessor_digest} block={block_hash} "
+                "expected_message_type=aggregate_relay start_monotonic_ns=11 "
+                "deadline_duration_us=20 absolute_deadline_ns=20011",
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root=6 "
+                "error=0 wire_error=0 permission=3 envelope=1 "
+                f"epoch=1 tree={tree_id} block={block_hash} "
+                f"generation={view_generation}",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root=6 dispatched=1",
+                "KAURI_RESPONSE_EVIDENCE disposition=idempotent_duplicate "
+                f"reporter={reporter} child={child} epoch=1 tree={tree_id} "
+                f"digest={predecessor_digest} block={block_hash} "
+                "message_type=aggregate_relay attempt_generation=2951 "
+                f"response_monotonic_ns={response_ns}",
+                "KAURI_EXPERIMENT response_duplicate_probe "
+                f"mode={RESPONSE_DUPLICATE_PROBE_MODE} consensus_accepted=1 "
+                f"reporter={reporter} child={child} epoch=1 tree={tree_id} "
+                f"digest={predecessor_digest} block={block_hash} "
+                "message_type=aggregate_relay "
+                f"response_monotonic_ns={response_ns} "
+                "window_end_monotonic_ns=500 "
+                "first_call_recorded=1 second_call_recorded=0",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    replica_events = dict(arguments["replica_events"])
+    reporter_events = replica_events[reporter]
+    replica_events[reporter] = (
+        reporter_events[0],
+        reporter_events[1],
+        _native_event(
+            source_id=f"replica-{reporter}",
+            sequence=3,
+            monotonic_ns=976,
+            event_type="block.committed",
+            payload={
+                "block_height": 75,
+                "block_hash": block_hash,
+                "parent_hash": "77" * 32,
+                "transaction_count": 1000,
+                "designated_observer": False,
+                "decision_proof": {
+                    "epoch_number": 1,
+                    "tree_id": tree_id,
+                    "epoch_digest": predecessor_digest,
+                    "block_hash": block_hash,
+                },
+                "view_generation": view_generation,
+                "commit_batch_index": 0,
+            },
+        ),
+        replace(reporter_events[2], line_number=4, source_sequence=4),
+        replace(reporter_events[3], line_number=5, source_sequence=5),
+    )
+    evidence = arguments["accepted"][(1, predecessor_digest)][0]
+    arguments["accepted"] = {
+        (1, predecessor_digest): (
+            evidence,
+            replace(
+                evidence,
+                ingestion_sequence=2,
+                observation_id="98" * 32,
+                reporter_id=reporter,
+                target_id=child,
+                acceptance_monotonic_ns=951,
+                reporter_monotonic_ns=response_ns,
+                reporter_sequence=2,
+                signer_set=(7, 8),
+            ),
+        )
+    }
+    arguments["replica_events"] = replica_events
+
+    assert validation._validate_v28_verified_response_duplicate_probe(**arguments)
+
+
 def _v31_relay_result_schema_fixture(
     tmp_path: Path,
 ) -> tuple[dict[int, tuple[str, ...]], Path]:
@@ -7959,10 +8171,11 @@ def test_v31_repair_probe_permits_exact_rejected_no_envelope_sentinels(
         validation.V28_MANIFEST_ID,
         validation.V29_MANIFEST_ID,
         validation.V30_MANIFEST_ID,
+        validation.V31_MANIFEST_ID,
         validation.FROZEN_MANIFEST_ID,
     ),
 )
-def test_v28_through_v31_slot037_bind_exact_bridge_only_duplicate_probe(
+def test_v28_through_v32_slot037_bind_exact_bridge_only_duplicate_probe(
     tmp_path: Path,
     manifest_id: str,
 ) -> None:
@@ -8004,15 +8217,31 @@ def test_v28_probe_pairing_permits_unrelated_interleaved_logging(
         ("wrong-epoch", "contract fields"),
         ("wrong-type", "contract fields"),
         ("guard-identity", "probe/guard identity"),
-        ("guard-generation", "guard/ingress generation"),
-        ("ingress-generation", "guard/ingress generation"),
+        ("guard-timestamp", "probe/guard identity"),
+        ("guard-generation-zero", "duplicate attempt generation.*unsigned 64-bit"),
+        (
+            "guard-generation-overflow",
+            "duplicate attempt generation.*unsigned 64-bit",
+        ),
+        ("ingress-generation-zero", "enveloped relay result generation"),
+        (
+            "ingress-generation-overflow",
+            "relay view generation.*unsigned 64-bit",
+        ),
+        ("ingress-packed-epoch", "ingress packed view identity"),
+        ("ingress-packed-tree", "ingress packed view identity"),
         ("missing-ingress", "original accepted ingress"),
         ("rejected-ingress", "original accepted ingress"),
         ("missing-arm", "exact arm"),
+        ("duplicate-arm", "duplicate/rearm response-attempt arm identity"),
+        ("missing-commit", "same-block structured commit"),
+        ("commit-view-generation", "structured commit view generation"),
         ("missing-observation", "Epoch1 accepted evidence"),
         ("timeout-observation", "on-time observation"),
         ("duplicate-reporter", "more than one.*per reporter"),
         ("intervening-guard", "probe/guard identity"),
+        ("duplicate-exact-guard", "probe guard is absent or duplicated"),
+        ("intervening-begin", "not immediately followed by its probe"),
         ("deadline-poison", "response deadline evidence failed"),
         ("unknown-poison", "unknown convergence poison"),
         ("missing-convergence", "converged event"),
@@ -8098,16 +8327,35 @@ def test_v28_response_duplicate_probe_is_fail_closed(
         )
     elif mutation == "guard-identity":
         lines[guard_index] = lines[guard_index].replace("block=8888", "block=9988")
-    elif mutation == "guard-generation":
+    elif mutation == "guard-timestamp":
         lines[guard_index] = lines[guard_index].replace(
-            "attempt_generation=7", "attempt_generation=8"
+            "response_monotonic_ns=900", "response_monotonic_ns=901"
         )
-    elif mutation == "ingress-generation":
+    elif mutation == "guard-generation-zero":
+        lines[guard_index] = lines[guard_index].replace(
+            "attempt_generation=2942", "attempt_generation=0"
+        )
+    elif mutation == "guard-generation-overflow":
+        lines[guard_index] = lines[guard_index].replace(
+            "attempt_generation=2942", "attempt_generation=18446744073709551616"
+        )
+    elif mutation in {
+        "ingress-generation-zero",
+        "ingress-generation-overflow",
+        "ingress-packed-epoch",
+        "ingress-packed-tree",
+    }:
         result_index = next(
             index for index, line in enumerate(lines) if "stage=result" in line
         )
+        generation = {
+            "ingress-generation-zero": 0,
+            "ingress-generation-overflow": 1 << 64,
+            "ingress-packed-epoch": ((2 << 32) | 6) + 1,
+            "ingress-packed-tree": ((1 << 32) | 7) + 1,
+        }[mutation]
         lines[result_index] = lines[result_index].replace(
-            "generation=4294967303", "generation=4294967304"
+            "generation=4294967303", f"generation={generation}"
         )
     elif mutation == "missing-ingress":
         lines = [line for line in lines if "KAURI_RELAY_INGRESS" not in line]
@@ -8126,6 +8374,28 @@ def test_v28_response_duplicate_probe_is_fail_closed(
         )
     elif mutation == "missing-arm":
         lines = [line for line in lines if "response_attempt_armed" not in line]
+    elif mutation == "duplicate-arm":
+        lines.insert(1, lines[0])
+    elif mutation in {"missing-commit", "commit-view-generation"}:
+        replica_events = dict(arguments["replica_events"])
+        reporter_events = tuple(replica_events[6])
+        if mutation == "missing-commit":
+            replica_events[6] = tuple(
+                event
+                for event in reporter_events
+                if event.event_type != "block.committed"
+            )
+        else:
+            replica_events[6] = tuple(
+                replace(
+                    event,
+                    payload={**event.payload, "view_generation": 4294967304},
+                )
+                if event.event_type == "block.committed"
+                else event
+                for event in reporter_events
+            )
+        arguments["replica_events"] = replica_events
     elif mutation in {"missing-observation", "timeout-observation"}:
         key = (1, arguments["predecessor_epoch_digest"])
         evidence = arguments["accepted"][key][0]
@@ -8138,6 +8408,13 @@ def test_v28_response_duplicate_probe_is_fail_closed(
         lines.insert(probe_index + 1, lines[probe_index])
     elif mutation == "intervening-guard":
         lines.insert(probe_index, lines[guard_index].replace("block=8888", "block=9988"))
+    elif mutation == "duplicate-exact-guard":
+        lines.insert(probe_index, lines[guard_index])
+    elif mutation == "intervening-begin":
+        lines.insert(
+            probe_index,
+            "KAURI_RELAY_INGRESS stage=begin recipient=6 source_replica=1",
+        )
     elif mutation == "deadline-poison":
         lines.append(
             "[EPOCH] Adaptive-v2 convergence evidence unhealthy: "
@@ -9011,6 +9288,7 @@ def _v28_repair_observation_fixture(
         29: _v29_candidate_manifest,
         30: _v30_candidate_manifest,
         31: _v31_candidate_manifest,
+        32: _v32_candidate_manifest,
     }[version](monkeypatch)
     expected = _v25_inherited_placement_expected_slot()
     digests = ("10" * 32, "11" * 32, "22" * 32)
@@ -9218,8 +9496,8 @@ def _v28_repair_observation_fixture(
     return document, arguments
 
 
-@pytest.mark.parametrize("version", (28, 29, 30, 31))
-def test_v28_through_v31_excluded_repair_observation_bind_exact_grouped_chronology(
+@pytest.mark.parametrize("version", (28, 29, 30, 31, 32))
+def test_v28_through_v32_excluded_repair_observation_bind_exact_grouped_chronology(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
 ) -> None:
@@ -9697,6 +9975,7 @@ def _v25_coverage_runtime_fixture(
         29: _v29_candidate_manifest,
         30: _v30_candidate_manifest,
         31: _v31_candidate_manifest,
+        32: _v32_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -9814,12 +10093,17 @@ def test_v27_coverage_runtime_binds_v2_timing_and_ordered_lifecycle(
         ),
         (
             31,
-            validation.FROZEN_MANIFEST_ID,
+            validation.V31_MANIFEST_ID,
             "results/shape-placement-factorial-v31/slot-037-n31-f2-b04-00",
+        ),
+        (
+            32,
+            validation.FROZEN_MANIFEST_ID,
+            "results/shape-placement-factorial-v32/slot-037-n31-f2-b04-00",
         ),
     ),
 )
-def test_v28_through_v31_campaign_and_exact_repair_runtime_are_independently_bound(
+def test_v28_through_v32_campaign_and_exact_repair_runtime_are_independently_bound(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     manifest_id: str,
@@ -9881,7 +10165,7 @@ def test_v28_through_v31_campaign_and_exact_repair_runtime_are_independently_bou
 
 @pytest.mark.parametrize(
     "version",
-    (28, 29, 30, 31),
+    (28, 29, 30, 31, 32),
 )
 @pytest.mark.parametrize(
     "mutation,reason",
@@ -9896,7 +10180,7 @@ def test_v28_through_v31_campaign_and_exact_repair_runtime_are_independently_bou
         ("missing-causal-contract", "causal acceptance contract"),
     ),
 )
-def test_v28_through_v31_exact_repair_runtime_are_fail_closed(
+def test_v28_through_v32_exact_repair_runtime_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     mutation: str,
@@ -10328,7 +10612,8 @@ def _v25_coverage_lifecycle_fixture(
         28: V28_MANIFEST_PATH,
         29: V29_MANIFEST_PATH,
         30: V30_MANIFEST_PATH,
-        31: FROZEN_MANIFEST_PATH,
+        31: V31_MANIFEST_PATH,
+        32: FROZEN_MANIFEST_PATH,
     }[version].read_bytes()
     runtime_bytes = _canonical(runtime_document)
     static_artifacts = {
@@ -10575,8 +10860,8 @@ def test_v25_repair_coverage_lifecycle_binds_independent_predecessor(
     )
 
 
-@pytest.mark.parametrize("version", (26, 27, 28, 29, 30, 31))
-def test_v26_through_v31_repair_coverage_lifecycle_inherit_exact_predecessor_binding(
+@pytest.mark.parametrize("version", (26, 27, 28, 29, 30, 31, 32))
+def test_v26_through_v32_repair_coverage_lifecycle_inherit_exact_predecessor_binding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     version: int,
@@ -10631,9 +10916,13 @@ def test_v28_three_row_prelaunch_rejection_cannot_validate_as_completed(
             30,
             "relay view generation exceeds its unsigned 64-bit bound",
         ),
+        (
+            31,
+            "v28 slot037 response duplicate probe guard/ingress generation drifted",
+        ),
     ),
 )
-def test_v29_and_v30_preserved_official_failures_cannot_validate_as_completed(
+def test_v29_through_v31_preserved_official_failures_cannot_validate_as_completed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     version: int,

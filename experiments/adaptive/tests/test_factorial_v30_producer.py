@@ -14,9 +14,6 @@ from experiments.adaptive.kauri_experiment import factorial_manifest as manifest
 from experiments.adaptive.kauri_experiment import factorial_runtime as runtime_module
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-V31_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v31.json"
-)
 V30_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v30.json"
 )
@@ -230,10 +227,10 @@ def test_v29_runtime_cannot_bind_to_v30_repair_slot(
         )
 
 
-def test_v31_is_default_and_v30_is_validation_only(
+def test_v32_is_default_and_v30_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V31_MANIFEST
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v32.json"
     assert cli.main(["--manifest", str(V30_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v30 are validation-only" in refusal["reason"]
+    assert "v1 through v31 are validation-only" in refusal["reason"]
