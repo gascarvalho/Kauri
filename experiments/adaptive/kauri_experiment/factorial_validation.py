@@ -54,6 +54,7 @@ from .factorial_manifest import (
     EXPECTED_ARM_CODES,
     EXPECTED_BLOCK_COUNT,
     EXPECTED_SLOT_COUNT,
+    FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
     FROZEN_PLAN_SHA256,
@@ -120,6 +121,9 @@ from .factorial_manifest import (
     V17_MANIFEST_ID,
     V17_MANIFEST_SHA256,
     V17_PLAN_SHA256,
+    V18_MANIFEST_ID,
+    V18_MANIFEST_SHA256,
+    V18_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -164,8 +168,11 @@ V16_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V17_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v17-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v18-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v19-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -272,14 +279,23 @@ V17_SMOKE_RUNTIME_SHA256 = (
 V17_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "7c4a5b7be38b7e985326e3c2286cac71891c2dc32488087064b4f85566d81d70"
 )
-FROZEN_RUNTIME_SHA256 = (
+V18_RUNTIME_SHA256 = (
     "a418a0d80e9deefd7bbc988fd92129ddc82b971d1a981e9d204b757e7f75ea37"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V18_SMOKE_RUNTIME_SHA256 = (
     "ba095ceb0ac43a42aba395963bc81f47dc8315ce914e6f06dd43878a3ed36d3b"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V18_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "0912ff8e9f5a0f8581e0c8422e8d55c5ff6942a6573864d635bec39d69d1835a"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "1b81ec26e48439d05ac54b68d2a1dafb3d38c4140f835ea6e1f0f3b07545046d"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "f0c999258453cc23bcf2956cb7b8b50ee3b3b05e6b7158ad5dd5d621046c03a0"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "538740a2d5421d80994bc7007421fe57a10e965fb1e5f71f1bc57b78c037b3d6"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -375,6 +391,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V15_MANIFEST_ID,
         V16_MANIFEST_ID,
         V17_MANIFEST_ID,
+        V18_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -427,7 +444,12 @@ def _uses_selection_visible_hard_timeout_witnesses(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V16_MANIFEST_ID, V17_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V16_MANIFEST_ID,
+            V17_MANIFEST_ID,
+            V18_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
@@ -445,6 +467,7 @@ def _uses_source_bound_contribution_opportunities(
             V15_MANIFEST_ID,
             V16_MANIFEST_ID,
             V17_MANIFEST_ID,
+            V18_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -461,6 +484,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V15_MANIFEST_ID,
             V16_MANIFEST_ID,
             V17_MANIFEST_ID,
+            V18_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -477,6 +501,7 @@ def _uses_precontainment_fault_coverage(
             V15_MANIFEST_ID,
             V16_MANIFEST_ID,
             V17_MANIFEST_ID,
+            V18_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -490,7 +515,8 @@ def _uses_precontainment_shape_preservation(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V17_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V17_MANIFEST_ID, V18_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -506,7 +532,7 @@ def _uses_precontainment_guarded_selection_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V18_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -514,6 +540,22 @@ def _uses_precontainment_guarded_selection_contract(
             None,
         )
         == PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
+    )
+
+
+def _uses_future_tree_proposal_delivery_contract(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and getattr(
+            responsive,
+            "future_tree_proposal_delivery_contract",
+            None,
+        )
+        == FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
     )
 
 
@@ -729,6 +771,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V17_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V17_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V18_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V18_MANIFEST_ID,
+            manifest_sha256=V18_MANIFEST_SHA256,
+            plan_sha256=V18_PLAN_SHA256,
+            runtime_sha256=V18_RUNTIME_SHA256,
+            smoke_runtime_sha256=V18_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V18_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2375,6 +2427,11 @@ def _is_excluded_coverage_smoke_slot(
             V17_COVERAGE_SMOKE_RUNTIME_SHA256,
             V17_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V18_MANIFEST_ID: (
+            V18_RUNTIME_SHA256,
+            V18_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2415,6 +2472,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V16_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V17_MANIFEST_ID:
         return V17_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V18_MANIFEST_ID:
+        return V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -2670,6 +2729,14 @@ def _validate_runtime_slot(
     explicit_phase_edge_eligibility = (
         _uses_explicit_phase_edge_eligibility(manifest)
     )
+    future_tree_proposal_delivery = (
+        _uses_future_tree_proposal_delivery_contract(manifest)
+    )
+    if (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and not future_tree_proposal_delivery
+    ):
+        _fail("v19 future-tree proposal delivery contract drifted")
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -2743,6 +2810,10 @@ def _validate_runtime_slot(
             artifact_identity[
                 "precontainment_guarded_selection_contract"
             ] = PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
+        if future_tree_proposal_delivery:
+            artifact_identity[
+                "future_tree_proposal_delivery_contract"
+            ] = FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
     else:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -2878,6 +2949,10 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "precontainment_guarded_selection_contract"
         ] = PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
+    if future_tree_proposal_delivery:
+        expected_causal_acceptance[
+            "future_tree_proposal_delivery_contract"
+        ] = FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
     if dict(
         _mapping(runtime.get("causal_acceptance"), "runtime causal acceptance")
     ) != expected_causal_acceptance:
@@ -2948,6 +3023,7 @@ def _validate_runtime_slot(
         V15_MANIFEST_ID,
         V16_MANIFEST_ID,
         V17_MANIFEST_ID,
+        V18_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (

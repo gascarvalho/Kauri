@@ -34,6 +34,7 @@ from .factorial_manifest import (
     FactorialArm,
     FactorialManifestError,
     FactorialSlot,
+    FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
@@ -4307,6 +4308,7 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v16/slot-066-n31-f5-b05-P": "v16",
         "results/shape-placement-factorial-v17/slot-066-n31-f5-b05-P": "v17",
         "results/shape-placement-factorial-v18/slot-066-n31-f5-b05-P": "v18",
+        "results/shape-placement-factorial-v19/slot-066-n31-f5-b05-P": "v19",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
@@ -4314,15 +4316,21 @@ def build_n31_coverage_smoke_slot(
         "v16": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
         "v17": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
         "v18": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        "v19": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
-        if manifest_version in {"v17", "v18"}
+        if manifest_version in {"v17", "v18", "v19"}
         else None
     )
     expected_guarded_selection_contract = (
         PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
-        if manifest_version == "v18"
+        if manifest_version in {"v18", "v19"}
+        else None
+    )
+    expected_future_tree_proposal_delivery_contract = (
+        FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+        if manifest_version == "v19"
         else None
     )
     if (
@@ -4388,6 +4396,8 @@ def build_n31_coverage_smoke_slot(
         != expected_shape_evaluation_contract
         or responsive.precontainment_guarded_selection_contract
         != expected_guarded_selection_contract
+        or responsive.future_tree_proposal_delivery_contract
+        != expected_future_tree_proposal_delivery_contract
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "

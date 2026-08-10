@@ -67,7 +67,7 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v18.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v19.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
@@ -327,21 +327,21 @@ def _require_frozen_artifacts(
     plan: FactorialPlan,
     runtime: FactorialRuntimePlan,
 ) -> bytes:
-    """Fail before any result claim if producer bytes drift from v18."""
+    """Fail before any result claim if producer bytes drift from v19."""
 
     if (
         manifest.manifest_id != FROZEN_MANIFEST_ID
         or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
     ):
-        raise FactorialExecutionError("campaign production requires exact frozen v18")
+        raise FactorialExecutionError("campaign production requires exact frozen v19")
     if plan.plan_sha256 != FROZEN_PLAN_SHA256:
         raise FactorialExecutionError(
-            "campaign plan bytes differ from the exact frozen v18 identity"
+            "campaign plan bytes differ from the exact frozen v19 identity"
         )
     payload = canonical_runtime_bytes(runtime)
     if _sha256(payload) != FROZEN_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "campaign runtime bytes differ from the exact frozen v18 identity"
+            "campaign runtime bytes differ from the exact frozen v19 identity"
         )
     return payload
 
@@ -743,7 +743,7 @@ def _run_smoke(
     smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
     if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "smoke runtime bytes differ from the exact frozen v18 identity"
+            "smoke runtime bytes differ from the exact frozen v19 identity"
         )
     _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
@@ -827,7 +827,7 @@ def _run_coverage_smoke(
     coverage_runtime_payload = _direct_runtime_bytes(coverage.runtime)
     if _sha256(coverage_runtime_payload) != FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "coverage-smoke runtime bytes differ from the exact frozen v18 identity"
+            "coverage-smoke runtime bytes differ from the exact frozen v19 identity"
         )
     _require_fresh_result_root(coverage_smoke_root, "coverage-smoke")
     artifacts = _static_artifacts(
@@ -1182,8 +1182,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) else 1
         if manifest.manifest_id != FROZEN_MANIFEST_ID:
             raise FactorialExecutionError(
-                "shape-placement-factorial-v1 through v17 are validation-only; "
-                "production commands require shape-placement-factorial-v18"
+                "shape-placement-factorial-v1 through v18 are validation-only; "
+                "production commands require shape-placement-factorial-v19"
             )
         plan = build_factorial_plan(manifest)
         runtime = build_factorial_runtime(plan)
@@ -1210,7 +1210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target_runtime_sha256 = _sha256(smoke_runtime_payload)
                 if target_runtime_sha256 != FROZEN_SMOKE_RUNTIME_SHA256:
                     raise FactorialExecutionError(
-                        "smoke runtime bytes differ from the exact frozen v18 identity"
+                        "smoke runtime bytes differ from the exact frozen v19 identity"
                     )
                 preflight_root = smoke_root
                 target_runtime_id = smoke.runtime.artifact_id
@@ -1233,7 +1233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ):
                     raise FactorialExecutionError(
                         "coverage-smoke runtime bytes differ from the exact "
-                        "frozen v18 identity"
+                        "frozen v19 identity"
                     )
                 preflight_root = coverage_smoke_root
                 target_runtime_id = coverage.runtime.artifact_id
