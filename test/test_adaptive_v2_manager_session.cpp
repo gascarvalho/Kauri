@@ -1641,6 +1641,119 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "configured convergence window admits late exact Q before its deadline",
+    "[adaptive-v2][manager-session][convergence][deadline][quorum]"
+    "[retry][regression]")
+{
+    auto extended_config = session_config();
+    extended_config.maximum_attempts_per_recipient = 5;
+    extended_config.convergence_window_ticks = 300;
+
+    const auto deliver_five_attempts =
+        [](AdaptiveV2ManagerSession &session) {
+        for (std::uint64_t tick = 0; tick <= 8; tick += 2)
+        {
+            const auto deliveries = session.due_deliveries(tick);
+            REQUIRE(deliveries.size() == kMembers.size());
+            for (const auto &request : deliveries)
+            {
+                CHECK(request.attempt == tick / 2 + 1);
+                CHECK(session.record_enqueue_result(
+                          request.recipient,
+                          request.attempt,
+                          true) ==
+                      AdaptiveV2ManagerConvergenceDisposition::
+                          advisory_enqueue_recorded);
+            }
+        }
+    };
+    const auto observe_matching =
+        [](AdaptiveV2ManagerSession &session,
+           const AdaptiveV2EpochChangeIdentity &identity,
+           const std::vector<ReplicaID> &sources) {
+        for (const auto source : sources)
+        {
+            CHECK(session.observe_commit(
+                      source,
+                      AdaptiveV2EpochChangeCommittedObservation{
+                          hotstuff::
+                              kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                          source,
+                          identity}) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+            CHECK(session.observe_activation(
+                      source,
+                      AdaptiveV2EpochActivatedObservation{
+                          hotstuff::
+                              kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                          source,
+                          identity,
+                          identity.successor_epoch_number,
+                          identity.successor_epoch_digest}) ==
+                  AdaptiveV2ManagerConvergenceDisposition::accepted);
+        }
+    };
+
+    SECTION("matching Q after tick 200 advances before tick 300")
+    {
+        Fixture fixture(extended_config);
+        const auto identity = fixture.prepare_convergence(
+            containment_policy(), 2'500, 0);
+        deliver_five_attempts(fixture.session);
+
+        CHECK(fixture.session.due_deliveries(250).empty());
+        REQUIRE(fixture.session.convergence_status().has_value());
+        CHECK(*fixture.session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+
+        observe_matching(fixture.session, identity, kSurvivors);
+
+        REQUIRE(fixture.session.convergence_status().has_value());
+        CHECK(*fixture.session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::
+                  ready_for_optimization);
+        CHECK(fixture.session.terminal_records().empty());
+        REQUIRE(fixture.session.consume_ready_and_rotate());
+        REQUIRE(fixture.session.terminal_records().size() == 1);
+        CHECK(fixture.session.terminal_records().front().outcome ==
+              hotstuff::AdaptiveV2ManagerCycleOutcome::advanced);
+        CHECK(fixture.session.terminal_records().front().reason ==
+              hotstuff::AdaptiveV2ManagerCycleTerminalReason::
+                  successor_converged);
+    }
+
+    SECTION("fewer than Q at tick 300 fails at the exact boundary")
+    {
+        Fixture fixture(extended_config);
+        const auto identity = fixture.prepare_convergence(
+            containment_policy(), 2'501, 0);
+        deliver_five_attempts(fixture.session);
+
+        observe_matching(
+            fixture.session,
+            identity,
+            std::vector<ReplicaID>{2, 3, 4, 5});
+
+        REQUIRE(fixture.session.convergence_status().has_value());
+        CHECK(*fixture.session.convergence_status() ==
+              AdaptiveV2ManagerConvergenceStatus::awaiting_activations);
+        CHECK(fixture.session.due_deliveries(299).empty());
+        CHECK(fixture.session.terminal_records().empty());
+        CHECK(fixture.session.due_deliveries(300).empty());
+        CHECK_FALSE(fixture.session.convergence_status().has_value());
+        REQUIRE(fixture.session.terminal_records().size() == 1);
+        CHECK(fixture.session.terminal_records().front().outcome ==
+              hotstuff::AdaptiveV2ManagerCycleOutcome::failed);
+        CHECK(fixture.session.terminal_records().front().reason ==
+              hotstuff::AdaptiveV2ManagerCycleTerminalReason::
+                  convergence_retry_exhausted);
+        CHECK(fixture.session.ingress().current_epoch().epoch_number() == 0);
+        CHECK(fixture.session.due_deliveries(301).empty());
+        CHECK(fixture.session.terminal_records().size() == 1);
+    }
+}
+
+TEST_CASE(
     "session delivers the immutable successor before commit identity exists",
     "[adaptive-v2][manager-session][precommit-delivery][m12-r02]"
     "[intentional-red]")

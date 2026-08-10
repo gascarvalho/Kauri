@@ -69,8 +69,11 @@ V30_MANIFEST_PATH = (
 V31_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v31.json"
 )
-FROZEN_MANIFEST_PATH = (
+V32_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v33.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -228,6 +231,12 @@ def test_v26_and_v27_duplicate_delivery_dispatch_is_version_and_field_exact() ->
     )
     assert validation._uses_verified_response_duplicate_delivery_contract(
         manifest(
+            validation.V32_MANIFEST_ID,
+            VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_verified_response_duplicate_delivery_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         )
@@ -291,6 +300,12 @@ def test_v23_future_tree_delivery_dispatch_is_version_and_field_exact() -> None:
     )
     assert validation._uses_future_tree_proposal_delivery_contract(
         manifest(
+            validation.V32_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         )
@@ -343,6 +358,12 @@ def test_v25_inherited_wait_exempt_placement_dispatch_is_version_and_field_exact
     assert validation._uses_inherited_consensus_wait_exempt_placement_contract(
         manifest(
             validation.V30_MANIFEST_ID,
+            INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
+        )
+    )
+    assert validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(
+            validation.V32_MANIFEST_ID,
             INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
         )
     )
@@ -441,7 +462,20 @@ def _v31_candidate_manifest(
 def _v32_candidate_manifest(
     _monkeypatch: pytest.MonkeyPatch,
 ):
+    payload = V32_MANIFEST_PATH.read_bytes()
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v33_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
     payload = FROZEN_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
     return manifest_module.parse_manifest_bytes(payload)
 
 
@@ -611,7 +645,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v32_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v33_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -659,6 +693,9 @@ def test_validator_retains_exact_v1_through_v32_artifact_identities() -> None:
         validation.V31_MANIFEST_ID
     )
     identities[32] = validation._frozen_artifact_identity(
+        validation.V32_MANIFEST_ID
+    )
+    identities[33] = validation._frozen_artifact_identity(
         validation.FROZEN_MANIFEST_ID
     )
 
@@ -900,15 +937,26 @@ def test_validator_retains_exact_v1_through_v32_artifact_identities() -> None:
         identities[31].coverage_smoke_runtime_sha256
         == validation.V31_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[32].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[32].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[32].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[32].manifest_sha256 == validation.V32_MANIFEST_SHA256
+    assert identities[32].plan_sha256 == validation.V32_PLAN_SHA256
+    assert identities[32].runtime_sha256 == validation.V32_RUNTIME_SHA256
     assert (
         identities[32].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V32_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[32].coverage_smoke_runtime_sha256
+        == validation.V32_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[33].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[33].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[33].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[33].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[33].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
     assert validation._coverage_smoke_result_root(
@@ -939,8 +987,11 @@ def test_validator_retains_exact_v1_through_v32_artifact_identities() -> None:
         validation.V31_MANIFEST_ID
     ) == "results/shape-placement-factorial-v31-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V32_MANIFEST_ID
     ) == "results/shape-placement-factorial-v32-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v33-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -1131,6 +1182,59 @@ def test_validator_v31_identities_match_independent_artifact_recomputation() -> 
 
 
 def test_validator_v32_identities_match_independent_artifact_recomputation() -> None:
+    manifest_payload = V32_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(V32_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    identity = validation._frozen_artifact_identity(
+        validation.V32_MANIFEST_ID
+    )
+    recomputed = (
+        hashlib.sha256(manifest_payload).hexdigest(),
+        hashlib.sha256(_canonical(json.loads(manifest_payload))).hexdigest(),
+        plan.plan_sha256,
+        hashlib.sha256(canonical_runtime_bytes(runtime)).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(smoke.runtime.as_document())
+        ).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest(),
+    )
+    expected = (
+        "cbc03d8c58b8192b70b5c0f8c0a504dc07076f8e78895a3a2c802b98658d691d",
+        "eb44b9c5c229db10fc967b7d3834029f8780c48f6ae4740b213a692c9af8cb42",
+        "3325d3d1b0b1bf2569686db9d28e3cc8d6cd6e9b6d6fc4ddf97e48b56c1bc2fa",
+        "5771dcfa48a4d6550231221b4a7dd409af190b6389797511c1e84419e1b4b395",
+        "5a27efa53d8324068c67ead555a304c77d7727d82b69bb1d84f4cc80b6d46e74",
+        "45da6535ee0bf9035b9f61375e03afd7737b6f0d8920431cb5f0248a58a06f86",
+    )
+
+    assert validation.V32_MANIFEST_ID == "shape-placement-factorial-v32"
+    assert recomputed == expected
+    assert expected[3:] == (
+        runtime_module.V32_RUNTIME_SHA256,
+        runtime_module.V32_SMOKE_RUNTIME_SHA256,
+        runtime_module.V32_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+    assert expected == (
+        identity.manifest_sha256,
+        manifest_module.V32_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    )
+
+
+def test_validator_v33_identities_match_independent_artifact_recomputation() -> None:
     manifest_payload = FROZEN_MANIFEST_PATH.read_bytes()
     manifest = load_frozen_manifest(FROZEN_MANIFEST_PATH)
     plan = build_factorial_plan(manifest)
@@ -1158,15 +1262,15 @@ def test_validator_v32_identities_match_independent_artifact_recomputation() -> 
         ).hexdigest(),
     )
     expected = (
-        "cbc03d8c58b8192b70b5c0f8c0a504dc07076f8e78895a3a2c802b98658d691d",
-        "eb44b9c5c229db10fc967b7d3834029f8780c48f6ae4740b213a692c9af8cb42",
-        "3325d3d1b0b1bf2569686db9d28e3cc8d6cd6e9b6d6fc4ddf97e48b56c1bc2fa",
-        "5771dcfa48a4d6550231221b4a7dd409af190b6389797511c1e84419e1b4b395",
-        "5a27efa53d8324068c67ead555a304c77d7727d82b69bb1d84f4cc80b6d46e74",
-        "45da6535ee0bf9035b9f61375e03afd7737b6f0d8920431cb5f0248a58a06f86",
+        "aa109a401ef88f7d135ff7f590ae1f372329ed5165c223ce0e3bf44536cf61fc",
+        "8faee7b8cf1148a7acec48b75f02ca3f5b864ee6981555ae78624664e246509f",
+        "0897fc233ae6fc25898ee576066403f122ad65416322dec2d4e99e03503fd81c",
+        "597bddecd5ada141dfaf1830cabb645fa5f50aaf20abd198c134a48e2d1e4e2b",
+        "c0b96dfaaf73a374113a0c6ba98f87c06a934eb6b40202d96a51b6182c714c05",
+        "18d9dd6841b3dc69a3797d9473aa0f14df2bc793cf3354abd67be91000e7007e",
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v32"
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v33"
     assert recomputed == expected
     assert expected == (
         identity.manifest_sha256,
@@ -1175,6 +1279,11 @@ def test_validator_v32_identities_match_independent_artifact_recomputation() -> 
         identity.runtime_sha256,
         identity.smoke_runtime_sha256,
         identity.coverage_smoke_runtime_sha256,
+    )
+    assert expected[3:] == (
+        runtime_module.FROZEN_RUNTIME_SHA256,
+        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
+        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
 
 
@@ -7293,6 +7402,157 @@ def _v26_duplicate_delivery_live_fixture(
     )
 
 
+def _cycle_convergence_arguments(
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    return {
+        name: arguments[name]
+        for name in (
+            "expected",
+            "manager_events",
+            "replica_events",
+            "predecessor_epoch_digest",
+            "predecessor_trees",
+            "successor_epoch_digest",
+            "successor_trees",
+            "command_payload_digest",
+            "activation_delay_blocks",
+        )
+    }
+
+
+def test_v33_convergence_completion_accepts_exact_all_n31_before_hard_deadline(
+    tmp_path: Path,
+) -> None:
+    arguments, _ = _v26_duplicate_delivery_live_fixture(tmp_path)
+
+    validation._v26_cycle1_convergence_command(
+        **_cycle_convergence_arguments(arguments),
+        hard_deadline_ns=3_200,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing-command", "cycle-1 commit/activation convergence"),
+        ("missing-activation", "cycle-1 commit/activation convergence"),
+        (
+            "last-command-at-deadline",
+            "all raw command/activation witnesses.*hard deadline",
+        ),
+        (
+            "last-activation-at-deadline",
+            "all raw command/activation witnesses.*hard deadline",
+        ),
+        (
+            "q21-at-deadline",
+            "raw activation quorum.*hard deadline",
+        ),
+        (
+            "convergence-at-deadline",
+            "adaptive_v2_converged.*hard deadline",
+        ),
+        (
+            "terminal-at-deadline",
+            "cycle-1 terminal.*hard deadline",
+        ),
+    ),
+)
+def test_v33_convergence_completion_is_strict_and_fail_closed_before_hard_deadline(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments, _ = _v26_duplicate_delivery_live_fixture(tmp_path)
+    hard_deadline_ns = 3_200
+    replica_events = {
+        replica_id: list(events)
+        for replica_id, events in arguments["replica_events"].items()
+    }
+    manager_events = list(arguments["manager_events"])
+
+    if mutation in {"missing-command", "missing-activation"}:
+        event_type = (
+            "epoch.command_committed"
+            if mutation == "missing-command"
+            else "epoch.activated"
+        )
+        replica_events[30] = [
+            event
+            for event in replica_events[30]
+            if not (
+                event.event_type == event_type
+                and event.payload.get(
+                    "successor_epoch_number"
+                    if event_type == "epoch.command_committed"
+                    else "epoch_number"
+                )
+                == 2
+            )
+        ]
+    elif mutation == "last-command-at-deadline":
+        replica_events[30] = [
+            replace(event, monotonic_ns=hard_deadline_ns)
+            if event.event_type == "epoch.command_committed"
+            and event.payload.get("successor_epoch_number") == 2
+            else replace(event, monotonic_ns=hard_deadline_ns + 1)
+            if event.event_type == "epoch.activated"
+            and event.payload.get("epoch_number") == 2
+            else event
+            for event in replica_events[30]
+        ]
+    elif mutation == "last-activation-at-deadline":
+        replica_events[30] = [
+            replace(event, monotonic_ns=hard_deadline_ns)
+            if event.event_type == "epoch.activated"
+            and event.payload.get("epoch_number") == 2
+            else event
+            for event in replica_events[30]
+        ]
+    elif mutation == "q21-at-deadline":
+        for replica_id in range(20, 31):
+            replica_events[replica_id] = [
+                replace(
+                    event,
+                    monotonic_ns=hard_deadline_ns + replica_id - 20,
+                )
+                if event.event_type == "epoch.activated"
+                and event.payload.get("epoch_number") == 2
+                else event
+                for event in replica_events[replica_id]
+            ]
+    elif mutation == "convergence-at-deadline":
+        manager_events = [
+            replace(event, monotonic_ns=hard_deadline_ns)
+            if event.event_type == "adaptive_v2_converged"
+            and event.payload["identity"]["successor_epoch_number"] == 2
+            else event
+            for event in manager_events
+        ]
+    else:
+        manager_events = [
+            replace(event, monotonic_ns=hard_deadline_ns)
+            if event.event_type == "adaptive_v2_session_terminal"
+            and event.payload.get("cycle_ordinal") == 1
+            else event
+            for event in manager_events
+        ]
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._v26_cycle1_convergence_command(
+            **{
+                **_cycle_convergence_arguments(arguments),
+                "manager_events": tuple(manager_events),
+                "replica_events": {
+                    replica_id: tuple(events)
+                    for replica_id, events in replica_events.items()
+                },
+            },
+            hard_deadline_ns=hard_deadline_ns,
+        )
+
+
 def test_v26_slot037_requires_live_idempotent_duplicate_delivery_proof(
     tmp_path: Path,
 ) -> None:
@@ -8172,10 +8432,11 @@ def test_v31_repair_probe_permits_exact_rejected_no_envelope_sentinels(
         validation.V29_MANIFEST_ID,
         validation.V30_MANIFEST_ID,
         validation.V31_MANIFEST_ID,
+        validation.V32_MANIFEST_ID,
         validation.FROZEN_MANIFEST_ID,
     ),
 )
-def test_v28_through_v32_slot037_bind_exact_bridge_only_duplicate_probe(
+def test_v28_through_v33_slot037_bind_exact_bridge_only_duplicate_probe(
     tmp_path: Path,
     manifest_id: str,
 ) -> None:
@@ -9289,6 +9550,7 @@ def _v28_repair_observation_fixture(
         30: _v30_candidate_manifest,
         31: _v31_candidate_manifest,
         32: _v32_candidate_manifest,
+        33: _v33_candidate_manifest,
     }[version](monkeypatch)
     expected = _v25_inherited_placement_expected_slot()
     digests = ("10" * 32, "11" * 32, "22" * 32)
@@ -9496,8 +9758,8 @@ def _v28_repair_observation_fixture(
     return document, arguments
 
 
-@pytest.mark.parametrize("version", (28, 29, 30, 31, 32))
-def test_v28_through_v32_excluded_repair_observation_bind_exact_grouped_chronology(
+@pytest.mark.parametrize("version", (28, 29, 30, 31, 32, 33))
+def test_v28_through_v33_excluded_repair_observation_bind_exact_grouped_chronology(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
 ) -> None:
@@ -9911,6 +10173,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
+    assert validation._coverage_smoke_slot_ids(validation.V32_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
     assert validation._coverage_smoke_slot_ids(validation.FROZEN_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
@@ -9938,6 +10204,7 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         validation.V25_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V26_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        validation.V32_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
     ),
 )
@@ -9976,6 +10243,7 @@ def _v25_coverage_runtime_fixture(
         30: _v30_candidate_manifest,
         31: _v31_candidate_manifest,
         32: _v32_candidate_manifest,
+        33: _v33_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -10073,6 +10341,110 @@ def test_v27_coverage_runtime_binds_v2_timing_and_ordered_lifecycle(
     )
 
 
+def test_v33_profile_runtime_slot_and_argv_bind_exact_deadline_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=33,
+    )
+    validation._validate_v33_static_timing_contract(manifest)
+    validated = validation._validate_v25_coverage_runtime_document(
+        runtime,
+        manifest=manifest,
+        expected_by_id=expected_by_id,
+    )
+
+    assert manifest.common_timers.transition_convergence_deadline_s == 30
+    assert manifest.common_timers.leader_progress_timeout_ms == 20_000
+    assert manifest.byzantine.duration_s == 450
+    assert manifest.common_timers.hard_timeout_s == 650
+    primary_id, repair_id = validation._coverage_smoke_slot_ids(
+        manifest.manifest_id
+    )
+    assert validated[primary_id]["fault_window"] == {
+        **validated[primary_id]["fault_window"],
+        "duration_s": 450,
+        "transition_convergence_deadline_s": 30,
+        "hard_timeout_s": 650,
+    }
+    assert validated[repair_id]["fault_window"]["duration_s"] == 300
+    for slot in validated.values():
+        argv = slot["manager_argv_template"]["argv"]
+        index = argv.index("--convergence-deadline-seconds")
+        assert argv[index + 1] == "30"
+        assert "leader-progress-timeout = 20" in slot["main_config"]["lines"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("deadline", "leader-timeout", "duration", "hard-timeout"),
+)
+def test_v33_profile_timing_contract_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    manifest = _v33_candidate_manifest(monkeypatch)
+    timers = manifest.common_timers
+    byzantine = manifest.byzantine
+    if mutation == "deadline":
+        timers = replace(timers, transition_convergence_deadline_s=29)
+    elif mutation == "leader-timeout":
+        timers = replace(timers, leader_progress_timeout_ms_per_depth=4_999)
+    elif mutation == "duration":
+        byzantine = replace(byzantine, duration_s=449)
+    else:
+        timers = replace(timers, hard_timeout_s=649)
+
+    with pytest.raises(FactorialValidationError, match="v33 exact 30s"):
+        validation._validate_v33_static_timing_contract(
+            replace(manifest, common_timers=timers, byzantine=byzantine)
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("fault-window-deadline", "fault-window"),
+        ("manager-argv-deadline", "exact 30s convergence deadline"),
+        ("leader-timeout", "main configuration/timers"),
+        ("duration", "fault-window"),
+        ("hard-timeout", "fault-window"),
+    ),
+)
+def test_v33_runtime_slot_rejects_any_deadline_or_schedule_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    reason: str,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=33,
+    )
+    primary = runtime["slots"][0]
+    if mutation == "fault-window-deadline":
+        primary["fault_window"]["transition_convergence_deadline_s"] = 29
+    elif mutation == "manager-argv-deadline":
+        argv = primary["manager_argv_template"]["argv"]
+        argv[argv.index("--convergence-deadline-seconds") + 1] = "29"
+    elif mutation == "leader-timeout":
+        lines = primary["main_config"]["lines"]
+        lines[lines.index("leader-progress-timeout = 20")] = (
+            "leader-progress-timeout = 19"
+        )
+    elif mutation == "duration":
+        primary["fault_window"]["duration_s"] = 449
+    else:
+        primary["fault_window"]["hard_timeout_s"] = 649
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
 @pytest.mark.parametrize(
     ("version", "manifest_id", "source_result_path"),
     (
@@ -10098,12 +10470,17 @@ def test_v27_coverage_runtime_binds_v2_timing_and_ordered_lifecycle(
         ),
         (
             32,
-            validation.FROZEN_MANIFEST_ID,
+            validation.V32_MANIFEST_ID,
             "results/shape-placement-factorial-v32/slot-037-n31-f2-b04-00",
+        ),
+        (
+            33,
+            validation.FROZEN_MANIFEST_ID,
+            "results/shape-placement-factorial-v33/slot-037-n31-f2-b04-00",
         ),
     ),
 )
-def test_v28_through_v32_campaign_and_exact_repair_runtime_are_independently_bound(
+def test_v28_through_v33_campaign_and_exact_repair_runtime_are_independently_bound(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     manifest_id: str,
@@ -10165,7 +10542,7 @@ def test_v28_through_v32_campaign_and_exact_repair_runtime_are_independently_bou
 
 @pytest.mark.parametrize(
     "version",
-    (28, 29, 30, 31, 32),
+    (28, 29, 30, 31, 32, 33),
 )
 @pytest.mark.parametrize(
     "mutation,reason",
@@ -10180,7 +10557,7 @@ def test_v28_through_v32_campaign_and_exact_repair_runtime_are_independently_bou
         ("missing-causal-contract", "causal acceptance contract"),
     ),
 )
-def test_v28_through_v32_exact_repair_runtime_are_fail_closed(
+def test_v28_through_v33_exact_repair_runtime_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     mutation: str,
@@ -10613,7 +10990,8 @@ def _v25_coverage_lifecycle_fixture(
         29: V29_MANIFEST_PATH,
         30: V30_MANIFEST_PATH,
         31: V31_MANIFEST_PATH,
-        32: FROZEN_MANIFEST_PATH,
+        32: V32_MANIFEST_PATH,
+        33: FROZEN_MANIFEST_PATH,
     }[version].read_bytes()
     runtime_bytes = _canonical(runtime_document)
     static_artifacts = {
@@ -10860,8 +11238,8 @@ def test_v25_repair_coverage_lifecycle_binds_independent_predecessor(
     )
 
 
-@pytest.mark.parametrize("version", (26, 27, 28, 29, 30, 31, 32))
-def test_v26_through_v32_repair_coverage_lifecycle_inherit_exact_predecessor_binding(
+@pytest.mark.parametrize("version", (26, 27, 28, 29, 30, 31, 32, 33))
+def test_v26_through_v33_repair_coverage_lifecycle_inherit_exact_predecessor_binding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     version: int,
@@ -10956,6 +11334,39 @@ def test_v29_through_v31_preserved_official_failures_cannot_validate_as_complete
             predecessor_result=_pass_coverage_validation(
                 expected_by_id["slot-066-n31-f5-b05-P"]
             ),
+        )
+
+
+def test_v32_preserved_official_primary_incomplete_cannot_validate_as_completed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(
+        monkeypatch,
+        tmp_path,
+        row_count=2,
+        version=32,
+    )
+    root = fixture["recorded_result_root"]
+    assert isinstance(root, Path)
+    ledger_path = root / execution.COVERAGE_SMOKE_LEDGER_FILENAME
+    rows = [json.loads(raw) for raw in ledger_path.read_bytes().splitlines()]
+    reason = "unexpected pre-cleanup exit: adaptive-manager=1"
+    rows[-1]["execution_outcome"] = "INCOMPLETE"
+    rows[-1]["execution_reason"] = reason
+    rows[-1]["validation"] = {
+        "campaign_member": False,
+        "figure_eligible": False,
+        "integrity_valid": False,
+        "outcome": "INCOMPLETE",
+        "reason": reason,
+    }
+    ledger_path.write_bytes(b"".join(_canonical(row) for row in rows))
+
+    with pytest.raises(FactorialValidationError, match="non-PASS terminal"):
+        _validate_v25_coverage_fixture(
+            fixture,
+            "slot-066-n31-f5-b05-P",
         )
 
 

@@ -210,13 +210,13 @@ def test_v27_is_validation_only_and_preserves_v26_alias(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v32.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v33.json"
     assert cli.main(["--manifest", str(V27_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v31 are validation-only" in refusal["reason"]
+    assert "v1 through v32 are validation-only" in refusal["reason"]
     assert cli.main(["--manifest", str(V26_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v31 are validation-only" in refusal["reason"]
+    assert "v1 through v32 are validation-only" in refusal["reason"]
 
     _, plan = _candidate_plan(monkeypatch)
     primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)

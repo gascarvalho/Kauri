@@ -1,4 +1,4 @@
-"""Frozen planning/preflight contract for the SHAPE32 factorial."""
+"""Frozen planning/preflight contract for the SHAPE33 factorial."""
 
 from __future__ import annotations
 
@@ -304,15 +304,26 @@ V31_PLAN_SHA256 = (
     "f589888a4456910f3188ee602565e990ea7c4fb45dedd798d8804b679b1591fa"
 )
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v32"
-FROZEN_MANIFEST_SHA256 = (
+V32_MANIFEST_ID = "shape-placement-factorial-v32"
+V32_MANIFEST_SHA256 = (
     "cbc03d8c58b8192b70b5c0f8c0a504dc07076f8e78895a3a2c802b98658d691d"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V32_SEMANTIC_SHA256 = (
     "eb44b9c5c229db10fc967b7d3834029f8780c48f6ae4740b213a692c9af8cb42"
 )
-FROZEN_PLAN_SHA256 = (
+V32_PLAN_SHA256 = (
     "3325d3d1b0b1bf2569686db9d28e3cc8d6cd6e9b6d6fc4ddf97e48b56c1bc2fa"
+)
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v33"
+FROZEN_MANIFEST_SHA256 = (
+    "aa109a401ef88f7d135ff7f590ae1f372329ed5165c223ce0e3bf44536cf61fc"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "8faee7b8cf1148a7acec48b75f02ca3f5b864ee6981555ae78624664e246509f"
+)
+FROZEN_PLAN_SHA256 = (
+    "0897fc233ae6fc25898ee576066403f122ad65416322dec2d4e99e03503fd81c"
 )
 
 RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1 = (
@@ -1103,9 +1114,10 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
-        _error("manifest ID is not a known frozen SHAPE32 contract")
+        _error("manifest ID is not a known frozen SHAPE33 contract")
     tiered = manifest_id in {
         V8_MANIFEST_ID,
         V9_MANIFEST_ID,
@@ -1131,6 +1143,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     causal_measurement = manifest_id in {
@@ -1157,6 +1170,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     explicit_causal_windows = manifest_id in {
@@ -1182,6 +1196,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     explicit_causal_edge_eligibility = manifest_id in {
@@ -1206,6 +1221,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     persistent = manifest_id in {
@@ -1239,6 +1255,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
@@ -1271,6 +1288,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -1310,12 +1328,13 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else "shape25-sensitive-responsiveness-v1"
     )
     if responsiveness.get("policy_version") != expected_policy_version:
-        _error("responsiveness policy version must be the frozen SHAPE32 policy")
+        _error("responsiveness policy version must be the frozen SHAPE33 policy")
     attempt_window = _integer(
         responsiveness.get("attempt_window"),
         "responsiveness_policy.attempt_window",
@@ -1367,6 +1386,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else (41 if causal_measurement else 32)
@@ -1395,6 +1415,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else 2
@@ -1475,6 +1496,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_mode = "tiered_persistent_responsive_omission_v2"
@@ -1596,6 +1618,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_responsive_schedule = RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1
@@ -1662,6 +1685,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add("precontainment_fault_coverage_gate")
@@ -1681,6 +1705,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1701,6 +1726,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1720,6 +1746,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1738,6 +1765,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1754,6 +1782,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1768,6 +1797,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1781,6 +1811,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1801,6 +1832,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1811,7 +1843,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                     "responsive-degradation verified-response duplicate delivery "
                     "contract is required"
                 )
-        if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+        if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, FROZEN_MANIFEST_ID}:
             expected_responsive_fields.update(
                 {
                     "excluded_repair_smoke_observation_contract",
@@ -1882,6 +1914,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             rate_eligible_timeout_counts = {
@@ -2012,6 +2045,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
@@ -2031,6 +2065,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else (
@@ -2074,6 +2109,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2101,6 +2137,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2130,6 +2167,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2154,6 +2192,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else (
@@ -2191,6 +2230,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2216,6 +2256,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2238,6 +2279,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2258,6 +2300,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else (
@@ -2275,7 +2318,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             )
         expected_excluded_repair_observation_contract = (
             EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
-            if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         if responsive.get("excluded_repair_smoke_observation_contract") != (
@@ -2284,7 +2327,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             _error("responsive-degradation excluded repair observation drifted")
         expected_excluded_repair_duplicate_probe_contract = (
             EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
-            if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         if responsive.get(
@@ -2303,6 +2346,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2419,6 +2463,14 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         timers.get("transition_convergence_deadline_s"),
         "timers.transition_convergence_deadline_s",
     )
+    expected_convergence_deadline_s = (
+        30 if manifest_id == FROZEN_MANIFEST_ID else 20
+    )
+    if convergence_deadline_s != expected_convergence_deadline_s:
+        _error(
+            "transition convergence deadline must equal the exact frozen "
+            f"{expected_convergence_deadline_s} second contract"
+        )
     schedule_slack_s = _integer(
         timers.get("schedule_slack_s"),
         "timers.schedule_slack_s",
@@ -2464,6 +2516,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else None
@@ -2576,6 +2629,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else (
@@ -2749,6 +2803,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2775,6 +2830,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V29_MANIFEST_ID,
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
+                V32_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         )
@@ -2802,7 +2858,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v32 may carry the compact "
+            "only shape-placement-factorial-v3 through v33 may carry the compact "
             "snapshot format field"
         )
 
@@ -2839,6 +2895,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V29_MANIFEST_ID: V29_SEMANTIC_SHA256,
         V30_MANIFEST_ID: V30_SEMANTIC_SHA256,
         V31_MANIFEST_ID: V31_SEMANTIC_SHA256,
+        V32_MANIFEST_ID: V32_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -3219,6 +3276,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V29_MANIFEST_ID: V29_MANIFEST_SHA256,
         V30_MANIFEST_ID: V30_MANIFEST_SHA256,
         V31_MANIFEST_ID: V31_MANIFEST_SHA256,
+        V32_MANIFEST_ID: V32_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -3705,6 +3763,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V29_MANIFEST_ID: (V29_MANIFEST_SHA256, V29_PLAN_SHA256),
         V30_MANIFEST_ID: (V30_MANIFEST_SHA256, V30_PLAN_SHA256),
         V31_MANIFEST_ID: (V31_MANIFEST_SHA256, V31_PLAN_SHA256),
+        V32_MANIFEST_ID: (V32_MANIFEST_SHA256, V32_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -3882,6 +3941,10 @@ __all__ = (
     "V31_MANIFEST_SHA256",
     "V31_PLAN_SHA256",
     "V31_SEMANTIC_SHA256",
+    "V32_MANIFEST_ID",
+    "V32_MANIFEST_SHA256",
+    "V32_PLAN_SHA256",
+    "V32_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",

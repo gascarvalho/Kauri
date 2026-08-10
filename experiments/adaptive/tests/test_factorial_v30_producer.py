@@ -227,10 +227,10 @@ def test_v29_runtime_cannot_bind_to_v30_repair_slot(
         )
 
 
-def test_v32_is_default_and_v30_is_validation_only(
+def test_v33_is_default_and_v30_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v32.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v33.json"
     assert cli.main(["--manifest", str(V30_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v31 are validation-only" in refusal["reason"]
+    assert "v1 through v32 are validation-only" in refusal["reason"]

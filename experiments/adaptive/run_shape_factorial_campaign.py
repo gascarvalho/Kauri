@@ -59,6 +59,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (  # noqa: 
     V29_MANIFEST_ID,
     V30_MANIFEST_ID,
     V31_MANIFEST_ID,
+    V32_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
     FactorialSlot,
@@ -87,7 +88,7 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v32.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v33.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
@@ -198,6 +199,7 @@ def _n31_coverage_smoke(plan: FactorialPlan) -> N31CoverageSmokeSlot:
             V29_MANIFEST_ID,
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else None
@@ -218,6 +220,7 @@ def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
         V29_MANIFEST_ID,
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return (primary, "slot-037-n31-f2-b04-00")
@@ -395,21 +398,21 @@ def _require_frozen_artifacts(
     plan: FactorialPlan,
     runtime: FactorialRuntimePlan,
 ) -> bytes:
-    """Fail before any result claim if producer bytes drift from v32."""
+    """Fail before any result claim if producer bytes drift from v33."""
 
     if (
         manifest.manifest_id != FROZEN_MANIFEST_ID
         or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
     ):
-        raise FactorialExecutionError("campaign production requires exact frozen v32")
+        raise FactorialExecutionError("campaign production requires exact frozen v33")
     if plan.plan_sha256 != FROZEN_PLAN_SHA256:
         raise FactorialExecutionError(
-            "campaign plan bytes differ from the exact frozen v32 identity"
+            "campaign plan bytes differ from the exact frozen v33 identity"
         )
     payload = canonical_runtime_bytes(runtime)
     if _sha256(payload) != FROZEN_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "campaign runtime bytes differ from the exact frozen v32 identity"
+            "campaign runtime bytes differ from the exact frozen v33 identity"
         )
     return payload
 
@@ -664,7 +667,7 @@ def _require_validated_coverage_smoke(
             or common_authorization_payload is None
         ):
             raise FactorialExecutionError(
-                "v32 coverage-smoke gate lacks its ordered runtime/static contract"
+                "v33 coverage-smoke gate lacks its ordered runtime/static contract"
             )
         _require_completed_coverage_smoke_sequence(
             coverage_smoke_root,
@@ -880,7 +883,7 @@ def _run_smoke(
     smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
     if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "smoke runtime bytes differ from the exact frozen v32 identity"
+            "smoke runtime bytes differ from the exact frozen v33 identity"
         )
     _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
@@ -956,7 +959,7 @@ def _run_coverage_smoke(
     coverage_runtime_payload = _direct_runtime_bytes(coverage.runtime)
     if _sha256(coverage_runtime_payload) != FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "coverage-smoke runtime bytes differ from the exact frozen v32 identity"
+            "coverage-smoke runtime bytes differ from the exact frozen v33 identity"
         )
     _require_fresh_result_root(coverage_smoke_root, "coverage-smoke")
     artifacts = _static_artifacts(
@@ -991,7 +994,7 @@ def _run_coverage_smoke(
     )
     if not isinstance(coverage.runtime, N31CoverageSmokeRuntime):
         raise FactorialExecutionError(
-            "v32 coverage-smoke launch lacks the ordered runtime"
+            "v33 coverage-smoke launch lacks the ordered runtime"
         )
     contract = build_coverage_smoke_execution_contract(
         runtime=coverage.runtime,
@@ -1160,7 +1163,7 @@ def _run_campaign(
     coverage = _n31_coverage_smoke(plan)
     if not isinstance(coverage.runtime, N31CoverageSmokeRuntime):
         raise FactorialExecutionError(
-            "v32 campaign gate lacks the ordered coverage-smoke runtime"
+            "v33 campaign gate lacks the ordered coverage-smoke runtime"
         )
     coverage_artifacts = _static_artifacts(
         arguments.manifest.resolve(),
@@ -1383,6 +1386,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     V29_MANIFEST_ID,
                     V30_MANIFEST_ID,
                     V31_MANIFEST_ID,
+                    V32_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }:
                     plan = build_factorial_plan(manifest)
@@ -1392,7 +1396,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         N31CoverageSmokeRuntime,
                     ):
                         raise FactorialExecutionError(
-                            "v32 coverage validation lacks the ordered runtime"
+                            "v33 coverage validation lacks the ordered runtime"
                         )
                     static_artifacts = _static_artifacts(
                         manifest_path,
@@ -1508,8 +1512,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) else 1
         if manifest.manifest_id != FROZEN_MANIFEST_ID:
             raise FactorialExecutionError(
-                "shape-placement-factorial-v1 through v31 are validation-only; "
-                "production commands require shape-placement-factorial-v32"
+                "shape-placement-factorial-v1 through v32 are validation-only; "
+                "production commands require shape-placement-factorial-v33"
             )
         plan = build_factorial_plan(manifest)
         runtime = build_factorial_runtime(plan)
@@ -1536,7 +1540,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target_runtime_sha256 = _sha256(smoke_runtime_payload)
                 if target_runtime_sha256 != FROZEN_SMOKE_RUNTIME_SHA256:
                     raise FactorialExecutionError(
-                        "smoke runtime bytes differ from the exact frozen v32 identity"
+                        "smoke runtime bytes differ from the exact frozen v33 identity"
                     )
                 preflight_root = smoke_root
                 target_runtime_id = smoke.runtime.artifact_id

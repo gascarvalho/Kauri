@@ -17,6 +17,9 @@ REPOSITORY = Path(__file__).resolve().parents[3]
 V32_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
 )
+V33_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v33.json"
+)
 V31_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v31.json"
 )
@@ -118,15 +121,15 @@ def test_v31_identities_are_explicit_historical_aliases() -> None:
     )
 
 
-def test_v32_six_identities_are_frozen_after_semantic_ack() -> None:
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v32"
+def test_v32_six_identities_are_explicit_historical_aliases() -> None:
+    assert manifest_module.V32_MANIFEST_ID == "shape-placement-factorial-v32"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V32_MANIFEST_SHA256,
+        manifest_module.V32_SEMANTIC_SHA256,
+        manifest_module.V32_PLAN_SHA256,
+        runtime_module.V32_RUNTIME_SHA256,
+        runtime_module.V32_SMOKE_RUNTIME_SHA256,
+        runtime_module.V32_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         "cbc03d8c58b8192b70b5c0f8c0a504dc07076f8e78895a3a2c802b98658d691d",
         "eb44b9c5c229db10fc967b7d3834029f8780c48f6ae4740b213a692c9af8cb42",
@@ -240,10 +243,10 @@ def test_v31_runtime_cannot_bind_to_v32_repair_slot(
         )
 
 
-def test_v32_is_default_and_v31_is_validation_only(
+def test_v32_is_validation_only_after_v33_roll(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V32_MANIFEST
-    assert cli.main(["--manifest", str(V31_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST == V33_MANIFEST
+    assert cli.main(["--manifest", str(V32_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v31 are validation-only" in refusal["reason"]
+    assert "v1 through v32 are validation-only" in refusal["reason"]

@@ -1,4 +1,4 @@
-"""Safe CLI-driver tests for the prospective one-shot SHAPE32 campaign."""
+"""Safe CLI-driver tests for the prospective one-shot SHAPE33 campaign."""
 
 from __future__ import annotations
 
@@ -33,7 +33,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v33.json"
+V32_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
+)
 V31_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v31.json"
 )
@@ -179,8 +182,8 @@ def _fake_build_provenance(
 
 
 @pytest.fixture(scope="module", autouse=True)
-def candidate_v32_identities():
-    """Independently recompute prospective v32 identities without freezing them."""
+def candidate_v33_identities():
+    """Independently recompute prospective v33 identities without freezing them."""
 
     source = MANIFEST.read_bytes()
     semantic = cli._canonical_json_bytes(json.loads(source))
@@ -224,7 +227,7 @@ def candidate_v32_identities():
 
 
 @pytest.fixture(scope="module")
-def frozen_contract(candidate_v32_identities):
+def frozen_contract(candidate_v33_identities):
     plan = build_factorial_plan(load_frozen_manifest(MANIFEST))
     return plan, build_factorial_runtime(plan)
 
@@ -314,6 +317,7 @@ def _slot_validation(
         (V29_MANIFEST, "v29"),
         (V30_MANIFEST, "v30"),
         (V31_MANIFEST, "v31"),
+        (V32_MANIFEST, "v32"),
     ),
 )
 @pytest.mark.parametrize(
@@ -342,8 +346,8 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1 through v31 are validation-only; "
-            "production commands require shape-placement-factorial-v32"
+            "shape-placement-factorial-v1 through v32 are validation-only; "
+            "production commands require shape-placement-factorial-v33"
         ),
         "status": "REJECT",
     }
@@ -418,7 +422,7 @@ def test_smoke_preflight_rejects_runtime_identity_drift(
     ) == 2
     refusal = json.loads(capsys.readouterr().err)
     assert refusal == {
-        "reason": "smoke runtime bytes differ from the exact frozen v32 identity",
+        "reason": "smoke runtime bytes differ from the exact frozen v33 identity",
         "status": "REJECT",
     }
 
@@ -453,7 +457,7 @@ def test_coverage_smoke_preflight_validates_exact_n31_runtime(
     assert result["target"] == "coverage-smoke"
     assert result["slot_count"] == 2
     assert result["runtime_id"] == (
-        "shape-placement-factorial-v32-excluded-n31-coverage-smoke-v1"
+        "shape-placement-factorial-v33-excluded-n31-coverage-smoke-v1"
     )
     assert result["runtime_sha256"] == (
         runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
@@ -610,7 +614,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v32").exists()
+    assert not (repository / "results/shape-placement-factorial-v33").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -635,7 +639,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v32").exists()
+    assert not (repository / "results/shape-placement-factorial-v33").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -661,7 +665,7 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v32-smoke"
+        repository / "results/shape-placement-factorial-v33-smoke"
     ).exists()
 
 
@@ -688,7 +692,7 @@ def test_coverage_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "coverage-smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v32-coverage-smoke"
+        repository / "results/shape-placement-factorial-v33-coverage-smoke"
     ).exists()
 
 
@@ -724,7 +728,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v32-smoke"
+        repository / "results/shape-placement-factorial-v33-smoke"
     ).exists()
 
 
@@ -784,7 +788,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v32-smoke"
+        / "results/shape-placement-factorial-v33-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"
@@ -904,7 +908,7 @@ def test_coverage_smoke_requires_independently_passing_n7_smoke(
     assert refusal["status"] == "REJECT"
     assert "N=7 smoke" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v32-coverage-smoke"
+        repository / "results/shape-placement-factorial-v33-coverage-smoke"
     ).exists()
 
 
@@ -978,7 +982,7 @@ def test_coverage_smoke_uses_exact_first_slot_and_separate_authorization(
         replace(
             slot,
             result_path=(
-                "results/shape-placement-factorial-v32-coverage-smoke/"
+                "results/shape-placement-factorial-v33-coverage-smoke/"
                 f"{slot.slot_id}"
             ),
         )
@@ -1002,7 +1006,7 @@ def test_coverage_smoke_uses_exact_first_slot_and_separate_authorization(
         "slot-037-n31-f2-b04-00",
     ]
     assert authorization["result_root"] == (
-        "results/shape-placement-factorial-v32-coverage-smoke"
+        "results/shape-placement-factorial-v33-coverage-smoke"
     )
     assert authorization["automatic_retries"] == 0
     assert authorization["replacement_policy"] == "none"
@@ -1012,11 +1016,11 @@ def test_coverage_smoke_uses_exact_first_slot_and_separate_authorization(
         "runtime.json": runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
     }
     assert observed["n7_root"] == (
-        repository / "results/shape-placement-factorial-v32-smoke"
+        repository / "results/shape-placement-factorial-v33-smoke"
     )
     assert (
         repository
-        / "results/shape-placement-factorial-v32-coverage-smoke"
+        / "results/shape-placement-factorial-v33-coverage-smoke"
         / cli.COVERAGE_SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(authorization)
     assert result["attempted_slot_count"] == result["expected_slot_count"] == 2
@@ -1110,7 +1114,7 @@ def test_campaign_requires_independently_passing_n31_coverage_smoke(
     assert refusal["status"] == "REJECT"
     assert "N=31 coverage smoke" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v32"
+        repository / "results/shape-placement-factorial-v33"
     ).exists()
 
 
