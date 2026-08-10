@@ -1002,6 +1002,155 @@ def test_observer_caps_post_selection_barrier_at_convergence_plus_slack(
     )
 
 
+def test_transition_ready_joins_one_immutable_stream_snapshot(
+    tmp_path: Path,
+    template_slot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = execution.build_slot_runtime(template_slot)
+    anchor_ns = execution.NANOSECONDS_PER_SECOND
+    event_time_ns = anchor_ns + 300 * execution.NANOSECONDS_PER_SECOND
+
+    def event(source: str, event_type: str, sequence: int) -> execution._Event:
+        return execution._Event(
+            source=source,
+            relative_path=f"raw/{source}.jsonl",
+            line_number=sequence,
+            value={
+                "source_sequence": sequence,
+                "source_monotonic_ns": event_time_ns + sequence,
+                "event_type": event_type,
+                "payload": {"cycle_ordinal": 0},
+            },
+            line_sha256=f"{sequence:064x}",
+        )
+
+    baseline = event(spec.structured_events.commit_observer_id, "block.committed", 1)
+    command = event("replica-30", "epoch.command_committed", 2)
+    activation = event("replica-30", "epoch.activated", 3)
+    selection = event("adaptive-manager", "adaptive_v2_evidence_snapshot", 4)
+    terminal = event("adaptive-manager", "adaptive_v2_session_terminal", 5)
+    snapshot: dict[str, tuple[execution._Event, ...]] = {}
+    stream_reads = 0
+    join_snapshots: list[object] = []
+
+    def read_streams(*_args, **_kwargs):
+        nonlocal stream_reads
+        stream_reads += 1
+        return snapshot
+
+    def barrier(current, *, event_type: str, **_kwargs):
+        join_snapshots.append(current)
+        return command if event_type == "epoch.command_committed" else activation
+
+    def manager(current, **_kwargs):
+        join_snapshots.append(current)
+        return selection
+
+    def successful(current, **_kwargs):
+        join_snapshots.append(current)
+        return terminal
+
+    class StopAfterTransitionJoin(RuntimeError):
+        pass
+
+    def wait_until(description: str, predicate, **_kwargs):
+        if description.startswith("all "):
+            return anchor_ns + execution.NANOSECONDS_PER_SECOND
+        if description.startswith("fixed pre-fault baseline"):
+            return baseline, {
+                "identity": {
+                    "decision_proof": {
+                        "epoch_number": 0,
+                        "epoch_digest": "22" * 32,
+                    }
+                }
+            }
+        if description.startswith("fixed fault-evidence window"):
+            return True
+        if description.startswith("manager selection anchor for epoch-1"):
+            return selection
+        assert description.startswith("exact epoch-1 command")
+        assert predicate() == (command, activation, selection)
+        raise StopAfterTransitionJoin
+
+    monkeypatch.setattr(execution, "read_event_streams", read_streams)
+    monkeypatch.setattr(execution, "_replica_transition_barrier", barrier)
+    monkeypatch.setattr(execution, "_manager_selection_event", manager)
+    monkeypatch.setattr(execution, "_successful_manager_terminal", successful)
+    monkeypatch.setattr(execution, "_wait_until", wait_until)
+
+    with pytest.raises(StopAfterTransitionJoin):
+        execution.observe_slot_phases(
+            spec,
+            tmp_path,
+            (),
+            shared_raw_clock_anchor_ns=anchor_ns,
+            hard_deadline_ns=(
+                anchor_ns
+                + spec.fault_window.hard_timeout_s
+                * execution.NANOSECONDS_PER_SECOND
+            ),
+            raw_now_ns=lambda: event_time_ns,
+            sleep=lambda _seconds: None,
+        )
+
+    assert stream_reads == 1
+    assert len(join_snapshots) == 4
+    assert all(current is snapshot for current in join_snapshots)
+
+
+def test_v27_schedule_contains_observed_slow_poll_timeline_and_v26_does_not() -> None:
+    v26 = json.loads(
+        (
+            REPOSITORY
+            / "experiments/adaptive/profiles/shape-placement-factorial-v26.json"
+        ).read_bytes()
+    )
+    v27 = json.loads(
+        (
+            REPOSITORY
+            / "experiments/adaptive/profiles/shape-placement-factorial-v27.json"
+        ).read_bytes()
+    )
+    observed_selection_ns = 471_547 * 1_000_000
+    observed_transition_ns = 472_570 * 1_000_000
+    observed_stable_end_ns = 503_086 * 1_000_000
+    observed_drain_ns = 523_086 * 1_000_000
+    slow_poll_finish_ns = observed_drain_ns + 4 * execution.NANOSECONDS_PER_SECOND
+
+    def bounds(manifest: dict[str, Any]) -> tuple[int, int]:
+        fault_end_ns = (
+            manifest["byzantine"]["window"]["start_after_prelaunch_anchor_s"]
+            + manifest["byzantine"]["window"]["duration_s"]
+        ) * execution.NANOSECONDS_PER_SECOND
+        hard_end_ns = (
+            manifest["timers"]["hard_timeout_s"]
+            * execution.NANOSECONDS_PER_SECOND
+        )
+        return fault_end_ns, hard_end_ns
+
+    def strictly_before(event_ns: int, deadline_ns: int) -> bool:
+        return event_ns < deadline_ns
+
+    v26_fault_end_ns, v26_hard_end_ns = bounds(v26)
+    v27_fault_end_ns, v27_hard_end_ns = bounds(v27)
+
+    assert strictly_before(observed_selection_ns, v26_hard_end_ns)
+    assert strictly_before(observed_transition_ns, v26_hard_end_ns)
+    assert not strictly_before(observed_stable_end_ns, v26_hard_end_ns)
+    assert not strictly_before(observed_drain_ns, v26_fault_end_ns)
+    assert not strictly_before(slow_poll_finish_ns, v26_hard_end_ns)
+
+    assert strictly_before(observed_selection_ns, v27_hard_end_ns)
+    assert strictly_before(observed_transition_ns, v27_hard_end_ns)
+    assert strictly_before(observed_stable_end_ns, v27_fault_end_ns)
+    assert strictly_before(observed_drain_ns, v27_fault_end_ns)
+    assert strictly_before(slow_poll_finish_ns, v27_hard_end_ns)
+    assert not strictly_before(v27_fault_end_ns, v27_fault_end_ns)
+    assert not strictly_before(v27_hard_end_ns, v27_hard_end_ns)
+
+
 @dataclass
 class _FakeProcess:
     pid: int

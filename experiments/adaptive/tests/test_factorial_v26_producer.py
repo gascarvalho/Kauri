@@ -164,12 +164,12 @@ def test_v26_freezes_all_six_recomputed_identities() -> None:
         repair_template=repair,
     )
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V26_MANIFEST_SHA256,
+        manifest_module.V26_SEMANTIC_SHA256,
+        manifest_module.V26_PLAN_SHA256,
+        runtime_module.V26_RUNTIME_SHA256,
+        runtime_module.V26_SMOKE_RUNTIME_SHA256,
+        runtime_module.V26_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         manifest.manifest_sha256,
         hashlib.sha256(
@@ -186,14 +186,14 @@ def test_v26_freezes_all_six_recomputed_identities() -> None:
     )
 
 
-def test_v26_is_only_production_default_and_preserves_v25_validation_alias(
+def test_v26_is_validation_only_and_preserves_v25_coverage_alias(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V26_MANIFEST
-    assert cli.main(["--manifest", str(V25_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v27.json"
+    assert cli.main(["--manifest", str(V26_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v25 are validation-only" in refusal["reason"]
+    assert "v1 through v26 are validation-only" in refusal["reason"]
 
     _, plan = _candidate_plan(monkeypatch)
     primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)

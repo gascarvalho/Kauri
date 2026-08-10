@@ -1,4 +1,4 @@
-"""Fail-closed local execution for one SHAPE26 factorial slot.
+"""Fail-closed local execution for one SHAPE27 factorial slot.
 
 The frozen factorial modules describe *what* may be run.  This module owns the
 small, deliberately local execution boundary: it proves an exact pushed
@@ -47,7 +47,9 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
     V25_MANIFEST_ID,
+    V26_MANIFEST_ID,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
+    VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     PortAllocation,
     build_factorial_plan,
     derive_actor_ids,
@@ -1324,7 +1326,8 @@ def build_coverage_smoke_execution_contract(
     slots = runtime.slots
     if (
         runtime.schema_version != 1
-        or runtime.manifest_id not in {V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        or runtime.manifest_id
+        not in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
         or runtime.execution_mode != "fixed_sequential"
         or runtime.automatic_retries != 0
         or runtime.replacement_policy != "none"
@@ -1582,6 +1585,7 @@ def _bind_execution_authorization(
         expected_slots = [planned.slot_id for planned in plan.slots]
     elif slot.replica_count == 31 and manifest.manifest_id in {
         V25_MANIFEST_ID,
+        V26_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_slots = [
@@ -2825,7 +2829,8 @@ def _bind_static_artifacts(
                 (item for item in plan.slots if item.execution_ordinal == 5),
                 None,
             )
-            if manifest.manifest_id in {V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if manifest.manifest_id
+            in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         if primary is None:
@@ -5492,8 +5497,11 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v24/slot-066-n31-f5-b05-P": "v24",
         "results/shape-placement-factorial-v25/slot-066-n31-f5-b05-P": "v25",
         "results/shape-placement-factorial-v26/slot-066-n31-f5-b05-P": "v26",
+        "results/shape-placement-factorial-v27/slot-066-n31-f5-b05-P": "v27",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
+    expected_fault_duration_s = 450 if manifest_version == "v27" else 300
+    expected_hard_timeout_s = 650 if manifest_version == "v27" else 500
     expected_timeout_eligibility = {
         "v15": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
         "v16": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
@@ -5507,6 +5515,7 @@ def build_n31_coverage_smoke_slot(
         "v24": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v25": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v26": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v27": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
@@ -5522,18 +5531,30 @@ def build_n31_coverage_smoke_slot(
             "v24",
             "v25",
             "v26",
+            "v27",
         }
         else None
     )
     expected_guarded_selection_contract = (
         PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
         if manifest_version
-        in {"v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26"}
+        in {
+            "v18",
+            "v19",
+            "v20",
+            "v21",
+            "v22",
+            "v23",
+            "v24",
+            "v25",
+            "v26",
+            "v27",
+        }
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-        if manifest_version in {"v23", "v24", "v25", "v26"}
+        if manifest_version in {"v23", "v24", "v25", "v26", "v27"}
         else (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_version in {"v19", "v20", "v21", "v22"}
@@ -5543,23 +5564,27 @@ def build_n31_coverage_smoke_slot(
     expected_source_bound_proposal_witness_contract = (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
         if manifest_version
-        in {"v20", "v21", "v22", "v23", "v24", "v25", "v26"}
+        in {"v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27"}
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-        if manifest_version in {"v22", "v23", "v24", "v25", "v26"}
+        if manifest_version in {"v22", "v23", "v24", "v25", "v26", "v27"}
         else None
     )
     expected_inherited_wait_exempt_placement_contract = (
         INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
-        if manifest_version in {"v25", "v26"}
+        if manifest_version in {"v25", "v26", "v27"}
         else None
     )
     expected_verified_response_duplicate_delivery_contract = (
-        VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
-        if manifest_version == "v26"
-        else None
+        VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2
+        if manifest_version == "v27"
+        else (
+            VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
+            if manifest_version == "v26"
+            else None
+        )
     )
     if (
         manifest_version is None
@@ -5613,6 +5638,8 @@ def build_n31_coverage_smoke_slot(
             30,
         )
         or template.maximum_omissions_per_proposal != 10
+        or template.byzantine.duration_s != expected_fault_duration_s
+        or template.common_timers.hard_timeout_s != expected_hard_timeout_s
         or template.ports
         != PortAllocation(peer_base=31_600, client_base=32_600, manager=33_600)
         or responsive is None
@@ -5635,9 +5662,13 @@ def build_n31_coverage_smoke_slot(
         or responsive.verified_response_duplicate_delivery_contract
         != expected_verified_response_duplicate_delivery_contract
         or template.workload.epoch1_preselection_residency_ms
-        != (60_000 if manifest_version in {"v24", "v25", "v26"} else None)
+        != (
+            60_000
+            if manifest_version in {"v24", "v25", "v26", "v27"}
+            else None
+        )
         or responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
-        != (82 if manifest_version in {"v24", "v25", "v26"} else None)
+        != (82 if manifest_version in {"v24", "v25", "v26", "v27"} else None)
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "
@@ -5655,7 +5686,7 @@ def build_n31_coverage_smoke_slot(
         )
     smoke = replace(template, result_path=result_path)
     primary_runtime = build_slot_runtime(smoke)
-    if manifest_version not in {"v25", "v26"}:
+    if manifest_version not in {"v25", "v26", "v27"}:
         if repair_template is not None or repair_result_path is not None:
             raise FactorialExecutionError(
                 "historical N=31 coverage smoke must remain single-slot"
@@ -5724,6 +5755,9 @@ def build_n31_coverage_smoke_slot(
             30,
         )
         or repair_template.maximum_omissions_per_proposal != 10
+        or repair_template.byzantine.duration_s != expected_fault_duration_s
+        or repair_template.common_timers.hard_timeout_s
+        != expected_hard_timeout_s
         or repair_template.ports
         != PortAllocation(peer_base=28_700, client_base=29_700, manager=30_700)
         or repair_responsive is None
