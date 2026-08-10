@@ -60,6 +60,15 @@ std::string function_body(
     return {};
 }
 
+std::string hotstuff_consensus_body(const std::string &contents)
+{
+    return function_body(
+        contents,
+        "void HotStuffBase::do_consensus(\n"
+        "        const block_t &blk,\n"
+        "        const quorum_cert_bt &verified_direct_certifier)");
+}
+
 bool contains_all(
     const std::string &contents,
     std::initializer_list<const char *> needles)
@@ -409,8 +418,7 @@ TEST_CASE(
         implementation, "void HotStuffBase::initialize_adaptive_epoch_runtime(");
     const auto admit = function_body(
         implementation, "HotStuffBase::admit_exact_context(");
-    const auto consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto consensus = hotstuff_consensus_body(implementation);
     const auto start = function_body(
         implementation, "void HotStuffBase::start(");
     const auto legacy_report = function_body(
@@ -546,7 +554,10 @@ TEST_CASE(
     REQUIRE_FALSE(consensus.empty());
     CHECK(contains_in_order(
         consensus,
-        {"cache_adaptive_v2_commit(blk, keys)",
+        {"committed_proposal_key(",
+         "blk, keys, verified_direct_certifier",
+         "cache_adaptive_v2_commit(",
+         "verified_direct_certifier != nullptr",
          "report_adaptive_v2_committed("}));
     REQUIRE_FALSE(committed.empty());
     CHECK(contains_in_order(
@@ -657,8 +668,7 @@ TEST_CASE("the actual commit path delegates once to the live binding",
           "[rem-d11][epoch-live-binding][commit][intentional-red]")
 {
     const auto implementation = source("src/hotstuff.cpp");
-    const auto consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto consensus = hotstuff_consensus_body(implementation);
 
     REQUIRE_FALSE(consensus.empty());
     const std::string delegation =
@@ -732,16 +742,16 @@ TEST_CASE("adaptive commit markers retain the committed proposal configuration",
     const auto marker = function_body(
         implementation,
         "void HotStuffBase::record_adaptive_commit_marker(");
-    const auto consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto consensus = hotstuff_consensus_body(implementation);
 
     CHECK(header.find(
-              "const std::vector<ProposalKey> &committed_keys") !=
+              "const std::optional<ProposalKey> &committed_key") !=
           std::string::npos);
     REQUIRE_FALSE(marker.empty());
     CHECK(contains_all(
         marker,
-        {"committed_keys",
+        {"committed_key.has_value()",
+         "const auto &key = *committed_key",
          "key.configuration",
          "find_exact_runtime_tree(key.configuration)"}));
     CHECK(marker.find("activation.active_effect()") == std::string::npos);
@@ -750,8 +760,82 @@ TEST_CASE("adaptive commit markers retain the committed proposal configuration",
     CHECK(contains_in_order(
         consensus,
         {"close_committed_block(blk->get_hash())",
-         "record_adaptive_commit_marker(blk, keys)",
+         "committed_proposal_key(",
+         "record_adaptive_commit_marker(blk, authoritative_key)",
          "proposal_admission->retire_proposal(key)"}));
+}
+
+TEST_CASE(
+    "verified core certifiers reach exact commit identity and generation recovery",
+    "[adaptive-v2][commit][certifier][identity][generation][wiring]")
+{
+    const auto consensus_header = source("include/hotstuff/consensus.h");
+    const auto hotstuff_header = source("include/hotstuff/hotstuff.h");
+    const auto core = source("src/consensus.cpp");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto update = function_body(core, "void HotStuffCore::update(");
+    const auto commit = hotstuff_consensus_body(implementation);
+    const auto resolve = function_body(
+        implementation,
+        "std::optional<ProposalKey> HotStuffBase::committed_proposal_key(");
+    const auto cache = function_body(
+        implementation, "void HotStuffBase::cache_adaptive_v2_commit(");
+
+    CHECK(contains_all(
+        consensus_header,
+        {"virtual void do_consensus(\n"
+         "            const block_t &blk,",
+         "const quorum_cert_bt &verified_direct_certifier)"}));
+    CHECK(contains_all(
+        hotstuff_header,
+        {"void do_consensus(const block_t &blk) override;",
+         "const quorum_cert_bt &verified_direct_certifier) override;"}));
+
+    REQUIRE_FALSE(update.empty());
+    CHECK(contains_in_order(
+        update,
+        {"const block_t &direct_certifier = queue_index == 0",
+         "has_valid_qc_ancestry(direct_certifier, blk)",
+         "do_consensus(blk, direct_certifier->qc)",
+         "do_consensus(blk, nullptr)"}));
+
+    REQUIRE_FALSE(commit.empty());
+    CHECK(contains_in_order(
+        commit,
+        {"proposal_contexts->close_committed_block(blk->get_hash())",
+         "committed_proposal_key(",
+         "blk, keys, verified_direct_certifier",
+         "cache_adaptive_v2_commit(",
+         "authoritative_key",
+         "verified_direct_certifier != nullptr"}));
+
+    REQUIRE_FALSE(resolve.empty());
+    CHECK(contains_in_order(
+        resolve,
+        {"verified_direct_certifier != nullptr",
+         "verified_direct_certifier->get_obj_hash()",
+         "verified_direct_certifier->has_n(config.nmajority)",
+         "verified_direct_certifier->verify(config)",
+         "merge(certificate_key)",
+         "blk->self_qc",
+         "for (const auto &committed_key : committed_keys)"}));
+
+    REQUIRE_FALSE(cache.empty());
+    const auto existing = cache.find(
+        "proposal_view_generations.find(*exact_key)");
+    const auto recovery = cache.find(
+        "else if (allow_runtime_generation_recovery)");
+    REQUIRE(existing != std::string::npos);
+    REQUIRE(recovery != std::string::npos);
+    CHECK(existing < recovery);
+    CHECK(contains_in_order(
+        cache,
+        {"else if (allow_runtime_generation_recovery)",
+         "find_exact_runtime_generation(",
+         "observe_proposal_view_generation(",
+         "generation = proposal_view_generation(*exact_key)",
+         "if (!generation.has_value())",
+         "exact_key.reset()"}));
 }
 
 TEST_CASE("adaptive v2 exposes one fail-closed pre-vote semantic gate",
@@ -1323,8 +1407,7 @@ TEST_CASE("deferred recovery is cleared only on deterministic terminal paths",
     const auto retire_block = function_body(
         implementation,
         "void HotStuffBase::retire_deferred_epoch_changes_for_block(");
-    const auto consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto consensus = hotstuff_consensus_body(implementation);
     const auto reply = function_body(
         implementation,
         "HotStuffBase::adaptive_definition_reply_handler(");
@@ -1403,8 +1486,7 @@ TEST_CASE("committed epoch history owns one coherent exact head snapshot",
     const auto gate = function_body(
         implementation,
         "HotStuffBase::pre_vote_epoch_change_gate(");
-    const auto consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto consensus = hotstuff_consensus_body(implementation);
 
     CHECK(contains_all(
         header,
@@ -1455,7 +1537,9 @@ TEST_CASE("committed epoch history owns one coherent exact head snapshot",
          "close_committed_block(blk->get_hash())"}));
     CHECK(contains_in_order(
         core,
-        {"do_consensus(blk);", "b_exec = blk;"}));
+        {"do_consensus(blk, direct_certifier->qc);",
+         "do_consensus(blk, nullptr);",
+         "b_exec = blk;"}));
 }
 
 TEST_CASE("committed adaptive v2 commands are cached after history advances",
@@ -1581,8 +1665,7 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
     const auto header = source("include/hotstuff/hotstuff.h");
     const auto implementation = source("src/hotstuff.cpp");
     const auto core = source("src/consensus.cpp");
-    const auto consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto consensus = hotstuff_consensus_body(implementation);
     const auto admit_local = function_body(
         implementation, "bool HotStuffBase::admit_local(");
     const auto post_commit = function_body(
@@ -1702,7 +1785,7 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
 
     CHECK(contains_in_order(
         core,
-        {"do_consensus(blk);",
+        {"do_consensus(blk, direct_certifier->qc);",
          "do_decide(Finality(",
          "do_post_block_commit(blk, commit_batch_index);"}));
 }
@@ -1734,8 +1817,7 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
         implementation, "void HotStuffBase::do_broadcast_proposal(");
     const auto remote_proposal = function_body(
         implementation, "void HotStuffBase::process_active(");
-    const auto do_consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto do_consensus = hotstuff_consensus_body(implementation);
     const auto retire_before_epoch = function_body(
         implementation,
         "void HotStuffBase::retire_deferred_epoch_changes_before_epoch(");
@@ -1763,7 +1845,8 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     CHECK(contains_in_order(
         consensus,
         {"std::uint64_t commit_batch_index = 0",
-         "commit_queue.rbegin()",
+         "for (std::size_t queue_index = commit_queue.size()",
+         "queue_index-- > 0",
          "do_post_block_commit(blk, commit_batch_index)",
          "++commit_batch_index"}));
     REQUIRE_FALSE(binding.empty());
@@ -1835,8 +1918,12 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     REQUIRE_FALSE(cache_commit.empty());
     CHECK(contains_all(
         cache_commit,
-        {"committed_proposal_key(blk, committed_keys)",
-         "proposal_view_generation(*committed_key)",
+        {"auto exact_key = committed_key",
+         "proposal_view_generations.find(*exact_key)",
+         "allow_runtime_generation_recovery",
+         "find_exact_runtime_generation(",
+         "observe_proposal_view_generation(",
+         "proposal_view_generation(*exact_key)",
          "PendingAdaptiveV2Commit"}));
     REQUIRE_FALSE(do_consensus.empty());
     CHECK(contains_in_order(
@@ -1844,7 +1931,9 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
         {"record_committed_epoch_change_history(blk)",
          "retire_deferred_epoch_changes_for_block(blk->get_hash())",
          "close_committed_block(blk->get_hash())",
-         "cache_adaptive_v2_commit(blk, keys)",
+         "committed_proposal_key(",
+         "cache_adaptive_v2_commit(",
+         "verified_direct_certifier != nullptr",
          "forget_proposal_view_generation(key)",
          "forget_proposal_view_generations_for_block(blk->get_hash())"}));
     REQUIRE_FALSE(retire_before_epoch.empty());
@@ -1982,8 +2071,7 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
     const auto runtime_header = source("include/hotstuff/epoch_runtime.h");
     const auto runtime = source("src/epoch_runtime.cpp");
     const auto implementation = source("src/hotstuff.cpp");
-    const auto consensus = function_body(
-        implementation, "void HotStuffBase::do_consensus(");
+    const auto consensus = hotstuff_consensus_body(implementation);
     const auto cache = function_body(
         implementation, "void HotStuffBase::cache_adaptive_v2_commit(");
     const auto post_commit = function_body(
@@ -2007,7 +2095,8 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
     CHECK(contains_in_order(
         consensus,
         {"proposal_contexts->close_committed_block(",
-         "cache_adaptive_v2_commit(blk, keys)"}));
+         "committed_proposal_key(",
+         "cache_adaptive_v2_commit("}));
     CHECK(consensus.find("rotate_adaptive_v2_after_commit(") ==
           std::string::npos);
 
@@ -2015,8 +2104,10 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
     CHECK(contains_in_order(
         cache,
         {"EpochProtocolMode::adaptive_v2",
-         "committed_proposal_key(blk, committed_keys)",
-         "proposal_view_generation(*committed_key)",
+         "proposal_view_generations.find(*exact_key)",
+         "allow_runtime_generation_recovery",
+         "find_exact_runtime_generation(",
+         "proposal_view_generation(*exact_key)",
          "pending_adaptive_v2_commit.emplace(",
          "PendingAdaptiveV2Commit"}));
     CHECK(cache.find("observed_committed_proposal_key(") ==
@@ -2025,7 +2116,7 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
         cache,
         {"committed_key",
          "generation",
-         "blk->get_hash(), committed_key, generation"}));
+         "blk->get_hash(), exact_key, generation"}));
 
     REQUIRE_FALSE(post_commit.empty());
     CHECK(contains_in_order(

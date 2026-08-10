@@ -2146,7 +2146,9 @@ TEST_CASE(
 
     const auto commit = function_slice(
         implementation,
-        "void HotStuffBase::do_consensus",
+        "void HotStuffBase::do_consensus(\n"
+        "        const block_t &blk,\n"
+        "        const quorum_cert_bt &verified_direct_certifier)",
         "void HotStuffBase::do_decide");
     const auto authoritative_guard = commit.find(
         "authoritative_key.has_value() &&");

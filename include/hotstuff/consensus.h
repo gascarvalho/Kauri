@@ -241,6 +241,20 @@ namespace hotstuff
         /** Called by HotStuffCore upon the decision being made for cmd. */
         virtual void do_decide(Finality &&fin) = 0;
         virtual void do_consensus(const block_t &blk) = 0;
+        /**
+         * Commit a block with the exact quorum certificate that directly
+         * certifies it when the commit rule has proved that ancestry.  The
+         * compatibility overload keeps non-adaptive applications unchanged;
+         * evidence-aware implementations may override this seam without
+         * changing consensus authority.
+         */
+        virtual void do_consensus(
+            const block_t &blk,
+            const quorum_cert_bt &verified_direct_certifier)
+        {
+            static_cast<void>(verified_direct_certifier);
+            do_consensus(blk);
+        }
         /** Called once per committed block after all application decisions.
          * The index is zero-based within the current commit queue, ordered
          * from the oldest committed block to the newest. */

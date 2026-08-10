@@ -1521,7 +1521,8 @@ namespace hotstuff
             const noexcept;
         std::optional<ProposalKey> committed_proposal_key(
             const block_t &blk,
-            const std::vector<ProposalKey> &committed_keys) const;
+            const std::vector<ProposalKey> &committed_keys,
+            const quorum_cert_bt &verified_direct_certifier) const;
         std::optional<uint256_t>
         adaptive_v2_committed_epoch_change_payload_digest(
             const block_t &blk) const noexcept;
@@ -1546,18 +1547,19 @@ namespace hotstuff
             std::uint32_t first_live_epoch) noexcept;
         void cache_adaptive_v2_commit(
             const block_t &blk,
-            const std::vector<ProposalKey> &committed_keys) noexcept;
+            const std::optional<ProposalKey> &committed_key,
+            bool allow_runtime_generation_recovery) noexcept;
         void rotate_adaptive_v2_after_commit(
             const std::optional<ProposalKey> &committed_key) noexcept;
         void record_adaptive_commit_marker(
             const block_t &blk,
-            const std::vector<ProposalKey> &committed_keys) const;
+            const std::optional<ProposalKey> &committed_key) const;
         void finish_adaptive_epoch_commit(
             const block_t &blk,
             const EpochCommitIngressResult &activation);
         void advance_committed_retirement_floor(
             const block_t &blk,
-            const std::vector<ProposalKey> &committed_keys);
+            const std::optional<ProposalKey> &committed_key);
 
         promise_t verify_exact_contribution(
             ExactContributionKind kind,
@@ -1773,6 +1775,9 @@ namespace hotstuff
         void proposer_base_deliver(const block_t &blk) override;
         void do_decide(Finality &&) override;
         void do_consensus(const block_t &blk) override;
+        void do_consensus(
+            const block_t &blk,
+            const quorum_cert_bt &verified_direct_certifier) override;
         void do_post_block_commit(
             const block_t &blk,
             std::uint64_t commit_batch_index) override;

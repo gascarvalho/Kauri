@@ -16,6 +16,12 @@ namespace hotstuff
 class ExperimentByzantineRuntimeIntegrationTestAccess final
 {
 public:
+    struct CachedCommitIdentity
+    {
+        std::optional<ProposalKey> key;
+        std::optional<std::uint64_t> generation;
+    };
+
     static bool consume_direct_vote(
         HotStuffBase &runtime,
         const ProposalKey &key,
@@ -185,6 +191,139 @@ public:
     {
         runtime.report_adaptive_v2_committed(committed_key);
     }
+
+    static ConfigurationId initialize_active_runtime(
+        HotStuffBase &runtime)
+    {
+        runtime.set_fanout(2);
+        runtime.set_piped_latency(2, 2);
+        runtime.set_tree_generation("default", "");
+        runtime.set_tree_period(8);
+
+        std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> replicas;
+        replicas.reserve(4);
+        for (ReplicaID replica = 0; replica < 4; ++replica)
+        {
+            const auto address = replica == runtime.get_id()
+                ? runtime.listen_addr
+                : NetAddr(
+                    static_cast<std::uint32_t>(0x7f000001),
+                    static_cast<std::uint16_t>(18000 + replica));
+            PrivKeyDummy private_key;
+            replicas.emplace_back(
+                address,
+                private_key.get_pubkey(),
+                DataStream(
+                    "indirect-commit-tls-" + std::to_string(replica))
+                    .get_hash());
+        }
+
+        runtime.tree_scheduler(std::move(replicas), true);
+        runtime.on_init(1);
+        runtime.get_pace_maker()->init(&runtime);
+        runtime.get_pace_maker()->update_tree_proposer();
+        runtime.activate_initial_leader_view();
+        runtime.initialize_adaptive_epoch_runtime();
+        return runtime.exact_configuration(0, 0);
+    }
+
+    static quorum_cert_bt direct_certifier(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::size_t signer_count = 3)
+    {
+        auto certificate = runtime.create_quorum_cert(key);
+        for (std::size_t signer = 0; signer < signer_count; ++signer)
+        {
+            const auto replica = static_cast<ReplicaID>(signer);
+            PrivKeyDummy private_key;
+            PartCertDummy part(private_key, key);
+            certificate->add_part(runtime.config, replica, part);
+        }
+        return certificate;
+    }
+
+    static quorum_cert_bt genesis_parent_certificate(
+        HotStuffBase &runtime)
+    {
+        return runtime.create_quorum_cert(genesis_certification_key(
+            runtime.get_genesis()->get_hash()));
+    }
+
+    static quorum_cert_bt invalid_direct_certifier(
+        const ProposalKey &key)
+    {
+        DataStream encoded;
+        encoded << static_cast<std::uint32_t>(2);
+        serialize_proposal_key(encoded, key);
+        encoded << DataStream("invalid-certificate-authentication").get_hash();
+        encoded << static_cast<std::size_t>(3);
+        encoded << htole(static_cast<std::uint32_t>(3));
+        for (ReplicaID signer = 0; signer < 3; ++signer)
+            encoded << signer;
+        quorum_cert_bt certificate = new QuorumCertDummy();
+        certificate->unserialize(encoded);
+        return certificate;
+    }
+
+    static std::optional<ProposalKey> resolve_committed_key(
+        const HotStuffBase &runtime,
+        const block_t &block,
+        const std::vector<ProposalKey> &closed_context_keys,
+        const quorum_cert_bt &verified_direct_certifier)
+    {
+        return runtime.committed_proposal_key(
+            block,
+            closed_context_keys,
+            verified_direct_certifier);
+    }
+
+    static CachedCommitIdentity resolve_and_cache_commit(
+        HotStuffBase &runtime,
+        const block_t &block,
+        const std::vector<ProposalKey> &closed_context_keys,
+        const quorum_cert_bt &verified_direct_certifier)
+    {
+        const auto key = resolve_committed_key(
+            runtime,
+            block,
+            closed_context_keys,
+            verified_direct_certifier);
+        runtime.cache_adaptive_v2_commit(
+            block,
+            key,
+            verified_direct_certifier != nullptr);
+        if (!runtime.pending_adaptive_v2_commit.has_value())
+            return {};
+        return CachedCommitIdentity{
+            runtime.pending_adaptive_v2_commit->committed_key,
+            runtime.pending_adaptive_v2_commit->view_generation};
+    }
+
+    static std::optional<std::uint64_t> view_generation(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.proposal_view_generation(key);
+    }
+
+    static bool observe_view_generation(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::uint64_t generation)
+    {
+        return runtime.observe_proposal_view_generation(key, generation);
+    }
+
+    static EpochRotationResult rotate_to_tree(
+        HotStuffBase &runtime,
+        std::uint32_t tree_id)
+    {
+        if (runtime.epoch_live_binding == nullptr)
+            return {EpochIngressError::state_rejected, std::nullopt};
+        return runtime.epoch_live_binding->rotate_to_tree(tree_id);
+    }
+
 };
 
 } // namespace hotstuff
@@ -201,6 +340,16 @@ public:
 
 protected:
     void state_machine_execute(const Finality &) override {}
+};
+
+class ActiveRuntimePaceMaker final : public PaceMakerDummy
+{
+public:
+    explicit ActiveRuntimePaceMaker(int32_t parent_limit)
+        : PaceMakerDummy(parent_limit) {}
+
+    size_t get_current_tid() override { return 0; }
+    size_t get_current_epoch() override { return 0; }
 };
 
 class RecordingOpportunityAuditEmitter final
@@ -357,6 +506,21 @@ ProposalKey proposal_key(
         digest(block_label)};
 }
 
+block_t indirect_commit_block(
+    TestHotStuff &runtime,
+    const std::string &label)
+{
+    return new Block(
+        std::vector<block_t>{runtime.get_genesis()},
+        std::vector<uint256_t>{digest(label)},
+        ExperimentByzantineRuntimeIntegrationTestAccess::
+            genesis_parent_certificate(runtime),
+        bytearray_t{},
+        1,
+        runtime.get_genesis(),
+        nullptr);
+}
+
 TEST_CASE(
     "native lifecycle retirement is bounded and preserves durable references",
     "[adaptive-v2][evidence][lifecycle][retirement][runtime-integration]")
@@ -494,6 +658,325 @@ TEST_CASE(
     CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
     CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
     CHECK(outbox->diagnostics().pending_reports == 0);
+}
+
+TEST_CASE(
+    "verified direct certifier recovers an unobserved indirect commit identity",
+    "[adaptive-v2][evidence][commit][indirect][certifier][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration =
+        Access::initialize_active_runtime(runtime);
+    const auto block = indirect_commit_block(runtime, "indirect-recovery");
+    const ProposalKey key{configuration, block->get_hash()};
+    const auto certifier = Access::direct_certifier(runtime, key);
+
+    REQUIRE(Access::view_generation(runtime, key) == std::nullopt);
+    const auto resolved = Access::resolve_committed_key(
+        runtime, block, {}, certifier);
+
+    REQUIRE(resolved.has_value());
+    CHECK(*resolved == key);
+    const auto cached = Access::resolve_and_cache_commit(
+        runtime, block, {}, certifier);
+    REQUIRE(cached.key == key);
+    const auto expected_generation = checked_activation_generation(0, 0);
+    REQUIRE(expected_generation.has_value());
+    CHECK(cached.generation == expected_generation);
+    CHECK(Access::view_generation(runtime, key) == expected_generation);
+}
+
+TEST_CASE(
+    "indirect commit identity sources and certifier proof fail closed",
+    "[adaptive-v2][evidence][commit][indirect][certifier][negative][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration =
+        Access::initialize_active_runtime(runtime);
+    const auto block = indirect_commit_block(runtime, "indirect-negative");
+    const ProposalKey key{configuration, block->get_hash()};
+    const auto valid = Access::direct_certifier(runtime, key);
+
+    SECTION("an under-quorum proof is not authoritative")
+    {
+        const auto under_quorum =
+            Access::direct_certifier(runtime, key, 2);
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, block, {key}, under_quorum).has_value());
+    }
+
+    SECTION("a quorum-sized certificate with invalid authentication fails")
+    {
+        const auto invalid =
+            Access::invalid_direct_certifier(key);
+        REQUIRE(invalid->has_n(runtime.get_config().nmajority));
+        REQUIRE_FALSE(invalid->verify(runtime.get_config()));
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, block, {key}, invalid).has_value());
+    }
+
+    SECTION("a proof replayed onto another block is rejected")
+    {
+        const auto other = indirect_commit_block(runtime, "proof-replay");
+        const ProposalKey other_key{
+            configuration, other->get_hash()};
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, other, {other_key}, valid).has_value());
+    }
+
+    SECTION("a closed context cannot disagree with the proof")
+    {
+        const ProposalKey drifted{
+            ConfigurationId{
+                configuration.epoch_number,
+                configuration.tree_id,
+                digest("drifted-commit-configuration")},
+            block->get_hash()};
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, block, {drifted}, valid).has_value());
+    }
+
+    SECTION("a self-QC cannot disagree with the verified proof")
+    {
+        const auto prototype =
+            indirect_commit_block(runtime, "self-qc-conflict");
+        const ProposalKey self_key{
+            ConfigurationId{
+                configuration.epoch_number,
+                configuration.tree_id,
+                digest("self-qc-drifted-configuration")},
+            prototype->get_hash()};
+        auto self_certificate =
+            Access::direct_certifier(runtime, self_key);
+        const block_t conflicted = new Block(
+            std::vector<block_t>{runtime.get_genesis()},
+            std::vector<uint256_t>{digest("self-qc-conflict")},
+            Access::genesis_parent_certificate(runtime),
+            bytearray_t{},
+            1,
+            runtime.get_genesis(),
+            std::move(self_certificate));
+        REQUIRE(conflicted->get_hash() == prototype->get_hash());
+        const ProposalKey proof_key{
+            configuration, conflicted->get_hash()};
+        const auto proof =
+            Access::direct_certifier(runtime, proof_key);
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, conflicted, {}, proof).has_value());
+    }
+
+    SECTION("a self-QC cannot disagree with a closed context")
+    {
+        const auto prototype =
+            indirect_commit_block(runtime, "self-context-conflict");
+        const ProposalKey self_key{
+            configuration, prototype->get_hash()};
+        auto self_certificate =
+            Access::direct_certifier(runtime, self_key);
+        const block_t conflicted = new Block(
+            std::vector<block_t>{runtime.get_genesis()},
+            std::vector<uint256_t>{digest("self-context-conflict")},
+            Access::genesis_parent_certificate(runtime),
+            bytearray_t{},
+            1,
+            runtime.get_genesis(),
+            std::move(self_certificate));
+        REQUIRE(conflicted->get_hash() == prototype->get_hash());
+        const ProposalKey closed_key{
+            ConfigurationId{
+                configuration.epoch_number,
+                configuration.tree_id,
+                digest("closed-context-drifted-configuration")},
+            conflicted->get_hash()};
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, conflicted, {closed_key}, nullptr).has_value());
+    }
+
+    SECTION("all three exact identity sources agree")
+    {
+        const auto prototype =
+            indirect_commit_block(runtime, "all-sources-agree");
+        const ProposalKey exact_key{
+            configuration, prototype->get_hash()};
+        auto self_certificate =
+            Access::direct_certifier(runtime, exact_key);
+        const block_t agreed = new Block(
+            std::vector<block_t>{runtime.get_genesis()},
+            std::vector<uint256_t>{digest("all-sources-agree")},
+            Access::genesis_parent_certificate(runtime),
+            bytearray_t{},
+            1,
+            runtime.get_genesis(),
+            std::move(self_certificate));
+        REQUIRE(agreed->get_hash() == prototype->get_hash());
+        const auto proof =
+            Access::direct_certifier(runtime, exact_key);
+        CHECK(Access::resolve_committed_key(
+            runtime, agreed, {exact_key}, proof) == exact_key);
+    }
+
+    SECTION("two closed identities for one block remain ambiguous")
+    {
+        const ProposalKey drifted{
+            ConfigurationId{
+                configuration.epoch_number,
+                configuration.tree_id,
+                digest("ambiguous-commit-configuration")},
+            block->get_hash()};
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, block, {key, drifted}, nullptr).has_value());
+    }
+
+    SECTION("missing proof and context retain no inferred identity")
+    {
+        CHECK_FALSE(Access::resolve_committed_key(
+            runtime, block, {}, nullptr).has_value());
+    }
+
+    SECTION("one exact closed context remains a valid legacy source")
+    {
+        CHECK(
+            Access::resolve_committed_key(
+                runtime, block, {key}, nullptr) == key);
+    }
+}
+
+TEST_CASE(
+    "certifier recovery preserves authenticated generations and tombstones",
+    "[adaptive-v2][evidence][commit][indirect][generation][runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration =
+        Access::initialize_active_runtime(runtime);
+
+    const auto observed_block =
+        indirect_commit_block(runtime, "observed-generation");
+    const ProposalKey observed_key{
+        configuration, observed_block->get_hash()};
+    Access::seed_view_generation(runtime, observed_key, 77);
+    const auto observed_proof =
+        Access::direct_certifier(runtime, observed_key);
+    const auto observed = Access::resolve_and_cache_commit(
+        runtime, observed_block, {}, observed_proof);
+    CHECK(observed.key == observed_key);
+    CHECK(observed.generation == 77);
+    CHECK(Access::view_generation(runtime, observed_key) == 77);
+
+    const auto tombstoned_block =
+        indirect_commit_block(runtime, "tombstoned-generation");
+    const ProposalKey tombstoned_key{
+        configuration, tombstoned_block->get_hash()};
+    Access::seed_view_generation(runtime, tombstoned_key, 81);
+    REQUIRE_FALSE(Access::observe_view_generation(
+        runtime, tombstoned_key, 82));
+    const auto tombstoned_proof =
+        Access::direct_certifier(runtime, tombstoned_key);
+    const auto tombstoned = Access::resolve_and_cache_commit(
+        runtime, tombstoned_block, {}, tombstoned_proof);
+    CHECK_FALSE(tombstoned.key.has_value());
+    CHECK_FALSE(tombstoned.generation.has_value());
+    CHECK_FALSE(Access::view_generation(
+        runtime, tombstoned_key).has_value());
+
+    const auto first_rotation = Access::rotate_to_tree(runtime, 1);
+    REQUIRE(first_rotation.error == EpochIngressError::none);
+    REQUIRE(first_rotation.update.has_value());
+    REQUIRE(
+        first_rotation.update->activation.configuration.tree_id == 1);
+    const auto draining_block =
+        indirect_commit_block(runtime, "draining-generation");
+    const ProposalKey draining_key{
+        configuration, draining_block->get_hash()};
+    const auto draining_proof =
+        Access::direct_certifier(runtime, draining_key);
+    const auto draining = Access::resolve_and_cache_commit(
+        runtime, draining_block, {}, draining_proof);
+    REQUIRE(draining.key == draining_key);
+    CHECK(
+        draining.generation == checked_activation_generation(0, 0));
+
+    const auto second_rotation = Access::rotate_to_tree(runtime, 2);
+    REQUIRE(second_rotation.error == EpochIngressError::none);
+    REQUIRE(second_rotation.update.has_value());
+    REQUIRE(
+        second_rotation.update->activation.configuration.tree_id == 2);
+    const auto retired_block =
+        indirect_commit_block(runtime, "retired-generation");
+    const ProposalKey retired_key{
+        configuration, retired_block->get_hash()};
+    const auto retired_proof =
+        Access::direct_certifier(runtime, retired_key);
+    const auto retired = Access::resolve_and_cache_commit(
+        runtime, retired_block, {}, retired_proof);
+    CHECK_FALSE(retired.key.has_value());
+    CHECK_FALSE(retired.generation.has_value());
+
+    const ConfigurationId retired_configuration{
+        9, 0, digest("retired-exact-configuration")};
+    const auto draining_expired_block =
+        indirect_commit_block(runtime, "stored-after-drain");
+    const ProposalKey draining_expired_key{
+        retired_configuration, draining_expired_block->get_hash()};
+    Access::seed_view_generation(runtime, draining_expired_key, 91);
+    const auto draining_expired_proof =
+        Access::direct_certifier(runtime, draining_expired_key);
+    const auto draining_expired = Access::resolve_and_cache_commit(
+        runtime,
+        draining_expired_block,
+        {},
+        draining_expired_proof);
+    CHECK(draining_expired.key == draining_expired_key);
+    CHECK(draining_expired.generation == 91);
+
+    const auto missing_block =
+        indirect_commit_block(runtime, "missing-after-drain");
+    const ProposalKey missing_key{
+        retired_configuration, missing_block->get_hash()};
+    const auto missing_proof =
+        Access::direct_certifier(runtime, missing_key);
+    const auto missing = Access::resolve_and_cache_commit(
+        runtime, missing_block, {}, missing_proof);
+    CHECK_FALSE(missing.key.has_value());
+    CHECK_FALSE(missing.generation.has_value());
 }
 
 TEST_CASE(

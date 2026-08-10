@@ -85,14 +85,19 @@ TEST_CASE("proposal retirement is reached from the deterministic commit loop",
         read_source("src/consensus.cpp"));
     const auto commit_loop = source_slice(
         source,
-        "for(autoit=commit_queue.rbegin();",
+        "for(std::size_tqueue_index=commit_queue.size();",
         "b_exec=blk;");
     const auto decided = commit_loop.find("blk->decision=1;");
-    const auto consensus = commit_loop.find("do_consensus(blk);");
+    const auto certified = commit_loop.find(
+        "do_consensus(blk,direct_certifier->qc);");
+    const auto fallback = commit_loop.find(
+        "do_consensus(blk,nullptr);");
 
     REQUIRE(decided != std::string::npos);
-    REQUIRE(consensus != std::string::npos);
-    CHECK(decided < consensus);
+    REQUIRE(certified != std::string::npos);
+    REQUIRE(fallback != std::string::npos);
+    CHECK(decided < certified);
+    CHECK(certified < fallback);
 }
 
 TEST_CASE("commit pruning and floor advancement are deterministically ordered",
@@ -102,7 +107,9 @@ TEST_CASE("commit pruning and floor advancement are deterministically ordered",
     const auto source = read_source("src/hotstuff.cpp");
     const auto consensus = without_whitespace(source_slice(
         source,
-        "void HotStuffBase::do_consensus",
+        "void HotStuffBase::do_consensus(\n"
+        "        const block_t &blk,\n"
+        "        const quorum_cert_bt &verified_direct_certifier)",
         "void HotStuffBase::do_decide"));
 
     const auto lifecycle_close = consensus.find(
@@ -110,7 +117,7 @@ TEST_CASE("commit pruning and floor advancement are deterministically ordered",
     const auto ingress_proposal =
         consensus.find("proposal_admission->retire_proposal(key)");
     const auto committed_floor = consensus.find(
-        "advance_committed_retirement_floor(blk,keys)");
+        "advance_committed_retirement_floor(blk,authoritative_key)");
     const auto pacemaker = consensus.find("pmaker->on_consensus(blk)");
     INFO("the lifecycle's block-hash index returns every exact committed "
          "key; all corresponding admission/dedup entries are pruned before "
@@ -185,9 +192,9 @@ TEST_CASE("commit floor waits for predecessor proposal contexts to drain",
         "proposal_contexts->has_open_context_before_epoch("
         "first_live_epoch)");
     const auto committed_key = floor_helper.find(
-        "committed_proposal_key(blk,committed_keys)");
+        "committed_key.has_value()");
     const auto exact_configuration = floor_helper.find(
-        "key->configuration!=active_configuration");
+        "committed_key->configuration!=active_configuration");
     const auto ingress_floor = floor_helper.find(
         "proposal_admission->advance_retirement_floor(");
     REQUIRE(committed_key != std::string::npos);

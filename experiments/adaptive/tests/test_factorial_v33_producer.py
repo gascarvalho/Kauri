@@ -20,8 +20,8 @@ V33_MANIFEST = (
 V32_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
 )
-V34_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v34.json"
+V35_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v35.json"
 )
 
 
@@ -295,10 +295,10 @@ def test_v32_and_v33_repair_runtimes_reject_bidirectional_cross_binding(
         )
 
 
-def test_v34_is_default_and_v33_is_validation_only(
+def test_v35_is_default_and_v33_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V34_MANIFEST
+    assert cli.DEFAULT_MANIFEST == V35_MANIFEST
     assert cli.main(["--manifest", str(V33_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v33 are validation-only" in refusal["reason"]
+    assert "v1 through v34 are validation-only" in refusal["reason"]

@@ -304,11 +304,18 @@ namespace hotstuff
 #endif
 
         std::uint64_t commit_batch_index = 0;
-        for (auto it = commit_queue.rbegin(); it != commit_queue.rend(); it++)
+        for (std::size_t queue_index = commit_queue.size();
+             queue_index-- > 0;)
         {
-            const block_t &blk = *it;
+            const block_t &blk = commit_queue[queue_index];
+            const block_t &direct_certifier = queue_index == 0
+                ? blk1
+                : commit_queue[queue_index - 1];
             blk->decision = 1;
-            do_consensus(blk);
+            if (has_valid_qc_ancestry(direct_certifier, blk))
+                do_consensus(blk, direct_certifier->qc);
+            else
+                do_consensus(blk, nullptr);
             LOG_PROTO("commit %s", std::string(*blk).c_str());
 
             // Clean piped_queue if the clock were undirectly committed 

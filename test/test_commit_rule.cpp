@@ -213,3 +213,67 @@ TEST_CASE("post-block commit preserves ordering across one commit queue",
     CHECK(callbacks.size() == 6);
     CHECK(core.committed().size() == 2);
 }
+
+TEST_CASE(
+    "each indirectly committed block carries its exact direct certifier",
+    "[adaptive-v2][commit-rule][indirect][certifier][identity]")
+{
+    CommitRuleCore core;
+    const auto chain = add_direct_chain(core, core.get_genesis(), 5);
+
+    REQUIRE_NOTHROW(core.apply_update(chain[4]));
+
+    const auto &callbacks = core.callbacks();
+    REQUIRE(callbacks.size() == 6);
+    for (std::size_t committed_index = 0;
+         committed_index < 2;
+         ++committed_index)
+    {
+        const auto &consensus = callbacks[committed_index * 3];
+        REQUIRE(consensus.kind == CommitCallbackKind::consensus);
+        REQUIRE(consensus.certifying_proposal.has_value());
+        CHECK(
+            *consensus.certifying_proposal ==
+            chain[committed_index + 1]->get_qc()->get_proposal_key());
+        CHECK(
+            consensus.certifying_proposal->block_hash ==
+            chain[committed_index]->get_hash());
+    }
+}
+
+TEST_CASE(
+    "commit queues attach only exact direct certifiers",
+    "[adaptive-v2][commit-rule][indirect][certifier][gaps]")
+{
+    CommitRuleCore core;
+    const block_t genesis = core.get_genesis();
+    const block_t block1 = core.add_block(genesis, genesis);
+    const block_t block2 = core.add_block(block1, block1);
+    const block_t block3 = core.add_block(block2, genesis);
+    const block_t block4 = core.add_block(block3, block1);
+    const block_t block5 = core.add_block(block4, block3);
+    const block_t block6 = core.add_block(block5, block3);
+    const block_t block7 = core.add_block(block6, block5);
+    const block_t block8 = core.add_block(block7, block7);
+
+    REQUIRE_NOTHROW(core.apply_update(block8));
+
+    const auto &callbacks = core.callbacks();
+    REQUIRE(core.committed().size() == 3);
+    REQUIRE(callbacks.size() == 9);
+    const auto &first = callbacks[0];
+    const auto &middle = callbacks[3];
+    const auto &last = callbacks[6];
+    REQUIRE(first.kind == CommitCallbackKind::consensus);
+    REQUIRE(middle.kind == CommitCallbackKind::consensus);
+    REQUIRE(last.kind == CommitCallbackKind::consensus);
+    REQUIRE(first.certifying_proposal.has_value());
+    CHECK(
+        first.certifying_proposal->block_hash == block1->get_hash());
+    CHECK_FALSE(middle.certifying_proposal.has_value());
+    REQUIRE(last.certifying_proposal.has_value());
+    CHECK(last.certifying_proposal->block_hash == block3->get_hash());
+    CHECK(core.committed()[0].hash == block1->get_hash());
+    CHECK(core.committed()[1].hash == block2->get_hash());
+    CHECK(core.committed()[2].hash == block3->get_hash());
+}

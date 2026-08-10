@@ -34,6 +34,7 @@ struct CommitCallbackObservation
     std::uint32_t height;
     uint256_t hash;
     std::optional<std::uint64_t> commit_batch_index;
+    std::optional<ProposalKey> certifying_proposal;
 };
 
 class CommitRuleCore final : public HotStuffCore
@@ -179,16 +180,28 @@ protected:
             CommitCallbackKind::decide,
             finality.cmd_height,
             finality.blk_hash,
+            std::nullopt,
             std::nullopt});
     }
 
     void do_consensus(const block_t &block) override
     {
+        do_consensus(block, nullptr);
+    }
+
+    void do_consensus(
+        const block_t &block,
+        const quorum_cert_bt &verified_direct_certifier) override
+    {
         callbacks_.push_back(CommitCallbackObservation{
             CommitCallbackKind::consensus,
             block->get_height(),
             block->get_hash(),
-            std::nullopt});
+            std::nullopt,
+            verified_direct_certifier == nullptr
+                ? std::nullopt
+                : std::optional<ProposalKey>{
+                      verified_direct_certifier->get_proposal_key()}});
         committed_.push_back(
             CommittedBlock{block->get_height(), block->get_hash()});
     }
@@ -201,7 +214,8 @@ protected:
             CommitCallbackKind::post_block_commit,
             block->get_height(),
             block->get_hash(),
-            commit_batch_index});
+            commit_batch_index,
+            std::nullopt});
     }
 
     void do_broadcast_proposal(const Proposal &) override {}

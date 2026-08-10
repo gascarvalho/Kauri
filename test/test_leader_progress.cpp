@@ -1484,7 +1484,9 @@ TEST_CASE("QC and commit progress use one exact establishing certificate",
         "void HotStuffBase::try_finish_exact_context");
     const auto commit = source_slice(
         hotstuff,
-        "void HotStuffBase::do_consensus",
+        "void HotStuffBase::do_consensus(\n"
+        "        const block_t &blk,\n"
+        "        const quorum_cert_bt &verified_direct_certifier)",
         "void HotStuffBase::do_decide");
     const auto update = source_slice(
         consensus,
@@ -1523,7 +1525,8 @@ TEST_CASE("QC and commit progress use one exact establishing certificate",
     const auto commit_hook =
         update.find("on_verified_commit_progress");
     const auto backlog =
-        update.find("for (auto it = commit_queue.rbegin()");
+        update.find(
+            "for (std::size_t queue_index = commit_queue.size()");
     REQUIRE(commit_hook != std::string::npos);
     REQUIRE(backlog != std::string::npos);
     const auto backlog_open = update.find('{', backlog);

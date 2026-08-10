@@ -1,4 +1,4 @@
-"""Prospective producer contract for the validation-only v34 version roll."""
+"""Prospective producer contract for the validation-only v35 version roll."""
 
 from __future__ import annotations
 
@@ -15,17 +15,14 @@ from experiments.adaptive.kauri_experiment import factorial_manifest as manifest
 from experiments.adaptive.kauri_experiment import factorial_runtime as runtime_module
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-V34_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v34.json"
-)
 V35_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v35.json"
 )
+V34_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v34.json"
+)
 V33_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v33.json"
-)
-V32_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
 )
 OBSERVATION_CONTRACT_V1 = (
     "exact_excluded_repair_smoke_epoch1_selection_terminal_all_replica_command_"
@@ -48,7 +45,7 @@ def _canonical(value: object) -> bytes:
 
 
 def _candidate_plan(monkeypatch: pytest.MonkeyPatch):
-    payload = V34_MANIFEST.read_bytes()
+    payload = V35_MANIFEST.read_bytes()
     semantic_sha256 = hashlib.sha256(_canonical(json.loads(payload))).hexdigest()
     monkeypatch.setattr(
         manifest_module,
@@ -124,67 +121,44 @@ def _coverage_binding(version: str) -> execution.CoverageSmokeLaunchBinding:
     )
 
 
-def test_v34_profile_is_one_lf_and_exact_three_value_delta() -> None:
+def test_v35_profile_is_one_lf_and_exact_two_value_delta() -> None:
+    v35_payload = V35_MANIFEST.read_bytes()
     v34_payload = V34_MANIFEST.read_bytes()
-    v33_payload = V33_MANIFEST.read_bytes()
 
-    assert v34_payload.endswith(b"\n")
-    assert not v34_payload.endswith(b"\n\n")
-    assert v34_payload.count(b"shape-placement-factorial-v34") == 2
-    normalized_v34 = v34_payload.replace(
+    assert v35_payload.endswith(b"\n")
+    assert not v35_payload.endswith(b"\n\n")
+    assert v35_payload.count(b"shape-placement-factorial-v35") == 2
+    normalized_v35 = v35_payload.replace(
+        b"shape-placement-factorial-v35",
         b"shape-placement-factorial-v34",
-        b"shape-placement-factorial-v33",
-    ).replace(
-        OBSERVATION_CONTRACT_V2.encode(),
-        OBSERVATION_CONTRACT_V1.encode(),
     )
-    assert normalized_v34 == v33_payload
+    assert normalized_v35 == v34_payload
+    v35 = json.loads(v35_payload)
     v34 = json.loads(v34_payload)
-    v33 = json.loads(v33_payload)
+    assert v35.pop("manifest_id") == "shape-placement-factorial-v35"
     assert v34.pop("manifest_id") == "shape-placement-factorial-v34"
-    assert v33.pop("manifest_id") == "shape-placement-factorial-v33"
+    assert v35["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v35"
+    )
     assert v34["artifacts"].pop("results_root") == (  # type: ignore[index]
         "results/shape-placement-factorial-v34"
     )
-    assert v33["artifacts"].pop("results_root") == (  # type: ignore[index]
-        "results/shape-placement-factorial-v33"
-    )
+    assert v35["timers"]["transition_convergence_deadline_s"] == 30  # type: ignore[index]
     assert v34["timers"]["transition_convergence_deadline_s"] == 30  # type: ignore[index]
-    assert v33["timers"]["transition_convergence_deadline_s"] == 30  # type: ignore[index]
+    v35_responsive = v35["byzantine"]["responsive_degradation"]  # type: ignore[index]
     v34_responsive = v34["byzantine"]["responsive_degradation"]  # type: ignore[index]
-    v33_responsive = v33["byzantine"]["responsive_degradation"]  # type: ignore[index]
+    assert v35_responsive.pop("excluded_repair_smoke_observation_contract") == (
+        OBSERVATION_CONTRACT_V2
+    )
     assert v34_responsive.pop("excluded_repair_smoke_observation_contract") == (
         OBSERVATION_CONTRACT_V2
     )
-    assert v33_responsive.pop("excluded_repair_smoke_observation_contract") == (
-        OBSERVATION_CONTRACT_V1
-    )
-    assert v34 == v33
+    assert v35 == v34
 
 
-def test_v33_identities_are_explicit_historical_aliases() -> None:
+def test_v34_identities_are_explicit_historical_aliases() -> None:
     assert (
-        manifest_module.V33_MANIFEST_ID,
-        manifest_module.V33_MANIFEST_SHA256,
-        manifest_module.V33_SEMANTIC_SHA256,
-        manifest_module.V33_PLAN_SHA256,
-        runtime_module.V33_RUNTIME_SHA256,
-        runtime_module.V33_SMOKE_RUNTIME_SHA256,
-        runtime_module.V33_COVERAGE_SMOKE_RUNTIME_SHA256,
-    ) == (
-        "shape-placement-factorial-v33",
-        "aa109a401ef88f7d135ff7f590ae1f372329ed5165c223ce0e3bf44536cf61fc",
-        "8faee7b8cf1148a7acec48b75f02ca3f5b864ee6981555ae78624664e246509f",
-        "0897fc233ae6fc25898ee576066403f122ad65416322dec2d4e99e03503fd81c",
-        "597bddecd5ada141dfaf1830cabb645fa5f50aaf20abd198c134a48e2d1e4e2b",
-        "c0b96dfaaf73a374113a0c6ba98f87c06a934eb6b40202d96a51b6182c714c05",
-        "18d9dd6841b3dc69a3797d9473aa0f14df2bc793cf3354abd67be91000e7007e",
-    )
-
-
-def test_v34_six_identities_are_explicit_historical_aliases() -> None:
-    assert manifest_module.V34_MANIFEST_ID == "shape-placement-factorial-v34"
-    assert (
+        manifest_module.V34_MANIFEST_ID,
         manifest_module.V34_MANIFEST_SHA256,
         manifest_module.V34_SEMANTIC_SHA256,
         manifest_module.V34_PLAN_SHA256,
@@ -192,6 +166,7 @@ def test_v34_six_identities_are_explicit_historical_aliases() -> None:
         runtime_module.V34_SMOKE_RUNTIME_SHA256,
         runtime_module.V34_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
+        "shape-placement-factorial-v34",
         "1b0c22f5f517487c507c7699198f597093dbc879994925ddbb8220c67decedb0",
         "e963372c05c51367c6a2d54ff2f1065b1bfb136b4e0857f2dbb69793078fc0a4",
         "6e48cd511a0788ea1e2e5b42fb9b09e47a4c269d40fe18779cb559990b536e92",
@@ -201,32 +176,51 @@ def test_v34_six_identities_are_explicit_historical_aliases() -> None:
     )
 
 
-def test_v33_exact_history_remains_loadable() -> None:
-    manifest = manifest_module.load_frozen_manifest(V33_MANIFEST)
+def test_v35_six_identities_are_frozen_after_semantic_ack() -> None:
+    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v35"
+    assert (
+        manifest_module.FROZEN_MANIFEST_SHA256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.FROZEN_PLAN_SHA256,
+        runtime_module.FROZEN_RUNTIME_SHA256,
+        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
+        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+    ) == (
+        "28303487578594d7eac64aa1eda11ea891a85b8a6d6ff386d42e920dc8b82b95",
+        "40422f2b8ac74e695fdfa18b687fce2b31b516f36bd2b6bfe51f53602bd4d0c8",
+        "6c558653d0db5e5f646de58c1a853d656fedbd7e61257e13755ef01ea9d42025",
+        "05ffcdc81d0cd0ec8a264cd0d5545e88fbf14dba1569629e6ec0f02c3a16615c",
+        "785abe70a6500a66c331e00dd81eeada1065457ff4dace4e6f9035b9006aaee6",
+        "4fa44f57128bc096c7fd40bbf9c054c184a273d07ca8f2bdc43fdda7c5e93ad2",
+    )
+
+
+def test_v34_exact_history_remains_loadable() -> None:
+    manifest = manifest_module.load_frozen_manifest(V34_MANIFEST)
     plan = manifest_module.build_factorial_plan(manifest)
     runtime = runtime_module.build_factorial_runtime(plan)
     coverage = _coverage(plan)
 
-    assert manifest.manifest_id == manifest_module.V33_MANIFEST_ID
-    assert manifest.manifest_sha256 == manifest_module.V33_MANIFEST_SHA256
-    assert plan.plan_sha256 == manifest_module.V33_PLAN_SHA256
+    assert manifest.manifest_id == manifest_module.V34_MANIFEST_ID
+    assert manifest.manifest_sha256 == manifest_module.V34_MANIFEST_SHA256
+    assert plan.plan_sha256 == manifest_module.V34_PLAN_SHA256
     assert hashlib.sha256(
         runtime_module.canonical_runtime_bytes(runtime)
-    ).hexdigest() == (runtime_module.V33_RUNTIME_SHA256)
+    ).hexdigest() == (runtime_module.V34_RUNTIME_SHA256)
     assert (
         hashlib.sha256(
             execution._canonical_json_bytes(coverage.runtime.as_document())
         ).hexdigest()
-        == runtime_module.V33_COVERAGE_SMOKE_RUNTIME_SHA256
+        == runtime_module.V34_COVERAGE_SMOKE_RUNTIME_SHA256
     )
     assert (
         manifest.byzantine.responsive_degradation.excluded_repair_smoke_observation_contract
-        == OBSERVATION_CONTRACT_V1
+        == OBSERVATION_CONTRACT_V2
     )
 
 
-@pytest.mark.parametrize("manifest_path", (V32_MANIFEST, V33_MANIFEST))
-def test_v32_and_v33_historical_runtime_preflight_remains_loadable(
+@pytest.mark.parametrize("manifest_path", (V33_MANIFEST, V34_MANIFEST))
+def test_v33_and_v34_historical_runtime_preflight_remains_loadable(
     manifest_path: Path,
 ) -> None:
     manifest = manifest_module.load_frozen_manifest(manifest_path)
@@ -241,7 +235,7 @@ def test_v32_and_v33_historical_runtime_preflight_remains_loadable(
     assert result["status"] == "PASS"
 
 
-def test_v34_preserves_timing_and_threads_v2_observation_contract(
+def test_v35_preserves_timing_and_threads_v2_observation_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest, plan, coverage = _candidate_coverage(monkeypatch)
@@ -304,57 +298,70 @@ def test_v34_preserves_timing_and_threads_v2_observation_contract(
     assert probe is not None
     assert probe.observation_contract == OBSERVATION_CONTRACT_V2
     assert probe.source_campaign_result_path == (
-        "results/shape-placement-factorial-v34/slot-037-n31-f2-b04-00"
+        "results/shape-placement-factorial-v35/slot-037-n31-f2-b04-00"
     )
     assert coverage.runtime.excluded_repair_smoke_probe == probe
 
 
-def test_v33_and_v34_exact_static_bindings_pass_but_cross_binding_fails(
+def test_v34_and_v35_exact_static_bindings_pass_but_cross_binding_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    v33_manifest = manifest_module.load_frozen_manifest(V33_MANIFEST)
-    v33_plan = manifest_module.build_factorial_plan(v33_manifest)
-    v33_coverage = _coverage(v33_plan)
-    _, v34_plan, v34_coverage = _candidate_coverage(monkeypatch)
-    v33_artifacts = _static_artifacts(V33_MANIFEST, v33_plan, v33_coverage)
+    v34_manifest = manifest_module.load_frozen_manifest(V34_MANIFEST)
+    v34_plan = manifest_module.build_factorial_plan(v34_manifest)
+    v34_coverage = _coverage(v34_plan)
+    _, v35_plan, v35_coverage = _candidate_coverage(monkeypatch)
     v34_artifacts = _static_artifacts(V34_MANIFEST, v34_plan, v34_coverage)
+    v35_artifacts = _static_artifacts(V35_MANIFEST, v35_plan, v35_coverage)
 
-    execution._bind_static_artifacts(
-        v33_coverage.slots[1],
-        v33_coverage.runtimes[1],
-        v33_artifacts,
-        campaign_member=False,
-    )
     execution._bind_static_artifacts(
         v34_coverage.slots[1],
         v34_coverage.runtimes[1],
         v34_artifacts,
         campaign_member=False,
     )
+    execution._bind_static_artifacts(
+        v35_coverage.slots[1],
+        v35_coverage.runtimes[1],
+        v35_artifacts,
+        campaign_member=False,
+    )
     with pytest.raises(execution.FactorialExecutionError):
         execution._bind_static_artifacts(
-            v34_coverage.slots[1],
-            v34_coverage.runtimes[1],
-            v33_artifacts,
-            campaign_member=False,
-        )
-    with pytest.raises(execution.FactorialExecutionError):
-        execution._bind_static_artifacts(
-            v33_coverage.slots[1],
-            v33_coverage.runtimes[1],
+            v35_coverage.slots[1],
+            v35_coverage.runtimes[1],
             v34_artifacts,
             campaign_member=False,
         )
+    with pytest.raises(execution.FactorialExecutionError):
+        execution._bind_static_artifacts(
+            v34_coverage.slots[1],
+            v34_coverage.runtimes[1],
+            v35_artifacts,
+            campaign_member=False,
+        )
 
 
-def test_v33_and_v34_repair_runtimes_reject_bidirectional_cross_binding(
+def test_v34_and_v35_repair_runtimes_reject_bidirectional_cross_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    v33_manifest = manifest_module.load_frozen_manifest(V33_MANIFEST)
-    v33_plan = manifest_module.build_factorial_plan(v33_manifest)
-    v33_coverage = _coverage(v33_plan)
-    _, v34_plan, v34_coverage = _candidate_coverage(monkeypatch)
+    v34_manifest = manifest_module.load_frozen_manifest(V34_MANIFEST)
+    v34_plan = manifest_module.build_factorial_plan(v34_manifest)
+    v34_coverage = _coverage(v34_plan)
+    _, v35_plan, v35_coverage = _candidate_coverage(monkeypatch)
 
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match=(
+            "slot/runtime derivation failed: excluded repair smoke probe source, "
+            "delta, contract, mode, or timing drifted"
+        ),
+    ):
+        execution._bind_static_artifacts(
+            v35_coverage.slots[1],
+            v34_coverage.runtimes[1],
+            _static_artifacts(V35_MANIFEST, v35_plan, v35_coverage),
+            campaign_member=False,
+        )
     with pytest.raises(
         execution.FactorialExecutionError,
         match=(
@@ -364,26 +371,13 @@ def test_v33_and_v34_repair_runtimes_reject_bidirectional_cross_binding(
     ):
         execution._bind_static_artifacts(
             v34_coverage.slots[1],
-            v33_coverage.runtimes[1],
+            v35_coverage.runtimes[1],
             _static_artifacts(V34_MANIFEST, v34_plan, v34_coverage),
             campaign_member=False,
         )
-    with pytest.raises(
-        execution.FactorialExecutionError,
-        match=(
-            "slot/runtime derivation failed: excluded repair smoke probe source, "
-            "delta, contract, mode, or timing drifted"
-        ),
-    ):
-        execution._bind_static_artifacts(
-            v33_coverage.slots[1],
-            v34_coverage.runtimes[1],
-            _static_artifacts(V33_MANIFEST, v33_plan, v33_coverage),
-            campaign_member=False,
-        )
 
 
-def test_v34_repair_runtime_and_execution_reject_self_consistent_v1_drift(
+def test_v35_repair_runtime_and_execution_reject_self_consistent_v1_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, coverage = _candidate_coverage(monkeypatch)
@@ -413,7 +407,7 @@ def test_v34_repair_runtime_and_execution_reject_self_consistent_v1_drift(
     with pytest.raises(execution.FactorialExecutionError, match="binding drifted"):
         execution._uses_exact_excluded_repair_smoke_bound(
             v1_runtime,
-            _coverage_binding("v34"),
+            _coverage_binding("v35"),
         )
 
 

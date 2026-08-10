@@ -55,7 +55,9 @@ TEST_CASE("consensus cleanup precedes pacemaker notification",
     const auto source = read_source("src/hotstuff.cpp");
     const auto body = source_slice(
         source,
-        "void HotStuffBase::do_consensus",
+        "void HotStuffBase::do_consensus(\n"
+        "        const block_t &blk,\n"
+        "        const quorum_cert_bt &verified_direct_certifier)",
         "void HotStuffBase::do_decide");
     const auto normalized = without_whitespace(body);
     const auto cleanup = normalized.find(

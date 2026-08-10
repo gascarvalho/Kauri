@@ -11785,18 +11785,50 @@ namespace hotstuff
 
     std::optional<ProposalKey> HotStuffBase::committed_proposal_key(
         const block_t &blk,
-        const std::vector<ProposalKey> &committed_keys) const
+        const std::vector<ProposalKey> &committed_keys,
+        const quorum_cert_bt &verified_direct_certifier) const
     {
-        if (blk->self_qc != nullptr)
+        if (blk == nullptr)
+            return std::nullopt;
+
+        std::optional<ProposalKey> resolved;
+        const auto merge = [&blk, &resolved](
+            const ProposalKey &candidate) noexcept {
+            if (candidate.block_hash != blk->get_hash() ||
+                (resolved.has_value() && *resolved != candidate))
+                return false;
+            resolved = candidate;
+            return true;
+        };
+
+        try
         {
-            const auto &certificate_key =
-                blk->self_qc->get_proposal_key();
-            if (certificate_key.block_hash == blk->get_hash())
-                return certificate_key;
+            if (verified_direct_certifier != nullptr)
+            {
+                const auto &certificate_key =
+                    verified_direct_certifier->get_proposal_key();
+                if (verified_direct_certifier->get_obj_hash() !=
+                        blk->get_hash() ||
+                    !verified_direct_certifier->has_n(config.nmajority) ||
+                    !verified_direct_certifier->verify(config) ||
+                    !merge(certificate_key))
+                    return std::nullopt;
+            }
+
+            if (blk->self_qc != nullptr &&
+                !merge(blk->self_qc->get_proposal_key()))
+                return std::nullopt;
+
+            for (const auto &committed_key : committed_keys)
+                if (!merge(committed_key))
+                    return std::nullopt;
         }
-        if (committed_keys.size() == 1)
-            return committed_keys.front();
-        return std::nullopt;
+        catch (...)
+        {
+            return std::nullopt;
+        }
+
+        return resolved;
     }
 
     bool HotStuffBase::observe_proposal_view_generation(
@@ -11989,14 +12021,12 @@ namespace hotstuff
 
     void HotStuffBase::record_adaptive_commit_marker(
         const block_t &blk,
-        const std::vector<ProposalKey> &committed_keys) const
+        const std::optional<ProposalKey> &committed_key) const
     {
         if (!adaptive_demo_markers || adaptive_epoch_runtime == nullptr)
             return;
 
-        const auto resolved_key = committed_proposal_key(
-            blk, committed_keys);
-        if (!resolved_key.has_value())
+        if (!committed_key.has_value())
         {
             HOTSTUFF_LOG_WARN(
                 "KAURI_DEMO marker_skipped replica=%u height=%llu "
@@ -12006,7 +12036,7 @@ namespace hotstuff
             return;
         }
 
-        const auto &key = *resolved_key;
+        const auto &key = *committed_key;
         const auto *tree = find_exact_runtime_tree(key.configuration);
         if (tree == nullptr)
         {
@@ -12128,16 +12158,15 @@ namespace hotstuff
 
     void HotStuffBase::advance_committed_retirement_floor(
         const block_t &blk,
-        const std::vector<ProposalKey> &committed_keys)
+        const std::optional<ProposalKey> &committed_key)
     {
         if (proposal_admission == nullptr || exact_epochs == nullptr)
             return;
 
         const auto &active_configuration =
             proposal_admission->active_configuration();
-        const auto key = committed_proposal_key(blk, committed_keys);
-        if (!key.has_value() ||
-            key->configuration != active_configuration)
+        if (!committed_key.has_value() ||
+            committed_key->configuration != active_configuration)
             return;
         const auto *active_epoch = exact_epochs->find_epoch(
             active_configuration.epoch_number);
@@ -12214,7 +12243,8 @@ namespace hotstuff
 
     void HotStuffBase::cache_adaptive_v2_commit(
         const block_t &blk,
-        const std::vector<ProposalKey> &committed_keys) noexcept
+        const std::optional<ProposalKey> &committed_key,
+        bool allow_runtime_generation_recovery) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
@@ -12223,14 +12253,32 @@ namespace hotstuff
             return;
         try
         {
-            const auto committed_key =
-                committed_proposal_key(blk, committed_keys);
-            const auto generation = committed_key.has_value()
-                ? proposal_view_generation(*committed_key)
-                : std::nullopt;
+            auto exact_key = committed_key;
+            std::optional<std::uint64_t> generation;
+            if (exact_key.has_value())
+            {
+                const auto existing =
+                    proposal_view_generations.find(*exact_key);
+                if (existing != proposal_view_generations.end())
+                {
+                    generation = existing->second;
+                }
+                else if (allow_runtime_generation_recovery)
+                {
+                    const auto runtime_generation =
+                        find_exact_runtime_generation(
+                            exact_key->configuration);
+                    if (runtime_generation.has_value() &&
+                        observe_proposal_view_generation(
+                            *exact_key, *runtime_generation))
+                        generation = proposal_view_generation(*exact_key);
+                }
+                if (!generation.has_value())
+                    exact_key.reset();
+            }
             pending_adaptive_v2_commit.emplace(
                 PendingAdaptiveV2Commit{
-                    blk->get_hash(), committed_key, generation});
+                    blk->get_hash(), exact_key, generation});
         }
         catch (...)
         {
@@ -12263,23 +12311,34 @@ namespace hotstuff
 
     void HotStuffBase::do_consensus(const block_t &blk)
     {
+        do_consensus(blk, nullptr);
+    }
+
+    void HotStuffBase::do_consensus(
+        const block_t &blk,
+        const quorum_cert_bt &verified_direct_certifier)
+    {
         record_committed_epoch_change_history(blk);
         retire_deferred_epoch_changes_for_block(blk->get_hash());
         const auto keys =
             proposal_contexts->close_committed_block(blk->get_hash());
-        const auto authoritative_key = committed_proposal_key(blk, keys);
+        const auto authoritative_key = committed_proposal_key(
+            blk, keys, verified_direct_certifier);
         const auto committed_payload_digest =
             adaptive_v2_committed_epoch_change_payload_digest(blk);
         observe_authoritative_commit(
             authoritative_key, committed_payload_digest);
         // Preserve the authoritative committed key for protocol cadence and
         // copy optional evidence metadata before terminal cache cleanup.
-        cache_adaptive_v2_commit(blk, keys);
+        cache_adaptive_v2_commit(
+            blk,
+            authoritative_key,
+            verified_direct_certifier != nullptr);
         report_adaptive_v2_committed(
             pending_adaptive_v2_commit.has_value()
                 ? pending_adaptive_v2_commit->committed_key
                 : std::nullopt);
-        record_adaptive_commit_marker(blk, keys);
+        record_adaptive_commit_marker(blk, authoritative_key);
         pending_exact_contributions.purge_block(blk->get_hash());
         for (const auto &key : keys)
         {
@@ -12303,7 +12362,7 @@ namespace hotstuff
                       get_epoch_digest(get_cur_epoch_nr()))
                 : EpochCommitIngressResult{};
         finish_adaptive_epoch_commit(blk, activation);
-        advance_committed_retirement_floor(blk, keys);
+        advance_committed_retirement_floor(blk, authoritative_key);
         pmaker->on_consensus(blk);
     }
 
