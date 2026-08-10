@@ -161,6 +161,9 @@ from .factorial_manifest import (
     V28_MANIFEST_ID,
     V28_MANIFEST_SHA256,
     V28_PLAN_SHA256,
+    V29_MANIFEST_ID,
+    V29_MANIFEST_SHA256,
+    V29_PLAN_SHA256,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     FrozenFactorialManifest,
@@ -218,6 +221,10 @@ V28_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
 )
+V29_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
@@ -268,8 +275,11 @@ V27_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V28_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v28-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v29-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v30-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -475,14 +485,23 @@ V28_SMOKE_RUNTIME_SHA256 = (
 V28_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "af28c19dafb2f01461c5b3c3a648a7ac4f200a71880a965b2ff9da892792fa84"
 )
-FROZEN_RUNTIME_SHA256 = (
+V29_RUNTIME_SHA256 = (
     "162531c501ba866b51033af411b5debb7d1e805c254d5a8fedcd29b59337a026"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V29_SMOKE_RUNTIME_SHA256 = (
     "5780c65662cbb1312f61f753e8d66237005ef666264bf99351b2d33f15d6680c"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V29_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "4042c313856f722a5abef6e537a8a73de1699dfdde17da0d9ab2bc8a628c995a"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "a0dfe6f503b0e013e757707697221c63711074d39490e7075887754987a22a44"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "6e8540045d60601810672d8f84adc8b4b7800bf5989e386ae39c3f6fa0d22beb"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "14429819aefef1a4e664f3fd32837cf659a5a10203929526e1137bc392389862"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -608,6 +627,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V26_MANIFEST_ID,
         V27_MANIFEST_ID,
         V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -624,6 +644,7 @@ def _v24_preselection_contract(
         V26_MANIFEST_ID,
         V27_MANIFEST_ID,
         V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return None
@@ -745,6 +766,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -767,6 +789,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -797,6 +820,7 @@ def _uses_source_bound_contribution_opportunities(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -824,6 +848,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -851,6 +876,7 @@ def _uses_precontainment_fault_coverage(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -878,6 +904,7 @@ def _uses_precontainment_shape_preservation(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -908,6 +935,7 @@ def _uses_precontainment_guarded_selection_contract(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -937,6 +965,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V26_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V27_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V28_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V29_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -965,6 +994,7 @@ def _uses_source_bound_proposal_witness_contract(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -991,6 +1021,7 @@ def _uses_evidence_snapshot_selection_contract(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1014,6 +1045,7 @@ def _uses_inherited_consensus_wait_exempt_placement_contract(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1034,6 +1066,7 @@ def _uses_verified_response_duplicate_delivery_contract(
         V26_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
         V27_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V28_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        V29_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     }
     return (
@@ -1408,6 +1441,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V28_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V28_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V29_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V29_MANIFEST_ID,
+            manifest_sha256=V29_MANIFEST_SHA256,
+            plan_sha256=V29_PLAN_SHA256,
+            runtime_sha256=V29_RUNTIME_SHA256,
+            smoke_runtime_sha256=V29_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V29_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -3138,6 +3181,8 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
 def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
     if manifest_id == FROZEN_MANIFEST_ID:
         return FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id == V29_MANIFEST_ID:
+        return V29_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V28_MANIFEST_ID:
         return V28_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V27_MANIFEST_ID:
@@ -3238,6 +3283,11 @@ def _is_excluded_coverage_smoke_slot(
             V28_COVERAGE_SMOKE_RUNTIME_SHA256,
             V28_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V29_MANIFEST_ID: (
+            V29_RUNTIME_SHA256,
+            V29_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -3300,6 +3350,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V27_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V28_MANIFEST_ID:
         return V28_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V29_MANIFEST_ID:
+        return V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -3324,7 +3376,7 @@ def _validate_v25_coverage_runtime_document(
         "minimum_free_bytes",
         "slots",
     }
-    if manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         expected_fields.add("excluded_repair_smoke_probe")
     _fields(
         runtime,
@@ -3338,6 +3390,7 @@ def _validate_v25_coverage_runtime_document(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.get("schema_version") != 1
@@ -3377,7 +3430,7 @@ def _validate_v25_coverage_runtime_document(
             _fail("v25 coverage constituent runtime result path drifted")
         _validate_runtime_slot(slot_runtime, expected, manifest)
         validated[slot_id] = slot_runtime
-    if manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         repair = validated[_coverage_smoke_slot_ids(manifest_id)[1]]
         if runtime.get("excluded_repair_smoke_probe") != repair.get(
             "excluded_repair_smoke_probe"
@@ -3514,6 +3567,7 @@ def _load_static_contracts(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             constituents = _validate_v25_coverage_runtime_document(
@@ -3671,7 +3725,8 @@ def _validate_runtime_slot(
     )
     responsive_contract_value = manifest.byzantine.responsive_degradation
     v28_repair_runtime = (
-        manifest.manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V28_MANIFEST_ID, V29_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and expected.slot_id == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
         and runtime.get("result_path")
         == f"{_coverage_smoke_result_root(manifest.manifest_id)}/{expected.slot_id}"
@@ -3708,7 +3763,11 @@ def _validate_runtime_slot(
             None,
         )
     )
-    if manifest.manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest.manifest_id in {
+        V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         if (
             excluded_repair_observation_contract
             != EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
@@ -3725,6 +3784,7 @@ def _validate_runtime_slot(
     if manifest.manifest_id in {
         V27_MANIFEST_ID,
         V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and (
         manifest.byzantine.duration_s != _V27_FAULT_WINDOW_DURATION_S
@@ -3744,6 +3804,7 @@ def _validate_runtime_slot(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -3761,6 +3822,7 @@ def _validate_runtime_slot(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -3777,6 +3839,7 @@ def _validate_runtime_slot(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -3792,6 +3855,7 @@ def _validate_runtime_slot(
         V26_MANIFEST_ID,
         V27_MANIFEST_ID,
         V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
@@ -3804,6 +3868,7 @@ def _validate_runtime_slot(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not inherited_wait_exempt_placement
@@ -3813,6 +3878,7 @@ def _validate_runtime_slot(
         V26_MANIFEST_ID,
         V27_MANIFEST_ID,
         V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         if not verified_response_duplicate_delivery:
@@ -3905,6 +3971,7 @@ def _validate_runtime_slot(
                     V26_MANIFEST_ID,
                     V27_MANIFEST_ID,
                     V28_MANIFEST_ID,
+                    V29_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -3926,7 +3993,11 @@ def _validate_runtime_slot(
             artifact_identity[
                 "verified_response_duplicate_delivery_contract"
             ] = duplicate_contract_value
-        if manifest.manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+        if manifest.manifest_id in {
+            V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }:
             artifact_identity.update(
                 {
                     "excluded_repair_smoke_observation_contract": (
@@ -3947,6 +4018,7 @@ def _validate_runtime_slot(
         if manifest.manifest_id in {
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity["fault_window_duration_s"] = (
@@ -4136,6 +4208,7 @@ def _validate_runtime_slot(
                 V26_MANIFEST_ID,
                 V27_MANIFEST_ID,
                 V28_MANIFEST_ID,
+                V29_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4157,7 +4230,11 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "verified_response_duplicate_delivery_contract"
         ] = duplicate_contract_value
-    if manifest.manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest.manifest_id in {
+        V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         expected_causal_acceptance.update(
             {
                 "excluded_repair_smoke_observation_contract": (
@@ -4256,6 +4333,7 @@ def _validate_runtime_slot(
         V26_MANIFEST_ID,
         V27_MANIFEST_ID,
         V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -9968,7 +10046,8 @@ def _validate_v28_excluded_repair_observation(
     """Validate the isolated v28+ repair chronology without changing legacy cutoffs."""
 
     if (
-        manifest.manifest_id not in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        not in {V28_MANIFEST_ID, V29_MANIFEST_ID, FROZEN_MANIFEST_ID}
         or expected.slot_id
         != _coverage_smoke_slot_ids(manifest.manifest_id)[1]
     ):
@@ -10460,6 +10539,7 @@ def _validate_v25_inherited_wait_exempt_placement_live_exercise(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or not coverage_smoke
@@ -10640,12 +10720,13 @@ def _v26_cycle1_convergence_command(
     manager_events: Sequence[_NativeEvent],
     replica_events: Mapping[int, Sequence[_NativeEvent]],
     predecessor_epoch_digest: str,
+    predecessor_trees: Sequence[Tree],
     successor_epoch_digest: str,
     successor_trees: Sequence[Tree],
     command_payload_digest: str,
     activation_delay_blocks: int,
 ) -> tuple[dict[str, Any], dict[int, int], int]:
-    """Reconstruct the exact cycle-1 commit, activation, and manager quorum."""
+    """Reconstruct exact cycle-0/cycle-1 commands, activations, and quorums."""
 
     predecessor_digest = _digest(
         predecessor_epoch_digest, "v26 cycle-1 predecessor digest"
@@ -10661,13 +10742,63 @@ def _v26_cycle1_convergence_command(
         "v26 cycle-1 activation delay",
         1,
     )
+    predecessor_tree_ids = {tree.tree_id for tree in predecessor_trees}
     successor_tree_ids = {tree.tree_id for tree in successor_trees}
     if (
         set(replica_events) != set(range(expected.replica_count))
+        or len(predecessor_trees) != expected.q
+        or predecessor_tree_ids != set(range(expected.q))
         or len(successor_trees) != expected.q
         or successor_tree_ids != set(range(expected.q))
     ):
-        _fail("v26 cycle-1 commit/activation convergence membership drifted")
+        _fail("v26 cycle-0/cycle-1 convergence membership drifted")
+
+    cycle0_canonical_command: dict[str, Any] | None = None
+    cycle0_activation_times: dict[int, int] = {}
+    for replica_id in range(expected.replica_count):
+        commands = tuple(
+            event
+            for event in replica_events[replica_id]
+            if event.event_type == "epoch.command_committed"
+            and event.payload.get("successor_epoch_number") == 1
+        )
+        activations = tuple(
+            event
+            for event in replica_events[replica_id]
+            if event.event_type == "epoch.activated"
+            and event.payload.get("epoch_number") == 1
+        )
+        if len(commands) != 1 or len(activations) != 1:
+            _fail("v26 cycle-0 commit/activation convergence is incomplete")
+        command = _command_identity(
+            commands[0].payload,
+            f"v26 cycle-0 replica-{replica_id} command",
+        )
+        if (
+            command["predecessor_epoch_number"] != 0
+            or command["successor_epoch_number"] != 1
+            or command["successor_epoch_digest"] != predecessor_digest
+            or command["activation_delay_blocks"] != activation_delay
+        ):
+            _fail("v26 cycle-0 commit/activation convergence identity drifted")
+        if cycle0_canonical_command is None:
+            cycle0_canonical_command = command
+        elif command != cycle0_canonical_command:
+            _fail("v26 cycle-0 commit/activation convergence is noncanonical")
+        cycle0_activation_times[replica_id] = activations[0].monotonic_ns
+        activation = _activation_identity(
+            activations[0].payload,
+            f"v26 cycle-0 replica-{replica_id} activation",
+        )
+        if (
+            activation["epoch_number"] != 1
+            or activation["epoch_digest"] != predecessor_digest
+            or activation["tree_id"] not in predecessor_tree_ids
+            or activation["activation_height"] != command["activation_height"]
+            or commands[0].monotonic_ns > activations[0].monotonic_ns
+        ):
+            _fail("v26 cycle-0 commit/activation convergence activation drifted")
+    assert cycle0_canonical_command is not None
 
     canonical_command: dict[str, Any] | None = None
     command_times: dict[int, int] = {}
@@ -10736,81 +10867,116 @@ def _v26_cycle1_convergence_command(
     ):
         _fail("v26 cycle-1 selection chronology drifted")
 
-    converged_events = tuple(
-        event
-        for event in manager_events
-        if event.event_type == "adaptive_v2_converged"
-    )
-    if len(converged_events) != 1:
+    cycle0_convergences: list[tuple[_NativeEvent, dict[str, Any]]] = []
+    cycle1_convergences: list[tuple[_NativeEvent, dict[str, Any]]] = []
+    for event in manager_events:
+        if event.event_type != "adaptive_v2_converged":
+            continue
+        if (
+            event.source_kind != "adaptation_manager"
+            or event.source_id != "adaptive-manager"
+        ):
+            _fail("v26 adaptive_v2_converged source drifted")
+        payload = event.payload
+        _fields(
+            payload,
+            {
+                "replica_id",
+                "delivery_attempt",
+                "disposition",
+                "identity",
+                "accepted_commit_count",
+                "accepted_activation_count",
+                "required_activation_count",
+                "canonical_payload_digest",
+                "failure_reason",
+            },
+            "v26 adaptive_v2_converged payload",
+        )
+        identity = _mapping(
+            payload["identity"], "v26 adaptive_v2_converged identity"
+        )
+        command = _command_identity(
+            {
+                "command_block_height": identity.get("command_block_height"),
+                "command_block_hash": identity.get("command_block_hash"),
+                "payload_digest": identity.get("command_payload_digest"),
+                "predecessor_epoch_number": identity.get(
+                    "predecessor_epoch_number"
+                ),
+                "predecessor_epoch_digest": identity.get(
+                    "predecessor_epoch_digest"
+                ),
+                "successor_epoch_number": identity.get(
+                    "successor_epoch_number"
+                ),
+                "successor_epoch_digest": identity.get(
+                    "successor_epoch_digest"
+                ),
+                "activation_delay_blocks": identity.get(
+                    "activation_delay_blocks"
+                ),
+                "activation_height": identity.get("activation_height"),
+            },
+            "v26 adaptive_v2_converged identity",
+        )
+        accepted_commits = _integer(
+            payload["accepted_commit_count"],
+            "v26 adaptive_v2_converged accepted commit count",
+        )
+        accepted_activations = _integer(
+            payload["accepted_activation_count"],
+            "v26 adaptive_v2_converged accepted activation count",
+        )
+        required = _integer(
+            payload["required_activation_count"],
+            "v26 adaptive_v2_converged required activation count",
+            1,
+        )
+        transition = (
+            command["predecessor_epoch_number"],
+            command["successor_epoch_number"],
+        )
+        if transition == (0, 1):
+            if command != cycle0_canonical_command:
+                _fail("v26 cycle-0 adaptive_v2_converged identity drifted")
+            cycle_label = "cycle-0"
+            cycle0_convergences.append((event, command))
+        elif transition == (1, 2):
+            if (
+                command["predecessor_epoch_digest"] != predecessor_digest
+                or command["successor_epoch_digest"] != successor_digest
+                or command != canonical_command
+            ):
+                _fail("v26 cycle-1 adaptive_v2_converged identity drifted")
+            cycle_label = "cycle-1"
+            cycle1_convergences.append((event, command))
+        else:
+            _fail("v26 adaptive_v2_converged has an unknown transition")
+        if (
+            payload["replica_id"] is not None
+            or payload["delivery_attempt"] is not None
+            or payload["disposition"] is not None
+            or payload["canonical_payload_digest"] is not None
+            or payload["failure_reason"] is not None
+            or required != expected.q
+            or accepted_activations != required
+            or not required <= accepted_commits <= expected.replica_count
+        ):
+            _fail(f"v26 {cycle_label} adaptive_v2_converged identity/count drifted")
+    if len(cycle0_convergences) != 1:
+        _fail("v26 cycle-0 adaptive_v2_converged event is absent or duplicated")
+    if len(cycle1_convergences) != 1:
         _fail("v26 cycle-1 adaptive_v2_converged event is absent or duplicated")
-    converged = converged_events[0]
+    cycle0_converged, _cycle0_command = cycle0_convergences[0]
+    converged, _manager_command = cycle1_convergences[0]
     if (
-        converged.source_kind != "adaptation_manager"
-        or converged.source_id != "adaptive-manager"
+        sorted(cycle0_activation_times.values())[expected.q - 1]
+        > cycle0_converged.monotonic_ns
     ):
-        _fail("v26 cycle-1 adaptive_v2_converged source drifted")
-    payload = converged.payload
-    _fields(
-        payload,
-        {
-            "replica_id",
-            "delivery_attempt",
-            "disposition",
-            "identity",
-            "accepted_commit_count",
-            "accepted_activation_count",
-            "required_activation_count",
-            "canonical_payload_digest",
-            "failure_reason",
-        },
-        "v26 cycle-1 adaptive_v2_converged payload",
-    )
-    identity = _mapping(
-        payload["identity"], "v26 cycle-1 adaptive_v2_converged identity"
-    )
-    manager_command = _command_identity(
-        {
-            "command_block_height": identity.get("command_block_height"),
-            "command_block_hash": identity.get("command_block_hash"),
-            "payload_digest": identity.get("command_payload_digest"),
-            "predecessor_epoch_number": identity.get(
-                "predecessor_epoch_number"
-            ),
-            "predecessor_epoch_digest": identity.get(
-                "predecessor_epoch_digest"
-            ),
-            "successor_epoch_number": identity.get("successor_epoch_number"),
-            "successor_epoch_digest": identity.get("successor_epoch_digest"),
-            "activation_delay_blocks": identity.get("activation_delay_blocks"),
-            "activation_height": identity.get("activation_height"),
-        },
-        "v26 cycle-1 adaptive_v2_converged identity",
-    )
-    accepted_commits = _integer(
-        payload["accepted_commit_count"],
-        "v26 cycle-1 accepted commit count",
-    )
-    accepted_activations = _integer(
-        payload["accepted_activation_count"],
-        "v26 cycle-1 accepted activation count",
-    )
-    required = _integer(
-        payload["required_activation_count"],
-        "v26 cycle-1 required activation count",
-        1,
-    )
-    if (
-        payload["replica_id"] is not None
-        or payload["delivery_attempt"] is not None
-        or payload["disposition"] is not None
-        or payload["canonical_payload_digest"] is not None
-        or payload["failure_reason"] is not None
-        or manager_command != canonical_command
-        or required != expected.q
-        or accepted_activations != required
-        or not required <= accepted_commits <= expected.replica_count
-    ):
-        _fail("v26 cycle-1 adaptive_v2_converged identity/count drifted")
+        _fail("v26 cycle-0 adaptive_v2_converged precedes its raw activation quorum")
+    if cycle0_converged.monotonic_ns >= selection.monotonic_ns:
+        _fail("v26 cycle-0 adaptive_v2_converged chronology drifted")
     if sorted(activation_times.values())[expected.q - 1] > converged.monotonic_ns:
         _fail("v26 cycle-1 adaptive_v2_converged precedes its raw activation quorum")
 
@@ -10890,6 +11056,7 @@ def _validate_v26_verified_response_duplicate_live_exercise(
         manager_events=manager_events,
         replica_events=replica_events,
         predecessor_epoch_digest=predecessor_digest,
+        predecessor_trees=predecessor_trees,
         successor_epoch_digest=successor_epoch_digest,
         successor_trees=successor_trees,
         command_payload_digest=command_payload_digest,
@@ -11082,6 +11249,7 @@ def _validate_v27_verified_response_duplicate_live_exercise(
         manager_events=manager_events,
         replica_events=replica_events,
         predecessor_epoch_digest=predecessor_digest,
+        predecessor_trees=predecessor_trees,
         successor_epoch_digest=successor_epoch_digest,
         successor_trees=successor_trees,
         command_payload_digest=command_payload_digest,
@@ -11269,7 +11437,7 @@ def _validate_v28_verified_response_duplicate_probe(
 
     probes = _response_duplicate_probe_markers(slot_root, paths_by_replica)
     in_scope = (
-        manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and coverage_smoke
         and expected.slot_id == _coverage_smoke_slot_ids(manifest_id)[1]
     )
@@ -11310,6 +11478,7 @@ def _validate_v28_verified_response_duplicate_probe(
         manager_events=manager_events,
         replica_events=replica_events,
         predecessor_epoch_digest=predecessor_digest,
+        predecessor_trees=predecessor_trees,
         successor_epoch_digest=successor_epoch_digest,
         successor_trees=successor_trees,
         command_payload_digest=command_payload_digest,
@@ -12252,6 +12421,7 @@ def _validate_v25_coverage_execution_lifecycle(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id not in coverage_slot_ids
@@ -12656,6 +12826,7 @@ def validate_slot(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         )
     )
@@ -12804,7 +12975,8 @@ def validate_slot(
 
         cutoff_contract = _mapping(runtime.get("cutoff_contract"), "runtime cutoff contract")
         v28_excluded_repair = (
-            manifest.manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            manifest.manifest_id
+            in {V28_MANIFEST_ID, V29_MANIFEST_ID, FROZEN_MANIFEST_ID}
             and coverage_smoke
             and expected.slot_id
             == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
@@ -12973,7 +13145,11 @@ def validate_slot(
             _validate_v27_verified_response_duplicate_live_exercise(
                 **duplicate_live_arguments
             )
-        elif manifest.manifest_id in {V28_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+        elif manifest.manifest_id in {
+            V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }:
             _validate_v28_verified_response_duplicate_probe(
                 **duplicate_live_arguments,
                 accepted=accepted,
@@ -13245,6 +13421,7 @@ def validate_slot(
                 V26_MANIFEST_ID,
                 V27_MANIFEST_ID,
                 V28_MANIFEST_ID,
+                V29_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         ):

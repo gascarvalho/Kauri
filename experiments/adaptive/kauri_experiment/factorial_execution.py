@@ -1,4 +1,4 @@
-"""Fail-closed local execution for one SHAPE29 factorial slot.
+"""Fail-closed local execution for one SHAPE30 factorial slot.
 
 The frozen factorial modules describe *what* may be run.  This module owns the
 small, deliberately local execution boundary: it proves an exact pushed
@@ -52,6 +52,7 @@ from .factorial_manifest import (
     V26_MANIFEST_ID,
     V27_MANIFEST_ID,
     V28_MANIFEST_ID,
+    V29_MANIFEST_ID,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     PortAllocation,
@@ -1346,6 +1347,7 @@ def build_coverage_smoke_execution_contract(
             V26_MANIFEST_ID,
             V27_MANIFEST_ID,
             V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.execution_mode != "fixed_sequential"
@@ -1608,6 +1610,7 @@ def _bind_execution_authorization(
         V26_MANIFEST_ID,
         V27_MANIFEST_ID,
         V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_slots = [
@@ -2860,6 +2863,7 @@ def _bind_static_artifacts(
                 V26_MANIFEST_ID,
                 V27_MANIFEST_ID,
                 V28_MANIFEST_ID,
+                V29_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -4475,7 +4479,8 @@ def _uses_exact_excluded_repair_smoke_bound(
     manifest_id = contract.get("manifest_id")
     manifest_version = {
         V28_MANIFEST_ID: "v28",
-        FROZEN_MANIFEST_ID: "v29",
+        V29_MANIFEST_ID: "v29",
+        FROZEN_MANIFEST_ID: "v30",
     }.get(manifest_id)
     if manifest_version is None:
         return False
@@ -4565,7 +4570,7 @@ def _uses_exact_excluded_repair_smoke_bound(
         and exact_replica_argv
     ):
         raise FactorialExecutionError(
-            "v28/v29 excluded repair smoke runtime binding drifted"
+            "v28/v29/v30 excluded repair smoke runtime binding drifted"
         )
     return True
 
@@ -5869,13 +5874,14 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v27/slot-066-n31-f5-b05-P": "v27",
         "results/shape-placement-factorial-v28/slot-066-n31-f5-b05-P": "v28",
         "results/shape-placement-factorial-v29/slot-066-n31-f5-b05-P": "v29",
+        "results/shape-placement-factorial-v30/slot-066-n31-f5-b05-P": "v30",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_fault_duration_s = (
-        450 if manifest_version in {"v27", "v28", "v29"} else 300
+        450 if manifest_version in {"v27", "v28", "v29", "v30"} else 300
     )
     expected_hard_timeout_s = (
-        650 if manifest_version in {"v27", "v28", "v29"} else 500
+        650 if manifest_version in {"v27", "v28", "v29", "v30"} else 500
     )
     expected_timeout_eligibility = {
         "v15": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
@@ -5893,6 +5899,7 @@ def build_n31_coverage_smoke_slot(
         "v27": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v28": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v29": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v30": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
@@ -5911,6 +5918,7 @@ def build_n31_coverage_smoke_slot(
             "v27",
             "v28",
             "v29",
+            "v30",
         }
         else None
     )
@@ -5930,12 +5938,14 @@ def build_n31_coverage_smoke_slot(
             "v27",
             "v28",
             "v29",
+            "v30",
         }
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-        if manifest_version in {"v23", "v24", "v25", "v26", "v27", "v28", "v29"}
+        if manifest_version
+        in {"v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30"}
         else (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_version in {"v19", "v20", "v21", "v22"}
@@ -5946,24 +5956,34 @@ def build_n31_coverage_smoke_slot(
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
         if manifest_version
         in {
-            "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
-        "v29"
+            "v20",
+            "v21",
+            "v22",
+            "v23",
+            "v24",
+            "v25",
+            "v26",
+            "v27",
+            "v28",
+            "v29",
+            "v30",
         }
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-        if manifest_version in {"v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29"}
+        if manifest_version
+        in {"v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30"}
         else None
     )
     expected_inherited_wait_exempt_placement_contract = (
         INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
-        if manifest_version in {"v25", "v26", "v27", "v28", "v29"}
+        if manifest_version in {"v25", "v26", "v27", "v28", "v29", "v30"}
         else None
     )
     expected_verified_response_duplicate_delivery_contract = (
         VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2
-        if manifest_version in {"v27", "v28", "v29"}
+        if manifest_version in {"v27", "v28", "v29", "v30"}
         else (
             VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
             if manifest_version == "v26"
@@ -5972,12 +5992,12 @@ def build_n31_coverage_smoke_slot(
     )
     expected_excluded_repair_observation_contract = (
         EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
-        if manifest_version in {"v28", "v29"}
+        if manifest_version in {"v28", "v29", "v30"}
         else None
     )
     expected_excluded_repair_duplicate_probe_contract = (
         EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
-        if manifest_version in {"v28", "v29"}
+        if manifest_version in {"v28", "v29", "v30"}
         else None
     )
     if (
@@ -6062,13 +6082,15 @@ def build_n31_coverage_smoke_slot(
         or template.workload.epoch1_preselection_residency_ms
         != (
             60_000
-            if manifest_version in {"v24", "v25", "v26", "v27", "v28", "v29"}
+            if manifest_version
+            in {"v24", "v25", "v26", "v27", "v28", "v29", "v30"}
             else None
         )
         or responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
         != (
             82
-            if manifest_version in {"v24", "v25", "v26", "v27", "v28", "v29"}
+            if manifest_version
+            in {"v24", "v25", "v26", "v27", "v28", "v29", "v30"}
             else None
         )
     ):
@@ -6088,7 +6110,7 @@ def build_n31_coverage_smoke_slot(
         )
     smoke = replace(template, result_path=result_path)
     primary_runtime = build_slot_runtime(smoke)
-    if manifest_version not in {"v25", "v26", "v27", "v28", "v29"}:
+    if manifest_version not in {"v25", "v26", "v27", "v28", "v29", "v30"}:
         if repair_template is not None or repair_result_path is not None:
             raise FactorialExecutionError(
                 "historical N=31 coverage smoke must remain single-slot"
@@ -6203,7 +6225,7 @@ def build_n31_coverage_smoke_slot(
             "v25+ N=31 repair coverage result path must be the exact canonical root"
         )
     excluded_repair_probe: ExcludedRepairSmokeProbeContract | None = None
-    if manifest_version in {"v28", "v29"}:
+    if manifest_version in {"v28", "v29", "v30"}:
         source_repair_runtime = build_slot_runtime(repair_template)
         repair_smoke = replace(
             repair_template,

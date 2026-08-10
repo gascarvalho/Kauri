@@ -205,7 +205,7 @@ def test_v21_is_validation_only_and_keeps_ordered_frozen_roots(
     assert cli.DEFAULT_MANIFEST != V21_MANIFEST
     assert cli.main(["--manifest", str(V21_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v28 are validation-only" in refusal["reason"]
+    assert "v1 through v29 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V21_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

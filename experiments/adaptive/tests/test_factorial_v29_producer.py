@@ -97,15 +97,15 @@ def test_v28_identities_are_explicit_historical_aliases() -> None:
     )
 
 
-def test_v29_six_identities_are_exact_frozen_values() -> None:
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v29"
+def test_v29_six_identities_are_exact_historical_values() -> None:
+    assert manifest_module.V29_MANIFEST_ID == "shape-placement-factorial-v29"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V29_MANIFEST_SHA256,
+        manifest_module.V29_SEMANTIC_SHA256,
+        manifest_module.V29_PLAN_SHA256,
+        runtime_module.V29_RUNTIME_SHA256,
+        runtime_module.V29_SMOKE_RUNTIME_SHA256,
+        runtime_module.V29_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         "e012be15b6193263138de7b5aee5f78eb67de10182bc07e4494373d648fde5fa",
         "605992c544a12c3652f1279bb960325bc94fe7cd72ebb251d1c5b8e101701361",
@@ -161,10 +161,10 @@ def test_v29_repair_runtime_passes_exact_static_binding(
     )
 
 
-def test_v29_is_default_and_v28_is_validation_only(
+def test_v29_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V29_MANIFEST
-    assert cli.main(["--manifest", str(V28_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST != V29_MANIFEST
+    assert cli.main(["--manifest", str(V29_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v28 are validation-only" in refusal["reason"]
+    assert "v1 through v29 are validation-only" in refusal["reason"]
