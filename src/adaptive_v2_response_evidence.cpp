@@ -783,7 +783,7 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
                     "disposition=idempotent_duplicate "
                     "reporter=%u child=%u epoch=%u tree=%u "
                     "digest=%s block=%s message_type=%s "
-                    "attempt_generation=%llu",
+                    "attempt_generation=%llu response_monotonic_ns=%llu",
                     static_cast<unsigned>(state_->reporter_id),
                     static_cast<unsigned>(authenticated_sender),
                     proposal.configuration.epoch_number,
@@ -792,7 +792,9 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
                     proposal.block_hash.to_hex().c_str(),
                     response_message_type_name(message_type),
                     static_cast<unsigned long long>(
-                        found->second.handle.generation));
+                        found->second.handle.generation),
+                    static_cast<unsigned long long>(
+                        response_monotonic_ns));
             }
             catch (...)
             {
