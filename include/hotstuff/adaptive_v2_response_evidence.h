@@ -52,6 +52,7 @@ struct AdaptiveV2ResponseEvidenceDiagnostics
     std::uint64_t deadline_cancellations{0};
     std::uint64_t deadline_cancellation_failures{0};
     std::uint64_t response_facts{0};
+    std::uint64_t idempotent_duplicate_responses{0};
     std::uint64_t timeout_facts{0};
     std::uint64_t timeout_missing_handles{0};
     std::uint64_t timeout_ineligible_attempts{0};

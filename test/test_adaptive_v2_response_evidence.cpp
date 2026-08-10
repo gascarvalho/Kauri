@@ -285,6 +285,76 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "duplicate on-time verified response is an idempotent no-op",
+    "[adaptive-v2][response-evidence][duplicate][on-time]")
+{
+    ManualEvidenceDeadlineScheduler scheduler;
+    AdaptiveV2ResponseEvidenceBridge bridge(0, limits());
+    scheduler.bind(bridge);
+    std::vector<EvidenceDeadlineResult> results;
+    bridge.bind_deadline_result_callback(
+        [&results](const ProposalKey &, EvidenceDeadlineResult result) {
+            results.push_back(result);
+        });
+    std::vector<EvidenceReportEnvelope> delivered;
+    bridge.bind_transport(
+        [&delivered](const EvidenceReportEnvelope &envelope) {
+            delivered.push_back(envelope);
+            return EvidenceTransportResult::accepted;
+        });
+
+    const auto key = proposal("duplicate-on-time-response");
+    REQUIRE(bridge.arm_with_deadline(
+        key, response_tree(), kStartNs, kDeadlineUs));
+    REQUIRE(bridge.record_verified_response(
+        key,
+        1,
+        ExpectedMessageType::aggregate_relay,
+        {1, 3},
+        after_us(20)));
+    REQUIRE(delivered.size() == 1);
+
+    CHECK_FALSE(bridge.record_verified_response(
+        key,
+        1,
+        ExpectedMessageType::aggregate_relay,
+        {1, 3, 4},
+        after_us(21)));
+    auto diagnostics = bridge.diagnostics();
+    CHECK(delivered.size() == 1);
+    CHECK(diagnostics.response_facts == 1);
+    CHECK(diagnostics.idempotent_duplicate_responses == 1);
+    CHECK(diagnostics.rejected_operations == 0);
+    CHECK(diagnostics.deadline_delivery_failures == 0);
+    CHECK(diagnostics.healthy);
+    CHECK(results.empty());
+
+    CHECK_FALSE(bridge.record_verified_response(
+        key,
+        1,
+        ExpectedMessageType::direct_vote,
+        {1},
+        after_us(22)));
+    CHECK_FALSE(bridge.record_verified_response(
+        key,
+        99,
+        ExpectedMessageType::aggregate_relay,
+        {99},
+        after_us(22)));
+    diagnostics = bridge.diagnostics();
+    CHECK(diagnostics.rejected_operations == 2);
+    CHECK(diagnostics.deadline_delivery_failures == 0);
+    CHECK(diagnostics.healthy);
+
+    REQUIRE(bridge.close_consensus_context(key));
+    REQUIRE(scheduler.fire(0, after_us(kDeadlineUs)));
+    CHECK(results ==
+          std::vector<EvidenceDeadlineResult>{
+              EvidenceDeadlineResult::evidence_accepted});
+    CHECK(bridge.diagnostics().healthy);
+}
+
+TEST_CASE(
     "adaptive-v2 commit cleanup preserves unanswered attempts until their deadline",
     "[adaptive-v2][response-evidence][deadline][commit]")
 {
@@ -1497,6 +1567,64 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "duplicate late verified response is an idempotent no-op",
+    "[adaptive-v2][response-evidence][duplicate][late]")
+{
+    ManualEvidenceDeadlineScheduler scheduler;
+    AdaptiveV2ResponseEvidenceBridge bridge(0, limits());
+    scheduler.bind(bridge);
+    std::vector<EvidenceDeadlineResult> results;
+    bridge.bind_deadline_result_callback(
+        [&results](const ProposalKey &, EvidenceDeadlineResult result) {
+            results.push_back(result);
+        });
+    std::vector<EvidenceReportEnvelope> delivered;
+    bridge.bind_transport(
+        [&delivered](const EvidenceReportEnvelope &envelope) {
+            delivered.push_back(envelope);
+            return EvidenceTransportResult::accepted;
+        });
+
+    const auto key = proposal("duplicate-late-response");
+    REQUIRE(bridge.arm_with_deadline(
+        key, response_tree(), kStartNs, kDeadlineUs));
+    REQUIRE(scheduler.fire(0, after_us(kDeadlineUs)));
+    REQUIRE(delivered.size() == 2);
+    CHECK(results.empty());
+
+    REQUIRE(bridge.record_verified_response(
+        key,
+        1,
+        ExpectedMessageType::aggregate_relay,
+        {1, 3},
+        after_us(130)));
+    REQUIRE(delivered.size() == 3);
+    CHECK(delivered.back().observation.outcome == ResponseOutcome::late);
+
+    CHECK_FALSE(bridge.record_verified_response(
+        key,
+        1,
+        ExpectedMessageType::aggregate_relay,
+        {1, 3, 4},
+        after_us(131)));
+    const auto diagnostics = bridge.diagnostics();
+    CHECK(delivered.size() == 3);
+    CHECK(diagnostics.timeout_facts == 2);
+    CHECK(diagnostics.response_facts == 1);
+    CHECK(diagnostics.idempotent_duplicate_responses == 1);
+    CHECK(diagnostics.rejected_operations == 0);
+    CHECK(diagnostics.deadline_delivery_failures == 0);
+    CHECK(diagnostics.healthy);
+    CHECK(results.empty());
+
+    REQUIRE(bridge.close_consensus_context(key));
+    CHECK(results ==
+          std::vector<EvidenceDeadlineResult>{
+              EvidenceDeadlineResult::evidence_accepted});
+    CHECK(bridge.diagnostics().healthy);
+}
+
+TEST_CASE(
     "adaptive-v2 wait-exempt absence and rejected response inputs produce no fact",
     "[adaptive-v2][response-evidence][neutral]")
 {
@@ -1961,9 +2089,19 @@ TEST_CASE(
         "AdaptiveV2DurableCommitPhase::suppressed");
     const auto persist_tombstone = deadline_result.find(
         "persist_adaptive_v2_commit_report", failed_tombstone);
+    const auto failed_convergence_poison = deadline_result.find(
+        "mark_adaptive_v2_convergence_evidence_unhealthy",
+        persist_tombstone);
+    const auto failed_convergence_reason = deadline_result.find(
+        "response_deadline_evidence_failed",
+        failed_convergence_poison);
     REQUIRE(failed_tombstone != std::string::npos);
     REQUIRE(persist_tombstone != std::string::npos);
+    REQUIRE(failed_convergence_poison != std::string::npos);
+    REQUIRE(failed_convergence_reason != std::string::npos);
     CHECK(failed_tombstone < persist_tombstone);
+    CHECK(persist_tombstone < failed_convergence_poison);
+    CHECK(failed_convergence_poison < failed_convergence_reason);
 
     const auto enqueue_deferred = function_slice(
         implementation,

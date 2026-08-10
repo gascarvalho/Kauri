@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "hotstuff/util.h"
+
 namespace hotstuff
 {
 namespace
@@ -184,13 +186,22 @@ bool has_unanswered_required_child(
         });
 }
 
+const char *response_message_type_name(
+    ExpectedMessageType message_type) noexcept
+{
+    return message_type == ExpectedMessageType::aggregate_relay
+               ? "aggregate_relay"
+               : "direct_vote";
+}
+
 } // namespace
 
 struct AdaptiveV2ResponseEvidenceBridge::State
 {
     State(ReplicaID reporter_id,
           AdaptiveV2ResponseEvidenceLimits configured_limits)
-        : limits(std::move(configured_limits)),
+        : reporter_id(reporter_id),
+          limits(std::move(configured_limits)),
           tracker(limits.attempts),
           reporter(EvidenceReporterConfig{
               reporter_id,
@@ -207,6 +218,7 @@ struct AdaptiveV2ResponseEvidenceBridge::State
             healthy = false;
     }
 
+    ReplicaID reporter_id{0};
     AdaptiveV2ResponseEvidenceLimits limits;
     ResponseAttemptTracker tracker;
     EvidenceReporter reporter;
@@ -236,6 +248,7 @@ struct AdaptiveV2ResponseEvidenceBridge::State
     std::uint64_t deadline_cancellations{0};
     std::uint64_t deadline_cancellation_failures{0};
     std::uint64_t response_facts{0};
+    std::uint64_t idempotent_duplicate_responses{0};
     std::uint64_t timeout_facts{0};
     std::uint64_t timeout_missing_handles{0};
     std::uint64_t timeout_ineligible_attempts{0};
@@ -758,6 +771,34 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
             found->second.handle.key.expected_message_type != message_type)
         {
             increment(state_->rejected_operations);
+            return false;
+        }
+        if (found->second.response_recorded)
+        {
+            increment(state_->idempotent_duplicate_responses);
+            try
+            {
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_RESPONSE_EVIDENCE "
+                    "disposition=idempotent_duplicate "
+                    "reporter=%u child=%u epoch=%u tree=%u "
+                    "digest=%s block=%s message_type=%s "
+                    "attempt_generation=%llu",
+                    state_->reporter_id,
+                    authenticated_sender,
+                    proposal.configuration.epoch_number,
+                    proposal.configuration.tree_id,
+                    proposal.configuration.epoch_digest.to_hex().c_str(),
+                    proposal.block_hash.to_hex().c_str(),
+                    response_message_type_name(message_type),
+                    static_cast<unsigned long long>(
+                        found->second.handle.generation));
+            }
+            catch (...)
+            {
+                // Audit output is best effort and cannot change protocol or
+                // response-evidence state.
+            }
             return false;
         }
         const bool expects_late = found->second.timeout_recorded;
@@ -1386,6 +1427,8 @@ AdaptiveV2ResponseEvidenceBridge::diagnostics() const noexcept
     result.deadline_cancellation_failures =
         state_->deadline_cancellation_failures;
     result.response_facts = state_->response_facts;
+    result.idempotent_duplicate_responses =
+        state_->idempotent_duplicate_responses;
     result.timeout_facts = state_->timeout_facts;
     result.timeout_missing_handles =
         state_->timeout_missing_handles;
