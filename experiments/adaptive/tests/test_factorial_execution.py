@@ -32,6 +32,12 @@ from experiments.adaptive.kauri_experiment.processes import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v24.json"
+V28_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v28.json"
+)
+V27_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v27.json"
+)
 
 
 @pytest.fixture(scope="module")
@@ -429,6 +435,197 @@ def test_static_artifacts_bind_exact_campaign_and_direct_smoke_documents(
         coverage_artifacts,
         campaign_member=False,
     )
+
+
+def test_static_artifacts_bind_exact_excluded_repair_probe_runtime() -> None:
+    plan = build_factorial_plan(load_frozen_manifest(V28_MANIFEST))
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    repair_slot = coverage.slots[1]
+    repair_runtime = coverage.runtimes[1]
+    artifacts = {
+        "manifest.json": V28_MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": execution._canonical_json_bytes(
+            coverage.runtime.as_document()
+        ),
+    }
+
+    execution._bind_static_artifacts(
+        repair_slot,
+        repair_runtime,
+        artifacts,
+        campaign_member=False,
+    )
+
+
+def _v28_coverage_static_contract():
+    plan = build_factorial_plan(load_frozen_manifest(V28_MANIFEST))
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    artifacts = {
+        "manifest.json": V28_MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": execution._canonical_json_bytes(
+            coverage.runtime.as_document()
+        ),
+    }
+    return plan, coverage, artifacts
+
+
+@pytest.mark.parametrize("mutation", ("tampered", "removed"))
+def test_static_artifacts_reject_tampered_or_removed_repair_probe(
+    mutation: str,
+) -> None:
+    _, coverage, artifacts = _v28_coverage_static_contract()
+    repair_slot = coverage.slots[1]
+    repair_runtime = coverage.runtimes[1]
+    probe = repair_runtime.excluded_repair_smoke_probe
+    assert probe is not None
+    candidate = replace(
+        repair_runtime,
+        excluded_repair_smoke_probe=(
+            replace(probe, hard_timeout_s=649)
+            if mutation == "tampered"
+            else None
+        ),
+    )
+
+    with pytest.raises(execution.FactorialExecutionError, match="slot/runtime"):
+        execution._bind_static_artifacts(
+            repair_slot,
+            candidate,
+            artifacts,
+            campaign_member=False,
+        )
+
+
+def test_static_artifacts_reject_repair_probe_injection_outside_repair() -> None:
+    plan, coverage, coverage_artifacts = _v28_coverage_static_contract()
+    probe = coverage.runtimes[1].excluded_repair_smoke_probe
+    assert probe is not None
+    primary_slot = coverage.slots[0]
+    primary_runtime = replace(
+        coverage.runtimes[0],
+        excluded_repair_smoke_probe=probe,
+    )
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    smoke_runtime = replace(smoke.runtime, excluded_repair_smoke_probe=probe)
+    campaign_slot = next(
+        slot for slot in plan.slots if slot.execution_ordinal == 5
+    )
+    campaign_runtime = replace(
+        execution.build_slot_runtime(campaign_slot),
+        excluded_repair_smoke_probe=probe,
+    )
+    campaign_plan_runtime = build_factorial_runtime(plan)
+    campaign_artifacts = {
+        "manifest.json": V28_MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": canonical_runtime_bytes(campaign_plan_runtime),
+    }
+
+    attempts = (
+        (primary_slot, primary_runtime, coverage_artifacts, False),
+        (smoke.slot, smoke_runtime, _smoke_static_artifacts(smoke), False),
+        (campaign_slot, campaign_runtime, campaign_artifacts, True),
+    )
+    for slot, spec, artifacts, campaign_member in attempts:
+        with pytest.raises(
+            execution.FactorialExecutionError,
+            match="slot/runtime derivation failed",
+        ):
+            execution._bind_static_artifacts(
+                slot,
+                spec,
+                artifacts,
+                campaign_member=campaign_member,
+            )
+
+
+@pytest.mark.parametrize("mutation", ("artifact", "replica_argv"))
+def test_static_artifacts_reject_repair_runtime_identity_drift(
+    mutation: str,
+) -> None:
+    _, coverage, artifacts = _v28_coverage_static_contract()
+    repair_slot = coverage.slots[1]
+    repair_runtime = coverage.runtimes[1]
+    if mutation == "artifact":
+        candidate = replace(
+            repair_runtime,
+            artifact_id=repair_runtime.artifact_id + "-drift",
+        )
+    else:
+        processes = list(repair_runtime.replica_argv_templates)
+        process = processes[0]
+        argv = list(process.argv)
+        option = "--experiment-response-evidence-duplicate-probe"
+        index = argv.index(option)
+        del argv[index : index + 2]
+        processes[0] = replace(process, argv=tuple(argv))
+        candidate = replace(
+            repair_runtime,
+            replica_argv_templates=tuple(processes),
+        )
+
+    with pytest.raises(execution.FactorialExecutionError, match="slot/runtime"):
+        execution._bind_static_artifacts(
+            repair_slot,
+            candidate,
+            artifacts,
+            campaign_member=False,
+        )
+
+
+def test_static_artifacts_reject_self_consistent_mutated_n31_contract() -> None:
+    _, coverage, artifacts = _v28_coverage_static_contract()
+    mutated_slot = replace(
+        coverage.slots[0],
+        scientific_seed=coverage.slots[0].scientific_seed + 1,
+    )
+    mutated_runtime = execution.build_slot_runtime(mutated_slot)
+
+    with pytest.raises(execution.FactorialExecutionError, match="not derivable"):
+        execution._bind_static_artifacts(
+            mutated_slot,
+            mutated_runtime,
+            artifacts,
+            campaign_member=False,
+        )
+
+
+def test_static_artifacts_reject_cross_version_coverage_runtime() -> None:
+    _, coverage, artifacts = _v28_coverage_static_contract()
+    previous_plan = build_factorial_plan(load_frozen_manifest(V27_MANIFEST))
+    previous_primary = next(
+        slot for slot in previous_plan.slots if slot.execution_ordinal == 1
+    )
+    previous_repair = next(
+        slot for slot in previous_plan.slots if slot.execution_ordinal == 5
+    )
+    previous = execution.build_n31_coverage_smoke_slot(
+        previous_primary,
+        repair_template=previous_repair,
+    )
+    artifacts["runtime.json"] = execution._canonical_json_bytes(
+        previous.runtime.as_document()
+    )
+
+    with pytest.raises(execution.FactorialExecutionError, match="runtime.json"):
+        execution._bind_static_artifacts(
+            coverage.slots[1],
+            coverage.runtimes[1],
+            artifacts,
+            campaign_member=False,
+        )
 
 
 @pytest.mark.parametrize("artifact", ("manifest.json", "plan.json", "runtime.json"))

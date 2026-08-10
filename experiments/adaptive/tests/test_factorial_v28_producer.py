@@ -252,12 +252,12 @@ def test_v27_history_has_no_probe_and_preserves_strict_450_runtime() -> None:
 
 def test_v28_six_identities_are_exact_frozen_values() -> None:
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V28_MANIFEST_SHA256,
+        manifest_module.V28_SEMANTIC_SHA256,
+        manifest_module.V28_PLAN_SHA256,
+        runtime_module.V28_RUNTIME_SHA256,
+        runtime_module.V28_SMOKE_RUNTIME_SHA256,
+        runtime_module.V28_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         "fda2a5e79ebd04e67d9e7db10675b5c31b6072803d986dad229ef6b115e0a659",
         "42ca63b1fb6d256852cd0f758fbf852b01b31c594705c0bb051b6bc18ca1f989",
@@ -496,10 +496,10 @@ def test_v28_runner_rejects_equality_at_every_recovery_boundary(
         )
 
 
-def test_v28_is_default_and_v27_is_validation_only(
+def test_v28_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V28_MANIFEST
-    assert cli.main(["--manifest", str(V27_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST != V28_MANIFEST
+    assert cli.main(["--manifest", str(V28_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v27 are validation-only" in refusal["reason"]
+    assert "v1 through v28 are validation-only" in refusal["reason"]
