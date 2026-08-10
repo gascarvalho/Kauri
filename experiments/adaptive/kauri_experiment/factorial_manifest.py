@@ -191,14 +191,23 @@ V20_SEMANTIC_SHA256 = (
 )
 V20_PLAN_SHA256 = "78c21a436a1680ecc5c3a253cd7d214cfaef88dbdf94cf90c05110975a6017ef"
 
-FROZEN_MANIFEST_ID = "shape-placement-factorial-v21"
-FROZEN_MANIFEST_SHA256 = (
+V21_MANIFEST_ID = "shape-placement-factorial-v21"
+V21_MANIFEST_SHA256 = (
     "81e1f15b630f6e877a92131bdc456047de516de9c98827b74f8d08a0ffeee853"
 )
-FROZEN_SEMANTIC_SHA256 = (
+V21_SEMANTIC_SHA256 = (
     "84f279aaba107f1d54db0143b1a9e39ebd7b292d6b652fc67ab2c8e583cb0296"
 )
-FROZEN_PLAN_SHA256 = "287c333eae3c1bcc1ed62f6db61745f36871098645c1f2e93147fa46f3960c9b"
+V21_PLAN_SHA256 = "287c333eae3c1bcc1ed62f6db61745f36871098645c1f2e93147fa46f3960c9b"
+
+FROZEN_MANIFEST_ID = "shape-placement-factorial-v22"
+FROZEN_MANIFEST_SHA256 = (
+    "61b28d7a3f24b2472967499a632098fff93c7b57ed75fcb1db759cfb0bab82c4"
+)
+FROZEN_SEMANTIC_SHA256 = (
+    "8719011642f91e891239e5cd43af1b580fd2c9caa58ed01c46e9a7293bc1d292"
+)
+FROZEN_PLAN_SHA256 = "2234fd682335553281351c2fdda022851d7c5d94b0e68e115a993bc80c3cec9c"
 
 RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1 = (
     "retain_unanswered_exact_parent_child_attempt_across_consensus_commit_until_"
@@ -261,6 +270,10 @@ SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1 = (
     "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
     "keys_are_native_proposal_configuration_witnesses_after_exact_topology_"
     "validation_v1"
+)
+EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1 = (
+    "full_prefix_without_inherited_consensus_wait_exempt_and_baseline_exclusive_"
+    "suffix_with_exact_inherited_consensus_wait_exempt_v1"
 )
 RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1 = (
     "omit_every_41st_unique_non_root_contribution_per_exact_epoch_identity_"
@@ -359,6 +372,7 @@ class ResponsiveDegradationContract(_Document):
     precontainment_guarded_selection_contract: str | None = None
     future_tree_proposal_delivery_contract: str | None = None
     source_bound_proposal_witness_contract: str | None = None
+    evidence_snapshot_selection_contract: str | None = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
@@ -375,6 +389,7 @@ class ResponsiveDegradationContract(_Document):
             "precontainment_guarded_selection_contract",
             "future_tree_proposal_delivery_contract",
             "source_bound_proposal_witness_contract",
+            "evidence_snapshot_selection_contract",
         ):
             if document[field] is None:
                 document.pop(field)
@@ -919,6 +934,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         _error("manifest ID is not a known frozen SHAPE25 contract")
@@ -936,6 +952,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     causal_measurement = manifest_id in {
@@ -951,6 +968,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     explicit_causal_windows = manifest_id in {
@@ -965,6 +983,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     explicit_causal_edge_eligibility = manifest_id in {
@@ -978,6 +997,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     persistent = manifest_id in {
@@ -1000,6 +1020,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     compact_snapshot = manifest_id in {
@@ -1021,6 +1042,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
     replica_counts = tuple(
@@ -1049,6 +1071,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else "shape25-sensitive-responsiveness-v1"
@@ -1095,6 +1118,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else (41 if causal_measurement else 32)
@@ -1112,6 +1136,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         else 2
@@ -1181,6 +1206,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_mode = "tiered_persistent_responsive_omission_v2"
@@ -1291,6 +1317,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_responsive_schedule = RESPONSIVE_ROLE_SCOPED_SCHEDULE_V1
@@ -1346,6 +1373,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add("precontainment_fault_coverage_gate")
@@ -1354,6 +1382,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1363,6 +1392,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
@@ -1371,14 +1401,23 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         if manifest_id in {
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_responsive_fields.add(
                 "future_tree_proposal_delivery_contract"
             )
-        if manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+        if manifest_id in {
+            V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }:
             expected_responsive_fields.add(
                 "source_bound_proposal_witness_contract"
+            )
+        if manifest_id == FROZEN_MANIFEST_ID:
+            expected_responsive_fields.add(
+                "evidence_snapshot_selection_contract"
             )
         if set(responsive) != expected_responsive_fields:
             _error("responsive-degradation contract fields are not frozen")
@@ -1425,6 +1464,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             rate_eligible_timeout_counts = {
@@ -1544,13 +1584,14 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1
         )
         expected_timeout_eligibility = (
             RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
-            if manifest_id == FROZEN_MANIFEST_ID
+            if manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else (
                 RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
                 if manifest_id
@@ -1581,6 +1622,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1597,6 +1639,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1615,6 +1658,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1629,7 +1673,12 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         expected_future_tree_proposal_delivery_contract = (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_id
-            in {V19_MANIFEST_ID, V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            in {
+                V19_MANIFEST_ID,
+                V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }
             else None
         )
         if responsive.get("future_tree_proposal_delivery_contract") != (
@@ -1641,7 +1690,8 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
             )
         expected_source_bound_proposal_witness_contract = (
             SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-            if manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if manifest_id
+            in {V20_MANIFEST_ID, V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         if responsive.get("source_bound_proposal_witness_contract") != (
@@ -1649,6 +1699,18 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         ):
             _error(
                 "responsive-degradation source-bound proposal witness "
+                "contract drifted"
+            )
+        expected_evidence_snapshot_selection_contract = (
+            EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+            if manifest_id == FROZEN_MANIFEST_ID
+            else None
+        )
+        if responsive.get("evidence_snapshot_selection_contract") != (
+            expected_evidence_snapshot_selection_contract
+        ):
+            _error(
+                "responsive-degradation evidence snapshot selection "
                 "contract drifted"
             )
         responsive_vectors = _array(
@@ -1878,6 +1940,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else (
@@ -2040,6 +2103,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2055,6 +2119,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         )
@@ -2082,7 +2147,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         )
     if compact_snapshot != ("evidence_snapshot_format" in artifacts):
         _error(
-            "only shape-placement-factorial-v3 through v21 may carry the compact "
+            "only shape-placement-factorial-v3 through v22 may carry the compact "
             "snapshot format field"
         )
 
@@ -2108,6 +2173,7 @@ def _validate_frozen_semantics(document: Mapping[str, Any]) -> None:
         V18_MANIFEST_ID: V18_SEMANTIC_SHA256,
         V19_MANIFEST_ID: V19_SEMANTIC_SHA256,
         V20_MANIFEST_ID: V20_SEMANTIC_SHA256,
+        V21_MANIFEST_ID: V21_SEMANTIC_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_SEMANTIC_SHA256,
     }[manifest_id]
     if semantic_sha256 != expected_semantic_sha256:
@@ -2374,6 +2440,11 @@ def parse_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
                             "source_bound_proposal_witness_contract"
                         )
                     ),
+                    evidence_snapshot_selection_contract=(
+                        byzantine["responsive_degradation"].get(
+                            "evidence_snapshot_selection_contract"
+                        )
+                    ),
                 )
                 if "responsive_degradation" in byzantine
                 else None
@@ -2447,6 +2518,7 @@ def load_frozen_manifest_bytes(payload: bytes) -> FrozenFactorialManifest:
         V18_MANIFEST_ID: V18_MANIFEST_SHA256,
         V19_MANIFEST_ID: V19_MANIFEST_SHA256,
         V20_MANIFEST_ID: V20_MANIFEST_SHA256,
+        V21_MANIFEST_ID: V21_MANIFEST_SHA256,
         FROZEN_MANIFEST_ID: FROZEN_MANIFEST_SHA256,
     }.get(manifest.manifest_id)
     if manifest.manifest_sha256 != expected_sha256:
@@ -2922,6 +2994,7 @@ def build_factorial_plan(manifest: FrozenFactorialManifest) -> FactorialPlan:
         V18_MANIFEST_ID: (V18_MANIFEST_SHA256, V18_PLAN_SHA256),
         V19_MANIFEST_ID: (V19_MANIFEST_SHA256, V19_PLAN_SHA256),
         V20_MANIFEST_ID: (V20_MANIFEST_SHA256, V20_PLAN_SHA256),
+        V21_MANIFEST_ID: (V21_MANIFEST_SHA256, V21_PLAN_SHA256),
         FROZEN_MANIFEST_ID: (FROZEN_MANIFEST_SHA256, FROZEN_PLAN_SHA256),
     }[manifest.manifest_id]
     if (
@@ -2941,6 +3014,7 @@ def canonical_plan_bytes(plan: FactorialPlan) -> bytes:
 
 __all__ = (
     "BREAKTHROUGH_STRUCTURAL_GATE_V4",
+    "EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1",
     "EXECUTION_CLEANUP_CONTRACT_V1",
     "EXPECTED_ARM_CODES",
     "EXPECTED_BLOCK_COUNT",
@@ -3048,6 +3122,10 @@ __all__ = (
     "V20_MANIFEST_SHA256",
     "V20_PLAN_SHA256",
     "V20_SEMANTIC_SHA256",
+    "V21_MANIFEST_ID",
+    "V21_MANIFEST_SHA256",
+    "V21_PLAN_SHA256",
+    "V21_SEMANTIC_SHA256",
     "ActorSelectionVector",
     "ActorRotationVector",
     "ByzantineActions",

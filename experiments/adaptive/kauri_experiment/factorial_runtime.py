@@ -15,6 +15,7 @@ import string
 from typing import Any
 
 from .factorial_manifest import (
+    EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
@@ -33,6 +34,7 @@ from .factorial_manifest import (
     V18_MANIFEST_ID,
     V19_MANIFEST_ID,
     V20_MANIFEST_ID,
+    V21_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -130,14 +132,23 @@ V20_SMOKE_RUNTIME_SHA256 = (
 V20_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "31f2a2a6d35c5f7c115b1dc6c321e92dc54f9edfd37ba9a9d9ac61c45d21f611"
 )
-FROZEN_RUNTIME_SHA256 = (
+V21_RUNTIME_SHA256 = (
     "c553c6bbbb6ff9014d5935eb1e0d939757eb9ea90a16038b7fefd34fada3ad8b"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V21_SMOKE_RUNTIME_SHA256 = (
     "c6d0a7e10b45c37072fd1dcc363f72d982efb726e57f1efe0f88dddf8f2f843c"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V21_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "5f0fa01ac8f5368cc09eff70d0a30f22156275e86683a627f54840caaa0eaa0c"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "ca423f6513cf54f774ce198af970af4bc0bccae2bb0143ab3e48a842ff680caa"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "9f8ecd3fbf44fe067e376bd24efe0adcb0938d8b383291e81106432ea1136583"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "b45fdba31d55c70107751cb0f3a00e26a2bf6b49352d50b342cd9768740af4db"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -384,6 +395,7 @@ class CausalAcceptanceContract(_Document):
     precontainment_guarded_selection_contract: str | None = None
     future_tree_proposal_delivery_contract: str | None = None
     source_bound_proposal_witness_contract: str | None = None
+    evidence_snapshot_selection_contract: str | None = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
@@ -395,6 +407,7 @@ class CausalAcceptanceContract(_Document):
             "precontainment_guarded_selection_contract",
             "future_tree_proposal_delivery_contract",
             "source_bound_proposal_witness_contract",
+            "evidence_snapshot_selection_contract",
         ):
             if document[field] is None:
                 document.pop(field)
@@ -901,6 +914,7 @@ def _causal_acceptance(
     guarded_selection_contract: str | None,
     future_tree_proposal_delivery_contract: str | None,
     source_bound_proposal_witness_contract: str | None,
+    evidence_snapshot_selection_contract: str | None,
 ) -> CausalAcceptanceContract:
     if coverage_gate not in {None, PRECONTAINMENT_FAULT_COVERAGE_GATE_V1}:
         raise FactorialManifestError(
@@ -956,6 +970,19 @@ def _causal_acceptance(
         raise FactorialManifestError(
             "source-bound proposal witnesses require future-tree delivery"
         )
+    if evidence_snapshot_selection_contract not in {
+        None,
+        EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
+    }:
+        raise FactorialManifestError(
+            "causal acceptance evidence snapshot selection contract drifted"
+        )
+    if evidence_snapshot_selection_contract is not None and (
+        source_bound_proposal_witness_contract is None
+    ):
+        raise FactorialManifestError(
+            "evidence snapshot selection requires source-bound proposal witnesses"
+        )
     return CausalAcceptanceContract(
         proof_source="independent_raw_artifact_validation",
         pre_epoch1_required_role="internal",
@@ -983,6 +1010,9 @@ def _causal_acceptance(
         ),
         source_bound_proposal_witness_contract=(
             source_bound_proposal_witness_contract
+        ),
+        evidence_snapshot_selection_contract=(
+            evidence_snapshot_selection_contract
         ),
     )
 
@@ -1406,6 +1436,13 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             identity["source_bound_proposal_witness_contract"] = (
                 responsive.source_bound_proposal_witness_contract
             )
+        if (
+            responsive is not None
+            and responsive.evidence_snapshot_selection_contract is not None
+        ):
+            identity["evidence_snapshot_selection_contract"] = (
+                responsive.evidence_snapshot_selection_contract
+            )
     if slot.cleanup_contract is not None:
         identity["cleanup_contract"] = slot.cleanup_contract
     return SlotRuntimeSpec(
@@ -1456,6 +1493,11 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             ),
             (
                 slot.byzantine.responsive_degradation.source_bound_proposal_witness_contract
+                if slot.byzantine.responsive_degradation is not None
+                else None
+            ),
+            (
+                slot.byzantine.responsive_degradation.evidence_snapshot_selection_contract
                 if slot.byzantine.responsive_degradation is not None
                 else None
             ),
@@ -1799,6 +1841,7 @@ def runtime_preflight(
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1947,7 +1990,7 @@ def runtime_preflight(
                     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
                 )
-            elif runtime.manifest_id == FROZEN_MANIFEST_ID:
+            elif runtime.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}:
                 expected_measurement_contract = (
                     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
                     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
@@ -1973,6 +2016,7 @@ def runtime_preflight(
                     V18_MANIFEST_ID,
                     V19_MANIFEST_ID,
                     V20_MANIFEST_ID,
+                    V21_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -1990,6 +2034,7 @@ def runtime_preflight(
                     V18_MANIFEST_ID,
                     V19_MANIFEST_ID,
                     V20_MANIFEST_ID,
+                    V21_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -2045,6 +2090,7 @@ def runtime_preflight(
                         V18_MANIFEST_ID,
                         V19_MANIFEST_ID,
                         V20_MANIFEST_ID,
+                        V21_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2250,6 +2296,7 @@ def runtime_preflight(
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2285,6 +2332,7 @@ def runtime_preflight(
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2294,15 +2342,25 @@ def runtime_preflight(
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if runtime.manifest_id
-            in {V19_MANIFEST_ID, V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            in {
+                V19_MANIFEST_ID,
+                V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }
             else None,
             SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-            if runtime.manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id
+            in {V20_MANIFEST_ID, V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            else None,
+            EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+            if runtime.manifest_id == FROZEN_MANIFEST_ID
             else None,
         ):
             raise FactorialManifestError(
@@ -2371,6 +2429,9 @@ __all__ = (
     "V20_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V20_RUNTIME_SHA256",
     "V20_SMOKE_RUNTIME_SHA256",
+    "V21_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V21_RUNTIME_SHA256",
+    "V21_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

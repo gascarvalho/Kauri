@@ -44,6 +44,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v22.json"
+)
+V21_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v21.json"
 )
 V20_MANIFEST_PATH = (
@@ -292,7 +295,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v21_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v22_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -318,7 +321,8 @@ def test_validator_retains_exact_v1_through_v21_artifact_identities() -> None:
             (18, V18_MANIFEST_PATH),
             (19, V19_MANIFEST_PATH),
             (20, V20_MANIFEST_PATH),
-            (21, MANIFEST_PATH),
+            (21, V21_MANIFEST_PATH),
+            (22, MANIFEST_PATH),
         )
     }
 
@@ -442,15 +446,26 @@ def test_validator_retains_exact_v1_through_v21_artifact_identities() -> None:
         identities[20].coverage_smoke_runtime_sha256
         == validation.V20_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[21].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[21].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[21].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[21].manifest_sha256 == validation.V21_MANIFEST_SHA256
+    assert identities[21].plan_sha256 == validation.V21_PLAN_SHA256
+    assert identities[21].runtime_sha256 == validation.V21_RUNTIME_SHA256
     assert (
         identities[21].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V21_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[21].coverage_smoke_runtime_sha256
+        == validation.V21_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[22].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[22].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[22].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[22].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[22].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
 
@@ -475,6 +490,7 @@ def test_validator_retains_exact_v1_through_v21_artifact_identities() -> None:
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
         V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -494,7 +510,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v21_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v22_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -528,6 +544,7 @@ def test_validator_requires_v9_through_v21_causal_contracts_but_accepts_v8() -> 
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
         V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -588,6 +605,7 @@ def test_validator_requires_v9_through_v21_causal_contracts_but_accepts_v8() -> 
                 V18_MANIFEST_PATH,
                 V19_MANIFEST_PATH,
                 V20_MANIFEST_PATH,
+                V21_MANIFEST_PATH,
                 MANIFEST_PATH,
             ):
                 assert document["tiered_cohorts"][
@@ -607,7 +625,7 @@ def test_validator_requires_v9_through_v21_causal_contracts_but_accepts_v8() -> 
                     )
                     else (
                         validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
-                        if manifest_path == MANIFEST_PATH
+                        if manifest_path in (V21_MANIFEST_PATH, MANIFEST_PATH)
                         else validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
                     )
                 )
@@ -668,7 +686,7 @@ def test_v17_runtime_mirrors_precontainment_shape_contract_only_in_causal_accept
     )
 
 
-def test_v18_through_v21_guarded_selection_contract_dispatch_is_exact() -> None:
+def test_v18_through_v22_guarded_selection_contract_dispatch_is_exact() -> None:
     contract = validation.PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
 
     def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
@@ -692,6 +710,9 @@ def test_v18_through_v21_guarded_selection_contract_dispatch_is_exact() -> None:
     assert validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V20_MANIFEST_ID, contract)
     )
+    assert validation._uses_precontainment_guarded_selection_contract(
+        manifest(validation.V21_MANIFEST_ID, contract)
+    )
     assert not validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V17_MANIFEST_ID, contract)
     )
@@ -703,7 +724,7 @@ def test_v18_through_v21_guarded_selection_contract_dispatch_is_exact() -> None:
     )
 
 
-def test_v19_future_tree_proposal_delivery_dispatch_is_version_exact() -> None:
+def test_v19_through_v22_future_tree_delivery_dispatch_is_exact() -> None:
     def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
         responsive = SimpleNamespace()
         if value is not None:
@@ -722,6 +743,12 @@ def test_v19_future_tree_proposal_delivery_dispatch_is_version_exact() -> None:
     assert validation._uses_future_tree_proposal_delivery_contract(
         manifest(
             validation.V20_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
+            validation.V21_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT,
         )
     )
@@ -748,7 +775,7 @@ def test_v19_future_tree_proposal_delivery_dispatch_is_version_exact() -> None:
     )
 
 
-def test_v20_through_v21_source_bound_proposal_witness_dispatch_is_exact() -> None:
+def test_v20_through_v22_source_bound_proposal_witness_dispatch_is_exact() -> None:
     contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
     assert contract == (
         "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
@@ -769,6 +796,9 @@ def test_v20_through_v21_source_bound_proposal_witness_dispatch_is_exact() -> No
         manifest(validation.V20_MANIFEST_ID, contract)
     )
     assert validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.V21_MANIFEST_ID, contract)
+    )
+    assert validation._uses_source_bound_proposal_witness_contract(
         manifest(validation.FROZEN_MANIFEST_ID, contract)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
@@ -782,7 +812,7 @@ def test_v20_through_v21_source_bound_proposal_witness_dispatch_is_exact() -> No
     )
 
 
-def test_v21_responsive_timeout_nonwitness_dispatch_is_field_exact() -> None:
+def test_v21_through_v22_timeout_nonwitness_dispatch_is_field_exact() -> None:
     contract = validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
     assert contract == (
         "selection_visible_exact_outstanding_timeout_witnesses_with_internal_"
@@ -797,6 +827,9 @@ def test_v21_responsive_timeout_nonwitness_dispatch_is_field_exact() -> None:
             byzantine=SimpleNamespace(responsive_degradation=responsive),
         )
 
+    assert validation._uses_selection_visible_responsive_timeout_nonwitnesses(
+        manifest(validation.V21_MANIFEST_ID, contract)
+    )
     assert validation._uses_selection_visible_responsive_timeout_nonwitnesses(
         manifest(validation.FROZEN_MANIFEST_ID, contract)
     )
@@ -813,6 +846,36 @@ def test_v21_responsive_timeout_nonwitness_dispatch_is_field_exact() -> None:
         manifest(validation.FROZEN_MANIFEST_ID, None)
     )
     assert not validation._uses_selection_visible_responsive_timeout_nonwitnesses(
+        manifest(validation.FROZEN_MANIFEST_ID, contract + "-forged")
+    )
+
+
+def test_v22_snapshot_selection_contract_dispatch_is_field_exact() -> None:
+    contract = validation.EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+    assert contract == (
+        "full_prefix_without_inherited_consensus_wait_exempt_and_baseline_"
+        "exclusive_suffix_with_exact_inherited_consensus_wait_exempt_v1"
+    )
+
+    def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
+        responsive = SimpleNamespace()
+        if value is not None:
+            responsive.evidence_snapshot_selection_contract = value
+        return SimpleNamespace(
+            manifest_id=manifest_id,
+            byzantine=SimpleNamespace(responsive_degradation=responsive),
+        )
+
+    assert validation._uses_evidence_snapshot_selection_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, contract)
+    )
+    assert not validation._uses_evidence_snapshot_selection_contract(
+        manifest(validation.V21_MANIFEST_ID, contract)
+    )
+    assert not validation._uses_evidence_snapshot_selection_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, None)
+    )
+    assert not validation._uses_evidence_snapshot_selection_contract(
         manifest(validation.FROZEN_MANIFEST_ID, contract + "-forged")
     )
 
@@ -936,8 +999,11 @@ def test_v19_binds_future_tree_contract_to_runtime_identity_and_acceptance() -> 
         )
 
 
-@pytest.mark.parametrize("manifest_path", (V20_MANIFEST_PATH, MANIFEST_PATH))
-def test_v20_through_v21_bind_source_bound_witness_to_runtime_identity_and_acceptance(
+@pytest.mark.parametrize(
+    "manifest_path",
+    (V20_MANIFEST_PATH, V21_MANIFEST_PATH, MANIFEST_PATH),
+)
+def test_v20_through_v22_bind_source_bound_witness_to_runtime_identity_and_acceptance(
     manifest_path: Path,
 ) -> None:
     manifest = load_frozen_manifest(manifest_path)
@@ -1006,6 +1072,101 @@ def test_v20_through_v21_bind_source_bound_witness_to_runtime_identity_and_accep
             document,
             expected_by_id[slot.slot_id],
             missing_manifest_contract,
+        )
+
+
+def test_v22_binds_snapshot_selection_to_runtime_identity_and_acceptance() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    slot = runtime.slots[0]
+    document = json.loads(json.dumps(slot.as_document()))
+    contract = validation.EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+
+    assert document["causal_acceptance"][
+        "evidence_snapshot_selection_contract"
+    ] == contract
+    assert "evidence_snapshot_selection_contract" not in document[
+        "tiered_cohorts"
+    ]
+    validation._validate_runtime_slot(
+        document,
+        expected_by_id[slot.slot_id],
+        manifest,
+    )
+
+    v21 = load_frozen_manifest(V21_MANIFEST_PATH)
+    v21_runtime = build_factorial_runtime(build_factorial_plan(v21))
+    v21_document = json.loads(json.dumps(v21_runtime.slots[0].as_document()))
+    assert "evidence_snapshot_selection_contract" not in v21_document[
+        "causal_acceptance"
+    ]
+    assert slot.artifact_id != v21_runtime.slots[0].artifact_id
+
+    missing = copy.deepcopy(document)
+    del missing["causal_acceptance"][
+        "evidence_snapshot_selection_contract"
+    ]
+    with pytest.raises(
+        FactorialValidationError,
+        match="causal acceptance contract",
+    ):
+        validation._validate_runtime_slot(
+            missing,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+
+    wrong_identity = copy.deepcopy(document)
+    wrong_identity["artifact_id"] = v21_runtime.slots[0].artifact_id
+    with pytest.raises(FactorialValidationError, match="runtime slot identity"):
+        validation._validate_runtime_slot(
+            wrong_identity,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+
+    responsive = manifest.byzantine.responsive_degradation
+    assert responsive is not None
+    missing_manifest_contract = replace(
+        manifest,
+        byzantine=replace(
+            manifest.byzantine,
+            responsive_degradation=replace(
+                responsive,
+                evidence_snapshot_selection_contract=None,
+            ),
+        ),
+    )
+    with pytest.raises(
+        FactorialValidationError,
+        match="evidence snapshot selection contract",
+    ):
+        validation._validate_runtime_slot(
+            document,
+            expected_by_id[slot.slot_id],
+            missing_manifest_contract,
+        )
+
+    forged_v21 = copy.deepcopy(v21_document)
+    forged_v21["causal_acceptance"][
+        "evidence_snapshot_selection_contract"
+    ] = contract
+    v21_expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(v21)
+    }
+    with pytest.raises(
+        FactorialValidationError,
+        match="causal acceptance contract",
+    ):
+        validation._validate_runtime_slot(
+            forged_v21,
+            v21_expected_by_id[v21_runtime.slots[0].slot_id],
+            v21,
         )
 
 
@@ -1142,7 +1303,7 @@ def test_v17_rejects_forged_v18_guarded_selection_runtime_field() -> None:
         )
 
 
-def test_v10_through_v21_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v22_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -1180,11 +1341,14 @@ def test_v10_through_v21_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V20_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V21_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_through_v21_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v22_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
@@ -1219,11 +1383,14 @@ def test_v11_through_v21_route_through_explicit_phase_edge_eligibility() -> None
         load_frozen_manifest(V20_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V21_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v16_through_v21_use_selection_visible_hard_timeout_witnesses() -> None:
+def test_v16_through_v22_use_selection_visible_hard_timeout_witnesses() -> None:
     assert not validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(V15_MANIFEST_PATH)
     )
@@ -1243,11 +1410,14 @@ def test_v16_through_v21_use_selection_visible_hard_timeout_witnesses() -> None:
         load_frozen_manifest(V20_MANIFEST_PATH)
     )
     assert validation._uses_selection_visible_hard_timeout_witnesses(
+        load_frozen_manifest(V21_MANIFEST_PATH)
+    )
+    assert validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v14_through_v21_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
+def test_v14_through_v22_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
     v13 = load_frozen_manifest(V13_MANIFEST_PATH)
 
     assert not validation._uses_source_bound_contribution_opportunities(v13)
@@ -1260,6 +1430,7 @@ def test_v14_through_v21_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
         V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1267,7 +1438,7 @@ def test_v14_through_v21_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         assert validation._uses_strict_sigint_cleanup(manifest)
 
 
-def test_validator_binds_v14_through_v21_cleanup_without_changing_v13() -> None:
+def test_validator_binds_v14_through_v22_cleanup_without_changing_v13() -> None:
     for manifest_path in (
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
@@ -1277,6 +1448,7 @@ def test_validator_binds_v14_through_v21_cleanup_without_changing_v13() -> None:
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
         V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1325,6 +1497,7 @@ def test_validator_binds_v14_through_v21_cleanup_without_changing_v13() -> None:
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
         V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
         MANIFEST_PATH,
     ),
 )
@@ -1354,7 +1527,7 @@ def test_validator_requires_each_explicit_causal_linkage_field(
     "field",
     ("marker_completeness_witness", "causal_timeout_eligibility"),
 )
-def test_validator_requires_each_explicit_v11_through_v21_phase_edge_field(
+def test_validator_requires_each_explicit_v11_through_v22_phase_edge_field(
     field: str,
 ) -> None:
     for manifest_path in (
@@ -1368,6 +1541,7 @@ def test_validator_requires_each_explicit_v11_through_v21_phase_edge_field(
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
         V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1504,6 +1678,141 @@ def test_compact_snapshot_rejects_count_or_commitment_tampering(
             full_prefix_snapshot_id="44" * 32,
             evidence_snapshot_id="55" * 32,
         )
+
+
+def _snapshot_selection_trees(
+    *wait_exempt_sets: tuple[int, ...],
+) -> tuple[Tree, ...]:
+    memberships = (
+        (0, 1, 2, 3, 4, 5, 6),
+        (1, 2, 3, 0, 4, 5, 6),
+    )
+    return tuple(
+        Tree(
+            tree_id=index,
+            fanout=2,
+            pipeline_stretch=2,
+            members=memberships[index],
+            wait_exempt=wait_exempt,
+        )
+        for index, wait_exempt in enumerate(wait_exempt_sets)
+    )
+
+
+def _snapshot_selection_manifest(
+    manifest_id: str,
+    contract: str | None,
+) -> SimpleNamespace:
+    responsive = SimpleNamespace()
+    if contract is not None:
+        responsive.evidence_snapshot_selection_contract = contract
+    return SimpleNamespace(
+        manifest_id=manifest_id,
+        byzantine=SimpleNamespace(responsive_degradation=responsive),
+    )
+
+
+def test_v22_snapshot_selection_uses_full_prefix_for_guarded_fallback() -> None:
+    assert validation._snapshot_uses_suffix(
+        _snapshot_selection_manifest(
+            validation.FROZEN_MANIFEST_ID,
+            validation.EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
+        ),
+        _snapshot_selection_trees((), ()),
+        membership=tuple(range(7)),
+        required_nonresponsive=2,
+        policy_intent="performance_optimization",
+    ) is False
+
+
+def test_v22_snapshot_selection_uses_suffix_for_exact_inherited_constraints(
+) -> None:
+    assert validation._snapshot_uses_suffix(
+        _snapshot_selection_manifest(
+            validation.FROZEN_MANIFEST_ID,
+            validation.EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
+        ),
+        _snapshot_selection_trees((4, 5), (4, 5)),
+        membership=tuple(range(7)),
+        required_nonresponsive=2,
+        policy_intent="fault_containment",
+    ) is True
+
+
+def test_v21_snapshot_selection_preserves_policy_intent_dispatch() -> None:
+    manifest = _snapshot_selection_manifest(
+        validation.V21_MANIFEST_ID,
+        validation.EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
+    )
+    assert validation._snapshot_uses_suffix(
+        manifest,
+        _snapshot_selection_trees((4, 5), (4, 5)),
+        membership=tuple(range(7)),
+        required_nonresponsive=2,
+        policy_intent="fault_containment",
+    ) is False
+    assert validation._snapshot_uses_suffix(
+        manifest,
+        _snapshot_selection_trees((), ()),
+        membership=tuple(range(7)),
+        required_nonresponsive=2,
+        policy_intent="performance_optimization",
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "trees",
+    (
+        _snapshot_selection_trees((), (4, 5)),
+        _snapshot_selection_trees((4,), (4,)),
+        _snapshot_selection_trees((1, 2), (1, 2)),
+        _snapshot_selection_trees((4, 5), (4, 6)),
+        _snapshot_selection_trees((5, 4), (5, 4)),
+        _snapshot_selection_trees((4, 4), (4, 4)),
+        _snapshot_selection_trees((4, 7), (4, 7)),
+    ),
+)
+def test_v22_snapshot_selection_rejects_malformed_inherited_constraints(
+    trees: tuple[Tree, ...],
+) -> None:
+    with pytest.raises(
+        FactorialValidationError,
+        match="inherited consensus wait-exempt",
+    ):
+        validation._snapshot_uses_inherited_constraint_suffix(
+            trees,
+            membership=tuple(range(7)),
+            required_nonresponsive=2,
+        )
+
+
+def test_v22_snapshot_suffix_preserves_cross_baseline_late_normalization() -> None:
+    timeout = replace(
+        _sparse_evidence_record(1, reporter_sequence=1),
+        observation_id="aa" * 32,
+        outcome="timeout",
+        response_duration_us=0,
+        signer_set=(),
+    )
+    crossing_late = replace(
+        timeout,
+        ingestion_sequence=2,
+        acceptance_monotonic_ns=102,
+        outcome="late",
+        response_duration_us=25,
+        reporter_monotonic_ns=202,
+        reporter_sequence=2,
+    )
+    fresh = _sparse_evidence_record(3, reporter_sequence=3)
+
+    selected = validation._snapshot_records(
+        (timeout, crossing_late, fresh),
+        baseline_cutoff=1,
+        current_cutoff=3,
+        suffix_only=True,
+    )
+
+    assert selected == (fresh,)
 
 
 def _sparse_evidence_record(

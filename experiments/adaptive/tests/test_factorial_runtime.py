@@ -15,6 +15,7 @@ from experiments.adaptive.kauri_experiment import factorial_execution
 from experiments.adaptive.kauri_experiment import factorial_runtime
 from experiments.adaptive.kauri_experiment import factorial_validation
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
+    EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     FactorialManifestError,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
@@ -64,6 +65,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v22.json"
+)
+V21_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v21.json"
 )
 V20_MANIFEST_PATH = (
@@ -375,6 +379,9 @@ def test_causal_sequence_requires_independent_raw_actor_role_proof(
             ),
             "source_bound_proposal_witness_contract": (
                 SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+            ),
+            "evidence_snapshot_selection_contract": (
+                EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
             ),
             "proof_source": "independent_raw_artifact_validation",
         }
@@ -1111,9 +1118,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
         V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v21_and_refuses_prior_production(
+def test_cli_defaults_to_v22_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1126,7 +1134,7 @@ def test_cli_defaults_to_v21_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v20 are validation-only" in refusal["reason"]
+    assert "v1 through v21 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(

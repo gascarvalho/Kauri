@@ -50,6 +50,7 @@ import signal
 from typing import Any
 
 from .factorial_manifest import (
+    EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     EXPECTED_ARM_CODES,
     EXPECTED_BLOCK_COUNT,
@@ -132,6 +133,9 @@ from .factorial_manifest import (
     V20_MANIFEST_ID,
     V20_MANIFEST_SHA256,
     V20_PLAN_SHA256,
+    V21_MANIFEST_ID,
+    V21_MANIFEST_SHA256,
+    V21_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -185,8 +189,11 @@ V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v20-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v21-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v22-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -320,14 +327,23 @@ V20_SMOKE_RUNTIME_SHA256 = (
 V20_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "31f2a2a6d35c5f7c115b1dc6c321e92dc54f9edfd37ba9a9d9ac61c45d21f611"
 )
-FROZEN_RUNTIME_SHA256 = (
+V21_RUNTIME_SHA256 = (
     "c553c6bbbb6ff9014d5935eb1e0d939757eb9ea90a16038b7fefd34fada3ad8b"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V21_SMOKE_RUNTIME_SHA256 = (
     "c6d0a7e10b45c37072fd1dcc363f72d982efb726e57f1efe0f88dddf8f2f843c"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V21_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "5f0fa01ac8f5368cc09eff70d0a30f22156275e86683a627f54840caaa0eaa0c"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "ca423f6513cf54f774ce198af970af4bc0bccae2bb0143ab3e48a842ff680caa"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "9f8ecd3fbf44fe067e376bd24efe0adcb0938d8b383291e81106432ea1136583"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "b45fdba31d55c70107751cb0f3a00e26a2bf6b49352d50b342cd9768740af4db"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -426,6 +442,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -491,7 +508,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
         )
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
     )
@@ -502,7 +519,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
@@ -523,6 +540,7 @@ def _uses_source_bound_contribution_opportunities(
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -542,6 +560,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -561,6 +580,7 @@ def _uses_precontainment_fault_coverage(
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -580,6 +600,7 @@ def _uses_precontainment_shape_preservation(
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -602,6 +623,7 @@ def _uses_precontainment_guarded_selection_contract(
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -620,7 +642,12 @@ def _uses_future_tree_proposal_delivery_contract(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V19_MANIFEST_ID, V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and getattr(
             responsive,
@@ -636,7 +663,8 @@ def _uses_source_bound_proposal_witness_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V20_MANIFEST_ID, V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -644,6 +672,22 @@ def _uses_source_bound_proposal_witness_contract(
             None,
         )
         == SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+    )
+
+
+def _uses_evidence_snapshot_selection_contract(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and getattr(
+            responsive,
+            "evidence_snapshot_selection_contract",
+            None,
+        )
+        == EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
     )
 
 
@@ -889,6 +933,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V20_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V20_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V21_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V21_MANIFEST_ID,
+            manifest_sha256=V21_MANIFEST_SHA256,
+            plan_sha256=V21_PLAN_SHA256,
+            runtime_sha256=V21_RUNTIME_SHA256,
+            smoke_runtime_sha256=V21_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V21_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2550,6 +2604,11 @@ def _is_excluded_coverage_smoke_slot(
             V20_COVERAGE_SMOKE_RUNTIME_SHA256,
             V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V21_MANIFEST_ID: (
+            V21_RUNTIME_SHA256,
+            V21_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2596,6 +2655,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V20_MANIFEST_ID:
         return V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V21_MANIFEST_ID:
+        return V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -2857,24 +2918,37 @@ def _validate_runtime_slot(
     source_bound_proposal_witnesses = (
         _uses_source_bound_proposal_witness_contract(manifest)
     )
+    evidence_snapshot_selection = (
+        _uses_evidence_snapshot_selection_contract(manifest)
+    )
     if (
         manifest.manifest_id
-        in {V19_MANIFEST_ID, V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and not future_tree_proposal_delivery
     ):
         _fail("future-tree proposal delivery contract drifted")
     if (
-        manifest.manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V20_MANIFEST_ID, V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and not source_bound_proposal_witnesses
     ):
         _fail("source-bound proposal witness contract drifted")
     if (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
             manifest
         )
     ):
-        _fail("v21 responsive timeout nonwitness contract drifted")
+        _fail("responsive timeout nonwitness contract drifted")
+    if manifest.manifest_id == FROZEN_MANIFEST_ID and not (
+        evidence_snapshot_selection
+    ):
+        _fail("evidence snapshot selection contract drifted")
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -2956,6 +3030,10 @@ def _validate_runtime_slot(
             artifact_identity[
                 "source_bound_proposal_witness_contract"
             ] = SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+        if evidence_snapshot_selection:
+            artifact_identity[
+                "evidence_snapshot_selection_contract"
+            ] = EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
     else:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -3099,6 +3177,10 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "source_bound_proposal_witness_contract"
         ] = SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+    if evidence_snapshot_selection:
+        expected_causal_acceptance[
+            "evidence_snapshot_selection_contract"
+        ] = EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
     if dict(
         _mapping(runtime.get("causal_acceptance"), "runtime causal acceptance")
     ) != expected_causal_acceptance:
@@ -3172,6 +3254,7 @@ def _validate_runtime_slot(
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -3947,6 +4030,111 @@ def _snapshot_records(
             continue
         result.append(record)
     return tuple(result)
+
+
+def _snapshot_uses_inherited_constraint_suffix(
+    predecessor_trees: Sequence[Tree],
+    *,
+    membership: Sequence[int],
+    required_nonresponsive: int,
+) -> bool:
+    """Mirror the native inherited-consensus constraint classification.
+
+    A uniformly empty predecessor wait-exempt set selects the guarded full
+    prefix.  A non-empty set selects the normalized post-baseline suffix only
+    after every decoded predecessor tree proves the same exact, bounded set of
+    physical leaves.  Every mixed or malformed topology fails closed.
+    """
+
+    if not predecessor_trees or required_nonresponsive <= 0:
+        _fail(
+            "evidence snapshot inherited consensus wait-exempt topology is "
+            "empty or has an invalid required count"
+        )
+    members = tuple(membership)
+    member_set = frozenset(members)
+    if (
+        len(member_set) != len(members)
+        or any(
+            type(replica_id) is not int or replica_id < 0
+            for replica_id in members
+        )
+    ):
+        _fail(
+            "evidence snapshot inherited consensus wait-exempt membership is "
+            "invalid"
+        )
+
+    for tree in predecessor_trees:
+        if (
+            tree.fanout <= 0
+            or not tree.members
+            or len(set(tree.members)) != len(tree.members)
+            or frozenset(tree.members) != member_set
+        ):
+            _fail(
+                "evidence snapshot inherited consensus wait-exempt predecessor "
+                "tree membership is invalid"
+            )
+
+    canonical = tuple(predecessor_trees[0].wait_exempt)
+    if not canonical:
+        if any(tree.wait_exempt for tree in predecessor_trees):
+            _fail(
+                "evidence snapshot inherited consensus wait-exempt topology "
+                "mixes empty and non-empty constraints"
+            )
+        return False
+
+    if (
+        len(canonical) != required_nonresponsive
+        or canonical != tuple(sorted(canonical))
+        or len(set(canonical)) != len(canonical)
+        or any(replica_id not in member_set for replica_id in canonical)
+    ):
+        _fail(
+            "evidence snapshot inherited consensus wait-exempt constraint set "
+            "is not the exact required sorted member set"
+        )
+
+    for tree in predecessor_trees:
+        if tuple(tree.wait_exempt) != canonical:
+            _fail(
+                "evidence snapshot inherited consensus wait-exempt constraints "
+                "differ across predecessor trees"
+            )
+        leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+        for replica_id in canonical:
+            try:
+                position = tree.members.index(replica_id)
+            except ValueError:
+                _fail(
+                    "evidence snapshot inherited consensus wait-exempt replica "
+                    "is absent from a predecessor tree"
+                )
+            if position < leaf_start:
+                _fail(
+                    "evidence snapshot inherited consensus wait-exempt replica "
+                    "is not a physical leaf in every predecessor tree"
+                )
+    return True
+
+
+def _snapshot_uses_suffix(
+    manifest: FrozenFactorialManifest,
+    predecessor_trees: Sequence[Tree],
+    *,
+    membership: Sequence[int],
+    required_nonresponsive: int,
+    policy_intent: str,
+) -> bool:
+    if _uses_evidence_snapshot_selection_contract(manifest):
+        return _snapshot_uses_inherited_constraint_suffix(
+            predecessor_trees,
+            membership=membership,
+            required_nonresponsive=required_nonresponsive,
+        )
+    return policy_intent == "performance_optimization"
 
 
 def _score_snapshot(
@@ -9011,7 +9199,13 @@ def _validate_adaptation_cycles(
         ):
             _fail("exclusive snapshot file differs from its native audit payload")
 
-        suffix_only = intent == "performance_optimization"
+        suffix_only = _snapshot_uses_suffix(
+            manifest,
+            predecessor_trees,
+            membership=tuple(range(expected.replica_count)),
+            required_nonresponsive=len(expected.actor_ids),
+            policy_intent=intent,
+        )
         selected_records = _snapshot_records(
             epoch_records,
             baseline_cutoff=baseline_cutoff,
