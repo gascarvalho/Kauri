@@ -70,6 +70,7 @@ from .factorial_manifest import (
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+    SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
@@ -124,6 +125,9 @@ from .factorial_manifest import (
     V18_MANIFEST_ID,
     V18_MANIFEST_SHA256,
     V18_PLAN_SHA256,
+    V19_MANIFEST_ID,
+    V19_MANIFEST_SHA256,
+    V19_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -171,8 +175,11 @@ V17_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v18-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v19-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v20-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -288,14 +295,23 @@ V18_SMOKE_RUNTIME_SHA256 = (
 V18_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "0912ff8e9f5a0f8581e0c8422e8d55c5ff6942a6573864d635bec39d69d1835a"
 )
-FROZEN_RUNTIME_SHA256 = (
+V19_RUNTIME_SHA256 = (
     "1b81ec26e48439d05ac54b68d2a1dafb3d38c4140f835ea6e1f0f3b07545046d"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V19_SMOKE_RUNTIME_SHA256 = (
     "f0c999258453cc23bcf2956cb7b8b50ee3b3b05e6b7158ad5dd5d621046c03a0"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V19_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "538740a2d5421d80994bc7007421fe57a10e965fb1e5f71f1bc57b78c037b3d6"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "df50a0202818bcafc699dd266dab6f97147659b0a09c4362207b90bd74d773a7"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "cdcb497c77d92ef66618980b3c710d3702d9e43d92802a8c95e745ace611b96e"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "31f2a2a6d35c5f7c115b1dc6c321e92dc54f9edfd37ba9a9d9ac61c45d21f611"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -392,6 +408,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V16_MANIFEST_ID,
         V17_MANIFEST_ID,
         V18_MANIFEST_ID,
+        V19_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -448,6 +465,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V16_MANIFEST_ID,
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
+            V19_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -468,6 +486,7 @@ def _uses_source_bound_contribution_opportunities(
             V16_MANIFEST_ID,
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
+            V19_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -485,6 +504,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V16_MANIFEST_ID,
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
+            V19_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -502,6 +522,7 @@ def _uses_precontainment_fault_coverage(
             V16_MANIFEST_ID,
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
+            V19_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -516,7 +537,12 @@ def _uses_precontainment_shape_preservation(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V17_MANIFEST_ID, V18_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V17_MANIFEST_ID,
+            V18_MANIFEST_ID,
+            V19_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and getattr(
             responsive,
@@ -532,7 +558,8 @@ def _uses_precontainment_guarded_selection_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V18_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V18_MANIFEST_ID, V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -548,7 +575,7 @@ def _uses_future_tree_proposal_delivery_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -556,6 +583,22 @@ def _uses_future_tree_proposal_delivery_contract(
             None,
         )
         == FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+    )
+
+
+def _uses_source_bound_proposal_witness_contract(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and getattr(
+            responsive,
+            "source_bound_proposal_witness_contract",
+            None,
+        )
+        == SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
     )
 
 
@@ -781,6 +824,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V18_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V18_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V19_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V19_MANIFEST_ID,
+            manifest_sha256=V19_MANIFEST_SHA256,
+            plan_sha256=V19_PLAN_SHA256,
+            runtime_sha256=V19_RUNTIME_SHA256,
+            smoke_runtime_sha256=V19_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V19_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2432,6 +2485,11 @@ def _is_excluded_coverage_smoke_slot(
             V18_COVERAGE_SMOKE_RUNTIME_SHA256,
             V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V19_MANIFEST_ID: (
+            V19_RUNTIME_SHA256,
+            V19_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2474,6 +2532,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V17_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V18_MANIFEST_ID:
         return V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V19_MANIFEST_ID:
+        return V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -2732,11 +2792,19 @@ def _validate_runtime_slot(
     future_tree_proposal_delivery = (
         _uses_future_tree_proposal_delivery_contract(manifest)
     )
+    source_bound_proposal_witnesses = (
+        _uses_source_bound_proposal_witness_contract(manifest)
+    )
     if (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and not future_tree_proposal_delivery
     ):
         _fail("v19 future-tree proposal delivery contract drifted")
+    if (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and not source_bound_proposal_witnesses
+    ):
+        _fail("v20 source-bound proposal witness contract drifted")
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -2814,6 +2882,10 @@ def _validate_runtime_slot(
             artifact_identity[
                 "future_tree_proposal_delivery_contract"
             ] = FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+        if source_bound_proposal_witnesses:
+            artifact_identity[
+                "source_bound_proposal_witness_contract"
+            ] = SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
     else:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -2953,6 +3025,10 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "future_tree_proposal_delivery_contract"
         ] = FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+    if source_bound_proposal_witnesses:
+        expected_causal_acceptance[
+            "source_bound_proposal_witness_contract"
+        ] = SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
     if dict(
         _mapping(runtime.get("causal_acceptance"), "runtime causal acceptance")
     ) != expected_causal_acceptance:
@@ -3024,6 +3100,7 @@ def _validate_runtime_slot(
         V16_MANIFEST_ID,
         V17_MANIFEST_ID,
         V18_MANIFEST_ID,
+        V19_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -4983,6 +5060,137 @@ def _validate_fault_contribution_opportunity_bijection(
                 )
 
 
+def _source_bound_proposal_configuration_witnesses(
+    *,
+    opportunities: Sequence[FaultContributionOpportunity],
+    replica_events: Mapping[int, Sequence[_NativeEvent]],
+    phase_configurations: Sequence[
+        tuple[str, int, str, Mapping[int, Tree]]
+    ],
+) -> frozenset[tuple[int, int, str, str]]:
+    """Return v20 witnesses only when every opportunity precedes shutdown."""
+
+    tree_ids_by_configuration: dict[tuple[int, str], tuple[int, ...]] = {}
+    for _phase, epoch_number, epoch_digest, trees in phase_configurations:
+        tree_ids = tuple(sorted(trees))
+        if not tree_ids:
+            _fail("source-bound proposal witness configuration has no trees")
+        key = (epoch_number, epoch_digest)
+        previous = tree_ids_by_configuration.setdefault(key, tree_ids)
+        if previous != tree_ids:
+            _fail("source-bound proposal witness configuration is ambiguous")
+
+    stopping_by_replica: dict[int, _NativeEvent] = {}
+    for replica_id, events in replica_events.items():
+        for event in events:
+            if event.event_type != "process.stopping":
+                continue
+            if (
+                event.source_kind != "replica"
+                or event.source_id != f"replica-{replica_id}"
+            ):
+                _fail(
+                    "source-bound proposal witness process.stopping event "
+                    "differs from its exact replica stream"
+                )
+            if replica_id in stopping_by_replica:
+                _fail(
+                    "source-bound proposal witness replica stream has duplicate "
+                    "process.stopping events"
+                )
+            stopping_by_replica[replica_id] = event
+
+    witnesses: set[tuple[int, int, str, str]] = set()
+    generation_by_proposal: dict[tuple[int, int, str, str], int] = {}
+    for opportunity in opportunities:
+        if opportunity.source_replica not in replica_events:
+            _fail(
+                "source-bound proposal witness opportunity lacks its exact "
+                "replica stream"
+            )
+        source_events = tuple(
+            event
+            for event in replica_events[opportunity.source_replica]
+            if (
+                event.event_type == "fault.contribution_opportunity"
+                and event.relative_path == opportunity.relative_path
+                and event.line_number == opportunity.line_number
+                and event.source_sequence == opportunity.source_sequence
+                and event.monotonic_ns == opportunity.event_monotonic_ns
+                and event.line_sha256 == opportunity.line_sha256
+            )
+        )
+        if len(source_events) != 1:
+            _fail(
+                "source-bound proposal witness opportunity lacks one exact "
+                "structured source event"
+            )
+        source_event = source_events[0]
+        if (
+            source_event.source_kind != "replica"
+            or source_event.source_id
+            != f"replica-{opportunity.source_replica}"
+        ):
+            _fail(
+                "source-bound proposal witness opportunity differs from its "
+                "exact replica stream"
+            )
+        stopping = stopping_by_replica.get(opportunity.source_replica)
+        if stopping is None:
+            _fail(
+                "source-bound proposal witness opportunity lacks same-source "
+                "process.stopping evidence"
+            )
+        if (
+            stopping.relative_path != source_event.relative_path
+            or stopping.source_instance != source_event.source_instance
+        ):
+            _fail(
+                "source-bound proposal witness opportunity and process.stopping "
+                "do not share one exact replica stream"
+            )
+        packed_generation = opportunity.view_generation - 1
+        generation_epoch = packed_generation >> 32
+        rotation_ordinal = packed_generation & 0xFFFF_FFFF
+        if generation_epoch != opportunity.epoch_number:
+            _fail(
+                "source-bound proposal witness view generation epoch differs "
+                "from its ProposalKey"
+            )
+        tree_ids = tree_ids_by_configuration.get(
+            (opportunity.epoch_number, opportunity.epoch_digest)
+        )
+        if tree_ids is None:
+            _fail(
+                "source-bound proposal witness lacks its exact configuration"
+            )
+        if tree_ids[rotation_ordinal % len(tree_ids)] != opportunity.tree_id:
+            _fail(
+                "source-bound proposal witness view generation rotation differs "
+                "from its canonical tree"
+            )
+        previous_generation = generation_by_proposal.setdefault(
+            opportunity.proposal_key,
+            opportunity.view_generation,
+        )
+        if previous_generation != opportunity.view_generation:
+            _fail(
+                "source-bound proposal witness has conflicting view generations "
+                "for one ProposalKey"
+            )
+        if not (
+            opportunity.decision_monotonic_ns
+            <= source_event.monotonic_ns
+            < stopping.monotonic_ns
+        ):
+            _fail(
+                "source-bound proposal witness opportunity is outside its "
+                "decision-to-process.stopping interval"
+            )
+        witnesses.add(opportunity.proposal_key)
+    return frozenset(witnesses)
+
+
 def _response_attempt_arm_markers(
     slot_root: Path,
     paths_by_replica: Mapping[int, Sequence[str]],
@@ -5904,6 +6112,7 @@ def validate_fault_causality(
     epoch2_selection_ns: int | None = None,
     responsive_omission_period: int = _V8_RESPONSIVE_OMISSION_PERIOD,
     source_bound_contribution_opportunities: bool = False,
+    source_bound_proposal_configuration_witnesses: bool = False,
     epoch0_qualifying_proposal_keys: Collection[
         tuple[int, int, str, str]
     ]
@@ -5993,6 +6202,14 @@ def validate_fault_causality(
         ("epoch1_stable", 1, epoch1_digest, epoch1_tree_by_id),
         ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
     )
+    if (
+        source_bound_proposal_configuration_witnesses
+        and not source_bound_contribution_opportunities
+    ):
+        _fail(
+            "source-bound proposal witnesses require strict contribution "
+            "opportunity validation"
+        )
     if source_bound_contribution_opportunities:
         if not role_scoped:
             _fail(
@@ -6006,6 +6223,14 @@ def validate_fault_causality(
             phase_windows=phase_windows,
             phase_configurations=phase_configurations,
         )
+        if source_bound_proposal_configuration_witnesses:
+            proposals.update(
+                _source_bound_proposal_configuration_witnesses(
+                    opportunities=contribution_opportunities,
+                    replica_events=replica_events,
+                    phase_configurations=phase_configurations,
+                )
+            )
     elif tiered:
         _validate_tiered_observed_marker_completeness(
             markers,
@@ -9259,6 +9484,9 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             ),
             source_bound_contribution_opportunities=(
                 source_bound_contribution_opportunities
+            ),
+            source_bound_proposal_configuration_witnesses=(
+                _uses_source_bound_proposal_witness_contract(manifest)
             ),
             epoch0_qualifying_proposal_keys=(
                 hierarchy.epoch0_fault_qualifying_proposal_keys

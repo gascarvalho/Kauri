@@ -1,4 +1,4 @@
-"""Prospective producer contract for future-tree proposal delivery v19."""
+"""Prospective producer contract for native proposal witnesses v20."""
 
 from __future__ import annotations
 
@@ -14,40 +14,41 @@ from experiments.adaptive.kauri_experiment import factorial_execution as executi
 from experiments.adaptive.kauri_experiment import factorial_manifest as manifest_module
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+    SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
     FactorialManifestError,
+    FROZEN_MANIFEST_SHA256,
+    FROZEN_PLAN_SHA256,
+    FROZEN_SEMANTIC_SHA256,
     V19_MANIFEST_SHA256,
     V19_PLAN_SHA256,
     V19_SEMANTIC_SHA256,
-    V18_MANIFEST_SHA256,
-    V18_PLAN_SHA256,
-    V18_SEMANTIC_SHA256,
     build_factorial_plan,
     load_frozen_manifest,
     parse_manifest_bytes,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
+    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+    FROZEN_RUNTIME_SHA256,
+    FROZEN_SMOKE_RUNTIME_SHA256,
     V19_COVERAGE_SMOKE_RUNTIME_SHA256,
     V19_RUNTIME_SHA256,
     V19_SMOKE_RUNTIME_SHA256,
-    V18_COVERAGE_SMOKE_RUNTIME_SHA256,
-    V18_RUNTIME_SHA256,
-    V18_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     build_slot_runtime,
     canonical_runtime_bytes,
 )
 
 REPOSITORY = Path(__file__).resolve().parents[3]
+V20_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v20.json"
+)
 V19_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v19.json"
 )
-V18_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v18.json"
-)
-FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT = (
-    "exact_immediate_successor_tree_proposals_relayed_and_buffered_without_pre_"
-    "activation_protocol_effects_then_revalidated_and_replayed_once_after_exact_"
-    "activation_v1"
+SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT = (
+    "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
+    "keys_are_native_proposal_configuration_witnesses_after_exact_topology_"
+    "validation_v1"
 )
 
 
@@ -77,93 +78,97 @@ def _runtime_identities(path: Path) -> tuple[str, str, str, str, str, str]:
     )
 
 
-def test_v19_only_changes_identity_root_and_future_tree_contract() -> None:
+def test_v20_only_changes_identity_root_and_proposal_witness_contract() -> None:
+    v20 = json.loads(V20_MANIFEST.read_bytes())
     v19 = json.loads(V19_MANIFEST.read_bytes())
-    v18 = json.loads(V18_MANIFEST.read_bytes())
 
+    assert v20.pop("manifest_id") == "shape-placement-factorial-v20"
     assert v19.pop("manifest_id") == "shape-placement-factorial-v19"
-    assert v18.pop("manifest_id") == "shape-placement-factorial-v18"
+    assert v20["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v20"
+    )
     assert v19["artifacts"].pop("results_root") == (  # type: ignore[index]
         "results/shape-placement-factorial-v19"
     )
-    assert v18["artifacts"].pop("results_root") == (  # type: ignore[index]
-        "results/shape-placement-factorial-v18"
-    )
+    v20_responsive = v20["byzantine"]["responsive_degradation"]  # type: ignore[index]
     v19_responsive = v19["byzantine"]["responsive_degradation"]  # type: ignore[index]
-    v18_responsive = v18["byzantine"]["responsive_degradation"]  # type: ignore[index]
     assert (
-        v19_responsive.pop(  # type: ignore[union-attr]
-            "future_tree_proposal_delivery_contract"
+        v20_responsive.pop(  # type: ignore[union-attr]
+            "source_bound_proposal_witness_contract"
         )
-        == FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT
+        == SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT
     )
-    assert "future_tree_proposal_delivery_contract" not in v18_responsive
-    assert v19 == v18
+    assert "source_bound_proposal_witness_contract" not in v19_responsive
+    assert v20 == v19
 
-    assert FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1 == (
-        FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT
+    assert SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1 == (
+        SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT
     )
-    assert manifest_module.V19_MANIFEST_ID == "shape-placement-factorial-v19"
+    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v20"
 
 
-@pytest.mark.parametrize("replacement", (None, "relay_future_tree_without_revalidation"))
-def test_v19_rejects_missing_or_forged_future_tree_contract(
+@pytest.mark.parametrize("replacement", (None, "accept_unpaired_shutdown_marker"))
+def test_v20_rejects_missing_or_forged_proposal_witness_contract(
     replacement: str | None,
 ) -> None:
-    document = json.loads(V19_MANIFEST.read_bytes())
+    document = json.loads(V20_MANIFEST.read_bytes())
     responsive = document["byzantine"]["responsive_degradation"]
     if replacement is None:
-        responsive.pop("future_tree_proposal_delivery_contract")
+        responsive.pop("source_bound_proposal_witness_contract")
     else:
-        responsive["future_tree_proposal_delivery_contract"] = replacement
+        responsive["source_bound_proposal_witness_contract"] = replacement
 
     with pytest.raises(
         FactorialManifestError,
-        match="future-tree proposal delivery contract|fields are not frozen",
+        match="source-bound proposal witness contract|fields are not frozen",
     ):
         parse_manifest_bytes(_encoded(document))
 
 
-def test_v18_rejects_forged_v19_field_and_still_dispatches() -> None:
-    assert _runtime_identities(V18_MANIFEST) == (
-        V18_MANIFEST_SHA256,
-        V18_SEMANTIC_SHA256,
-        V18_PLAN_SHA256,
-        V18_RUNTIME_SHA256,
-        V18_SMOKE_RUNTIME_SHA256,
-        V18_COVERAGE_SMOKE_RUNTIME_SHA256,
+def test_v19_rejects_forged_v20_field_and_preserves_all_identities() -> None:
+    assert _runtime_identities(V19_MANIFEST) == (
+        V19_MANIFEST_SHA256,
+        V19_SEMANTIC_SHA256,
+        V19_PLAN_SHA256,
+        V19_RUNTIME_SHA256,
+        V19_SMOKE_RUNTIME_SHA256,
+        V19_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
-    document = json.loads(V18_MANIFEST.read_bytes())
+    document = json.loads(V19_MANIFEST.read_bytes())
     document["byzantine"]["responsive_degradation"][  # type: ignore[index]
-        "future_tree_proposal_delivery_contract"
-    ] = FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT
+        "source_bound_proposal_witness_contract"
+    ] = SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT
     with pytest.raises(FactorialManifestError, match="fields are not frozen"):
         parse_manifest_bytes(_encoded(document))
 
 
-def test_v19_runtime_mirrors_future_tree_contract_without_launch_drift() -> None:
+def test_v20_runtime_mirrors_witness_contract_without_launch_drift() -> None:
+    v20_plan = build_factorial_plan(load_frozen_manifest(V20_MANIFEST))
     v19_plan = build_factorial_plan(load_frozen_manifest(V19_MANIFEST))
-    v18_plan = build_factorial_plan(load_frozen_manifest(V18_MANIFEST))
+    v20_runtime = build_factorial_runtime(v20_plan)
     v19_runtime = build_factorial_runtime(v19_plan)
-    v18_runtime = build_factorial_runtime(v18_plan)
 
-    assert len(v19_runtime.slots) == len(v18_runtime.slots)
-    for v19_slot, v18_slot in zip(v19_runtime.slots, v18_runtime.slots, strict=True):
+    assert len(v20_runtime.slots) == len(v19_runtime.slots)
+    for v20_slot, v19_slot in zip(v20_runtime.slots, v19_runtime.slots, strict=True):
         assert (
-            v19_slot.causal_acceptance.future_tree_proposal_delivery_contract
-            == FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT
+            v20_slot.causal_acceptance.source_bound_proposal_witness_contract
+            == SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT
         )
-        assert v18_slot.causal_acceptance.future_tree_proposal_delivery_contract is None
-        assert v19_slot.fault_window == v18_slot.fault_window
-        assert v19_slot.cutoff_contract == v18_slot.cutoff_contract
-        assert v19_slot.responsiveness_policy == v18_slot.responsiveness_policy
-        assert v19_slot.manager_argv_template == v18_slot.manager_argv_template
-        assert v19_slot.replica_argv_templates == v18_slot.replica_argv_templates
-        assert v19_slot.transitions == v18_slot.transitions
+        assert (
+            v20_slot.causal_acceptance.future_tree_proposal_delivery_contract
+            == FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+        )
+        assert v19_slot.causal_acceptance.source_bound_proposal_witness_contract is None
+        assert v20_slot.fault_window == v19_slot.fault_window
+        assert v20_slot.cutoff_contract == v19_slot.cutoff_contract
+        assert v20_slot.responsiveness_policy == v19_slot.responsiveness_policy
+        assert v20_slot.manager_argv_template == v19_slot.manager_argv_template
+        assert v20_slot.replica_argv_templates == v19_slot.replica_argv_templates
+        assert v20_slot.transitions == v19_slot.transitions
 
 
-def test_v19_future_tree_contract_is_bound_into_slot_artifact_identity() -> None:
-    plan = build_factorial_plan(load_frozen_manifest(V19_MANIFEST))
+def test_v20_witness_contract_is_bound_into_slot_artifact_identity() -> None:
+    plan = build_factorial_plan(load_frozen_manifest(V20_MANIFEST))
     slot = plan.slots[0]
     responsive = slot.byzantine.responsive_degradation
     assert responsive is not None
@@ -175,52 +180,53 @@ def test_v19_future_tree_contract_is_bound_into_slot_artifact_identity() -> None
             slot.byzantine,
             responsive_degradation=replace(
                 responsive,
-                future_tree_proposal_delivery_contract=None,
+                source_bound_proposal_witness_contract=None,
             ),
         ),
     )
     assert build_slot_runtime(missing).artifact_id != runtime.artifact_id
 
 
-def test_v19_all_six_static_identities_are_frozen() -> None:
-    assert _runtime_identities(V19_MANIFEST) == (
-        V19_MANIFEST_SHA256,
-        V19_SEMANTIC_SHA256,
-        V19_PLAN_SHA256,
-        V19_RUNTIME_SHA256,
-        V19_SMOKE_RUNTIME_SHA256,
-        V19_COVERAGE_SMOKE_RUNTIME_SHA256,
+def test_v20_all_six_static_identities_are_frozen() -> None:
+    assert _runtime_identities(V20_MANIFEST) == (
+        FROZEN_MANIFEST_SHA256,
+        FROZEN_SEMANTIC_SHA256,
+        FROZEN_PLAN_SHA256,
+        FROZEN_RUNTIME_SHA256,
+        FROZEN_SMOKE_RUNTIME_SHA256,
+        FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
 
 
-def test_v19_is_validation_only_and_keeps_ordered_fresh_roots(
+def test_v20_default_refuses_v19_and_keeps_ordered_fresh_roots(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST != V19_MANIFEST
+    assert cli.DEFAULT_MANIFEST == V20_MANIFEST
     assert cli.main(["--manifest", str(V19_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
     assert "v1 through v19 are validation-only" in refusal["reason"]
 
-    plan = build_factorial_plan(load_frozen_manifest(V19_MANIFEST))
+    plan = build_factorial_plan(load_frozen_manifest(V20_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])
     first = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
     n31 = execution.build_n31_coverage_smoke_slot(first)
     assert n7.slot.result_path == (
-        "results/shape-placement-factorial-v19-smoke/smoke-n7-f2-PS"
+        "results/shape-placement-factorial-v20-smoke/smoke-n7-f2-PS"
     )
     assert n31.slot == replace(
         first,
         result_path=(
-            "results/shape-placement-factorial-v19-coverage-smoke/"
+            "results/shape-placement-factorial-v20-coverage-smoke/"
             "slot-066-n31-f5-b05-P"
         ),
     )
     assert plan.automatic_retries == 0
+    assert plan.replacement_policy == "none"
     assert build_factorial_runtime(plan).automatic_retries == 0
 
 
-def test_v19_n31_coverage_smoke_rejects_missing_future_tree_contract() -> None:
-    plan = build_factorial_plan(load_frozen_manifest(V19_MANIFEST))
+def test_v20_n31_coverage_smoke_rejects_missing_witness_contract() -> None:
+    plan = build_factorial_plan(load_frozen_manifest(V20_MANIFEST))
     first = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
     responsive = first.byzantine.responsive_degradation
     assert responsive is not None
@@ -236,7 +242,7 @@ def test_v19_n31_coverage_smoke_rejects_missing_future_tree_contract() -> None:
                     first.byzantine,
                     responsive_degradation=replace(
                         responsive,
-                        future_tree_proposal_delivery_contract=None,
+                        source_bound_proposal_witness_contract=None,
                     ),
                 ),
             )

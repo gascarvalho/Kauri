@@ -44,6 +44,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v20.json"
+)
+V19_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v19.json"
 )
 V18_MANIFEST_PATH = (
@@ -286,7 +289,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v19_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v20_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -310,7 +313,8 @@ def test_validator_retains_exact_v1_through_v19_artifact_identities() -> None:
             (16, V16_MANIFEST_PATH),
             (17, V17_MANIFEST_PATH),
             (18, V18_MANIFEST_PATH),
-            (19, MANIFEST_PATH),
+            (19, V19_MANIFEST_PATH),
+            (20, MANIFEST_PATH),
         )
     }
 
@@ -412,15 +416,26 @@ def test_validator_retains_exact_v1_through_v19_artifact_identities() -> None:
         identities[18].coverage_smoke_runtime_sha256
         == validation.V18_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[19].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[19].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[19].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[19].manifest_sha256 == validation.V19_MANIFEST_SHA256
+    assert identities[19].plan_sha256 == validation.V19_PLAN_SHA256
+    assert identities[19].runtime_sha256 == validation.V19_RUNTIME_SHA256
     assert (
         identities[19].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V19_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[19].coverage_smoke_runtime_sha256
+        == validation.V19_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[20].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[20].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[20].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[20].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[20].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
 
@@ -443,6 +458,7 @@ def test_validator_retains_exact_v1_through_v19_artifact_identities() -> None:
         V16_MANIFEST_PATH,
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
+        V19_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -462,7 +478,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v19_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v20_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -494,6 +510,7 @@ def test_validator_requires_v9_through_v19_causal_contracts_but_accepts_v8() -> 
         V16_MANIFEST_PATH,
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
+        V19_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -552,6 +569,7 @@ def test_validator_requires_v9_through_v19_causal_contracts_but_accepts_v8() -> 
                 V16_MANIFEST_PATH,
                 V17_MANIFEST_PATH,
                 V18_MANIFEST_PATH,
+                V19_MANIFEST_PATH,
                 MANIFEST_PATH,
             ):
                 assert document["tiered_cohorts"][
@@ -566,6 +584,7 @@ def test_validator_requires_v9_through_v19_causal_contracts_but_accepts_v8() -> 
                         V16_MANIFEST_PATH,
                         V17_MANIFEST_PATH,
                         V18_MANIFEST_PATH,
+                        V19_MANIFEST_PATH,
                         MANIFEST_PATH,
                     )
                     else validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
@@ -627,7 +646,7 @@ def test_v17_runtime_mirrors_precontainment_shape_contract_only_in_causal_accept
     )
 
 
-def test_v18_through_v19_guarded_selection_contract_dispatch_is_exact() -> None:
+def test_v18_through_v20_guarded_selection_contract_dispatch_is_exact() -> None:
     contract = validation.PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
 
     def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
@@ -644,6 +663,9 @@ def test_v18_through_v19_guarded_selection_contract_dispatch_is_exact() -> None:
     )
     assert validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V18_MANIFEST_ID, contract)
+    )
+    assert validation._uses_precontainment_guarded_selection_contract(
+        manifest(validation.V19_MANIFEST_ID, contract)
     )
     assert not validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V17_MANIFEST_ID, contract)
@@ -668,7 +690,13 @@ def test_v19_future_tree_proposal_delivery_dispatch_is_version_exact() -> None:
 
     assert validation._uses_future_tree_proposal_delivery_contract(
         manifest(
-            "shape-placement-factorial-v19",
+            validation.V19_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT,
         )
     )
@@ -679,13 +707,44 @@ def test_v19_future_tree_proposal_delivery_dispatch_is_version_exact() -> None:
         )
     )
     assert not validation._uses_future_tree_proposal_delivery_contract(
-        manifest("shape-placement-factorial-v19", None)
+        manifest(validation.V19_MANIFEST_ID, None)
     )
     assert not validation._uses_future_tree_proposal_delivery_contract(
         manifest(
-            "shape-placement-factorial-v19",
+            validation.V19_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT + "-forged",
         )
+    )
+
+
+def test_v20_source_bound_proposal_witness_dispatch_is_version_exact() -> None:
+    contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+    assert contract == (
+        "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
+        "keys_are_native_proposal_configuration_witnesses_after_exact_topology_"
+        "validation_v1"
+    )
+
+    def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
+        responsive = SimpleNamespace()
+        if value is not None:
+            responsive.source_bound_proposal_witness_contract = value
+        return SimpleNamespace(
+            manifest_id=manifest_id,
+            byzantine=SimpleNamespace(responsive_degradation=responsive),
+        )
+
+    assert validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, contract)
+    )
+    assert not validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.V19_MANIFEST_ID, contract)
+    )
+    assert not validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, None)
+    )
+    assert not validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, contract + "-forged")
     )
 
 
@@ -739,7 +798,7 @@ def test_v18_binds_guarded_selection_contract_to_runtime_identity_and_acceptance
 
 
 def test_v19_binds_future_tree_contract_to_runtime_identity_and_acceptance() -> None:
-    manifest = load_frozen_manifest(MANIFEST_PATH)
+    manifest = load_frozen_manifest(V19_MANIFEST_PATH)
     runtime = build_factorial_runtime(build_factorial_plan(manifest))
     expected_by_id = {
         expected.slot_id: expected
@@ -805,6 +864,98 @@ def test_v19_binds_future_tree_contract_to_runtime_identity_and_acceptance() -> 
             document,
             expected_by_id[slot.slot_id],
             missing_manifest_contract,
+        )
+
+
+def test_v20_binds_source_bound_witness_to_runtime_identity_and_acceptance(
+) -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    slot = runtime.slots[0]
+    document = json.loads(json.dumps(slot.as_document()))
+    contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+
+    assert document["causal_acceptance"][
+        "source_bound_proposal_witness_contract"
+    ] == contract
+    validation._validate_runtime_slot(
+        document,
+        expected_by_id[slot.slot_id],
+        manifest,
+    )
+
+    v19 = load_frozen_manifest(V19_MANIFEST_PATH)
+    v19_runtime = build_factorial_runtime(build_factorial_plan(v19))
+    assert slot.artifact_id != v19_runtime.slots[0].artifact_id
+    assert "source_bound_proposal_witness_contract" not in (
+        v19_runtime.slots[0].causal_acceptance.as_document()
+    )
+
+    missing = copy.deepcopy(document)
+    del missing["causal_acceptance"][
+        "source_bound_proposal_witness_contract"
+    ]
+    with pytest.raises(FactorialValidationError, match="causal acceptance contract"):
+        validation._validate_runtime_slot(
+            missing,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+
+    wrong_identity = copy.deepcopy(document)
+    wrong_identity["artifact_id"] = v19_runtime.slots[0].artifact_id
+    with pytest.raises(FactorialValidationError, match="runtime slot identity"):
+        validation._validate_runtime_slot(
+            wrong_identity,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+
+    responsive = manifest.byzantine.responsive_degradation
+    assert responsive is not None
+    missing_manifest_contract = replace(
+        manifest,
+        byzantine=replace(
+            manifest.byzantine,
+            responsive_degradation=replace(
+                responsive,
+                source_bound_proposal_witness_contract=None,
+            ),
+        ),
+    )
+    with pytest.raises(
+        FactorialValidationError,
+        match="v20 source-bound proposal witness contract",
+    ):
+        validation._validate_runtime_slot(
+            document,
+            expected_by_id[slot.slot_id],
+            missing_manifest_contract,
+        )
+
+
+def test_v19_rejects_forged_v20_source_bound_witness_runtime_field() -> None:
+    manifest = load_frozen_manifest(V19_MANIFEST_PATH)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    slot = runtime.slots[0]
+    document = json.loads(json.dumps(slot.as_document()))
+    document["causal_acceptance"][
+        "source_bound_proposal_witness_contract"
+    ] = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+
+    with pytest.raises(FactorialValidationError, match="causal acceptance contract"):
+        validation._validate_runtime_slot(
+            document,
+            expected_by_id[slot.slot_id],
+            manifest,
         )
 
 
@@ -920,7 +1071,7 @@ def test_v17_rejects_forged_v18_guarded_selection_runtime_field() -> None:
         )
 
 
-def test_v10_through_v19_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v20_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -952,11 +1103,14 @@ def test_v10_through_v19_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V18_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V19_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_through_v19_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v20_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
@@ -985,11 +1139,14 @@ def test_v11_through_v19_route_through_explicit_phase_edge_eligibility() -> None
         load_frozen_manifest(V18_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V19_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v16_through_v19_use_selection_visible_hard_timeout_witnesses() -> None:
+def test_v16_through_v20_use_selection_visible_hard_timeout_witnesses() -> None:
     assert not validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(V15_MANIFEST_PATH)
     )
@@ -1003,11 +1160,14 @@ def test_v16_through_v19_use_selection_visible_hard_timeout_witnesses() -> None:
         load_frozen_manifest(V18_MANIFEST_PATH)
     )
     assert validation._uses_selection_visible_hard_timeout_witnesses(
+        load_frozen_manifest(V19_MANIFEST_PATH)
+    )
+    assert validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v14_through_v19_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
+def test_v14_through_v20_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
     v13 = load_frozen_manifest(V13_MANIFEST_PATH)
 
     assert not validation._uses_source_bound_contribution_opportunities(v13)
@@ -1018,6 +1178,7 @@ def test_v14_through_v19_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         V16_MANIFEST_PATH,
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
+        V19_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1025,7 +1186,7 @@ def test_v14_through_v19_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         assert validation._uses_strict_sigint_cleanup(manifest)
 
 
-def test_validator_binds_v14_through_v19_cleanup_without_changing_v13() -> None:
+def test_validator_binds_v14_through_v20_cleanup_without_changing_v13() -> None:
     for manifest_path in (
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
@@ -1033,6 +1194,7 @@ def test_validator_binds_v14_through_v19_cleanup_without_changing_v13() -> None:
         V16_MANIFEST_PATH,
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
+        V19_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1079,6 +1241,7 @@ def test_validator_binds_v14_through_v19_cleanup_without_changing_v13() -> None:
         V16_MANIFEST_PATH,
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
+        V19_MANIFEST_PATH,
         MANIFEST_PATH,
     ),
 )
@@ -1108,7 +1271,7 @@ def test_validator_requires_each_explicit_causal_linkage_field(
     "field",
     ("marker_completeness_witness", "causal_timeout_eligibility"),
 )
-def test_validator_requires_each_explicit_v11_through_v19_phase_edge_field(
+def test_validator_requires_each_explicit_v11_through_v20_phase_edge_field(
     field: str,
 ) -> None:
     for manifest_path in (
@@ -1120,6 +1283,7 @@ def test_validator_requires_each_explicit_v11_through_v19_phase_edge_field(
         V16_MANIFEST_PATH,
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
+        V19_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -6938,6 +7102,469 @@ def _v16_hard_timeout_witness_fixture() -> dict[str, object]:
             for item in epoch0_markers
         },
     }
+
+
+def _v20_shutdown_tail_witness_fixture() -> dict[str, object]:
+    """Convert the exact hard-actor fixture to a source-bound v20 tail."""
+
+    arguments = _v16_hard_timeout_witness_fixture()
+    legacy_markers = arguments["markers"]
+    assert isinstance(legacy_markers, tuple)
+    initial_trees = {
+        tree.tree_id: tree for tree in arguments["initial_trees"]
+    }
+    epoch1_trees = {tree.tree_id: tree for tree in arguments["epoch1_trees"]}
+    epoch2_trees = {tree.tree_id: tree for tree in arguments["epoch2_trees"]}
+    trees_by_epoch = {
+        0: initial_trees,
+        1: epoch1_trees,
+        2: epoch2_trees,
+    }
+    markers: list[FaultMarker] = []
+    opportunities: list[validation.FaultContributionOpportunity] = []
+    for legacy in legacy_markers:
+        tree = trees_by_epoch[legacy.epoch_number][legacy.tree_id]
+        position = tree.members.index(legacy.actor)
+        leaf_start = validation._first_leaf_index(len(tree.members), tree.fanout)
+        role = "internal" if position < leaf_start else "leaf"
+        marker = replace(
+            legacy,
+            fault_mode="tiered_persistent_responsive_omission_v2",
+            cohort="hard",
+            hard_actor_count=1,
+            responsive_degraded_actor_count=0,
+            fault_threshold=1,
+            max_omissions_per_proposal=1,
+            responsive_omission_period=41,
+            contribution_ordinal=0,
+            contribution_role=role,
+            role_contribution_ordinal=0,
+        )
+        markers.append(marker)
+        opportunities.append(
+            validation.FaultContributionOpportunity(
+                source_replica=marker.actor,
+                relative_path=f"raw/replica-{marker.actor}.jsonl",
+                line_number=len(opportunities) + 1,
+                source_sequence=len(opportunities) + 1,
+                event_monotonic_ns=marker.monotonic_ns,
+                line_sha256=f"{len(opportunities) + 100:064x}",
+                actor=marker.actor,
+                epoch_number=marker.epoch_number,
+                tree_id=marker.tree_id,
+                epoch_digest=marker.epoch_digest,
+                block_hash=marker.block_hash,
+                view_generation=marker.epoch_number * (1 << 32) + marker.tree_id + 1,
+                physical_role=role,
+                parent_replica=tree.members[(position - 1) // tree.fanout],
+                expected_message_type=(
+                    "aggregate_relay" if role == "internal" else "direct_vote"
+                ),
+                cohort="hard",
+                window=marker.window,
+                window_start_ns=marker.window_start_ns,
+                window_end_ns=marker.window_end_ns,
+                decision_monotonic_ns=marker.monotonic_ns,
+                contribution_ordinal=0,
+                role_contribution_ordinal=0,
+                scheduled_action=marker.action,
+                responsive_omission_period=41,
+                fault_threshold=1,
+                hard_actor_count=1,
+                responsive_degraded_actor_count=0,
+                fault_mode=marker.fault_mode,
+            )
+        )
+
+    actor = markers[0].actor
+    legacy_events = arguments["replica_events"]
+    assert isinstance(legacy_events, dict)
+    proposal_events = legacy_events[actor]
+    assert isinstance(proposal_events, tuple)
+    # The final active proposal is interrupted after its exact opportunity and
+    # marker but before any aggregation/configuration event or commit.
+    combined_events = [*proposal_events[:-1]]
+    combined_events.extend(
+        _native_event(
+            source_id=f"replica-{actor}",
+            sequence=index,
+            monotonic_ns=opportunity.event_monotonic_ns,
+            event_type="fault.contribution_opportunity",
+            payload={
+                "proposal": {
+                    "epoch_number": opportunity.epoch_number,
+                    "tree_id": opportunity.tree_id,
+                    "epoch_digest": opportunity.epoch_digest,
+                    "block_hash": opportunity.block_hash,
+                }
+            },
+        )
+        for index, opportunity in enumerate(opportunities, start=1)
+    )
+    combined_events.append(
+        _native_event(
+            source_id=f"replica-{actor}",
+            sequence=1,
+            monotonic_ns=1_150,
+            event_type="process.stopping",
+            payload={"exit_status": None},
+        )
+    )
+    combined_events = [
+        replace(event, line_number=index, source_sequence=index)
+        for index, event in enumerate(
+            sorted(combined_events, key=lambda event: event.monotonic_ns),
+            start=1,
+        )
+    ]
+    opportunity_event_by_key = {
+        (
+            event.payload["proposal"]["epoch_number"],
+            event.payload["proposal"]["tree_id"],
+            event.payload["proposal"]["epoch_digest"],
+            event.payload["proposal"]["block_hash"],
+        ): event
+        for event in combined_events
+        if event.event_type == "fault.contribution_opportunity"
+    }
+    opportunities = [
+        replace(
+            opportunity,
+            relative_path=opportunity_event_by_key[
+                opportunity.proposal_key
+            ].relative_path,
+            line_number=opportunity_event_by_key[
+                opportunity.proposal_key
+            ].line_number,
+            source_sequence=opportunity_event_by_key[
+                opportunity.proposal_key
+            ].source_sequence,
+            event_monotonic_ns=opportunity_event_by_key[
+                opportunity.proposal_key
+            ].monotonic_ns,
+            line_sha256=opportunity_event_by_key[
+                opportunity.proposal_key
+            ].line_sha256,
+        )
+        for opportunity in opportunities
+    ]
+    arguments.update(
+        {
+            "markers": tuple(markers),
+            "contribution_opportunities": tuple(opportunities),
+            "replica_events": {actor: tuple(combined_events)},
+            "fault_mode": "tiered_persistent_responsive_omission_v2",
+            "source_bound_contribution_opportunities": True,
+            "selection_visible_hard_timeout_witnesses": True,
+            "phase_windows": {
+                phase: (start, end, 6 if phase != "baseline" else bucket_count)
+                for phase, (start, end, bucket_count) in arguments[
+                    "phase_windows"
+                ].items()
+            },
+        }
+    )
+    return arguments
+
+
+def _isolate_v20_shutdown_tail_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the synthetic fixture focused on the proposal-witness join."""
+
+    monkeypatch.setattr(
+        validation,
+        "_validate_fault_marker_schedule",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_role_scoped_epoch1_internal_opportunities",
+        lambda *args, **kwargs: None,
+    )
+
+
+def test_v20_shutdown_tail_opportunity_witness_is_version_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = _v20_shutdown_tail_witness_fixture()
+    # The fixture deliberately isolates the witness join from the tiered
+    # cohort-cardinality and responsive-degraded role-coverage checks; the
+    # real opportunity bijection/topology and hard-actor causal gates run.
+    _isolate_v20_shutdown_tail_join(monkeypatch)
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="no matching native proposal/configuration event",
+    ):
+        validate_fault_causality(**arguments)
+
+    assert validate_fault_causality(
+        **arguments,
+        source_bound_proposal_configuration_witnesses=True,
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("marker_only", "marker-only"),
+        ("event_only", "event-only"),
+        ("mismatched_key", "marker-only"),
+    ),
+)
+def test_v20_proposal_witness_preserves_exact_pairing_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    arguments = _v20_shutdown_tail_witness_fixture()
+    _isolate_v20_shutdown_tail_join(monkeypatch)
+    opportunities = arguments["contribution_opportunities"]
+    assert isinstance(opportunities, tuple)
+    if mutation == "marker_only":
+        mutated = opportunities[:-1]
+    elif mutation == "event_only":
+        mutated = (
+            *opportunities,
+            replace(opportunities[-1], block_hash="ff" * 32),
+        )
+    else:
+        mutated = (
+            *opportunities[:-1],
+            replace(opportunities[-1], block_hash="ff" * 32),
+        )
+
+    with pytest.raises(FactorialValidationError, match=message):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "contribution_opportunities": mutated,
+            },
+            source_bound_proposal_configuration_witnesses=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("before_decision", "decision-to-process.stopping interval"),
+        ("at_stopping", "decision-to-process.stopping interval"),
+        ("missing_stopping", "lacks same-source process.stopping"),
+    ),
+)
+def test_v20_proposal_witness_requires_exact_source_shutdown_order(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    arguments = _v20_shutdown_tail_witness_fixture()
+    _isolate_v20_shutdown_tail_join(monkeypatch)
+    opportunities = arguments["contribution_opportunities"]
+    replica_events = arguments["replica_events"]
+    assert isinstance(opportunities, tuple)
+    assert isinstance(replica_events, dict)
+    tail = opportunities[-1]
+    actor = tail.source_replica
+    events = replica_events[actor]
+    assert isinstance(events, tuple)
+    stopping = next(event for event in events if event.event_type == "process.stopping")
+    source_event = next(
+        event
+        for event in events
+        if (
+            event.event_type == "fault.contribution_opportunity"
+            and event.line_number == tail.line_number
+        )
+    )
+    if mutation == "before_decision":
+        event_monotonic_ns = tail.decision_monotonic_ns - 1
+        opportunities = (
+            *opportunities[:-1],
+            replace(
+                tail,
+                event_monotonic_ns=event_monotonic_ns,
+            ),
+        )
+    elif mutation == "at_stopping":
+        event_monotonic_ns = stopping.monotonic_ns
+        opportunities = (
+            *opportunities[:-1],
+            replace(tail, event_monotonic_ns=event_monotonic_ns),
+        )
+    else:
+        replica_events = {
+            **replica_events,
+            actor: tuple(
+                event for event in events if event.event_type != "process.stopping"
+            ),
+        }
+    if mutation != "missing_stopping":
+        replica_events = {
+            **replica_events,
+            actor: tuple(
+                replace(event, monotonic_ns=event_monotonic_ns)
+                if event is source_event
+                else event
+                for event in events
+            ),
+        }
+
+    with pytest.raises(FactorialValidationError, match=message):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "contribution_opportunities": opportunities,
+                "replica_events": replica_events,
+            },
+            source_bound_proposal_configuration_witnesses=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("wrong_epoch", "view generation epoch"),
+        ("wrong_tree", "view generation rotation"),
+    ),
+)
+def test_v20_proposal_witness_binds_canonical_generation_topology(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    arguments = _v20_shutdown_tail_witness_fixture()
+    _isolate_v20_shutdown_tail_join(monkeypatch)
+    opportunities = arguments["contribution_opportunities"]
+    assert isinstance(opportunities, tuple)
+    target_index = -1 if mutation == "wrong_epoch" else 0
+    target = opportunities[target_index]
+    mutated = replace(
+        target,
+        view_generation=(1 if mutation == "wrong_epoch" else 2),
+    )
+    opportunities = tuple(
+        mutated if index == target_index % len(opportunities) else opportunity
+        for index, opportunity in enumerate(opportunities)
+    )
+
+    with pytest.raises(FactorialValidationError, match=message):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "contribution_opportunities": opportunities,
+            },
+            source_bound_proposal_configuration_witnesses=True,
+        )
+
+
+def test_v20_proposal_witness_rejects_cross_actor_generation_conflict() -> None:
+    arguments = _v20_shutdown_tail_witness_fixture()
+    opportunities = arguments["contribution_opportunities"]
+    replica_events = arguments["replica_events"]
+    assert isinstance(opportunities, tuple)
+    assert isinstance(replica_events, dict)
+    original = opportunities[-1]
+    original_events = replica_events[original.source_replica]
+    assert isinstance(original_events, tuple)
+    source_event = next(
+        event
+        for event in original_events
+        if (
+            event.event_type == "fault.contribution_opportunity"
+            and event.line_number == original.line_number
+        )
+    )
+    stopping = next(
+        event
+        for event in original_events
+        if event.event_type == "process.stopping"
+    )
+    other_actor = 2
+    other_path = f"raw/replica-{other_actor}.jsonl"
+    other_instance = f"slot-replica-{other_actor}"
+    other_line_sha256 = "fe" * 32
+    other_source_event = replace(
+        source_event,
+        relative_path=other_path,
+        line_number=1,
+        source_id=f"replica-{other_actor}",
+        source_instance=other_instance,
+        source_sequence=1,
+        line_sha256=other_line_sha256,
+    )
+    other_stopping = replace(
+        stopping,
+        relative_path=other_path,
+        line_number=2,
+        source_id=f"replica-{other_actor}",
+        source_instance=other_instance,
+        source_sequence=2,
+    )
+    conflicting = replace(
+        original,
+        source_replica=other_actor,
+        relative_path=other_path,
+        line_number=1,
+        source_sequence=1,
+        line_sha256=other_line_sha256,
+        actor=other_actor,
+        view_generation=(
+            original.view_generation + len(arguments["epoch2_trees"])
+        ),
+    )
+    phase_configurations = (
+        (
+            "fault_evidence",
+            0,
+            arguments["initial_epoch_digest"],
+            {tree.tree_id: tree for tree in arguments["initial_trees"]},
+        ),
+        (
+            "epoch1_stable",
+            1,
+            arguments["epoch1_digest"],
+            {tree.tree_id: tree for tree in arguments["epoch1_trees"]},
+        ),
+        (
+            "epoch2_stable",
+            2,
+            arguments["epoch2_digest"],
+            {tree.tree_id: tree for tree in arguments["epoch2_trees"]},
+        ),
+    )
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="conflicting view generations",
+    ):
+        validation._source_bound_proposal_configuration_witnesses(
+            opportunities=(*opportunities, conflicting),
+            replica_events={
+                **replica_events,
+                other_actor: (other_source_event, other_stopping),
+            },
+            phase_configurations=phase_configurations,
+        )
+
+
+def test_v20_proposal_witness_cannot_bypass_source_bound_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = _v20_shutdown_tail_witness_fixture()
+    _isolate_v20_shutdown_tail_join(monkeypatch)
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="require strict contribution opportunity validation",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "source_bound_contribution_opportunities": False,
+            },
+            source_bound_proposal_configuration_witnesses=True,
+        )
 
 
 def test_v16_tail_timeout_after_selection_cutoff_is_a_nonwitness() -> None:
