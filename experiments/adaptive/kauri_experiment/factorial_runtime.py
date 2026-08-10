@@ -19,6 +19,7 @@ from .factorial_manifest import (
     EXECUTION_CLEANUP_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+    FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
@@ -35,6 +36,7 @@ from .factorial_manifest import (
     V19_MANIFEST_ID,
     V20_MANIFEST_ID,
     V21_MANIFEST_ID,
+    V22_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -141,14 +143,23 @@ V21_SMOKE_RUNTIME_SHA256 = (
 V21_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "5f0fa01ac8f5368cc09eff70d0a30f22156275e86683a627f54840caaa0eaa0c"
 )
-FROZEN_RUNTIME_SHA256 = (
+V22_RUNTIME_SHA256 = (
     "ca423f6513cf54f774ce198af970af4bc0bccae2bb0143ab3e48a842ff680caa"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V22_SMOKE_RUNTIME_SHA256 = (
     "9f8ecd3fbf44fe067e376bd24efe0adcb0938d8b383291e81106432ea1136583"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V22_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "b45fdba31d55c70107751cb0f3a00e26a2bf6b49352d50b342cd9768740af4db"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "2eadce094849280fa632cba7064bed822b2e172485e49d084131d09be9e73e42"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "aa86c344be1df785a3dd0f8602cda5534316b4b0f5e09d45b8605d14f74976d0"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "8706bc9292691b48c5f5db7728e22bebb6eaae399643da9cee5778d78adb9bd6"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -947,6 +958,7 @@ def _causal_acceptance(
     if future_tree_proposal_delivery_contract not in {
         None,
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+        FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }:
         raise FactorialManifestError(
             "causal acceptance future-tree proposal delivery contract drifted"
@@ -1842,6 +1854,7 @@ def runtime_preflight(
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
+                V22_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1990,7 +2003,11 @@ def runtime_preflight(
                     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
                 )
-            elif runtime.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+            elif runtime.manifest_id in {
+                V21_MANIFEST_ID,
+                V22_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }:
                 expected_measurement_contract = (
                     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
                     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
@@ -2017,6 +2034,7 @@ def runtime_preflight(
                     V19_MANIFEST_ID,
                     V20_MANIFEST_ID,
                     V21_MANIFEST_ID,
+                    V22_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -2035,6 +2053,7 @@ def runtime_preflight(
                     V19_MANIFEST_ID,
                     V20_MANIFEST_ID,
                     V21_MANIFEST_ID,
+                    V22_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -2091,6 +2110,7 @@ def runtime_preflight(
                         V19_MANIFEST_ID,
                         V20_MANIFEST_ID,
                         V21_MANIFEST_ID,
+                        V22_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2297,6 +2317,7 @@ def runtime_preflight(
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2333,6 +2354,7 @@ def runtime_preflight(
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
+                V22_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2343,24 +2365,35 @@ def runtime_preflight(
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
+                V22_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
-            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+            (
+                FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
+                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+            )
             if runtime.manifest_id
             in {
                 V19_MANIFEST_ID,
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
+                V22_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
             if runtime.manifest_id
-            in {V20_MANIFEST_ID, V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            in {
+                V20_MANIFEST_ID,
+                V21_MANIFEST_ID,
+                V22_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }
             else None,
             EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            if runtime.manifest_id in {V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
         ):
             raise FactorialManifestError(
@@ -2432,6 +2465,9 @@ __all__ = (
     "V21_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V21_RUNTIME_SHA256",
     "V21_SMOKE_RUNTIME_SHA256",
+    "V22_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V22_RUNTIME_SHA256",
+    "V22_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

@@ -34,7 +34,10 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
-MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v22.json"
+MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
+V22_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v22.json"
+)
 V21_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v21.json"
 )
@@ -230,6 +233,7 @@ def _slot_validation(
         (V19_MANIFEST, "v19"),
         (V20_MANIFEST, "v20"),
         (V21_MANIFEST, "v21"),
+        (V22_MANIFEST, "v22"),
     ),
 )
 @pytest.mark.parametrize(
@@ -258,8 +262,8 @@ def test_prior_manifest_is_validation_only_before_any_result_claim(
 
     assert refusal == {
         "reason": (
-            "shape-placement-factorial-v1 through v21 are validation-only; "
-            "production commands require shape-placement-factorial-v22"
+            "shape-placement-factorial-v1 through v22 are validation-only; "
+            "production commands require shape-placement-factorial-v23"
         ),
         "status": "REJECT",
     }
@@ -334,7 +338,7 @@ def test_smoke_preflight_rejects_runtime_identity_drift(
     ) == 2
     refusal = json.loads(capsys.readouterr().err)
     assert refusal == {
-        "reason": "smoke runtime bytes differ from the exact frozen v22 identity",
+        "reason": "smoke runtime bytes differ from the exact frozen v23 identity",
         "status": "REJECT",
     }
 
@@ -522,7 +526,7 @@ def test_run_requires_explicit_authorization_before_any_launch(
 
     assert refusal["status"] == "REJECT"
     assert "approval-reference" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v22").exists()
+    assert not (repository / "results/shape-placement-factorial-v23").exists()
 
 
 def test_campaign_runtime_identity_drift_rejects_before_result_claim(
@@ -547,7 +551,7 @@ def test_campaign_runtime_identity_drift_rejects_before_result_claim(
     refusal = json.loads(capsys.readouterr().err)
 
     assert "campaign runtime bytes differ" in refusal["reason"]
-    assert not (repository / "results/shape-placement-factorial-v22").exists()
+    assert not (repository / "results/shape-placement-factorial-v23").exists()
 
 
 def test_smoke_runtime_identity_drift_rejects_before_result_claim(
@@ -573,7 +577,7 @@ def test_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v22-smoke"
+        repository / "results/shape-placement-factorial-v23-smoke"
     ).exists()
 
 
@@ -600,7 +604,7 @@ def test_coverage_smoke_runtime_identity_drift_rejects_before_result_claim(
 
     assert "coverage-smoke runtime bytes differ" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v22-coverage-smoke"
+        repository / "results/shape-placement-factorial-v23-coverage-smoke"
     ).exists()
 
 
@@ -636,7 +640,7 @@ def test_invalid_authorization_does_not_claim_the_one_shot_smoke_root(
     assert refusal["status"] == "REJECT"
     assert "schema drifted" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v22-smoke"
+        repository / "results/shape-placement-factorial-v23-smoke"
     ).exists()
 
 
@@ -696,7 +700,7 @@ def test_smoke_generates_exact_excluded_receipt_and_validates_independently(
     assert observed["authorization"]["kauri_revision"] == REVISION
     assert (
         repository
-        / "results/shape-placement-factorial-v22-smoke"
+        / "results/shape-placement-factorial-v23-smoke"
         / cli.SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(observed["authorization"])
     assert result["validation"]["outcome"] == "PASS"
@@ -816,7 +820,7 @@ def test_coverage_smoke_requires_independently_passing_n7_smoke(
     assert refusal["status"] == "REJECT"
     assert "N=7 smoke" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v22-coverage-smoke"
+        repository / "results/shape-placement-factorial-v23-coverage-smoke"
     ).exists()
 
 
@@ -879,7 +883,7 @@ def test_coverage_smoke_uses_exact_first_slot_and_separate_authorization(
     assert observed["slot"] == replace(
         first,
         result_path=(
-            "results/shape-placement-factorial-v22-coverage-smoke/"
+            "results/shape-placement-factorial-v23-coverage-smoke/"
             "slot-066-n31-f5-b05-P"
         ),
     )
@@ -890,7 +894,7 @@ def test_coverage_smoke_uses_exact_first_slot_and_separate_authorization(
     assert authorization["scope"] == "excluded_n31_coverage_smoke"
     assert authorization["slot_ids"] == ["slot-066-n31-f5-b05-P"]
     assert authorization["result_root"] == (
-        "results/shape-placement-factorial-v22-coverage-smoke"
+        "results/shape-placement-factorial-v23-coverage-smoke"
     )
     assert authorization["automatic_retries"] == 0
     assert authorization["replacement_policy"] == "none"
@@ -900,11 +904,11 @@ def test_coverage_smoke_uses_exact_first_slot_and_separate_authorization(
         "runtime.json": FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
     }
     assert observed["n7_root"] == (
-        repository / "results/shape-placement-factorial-v22-smoke"
+        repository / "results/shape-placement-factorial-v23-smoke"
     )
     assert (
         repository
-        / "results/shape-placement-factorial-v22-coverage-smoke"
+        / "results/shape-placement-factorial-v23-coverage-smoke"
         / cli.COVERAGE_SMOKE_AUTHORIZATION_FILENAME
     ).read_bytes() == cli._canonical_json_bytes(authorization)
     assert result["validation"]["outcome"] == "PASS"
@@ -994,7 +998,7 @@ def test_campaign_requires_independently_passing_n31_coverage_smoke(
     assert refusal["status"] == "REJECT"
     assert "N=31 coverage smoke" in refusal["reason"]
     assert not (
-        repository / "results/shape-placement-factorial-v22"
+        repository / "results/shape-placement-factorial-v23"
     ).exists()
 
 

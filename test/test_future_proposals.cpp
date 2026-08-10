@@ -70,10 +70,21 @@ using hotstuff::BufferedProposal;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
 using hotstuff::FutureProposalBuffer;
+using hotstuff::FutureProposalBufferLimits;
+using hotstuff::FutureProposalInsertDisposition;
 using hotstuff::ProposalMetadata;
 using hotstuff::ReplicaID;
 using hotstuff::bytearray_t;
 using hotstuff::uint256_t;
+
+static_assert(
+    noexcept(std::declval<FutureProposalBuffer &>().purge(
+        std::declval<const ConfigurationId &>())),
+    "configuration retirement purge must be allocation-free and noexcept");
+static_assert(
+    noexcept(std::declval<FutureProposalBuffer &>().purge_before_epoch(
+        std::declval<std::uint32_t>())),
+    "retirement-floor purge must be allocation-free and noexcept");
 
 uint256_t digest(const std::string &label)
 {
@@ -235,6 +246,207 @@ TEST_CASE("duplicate future proposals retain one buffer entry and payload",
     REQUIRE(drained.size() == 1);
     CHECK((drained.front().wire_payload == bytearray_t{0x01, 0x02}));
     CHECK(buffer.size() == 0);
+}
+
+TEST_CASE("future proposal limits isolate exact configuration generations",
+          "[future-proposals][capacity][per-configuration]")
+{
+    FutureProposalBufferLimits limits;
+    limits.max_entries = 16;
+    limits.max_wire_bytes = 1024;
+    limits.max_entries_per_configuration_generation = 2;
+    limits.max_wire_bytes_per_configuration_generation = 4;
+    FutureProposalBuffer buffer{limits};
+
+    const auto config_a = configuration(12, 3, "epoch-twelve");
+    const auto config_b = configuration(12, 4, "epoch-twelve");
+    auto a_first = proposal(config_a, "a-first", 0, {0x01, 0x02});
+    auto a_second = proposal(config_a, "a-second", 0, {0x03, 0x04});
+    auto a_over_count = proposal(config_a, "a-over-count", 0, {0x05});
+    auto a_next_generation =
+        proposal(config_a, "a-next-generation", 0, {0x06, 0x07});
+    auto b_same_generation =
+        proposal(config_b, "b-same-generation", 1, {0x08, 0x09});
+    a_first.view_generation = 7;
+    a_second.view_generation = 7;
+    a_over_count.view_generation = 7;
+    a_next_generation.view_generation = 8;
+    b_same_generation.view_generation = 7;
+
+    CHECK(buffer.insert(a_first).disposition ==
+          FutureProposalInsertDisposition::inserted);
+    CHECK(buffer.insert(a_second).disposition ==
+          FutureProposalInsertDisposition::inserted);
+    CHECK(buffer.insert(a_over_count).disposition ==
+          FutureProposalInsertDisposition::rejected_capacity);
+
+    // A full exact bucket cannot starve another generation or
+    // configuration.
+    CHECK(buffer.insert(a_next_generation).disposition ==
+          FutureProposalInsertDisposition::inserted);
+    CHECK(buffer.insert(b_same_generation).disposition ==
+          FutureProposalInsertDisposition::inserted);
+    CHECK(buffer.size() == 4);
+
+    FutureProposalBufferLimits byte_limits = limits;
+    byte_limits.max_entries_per_configuration_generation = 8;
+    byte_limits.max_wire_bytes_per_configuration_generation = 3;
+    FutureProposalBuffer byte_buffer{byte_limits};
+    auto byte_first = proposal(config_a, "byte-first", 0, {0x01, 0x02});
+    auto byte_over = proposal(config_a, "byte-over", 0, {0x03, 0x04});
+    auto byte_other_bucket =
+        proposal(config_a, "byte-other-bucket", 0, {0x05, 0x06});
+    byte_first.view_generation = 9;
+    byte_over.view_generation = 9;
+    byte_other_bucket.view_generation = 10;
+
+    CHECK(byte_buffer.insert(byte_first).disposition ==
+          FutureProposalInsertDisposition::inserted);
+    CHECK(byte_buffer.insert(byte_over).disposition ==
+          FutureProposalInsertDisposition::rejected_capacity);
+    CHECK(byte_buffer.insert(byte_other_bucket).disposition ==
+          FutureProposalInsertDisposition::inserted);
+    CHECK(byte_buffer.size() == 2);
+}
+
+TEST_CASE("future proposal global count and wire byte limits fail closed",
+          "[future-proposals][capacity][global]")
+{
+    const auto config_a = configuration(13, 1, "epoch-thirteen");
+    const auto config_b = configuration(13, 2, "epoch-thirteen");
+
+    SECTION("global entry count")
+    {
+        FutureProposalBufferLimits limits;
+        limits.max_entries = 2;
+        limits.max_wire_bytes = 1024;
+        limits.max_entries_per_configuration_generation = 8;
+        limits.max_wire_bytes_per_configuration_generation = 1024;
+        FutureProposalBuffer buffer{limits};
+
+        auto first = proposal(config_a, "count-first", 0, {0x01});
+        auto second = proposal(config_b, "count-second", 1, {0x02});
+        auto overflow = proposal(config_b, "count-overflow", 1, {0x03});
+        first.view_generation = 1;
+        second.view_generation = 2;
+        overflow.view_generation = 3;
+
+        REQUIRE(buffer.insert(first).disposition ==
+                FutureProposalInsertDisposition::inserted);
+        REQUIRE(buffer.insert(second).disposition ==
+                FutureProposalInsertDisposition::inserted);
+        CHECK(buffer.insert(overflow).disposition ==
+              FutureProposalInsertDisposition::rejected_capacity);
+        CHECK_FALSE(buffer.contains(overflow.metadata.key()));
+        CHECK(buffer.size() == 2);
+    }
+
+    SECTION("global retained wire bytes")
+    {
+        FutureProposalBufferLimits limits;
+        limits.max_entries = 8;
+        limits.max_wire_bytes = 3;
+        limits.max_entries_per_configuration_generation = 8;
+        limits.max_wire_bytes_per_configuration_generation = 3;
+        FutureProposalBuffer buffer{limits};
+
+        auto first = proposal(config_a, "bytes-first", 0, {0x01, 0x02});
+        auto overflow = proposal(config_b, "bytes-overflow", 1, {0x03, 0x04});
+        first.view_generation = 1;
+        overflow.view_generation = 2;
+
+        REQUIRE(buffer.insert(first).disposition ==
+                FutureProposalInsertDisposition::inserted);
+        CHECK(buffer.insert(overflow).disposition ==
+              FutureProposalInsertDisposition::rejected_capacity);
+        CHECK_FALSE(buffer.contains(overflow.metadata.key()));
+        CHECK(buffer.size() == 1);
+    }
+}
+
+TEST_CASE("duplicate detection precedes capacity and retains first payload",
+          "[future-proposals][capacity][deduplication]")
+{
+    FutureProposalBufferLimits limits;
+    limits.max_entries = 1;
+    limits.max_wire_bytes = 2;
+    limits.max_entries_per_configuration_generation = 1;
+    limits.max_wire_bytes_per_configuration_generation = 2;
+    FutureProposalBuffer buffer{limits};
+    const auto config = configuration(14, 1, "epoch-fourteen");
+    auto first = proposal(config, "same-key", 0, {0x01, 0x02});
+    auto duplicate = proposal(config, "same-key", 0, bytearray_t(64, 0xff));
+    first.view_generation = 4;
+    duplicate.view_generation = 4;
+
+    REQUIRE(buffer.insert(first).disposition ==
+            FutureProposalInsertDisposition::inserted);
+    CHECK(buffer.insert(duplicate).disposition ==
+          FutureProposalInsertDisposition::duplicate);
+    CHECK(buffer.size() == 1);
+
+    const auto drained = buffer.drain(config);
+    REQUIRE(drained.size() == 1);
+    CHECK((drained.front().wire_payload == bytearray_t{0x01, 0x02}));
+}
+
+TEST_CASE("all removal paths release future proposal capacity exactly",
+          "[future-proposals][capacity][accounting]")
+{
+    FutureProposalBufferLimits limits;
+    limits.max_entries = 1;
+    limits.max_wire_bytes = 2;
+    limits.max_entries_per_configuration_generation = 1;
+    limits.max_wire_bytes_per_configuration_generation = 2;
+    const auto config_a = configuration(15, 1, "epoch-fifteen");
+
+    const auto exercise_release = [&](auto release) {
+        FutureProposalBuffer buffer{limits};
+        auto first = proposal(config_a, "release-first", 0, {0x01, 0x02});
+        auto replacement =
+            proposal(config_a, "release-replacement", 0, {0x03, 0x04});
+        first.view_generation = 1;
+        replacement.view_generation = 1;
+        first.processing_payload = bytearray_t(128, 0xaa);
+        REQUIRE(buffer.insert(first).disposition ==
+                FutureProposalInsertDisposition::inserted);
+        REQUIRE(buffer.insert(replacement).disposition ==
+                FutureProposalInsertDisposition::rejected_capacity);
+        release(buffer, first);
+        CHECK(buffer.insert(replacement).disposition ==
+              FutureProposalInsertDisposition::inserted);
+        CHECK(buffer.size() == 1);
+    };
+
+    SECTION("erase")
+    {
+        exercise_release([](FutureProposalBuffer &buffer,
+                            const BufferedProposal &first) {
+            REQUIRE(buffer.erase(first.metadata.key()));
+        });
+    }
+    SECTION("drain")
+    {
+        exercise_release([](FutureProposalBuffer &buffer,
+                            const BufferedProposal &first) {
+            REQUIRE(buffer.drain(first.metadata.configuration).size() == 1);
+        });
+    }
+    SECTION("purge")
+    {
+        exercise_release([](FutureProposalBuffer &buffer,
+                            const BufferedProposal &first) {
+            REQUIRE(buffer.purge(first.metadata.configuration) == 1);
+        });
+    }
+    SECTION("epoch floor purge")
+    {
+        exercise_release([](FutureProposalBuffer &buffer,
+                            const BufferedProposal &first) {
+            REQUIRE(buffer.purge_before_epoch(
+                        first.metadata.configuration.epoch_number + 1) == 1);
+        });
+    }
 }
 
 TEST_CASE("exact drain is not blocked by another configuration at the head",

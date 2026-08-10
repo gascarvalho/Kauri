@@ -14,25 +14,25 @@ from experiments.adaptive.kauri_experiment import factorial_execution as executi
 from experiments.adaptive.kauri_experiment import factorial_manifest as manifest_module
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
-    FROZEN_MANIFEST_SHA256,
-    FROZEN_PLAN_SHA256,
-    FROZEN_SEMANTIC_SHA256,
     V21_MANIFEST_ID,
     V21_MANIFEST_SHA256,
     V21_PLAN_SHA256,
     V21_SEMANTIC_SHA256,
+    V22_MANIFEST_SHA256,
+    V22_PLAN_SHA256,
+    V22_SEMANTIC_SHA256,
     FactorialManifestError,
     build_factorial_plan,
     load_frozen_manifest,
     parse_manifest_bytes,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
-    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
     V21_COVERAGE_SMOKE_RUNTIME_SHA256,
     V21_RUNTIME_SHA256,
     V21_SMOKE_RUNTIME_SHA256,
+    V22_COVERAGE_SMOKE_RUNTIME_SHA256,
+    V22_RUNTIME_SHA256,
+    V22_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     build_slot_runtime,
     canonical_runtime_bytes,
@@ -100,7 +100,7 @@ def test_v22_only_changes_identity_root_and_snapshot_selection_contract() -> Non
     assert EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1 == (
         SNAPSHOT_SELECTION_CONTRACT_V1
     )
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v22"
+    assert manifest_module.V22_MANIFEST_ID == "shape-placement-factorial-v22"
 
 
 @pytest.mark.parametrize("replacement", (None, "intent_selected_snapshot_v0"))
@@ -186,22 +186,22 @@ def test_v22_snapshot_selection_is_bound_into_slot_artifact_identity() -> None:
 
 def test_v22_all_six_static_identities_are_frozen() -> None:
     assert _runtime_identities(V22_MANIFEST) == (
-        FROZEN_MANIFEST_SHA256,
-        FROZEN_SEMANTIC_SHA256,
-        FROZEN_PLAN_SHA256,
-        FROZEN_RUNTIME_SHA256,
-        FROZEN_SMOKE_RUNTIME_SHA256,
-        FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        V22_MANIFEST_SHA256,
+        V22_SEMANTIC_SHA256,
+        V22_PLAN_SHA256,
+        V22_RUNTIME_SHA256,
+        V22_SMOKE_RUNTIME_SHA256,
+        V22_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
 
 
-def test_v22_default_refuses_v21_and_keeps_ordered_fresh_roots(
+def test_v22_is_validation_only_and_keeps_ordered_frozen_roots(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V22_MANIFEST
-    assert cli.main(["--manifest", str(V21_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST != V22_MANIFEST
+    assert cli.main(["--manifest", str(V22_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v21 are validation-only" in refusal["reason"]
+    assert "v1 through v22 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V22_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

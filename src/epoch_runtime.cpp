@@ -646,9 +646,7 @@ struct HotStuffEpochRuntimeAdapter::State
             envelope.configuration.epoch_number ==
                 active.configuration.epoch_number &&
             envelope.configuration.epoch_digest ==
-                active.configuration.epoch_digest &&
-            active.rotation_ordinal !=
-                std::numeric_limits<std::uint32_t>::max())
+                active.configuration.epoch_digest)
         {
             const auto &trees = active.definition->trees();
             if (trees.size() > 1)
@@ -662,23 +660,36 @@ struct HotStuffEpochRuntimeAdapter::State
                     });
                 if (current != trees.end())
                 {
-                    auto next = current;
-                    ++next;
-                    if (next == trees.end())
-                        next = trees.begin();
-                    const auto generation =
-                        checked_activation_generation(
-                            active.configuration.epoch_number,
+                    auto candidate = current;
+                    for (std::size_t offset = 1;
+                         offset < trees.size();
+                         ++offset)
+                    {
+                        ++candidate;
+                        if (candidate == trees.end())
+                            candidate = trees.begin();
+                        if (candidate->tree_id !=
+                            envelope.configuration.tree_id)
+                            continue;
+                        if (candidate->tree_id ==
+                            active.configuration.tree_id)
+                            return false;
+
+                        const auto ordinal =
                             static_cast<std::uint64_t>(
-                                active.rotation_ordinal) +
-                                1);
-                    if (next->tree_id !=
-                            active.configuration.tree_id &&
-                        envelope.configuration.tree_id ==
-                            next->tree_id &&
-                        generation.has_value() &&
-                        envelope.view_generation == *generation)
-                        return true;
+                                active.rotation_ordinal);
+                        if (static_cast<std::uint64_t>(offset) >
+                            std::numeric_limits<std::uint32_t>::max() -
+                                ordinal)
+                            return false;
+                        const auto generation =
+                            checked_activation_generation(
+                                active.configuration.epoch_number,
+                                ordinal +
+                                    static_cast<std::uint64_t>(offset));
+                        return generation.has_value() &&
+                               envelope.view_generation == *generation;
+                    }
                 }
             }
         }

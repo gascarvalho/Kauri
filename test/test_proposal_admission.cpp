@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include <string>
 
 #include "catch.hpp"
@@ -109,6 +110,7 @@ using hotstuff::EpochStore;
 using hotstuff::EpochTreeDefinition;
 using hotstuff::EpochValidationContext;
 using hotstuff::FutureProposalBuffer;
+using hotstuff::FutureProposalBufferLimits;
 using hotstuff::ProposalAdmissionCoordinator;
 using hotstuff::ProposalAdmissionEffects;
 using hotstuff::ProposalContextEvent;
@@ -247,6 +249,7 @@ struct StagedEpochs
 class EffectSpy final : public ProposalAdmissionEffects
 {
 public:
+    bool throw_on_relay{false};
     std::size_t relays{0};
     std::size_t active_processing{0};
     std::size_t local_votes{0};
@@ -259,6 +262,8 @@ public:
 
     void relay_once(const BufferedProposal &value) override
     {
+        if (throw_on_relay)
+            throw std::runtime_error("relay failure");
         ++relays;
         sequence.emplace_back("relay");
         relayed.push_back(value.metadata.key());
@@ -869,6 +874,103 @@ TEST_CASE("known future proposal is relayed once buffered and otherwise inert",
     const auto activated_again = coordinator.activate(future);
     CHECK(activated_again.empty());
     CHECK(effects.active_processing == 1);
+    CHECK(effects.relays == 1);
+}
+
+TEST_CASE("future capacity rejection precedes relay and received mutation",
+          "[proposal-admission][future][capacity]")
+{
+    StagedEpochs fixture;
+    FutureProposalBufferLimits limits;
+    limits.max_entries = 1;
+    limits.max_wire_bytes = 1;
+    limits.max_entries_per_configuration_generation = 1;
+    limits.max_wire_bytes_per_configuration_generation = 1;
+    FutureProposalBuffer buffer{limits};
+    EffectSpy effects;
+    const auto active = configuration(*fixture.epoch0, 7);
+    const auto future_a = configuration(*fixture.epoch1, 7);
+    const auto future_b = configuration(*fixture.epoch1, 11);
+    ProposalAdmissionCoordinator coordinator{
+        fixture.store, active, buffer, effects};
+    auto admitted = proposal(future_a, "capacity-first", 2, {0x01});
+    auto overflow = proposal(future_b, "capacity-overflow", 3, {0x02});
+    admitted.view_generation = 1;
+    overflow.view_generation = 2;
+
+    REQUIRE(coordinator.receive(admitted).disposition ==
+            ProposalDisposition::buffered_future);
+    REQUIRE(buffer.size() == 1);
+    REQUIRE(effects.relays == 1);
+    REQUIRE(coordinator.storage_stats().retained_received == 1);
+
+    const auto rejected = coordinator.receive(overflow);
+    CHECK(rejected.disposition ==
+          ProposalDisposition::rejected_capacity);
+    CHECK_FALSE(buffer.contains(overflow.metadata.key()));
+    CHECK(buffer.size() == 1);
+    CHECK(effects.relays == 1);
+    CHECK(coordinator.storage_stats().retained_received == 1);
+    check_no_protocol_side_effects(effects);
+
+    // Duplicate classification is stable even while the buffer is full.
+    CHECK(coordinator.receive(admitted).disposition ==
+          ProposalDisposition::duplicate);
+    CHECK(effects.relays == 1);
+    CHECK(coordinator.storage_stats().retained_received == 1);
+
+    // Releasing the retained entry makes the previously rejected exact key
+    // admissible, proving overload did not leave a received tombstone.
+    REQUIRE(coordinator.retire_proposal(admitted.metadata.key()));
+    CHECK(coordinator.receive(overflow).disposition ==
+          ProposalDisposition::buffered_future);
+    CHECK(buffer.contains(overflow.metadata.key()));
+    CHECK(effects.relays == 2);
+    CHECK(coordinator.storage_stats().retained_received == 2);
+
+    // Configuration retirement uses the same exact accounting path and
+    // releases capacity for an unrelated later configuration.
+    REQUIRE(coordinator.retire_configuration(future_b) == 1);
+    const auto later = configuration(*fixture.epoch2, 7);
+    auto after_retirement =
+        proposal(later, "capacity-after-retirement", 2, {0x03});
+    after_retirement.view_generation = 3;
+    CHECK(coordinator.receive(after_retirement).disposition ==
+          ProposalDisposition::buffered_future);
+    CHECK(buffer.contains(after_retirement.metadata.key()));
+    CHECK(effects.relays == 3);
+}
+
+TEST_CASE("future relay exceptions roll back capacity and received state",
+          "[proposal-admission][future][capacity][exception]")
+{
+    StagedEpochs fixture;
+    FutureProposalBufferLimits limits;
+    limits.max_entries = 1;
+    limits.max_wire_bytes = 1;
+    limits.max_entries_per_configuration_generation = 1;
+    limits.max_wire_bytes_per_configuration_generation = 1;
+    FutureProposalBuffer buffer{limits};
+    EffectSpy effects;
+    effects.throw_on_relay = true;
+    const auto active = configuration(*fixture.epoch0, 7);
+    const auto future = configuration(*fixture.epoch1, 7);
+    ProposalAdmissionCoordinator coordinator{
+        fixture.store, active, buffer, effects};
+    auto candidate = proposal(future, "relay-rollback", 2, {0x01});
+    candidate.view_generation = 1;
+
+    REQUIRE_THROWS_AS(coordinator.receive(candidate), std::runtime_error);
+    CHECK(buffer.size() == 0);
+    CHECK_FALSE(buffer.contains(candidate.metadata.key()));
+    CHECK(coordinator.storage_stats().retained_received == 0);
+    CHECK(effects.relays == 0);
+
+    effects.throw_on_relay = false;
+    CHECK(coordinator.receive(candidate).disposition ==
+          ProposalDisposition::buffered_future);
+    CHECK(buffer.size() == 1);
+    CHECK(coordinator.storage_stats().retained_received == 1);
     CHECK(effects.relays == 1);
 }
 

@@ -210,6 +210,15 @@ EpochDefinitionInput rotating_epoch_v2_input()
     return input;
 }
 
+EpochDefinitionInput wide_rotating_epoch_v2_input()
+{
+    // Repeat roots only after every member has led once.  Tree identity and
+    // canonical definition order, rather than root identity, define the
+    // prospective-generation horizon exercised by this fixture.
+    return rooted_epoch_v2_input(
+        0, {0, 1, 2, 3, 4, 5, 6, 0, 1, 2});
+}
+
 EpochDefinitionInput shaped_epoch_v2_input(
     std::uint32_t epoch_number,
     const std::vector<ReplicaID> &roots,
@@ -738,14 +747,26 @@ struct RotatingProposalHarness
     explicit RotatingProposalHarness(
         std::uint32_t rotation_ordinal = 0,
         std::uint32_t active_tree_id = 6)
-        : epoch0(store.stage(
-              rotating_epoch_v2_input(), validation_context(0))),
+        : RotatingProposalHarness(
+              rotating_epoch_v2_input(),
+              rotation_ordinal,
+              active_tree_id,
+              {})
+    {}
+
+    RotatingProposalHarness(
+        EpochDefinitionInput initial,
+        std::uint32_t rotation_ordinal,
+        std::uint32_t active_tree_id,
+        FutureProposalBufferLimits future_limits = {})
+        : epoch0(store.stage(std::move(initial), validation_context(0))),
           activation(
               store,
               epoch0,
               0,
               active_tree_id,
               rotation_ordinal),
+          future(future_limits),
           admission(
               store,
               activation.active_effect().configuration,
@@ -1305,6 +1326,293 @@ TEST_CASE("adaptive v2 buffers only the exact immediate next tree until live rot
     CHECK(idempotent.remaining == 0);
 }
 
+TEST_CASE("adaptive v2 buffers distinct canonical future configurations and drains only the active bucket",
+          "[adaptive-v2][epoch-live-binding][rotation][future-proposal][horizon]")
+{
+    RotatingProposalHarness harness;
+    const auto active = harness.activation.active_effect();
+    REQUIRE(active.configuration.tree_id == 6);
+    const auto generation_at = [&active](std::uint64_t offset) {
+        return checked_activation_generation(
+            active.configuration.epoch_number,
+            static_cast<std::uint64_t>(active.rotation_ordinal) + offset);
+    };
+    const auto tree42_generation = generation_at(1);
+    const auto tree77_generation = generation_at(2);
+    REQUIRE(tree42_generation.has_value());
+    REQUIRE(tree77_generation.has_value());
+
+    const ConfigurationId tree42{
+        active.configuration.epoch_number,
+        42,
+        active.configuration.epoch_digest};
+    const ConfigurationId tree77{
+        active.configuration.epoch_number,
+        77,
+        active.configuration.epoch_digest};
+    const auto first = rotation_proposal(
+        tree42, *tree42_generation, 1, "future-tree-42");
+    const auto second = rotation_proposal(
+        tree77, *tree77_generation, 2, "future-tree-77");
+
+    const auto first_buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(first),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(first_buffered.error == EpochIngressError::none);
+    REQUIRE(first_buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    const auto second_buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(second),
+        AuthenticatedEpochPeer::replica(2));
+    REQUIRE(second_buffered.error == EpochIngressError::none);
+    REQUIRE(second_buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+
+    const auto second_duplicate = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(second),
+        AuthenticatedEpochPeer::replica(2));
+    REQUIRE(second_duplicate.error == EpochIngressError::none);
+    CHECK(second_duplicate.admission_disposition ==
+          ProposalDisposition::duplicate);
+    CHECK(harness.future.size() == 2);
+    CHECK(harness.proposal_effects.relay_count == 2);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    CHECK(harness.proposal_effects.expected_vote_state_count == 0);
+    CHECK(harness.proposal_effects.latency_deadline_count == 0);
+    CHECK(harness.proposal_effects.aggregation_timer_count == 0);
+    CHECK(harness.proposal_effects.timeout_report_count == 0);
+
+    const auto first_rotation = harness.binding.rotate_to_tree(42);
+    REQUIRE(first_rotation.error == EpochIngressError::none);
+    REQUIRE(first_rotation.update.has_value());
+    CHECK(harness.live_effects.apply_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 1);
+    CHECK(harness.proposal_effects.process_count == 1);
+    CHECK(harness.proposal_effects.apply_count_seen_on_process == 1);
+    CHECK(harness.proposal_effects.processed_body == first.body);
+    CHECK(harness.future.size() == 1);
+    const auto retained =
+        harness.adapter.buffered_proposal_identity(second.key());
+    REQUIRE(retained.has_value());
+    CHECK(retained->view_generation == *tree77_generation);
+
+    const auto second_rotation = harness.binding.rotate_to_tree(77);
+    REQUIRE(second_rotation.error == EpochIngressError::none);
+    REQUIRE(second_rotation.update.has_value());
+    CHECK(harness.live_effects.apply_count == 2);
+    CHECK(harness.proposal_effects.process_attempt_count == 2);
+    CHECK(harness.proposal_effects.process_count == 2);
+    CHECK(harness.proposal_effects.apply_count_seen_on_process == 2);
+    CHECK(harness.proposal_effects.processed_body == second.body);
+    CHECK(harness.future.size() == 0);
+
+    const auto second_after_activation = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(second),
+        AuthenticatedEpochPeer::replica(2));
+    REQUIRE(second_after_activation.error == EpochIngressError::none);
+    CHECK(second_after_activation.admission_disposition ==
+          ProposalDisposition::duplicate);
+    CHECK(harness.proposal_effects.relay_count == 2);
+    CHECK(harness.proposal_effects.process_attempt_count == 2);
+}
+
+TEST_CASE("adaptive v2 admits the seventh canonical future offset without preactivation effects",
+          "[adaptive-v2][epoch-runtime][rotation][future-proposal][horizon][offset-seven]")
+{
+    RotatingProposalHarness harness(
+        wide_rotating_epoch_v2_input(), 2, 2);
+    const auto active = harness.activation.active_effect();
+    const auto generation = checked_activation_generation(
+        active.configuration.epoch_number,
+        static_cast<std::uint64_t>(active.rotation_ordinal) + 7);
+    REQUIRE(generation.has_value());
+    const auto &tree9 = harness.epoch0.trees().at(9);
+    const auto proposal = rotation_proposal(
+        ConfigurationId{
+            active.configuration.epoch_number,
+            tree9.tree_id,
+            active.configuration.epoch_digest},
+        *generation,
+        tree9.members_breadth_first.front(),
+        "future-offset-seven");
+
+    const auto buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(proposal.originator));
+    REQUIRE(buffered.error == EpochIngressError::none);
+    REQUIRE(buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    CHECK(harness.proposal_effects.expected_vote_state_count == 0);
+    CHECK(harness.proposal_effects.latency_deadline_count == 0);
+    CHECK(harness.proposal_effects.aggregation_timer_count == 0);
+    CHECK(harness.proposal_effects.timeout_report_count == 0);
+}
+
+TEST_CASE("adaptive v2 future capacity rejection is inert and leaves no received tombstone",
+          "[adaptive-v2][epoch-runtime][future-proposal][capacity][fail-closed]")
+{
+    FutureProposalBufferLimits limits;
+    limits.max_entries = 1;
+    limits.max_wire_bytes = 1024 * 1024;
+    limits.max_entries_per_configuration_generation = 1;
+    limits.max_wire_bytes_per_configuration_generation = 1024 * 1024;
+    RotatingProposalHarness harness(
+        rotating_epoch_v2_input(), 0, 6, limits);
+    const auto active = harness.activation.active_effect();
+    const auto generation_at = [&active](std::uint64_t offset) {
+        return checked_activation_generation(
+            active.configuration.epoch_number,
+            static_cast<std::uint64_t>(active.rotation_ordinal) + offset);
+    };
+    const auto first_generation = generation_at(1);
+    const auto second_generation = generation_at(2);
+    REQUIRE(first_generation.has_value());
+    REQUIRE(second_generation.has_value());
+    const auto first = rotation_proposal(
+        ConfigurationId{
+            active.configuration.epoch_number,
+            42,
+            active.configuration.epoch_digest},
+        *first_generation,
+        1,
+        "capacity-retained-first");
+    const auto second = rotation_proposal(
+        ConfigurationId{
+            active.configuration.epoch_number,
+            77,
+            active.configuration.epoch_digest},
+        *second_generation,
+        2,
+        "capacity-rejected-second");
+
+    const auto retained = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(first),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(retained.error == EpochIngressError::none);
+    REQUIRE(retained.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 1);
+
+    for (std::size_t attempt = 0; attempt < 2; ++attempt)
+    {
+        const auto rejected = harness.binding.handle_proposal(
+            consensus_message<MsgPropose>(second),
+            AuthenticatedEpochPeer::replica(2));
+        CHECK(rejected.error == EpochIngressError::state_rejected);
+        CHECK(rejected.permission ==
+              EpochConsensusPermission::rejected_identity);
+        REQUIRE(rejected.admission_disposition.has_value());
+        CHECK(*rejected.admission_disposition ==
+              ProposalDisposition::rejected_capacity);
+        CHECK(harness.future.size() == 1);
+        CHECK(harness.proposal_effects.relay_count == 1);
+        CHECK(harness.proposal_effects.process_attempt_count == 0);
+        CHECK_FALSE(
+            harness.adapter.buffered_proposal_identity(second.key())
+                .has_value());
+        CHECK_FALSE(
+            harness.adapter.processed_proposal_identity(second.key())
+                .has_value());
+    }
+
+    REQUIRE(harness.binding.rotate_to_tree(42).update.has_value());
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.process_count == 1);
+
+    const auto admitted_after_release = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(second),
+        AuthenticatedEpochPeer::replica(2));
+    REQUIRE(admitted_after_release.error == EpochIngressError::none);
+    REQUIRE(admitted_after_release.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 2);
+    CHECK(harness.proposal_effects.process_count == 1);
+    REQUIRE(harness.binding.rotate_to_tree(77).update.has_value());
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.process_count == 2);
+}
+
+TEST_CASE("adaptive v2 buffers the canonical tree3 through tree9 prefix and replays it only after sequential live activation",
+          "[adaptive-v2][epoch-live-binding][rotation][future-proposal][horizon][end-to-end]")
+{
+    RotatingProposalHarness harness(
+        wide_rotating_epoch_v2_input(), 2, 2);
+    const auto active = harness.activation.active_effect();
+    REQUIRE(active.configuration.tree_id == 2);
+    REQUIRE(active.rotation_ordinal == 2);
+    REQUIRE(harness.epoch0.trees().size() == 10);
+
+    std::vector<EpochConsensusEnvelope> proposals;
+    for (std::uint32_t tree_id = 3; tree_id <= 9; ++tree_id)
+    {
+        const auto offset = static_cast<std::uint64_t>(tree_id - 2);
+        const auto generation = checked_activation_generation(
+            active.configuration.epoch_number,
+            static_cast<std::uint64_t>(active.rotation_ordinal) + offset);
+        REQUIRE(generation.has_value());
+        const auto &tree = harness.epoch0.trees().at(tree_id);
+        const auto label = "future-tree-" + std::to_string(tree_id);
+        proposals.push_back(rotation_proposal(
+            ConfigurationId{
+                active.configuration.epoch_number,
+                tree_id,
+                active.configuration.epoch_digest},
+            *generation,
+            tree.members_breadth_first.front(),
+            label.c_str()));
+    }
+
+    for (const auto &proposal : proposals)
+    {
+        const auto buffered = harness.binding.handle_proposal(
+            consensus_message<MsgPropose>(proposal),
+            AuthenticatedEpochPeer::replica(proposal.originator));
+        REQUIRE(buffered.error == EpochIngressError::none);
+        REQUIRE(buffered.admission_disposition ==
+                ProposalDisposition::buffered_future);
+    }
+
+    CHECK(harness.future.size() == proposals.size());
+    CHECK(harness.proposal_effects.relay_count == proposals.size());
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    CHECK(harness.proposal_effects.expected_vote_state_count == 0);
+    CHECK(harness.proposal_effects.latency_deadline_count == 0);
+    CHECK(harness.proposal_effects.aggregation_timer_count == 0);
+    CHECK(harness.proposal_effects.timeout_report_count == 0);
+
+    for (std::size_t index = 0; index < proposals.size(); ++index)
+    {
+        const auto tree_id = static_cast<std::uint32_t>(index + 3);
+        const auto rotated = harness.binding.rotate_to_tree(tree_id);
+        REQUIRE(rotated.error == EpochIngressError::none);
+        REQUIRE(rotated.update.has_value());
+        CHECK(rotated.update->activation.configuration ==
+              proposals[index].configuration);
+        CHECK(rotated.update->activation.generation ==
+              proposals[index].view_generation);
+        CHECK(harness.live_effects.apply_count == index + 1);
+        CHECK(harness.proposal_effects.process_attempt_count == index + 1);
+        CHECK(harness.proposal_effects.process_count == index + 1);
+        CHECK(harness.proposal_effects.apply_count_seen_on_process ==
+              index + 1);
+        CHECK(harness.proposal_effects.processed_body ==
+              proposals[index].body);
+        CHECK(harness.future.size() == proposals.size() - index - 1);
+        CHECK(harness.proposal_effects.timeout_report_count == 0);
+    }
+}
+
 TEST_CASE("adaptive v2 prospective tree gate rejects inexact identities",
           "[adaptive-v2][epoch-runtime][rotation][future-proposal][fail-closed]")
 {
@@ -1366,6 +1674,26 @@ TEST_CASE("adaptive v2 prospective tree gate rejects inexact identities",
         rotation_proposal(
             ConfigurationId{
                 active.configuration.epoch_number,
+                999,
+                active.configuration.epoch_digest},
+            *next_generation,
+            2,
+            "unknown-tree"),
+        2);
+    rejects(
+        rotation_proposal(
+            ConfigurationId{
+                active.configuration.epoch_number + 1,
+                42,
+                active.configuration.epoch_digest},
+            *next_generation,
+            1,
+            "wrong-epoch"),
+        1);
+    rejects(
+        rotation_proposal(
+            ConfigurationId{
+                active.configuration.epoch_number,
                 42,
                 digest("wrong-current-epoch-digest")},
             *next_generation,
@@ -1389,8 +1717,8 @@ TEST_CASE("adaptive v2 prospective tree gate rejects inexact identities",
     CHECK(harness.proposal_effects.relay_count == 0);
 }
 
-TEST_CASE("adaptive v2 prospective proposal wraps from last tree to first",
-          "[adaptive-v2][epoch-live-binding][rotation][future-proposal][wrap]")
+TEST_CASE("adaptive v2 prospective proposal horizon wraps once but never admits the full-wrap current tree",
+          "[adaptive-v2][epoch-live-binding][rotation][future-proposal][wrap][nonwrapping]")
 {
     RotatingProposalHarness harness(2, 77);
     const auto active = harness.activation.active_effect();
@@ -1405,6 +1733,27 @@ TEST_CASE("adaptive v2 prospective proposal wraps from last tree to first",
     REQUIRE(wrapped_generation.has_value());
     const auto proposal = rotation_proposal(
         wrapped, *wrapped_generation, 0, "wrapped-next-tree");
+
+    const auto full_wrap_generation = checked_activation_generation(
+        active.configuration.epoch_number,
+        static_cast<std::uint64_t>(active.rotation_ordinal) +
+            harness.epoch0.trees().size());
+    REQUIRE(full_wrap_generation.has_value());
+    const auto current_tree_future = rotation_proposal(
+        active.configuration,
+        *full_wrap_generation,
+        2,
+        "full-wrap-current-tree");
+    const auto current_rejected = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(current_tree_future),
+        AuthenticatedEpochPeer::replica(2));
+    CHECK(current_rejected.error == EpochIngressError::state_rejected);
+    CHECK(current_rejected.permission ==
+          EpochConsensusPermission::rejected_identity);
+    CHECK_FALSE(current_rejected.admission_disposition.has_value());
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.relay_count == 0);
+    CHECK(harness.live_effects.apply_count == 0);
 
     const auto buffered = harness.binding.handle_proposal(
         consensus_message<MsgPropose>(proposal),
@@ -1527,6 +1876,54 @@ TEST_CASE("adaptive v2 prospective rotation fails closed at ordinal exhaustion",
     CHECK(rotation.error == EpochIngressError::state_rejected);
     CHECK_FALSE(rotation.update.has_value());
     CHECK(harness.live_effects.apply_count == 0);
+}
+
+TEST_CASE("adaptive v2 future horizon admits the last ordinal and rejects an overflowing later offset",
+          "[adaptive-v2][epoch-runtime][rotation][future-proposal][overflow][horizon]")
+{
+    RotatingProposalHarness harness(
+        std::numeric_limits<std::uint32_t>::max() - 1);
+    const auto active = harness.activation.active_effect();
+    const auto final_generation = checked_activation_generation(
+        active.configuration.epoch_number,
+        std::numeric_limits<std::uint32_t>::max());
+    REQUIRE(final_generation.has_value());
+
+    const auto final = rotation_proposal(
+        ConfigurationId{
+            active.configuration.epoch_number,
+            42,
+            active.configuration.epoch_digest},
+        *final_generation,
+        1,
+        "last-valid-ordinal");
+    const auto final_buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(final),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(final_buffered.error == EpochIngressError::none);
+    REQUIRE(final_buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 1);
+
+    const auto overflow = rotation_proposal(
+        ConfigurationId{
+            active.configuration.epoch_number,
+            77,
+            active.configuration.epoch_digest},
+        *final_generation + 1,
+        2,
+        "overflowing-second-offset");
+    const auto rejected = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(overflow),
+        AuthenticatedEpochPeer::replica(2));
+    CHECK(rejected.error == EpochIngressError::state_rejected);
+    CHECK(rejected.permission ==
+          EpochConsensusPermission::rejected_identity);
+    CHECK_FALSE(rejected.admission_disposition.has_value());
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
 }
 
 TEST_CASE("adaptive v1 retains same-epoch future-tree rejection",

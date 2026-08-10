@@ -8,7 +8,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include "hotstuff/configuration.h"
@@ -46,26 +48,71 @@ struct BufferedProposal
     bytearray_t processing_payload;
 };
 
+struct FutureProposalBufferLimits
+{
+    std::size_t max_entries{4096};
+    std::size_t max_wire_bytes{64U * 1024U * 1024U};
+    std::size_t max_entries_per_configuration_generation{64};
+    std::size_t max_wire_bytes_per_configuration_generation{
+        16U * 1024U * 1024U};
+};
+
+enum class FutureProposalInsertDisposition
+{
+    inserted,
+    duplicate,
+    rejected_capacity
+};
+
+struct FutureProposalInsertResult
+{
+    FutureProposalInsertDisposition disposition;
+
+    // Preserve source compatibility for existing insertion-only adapters.
+    operator bool() const noexcept
+    {
+        return disposition == FutureProposalInsertDisposition::inserted;
+    }
+};
+
 class FutureProposalBuffer final
 {
 public:
-    bool insert(BufferedProposal proposal);
+    explicit FutureProposalBuffer(
+        FutureProposalBufferLimits limits = {});
+
+    FutureProposalInsertResult insert(BufferedProposal proposal);
     bool contains(const ProposalKey &key) const;
     const BufferedProposal *first_unclaimed(
         const ConfigurationId &configuration,
         const std::set<ProposalKey> &claimed) const noexcept;
-    bool erase(const ProposalKey &key);
+    bool erase(const ProposalKey &key) noexcept;
     std::size_t size() const noexcept;
 
     std::vector<BufferedProposal> drain(
         const ConfigurationId &configuration);
-    std::size_t purge(const ConfigurationId &configuration);
+    std::size_t purge(
+        const ConfigurationId &configuration) noexcept;
     std::size_t purge_before_epoch(
-        std::uint32_t first_live_epoch);
+        std::uint32_t first_live_epoch) noexcept;
 
 private:
+    using ConfigurationGeneration =
+        std::pair<ConfigurationId, std::uint64_t>;
+
+    struct BucketUsage
+    {
+        std::size_t entries{0};
+        std::size_t wire_bytes{0};
+    };
+
+    void release(const BufferedProposal &proposal) noexcept;
+
+    FutureProposalBufferLimits limits_;
     std::vector<BufferedProposal> proposals_;
     std::set<ProposalKey> keys_;
+    std::map<ConfigurationGeneration, BucketUsage> bucket_usage_;
+    std::size_t retained_wire_bytes_{0};
 };
 
 } // namespace hotstuff

@@ -56,6 +56,7 @@ from .factorial_manifest import (
     EXPECTED_BLOCK_COUNT,
     EXPECTED_SLOT_COUNT,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+    FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
     FROZEN_PLAN_SHA256,
@@ -136,6 +137,9 @@ from .factorial_manifest import (
     V21_MANIFEST_ID,
     V21_MANIFEST_SHA256,
     V21_PLAN_SHA256,
+    V22_MANIFEST_ID,
+    V22_MANIFEST_SHA256,
+    V22_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -192,8 +196,11 @@ V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v21-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v22-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v23-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -336,14 +343,23 @@ V21_SMOKE_RUNTIME_SHA256 = (
 V21_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "5f0fa01ac8f5368cc09eff70d0a30f22156275e86683a627f54840caaa0eaa0c"
 )
-FROZEN_RUNTIME_SHA256 = (
+V22_RUNTIME_SHA256 = (
     "ca423f6513cf54f774ce198af970af4bc0bccae2bb0143ab3e48a842ff680caa"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V22_SMOKE_RUNTIME_SHA256 = (
     "9f8ecd3fbf44fe067e376bd24efe0adcb0938d8b383291e81106432ea1136583"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V22_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "b45fdba31d55c70107751cb0f3a00e26a2bf6b49352d50b342cd9768740af4db"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "2eadce094849280fa632cba7064bed822b2e172485e49d084131d09be9e73e42"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "aa86c344be1df785a3dd0f8602cda5534316b4b0f5e09d45b8605d14f74976d0"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "8706bc9292691b48c5f5db7728e22bebb6eaae399643da9cee5778d78adb9bd6"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -443,6 +459,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
         V21_MANIFEST_ID,
+        V22_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -508,7 +525,8 @@ def _uses_selection_visible_hard_timeout_witnesses(
             == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
         )
     return (
-        manifest.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V21_MANIFEST_ID, V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
     )
@@ -519,7 +537,8 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V21_MANIFEST_ID, V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
@@ -541,6 +560,7 @@ def _uses_source_bound_contribution_opportunities(
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -561,6 +581,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -581,6 +602,7 @@ def _uses_precontainment_fault_coverage(
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -601,6 +623,7 @@ def _uses_precontainment_shape_preservation(
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -624,6 +647,7 @@ def _uses_precontainment_guarded_selection_contract(
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -640,22 +664,23 @@ def _uses_future_tree_proposal_delivery_contract(
     manifest: FrozenFactorialManifest,
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
-    return (
-        manifest.manifest_id
-        in {
-            V19_MANIFEST_ID,
-            V20_MANIFEST_ID,
-            V21_MANIFEST_ID,
-            FROZEN_MANIFEST_ID,
-        }
-        and responsive is not None
-        and getattr(
-            responsive,
-            "future_tree_proposal_delivery_contract",
-            None,
-        )
-        == FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
-    )
+    if responsive is None:
+        return False
+    expected_by_manifest = {
+        V19_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+        V20_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+        V21_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+        V22_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+        FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+    }
+    expected = expected_by_manifest.get(manifest.manifest_id)
+    if expected is None:
+        return False
+    return getattr(
+        responsive,
+        "future_tree_proposal_delivery_contract",
+        None,
+    ) == expected
 
 
 def _uses_source_bound_proposal_witness_contract(
@@ -664,7 +689,12 @@ def _uses_source_bound_proposal_witness_contract(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V20_MANIFEST_ID, V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and getattr(
             responsive,
@@ -680,7 +710,7 @@ def _uses_evidence_snapshot_selection_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -943,6 +973,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V21_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V21_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V22_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V22_MANIFEST_ID,
+            manifest_sha256=V22_MANIFEST_SHA256,
+            plan_sha256=V22_PLAN_SHA256,
+            runtime_sha256=V22_RUNTIME_SHA256,
+            smoke_runtime_sha256=V22_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V22_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2609,6 +2649,11 @@ def _is_excluded_coverage_smoke_slot(
             V21_COVERAGE_SMOKE_RUNTIME_SHA256,
             V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V22_MANIFEST_ID: (
+            V22_RUNTIME_SHA256,
+            V22_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2657,6 +2702,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V21_MANIFEST_ID:
         return V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V22_MANIFEST_ID:
+        return V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -2927,6 +2974,7 @@ def _validate_runtime_slot(
             V19_MANIFEST_ID,
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -2934,18 +2982,27 @@ def _validate_runtime_slot(
         _fail("future-tree proposal delivery contract drifted")
     if (
         manifest.manifest_id
-        in {V20_MANIFEST_ID, V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V20_MANIFEST_ID,
+            V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and not source_bound_proposal_witnesses
     ):
         _fail("source-bound proposal witness contract drifted")
     if (
-        manifest.manifest_id in {V21_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V21_MANIFEST_ID, V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
             manifest
         )
     ):
         _fail("responsive timeout nonwitness contract drifted")
-    if manifest.manifest_id == FROZEN_MANIFEST_ID and not (
+    if manifest.manifest_id in {
+        V22_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    } and not (
         evidence_snapshot_selection
     ):
         _fail("evidence snapshot selection contract drifted")
@@ -3025,7 +3082,11 @@ def _validate_runtime_slot(
         if future_tree_proposal_delivery:
             artifact_identity[
                 "future_tree_proposal_delivery_contract"
-            ] = FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+            ] = (
+                FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
+                if manifest.manifest_id == FROZEN_MANIFEST_ID
+                else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+            )
         if source_bound_proposal_witnesses:
             artifact_identity[
                 "source_bound_proposal_witness_contract"
@@ -3172,7 +3233,11 @@ def _validate_runtime_slot(
     if future_tree_proposal_delivery:
         expected_causal_acceptance[
             "future_tree_proposal_delivery_contract"
-        ] = FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+        ] = (
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
+            if manifest.manifest_id == FROZEN_MANIFEST_ID
+            else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+        )
     if source_bound_proposal_witnesses:
         expected_causal_acceptance[
             "source_bound_proposal_witness_contract"
@@ -3255,6 +3320,7 @@ def _validate_runtime_slot(
         V19_MANIFEST_ID,
         V20_MANIFEST_ID,
         V21_MANIFEST_ID,
+        V22_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (

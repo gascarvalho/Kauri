@@ -23,6 +23,7 @@ enum class ProposalDisposition
     rejected_digest_mismatch,
     rejected_stale_configuration,
     rejected_invalid_proposer,
+    rejected_capacity,
     duplicate,
     buffered_future,
     admitted_active

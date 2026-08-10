@@ -107,21 +107,46 @@ ProposalAdmissionResult ProposalAdmissionCoordinator::receive(
     }
 
     const auto key = proposal.metadata.key();
-    if (!received_.insert(key).second)
+    if (received_.count(key) != 0)
     {
         return result(ProposalDisposition::duplicate, key);
     }
 
-    effects_.relay_once(proposal);
     if (proposal.metadata.configuration != active_configuration_)
     {
-        if (!future_proposals_.insert(std::move(proposal)))
+        const auto insertion = future_proposals_.insert(proposal);
+        if (insertion.disposition ==
+            FutureProposalInsertDisposition::duplicate)
         {
             return result(ProposalDisposition::duplicate, key);
+        }
+        if (insertion.disposition ==
+            FutureProposalInsertDisposition::rejected_capacity)
+        {
+            return result(ProposalDisposition::rejected_capacity, key);
+        }
+
+        try
+        {
+            if (!received_.insert(key).second)
+            {
+                future_proposals_.erase(key);
+                return result(ProposalDisposition::duplicate, key);
+            }
+            effects_.relay_once(proposal);
+        }
+        catch (...)
+        {
+            received_.erase(key);
+            future_proposals_.erase(key);
+            throw;
         }
         return result(ProposalDisposition::buffered_future, key);
     }
 
+    if (!received_.insert(key).second)
+        return result(ProposalDisposition::duplicate, key);
+    effects_.relay_once(proposal);
     admitted_.insert(key);
     effects_.process_active(proposal);
     return result(ProposalDisposition::admitted_active, key);

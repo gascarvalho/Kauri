@@ -36,6 +36,7 @@ from .factorial_manifest import (
     FactorialManifestError,
     FactorialSlot,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+    FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
@@ -4315,6 +4316,7 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v20/slot-066-n31-f5-b05-P": "v20",
         "results/shape-placement-factorial-v21/slot-066-n31-f5-b05-P": "v21",
         "results/shape-placement-factorial-v22/slot-066-n31-f5-b05-P": "v22",
+        "results/shape-placement-factorial-v23/slot-066-n31-f5-b05-P": "v23",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
@@ -4326,30 +4328,36 @@ def build_n31_coverage_smoke_slot(
         "v20": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
         "v21": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v22": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v23": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
-        if manifest_version in {"v17", "v18", "v19", "v20", "v21", "v22"}
+        if manifest_version
+        in {"v17", "v18", "v19", "v20", "v21", "v22", "v23"}
         else None
     )
     expected_guarded_selection_contract = (
         PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
-        if manifest_version in {"v18", "v19", "v20", "v21", "v22"}
+        if manifest_version in {"v18", "v19", "v20", "v21", "v22", "v23"}
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
-        FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
-        if manifest_version in {"v19", "v20", "v21", "v22"}
-        else None
+        FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
+        if manifest_version == "v23"
+        else (
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
+            if manifest_version in {"v19", "v20", "v21", "v22"}
+            else None
+        )
     )
     expected_source_bound_proposal_witness_contract = (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-        if manifest_version in {"v20", "v21", "v22"}
+        if manifest_version in {"v20", "v21", "v22", "v23"}
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-        if manifest_version == "v22"
+        if manifest_version in {"v22", "v23"}
         else None
     )
     if (
