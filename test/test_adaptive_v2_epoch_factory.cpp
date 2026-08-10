@@ -221,7 +221,8 @@ EpochDefinitionInput campaign_contained_epoch_input(
 
 AdaptiveV2SelectionResult campaign_inherited_selection(
     const EpochDefinition &current,
-    const CampaignScaleCase &profile)
+    const CampaignScaleCase &profile,
+    bool selected_replicas_recovered = false)
 {
     const auto members = campaign_membership();
     const std::set<ReplicaID> hard(
@@ -257,7 +258,8 @@ AdaptiveV2SelectionResult campaign_inherited_selection(
             observation.reporter_monotonic_ns =
                 (sequence + 1) * 1'000;
             const bool omitted =
-                hard.count(target) != 0 ||
+                (!selected_replicas_recovered &&
+                 hard.count(target) != 0) ||
                 (degraded.count(target) != 0 && attempt == 31);
             if (omitted)
             {
@@ -302,7 +304,14 @@ AdaptiveV2SelectionResult campaign_inherited_selection(
         std::make_unique<hotstuff::AdaptationSnapshot>(
             std::move(snapshot));
     result.selected_replicas = profile.hard;
-    result.eligible_roots = profile.fast;
+    for (const auto &entry : result.snapshot->ranking())
+    {
+        if (hard.count(entry.replica_id) == 0 && entry.eligible &&
+            result.eligible_roots.size() < 21)
+        {
+            result.eligible_roots.push_back(entry.replica_id);
+        }
+    }
     return result;
 }
 
@@ -977,6 +986,90 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "N31 f2 containment keeps an all-responsive inherited set below every "
+    "influential position",
+    "[adaptive-v2][epoch-factory][inheritance][recovered][containment]"
+    "[n31][f2]")
+{
+    const CampaignScaleCase profile{
+        2,
+        41'728,
+        {26, 27, 28},
+        {1, 7, 8, 12, 16, 19, 20},
+        {}};
+    const auto members = campaign_membership();
+    EpochStore store{members};
+    const auto &current = store.stage(
+        campaign_contained_epoch_input(profile),
+        EpochValidationContext{});
+    auto selection = campaign_inherited_selection(
+        current, profile, true);
+    REQUIRE(selection.snapshot != nullptr);
+    const auto ranking_before = selection.snapshot->ranking();
+    const auto snapshot_id_before = selection.snapshot->snapshot_id();
+    for (const auto selected : selection.selected_replicas)
+    {
+        const auto entry = std::find_if(
+            selection.snapshot->ranking().begin(),
+            selection.snapshot->ranking().end(),
+            [selected](const auto &candidate) {
+                return candidate.replica_id == selected;
+            });
+        REQUIRE(entry != selection.snapshot->ranking().end());
+        REQUIRE(entry->classification == ResponsivenessClass::responsive);
+        REQUIRE(entry->eligible);
+    }
+
+    hotstuff::AdaptiveV2TransitionPolicy policy;
+    policy.intent = TreePolicyKind::fault_containment;
+    for (const auto &tree : current.trees())
+    {
+        policy.containment_baseline_roots.push_back(
+            BaselineRoot{
+                tree.tree_id,
+                tree.members_breadth_first.front()});
+    }
+    const TreePlacementInput placement{
+        members,
+        TreeShape{2, 2, 21},
+        profile.scientific_seed,
+        "shape25-fault-containment-v1"};
+    const auto result = hotstuff::build_adaptive_v2_successor_bundle(
+        current,
+        selection,
+        policy,
+        placement,
+        5,
+        kIssuerId,
+        private_key(),
+        EpochChangeBundleLimits{});
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    REQUIRE(result.bundle->definition().trees.size() == 21);
+    CHECK(selection.snapshot->ranking() == ranking_before);
+    CHECK(selection.snapshot->snapshot_id() == snapshot_id_before);
+    for (const auto &tree : result.bundle->definition().trees)
+    {
+        CHECK(tree.fanout == 2);
+        CHECK(tree.wait_exempt_leaves == profile.hard);
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto selected : profile.hard)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                selected);
+            REQUIRE(position != tree.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      tree.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
+    }
+}
+
+TEST_CASE(
     "containment preserves a responsive baseline root below the top Q",
     "[adaptive-v2][epoch-factory][containment][roots][n7]")
 {
@@ -1282,6 +1375,54 @@ TEST_CASE(
             REQUIRE(position != candidate.members_breadth_first.end());
             CHECK(static_cast<std::size_t>(std::distance(
                       candidate.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
+    }
+}
+
+TEST_CASE(
+    "factory replaces a freshly responsive inherited baseline-root "
+    "collision",
+    "[adaptive-v2][epoch-factory][inheritance][recovered][containment]"
+    "[baseline-collision][n7]")
+{
+    InheritedFixture fixture(inherited_epoch_input(), true);
+    hotstuff::AdaptiveV2TransitionPolicy policy;
+    policy.intent = TreePolicyKind::fault_containment;
+    policy.containment_baseline_roots = {
+        BaselineRoot{0, 0},
+        BaselineRoot{1, 2},
+        BaselineRoot{2, 3},
+        BaselineRoot{3, 4},
+        BaselineRoot{4, 5}};
+
+    const auto result = hotstuff::build_adaptive_v2_successor_bundle(
+        *fixture.current,
+        fixture.selection,
+        policy,
+        fixture.placement,
+        5,
+        kIssuerId,
+        fixture.key,
+        fixture.limits);
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    CHECK(bundle_roots(*result.bundle) ==
+          std::vector<ReplicaID>{6, 2, 3, 4, 5});
+    for (const auto &tree : result.bundle->definition().trees)
+    {
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto selected : fixture.selection.selected_replicas)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                selected);
+            REQUIRE(position != tree.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      tree.members_breadth_first.begin(), position)) >=
                   leaf_start);
         }
     }

@@ -1250,6 +1250,67 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "N7 recurring containment keeps freshly responsive inherited actors "
+    "as leaves",
+    "[adaptive-v2][manager-controller][inheritance][recovered]"
+    "[fault-containment][n7]")
+{
+    Fixture fixture;
+    rotate_to_exact_epoch_one(
+        fixture, TreePolicyKind::fault_containment);
+    fixture.ready_all();
+    fixture.complete_responsive_baseline();
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+
+    fixture.complete_responsive_baseline();
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    const auto &selection = *fixture.controller->selection_audit();
+    REQUIRE(selection.snapshot != nullptr);
+    CHECK(selection.constraint_basis ==
+          AdaptiveV2SelectionConstraintBasis::
+              inherited_consensus_wait_exempt);
+    CHECK(selection.selected_replicas ==
+          std::vector<ReplicaID>{0, 1});
+    CHECK(selection.metadata.replica_count == 7);
+    CHECK(selection.metadata.fault_threshold == 2);
+    CHECK(selection.metadata.quorum == 5);
+    for (const auto actor : selection.selected_replicas)
+    {
+        const auto *entry = ranking_entry(*selection.snapshot, actor);
+        REQUIRE(entry != nullptr);
+        CHECK(entry->classification == ResponsivenessClass::responsive);
+        CHECK(entry->eligible);
+    }
+
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    CHECK(successor_roots(*fixture.controller) ==
+          std::vector<ReplicaID>{2, 3, 4, 5, 6});
+    for (const auto &tree :
+         fixture.controller->successor_bundle()->definition().trees)
+    {
+        CHECK(tree.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto actor : selection.selected_replicas)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                actor);
+            REQUIRE(position != tree.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      tree.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
+    }
+    CHECK(fixture.controller->healthy());
+}
+
+TEST_CASE(
     "recurring policies reject malformed predecessor containment sets",
     "[adaptive-v2][manager-controller][inheritance][fail-closed][n7]")
 {

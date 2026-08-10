@@ -127,17 +127,17 @@ ValidatedInput validate_input(
     return validated;
 }
 
-ValidatedInput apply_performance_constraints(
+ValidatedInput apply_explicit_constraints(
     ValidatedInput validated,
     const TreePlacementInput &input,
-    const PerformanceOptimizationPolicy &policy)
+    const std::vector<ReplicaID> &constrained_leaves)
 {
-    if (policy.constrained_leaves.empty())
+    if (constrained_leaves.empty())
         return validated;
-    if (policy.constrained_leaves.size() > validated.members.size())
+    if (constrained_leaves.size() > validated.members.size())
         reject("tree policy constrained leaves exceed membership");
 
-    for (const auto replica : policy.constrained_leaves)
+    for (const auto replica : constrained_leaves)
     {
         if (validated.scores.count(replica) == 0 ||
             !validated.policy_constrained.insert(replica).second)
@@ -164,6 +164,24 @@ ValidatedInput apply_performance_constraints(
     if (constrained_count > leaf_capacity)
         reject("tree policy constraints exceed leaf capacity");
     return validated;
+}
+
+ValidatedInput apply_performance_constraints(
+    ValidatedInput validated,
+    const TreePlacementInput &input,
+    const PerformanceOptimizationPolicy &policy)
+{
+    return apply_explicit_constraints(
+        std::move(validated), input, policy.constrained_leaves);
+}
+
+ValidatedInput apply_containment_constraints(
+    ValidatedInput validated,
+    const TreePlacementInput &input,
+    const FaultContainmentPolicy &policy)
+{
+    return apply_explicit_constraints(
+        std::move(validated), input, policy.constrained_leaves);
 }
 
 std::vector<std::optional<ReplicaID>> canonical_baselines(
@@ -213,6 +231,7 @@ RootPlan containment_roots(
         const auto replica = *baselines[tree];
         const auto *score = find_score(validated, replica);
         if (score != nullptr && score->eligible &&
+            validated.policy_constrained.count(replica) == 0 &&
             reserved.insert(replica).second)
         {
             preserve[tree] = true;
@@ -237,7 +256,8 @@ RootPlan containment_roots(
             {
                 reason = RootSelectionReason::fallback_missing_baseline;
             }
-            else if (!requested_score->eligible)
+            else if (!requested_score->eligible ||
+                     validated.policy_constrained.count(requested) != 0)
             {
                 reason =
                     RootSelectionReason::fallback_ineligible_baseline;
@@ -261,8 +281,11 @@ RootPlan containment_roots(
         }
 
         const auto *selected_score = find_score(validated, selected);
-        if (selected_score == nullptr || !selected_score->eligible)
+        if (selected_score == nullptr || !selected_score->eligible ||
+            validated.policy_constrained.count(selected) != 0)
+        {
             reject("tree policy selected an invalid root");
+        }
         plan.roots[tree] = selected;
         plan.decisions.push_back(
             {static_cast<std::uint32_t>(tree),
@@ -578,7 +601,8 @@ TreePlacementResult build_tree_placement(
     const AdaptationSnapshot &snapshot,
     const FaultContainmentPolicy &policy)
 {
-    const auto validated = validate_input(input, snapshot);
+    const auto validated = apply_containment_constraints(
+        validate_input(input, snapshot), input, policy);
     auto work = build_work(
         input,
         snapshot,

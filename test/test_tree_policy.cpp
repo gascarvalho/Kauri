@@ -92,6 +92,7 @@ struct BaselineRoot
 struct FaultContainmentPolicy
 {
     std::vector<BaselineRoot> baseline_roots;
+    std::vector<ReplicaID> constrained_leaves;
 };
 
 struct PerformanceOptimizationPolicy
@@ -652,6 +653,158 @@ TEST_CASE("containment replaces unusable baseline roots by ranked eligible repli
               RootSelectionReason::preserved_eligible_baseline);
         CHECK(reserved.explanation().root_decisions.at(2).reason ==
               RootSelectionReason::preserved_eligible_baseline);
+    }
+}
+
+TEST_CASE(
+    "containment keeps responsive explicit constraints out of N31 f2 "
+    "influential roles",
+    "[t10][tree-policy][containment][constraints][recovered][n31][f2]")
+{
+    const auto members = sequential_members(31);
+    const auto snapshot = make_snapshot(members);
+    const auto ranking_before = snapshot.ranking();
+    const auto snapshot_id_before = snapshot.snapshot_id();
+    const auto input = placement_input(
+        members, 2, 21, 0xA2F7, "fault-containment-constrained-v1");
+    std::vector<BaselineRoot> baselines;
+    for (std::uint32_t tree_id = 0; tree_id < 21; ++tree_id)
+    {
+        baselines.push_back(BaselineRoot{
+            tree_id, static_cast<ReplicaID>(tree_id)});
+    }
+    const FaultContainmentPolicy policy{
+        std::move(baselines), {26, 27, 28}};
+
+    const auto result = hotstuff::build_tree_placement(
+        input, snapshot, policy);
+
+    REQUIRE(result.trees().size() == 21);
+    for (std::size_t tree_index = 0;
+         tree_index < result.trees().size();
+         ++tree_index)
+    {
+        const auto &tree = result.trees()[tree_index];
+        CHECK(tree.members_breadth_first.front() == tree_index);
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto constrained : policy.constrained_leaves)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                constrained);
+            REQUIRE(position != tree.members_breadth_first.end());
+            const auto position_index = static_cast<std::size_t>(
+                std::distance(
+                    tree.members_breadth_first.begin(), position));
+            CHECK(position_index >= leaf_start);
+            const auto &role = result.explanation().replica_roles.at(
+                tree_index * members.size() + position_index);
+            CHECK(role.classification == ResponsivenessClass::responsive);
+            CHECK(role.eligible);
+            CHECK(role.role == TreeReplicaRole::leaf);
+            CHECK(role.reason == ReplicaPlacementReason::
+                                     policy_constrained_leaf);
+        }
+    }
+    CHECK(snapshot.ranking() == ranking_before);
+    CHECK(snapshot.snapshot_id() == snapshot_id_before);
+
+    auto reordered_policy = policy;
+    std::reverse(
+        reordered_policy.constrained_leaves.begin(),
+        reordered_policy.constrained_leaves.end());
+    const auto reordered = hotstuff::build_tree_placement(
+        input, snapshot, reordered_policy);
+    CHECK(output_fingerprint(reordered) == output_fingerprint(result));
+}
+
+TEST_CASE(
+    "containment treats a constrained baseline root as an ineligible "
+    "fallback",
+    "[t10][tree-policy][containment][constraints][baseline-collision][n7]")
+{
+    const auto members = sequential_members(7);
+    const auto snapshot = make_snapshot(members);
+    const auto input = placement_input(
+        members, 2, 5, 0xC011, "fault-containment-collision-v1");
+    const FaultContainmentPolicy policy{
+        {BaselineRoot{0, 0},
+         BaselineRoot{1, 2},
+         BaselineRoot{2, 3},
+         BaselineRoot{3, 4},
+         BaselineRoot{4, 5}},
+        {0, 1}};
+
+    const auto result = hotstuff::build_tree_placement(
+        input, snapshot, policy);
+
+    CHECK(selected_roots(result) ==
+          std::vector<ReplicaID>{6, 2, 3, 4, 5});
+    REQUIRE(result.explanation().root_decisions.size() == 5);
+    CHECK(result.explanation().root_decisions.front().reason ==
+          RootSelectionReason::fallback_ineligible_baseline);
+    CHECK(score_for(snapshot, 0).eligible);
+    for (const auto &tree : result.trees())
+    {
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto constrained : policy.constrained_leaves)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                constrained);
+            REQUIRE(position != tree.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      tree.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
+    }
+}
+
+TEST_CASE(
+    "containment explicit constraints reject malformed and over-capacity "
+    "input",
+    "[t10][tree-policy][containment][constraints][negative][n7]")
+{
+    const auto members = sequential_members(7);
+    const auto snapshot = make_snapshot(members);
+    const auto input = placement_input(
+        members, 2, 1, 0xC011, "fault-containment-constrained-v1");
+    const std::vector<BaselineRoot> baseline{BaselineRoot{0, 6}};
+
+    SECTION("constraints must be unique")
+    {
+        CHECK_THROWS_AS(
+            hotstuff::build_tree_placement(
+                input,
+                snapshot,
+                FaultContainmentPolicy{baseline, {0, 0}}),
+            std::invalid_argument);
+    }
+
+    SECTION("constraints must be exact members")
+    {
+        CHECK_THROWS_AS(
+            hotstuff::build_tree_placement(
+                input,
+                snapshot,
+                FaultContainmentPolicy{baseline, {0, 7}}),
+            std::invalid_argument);
+    }
+
+    SECTION("constraints must fit the exact physical leaf capacity")
+    {
+        REQUIRE(first_leaf_index(7, 2) == 3);
+        CHECK_THROWS_AS(
+            hotstuff::build_tree_placement(
+                input,
+                snapshot,
+                FaultContainmentPolicy{
+                    baseline, {0, 1, 2, 3, 4}}),
+            std::invalid_argument);
     }
 }
 

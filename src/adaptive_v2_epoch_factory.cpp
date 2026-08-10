@@ -617,12 +617,17 @@ bool exact_containment_placement(
 
     const std::set<ReplicaID> member_set(
         membership.begin(), membership.end());
+    const std::set<ReplicaID> constrained(
+        selected.begin(), selected.end());
     std::vector<ReplicaID> eligible_roots;
     eligible_roots.reserve(snapshot.ranking().size());
     for (const auto &entry : snapshot.ranking())
     {
-        if (entry.eligible)
+        if (entry.eligible &&
+            constrained.count(entry.replica_id) == 0)
+        {
             eligible_roots.push_back(entry.replica_id);
+        }
     }
     const std::set<ReplicaID> eligible(
         eligible_roots.begin(), eligible_roots.end());
@@ -842,7 +847,8 @@ AdaptiveV2EpochFactoryResult build_validated(
                 placement_input,
                 *selection.snapshot,
                 FaultContainmentPolicy{
-                    transition_policy.containment_baseline_roots}));
+                    transition_policy.containment_baseline_roots,
+                    selected}));
             break;
         case TreePolicyKind::performance_optimization:
             if (!transition_policy.containment_baseline_roots.empty())

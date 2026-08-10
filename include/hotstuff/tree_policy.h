@@ -71,6 +71,15 @@ struct BaselineRoot
 struct FaultContainmentPolicy
 {
     std::vector<BaselineRoot> baseline_roots;
+    /**
+     * Optional exact member set that must remain leaves in every tree.
+     *
+     * These replicas retain their immutable evidence classification and
+     * eligibility in the explanation, but cannot be selected as roots or
+     * internal members. An empty set preserves the original containment
+     * behavior.
+     */
+    std::vector<ReplicaID> constrained_leaves;
 };
 
 struct PerformanceOptimizationPolicy
