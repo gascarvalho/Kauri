@@ -51,6 +51,8 @@ from typing import Any
 
 from .factorial_manifest import (
     EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     EXPECTED_ARM_CODES,
     EXPECTED_BLOCK_COUNT,
@@ -153,6 +155,9 @@ from .factorial_manifest import (
     V26_MANIFEST_ID,
     V26_MANIFEST_SHA256,
     V26_PLAN_SHA256,
+    V27_MANIFEST_ID,
+    V27_MANIFEST_SHA256,
+    V27_PLAN_SHA256,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     FrozenFactorialManifest,
@@ -210,6 +215,10 @@ FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
 )
+V27_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v15-coverage-smoke"
 )
@@ -246,8 +255,11 @@ V25_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V26_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v26-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V27_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v27-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v28-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -435,14 +447,23 @@ V26_SMOKE_RUNTIME_SHA256 = (
 V26_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "34b7cfacebf3c3998a01b1432a3b7b5a10efc51ea23c4e807365b085f838e62f"
 )
-FROZEN_RUNTIME_SHA256 = (
+V27_RUNTIME_SHA256 = (
     "fac92d4b69431f4e3ce8f4839adbea5772862eb2f6dceb3f5271309a7a914c50"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V27_SMOKE_RUNTIME_SHA256 = (
     "af2ecb0e0a338643ec31debc523590260efdc2a7b22fc1fb60b4a227b64cbd3a"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V27_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "6b50e59233cb2552c8160c6d2293aa6158920b14235ff4fdc602f65f1b567c7c"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "7925f0de66f0d7fd7412dfae3e9754dcbceb8d0516b875552f98b3f637225fba"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "de9599ac4d22582fea1746eda8deb885e6bc9f2c1d79c9fd723de299cc0edb74"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "af28c19dafb2f01461c5b3c3a648a7ac4f200a71880a965b2ff9da892792fa84"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -470,6 +491,20 @@ EVIDENCE_WINDOW_RULE = "fresh_exact_predecessor_after_common_commit"
 SELECTOR_VERSION = "shape-v1"
 SHAPE_TIE_RULE = "lower-latency-risk-churn-current-canonical-v1"
 REFERENCE_TREE_RULE = "lowest-tree-id-prefix-q-v1"
+EXCLUDED_REPAIR_OBSERVATION_ROW_NAMES = (
+    "epoch1_selection",
+    "epoch1_command",
+    "epoch1_activation",
+    "epoch1_terminal",
+    "epoch1_stable_end",
+    "fault_window_end",
+    "epoch2_selection",
+    "epoch2_command",
+    "epoch2_activation",
+    "epoch2_terminal",
+    "epoch2_stable_end",
+    "epoch2_drain_complete",
+)
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _UINT64_MAX = (1 << 64) - 1
@@ -524,6 +559,7 @@ _V24_EPOCH1_PRESELECTION_RESIDENCY_MS = 60_000
 _V24_PRIMARY_INTERNAL_ROLE_OPPORTUNITIES = 82
 _V27_FAULT_WINDOW_DURATION_S = 450
 _V27_HARD_TIMEOUT_S = 650
+_V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S = 300
 _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
     "{{fault_containment_evidence_start_monotonic_ns}}"
 )
@@ -551,6 +587,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V24_MANIFEST_ID,
         V25_MANIFEST_ID,
         V26_MANIFEST_ID,
+        V27_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -565,6 +602,7 @@ def _v24_preselection_contract(
         V24_MANIFEST_ID,
         V25_MANIFEST_ID,
         V26_MANIFEST_ID,
+        V27_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return None
@@ -684,6 +722,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -704,6 +743,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -732,6 +772,7 @@ def _uses_source_bound_contribution_opportunities(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -757,6 +798,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -782,6 +824,7 @@ def _uses_precontainment_fault_coverage(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -807,6 +850,7 @@ def _uses_precontainment_shape_preservation(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -835,6 +879,7 @@ def _uses_precontainment_guarded_selection_contract(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -862,6 +907,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V24_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V25_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V26_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V27_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -888,6 +934,7 @@ def _uses_source_bound_proposal_witness_contract(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -912,6 +959,7 @@ def _uses_evidence_snapshot_selection_contract(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -929,7 +977,13 @@ def _uses_inherited_consensus_wait_exempt_placement_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {
+            V25_MANIFEST_ID,
+            V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and getattr(
             responsive,
@@ -946,6 +1000,7 @@ def _uses_verified_response_duplicate_delivery_contract(
     responsive = manifest.byzantine.responsive_degradation
     expected_by_manifest = {
         V26_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
+        V27_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     }
     return (
@@ -1008,6 +1063,18 @@ _RESPONSE_EVIDENCE_DUPLICATE_MARKER = re.compile(
     r"epoch=([0-9]+) tree=([0-9]+) digest=([0-9a-f]{64}) "
     r"block=([0-9a-f]{64}) message_type=(direct_vote|aggregate_relay) "
     r"attempt_generation=([0-9]+) response_monotonic_ns=([0-9]+)\s*$"
+)
+RESPONSE_DUPLICATE_PROBE_MODE_V1 = (
+    "exact_once_post_fault_epoch1_responsive_internal_child_v1"
+)
+_RESPONSE_DUPLICATE_PROBE_MARKER = re.compile(
+    r"(?:^|\s)KAURI_EXPERIMENT response_duplicate_probe "
+    r"mode=([^\s]+) consensus_accepted=([01]) "
+    r"reporter=([0-9]+) child=([0-9]+) epoch=([0-9]+) tree=([0-9]+) "
+    r"digest=([0-9a-f]{64}) block=([0-9a-f]{64}) "
+    r"message_type=(direct_vote|aggregate_relay) "
+    r"response_monotonic_ns=([0-9]+) window_end_monotonic_ns=([0-9]+) "
+    r"first_call_recorded=([01]) second_call_recorded=([01])\s*$"
 )
 _RELAY_INGRESS_BEGIN_MARKER = re.compile(
     r"(?:^|\s)KAURI_RELAY_INGRESS stage=begin recipient=([0-9]+) "
@@ -1290,6 +1357,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
                 V26_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
+        V27_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V27_MANIFEST_ID,
+            manifest_sha256=V27_MANIFEST_SHA256,
+            plan_sha256=V27_PLAN_SHA256,
+            runtime_sha256=V27_RUNTIME_SHA256,
+            smoke_runtime_sha256=V27_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V27_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
             manifest_id=FROZEN_MANIFEST_ID,
             manifest_sha256=FROZEN_MANIFEST_SHA256,
@@ -1476,6 +1553,37 @@ class _IdempotentDuplicateResponseMarker:
     message_type: str
     attempt_generation: int
     response_monotonic_ns: int
+
+    @property
+    def identity(self) -> tuple[int, int, int, int, str, str, str]:
+        return (
+            self.reporter_id,
+            self.child_id,
+            self.epoch_number,
+            self.tree_id,
+            self.epoch_digest,
+            self.block_hash,
+            self.message_type,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ResponseDuplicateProbeMarker:
+    relative_path: str
+    line_number: int
+    reporter_id: int
+    child_id: int
+    epoch_number: int
+    tree_id: int
+    epoch_digest: str
+    block_hash: str
+    message_type: str
+    response_monotonic_ns: int
+    window_end_monotonic_ns: int
+    mode: str
+    consensus_accepted: int
+    first_call_recorded: int
+    second_call_recorded: int
 
     @property
     def identity(self) -> tuple[int, int, int, int, str, str, str]:
@@ -2987,6 +3095,8 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
 def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
     if manifest_id == FROZEN_MANIFEST_ID:
         return FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id == V27_MANIFEST_ID:
+        return V27_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V26_MANIFEST_ID:
         return V26_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V25_MANIFEST_ID:
@@ -3073,6 +3183,11 @@ def _is_excluded_coverage_smoke_slot(
             V26_COVERAGE_SMOKE_RUNTIME_SHA256,
             V26_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V27_MANIFEST_ID: (
+            V27_RUNTIME_SHA256,
+            V27_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V27_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -3131,6 +3246,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V25_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V26_MANIFEST_ID:
         return V26_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V27_MANIFEST_ID:
+        return V27_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -3143,24 +3260,33 @@ def _validate_v25_coverage_runtime_document(
     manifest: FrozenFactorialManifest,
     expected_by_id: Mapping[str, _ExpectedSlot],
 ) -> dict[str, Mapping[str, Any]]:
+    manifest_id = manifest.manifest_id
+    expected_fields = {
+        "schema_version",
+        "runtime_id",
+        "manifest_id",
+        "execution_mode",
+        "automatic_retries",
+        "replacement_policy",
+        "stop_on_first_non_pass",
+        "minimum_free_bytes",
+        "slots",
+    }
+    if manifest_id == FROZEN_MANIFEST_ID:
+        expected_fields.add("excluded_repair_smoke_probe")
     _fields(
         runtime,
-        {
-            "schema_version",
-            "runtime_id",
-            "manifest_id",
-            "execution_mode",
-            "automatic_retries",
-            "replacement_policy",
-            "stop_on_first_non_pass",
-            "minimum_free_bytes",
-            "slots",
-        },
+        expected_fields,
         "v25+ N=31 coverage runtime",
     )
-    manifest_id = manifest.manifest_id
     if (
-        manifest_id not in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest_id
+        not in {
+            V25_MANIFEST_ID,
+            V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         or runtime.get("schema_version") != 1
         or runtime.get("runtime_id")
         != f"{manifest_id}-excluded-n31-coverage-smoke-v1"
@@ -3198,6 +3324,12 @@ def _validate_v25_coverage_runtime_document(
             _fail("v25 coverage constituent runtime result path drifted")
         _validate_runtime_slot(slot_runtime, expected, manifest)
         validated[slot_id] = slot_runtime
+    if manifest_id == FROZEN_MANIFEST_ID:
+        repair = validated[FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]]
+        if runtime.get("excluded_repair_smoke_probe") != repair.get(
+            "excluded_repair_smoke_probe"
+        ):
+            _fail("v28 coverage runtime repair probe identity drifted")
     return validated
 
 
@@ -3324,7 +3456,12 @@ def _load_static_contracts(
                 "runtime.json drifted from the exact frozen N=31 coverage "
                 "smoke identity"
             )
-        if manifest.manifest_id in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+        if manifest.manifest_id in {
+            V25_MANIFEST_ID,
+            V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }:
             constituents = _validate_v25_coverage_runtime_document(
                 runtime,
                 manifest=manifest,
@@ -3479,6 +3616,17 @@ def _validate_runtime_slot(
         _uses_verified_response_duplicate_delivery_contract(manifest)
     )
     responsive_contract_value = manifest.byzantine.responsive_degradation
+    v28_repair_runtime = (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and expected.slot_id == FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
+        and runtime.get("result_path")
+        == f"{EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT}/{expected.slot_id}"
+    )
+    effective_fault_window_duration_s = (
+        _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+        if v28_repair_runtime
+        else manifest.byzantine.duration_s
+    )
     duplicate_contract_value = (
         None
         if responsive_contract_value is None
@@ -3488,12 +3636,43 @@ def _validate_runtime_slot(
             None,
         )
     )
+    excluded_repair_observation_contract = (
+        None
+        if responsive_contract_value is None
+        else getattr(
+            responsive_contract_value,
+            "excluded_repair_smoke_observation_contract",
+            None,
+        )
+    )
+    excluded_repair_duplicate_probe_contract = (
+        None
+        if responsive_contract_value is None
+        else getattr(
+            responsive_contract_value,
+            "excluded_repair_smoke_verified_response_duplicate_probe_contract",
+            None,
+        )
+    )
+    if manifest.manifest_id == FROZEN_MANIFEST_ID:
+        if (
+            excluded_repair_observation_contract
+            != EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+            or excluded_repair_duplicate_probe_contract
+            != EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+        ):
+            _fail("v28 excluded repair smoke profile contracts drifted")
+    elif (
+        excluded_repair_observation_contract is not None
+        or excluded_repair_duplicate_probe_contract is not None
+    ):
+        _fail("excluded repair smoke profile contracts escaped v28")
     v24_preselection_contract = _v24_preselection_contract(manifest)
-    if manifest.manifest_id == FROZEN_MANIFEST_ID and (
+    if manifest.manifest_id in {V27_MANIFEST_ID, FROZEN_MANIFEST_ID} and (
         manifest.byzantine.duration_s != _V27_FAULT_WINDOW_DURATION_S
         or manifest.common_timers.hard_timeout_s != _V27_HARD_TIMEOUT_S
     ):
-        _fail("v27 fault-window duration or hard timeout drifted")
+        _fail("v27+ campaign fault-window duration or hard timeout drifted")
     if (
         manifest.manifest_id
         in {
@@ -3505,6 +3684,7 @@ def _validate_runtime_slot(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -3520,6 +3700,7 @@ def _validate_runtime_slot(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -3534,6 +3715,7 @@ def _validate_runtime_slot(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -3547,17 +3729,28 @@ def _validate_runtime_slot(
         V24_MANIFEST_ID,
         V25_MANIFEST_ID,
         V26_MANIFEST_ID,
+        V27_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
     ):
         _fail("evidence snapshot selection contract drifted")
     if (
-        manifest.manifest_id in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {
+            V25_MANIFEST_ID,
+            V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and not inherited_wait_exempt_placement
     ):
         _fail("inherited consensus wait-exempt placement contract drifted")
-    if manifest.manifest_id in {V26_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest.manifest_id in {
+        V26_MANIFEST_ID,
+        V27_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         if not verified_response_duplicate_delivery:
             _fail("verified response duplicate delivery contract drifted")
     elif duplicate_contract_value is not None:
@@ -3646,6 +3839,7 @@ def _validate_runtime_slot(
                     V24_MANIFEST_ID,
                     V25_MANIFEST_ID,
                     V26_MANIFEST_ID,
+                    V27_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -3667,6 +3861,17 @@ def _validate_runtime_slot(
             artifact_identity[
                 "verified_response_duplicate_delivery_contract"
             ] = duplicate_contract_value
+        if manifest.manifest_id == FROZEN_MANIFEST_ID:
+            artifact_identity.update(
+                {
+                    "excluded_repair_smoke_observation_contract": (
+                        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+                    ),
+                    "excluded_repair_smoke_verified_response_duplicate_probe_contract": (
+                        EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+                    ),
+                }
+            )
         if v24_preselection_contract is not None:
             artifact_identity["epoch1_preselection_residency_ms"] = (
                 v24_preselection_contract[0]
@@ -3674,7 +3879,7 @@ def _validate_runtime_slot(
             artifact_identity[
                 "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection"
             ] = v24_preselection_contract[1]
-        if manifest.manifest_id == FROZEN_MANIFEST_ID:
+        if manifest.manifest_id in {V27_MANIFEST_ID, FROZEN_MANIFEST_ID}:
             artifact_identity["fault_window_duration_s"] = (
                 _V27_FAULT_WINDOW_DURATION_S
             )
@@ -3689,6 +3894,41 @@ def _validate_runtime_slot(
         }
     if manifest.cleanup_contract is not None:
         artifact_identity["cleanup_contract"] = manifest.cleanup_contract
+    source_campaign_artifact_id = (
+        "slot-runtime-" + _sha256(_canonical_json_bytes(artifact_identity))[:24]
+    )
+    expected_repair_probe: dict[str, object] | None = None
+    if v28_repair_runtime:
+        expected_repair_probe = {
+            "source_campaign_slot_id": expected.slot_id,
+            "source_campaign_result_path": (
+                f"results/{FROZEN_MANIFEST_ID}/{expected.slot_id}"
+            ),
+            "source_campaign_artifact_id": source_campaign_artifact_id,
+            "semantic_delta": "byzantine.window.duration_s:450->300",
+            "source_fault_window_duration_s": _V27_FAULT_WINDOW_DURATION_S,
+            "effective_fault_window_duration_s": (
+                _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+            ),
+            "hard_timeout_s": _V27_HARD_TIMEOUT_S,
+            "observation_contract": (
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+            ),
+            "verified_response_duplicate_probe_contract": (
+                EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+            ),
+            "verified_response_duplicate_probe_mode": (
+                RESPONSE_DUPLICATE_PROBE_MODE_V1
+            ),
+        }
+        if runtime.get("excluded_repair_smoke_probe") != expected_repair_probe:
+            _fail("v28 excluded repair smoke probe runtime contract drifted")
+        artifact_identity["fault_window_duration_s"] = (
+            _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+        )
+        artifact_identity["excluded_repair_smoke_probe"] = expected_repair_probe
+    elif "excluded_repair_smoke_probe" in runtime:
+        _fail("excluded repair smoke probe leaked outside exact v28 slot037 runtime")
     checks = {
         "schema_version": 1,
         "artifact_id": "slot-runtime-"
@@ -3825,6 +4065,7 @@ def _validate_runtime_slot(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -3846,6 +4087,17 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "verified_response_duplicate_delivery_contract"
         ] = duplicate_contract_value
+    if manifest.manifest_id == FROZEN_MANIFEST_ID:
+        expected_causal_acceptance.update(
+            {
+                "excluded_repair_smoke_observation_contract": (
+                    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+                ),
+                "excluded_repair_smoke_verified_response_duplicate_probe_contract": (
+                    EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+                ),
+            }
+        )
     if v24_preselection_contract is not None:
         expected_causal_acceptance["epoch1_preselection_residency_ms"] = (
             v24_preselection_contract[0]
@@ -3898,7 +4150,7 @@ def _validate_runtime_slot(
         "start_after_prelaunch_anchor_s": (
             manifest.byzantine.start_after_prelaunch_anchor_s
         ),
-        "duration_s": manifest.byzantine.duration_s,
+        "duration_s": effective_fault_window_duration_s,
         "transition_convergence_deadline_s": (
             manifest.common_timers.transition_convergence_deadline_s
         ),
@@ -3932,6 +4184,7 @@ def _validate_runtime_slot(
         V24_MANIFEST_ID,
         V25_MANIFEST_ID,
         V26_MANIFEST_ID,
+        V27_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -4098,6 +4351,8 @@ def _validate_runtime_slot(
         manager_argv,
         (),
     )
+    if "--experiment-response-evidence-duplicate-probe" in manager_argv:
+        _fail("v28 response duplicate probe option leaked into manager argv")
     required_nonresponsive = (
         manager_argv[manager_argv.index("--required-nonresponsive") + 1]
         if manager_argv.count("--required-nonresponsive") == 1
@@ -4167,6 +4422,15 @@ def _validate_runtime_slot(
             "--experiment-responsive-degraded-omission-actors" not in argv
             and "--experiment-responsive-omission-period" not in argv
         )
+        probe_option = "--experiment-response-evidence-duplicate-probe"
+        probe_options_valid = (
+            argv.count(probe_option) == 1
+            and options.get(probe_option) == RESPONSE_DUPLICATE_PROBE_MODE_V1
+            and argv.count(RESPONSE_DUPLICATE_PROBE_MODE_V1) == 1
+        ) if v28_repair_runtime else (
+            probe_option not in argv
+            and RESPONSE_DUPLICATE_PROBE_MODE_V1 not in argv
+        )
         if (
             argv.count("--experiment-byzantine-mode") != 1
             or argv.count("--experiment-byzantine-window") != 1
@@ -4183,6 +4447,7 @@ def _validate_runtime_slot(
             or options.get("--experiment-byzantine-max-omissions-per-proposal")
             != str(expected_max_omissions)
             or not tiered_options_valid
+            or not probe_options_valid
         ):
             _fail("runtime replica omission actor/cap contract drifted")
 
@@ -6497,6 +6762,100 @@ def _relay_ingress_witnesses(
                     )
                 )
     return tuple(witnesses), tuple(all_duplicates)
+
+
+def _response_duplicate_probe_markers(
+    slot_root: Path,
+    paths_by_replica: Mapping[int, Sequence[str]],
+) -> tuple[_ResponseDuplicateProbeMarker, ...]:
+    """Parse exact repair-only response-evidence replay probe markers."""
+
+    markers: list[_ResponseDuplicateProbeMarker] = []
+
+    def uint64(token: str, label: str, *, minimum: int = 0) -> int:
+        try:
+            value = int(token)
+        except ValueError as error:
+            raise _Reject(f"{label} is not an integer") from error
+        if not minimum <= value <= _UINT64_MAX:
+            _fail(f"{label} exceeds its unsigned 64-bit bound")
+        return value
+
+    for replica_id, paths in paths_by_replica.items():
+        for relative in paths:
+            path = _safe_file(slot_root, relative)
+            assert path is not None
+            try:
+                if path.stat().st_size > _MAX_EVENT_STREAM_BYTES:
+                    _fail(f"process log exceeds its fixed bound: {relative}")
+                with path.open("rb") as stream:
+                    for line_number, raw in enumerate(stream, start=1):
+                        if len(raw) > _MAX_EVENT_LINE_BYTES:
+                            _fail(f"{relative}:{line_number} exceeds the line bound")
+                        token = b"KAURI_EXPERIMENT response_duplicate_probe"
+                        if token not in raw:
+                            continue
+                        if raw.count(token) != 1:
+                            _fail(
+                                f"{relative}:{line_number} has an ambiguous "
+                                "response duplicate probe marker"
+                            )
+                        try:
+                            line = raw.decode("utf-8", errors="strict").rstrip(
+                                "\r\n"
+                            )
+                        except UnicodeDecodeError as error:
+                            raise _Reject(
+                                f"{relative}:{line_number} response duplicate "
+                                "probe marker is not UTF-8"
+                            ) from error
+                        matches = tuple(_RESPONSE_DUPLICATE_PROBE_MARKER.finditer(line))
+                        if len(matches) != 1:
+                            _fail(
+                                f"{relative}:{line_number} has a malformed "
+                                "response duplicate probe marker"
+                            )
+                        match = matches[0]
+                        marker = _ResponseDuplicateProbeMarker(
+                            relative_path=relative,
+                            line_number=line_number,
+                            mode=match.group(1),
+                            consensus_accepted=uint64(
+                                match.group(2), "probe consensus accepted"
+                            ),
+                            reporter_id=uint64(match.group(3), "probe reporter"),
+                            child_id=uint64(match.group(4), "probe child"),
+                            epoch_number=uint64(match.group(5), "probe epoch"),
+                            tree_id=uint64(match.group(6), "probe tree"),
+                            epoch_digest=match.group(7),
+                            block_hash=match.group(8),
+                            message_type=match.group(9),
+                            response_monotonic_ns=uint64(
+                                match.group(10),
+                                "probe response monotonic timestamp",
+                                minimum=1,
+                            ),
+                            window_end_monotonic_ns=uint64(
+                                match.group(11),
+                                "probe fault-window end",
+                                minimum=1,
+                            ),
+                            first_call_recorded=uint64(
+                                match.group(12), "probe first-call result"
+                            ),
+                            second_call_recorded=uint64(
+                                match.group(13), "probe second-call result"
+                            ),
+                        )
+                        if marker.reporter_id != replica_id:
+                            _fail(
+                                "response duplicate probe reporter differs from "
+                                "its replica log"
+                            )
+                        markers.append(marker)
+            except OSError as error:
+                raise _Incomplete(f"cannot read process log {relative}") from error
+    return tuple(markers)
 
 
 def _adaptive_proposal_identity(
@@ -9007,17 +9366,22 @@ def _validate_phase_cutoffs(
     replica_count: int,
     quorum: int,
     drain_margin_s: int,
+    excluded_repair_observation_required: bool = False,
+    completion_bound_ns: int | None = None,
 ) -> tuple[dict[str, int], dict[str, tuple[int, int, int]]]:
+    expected_fields = {
+        "schema_version",
+        "slot_id",
+        "cutoff_rule",
+        "cutoffs",
+        "phases",
+        "phase_qualifications",
+    }
+    if excluded_repair_observation_required:
+        expected_fields.add("excluded_repair_observation")
     _fields(
         document,
-        {
-            "schema_version",
-            "slot_id",
-            "cutoff_rule",
-            "cutoffs",
-            "phases",
-            "phase_qualifications",
-        },
+        expected_fields,
         PHASE_CUTOFFS_FILENAME,
     )
     if (
@@ -9137,10 +9501,18 @@ def _validate_phase_cutoffs(
         and windows["epoch2_stable"][1] <= times["epoch2_drain_complete"]
     ):
         _fail("phase windows are not bounded by their exact live cutoffs")
+    completion_bound = (
+        window_end_ns if completion_bound_ns is None else completion_bound_ns
+    )
     if not (
-        windows["epoch2_stable"][1] < window_end_ns
-        and times["epoch2_drain_complete"] < window_end_ns
+        windows["epoch2_stable"][1] < completion_bound
+        and times["epoch2_drain_complete"] < completion_bound
     ):
+        if excluded_repair_observation_required:
+            _fail(
+                "v28 repair Epoch2 stable measurement and drain did not finish "
+                "before the shared hard deadline"
+            )
         _fail("Epoch2 stable measurement and drain did not finish during the fault window")
 
     if set(replica_events) != set(range(replica_count)) or not 0 < quorum <= replica_count:
@@ -9437,6 +9809,263 @@ def _validate_phase_cutoffs(
         ):
             _fail(f"{phase_name} common-Q qualification does not replay exactly")
     return times, windows
+
+
+def _native_event_reference(event: _NativeEvent) -> dict[str, object]:
+    return {
+        "relative_path": event.relative_path,
+        "line_number": event.line_number,
+        "source_id": event.source_id,
+        "source_sequence": event.source_sequence,
+        "source_monotonic_ns": event.monotonic_ns,
+        "event_type": event.event_type,
+        "line_sha256": event.line_sha256,
+    }
+
+
+def _excluded_repair_transition_barrier(
+    *,
+    replica_events: Mapping[int, Sequence[_NativeEvent]],
+    replica_count: int,
+    event_type: str,
+    epoch_number: int,
+) -> _NativeEvent:
+    """Rebuild the producer's exact all-replica latest transition boundary."""
+
+    if set(replica_events) != set(range(replica_count)):
+        _fail("v28 repair observation does not cover exact replica membership")
+    selected: list[_NativeEvent] = []
+    canonical_identity: Mapping[str, Any] | None = None
+    for replica_id in range(replica_count):
+        if event_type == "epoch.command_committed":
+            candidates = tuple(
+                event
+                for event in replica_events[replica_id]
+                if event.event_type == event_type
+                and event.payload.get("successor_epoch_number") == epoch_number
+            )
+        elif event_type == "epoch.activated":
+            candidates = tuple(
+                event
+                for event in replica_events[replica_id]
+                if event.event_type == event_type
+                and event.payload.get("epoch_number") == epoch_number
+            )
+        else:
+            _fail("v28 repair observation requested an unknown transition barrier")
+        if len(candidates) != 1:
+            _fail(
+                "v28 repair observation lacks one exact all-replica "
+                f"{event_type} boundary for Epoch{epoch_number}"
+            )
+        event = candidates[0]
+        identity = (
+            _command_identity(
+                event.payload,
+                f"v28 repair Epoch{epoch_number} command barrier",
+            )
+            if event_type == "epoch.command_committed"
+            else _activation_identity(
+                event.payload,
+                f"v28 repair Epoch{epoch_number} activation barrier",
+            )
+        )
+        if canonical_identity is None:
+            canonical_identity = identity
+        elif identity != canonical_identity:
+            _fail(
+                "v28 repair observation all-replica transition identity is "
+                "noncanonical"
+            )
+        selected.append(event)
+    return max(selected, key=lambda event: (event.monotonic_ns, event.source_id))
+
+
+def _validate_v28_excluded_repair_observation(
+    document: Mapping[str, Any],
+    *,
+    manifest: FrozenFactorialManifest,
+    expected: _ExpectedSlot,
+    manager_events: Sequence[_NativeEvent],
+    replica_events: Mapping[int, Sequence[_NativeEvent]],
+    events_by_ref: Mapping[tuple[str, int], _NativeEvent],
+    cutoff_times: Mapping[str, int],
+    phase_windows: Mapping[str, tuple[int, int, int]],
+    fault_window_end_ns: int,
+    hard_deadline_ns: int,
+) -> None:
+    """Validate the isolated v28 repair chronology without changing legacy cutoffs."""
+
+    if (
+        manifest.manifest_id != FROZEN_MANIFEST_ID
+        or expected.slot_id != FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
+    ):
+        _fail("v28 excluded repair observation escaped its exact slot scope")
+    fault_end = _integer(
+        fault_window_end_ns,
+        "v28 excluded repair reconstructed fault-window end",
+        1,
+    )
+    hard_deadline = _integer(
+        hard_deadline_ns,
+        "v28 excluded repair reconstructed hard deadline",
+        1,
+    )
+    selection_events, _ = _adaptation_cycle_event_contract(
+        snapshot_events=tuple(
+            event
+            for event in manager_events
+            if event.event_type == "adaptive_v2_evidence_snapshot"
+        ),
+        shape_events=tuple(
+            event
+            for event in manager_events
+            if event.event_type == "adaptive_v2_shape_decision"
+        ),
+        manifest=manifest,
+    )
+    terminal_events: dict[int, _NativeEvent] = {}
+    for cycle in (0, 1):
+        matches = tuple(
+            event
+            for event in manager_events
+            if event.event_type == "adaptive_v2_session_terminal"
+            and event.payload.get("cycle_ordinal") == cycle
+        )
+        if len(matches) != 1:
+            _fail("v28 excluded repair observation terminal is absent or duplicated")
+        terminal_events[cycle] = matches[0]
+
+    command_events = {
+        epoch: _excluded_repair_transition_barrier(
+            replica_events=replica_events,
+            replica_count=expected.replica_count,
+            event_type="epoch.command_committed",
+            epoch_number=epoch,
+        )
+        for epoch in (1, 2)
+    }
+    activation_events = {
+        epoch: _excluded_repair_transition_barrier(
+            replica_events=replica_events,
+            replica_count=expected.replica_count,
+            event_type="epoch.activated",
+            epoch_number=epoch,
+        )
+        for epoch in (1, 2)
+    }
+    cutoff_rows = {
+        _string(row.get("name"), "v28 repair legacy cutoff name"): row
+        for row in (
+            _mapping(raw, "v28 repair legacy cutoff")
+            for raw in _array(document.get("cutoffs"), "phase-cutoffs.cutoffs")
+        )
+    }
+    drain_row = cutoff_rows.get("epoch2_drain_complete")
+    if drain_row is None:
+        _fail("v28 excluded repair observation lacks the legacy drain cutoff")
+    drain_event = events_by_ref.get(
+        (
+            _string(drain_row.get("source_path"), "v28 repair drain source path"),
+            _integer(
+                drain_row.get("source_sequence"),
+                "v28 repair drain source sequence",
+            ),
+        )
+    )
+    if drain_event is None:
+        _fail("v28 excluded repair observation drain reference is absent")
+
+    def native_row(name: str, event: _NativeEvent) -> dict[str, object]:
+        return {
+            "name": name,
+            "monotonic_ns": event.monotonic_ns,
+            "event": _native_event_reference(event),
+        }
+
+    expected_rows = [
+        native_row("epoch1_selection", selection_events[0]),
+        native_row("epoch1_command", command_events[1]),
+        native_row("epoch1_activation", activation_events[1]),
+        native_row("epoch1_terminal", terminal_events[0]),
+        {
+            "name": "epoch1_stable_end",
+            "monotonic_ns": phase_windows["epoch1_stable"][1],
+            "derivation": "phase.epoch1_stable.end_monotonic_ns",
+        },
+        {
+            "name": "fault_window_end",
+            "monotonic_ns": fault_end,
+            "derivation": "shared_anchor_plus_fault_start_and_duration",
+        },
+        native_row("epoch2_selection", selection_events[1]),
+        native_row("epoch2_command", command_events[2]),
+        native_row("epoch2_activation", activation_events[2]),
+        native_row("epoch2_terminal", terminal_events[1]),
+        {
+            "name": "epoch2_stable_end",
+            "monotonic_ns": phase_windows["epoch2_stable"][1],
+            "derivation": "phase.epoch2_stable.end_monotonic_ns",
+        },
+        native_row("epoch2_drain_complete", drain_event),
+    ]
+    observation = _mapping(
+        document.get("excluded_repair_observation"),
+        "phase-cutoffs.excluded_repair_observation",
+    )
+    expected_observation = {
+        "schema_version": 1,
+        "observation_contract": EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+        "fault_window_end_monotonic_ns": fault_end,
+        "hard_deadline_monotonic_ns": hard_deadline,
+        "rows": expected_rows,
+    }
+    if not _exact_json_value(observation, expected_observation):
+        _fail("v28 excluded repair observation document drifted")
+
+    timestamps = {
+        row["name"]: _integer(
+            row["monotonic_ns"],
+            f"v28 excluded repair {row['name']} timestamp",
+            1,
+        )
+        for row in expected_rows
+    }
+    if tuple(timestamps) != EXCLUDED_REPAIR_OBSERVATION_ROW_NAMES:
+        _fail("v28 excluded repair observation row order drifted")
+    if not all(
+        timestamps[name] < fault_end
+        for name in EXCLUDED_REPAIR_OBSERVATION_ROW_NAMES[:5]
+    ):
+        _fail("v28 excluded repair Epoch1 proof did not finish before fault end")
+    if not (
+        fault_end < timestamps["epoch2_selection"]
+        and fault_end < timestamps["epoch2_command"]
+        and all(
+            fault_end < event.monotonic_ns
+            for events in replica_events.values()
+            for event in events
+            if event.event_type == "epoch.command_committed"
+            and event.payload.get("successor_epoch_number") == 2
+        )
+    ):
+        _fail(
+            "v28 excluded repair Epoch2 selection/all-replica commands did "
+            "not follow fault end"
+        )
+    if not all(
+        timestamps[name] < hard_deadline
+        for name in EXCLUDED_REPAIR_OBSERVATION_ROW_NAMES[6:]
+    ):
+        _fail("v28 excluded repair Epoch2 proof did not finish before hard deadline")
+    if (
+        cutoff_times["epoch1_command"] != command_events[1].monotonic_ns
+        or cutoff_times["epoch1_activation"] != activation_events[1].monotonic_ns
+        or cutoff_times["epoch2_command"] != command_events[2].monotonic_ns
+        or cutoff_times["epoch2_activation"] != activation_events[2].monotonic_ns
+        or cutoff_times["epoch2_drain_complete"] != drain_event.monotonic_ns
+    ):
+        _fail("v28 excluded repair observation is detached from legacy cutoffs")
 
 
 def _expected_snapshot_payload_observations(
@@ -9753,7 +10382,13 @@ def _validate_v25_inherited_wait_exempt_placement_live_exercise(
     """Prove the inherited-placement branch in exact v25+ slot037."""
 
     if (
-        manifest_id not in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest_id
+        not in {
+            V25_MANIFEST_ID,
+            V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         or not coverage_smoke
         or expected.slot_id != V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
     ):
@@ -9963,6 +10598,7 @@ def _v26_cycle1_convergence_command(
 
     canonical_command: dict[str, Any] | None = None
     command_times: dict[int, int] = {}
+    activation_times: dict[int, int] = {}
     for replica_id in range(expected.replica_count):
         commands = tuple(
             event
@@ -9996,6 +10632,7 @@ def _v26_cycle1_convergence_command(
         elif command != canonical_command:
             _fail("v26 cycle-1 commit/activation convergence is noncanonical")
         command_times[replica_id] = commands[0].monotonic_ns
+        activation_times[replica_id] = activations[0].monotonic_ns
         activation = _activation_identity(
             activations[0].payload,
             f"v26 cycle-1 replica-{replica_id} activation",
@@ -10009,6 +10646,22 @@ def _v26_cycle1_convergence_command(
         ):
             _fail("v26 cycle-1 commit/activation convergence activation drifted")
     assert canonical_command is not None
+
+    selection_events = tuple(
+        event
+        for event in manager_events
+        if event.event_type == "adaptive_v2_shape_decision"
+        and event.payload.get("cycle_ordinal") == 1
+    )
+    if len(selection_events) != 1:
+        _fail("v26 cycle-1 selection is absent or duplicated")
+    selection = selection_events[0]
+    if (
+        selection.source_kind != "adaptation_manager"
+        or selection.source_id != "adaptive-manager"
+        or selection.monotonic_ns > min(command_times.values())
+    ):
+        _fail("v26 cycle-1 selection chronology drifted")
 
     converged_events = tuple(
         event
@@ -10085,6 +10738,8 @@ def _v26_cycle1_convergence_command(
         or not required <= accepted_commits <= expected.replica_count
     ):
         _fail("v26 cycle-1 adaptive_v2_converged identity/count drifted")
+    if sorted(activation_times.values())[expected.q - 1] > converged.monotonic_ns:
+        _fail("v26 cycle-1 adaptive_v2_converged precedes its raw activation quorum")
 
     terminals = tuple(
         event
@@ -10322,9 +10977,9 @@ def _validate_v27_verified_response_duplicate_live_exercise(
     """Bind a post-dispatch guard marker to repeated accepted relay ingress."""
 
     if (
-        manifest_id != FROZEN_MANIFEST_ID
+        manifest_id != V27_MANIFEST_ID
         or not coverage_smoke
-        or expected.slot_id != FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
+        or expected.slot_id != V27_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
     ):
         return False
     if (
@@ -10517,6 +11172,269 @@ def _validate_v27_verified_response_duplicate_live_exercise(
             _fail(message)
     _fail("v27 slot037 duplicate marker is not an exact live witness")
     raise AssertionError("unreachable")
+
+
+def _validate_v28_verified_response_duplicate_probe(
+    *,
+    manifest_id: str,
+    coverage_smoke: bool,
+    expected: _ExpectedSlot,
+    slot_root: Path,
+    paths_by_replica: Mapping[int, Sequence[str]],
+    manager_events: Sequence[_NativeEvent],
+    replica_events: Mapping[int, Sequence[_NativeEvent]],
+    accepted: Mapping[tuple[int, str], Sequence[_EvidenceRecord]],
+    predecessor_epoch_digest: str,
+    predecessor_trees: Sequence[Tree],
+    successor_epoch_digest: str,
+    successor_trees: Sequence[Tree],
+    command_payload_digest: str,
+    activation_delay_blocks: int,
+    fault_window_end_ns: int,
+) -> bool:
+    """Validate the v28 repair-only bridge replay without claiming wire replay."""
+
+    probes = _response_duplicate_probe_markers(slot_root, paths_by_replica)
+    in_scope = (
+        manifest_id == FROZEN_MANIFEST_ID
+        and coverage_smoke
+        and expected.slot_id == FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
+    )
+    if not in_scope:
+        if probes:
+            _fail(
+                "v28 response duplicate probe escaped the exact excluded repair smoke"
+            )
+        return False
+    if (
+        expected.block_id != "n31-f2-b04"
+        or expected.arm_code != "00"
+        or expected.ordinal != 37
+        or expected.execution_ordinal != 5
+        or expected.replica_count != 31
+        or expected.f != 10
+        or expected.q != 21
+        or expected.tree_count != 21
+        or expected.initial_fanout != 2
+        or expected.placement_adaptation
+        or expected.shape_adaptation
+        or expected.actor_ids != (26, 27, 28)
+        or expected.responsive_degraded_actor_ids
+        != (1, 7, 8, 12, 16, 19, 20)
+    ):
+        _fail("v28 slot037 response duplicate probe scope drifted")
+    fault_end_ns = _integer(
+        fault_window_end_ns,
+        "v28 slot037 probe fault-window end",
+        1,
+    )
+    predecessor_digest = _digest(
+        predecessor_epoch_digest,
+        "v28 slot037 probe predecessor digest",
+    )
+    _command, command_times, convergence_ns = _v26_cycle1_convergence_command(
+        expected=expected,
+        manager_events=manager_events,
+        replica_events=replica_events,
+        predecessor_epoch_digest=predecessor_digest,
+        successor_epoch_digest=successor_epoch_digest,
+        successor_trees=successor_trees,
+        command_payload_digest=command_payload_digest,
+        activation_delay_blocks=activation_delay_blocks,
+    )
+    if (
+        len(predecessor_trees) != expected.q
+        or tuple(tree.tree_id for tree in predecessor_trees)
+        != tuple(range(expected.q))
+    ):
+        _fail("v28 slot037 response duplicate probe active topology is incomplete")
+    membership = tuple(range(expected.replica_count))
+    trees_by_id: dict[int, Tree] = {}
+    for tree in predecessor_trees:
+        if (
+            tuple(sorted(tree.members)) != membership
+            or len(set(tree.members)) != len(membership)
+            or tree.fanout != expected.initial_fanout
+            or tree.pipeline_stretch != expected.pipeline_stretch
+        ):
+            _fail("v28 slot037 response duplicate probe active topology drifted")
+        trees_by_id[tree.tree_id] = tree
+
+    arm_markers = _response_attempt_arm_markers(slot_root, paths_by_replica)
+    ingress_witnesses, duplicate_markers = _relay_ingress_witnesses(
+        slot_root,
+        paths_by_replica,
+        allow_shared_outbox_after_convergence=True,
+    )
+    if not probes:
+        _fail("v28 slot037 lacks a response duplicate probe marker")
+    reporters = [probe.reporter_id for probe in probes]
+    if len(set(reporters)) != len(reporters):
+        _fail("v28 slot037 has more than one response duplicate probe per reporter")
+
+    responsive_children = frozenset(expected.responsive_degraded_actor_ids)
+    epoch_records = tuple(accepted.get((1, predecessor_digest), ()))
+    if not epoch_records:
+        _fail("v28 slot037 response duplicate probe lacks Epoch1 accepted evidence")
+    prior_probes: list[_ResponseDuplicateProbeMarker] = []
+    for probe in probes:
+        if (
+            probe.mode != RESPONSE_DUPLICATE_PROBE_MODE_V1
+            or probe.consensus_accepted != 1
+            or probe.first_call_recorded != 1
+            or probe.second_call_recorded != 0
+            or probe.epoch_number != 1
+            or probe.epoch_digest != predecessor_digest
+            or probe.message_type != "aggregate_relay"
+            or probe.child_id not in responsive_children
+            or probe.window_end_monotonic_ns != fault_end_ns
+            or not fault_end_ns < probe.response_monotonic_ns
+        ):
+            _fail("v28 slot037 response duplicate probe contract fields drifted")
+        reporter_command_ns = command_times.get(probe.reporter_id)
+        if (
+            reporter_command_ns is None
+            or not probe.response_monotonic_ns < reporter_command_ns
+            or not probe.response_monotonic_ns < convergence_ns
+        ):
+            _fail(
+                "v28 slot037 response duplicate probe is not post-fault and "
+                "pre-reporter-command/convergence"
+            )
+
+        relevant_guards = tuple(
+            marker
+            for marker in duplicate_markers
+            if marker.relative_path == probe.relative_path
+            and marker.reporter_id == probe.reporter_id
+            and marker.child_id == probe.child_id
+            and marker.line_number < probe.line_number
+        )
+        if not relevant_guards:
+            _fail("v28 slot037 response duplicate probe lacks its preceding guard")
+        guard = max(relevant_guards, key=lambda marker: marker.line_number)
+        if (
+            guard.identity != probe.identity
+            or guard.response_monotonic_ns != probe.response_monotonic_ns
+            or any(
+                marker.relative_path == probe.relative_path
+                and guard.line_number < marker.line_number < probe.line_number
+                and marker.identity == probe.identity
+                for marker in duplicate_markers
+            )
+            or any(
+                marker.relative_path == probe.relative_path
+                and guard.line_number < marker.line_number < probe.line_number
+                and marker.identity == probe.identity
+                for marker in prior_probes
+            )
+        ):
+            _fail("v28 slot037 response duplicate probe/guard identity drifted")
+
+        tree = trees_by_id.get(probe.tree_id)
+        if tree is None:
+            _fail("v28 slot037 response duplicate probe tree is not active")
+        try:
+            child_position = tree.members.index(probe.child_id)
+        except ValueError:
+            _fail("v28 slot037 response duplicate probe child is not active")
+        leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+        if (
+            child_position == 0
+            or child_position >= leaf_start
+            or tree.members[(child_position - 1) // tree.fanout]
+            != probe.reporter_id
+        ):
+            _fail(
+                "v28 slot037 response duplicate probe lacks responsive internal-child topology"
+            )
+
+        ingress_candidates = tuple(
+            witness
+            for witness in ingress_witnesses
+            if witness.accepted
+            and witness.relative_path == probe.relative_path
+            and witness.recipient_id == probe.reporter_id
+            and witness.source_replica_id == probe.child_id
+            and witness.epoch_number == probe.epoch_number
+            and witness.tree_id == probe.tree_id
+            and witness.block_hash == probe.block_hash
+            and witness.root_id == tree.members[0]
+            and witness.complete_line_number < guard.line_number
+        )
+        if not ingress_candidates:
+            _fail(
+                "v28 slot037 response duplicate probe lacks its original accepted ingress"
+            )
+        ingress = max(
+            ingress_candidates,
+            key=lambda witness: witness.complete_line_number,
+        )
+        if (
+            ingress.next_same_pair_begin_line is not None
+            and ingress.next_same_pair_begin_line < guard.line_number
+        ):
+            _fail(
+                "v28 slot037 response duplicate probe has an intervening relay begin"
+            )
+        packed_generation = ingress.view_generation - 1
+        generation_epoch = packed_generation >> 32
+        rotation_ordinal = packed_generation & 0xFFFF_FFFF
+        if (
+            generation_epoch != probe.epoch_number
+            or predecessor_trees[
+                rotation_ordinal % len(predecessor_trees)
+            ].tree_id
+            != probe.tree_id
+            or guard.attempt_generation
+            != (ingress.view_generation & 0xFFFF_FFFF)
+        ):
+            _fail(
+                "v28 slot037 response duplicate probe guard/ingress generation drifted"
+            )
+        arm = next(
+            (
+                marker
+                for marker in arm_markers
+                if marker.identity == probe.identity
+                and marker.relative_path == probe.relative_path
+                and marker.line_number < ingress.begin_line_number
+                and marker.start_monotonic_ns <= probe.response_monotonic_ns
+            ),
+            None,
+        )
+        if arm is None:
+            _fail("v28 slot037 response duplicate probe lacks its exact arm")
+
+        observations = tuple(
+            record
+            for record in epoch_records
+            if record.reporter_id == probe.reporter_id
+            and record.target_id == probe.child_id
+            and record.epoch_number == probe.epoch_number
+            and record.tree_id == probe.tree_id
+            and record.epoch_digest == probe.epoch_digest
+            and record.block_hash == probe.block_hash
+            and record.message_type == probe.message_type
+            and record.outcome == "on_time"
+            and record.reporter_monotonic_ns == probe.response_monotonic_ns
+        )
+        if len(observations) != 1:
+            _fail(
+                "v28 slot037 response duplicate probe lacks one exact manager "
+                "on-time observation"
+            )
+        observation = observations[0]
+        if not (
+            probe.response_monotonic_ns
+            <= observation.acceptance_monotonic_ns
+            < reporter_command_ns
+        ):
+            _fail(
+                "v28 slot037 response duplicate probe manager observation timing drifted"
+            )
+        prior_probes.append(probe)
+    return True
 
 
 def _validate_transition_terminal_deadline(
@@ -11255,7 +12173,13 @@ def _validate_v25_coverage_execution_lifecycle(
         _fail("v25+ coverage lifecycle slot sequence is not exact")
     primary_id, repair_id = coverage_slot_ids
     if (
-        manifest.manifest_id not in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        not in {
+            V25_MANIFEST_ID,
+            V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         or expected.slot_id not in coverage_slot_ids
         or result.slot_id != expected.slot_id
     ):
@@ -11656,6 +12580,7 @@ def validate_slot(
         for manifest_id in (
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         )
     )
@@ -11803,6 +12728,18 @@ def validate_slot(
             events_by_ref[key] = event
 
         cutoff_contract = _mapping(runtime.get("cutoff_contract"), "runtime cutoff contract")
+        v28_excluded_repair = (
+            manifest.manifest_id == FROZEN_MANIFEST_ID
+            and coverage_smoke
+            and expected.slot_id == FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
+        )
+        hard_deadline_ns = anchor_ns + _integer(
+            _mapping(runtime.get("fault_window"), "runtime fault window").get(
+                "hard_timeout_s"
+            ),
+            "runtime hard timeout",
+            1,
+        ) * _NANOSECONDS_PER_SECOND
         bucket_width_s = _integer(
             cutoff_contract.get("bucket_width_s"), "runtime bucket width", 1
         )
@@ -11835,6 +12772,10 @@ def validate_slot(
                 "runtime fault window drain margin",
                 1,
             ),
+            excluded_repair_observation_required=v28_excluded_repair,
+            completion_bound_ns=(
+                hard_deadline_ns if v28_excluded_repair else None
+            ),
         )
 
         initial_epoch_digest, initial_trees = _initial_epoch(expected)
@@ -11857,6 +12798,19 @@ def validate_slot(
             cutoff_times=cutoff_times,
         )
         bundles = (epoch1_bundle, epoch2_bundle)
+        if v28_excluded_repair:
+            _validate_v28_excluded_repair_observation(
+                cutoff_document,
+                manifest=manifest,
+                expected=expected,
+                manager_events=manager_events,
+                replica_events=replica_events,
+                events_by_ref=events_by_ref,
+                cutoff_times=cutoff_times,
+                phase_windows=phase_windows,
+                fault_window_end_ns=window_end_ns,
+                hard_deadline_ns=hard_deadline_ns,
+            )
         epoch1_roots = tuple(tree.members[0] for tree in bundles[0].trees)
         epoch2_roots = tuple(tree.members[0] for tree in bundles[1].trees)
         promoted_replica_ids = tuple(sorted(set(epoch2_roots) - set(epoch1_roots)))
@@ -11939,9 +12893,15 @@ def validate_slot(
             _validate_v26_verified_response_duplicate_live_exercise(
                 **duplicate_live_arguments
             )
-        elif manifest.manifest_id == FROZEN_MANIFEST_ID:
+        elif manifest.manifest_id == V27_MANIFEST_ID:
             _validate_v27_verified_response_duplicate_live_exercise(
                 **duplicate_live_arguments
+            )
+        elif manifest.manifest_id == FROZEN_MANIFEST_ID:
+            _validate_v28_verified_response_duplicate_probe(
+                **duplicate_live_arguments,
+                accepted=accepted,
+                fault_window_end_ns=window_end_ns,
             )
         markers = _fault_markers(slot_root, paths_by_replica)
         source_bound_contribution_opportunities = (
@@ -12203,7 +13163,13 @@ def validate_slot(
         )
         if (
             coverage_smoke
-            and manifest.manifest_id in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            and manifest.manifest_id
+            in {
+                V25_MANIFEST_ID,
+                V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }
         ):
             coverage_slot_ids = _coverage_smoke_slot_ids(manifest.manifest_id)
             predecessor_result = None

@@ -1894,6 +1894,9 @@ TEST_CASE(
     "[adaptive-v2][response-evidence][wiring]")
 {
     const auto implementation = source("src/hotstuff.cpp");
+    const auto hotstuff_header = source("include/hotstuff/hotstuff.h");
+    const auto experiment_header =
+        source("include/hotstuff/experiment_byzantine_adapter.h");
 
     const auto evidence_enqueue = function_slice(
         implementation,
@@ -1993,6 +1996,101 @@ TEST_CASE(
     CHECK(contribution.find("contribution.authenticated_sender", observed) !=
           std::string::npos);
     CHECK(contribution.find("contribution_signers", observed) !=
+          std::string::npos);
+
+    const auto first_probe_call = contribution.find(
+        "record_verified_response");
+    const auto second_probe_call = contribution.find(
+        "record_verified_response",
+        first_probe_call + 1);
+    const auto probe_marker = contribution.find(
+        "KAURI_EXPERIMENT response_duplicate_probe");
+    REQUIRE(first_probe_call != std::string::npos);
+    REQUIRE(second_probe_call != std::string::npos);
+    REQUIRE(probe_marker != std::string::npos);
+    CHECK(first_probe_call < second_probe_call);
+    CHECK(second_probe_call < probe_marker);
+    CHECK(contribution.find(
+              "record_verified_response",
+              second_probe_call + 1) == std::string::npos);
+    CHECK(contribution.find("first_call_recorded &&") !=
+          std::string::npos);
+    CHECK(contribution.find("first_call_recorded") != std::string::npos);
+    CHECK(contribution.find("second_call_recorded") != std::string::npos);
+    CHECK(contribution.find("consensus_accepted=1") != std::string::npos);
+    CHECK(contribution.find("message_type=aggregate_relay") !=
+          std::string::npos);
+    CHECK(contribution.find("response_monotonic_ns=%llu") !=
+          std::string::npos);
+    CHECK(contribution.find("window_end_monotonic_ns=%llu") !=
+          std::string::npos);
+    CHECK(experiment_header.find(
+              "exact_once_post_fault_epoch1_responsive_internal_child_v1") !=
+          std::string::npos);
+    CHECK(contribution.find(
+              "kExperimentResponseEvidenceDuplicateProbeMode") !=
+          std::string::npos);
+    CHECK(contribution.find(
+              "lease.key().configuration.epoch_number == 1") !=
+          std::string::npos);
+    CHECK(contribution.find(
+              "kind == ExactContributionKind::aggregate_relay") !=
+          std::string::npos);
+    CHECK(contribution.find(
+              "is_tiered_responsive_degraded_actor") !=
+          std::string::npos);
+    CHECK(contribution.find("child_subtree->second.size() > 1") !=
+          std::string::npos);
+    CHECK(contribution.find("response_monotonic_ns >=") !=
+          std::string::npos);
+    CHECK(contribution.find("compare_exchange_strong") !=
+          std::string::npos);
+    const auto aggregate_record = contribution.find(
+        "record_verified_aggregate_certificate");
+    REQUIRE(aggregate_record != std::string::npos);
+    CHECK(contribution.find(
+              "record_verified_aggregate_certificate",
+              aggregate_record + 1) == std::string::npos);
+    CHECK(contribution.find("lease.key()", first_probe_call) <
+          second_probe_call);
+    CHECK(contribution.find("lease.key()", second_probe_call) <
+          probe_marker);
+    CHECK(contribution.find(
+              "contribution.authenticated_sender", first_probe_call) <
+          second_probe_call);
+    CHECK(contribution.find(
+              "contribution.authenticated_sender", second_probe_call) <
+          probe_marker);
+    CHECK(contribution.find("contribution_signers", first_probe_call) <
+          second_probe_call);
+    CHECK(contribution.find("contribution_signers", second_probe_call) <
+          probe_marker);
+    CHECK(contribution.find("response_monotonic_ns", first_probe_call) <
+          second_probe_call);
+    CHECK(contribution.find("response_monotonic_ns", second_probe_call) <
+          probe_marker);
+    CHECK(contribution.find("epoch_digest.to_hex()", probe_marker) !=
+          std::string::npos);
+    CHECK(contribution.find("block_hash.to_hex()", probe_marker) !=
+          std::string::npos);
+
+    CHECK(hotstuff_header.find(
+              "experiment_response_evidence_duplicate_probe_consumed") !=
+          std::string::npos);
+    const auto configure_probe = function_slice(
+        implementation,
+        "void HotStuffBase::configure_experiment_byzantine_faults",
+        "void HotStuffBase::configure_experiment_post_qc_audit");
+    CHECK(configure_probe.find(
+              "kExperimentResponseEvidenceDuplicateProbeMode") !=
+          std::string::npos);
+    CHECK(configure_probe.find(
+              "tiered_persistent_responsive_omission_v2") !=
+          std::string::npos);
+    CHECK(configure_probe.find("window_end_monotonic_ns") !=
+          std::string::npos);
+    CHECK(configure_probe.find(
+              "experiment_response_evidence_duplicate_probe_consumed.store(false)") !=
           std::string::npos);
 
     const auto timeout = function_slice(

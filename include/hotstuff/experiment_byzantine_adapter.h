@@ -19,6 +19,10 @@
 namespace hotstuff
 {
 
+inline constexpr char
+    kExperimentResponseEvidenceDuplicateProbeMode[] =
+        "exact_once_post_fault_epoch1_responsive_internal_child_v1";
+
 struct ExperimentByzantineContext final
 {
     ProposalKey proposal;
@@ -113,6 +117,7 @@ struct ExperimentByzantineOptions final
     std::size_t maximum_omission_contexts{0};
     std::size_t maximum_direct_vote_omission_contexts{0};
     std::optional<ExperimentRotatingOmissionOptions> rotating_omission;
+    std::string response_evidence_duplicate_probe;
     std::function<void(const ExperimentOmissionMarker &)>
         omission_marker_emitter;
 };

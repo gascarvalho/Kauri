@@ -18,6 +18,7 @@
 #ifndef _HOTSTUFF_CORE_H
 #define _HOTSTUFF_CORE_H
 
+#include <atomic>
 #include <deque>
 #include <queue>
 #include <unordered_map>
@@ -1145,6 +1146,11 @@ namespace hotstuff
         AggregationScheduler::Cancellation
             experiment_post_qc_audit_expiry_cancellation;
         std::string experiment_diagnostic_window;
+        std::string experiment_response_evidence_duplicate_probe;
+        std::uint64_t
+            experiment_response_evidence_duplicate_probe_window_end_ns{0};
+        std::atomic<bool>
+            experiment_response_evidence_duplicate_probe_consumed{false};
         // Experiment-only ordering state. The configured adapter bound is
         // copied before startup and caps this exact-proposal map.
         enum class ExperimentFalseTimeoutCommitAction

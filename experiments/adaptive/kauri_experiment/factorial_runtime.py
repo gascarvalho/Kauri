@@ -1,4 +1,4 @@
-"""Pure launch contracts for the frozen SHAPE27 factorial campaign.
+"""Pure launch contracts for the frozen SHAPE28 factorial campaign.
 
 This module does not predict adaptive outcomes and never starts a process.
 It freezes only the inputs, live-evidence acceptance predicates, relative
@@ -7,7 +7,7 @@ timing, argv templates, and the result-independent execution order.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -16,6 +16,8 @@ from typing import Any
 
 from .factorial_manifest import (
     EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
@@ -42,6 +44,7 @@ from .factorial_manifest import (
     V24_MANIFEST_ID,
     V25_MANIFEST_ID,
     V26_MANIFEST_ID,
+    V27_MANIFEST_ID,
     V9_MANIFEST_ID,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
@@ -195,14 +198,23 @@ V26_SMOKE_RUNTIME_SHA256 = (
 V26_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "34b7cfacebf3c3998a01b1432a3b7b5a10efc51ea23c4e807365b085f838e62f"
 )
-FROZEN_RUNTIME_SHA256 = (
+V27_RUNTIME_SHA256 = (
     "fac92d4b69431f4e3ce8f4839adbea5772862eb2f6dceb3f5271309a7a914c50"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V27_SMOKE_RUNTIME_SHA256 = (
     "af2ecb0e0a338643ec31debc523590260efdc2a7b22fc1fb60b4a227b64cbd3a"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V27_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "6b50e59233cb2552c8160c6d2293aa6158920b14235ff4fdc602f65f1b567c7c"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "7925f0de66f0d7fd7412dfae3e9754dcbceb8d0516b875552f98b3f637225fba"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "de9599ac4d22582fea1746eda8deb885e6bc9f2c1d79c9fd723de299cc0edb74"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "af28c19dafb2f01461c5b3c3a648a7ac4f200a71880a965b2ff9da892792fa84"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -217,6 +229,15 @@ _MANAGER_TLS_CERTIFICATE_TOKEN = "{{manager_tls_certificate_der_hex}}"
 _ISSUER_PRIVATE_KEY_TOKEN = "{{epoch_issuer_private_key_hex}}"
 _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
     "{{fault_containment_evidence_start_monotonic_ns}}"
+)
+EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1 = (
+    "exact_once_post_fault_epoch1_responsive_internal_child_v1"
+)
+EXCLUDED_REPAIR_SMOKE_PROBE_OPTION = (
+    "--experiment-response-evidence-duplicate-probe"
+)
+EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V1 = (
+    "byzantine.window.duration_s:450->300"
 )
 _FAULT_CONTAINMENT_COVERAGE_READY_EVENT = (
     "adaptive_v2.fault_containment_coverage_ready"
@@ -452,6 +473,10 @@ class CausalAcceptanceContract(_Document):
     evidence_snapshot_selection_contract: str | None = None
     inherited_consensus_wait_exempt_placement_contract: str | None = None
     verified_response_duplicate_delivery_contract: str | None = None
+    excluded_repair_smoke_observation_contract: str | None = None
+    excluded_repair_smoke_verified_response_duplicate_probe_contract: str | None = (
+        None
+    )
     epoch1_preselection_residency_ms: int | None = None
     minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection: (
         int | None
@@ -470,6 +495,8 @@ class CausalAcceptanceContract(_Document):
             "evidence_snapshot_selection_contract",
             "inherited_consensus_wait_exempt_placement_contract",
             "verified_response_duplicate_delivery_contract",
+            "excluded_repair_smoke_observation_contract",
+            "excluded_repair_smoke_verified_response_duplicate_probe_contract",
             "epoch1_preselection_residency_ms",
             "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection",
         ):
@@ -615,6 +642,20 @@ class SmokeMetadata(_Document):
 
 
 @dataclass(frozen=True, slots=True)
+class ExcludedRepairSmokeProbeContract(_Document):
+    source_campaign_slot_id: str
+    source_campaign_result_path: str
+    source_campaign_artifact_id: str
+    semantic_delta: str
+    source_fault_window_duration_s: int
+    effective_fault_window_duration_s: int
+    hard_timeout_s: int
+    observation_contract: str
+    verified_response_duplicate_probe_contract: str
+    verified_response_duplicate_probe_mode: str
+
+
+@dataclass(frozen=True, slots=True)
 class SlotRuntimeSpec(_Document):
     schema_version: int
     artifact_id: str
@@ -650,6 +691,7 @@ class SlotRuntimeSpec(_Document):
     process_logs: ProcessLogContract
     manager_argv_template: ManagerArgvTemplate
     replica_argv_templates: tuple[ReplicaProcessSpec, ...]
+    excluded_repair_smoke_probe: ExcludedRepairSmokeProbeContract | None = None
     cleanup_contract: str | None = None
 
     def as_document(self) -> dict[str, object]:
@@ -660,6 +702,8 @@ class SlotRuntimeSpec(_Document):
         document["epoch2_placement"] = self.epoch2_placement.as_document()
         if self.cleanup_contract is None:
             document.pop("cleanup_contract")
+        if self.excluded_repair_smoke_probe is None:
+            document.pop("excluded_repair_smoke_probe")
         if self.tiered_cohorts is None:
             document.pop("tiered_cohorts")
         else:
@@ -981,6 +1025,8 @@ def _causal_acceptance(
     evidence_snapshot_selection_contract: str | None,
     inherited_wait_exempt_placement_contract: str | None,
     verified_response_duplicate_delivery_contract: str | None,
+    excluded_repair_smoke_observation_contract: str | None,
+    excluded_repair_smoke_duplicate_probe_contract: str | None,
     epoch1_preselection_residency_ms: int | None,
     minimum_primary_internal_opportunities: int | None,
 ) -> CausalAcceptanceContract:
@@ -1079,6 +1125,33 @@ def _causal_acceptance(
         raise FactorialManifestError(
             "verified-response duplicate delivery requires inherited placement"
         )
+    if excluded_repair_smoke_observation_contract not in {
+        None,
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+    }:
+        raise FactorialManifestError(
+            "causal acceptance excluded repair observation contract drifted"
+        )
+    if excluded_repair_smoke_duplicate_probe_contract not in {
+        None,
+        EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1,
+    }:
+        raise FactorialManifestError(
+            "causal acceptance excluded repair duplicate probe contract drifted"
+        )
+    if (excluded_repair_smoke_observation_contract is None) != (
+        excluded_repair_smoke_duplicate_probe_contract is None
+    ):
+        raise FactorialManifestError(
+            "causal acceptance excluded repair smoke contracts must be paired"
+        )
+    if excluded_repair_smoke_observation_contract is not None and (
+        verified_response_duplicate_delivery_contract
+        != VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2
+    ):
+        raise FactorialManifestError(
+            "excluded repair smoke contracts require duplicate delivery v2"
+        )
     if epoch1_preselection_residency_ms not in {None, 60_000}:
         raise FactorialManifestError(
             "causal acceptance Epoch-1 preselection residency drifted"
@@ -1091,7 +1164,7 @@ def _causal_acceptance(
         minimum_primary_internal_opportunities is None
     ):
         raise FactorialManifestError(
-            "causal acceptance v24/v25/v26/v27 timing and opportunity gates must "
+            "causal acceptance v24/v25/v26/v27/v28 timing and opportunity gates must "
             "be paired"
         )
     return CausalAcceptanceContract(
@@ -1130,6 +1203,12 @@ def _causal_acceptance(
         ),
         verified_response_duplicate_delivery_contract=(
             verified_response_duplicate_delivery_contract
+        ),
+        excluded_repair_smoke_observation_contract=(
+            excluded_repair_smoke_observation_contract
+        ),
+        excluded_repair_smoke_verified_response_duplicate_probe_contract=(
+            excluded_repair_smoke_duplicate_probe_contract
         ),
         epoch1_preselection_residency_ms=epoch1_preselection_residency_ms,
         minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection=(
@@ -1387,6 +1466,7 @@ def _replica_argv_templates(
     main_config: ConfigContract,
     structured_events: StructuredEventContract,
     tiered: TieredCohortContract | None,
+    excluded_repair_smoke_probe_mode: str | None,
 ) -> tuple[ReplicaProcessSpec, ...]:
     actors = ",".join(map(str, slot.byzantine_actor_ids))
     window_suffix = {
@@ -1410,6 +1490,14 @@ def _replica_argv_templates(
             str(tiered.responsive_omission_period),
         )
         if tiered is not None
+        else ()
+    )
+    probe_arguments = (
+        (
+            EXCLUDED_REPAIR_SMOKE_PROBE_OPTION,
+            excluded_repair_smoke_probe_mode,
+        )
+        if excluded_repair_smoke_probe_mode is not None
         else ()
     )
     result: list[ReplicaProcessSpec] = []
@@ -1438,6 +1526,7 @@ def _replica_argv_templates(
             "--experiment-rotating-omission-actors",
             actors,
             *tiered_arguments,
+            *probe_arguments,
             "--experiment-byzantine-max-omissions-per-proposal",
             str(slot.maximum_omissions_per_proposal),
             "--experiment-rotating-omission-context-limit",
@@ -1447,11 +1536,71 @@ def _replica_argv_templates(
     return tuple(result)
 
 
-def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
+def _validate_excluded_repair_smoke_probe(
+    slot: FactorialSlot,
+    probe: ExcludedRepairSmokeProbeContract | None,
+) -> None:
+    if probe is None:
+        return
+    if not isinstance(probe, ExcludedRepairSmokeProbeContract):
+        raise FactorialManifestError(
+            "excluded repair smoke probe must use the frozen runtime contract"
+        )
+    source_path = (
+        "results/shape-placement-factorial-v28/"
+        "slot-037-n31-f2-b04-00"
+    )
+    effective_path = (
+        "results/shape-placement-factorial-v28-coverage-smoke/"
+        "slot-037-n31-f2-b04-00"
+    )
+    if (
+        slot.slot_id != "slot-037-n31-f2-b04-00"
+        or slot.result_path != effective_path
+        or slot.byzantine.duration_s != 300
+        or slot.common_timers.hard_timeout_s != 650
+    ):
+        raise FactorialManifestError(
+            "excluded repair smoke probe is restricted to exact v28 slot 037"
+        )
+    source_slot = replace(
+        slot,
+        result_path=source_path,
+        byzantine=replace(slot.byzantine, duration_s=450),
+    )
+    source_runtime = build_slot_runtime(source_slot)
+    expected = ExcludedRepairSmokeProbeContract(
+        source_campaign_slot_id=source_slot.slot_id,
+        source_campaign_result_path=source_path,
+        source_campaign_artifact_id=source_runtime.artifact_id,
+        semantic_delta=EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V1,
+        source_fault_window_duration_s=450,
+        effective_fault_window_duration_s=300,
+        hard_timeout_s=650,
+        observation_contract=EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+        verified_response_duplicate_probe_contract=(
+            EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+        ),
+        verified_response_duplicate_probe_mode=(
+            EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1
+        ),
+    )
+    if probe != expected:
+        raise FactorialManifestError(
+            "excluded repair smoke probe source, delta, contract, mode, or timing drifted"
+        )
+
+
+def build_slot_runtime(
+    slot: FactorialSlot,
+    *,
+    excluded_repair_smoke_probe: ExcludedRepairSmokeProbeContract | None = None,
+) -> SlotRuntimeSpec:
     """Build one pure slot contract without sampling clocks or live evidence."""
 
     if not isinstance(slot, FactorialSlot):
         raise FactorialManifestError("slot runtime input must be a FactorialSlot")
+    _validate_excluded_repair_smoke_probe(slot, excluded_repair_smoke_probe)
     epoch1_policy = "fault_containment"
     epoch2_policy = (
         "performance_optimization" if slot.placement_adaptation else "fault_containment"
@@ -1593,6 +1742,20 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
                         "hard_timeout_s": slot.common_timers.hard_timeout_s,
                     }
                 )
+        if (
+            responsive is not None
+            and responsive.excluded_repair_smoke_observation_contract is not None
+        ):
+            identity.update(
+                {
+                    "excluded_repair_smoke_observation_contract": (
+                        responsive.excluded_repair_smoke_observation_contract
+                    ),
+                    "excluded_repair_smoke_verified_response_duplicate_probe_contract": (
+                        responsive.excluded_repair_smoke_verified_response_duplicate_probe_contract
+                    ),
+                }
+            )
         if slot.workload.epoch1_preselection_residency_ms is not None:
             identity["epoch1_preselection_residency_ms"] = (
                 slot.workload.epoch1_preselection_residency_ms
@@ -1607,6 +1770,10 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             ] = responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
     if slot.cleanup_contract is not None:
         identity["cleanup_contract"] = slot.cleanup_contract
+    if excluded_repair_smoke_probe is not None:
+        identity["excluded_repair_smoke_probe"] = (
+            excluded_repair_smoke_probe.as_document()
+        )
     return SlotRuntimeSpec(
         schema_version=1,
         artifact_id=f"slot-runtime-{_digest(identity)[:24]}",
@@ -1673,6 +1840,16 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
                 if slot.byzantine.responsive_degradation is not None
                 else None
             ),
+            (
+                slot.byzantine.responsive_degradation.excluded_repair_smoke_observation_contract
+                if slot.byzantine.responsive_degradation is not None
+                else None
+            ),
+            (
+                slot.byzantine.responsive_degradation.excluded_repair_smoke_verified_response_duplicate_probe_contract
+                if slot.byzantine.responsive_degradation is not None
+                else None
+            ),
             slot.workload.epoch1_preselection_residency_ms,
             (
                 slot.byzantine.responsive_degradation.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
@@ -1695,8 +1872,17 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             slot, transitions, structured_events
         ),
         replica_argv_templates=_replica_argv_templates(
-            slot, main_config, structured_events, tiered_cohorts
+            slot,
+            main_config,
+            structured_events,
+            tiered_cohorts,
+            (
+                excluded_repair_smoke_probe.verified_response_duplicate_probe_mode
+                if excluded_repair_smoke_probe is not None
+                else None
+            ),
         ),
+        excluded_repair_smoke_probe=excluded_repair_smoke_probe,
         cleanup_contract=slot.cleanup_contract,
     )
 
@@ -2025,6 +2211,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2044,6 +2231,7 @@ def runtime_preflight(
                     V24_MANIFEST_ID,
                     V25_MANIFEST_ID,
                     V26_MANIFEST_ID,
+                    V27_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else slot.cutoff_contract.epoch1_stable_bucket_count
@@ -2190,6 +2378,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }:
                 expected_measurement_contract = (
@@ -2223,6 +2412,7 @@ def runtime_preflight(
                     V24_MANIFEST_ID,
                     V25_MANIFEST_ID,
                     V26_MANIFEST_ID,
+                    V27_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -2246,6 +2436,7 @@ def runtime_preflight(
                     V24_MANIFEST_ID,
                     V25_MANIFEST_ID,
                     V26_MANIFEST_ID,
+                    V27_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -2307,6 +2498,7 @@ def runtime_preflight(
                         V24_MANIFEST_ID,
                         V25_MANIFEST_ID,
                         V26_MANIFEST_ID,
+                        V27_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2518,6 +2710,7 @@ def runtime_preflight(
             V24_MANIFEST_ID,
             V25_MANIFEST_ID,
             V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2559,6 +2752,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2574,6 +2768,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2585,6 +2780,7 @@ def runtime_preflight(
                     V24_MANIFEST_ID,
                     V25_MANIFEST_ID,
                     V26_MANIFEST_ID,
+                    V27_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -2599,6 +2795,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2612,6 +2809,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2623,6 +2821,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2631,22 +2830,30 @@ def runtime_preflight(
             in {
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2
-            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            if runtime.manifest_id in {V27_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else (
                 VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
                 if runtime.manifest_id == V26_MANIFEST_ID
                 else None
             ),
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            else None,
+            EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            else None,
             60_000
             if runtime.manifest_id
             in {
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2656,6 +2863,7 @@ def runtime_preflight(
                 V24_MANIFEST_ID,
                 V25_MANIFEST_ID,
                 V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2682,6 +2890,10 @@ __all__ = (
     "ConfigContract",
     "CausalAcceptanceContract",
     "CutoffContract",
+    "ExcludedRepairSmokeProbeContract",
+    "EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1",
+    "EXCLUDED_REPAIR_SMOKE_PROBE_OPTION",
+    "EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V1",
     "FactorialRuntimePlan",
     "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
     "FROZEN_RUNTIME_SHA256",
@@ -2744,6 +2956,9 @@ __all__ = (
     "V26_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V26_RUNTIME_SHA256",
     "V26_SMOKE_RUNTIME_SHA256",
+    "V27_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V27_RUNTIME_SHA256",
+    "V27_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

@@ -1,4 +1,4 @@
-"""Fail-closed local execution for one SHAPE27 factorial slot.
+"""Fail-closed local execution for one SHAPE28 factorial slot.
 
 The frozen factorial modules describe *what* may be run.  This module owns the
 small, deliberately local execution boundary: it proves an exact pushed
@@ -32,6 +32,8 @@ from typing import IO, Any, Protocol
 
 from .factorial_manifest import (
     EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1,
     FactorialArm,
     FactorialManifestError,
     FactorialSlot,
@@ -48,6 +50,7 @@ from .factorial_manifest import (
     SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
     V25_MANIFEST_ID,
     V26_MANIFEST_ID,
+    V27_MANIFEST_ID,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     PortAllocation,
@@ -58,6 +61,10 @@ from .factorial_manifest import (
     load_frozen_manifest_bytes,
 )
 from .factorial_runtime import (
+    EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1,
+    EXCLUDED_REPAIR_SMOKE_PROBE_OPTION,
+    EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V1,
+    ExcludedRepairSmokeProbeContract,
     FactorialRuntimePlan,
     ManagerSecretMaterial,
     ReplicaProcessSpec,
@@ -241,9 +248,10 @@ class N31CoverageSmokeRuntime:
     stop_on_first_non_pass: bool
     minimum_free_bytes: int
     slots: tuple[SlotRuntimeSpec, ...]
+    excluded_repair_smoke_probe: ExcludedRepairSmokeProbeContract | None = None
 
     def as_document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "schema_version": self.schema_version,
             "runtime_id": self.runtime_id,
             "manifest_id": self.manifest_id,
@@ -254,6 +262,11 @@ class N31CoverageSmokeRuntime:
             "minimum_free_bytes": self.minimum_free_bytes,
             "slots": [slot.as_document() for slot in self.slots],
         }
+        if self.excluded_repair_smoke_probe is not None:
+            document["excluded_repair_smoke_probe"] = (
+                self.excluded_repair_smoke_probe.as_document()
+            )
+        return document
 
 
 @dataclass(frozen=True, slots=True)
@@ -1327,7 +1340,12 @@ def build_coverage_smoke_execution_contract(
     if (
         runtime.schema_version != 1
         or runtime.manifest_id
-        not in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        not in {
+            V25_MANIFEST_ID,
+            V26_MANIFEST_ID,
+            V27_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         or runtime.execution_mode != "fixed_sequential"
         or runtime.automatic_retries != 0
         or runtime.replacement_policy != "none"
@@ -1586,6 +1604,7 @@ def _bind_execution_authorization(
     elif slot.replica_count == 31 and manifest.manifest_id in {
         V25_MANIFEST_ID,
         V26_MANIFEST_ID,
+        V27_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_slots = [
@@ -2830,7 +2849,12 @@ def _bind_static_artifacts(
                 None,
             )
             if manifest.manifest_id
-            in {V25_MANIFEST_ID, V26_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            in {
+                V25_MANIFEST_ID,
+                V26_MANIFEST_ID,
+                V27_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }
             else None
         )
         if primary is None:
@@ -4006,6 +4030,7 @@ def observe_slot_phases(
     )
 
     transition_events: dict[int, tuple[_Event, _Event, _Event]] = {}
+    terminal_events: dict[int, _Event] = {}
     stable_events: dict[int, tuple[_Event, Mapping[str, object], int]] = {}
     phase_configurations: dict[int, tuple[int, str]] = {}
     for cycle, epoch in ((0, 1), (1, 2)):
@@ -4022,7 +4047,7 @@ def observe_slot_phases(
 
         def transition_ready(
             selected_anchor: _Event | None = None,
-        ) -> tuple[_Event, _Event, _Event] | None:
+        ) -> tuple[_Event, _Event, _Event, _Event] | None:
             current = streams()
             command = _replica_transition_barrier(
                 current,
@@ -4062,7 +4087,7 @@ def observe_slot_phases(
                 raise FactorialExecutionError(
                     "epoch-1 command occurred before the frozen fault-evidence window ended"
                 )
-            return command, activation, selection
+            return command, activation, selection, terminal
 
         if observation_bound_rule == (
             "shared_slot_hard_deadline_until_manager_selection_v1"
@@ -4085,7 +4110,7 @@ def observe_slot_phases(
                 raise FactorialExecutionError(
                     f"epoch-{epoch} manager selection is malformed"
                 )
-            command, activation, _ = _wait_until(
+            command, activation, _, terminal = _wait_until(
                 f"exact epoch-{epoch} command, terminal, and activation "
                 "after manager selection",
                 lambda: transition_ready(selection),
@@ -4102,7 +4127,7 @@ def observe_slot_phases(
                 clean_exit_authorizer=authorize_clean_exit,
             )
         else:
-            command, activation, selection = _wait_until(
+            command, activation, selection, terminal = _wait_until(
                 f"exact epoch-{epoch} command, manager selection, terminal, "
                 "and activation",
                 transition_ready,
@@ -4119,6 +4144,7 @@ def observe_slot_phases(
                 clean_exit_authorizer=authorize_clean_exit,
             )
         transition_events[epoch] = (command, activation, selection)
+        terminal_events[epoch] = terminal
         activated_epoch, _, activated_digest, _ = _epoch_activation_identity(
             activation
         )
@@ -4302,7 +4328,7 @@ def observe_slot_phases(
             },
         },
     ]
-    return {
+    document: dict[str, object] = {
         "schema_version": 1,
         "slot_id": spec.slot_id,
         "cutoff_rule": spec.cutoff_contract.actual_cutoff_validation_rule,
@@ -4314,6 +4340,56 @@ def observe_slot_phases(
             {"phase": "epoch2_stable", "common_commit": dict(stable_events[2][1])},
         ],
     }
+    if spec.excluded_repair_smoke_probe is not None:
+        fault_window_end_ns = shared_raw_clock_anchor_ns + (
+            spec.fault_window.start_after_prelaunch_anchor_s
+            + spec.fault_window.duration_s
+        ) * NANOSECONDS_PER_SECOND
+
+        def native_boundary(name: str, event: _Event) -> dict[str, object]:
+            return {
+                "name": name,
+                "monotonic_ns": event.timestamp_ns,
+                "event": event.reference(),
+            }
+
+        document["excluded_repair_observation"] = {
+            "schema_version": 1,
+            "observation_contract": (
+                spec.excluded_repair_smoke_probe.observation_contract
+            ),
+            "fault_window_end_monotonic_ns": fault_window_end_ns,
+            "hard_deadline_monotonic_ns": hard_deadline_ns,
+            "rows": [
+                native_boundary("epoch1_selection", transition_events[1][2]),
+                native_boundary("epoch1_command", transition_events[1][0]),
+                native_boundary("epoch1_activation", transition_events[1][1]),
+                native_boundary("epoch1_terminal", terminal_events[1]),
+                {
+                    "name": "epoch1_stable_end",
+                    "monotonic_ns": stable_events[1][2],
+                    "derivation": "phase.epoch1_stable.end_monotonic_ns",
+                },
+                {
+                    "name": "fault_window_end",
+                    "monotonic_ns": fault_window_end_ns,
+                    "derivation": (
+                        "shared_anchor_plus_fault_start_and_duration"
+                    ),
+                },
+                native_boundary("epoch2_selection", transition_events[2][2]),
+                native_boundary("epoch2_command", transition_events[2][0]),
+                native_boundary("epoch2_activation", transition_events[2][1]),
+                native_boundary("epoch2_terminal", terminal_events[2]),
+                {
+                    "name": "epoch2_stable_end",
+                    "monotonic_ns": stable_events[2][2],
+                    "derivation": "phase.epoch2_stable.end_monotonic_ns",
+                },
+                native_boundary("epoch2_drain_complete", drain_event),
+            ],
+        }
+    return document
 
 
 def _assert_epoch2_completion_within_fault_window(
@@ -4370,6 +4446,273 @@ def _assert_epoch2_completion_within_fault_window(
         raise IncompleteFactorialSlot(
             "epoch-2 stable window and drain must finish strictly before "
             "the fault window ends"
+        )
+
+
+def _uses_exact_excluded_repair_smoke_bound(
+    spec: SlotRuntimeSpec,
+    coverage_binding: CoverageSmokeLaunchBinding | None,
+) -> bool:
+    if coverage_binding is None or spec.slot_id != "slot-037-n31-f2-b04-00":
+        return False
+    try:
+        contract = json.loads(coverage_binding.contract_payload)
+    except (TypeError, ValueError) as error:
+        raise FactorialExecutionError(
+            "excluded repair smoke coverage binding is malformed"
+        ) from error
+    if not isinstance(contract, Mapping):
+        raise FactorialExecutionError(
+            "excluded repair smoke coverage binding is malformed"
+        )
+    if contract.get("manifest_id") != FROZEN_MANIFEST_ID:
+        return False
+    expected_schedule = [
+        {
+            "coverage_execution_ordinal": 1,
+            "source_campaign_execution_ordinal": 1,
+            "slot_id": "slot-066-n31-f5-b05-P",
+            "block_id": "n31-f5-b05",
+            "arm_code": "P",
+        },
+        {
+            "coverage_execution_ordinal": 2,
+            "source_campaign_execution_ordinal": 5,
+            "slot_id": "slot-037-n31-f2-b04-00",
+            "block_id": "n31-f2-b04",
+            "arm_code": "00",
+        },
+    ]
+    probe = spec.excluded_repair_smoke_probe
+    source_artifact_id = (
+        probe.source_campaign_artifact_id if probe is not None else None
+    )
+    exact_source_artifact = (
+        isinstance(source_artifact_id, str)
+        and source_artifact_id.startswith("slot-runtime-")
+        and len(source_artifact_id) == len("slot-runtime-") + 24
+        and all(character in _HEX_DIGITS for character in source_artifact_id[13:])
+    )
+    exact_probe = (
+        probe is not None
+        and probe.source_campaign_slot_id == "slot-037-n31-f2-b04-00"
+        and probe.source_campaign_result_path
+        == "results/shape-placement-factorial-v28/slot-037-n31-f2-b04-00"
+        and exact_source_artifact
+        and probe.semantic_delta == EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V1
+        and probe.source_fault_window_duration_s == 450
+        and probe.effective_fault_window_duration_s == 300
+        and probe.hard_timeout_s == 650
+        and probe.observation_contract
+        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+        and probe.verified_response_duplicate_probe_contract
+        == EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+        and probe.verified_response_duplicate_probe_mode
+        == EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1
+    )
+    exact_replica_argv = (
+        len(spec.replica_argv_templates) == 31
+        and all(
+            process.argv.count(EXCLUDED_REPAIR_SMOKE_PROBE_OPTION) == 1
+            and process.argv.count(EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1) == 1
+            and process.argv[
+                process.argv.index(EXCLUDED_REPAIR_SMOKE_PROBE_OPTION) + 1
+            ]
+            == EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1
+            for process in spec.replica_argv_templates
+        )
+        and EXCLUDED_REPAIR_SMOKE_PROBE_OPTION
+        not in spec.manager_argv_template.argv
+    )
+    if not (
+        contract.get("coverage_smoke_id")
+        == "shape-placement-factorial-v28-excluded-n31-coverage-smoke-v1"
+        and contract.get("expected_slot_count") == 2
+        and contract.get("execution_schedule") == expected_schedule
+        and spec.result_path
+        == (
+            "results/shape-placement-factorial-v28-coverage-smoke/"
+            "slot-037-n31-f2-b04-00"
+        )
+        and spec.execution_ordinal == 5
+        and spec.replica_count == 31
+        and spec.fault_window.duration_s == 300
+        and spec.fault_window.hard_timeout_s == 650
+        and spec.causal_acceptance.excluded_repair_smoke_observation_contract
+        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+        and spec.causal_acceptance.excluded_repair_smoke_verified_response_duplicate_probe_contract
+        == EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+        and exact_probe
+        and exact_replica_argv
+    ):
+        raise FactorialExecutionError(
+            "v28 excluded repair smoke runtime binding drifted"
+        )
+    return True
+
+
+def _assert_excluded_repair_smoke_completion(
+    spec: SlotRuntimeSpec,
+    phase_cutoffs: Mapping[str, object],
+    *,
+    shared_raw_clock_anchor_ns: int,
+) -> None:
+    observation = phase_cutoffs.get("excluded_repair_observation")
+    if not isinstance(observation, Mapping) or set(observation) != {
+        "schema_version",
+        "observation_contract",
+        "fault_window_end_monotonic_ns",
+        "hard_deadline_monotonic_ns",
+        "rows",
+    }:
+        raise FactorialExecutionError(
+            "excluded repair smoke observation document is missing or malformed"
+        )
+    expected_fault_end_ns = shared_raw_clock_anchor_ns + (
+        spec.fault_window.start_after_prelaunch_anchor_s
+        + spec.fault_window.duration_s
+    ) * NANOSECONDS_PER_SECOND
+    expected_hard_deadline_ns = shared_raw_clock_anchor_ns + (
+        spec.fault_window.hard_timeout_s * NANOSECONDS_PER_SECOND
+    )
+    if (
+        observation.get("schema_version") != 1
+        or observation.get("observation_contract")
+        != EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+        or observation.get("fault_window_end_monotonic_ns")
+        != expected_fault_end_ns
+        or observation.get("hard_deadline_monotonic_ns")
+        != expected_hard_deadline_ns
+    ):
+        raise FactorialExecutionError(
+            "excluded repair smoke observation identity or timing drifted"
+        )
+    rows_raw = observation.get("rows")
+    if isinstance(rows_raw, (str, bytes)) or not isinstance(rows_raw, Sequence):
+        raise FactorialExecutionError(
+            "excluded repair smoke observation rows are malformed"
+        )
+    rows = tuple(rows_raw)
+    names = (
+        "epoch1_selection",
+        "epoch1_command",
+        "epoch1_activation",
+        "epoch1_terminal",
+        "epoch1_stable_end",
+        "fault_window_end",
+        "epoch2_selection",
+        "epoch2_command",
+        "epoch2_activation",
+        "epoch2_terminal",
+        "epoch2_stable_end",
+        "epoch2_drain_complete",
+    )
+    if len(rows) != len(names) or any(
+        not isinstance(row, Mapping) or row.get("name") != name
+        for row, name in zip(rows, names, strict=True)
+    ):
+        raise FactorialExecutionError(
+            "excluded repair smoke observation row order drifted"
+        )
+    timestamps = tuple(row.get("monotonic_ns") for row in rows)
+    if any(type(timestamp) is not int or timestamp <= 0 for timestamp in timestamps):
+        raise FactorialExecutionError(
+            "excluded repair smoke observation timestamps are malformed"
+        )
+    expected_event_types = {
+        0: "adaptive_v2_evidence_snapshot",
+        1: "epoch.command_committed",
+        2: "epoch.activated",
+        3: "adaptive_v2_session_terminal",
+        6: "adaptive_v2_shape_decision",
+        7: "epoch.command_committed",
+        8: "epoch.activated",
+        9: "adaptive_v2_session_terminal",
+        11: "block.committed",
+    }
+    for index, event_type in expected_event_types.items():
+        row = rows[index]
+        event = row.get("event")
+        if (
+            set(row) != {"name", "monotonic_ns", "event"}
+            or not isinstance(event, Mapping)
+            or set(event)
+            != {
+                "relative_path",
+                "line_number",
+                "source_id",
+                "source_sequence",
+                "source_monotonic_ns",
+                "event_type",
+                "line_sha256",
+            }
+            or not isinstance(event.get("relative_path"), str)
+            or not event.get("relative_path")
+            or type(event.get("line_number")) is not int
+            or event.get("line_number", 0) <= 0
+            or not isinstance(event.get("source_id"), str)
+            or not event.get("source_id")
+            or type(event.get("source_sequence")) is not int
+            or event.get("source_sequence", -1) < 0
+            or event.get("source_monotonic_ns") != timestamps[index]
+            or event.get("event_type") != event_type
+            or not isinstance(event.get("line_sha256"), str)
+            or len(event.get("line_sha256", "")) != 64
+            or any(
+                character not in _HEX_DIGITS
+                for character in event.get("line_sha256", "")
+            )
+        ):
+            raise FactorialExecutionError(
+                "excluded repair smoke native observation row drifted"
+            )
+    expected_derivations = {
+        4: "phase.epoch1_stable.end_monotonic_ns",
+        5: "shared_anchor_plus_fault_start_and_duration",
+        10: "phase.epoch2_stable.end_monotonic_ns",
+    }
+    for index, derivation in expected_derivations.items():
+        row = rows[index]
+        if set(row) != {"name", "monotonic_ns", "derivation"} or row.get(
+            "derivation"
+        ) != derivation:
+            raise FactorialExecutionError(
+                "excluded repair smoke derived observation row drifted"
+            )
+    phases_raw = phase_cutoffs.get("phases")
+    if isinstance(phases_raw, (str, bytes)) or not isinstance(phases_raw, Sequence):
+        raise FactorialExecutionError(
+            "excluded repair smoke lacks legacy phase boundaries"
+        )
+    phase_ends = {
+        phase.get("phase"): phase.get("end_monotonic_ns")
+        for phase in phases_raw
+        if isinstance(phase, Mapping)
+    }
+    if (
+        timestamps[4] != phase_ends.get("epoch1_stable")
+        or timestamps[5] != expected_fault_end_ns
+        or timestamps[10] != phase_ends.get("epoch2_stable")
+    ):
+        raise FactorialExecutionError(
+            "excluded repair smoke derived boundaries disagree with legacy phases"
+        )
+    epoch1_timestamps = timestamps[:5]
+    epoch2_timestamps = timestamps[6:]
+    if not all(timestamp < expected_fault_end_ns for timestamp in epoch1_timestamps):
+        raise IncompleteFactorialSlot(
+            "excluded repair epoch-1 completion must be strictly before fault end"
+        )
+    if not (
+        expected_fault_end_ns < timestamps[6]
+        and expected_fault_end_ns < timestamps[7]
+    ):
+        raise IncompleteFactorialSlot(
+            "excluded repair fault end must be strictly before cycle-1 selection and command"
+        )
+    if not all(timestamp < expected_hard_deadline_ns for timestamp in epoch2_timestamps):
+        raise IncompleteFactorialSlot(
+            "excluded repair epoch-2 completion and drain must be strictly before hard deadline"
         )
 
 
@@ -5169,11 +5512,18 @@ def execute_slot_once(
             raw_now_ns=raw_now_ns,
             sleep=sleep,
         )
-        _assert_epoch2_completion_within_fault_window(
-            spec,
-            observed_phase_cutoffs,
-            shared_raw_clock_anchor_ns=anchor_ns,
-        )
+        if _uses_exact_excluded_repair_smoke_bound(spec, coverage_binding):
+            _assert_excluded_repair_smoke_completion(
+                spec,
+                observed_phase_cutoffs,
+                shared_raw_clock_anchor_ns=anchor_ns,
+            )
+        else:
+            _assert_epoch2_completion_within_fault_window(
+                spec,
+                observed_phase_cutoffs,
+                shared_raw_clock_anchor_ns=anchor_ns,
+            )
         _write_exclusive(
             slot_directory / "phase-cutoffs.json",
             _canonical_json_bytes(observed_phase_cutoffs),
@@ -5498,10 +5848,15 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v25/slot-066-n31-f5-b05-P": "v25",
         "results/shape-placement-factorial-v26/slot-066-n31-f5-b05-P": "v26",
         "results/shape-placement-factorial-v27/slot-066-n31-f5-b05-P": "v27",
+        "results/shape-placement-factorial-v28/slot-066-n31-f5-b05-P": "v28",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
-    expected_fault_duration_s = 450 if manifest_version == "v27" else 300
-    expected_hard_timeout_s = 650 if manifest_version == "v27" else 500
+    expected_fault_duration_s = (
+        450 if manifest_version in {"v27", "v28"} else 300
+    )
+    expected_hard_timeout_s = (
+        650 if manifest_version in {"v27", "v28"} else 500
+    )
     expected_timeout_eligibility = {
         "v15": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
         "v16": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
@@ -5516,6 +5871,7 @@ def build_n31_coverage_smoke_slot(
         "v25": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v26": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v27": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v28": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
@@ -5532,6 +5888,7 @@ def build_n31_coverage_smoke_slot(
             "v25",
             "v26",
             "v27",
+            "v28",
         }
         else None
     )
@@ -5549,12 +5906,13 @@ def build_n31_coverage_smoke_slot(
             "v25",
             "v26",
             "v27",
+            "v28",
         }
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-        if manifest_version in {"v23", "v24", "v25", "v26", "v27"}
+        if manifest_version in {"v23", "v24", "v25", "v26", "v27", "v28"}
         else (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_version in {"v19", "v20", "v21", "v22"}
@@ -5564,27 +5922,39 @@ def build_n31_coverage_smoke_slot(
     expected_source_bound_proposal_witness_contract = (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
         if manifest_version
-        in {"v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27"}
+        in {
+            "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28"
+        }
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-        if manifest_version in {"v22", "v23", "v24", "v25", "v26", "v27"}
+        if manifest_version in {"v22", "v23", "v24", "v25", "v26", "v27", "v28"}
         else None
     )
     expected_inherited_wait_exempt_placement_contract = (
         INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
-        if manifest_version in {"v25", "v26", "v27"}
+        if manifest_version in {"v25", "v26", "v27", "v28"}
         else None
     )
     expected_verified_response_duplicate_delivery_contract = (
         VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2
-        if manifest_version == "v27"
+        if manifest_version in {"v27", "v28"}
         else (
             VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
             if manifest_version == "v26"
             else None
         )
+    )
+    expected_excluded_repair_observation_contract = (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+        if manifest_version == "v28"
+        else None
+    )
+    expected_excluded_repair_duplicate_probe_contract = (
+        EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+        if manifest_version == "v28"
+        else None
     )
     if (
         manifest_version is None
@@ -5661,14 +6031,22 @@ def build_n31_coverage_smoke_slot(
         != expected_inherited_wait_exempt_placement_contract
         or responsive.verified_response_duplicate_delivery_contract
         != expected_verified_response_duplicate_delivery_contract
+        or responsive.excluded_repair_smoke_observation_contract
+        != expected_excluded_repair_observation_contract
+        or responsive.excluded_repair_smoke_verified_response_duplicate_probe_contract
+        != expected_excluded_repair_duplicate_probe_contract
         or template.workload.epoch1_preselection_residency_ms
         != (
             60_000
-            if manifest_version in {"v24", "v25", "v26", "v27"}
+            if manifest_version in {"v24", "v25", "v26", "v27", "v28"}
             else None
         )
         or responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
-        != (82 if manifest_version in {"v24", "v25", "v26", "v27"} else None)
+        != (
+            82
+            if manifest_version in {"v24", "v25", "v26", "v27", "v28"}
+            else None
+        )
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "
@@ -5686,7 +6064,7 @@ def build_n31_coverage_smoke_slot(
         )
     smoke = replace(template, result_path=result_path)
     primary_runtime = build_slot_runtime(smoke)
-    if manifest_version not in {"v25", "v26", "v27"}:
+    if manifest_version not in {"v25", "v26", "v27", "v28"}:
         if repair_template is not None or repair_result_path is not None:
             raise FactorialExecutionError(
                 "historical N=31 coverage smoke must remain single-slot"
@@ -5779,6 +6157,10 @@ def build_n31_coverage_smoke_slot(
         != INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
         or repair_responsive.verified_response_duplicate_delivery_contract
         != expected_verified_response_duplicate_delivery_contract
+        or repair_responsive.excluded_repair_smoke_observation_contract
+        != expected_excluded_repair_observation_contract
+        or repair_responsive.excluded_repair_smoke_verified_response_duplicate_probe_contract
+        != expected_excluded_repair_duplicate_probe_contract
         or repair_template.workload.epoch1_preselection_residency_ms != 60_000
         or repair_responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
         != 82
@@ -5796,8 +6178,37 @@ def build_n31_coverage_smoke_slot(
         raise FactorialExecutionError(
             "v25+ N=31 repair coverage result path must be the exact canonical root"
         )
-    repair_smoke = replace(repair_template, result_path=repair_result_path)
-    repair_runtime = build_slot_runtime(repair_smoke)
+    excluded_repair_probe: ExcludedRepairSmokeProbeContract | None = None
+    if manifest_version == "v28":
+        source_repair_runtime = build_slot_runtime(repair_template)
+        repair_smoke = replace(
+            repair_template,
+            result_path=repair_result_path,
+            byzantine=replace(repair_template.byzantine, duration_s=300),
+        )
+        excluded_repair_probe = ExcludedRepairSmokeProbeContract(
+            source_campaign_slot_id=repair_template.slot_id,
+            source_campaign_result_path=repair_template.result_path,
+            source_campaign_artifact_id=source_repair_runtime.artifact_id,
+            semantic_delta=EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V1,
+            source_fault_window_duration_s=450,
+            effective_fault_window_duration_s=300,
+            hard_timeout_s=650,
+            observation_contract=EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+            verified_response_duplicate_probe_contract=(
+                EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+            ),
+            verified_response_duplicate_probe_mode=(
+                EXCLUDED_REPAIR_SMOKE_PROBE_MODE_V1
+            ),
+        )
+        repair_runtime = build_slot_runtime(
+            repair_smoke,
+            excluded_repair_smoke_probe=excluded_repair_probe,
+        )
+    else:
+        repair_smoke = replace(repair_template, result_path=repair_result_path)
+        repair_runtime = build_slot_runtime(repair_smoke)
     ordered_runtimes = (primary_runtime, repair_runtime)
     coverage_runtime = N31CoverageSmokeRuntime(
         schema_version=1,
@@ -5812,6 +6223,7 @@ def build_n31_coverage_smoke_slot(
         stop_on_first_non_pass=True,
         minimum_free_bytes=10_000_000_000,
         slots=ordered_runtimes,
+        excluded_repair_smoke_probe=excluded_repair_probe,
     )
     return N31CoverageSmokeSlot(
         slot=smoke,

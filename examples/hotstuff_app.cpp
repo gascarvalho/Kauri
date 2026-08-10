@@ -293,7 +293,8 @@ parse_experiment_byzantine_options(
     const std::string &raw_window_start_monotonic_ns,
     const std::string &raw_window_end_monotonic_ns,
     int max_omissions_per_proposal,
-    int maximum_rotating_contexts)
+    int maximum_rotating_contexts,
+    const std::string &raw_response_evidence_duplicate_probe)
 {
     const bool scheduled_argument_present =
         !raw_rotating_omission_actors.empty() ||
@@ -302,7 +303,8 @@ parse_experiment_byzantine_options(
         !raw_window_start_monotonic_ns.empty() ||
         !raw_window_end_monotonic_ns.empty() ||
         max_omissions_per_proposal != 0 ||
-        maximum_rotating_contexts != 0;
+        maximum_rotating_contexts != 0 ||
+        !raw_response_evidence_duplicate_probe.empty();
     const bool requested =
         !fault_mode.empty() ||
         !raw_configuration.empty() ||
@@ -355,6 +357,16 @@ parse_experiment_byzantine_options(
             throw HotStuffError(
                 "scheduled omission does not accept static configuration "
                 "or a context limit");
+        if (!raw_response_evidence_duplicate_probe.empty() &&
+            raw_response_evidence_duplicate_probe !=
+                hotstuff::kExperimentResponseEvidenceDuplicateProbeMode)
+            throw HotStuffError(
+                "unsupported experiment response-evidence duplicate probe");
+        if (!raw_response_evidence_duplicate_probe.empty() &&
+            fault_mode !=
+                "tiered_persistent_responsive_omission_v2")
+            throw HotStuffError(
+                "response-evidence duplicate probe requires the tiered v2 mode");
     }
     else
     {
@@ -413,6 +425,8 @@ parse_experiment_byzantine_options(
     hotstuff::ExperimentByzantineOptions options;
     options.enabled = true;
     options.diagnostic_window = diagnostic_window;
+    options.response_evidence_duplicate_probe =
+        raw_response_evidence_duplicate_probe;
     if (scheduled_mode)
     {
         if (raw_rotating_omission_actors.empty() ||
@@ -963,6 +977,8 @@ int main(int argc, char **argv)
         Config::OptValInt::create(0);
     auto opt_experiment_rotating_omission_context_limit =
         Config::OptValInt::create(0);
+    auto opt_experiment_response_evidence_duplicate_probe =
+        Config::OptValStr::create("");
     auto opt_experiment_post_qc_audit_configuration =
         Config::OptValStr::create("");
     auto opt_experiment_post_qc_audit_window =
@@ -1205,6 +1221,12 @@ int main(int argc, char **argv)
         -1,
         "maximum retained exact scheduled omission proposal contexts");
     config.add_opt(
+        "experiment-response-evidence-duplicate-probe",
+        opt_experiment_response_evidence_duplicate_probe,
+        Config::SET_VAL,
+        -1,
+        "exact experiment-only response-evidence duplicate probe mode");
+    config.add_opt(
         "experiment-post-qc-audit-configuration",
         opt_experiment_post_qc_audit_configuration,
         Config::SET_VAL,
@@ -1336,7 +1358,8 @@ int main(int argc, char **argv)
             opt_experiment_byzantine_window_start_monotonic_ns->get(),
             opt_experiment_byzantine_window_end_monotonic_ns->get(),
             opt_experiment_byzantine_max_omissions_per_proposal->get(),
-            opt_experiment_rotating_omission_context_limit->get());
+            opt_experiment_rotating_omission_context_limit->get(),
+            opt_experiment_response_evidence_duplicate_probe->get());
     const auto experiment_post_qc_audit_options =
         parse_experiment_post_qc_audit_options(
             opt_epoch_protocol_mode->get(),

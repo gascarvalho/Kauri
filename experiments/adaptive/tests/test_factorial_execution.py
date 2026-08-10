@@ -1071,7 +1071,7 @@ def test_transition_ready_joins_one_immutable_stream_snapshot(
         if description.startswith("manager selection anchor for epoch-1"):
             return selection
         assert description.startswith("exact epoch-1 command")
-        assert predicate() == (command, activation, selection)
+        assert predicate() == (command, activation, selection, terminal)
         raise StopAfterTransitionJoin
 
     monkeypatch.setattr(execution, "read_event_streams", read_streams)

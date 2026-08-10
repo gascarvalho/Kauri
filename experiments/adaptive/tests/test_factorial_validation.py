@@ -54,8 +54,11 @@ V25_MANIFEST_PATH = (
 V26_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v26.json"
 )
-FROZEN_MANIFEST_PATH = (
+V27_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v27.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v28.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -149,6 +152,32 @@ VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2 = (
     "completed_accepted_ingress_and_cannot_fail_the_response_deadline_or_suppress_"
     "later_convergence_observations_v2"
 )
+EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT = (
+    "exact_excluded_repair_smoke_epoch1_selection_terminal_all_replica_command_"
+    "activation_and_stable_end_before_fault_end_then_fault_end_before_cycle1_"
+    "selection_then_epoch2_terminal_all_replica_command_activation_stable_end_"
+    "and_drain_before_shared_hard_deadline_v1"
+)
+EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT = (
+    "exact_excluded_repair_smoke_at_least_one_post_fault_epoch1_internal_"
+    "responsive_child_response_is_replayed_only_into_response_evidence_bridge_"
+    "after_consensus_acceptance_and_first_evidence_record_with_at_most_one_probe_"
+    "per_reporter_v1"
+)
+RESPONSE_DUPLICATE_PROBE_MODE = (
+    "exact_once_post_fault_epoch1_responsive_internal_child_v1"
+)
+
+
+def test_v28_repair_contract_literals_are_exact() -> None:
+    assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1 == (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+    )
+    assert (
+        validation.EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+        == EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT
+    )
+    assert validation.RESPONSE_DUPLICATE_PROBE_MODE_V1 == RESPONSE_DUPLICATE_PROBE_MODE
 
 
 def test_v26_and_v27_duplicate_delivery_dispatch_is_version_and_field_exact() -> None:
@@ -341,13 +370,14 @@ def _v26_candidate_manifest(
 def _v27_candidate_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    payload = V27_MANIFEST_PATH.read_bytes()
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v28_candidate_manifest(
+    _monkeypatch: pytest.MonkeyPatch,
+):
     payload = FROZEN_MANIFEST_PATH.read_bytes()
-    semantic = _canonical(json.loads(payload))
-    monkeypatch.setattr(
-        manifest_module,
-        "FROZEN_SEMANTIC_SHA256",
-        hashlib.sha256(semantic).hexdigest(),
-    )
     return manifest_module.parse_manifest_bytes(payload)
 
 
@@ -517,7 +547,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v26_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v28_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -549,8 +579,12 @@ def test_validator_retains_exact_v1_through_v26_artifact_identities() -> None:
             (24, MANIFEST_PATH),
             (25, V25_MANIFEST_PATH),
             (26, V26_MANIFEST_PATH),
+            (27, V27_MANIFEST_PATH),
         )
     }
+    identities[28] = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
 
     assert identities[1].manifest_sha256 == validation.LEGACY_MANIFEST_SHA256
     assert identities[2].manifest_sha256 == validation.V2_MANIFEST_SHA256
@@ -738,6 +772,25 @@ def test_validator_retains_exact_v1_through_v26_artifact_identities() -> None:
         identities[26].coverage_smoke_runtime_sha256
         == validation.V26_COVERAGE_SMOKE_RUNTIME_SHA256
     )
+    assert identities[27].manifest_sha256 == validation.V27_MANIFEST_SHA256
+    assert identities[27].plan_sha256 == validation.V27_PLAN_SHA256
+    assert identities[27].runtime_sha256 == validation.V27_RUNTIME_SHA256
+    assert identities[27].smoke_runtime_sha256 == validation.V27_SMOKE_RUNTIME_SHA256
+    assert (
+        identities[27].coverage_smoke_runtime_sha256
+        == validation.V27_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[28].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[28].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[28].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[28].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[28].coverage_smoke_runtime_sha256
+        == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
     assert validation._coverage_smoke_result_root(
         validation.V23_MANIFEST_ID
     ) == "results/shape-placement-factorial-v23-coverage-smoke"
@@ -751,11 +804,53 @@ def test_validator_retains_exact_v1_through_v26_artifact_identities() -> None:
         validation.V26_MANIFEST_ID
     ) == "results/shape-placement-factorial-v26-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V27_MANIFEST_ID
     ) == "results/shape-placement-factorial-v27-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v28-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
+    manifest_payload = V27_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(V27_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    primary = next(
+        slot for slot in plan.slots if slot.execution_ordinal == 1
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.execution_ordinal == 5
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+
+    recomputed = (
+        hashlib.sha256(manifest_payload).hexdigest(),
+        hashlib.sha256(_canonical(json.loads(manifest_payload))).hexdigest(),
+        plan.plan_sha256,
+        hashlib.sha256(canonical_runtime_bytes(runtime)).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(smoke.runtime.as_document())
+        ).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest(),
+    )
+    assert recomputed == (
+        manifest_module.V27_MANIFEST_SHA256,
+        manifest_module.V27_SEMANTIC_SHA256,
+        manifest_module.V27_PLAN_SHA256,
+        validation.V27_RUNTIME_SHA256,
+        validation.V27_SMOKE_RUNTIME_SHA256,
+        validation.V27_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+
+
+def test_validator_v28_identities_match_independent_artifact_recomputation() -> None:
     manifest_payload = FROZEN_MANIFEST_PATH.read_bytes()
     manifest = load_frozen_manifest(FROZEN_MANIFEST_PATH)
     plan = build_factorial_plan(manifest)
@@ -6722,10 +6817,10 @@ def _v26_duplicate_delivery_live_fixture(
             source_id="adaptive-manager",
             source_instance="slot-adaptive-manager",
             source_sequence=1,
-            monotonic_ns=3_000,
-            event_type="adaptive_v2_converged",
-            payload=convergence_payload,
-            line_sha256="55" * 32,
+            monotonic_ns=900,
+            event_type="adaptive_v2_shape_decision",
+            payload={"cycle_ordinal": 1},
+            line_sha256="54" * 32,
         ),
         validation._NativeEvent(
             relative_path="raw/adaptive-manager.jsonl",
@@ -6734,6 +6829,18 @@ def _v26_duplicate_delivery_live_fixture(
             source_id="adaptive-manager",
             source_instance="slot-adaptive-manager",
             source_sequence=2,
+            monotonic_ns=3_000,
+            event_type="adaptive_v2_converged",
+            payload=convergence_payload,
+            line_sha256="55" * 32,
+        ),
+        validation._NativeEvent(
+            relative_path="raw/adaptive-manager.jsonl",
+            line_number=3,
+            source_kind="adaptation_manager",
+            source_id="adaptive-manager",
+            source_instance="slot-adaptive-manager",
+            source_sequence=3,
             monotonic_ns=3_100,
             event_type="adaptive_v2_session_terminal",
             payload=terminal_payload,
@@ -6814,7 +6921,7 @@ def test_v26_slot037_requires_live_idempotent_duplicate_delivery_proof(
         **arguments
     )
     assert not validation._validate_v26_verified_response_duplicate_live_exercise(
-        **{**arguments, "manifest_id": validation.FROZEN_MANIFEST_ID}
+        **{**arguments, "manifest_id": validation.V27_MANIFEST_ID}
     )
     assert not validation._validate_v27_verified_response_duplicate_live_exercise(
         **arguments
@@ -6832,6 +6939,10 @@ def test_v26_slot037_requires_live_idempotent_duplicate_delivery_proof(
         ("late-marker", "active topology/response-attempt arm"),
         ("deadline-poison", "convergence poison"),
         ("missing-activation", "cycle-1 commit/activation convergence"),
+        ("selection-after-command", "cycle-1 selection chronology"),
+        ("command-after-activation", "convergence activation drifted"),
+        ("premature-convergence", "raw activation quorum"),
+        ("convergence-after-terminal", "convergence terminal drifted"),
         ("missing-converged", "cycle-1 adaptive_v2_converged"),
         ("drifted-converged", "cycle-1 adaptive_v2_converged"),
         ("short-converged", "cycle-1 adaptive_v2_converged"),
@@ -6873,20 +6984,55 @@ def test_v26_slot037_duplicate_delivery_proof_is_fail_closed(
         replica_events = dict(arguments["replica_events"])
         replica_events[30] = replica_events[30][:1]
         arguments["replica_events"] = replica_events
+    elif mutation == "selection-after-command":
+        selection, converged, terminal = arguments["manager_events"]
+        arguments["manager_events"] = (
+            replace(selection, monotonic_ns=1_001),
+            converged,
+            terminal,
+        )
+    elif mutation == "command-after-activation":
+        replica_events = dict(arguments["replica_events"])
+        command, activation = replica_events[0]
+        replica_events[0] = (
+            replace(command, monotonic_ns=activation.monotonic_ns + 1),
+            activation,
+        )
+        arguments["replica_events"] = replica_events
+    elif mutation == "premature-convergence":
+        selection, converged, terminal = arguments["manager_events"]
+        arguments["manager_events"] = (
+            selection,
+            replace(converged, monotonic_ns=2_019),
+            terminal,
+        )
+    elif mutation == "convergence-after-terminal":
+        selection, converged, terminal = arguments["manager_events"]
+        arguments["manager_events"] = (
+            selection,
+            converged,
+            replace(terminal, monotonic_ns=converged.monotonic_ns - 1),
+        )
     elif mutation == "missing-converged":
-        arguments["manager_events"] = arguments["manager_events"][1:]
+        arguments["manager_events"] = tuple(
+            event
+            for event in arguments["manager_events"]
+            if event.event_type != "adaptive_v2_converged"
+        )
     elif mutation == "drifted-converged":
-        converged, terminal = arguments["manager_events"]
+        selection, converged, terminal = arguments["manager_events"]
         identity = dict(converged.payload["identity"])
         identity["command_block_hash"] = "77" * 32
         arguments["manager_events"] = (
+            selection,
             replace(converged, payload={**converged.payload, "identity": identity}),
             terminal,
         )
     elif mutation == "short-converged":
-        converged, terminal = arguments["manager_events"]
+        selection, converged, terminal = arguments["manager_events"]
         expected = arguments["expected"]
         arguments["manager_events"] = (
+            selection,
             replace(
                 converged,
                 payload={
@@ -6897,9 +7043,10 @@ def test_v26_slot037_duplicate_delivery_proof_is_fail_closed(
             terminal,
         )
     elif mutation == "required-count-drift":
-        converged, terminal = arguments["manager_events"]
+        selection, converged, terminal = arguments["manager_events"]
         expected = arguments["expected"]
         arguments["manager_events"] = (
+            selection,
             replace(
                 converged,
                 payload={
@@ -6912,8 +7059,9 @@ def test_v26_slot037_duplicate_delivery_proof_is_fail_closed(
             terminal,
         )
     else:
-        converged, terminal = arguments["manager_events"]
+        selection, converged, terminal = arguments["manager_events"]
         arguments["manager_events"] = (
+            selection,
             converged,
             replace(
                 terminal,
@@ -6932,7 +7080,7 @@ def _v27_duplicate_delivery_live_fixture(
     tmp_path: Path,
 ) -> tuple[dict[str, object], Path]:
     arguments, log_path = _v26_duplicate_delivery_live_fixture(tmp_path)
-    arguments["manifest_id"] = validation.FROZEN_MANIFEST_ID
+    arguments["manifest_id"] = validation.V27_MANIFEST_ID
     lines = log_path.read_text(encoding="utf-8").splitlines()
     log_path.write_text(
         "\n".join(
@@ -6961,6 +7109,265 @@ def test_v27_slot037_binds_post_dispatch_duplicate_and_permits_proven_tail(
     assert not validation._validate_v26_verified_response_duplicate_live_exercise(
         **arguments
     )
+
+
+def _v28_duplicate_probe_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, object], Path]:
+    arguments, log_path = _v26_duplicate_delivery_live_fixture(tmp_path)
+    predecessor_digest = arguments["predecessor_epoch_digest"]
+    proposal_block_hash = "88" * 32
+    reporter = 6
+    child = 1
+    tree_id = 6
+    response_ns = 900
+    fault_end_ns = 500
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    guard = lines[5]
+    probe = (
+        "KAURI_EXPERIMENT response_duplicate_probe "
+        f"mode={RESPONSE_DUPLICATE_PROBE_MODE} consensus_accepted=1 "
+        f"reporter={reporter} child={child} epoch=1 tree={tree_id} "
+        f"digest={predecessor_digest} block={proposal_block_hash} "
+        "message_type=aggregate_relay "
+        f"response_monotonic_ns={response_ns} "
+        f"window_end_monotonic_ns={fault_end_ns} "
+        "first_call_recorded=1 second_call_recorded=0"
+    )
+    log_path.write_text(
+        "\n".join(
+            (
+                *lines[:4],
+                guard,
+                probe,
+                "[EPOCH] Adaptive-v2 convergence evidence unhealthy: "
+                "shared_outbox_delivery_failed",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence = validation._EvidenceRecord(
+        ingestion_sequence=1,
+        acceptance_monotonic_ns=950,
+        observation_id="99" * 32,
+        reporter_id=reporter,
+        target_id=child,
+        epoch_number=1,
+        tree_id=tree_id,
+        epoch_digest=predecessor_digest,
+        block_hash=proposal_block_hash,
+        message_type="aggregate_relay",
+        outcome="on_time",
+        response_duration_us=20,
+        deadline_duration_us=20,
+        reporter_monotonic_ns=response_ns,
+        reporter_sequence=1,
+        signer_set=(1, 3),
+    )
+    arguments.update(
+        {
+            "manifest_id": "shape-placement-factorial-v28",
+            "accepted": {(1, predecessor_digest): (evidence,)},
+            "fault_window_end_ns": fault_end_ns,
+        }
+    )
+    return arguments, log_path
+
+
+def test_v28_slot037_binds_exact_bridge_only_duplicate_probe(
+    tmp_path: Path,
+) -> None:
+    arguments, _ = _v28_duplicate_probe_fixture(tmp_path)
+    assert validation._validate_v28_verified_response_duplicate_probe(
+        **arguments
+    )
+
+
+def test_v28_probe_pairing_permits_unrelated_interleaved_logging(
+    tmp_path: Path,
+) -> None:
+    arguments, log_path = _v28_duplicate_probe_fixture(tmp_path)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    probe_index = next(
+        index for index, line in enumerate(lines) if "response_duplicate_probe" in line
+    )
+    lines.insert(probe_index, "unrelated native diagnostic")
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert validation._validate_v28_verified_response_duplicate_probe(
+        **arguments
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        ("missing-probe", "lacks a response duplicate probe"),
+        ("missing-guard", "lacks its preceding guard"),
+        ("wrong-mode", "contract fields"),
+        ("consensus-rejected", "contract fields"),
+        ("wrong-result-bits", "contract fields"),
+        ("wrong-window", "contract fields"),
+        ("at-fault-end", "contract fields"),
+        ("at-reporter-command", "pre-reporter-command"),
+        ("wrong-child", "contract fields"),
+        ("responsive-leaf-child", "internal-child topology"),
+        ("wrong-epoch", "contract fields"),
+        ("wrong-type", "contract fields"),
+        ("guard-identity", "probe/guard identity"),
+        ("guard-generation", "guard/ingress generation"),
+        ("ingress-generation", "guard/ingress generation"),
+        ("missing-ingress", "original accepted ingress"),
+        ("rejected-ingress", "original accepted ingress"),
+        ("missing-arm", "exact arm"),
+        ("missing-observation", "Epoch1 accepted evidence"),
+        ("timeout-observation", "on-time observation"),
+        ("duplicate-reporter", "more than one.*per reporter"),
+        ("intervening-guard", "probe/guard identity"),
+        ("deadline-poison", "response deadline evidence failed"),
+        ("unknown-poison", "unknown convergence poison"),
+        ("missing-convergence", "converged event"),
+        ("missing-activation", "commit/activation convergence"),
+        ("campaign-leak", "escaped the exact excluded repair smoke"),
+    ),
+)
+def test_v28_response_duplicate_probe_is_fail_closed(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments, log_path = _v28_duplicate_probe_fixture(tmp_path)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    probe_index = next(
+        index for index, line in enumerate(lines) if "response_duplicate_probe" in line
+    )
+    guard_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "KAURI_RESPONSE_EVIDENCE" in line
+    )
+    if mutation == "missing-probe":
+        del lines[probe_index]
+    elif mutation == "missing-guard":
+        del lines[guard_index]
+    elif mutation == "wrong-mode":
+        lines[probe_index] = lines[probe_index].replace(
+            RESPONSE_DUPLICATE_PROBE_MODE,
+            RESPONSE_DUPLICATE_PROBE_MODE + "-drift",
+        )
+    elif mutation == "consensus-rejected":
+        lines[probe_index] = lines[probe_index].replace(
+            "consensus_accepted=1", "consensus_accepted=0"
+        )
+    elif mutation == "wrong-result-bits":
+        lines[probe_index] = lines[probe_index].replace(
+            "first_call_recorded=1 second_call_recorded=0",
+            "first_call_recorded=0 second_call_recorded=1",
+        )
+    elif mutation == "wrong-window":
+        lines[probe_index] = lines[probe_index].replace(
+            "window_end_monotonic_ns=500", "window_end_monotonic_ns=501"
+        )
+    elif mutation == "at-fault-end":
+        lines[probe_index] = lines[probe_index].replace(
+            "response_monotonic_ns=900", "response_monotonic_ns=500"
+        )
+    elif mutation == "at-reporter-command":
+        lines[probe_index] = lines[probe_index].replace(
+            "response_monotonic_ns=900", "response_monotonic_ns=1006"
+        )
+        lines[guard_index] = lines[guard_index].replace(
+            "response_monotonic_ns=900", "response_monotonic_ns=1006"
+        )
+        evidence = arguments["accepted"][(1, arguments["predecessor_epoch_digest"])][0]
+        arguments["accepted"] = {
+            (1, arguments["predecessor_epoch_digest"]): (
+                replace(
+                    evidence,
+                    reporter_monotonic_ns=1006,
+                    acceptance_monotonic_ns=1006,
+                ),
+            )
+        }
+    elif mutation == "wrong-child":
+        lines[probe_index] = lines[probe_index].replace("child=1", "child=2")
+    elif mutation == "responsive-leaf-child":
+        lines = [
+            line.replace("child=1", "child=16").replace(
+                "source_replica=1", "source_replica=16"
+            )
+            for line in lines
+        ]
+        key = (1, arguments["predecessor_epoch_digest"])
+        evidence = arguments["accepted"][key][0]
+        arguments["accepted"] = {key: (replace(evidence, target_id=16),)}
+    elif mutation == "wrong-epoch":
+        lines[probe_index] = lines[probe_index].replace("epoch=1", "epoch=0")
+    elif mutation == "wrong-type":
+        lines[probe_index] = lines[probe_index].replace(
+            "message_type=aggregate_relay", "message_type=direct_vote"
+        )
+    elif mutation == "guard-identity":
+        lines[guard_index] = lines[guard_index].replace("block=8888", "block=9988")
+    elif mutation == "guard-generation":
+        lines[guard_index] = lines[guard_index].replace(
+            "attempt_generation=7", "attempt_generation=8"
+        )
+    elif mutation == "ingress-generation":
+        result_index = next(
+            index for index, line in enumerate(lines) if "stage=result" in line
+        )
+        lines[result_index] = lines[result_index].replace(
+            "generation=4294967303", "generation=4294967304"
+        )
+    elif mutation == "missing-ingress":
+        lines = [line for line in lines if "KAURI_RELAY_INGRESS" not in line]
+    elif mutation == "rejected-ingress":
+        result_index = next(
+            index for index, line in enumerate(lines) if "stage=result" in line
+        )
+        lines[result_index] = lines[result_index].replace(
+            "permission=3", "permission=2"
+        )
+    elif mutation == "missing-arm":
+        lines = [line for line in lines if "response_attempt_armed" not in line]
+    elif mutation in {"missing-observation", "timeout-observation"}:
+        key = (1, arguments["predecessor_epoch_digest"])
+        evidence = arguments["accepted"][key][0]
+        arguments["accepted"] = (
+            {}
+            if mutation == "missing-observation"
+            else {key: (replace(evidence, outcome="timeout"),)}
+        )
+    elif mutation == "duplicate-reporter":
+        lines.insert(probe_index + 1, lines[probe_index])
+    elif mutation == "intervening-guard":
+        lines.insert(probe_index, lines[guard_index].replace("block=8888", "block=9988"))
+    elif mutation == "deadline-poison":
+        lines.append(
+            "[EPOCH] Adaptive-v2 convergence evidence unhealthy: "
+            "response_deadline_evidence_failed"
+        )
+    elif mutation == "unknown-poison":
+        lines.append(
+            "[EPOCH] Adaptive-v2 convergence evidence unhealthy: unknown_failure"
+        )
+    elif mutation == "missing-convergence":
+        arguments["manager_events"] = tuple(
+            event
+            for event in arguments["manager_events"]
+            if event.event_type != "adaptive_v2_converged"
+        )
+    elif mutation == "missing-activation":
+        replica_events = dict(arguments["replica_events"])
+        replica_events[30] = replica_events[30][:1]
+        arguments["replica_events"] = replica_events
+    else:
+        arguments["coverage_smoke"] = False
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v28_verified_response_duplicate_probe(**arguments)
 
 
 @pytest.mark.parametrize(
@@ -7026,7 +7433,11 @@ def test_v27_slot037_duplicate_delivery_proof_is_fail_closed(
             "response_deadline_result_exception"
         )
     elif mutation == "outbox-without-convergence":
-        arguments["manager_events"] = arguments["manager_events"][1:]
+        arguments["manager_events"] = tuple(
+            event
+            for event in arguments["manager_events"]
+            if event.event_type != "adaptive_v2_converged"
+        )
     else:
         replica_events = dict(arguments["replica_events"])
         replica_events[30] = replica_events[30][:1]
@@ -7765,6 +8176,290 @@ def test_phase_cutoffs_enforce_prefault_baseline_and_full_observation_hold() -> 
         validation._validate_phase_cutoffs(early_drain, **arguments)
 
 
+def _v28_repair_observation_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fault_end_ns: int = 500,
+    hard_deadline_ns: int = 1_000,
+) -> tuple[dict[str, object], dict[str, object]]:
+    manifest = _v28_candidate_manifest(monkeypatch)
+    expected = _v25_inherited_placement_expected_slot()
+    digests = ("10" * 32, "11" * 32, "22" * 32)
+    manager_events = (
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=1,
+            monotonic_ns=100,
+            event_type="adaptive_v2_evidence_snapshot",
+            payload={"cycle_ordinal": 0},
+        ),
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=2,
+            monotonic_ns=190,
+            event_type="adaptive_v2_session_terminal",
+            payload={"cycle_ordinal": 0},
+        ),
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=3,
+            monotonic_ns=550,
+            event_type="adaptive_v2_evidence_snapshot",
+            payload={"cycle_ordinal": 1},
+        ),
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=4,
+            monotonic_ns=600,
+            event_type="adaptive_v2_shape_decision",
+            payload={"cycle_ordinal": 1},
+        ),
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=5,
+            monotonic_ns=750,
+            event_type="adaptive_v2_session_terminal",
+            payload={"cycle_ordinal": 1},
+        ),
+    )
+    replica_streams: dict[int, list[validation._NativeEvent]] = {}
+    for replica_id in range(expected.replica_count):
+        stream: list[validation._NativeEvent] = []
+        for epoch, command_ns, activation_ns in (
+            (1, 120 + replica_id, 151 + replica_id),
+            (2, 620 + replica_id, 670 + replica_id),
+        ):
+            command_height = 100 + epoch * 10
+            stream.extend(
+                (
+                    _native_event(
+                        source_id=f"replica-{replica_id}",
+                        sequence=len(stream) + 1,
+                        monotonic_ns=command_ns,
+                        event_type="epoch.command_committed",
+                        payload={
+                            "command_block_height": command_height,
+                            "command_block_hash": f"{epoch:064x}",
+                            "payload_digest": f"{epoch + 10:064x}",
+                            "predecessor_epoch_number": epoch - 1,
+                            "predecessor_epoch_digest": digests[epoch - 1],
+                            "successor_epoch_number": epoch,
+                            "successor_epoch_digest": digests[epoch],
+                            "activation_delay_blocks": 5,
+                            "activation_height": command_height + 5,
+                        },
+                    ),
+                    _native_event(
+                        source_id=f"replica-{replica_id}",
+                        sequence=len(stream) + 2,
+                        monotonic_ns=activation_ns,
+                        event_type="epoch.activated",
+                        payload={
+                            "epoch_number": epoch,
+                            "tree_id": 0,
+                            "epoch_digest": digests[epoch],
+                            "activation_height": command_height + 5,
+                        },
+                    ),
+                )
+            )
+        replica_streams[replica_id] = stream
+    drain = _native_event(
+        source_id="replica-0",
+        sequence=5,
+        monotonic_ns=900,
+        event_type="block.committed",
+        payload={},
+    )
+    replica_streams[0].append(drain)
+    replica_events = {
+        replica_id: tuple(stream)
+        for replica_id, stream in replica_streams.items()
+    }
+    all_events = (
+        *manager_events,
+        *(event for stream in replica_events.values() for event in stream),
+    )
+    events_by_ref = {
+        (event.relative_path, event.source_sequence): event for event in all_events
+    }
+    commands = {
+        epoch: max(
+            (
+                event
+                for stream in replica_events.values()
+                for event in stream
+                if event.event_type == "epoch.command_committed"
+                and event.payload["successor_epoch_number"] == epoch
+            ),
+            key=lambda event: (event.monotonic_ns, event.source_id),
+        )
+        for epoch in (1, 2)
+    }
+    activations = {
+        epoch: max(
+            (
+                event
+                for stream in replica_events.values()
+                for event in stream
+                if event.event_type == "epoch.activated"
+                and event.payload["epoch_number"] == epoch
+            ),
+            key=lambda event: (event.monotonic_ns, event.source_id),
+        )
+        for epoch in (1, 2)
+    }
+
+    def native_row(name: str, event: validation._NativeEvent) -> dict[str, object]:
+        return {
+            "name": name,
+            "monotonic_ns": event.monotonic_ns,
+            "event": validation._native_event_reference(event),
+        }
+
+    observation = {
+        "schema_version": 1,
+        "observation_contract": EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT,
+        "fault_window_end_monotonic_ns": fault_end_ns,
+        "hard_deadline_monotonic_ns": hard_deadline_ns,
+        "rows": [
+            native_row("epoch1_selection", manager_events[0]),
+            native_row("epoch1_command", commands[1]),
+            native_row("epoch1_activation", activations[1]),
+            native_row("epoch1_terminal", manager_events[1]),
+            {
+                "name": "epoch1_stable_end",
+                "monotonic_ns": 200,
+                "derivation": "phase.epoch1_stable.end_monotonic_ns",
+            },
+            {
+                "name": "fault_window_end",
+                "monotonic_ns": fault_end_ns,
+                "derivation": "shared_anchor_plus_fault_start_and_duration",
+            },
+            native_row("epoch2_selection", manager_events[3]),
+            native_row("epoch2_command", commands[2]),
+            native_row("epoch2_activation", activations[2]),
+            native_row("epoch2_terminal", manager_events[4]),
+            {
+                "name": "epoch2_stable_end",
+                "monotonic_ns": 800,
+                "derivation": "phase.epoch2_stable.end_monotonic_ns",
+            },
+            native_row("epoch2_drain_complete", drain),
+        ],
+    }
+    document = {
+        "cutoffs": [
+            {
+                "name": name,
+                "source_path": event.relative_path,
+                "source_sequence": event.source_sequence,
+            }
+            for name, event in (
+                ("epoch1_command", commands[1]),
+                ("epoch1_activation", activations[1]),
+                ("epoch2_command", commands[2]),
+                ("epoch2_activation", activations[2]),
+                ("epoch2_drain_complete", drain),
+            )
+        ],
+        "excluded_repair_observation": observation,
+    }
+    arguments: dict[str, object] = {
+        "manifest": manifest,
+        "expected": expected,
+        "manager_events": manager_events,
+        "replica_events": replica_events,
+        "events_by_ref": events_by_ref,
+        "cutoff_times": {
+            "epoch1_command": commands[1].monotonic_ns,
+            "epoch1_activation": activations[1].monotonic_ns,
+            "epoch2_command": commands[2].monotonic_ns,
+            "epoch2_activation": activations[2].monotonic_ns,
+            "epoch2_drain_complete": drain.monotonic_ns,
+        },
+        "phase_windows": {
+            "epoch1_stable": (150, 200, 1),
+            "epoch2_stable": (720, 800, 1),
+        },
+        "fault_window_end_ns": fault_end_ns,
+        "hard_deadline_ns": hard_deadline_ns,
+    }
+    return document, arguments
+
+
+def test_v28_excluded_repair_observation_binds_exact_grouped_chronology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document, arguments = _v28_repair_observation_fixture(monkeypatch)
+    validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        ("wrong-contract", "document drifted"),
+        ("extra-row", "document drifted"),
+        ("wrong-reference", "document drifted"),
+        ("wrong-derivation", "document drifted"),
+        ("epoch1-at-fault-end", "Epoch1 proof"),
+        ("epoch2-selection-at-fault-end", "selection/all-replica"),
+        ("one-epoch2-command-before-fault", "all-replica commands"),
+        ("epoch2-at-hard-deadline", "Epoch2 proof"),
+        ("missing-replica-command", "all-replica"),
+    ),
+)
+def test_v28_excluded_repair_observation_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    reason: str,
+) -> None:
+    fault_end_ns = 190 if mutation == "epoch1-at-fault-end" else 500
+    if mutation == "epoch2-selection-at-fault-end":
+        fault_end_ns = 600
+    hard_deadline_ns = 900 if mutation == "epoch2-at-hard-deadline" else 1_000
+    document, arguments = _v28_repair_observation_fixture(
+        monkeypatch,
+        fault_end_ns=fault_end_ns,
+        hard_deadline_ns=hard_deadline_ns,
+    )
+    observation = document["excluded_repair_observation"]
+    if mutation == "wrong-contract":
+        observation["observation_contract"] += "-drift"
+    elif mutation == "extra-row":
+        observation["rows"].append(copy.deepcopy(observation["rows"][-1]))
+    elif mutation == "wrong-reference":
+        observation["rows"][0]["event"]["line_sha256"] = "ff" * 32
+    elif mutation == "wrong-derivation":
+        observation["rows"][4]["derivation"] = "phase.drift"
+    elif mutation in {
+        "missing-replica-command",
+        "one-epoch2-command-before-fault",
+    }:
+        replica_events = dict(arguments["replica_events"])
+        if mutation == "missing-replica-command":
+            replica_events[30] = tuple(
+                event
+                for event in replica_events[30]
+                if not (
+                    event.event_type == "epoch.command_committed"
+                    and event.payload["successor_epoch_number"] == 1
+                )
+            )
+        else:
+            replica_events[0] = tuple(
+                replace(event, monotonic_ns=499)
+                if event.event_type == "epoch.command_committed"
+                and event.payload["successor_epoch_number"] == 2
+                else event
+                for event in replica_events[0]
+            )
+        arguments["replica_events"] = replica_events
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+
 def test_independent_config_reconstruction_accepts_only_exact_launcher_bytes(
     tmp_path: Path,
 ) -> None:
@@ -8143,6 +8838,7 @@ def _v25_coverage_runtime_fixture(
         25: _v25_candidate_manifest,
         26: _v26_candidate_manifest,
         27: _v27_candidate_manifest,
+        28: _v28_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -8222,7 +8918,7 @@ def test_v27_coverage_runtime_binds_v2_timing_and_ordered_lifecycle(
         expected_by_id=expected_by_id,
     )
 
-    assert tuple(validated) == validation.FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    assert tuple(validated) == validation.V27_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     assert runtime["runtime_id"] == (
         "shape-placement-factorial-v27-excluded-n31-coverage-smoke-v1"
     )
@@ -8238,6 +8934,124 @@ def test_v27_coverage_runtime_binds_v2_timing_and_ordered_lifecycle(
         == VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2
         for slot in runtime["slots"]
     )
+
+
+def test_v28_campaign_and_exact_repair_runtime_are_independently_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, coverage_runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=28,
+    )
+    plan = build_factorial_plan(manifest)
+    campaign_runtime = json.loads(
+        canonical_runtime_bytes(build_factorial_runtime(plan))
+    )
+    for slot_id in validation.FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS:
+        campaign_slot = next(
+            slot for slot in campaign_runtime["slots"] if slot["slot_id"] == slot_id
+        )
+        validation._validate_runtime_slot(
+            campaign_slot,
+            expected_by_id[slot_id],
+            manifest,
+        )
+        assert campaign_slot["fault_window"]["duration_s"] == 450
+        assert "excluded_repair_smoke_probe" not in campaign_slot
+        assert all(
+            "--experiment-response-evidence-duplicate-probe" not in row["argv"]
+            for row in campaign_slot["replica_argv_templates"]
+        )
+
+    validated = validation._validate_v25_coverage_runtime_document(
+        coverage_runtime,
+        manifest=manifest,
+        expected_by_id=expected_by_id,
+    )
+    primary = validated[validation.FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[0]]
+    repair = validated[validation.FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]]
+    probe = repair["excluded_repair_smoke_probe"]
+    assert primary["fault_window"]["duration_s"] == 450
+    assert "excluded_repair_smoke_probe" not in primary
+    assert repair["fault_window"]["duration_s"] == 300
+    assert repair["fault_window"]["hard_timeout_s"] == 650
+    assert probe == coverage_runtime["excluded_repair_smoke_probe"]
+    assert probe["source_campaign_slot_id"] == repair["slot_id"]
+    assert probe["source_campaign_result_path"] == (
+        "results/shape-placement-factorial-v28/slot-037-n31-f2-b04-00"
+    )
+    assert probe["semantic_delta"] == "byzantine.window.duration_s:450->300"
+    assert probe["observation_contract"] == (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+    )
+    assert probe["verified_response_duplicate_probe_contract"] == (
+        EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT
+    )
+    assert all(
+        row["argv"].count("--experiment-response-evidence-duplicate-probe") == 1
+        and row["argv"].count(RESPONSE_DUPLICATE_PROBE_MODE) == 1
+        for row in repair["replica_argv_templates"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        ("missing-top-probe", "invalid field set"),
+        ("wrong-source-artifact", "probe runtime contract"),
+        ("wrong-delta", "probe runtime contract"),
+        ("wrong-duration", "probe runtime contract|fault-window"),
+        ("missing-repair-probe", "probe runtime contract"),
+        ("missing-probe-argv", "omission actor/cap contract"),
+        ("primary-probe-argv", "omission actor/cap contract"),
+        ("missing-causal-contract", "causal acceptance contract"),
+    ),
+)
+def test_v28_exact_repair_runtime_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    reason: str,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=28,
+    )
+    primary, repair = runtime["slots"]
+    if mutation == "missing-top-probe":
+        runtime.pop("excluded_repair_smoke_probe")
+    elif mutation == "wrong-source-artifact":
+        repair["excluded_repair_smoke_probe"]["source_campaign_artifact_id"] = (
+            "slot-runtime-" + "0" * 24
+        )
+    elif mutation == "wrong-delta":
+        repair["excluded_repair_smoke_probe"]["semantic_delta"] = "duration-drift"
+    elif mutation == "wrong-duration":
+        repair["excluded_repair_smoke_probe"][
+            "effective_fault_window_duration_s"
+        ] = 301
+    elif mutation == "missing-repair-probe":
+        repair.pop("excluded_repair_smoke_probe")
+    elif mutation == "missing-probe-argv":
+        argv = repair["replica_argv_templates"][0]["argv"]
+        index = argv.index("--experiment-response-evidence-duplicate-probe")
+        del argv[index : index + 2]
+    elif mutation == "primary-probe-argv":
+        primary["replica_argv_templates"][0]["argv"].extend(
+            [
+                "--experiment-response-evidence-duplicate-probe",
+                RESPONSE_DUPLICATE_PROBE_MODE,
+            ]
+        )
+    else:
+        repair["causal_acceptance"].pop(
+            "excluded_repair_smoke_observation_contract"
+        )
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
 
 
 @pytest.mark.parametrize(
@@ -8620,7 +9434,8 @@ def _v25_coverage_lifecycle_fixture(
     manifest_bytes = {
         25: V25_MANIFEST_PATH,
         26: V26_MANIFEST_PATH,
-        27: FROZEN_MANIFEST_PATH,
+        27: V27_MANIFEST_PATH,
+        28: FROZEN_MANIFEST_PATH,
     }[version].read_bytes()
     runtime_bytes = _canonical(runtime_document)
     static_artifacts = {

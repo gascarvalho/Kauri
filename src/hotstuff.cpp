@@ -6074,15 +6074,75 @@ namespace hotstuff
                         contribution.authenticated_sender);
             if (adaptive_v2_response_evidence != nullptr &&
                 !suppress_positive_observation)
-                static_cast<void>(
+            {
+                const auto response_monotonic_ns =
+                    adaptive_evidence_monotonic_now_ns();
+                const auto response_message_type =
+                    kind == ExactContributionKind::direct_vote
+                        ? ExpectedMessageType::direct_vote
+                        : ExpectedMessageType::aggregate_relay;
+                const bool first_call_recorded =
                     adaptive_v2_response_evidence->record_verified_response(
                         lease.key(),
                         contribution.authenticated_sender,
-                        kind == ExactContributionKind::direct_vote
-                            ? ExpectedMessageType::direct_vote
-                            : ExpectedMessageType::aggregate_relay,
+                        response_message_type,
                         contribution_signers,
-                        adaptive_evidence_monotonic_now_ns()));
+                        response_monotonic_ns);
+
+                const auto child_subtree =
+                    lease.tree().child_subtrees.find(
+                        contribution.authenticated_sender);
+                bool expected_probe_unconsumed = false;
+                if (first_call_recorded &&
+                    experiment_response_evidence_duplicate_probe ==
+                        kExperimentResponseEvidenceDuplicateProbeMode &&
+                    kind == ExactContributionKind::aggregate_relay &&
+                    lease.key().configuration.epoch_number == 1 &&
+                    response_monotonic_ns != 0 &&
+                    response_monotonic_ns >=
+                        experiment_response_evidence_duplicate_probe_window_end_ns &&
+                    child_subtree != lease.tree().child_subtrees.end() &&
+                    child_subtree->second.size() > 1 &&
+                    experiment_byzantine_adapter != nullptr &&
+                    experiment_byzantine_adapter
+                        ->is_tiered_responsive_degraded_actor(
+                            contribution.authenticated_sender) &&
+                    experiment_response_evidence_duplicate_probe_consumed
+                        .compare_exchange_strong(
+                            expected_probe_unconsumed, true))
+                {
+                    const bool second_call_recorded =
+                        adaptive_v2_response_evidence
+                            ->record_verified_response(
+                                lease.key(),
+                                contribution.authenticated_sender,
+                                response_message_type,
+                                contribution_signers,
+                                response_monotonic_ns);
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_EXPERIMENT response_duplicate_probe "
+                        "mode=%s consensus_accepted=1 reporter=%u "
+                        "child=%u epoch=%u tree=%u digest=%s block=%s "
+                        "message_type=aggregate_relay "
+                        "response_monotonic_ns=%llu "
+                        "window_end_monotonic_ns=%llu "
+                        "first_call_recorded=1 second_call_recorded=%u",
+                        experiment_response_evidence_duplicate_probe.c_str(),
+                        static_cast<unsigned>(get_id()),
+                        static_cast<unsigned>(
+                            contribution.authenticated_sender),
+                        lease.key().configuration.epoch_number,
+                        lease.key().configuration.tree_id,
+                        lease.key()
+                            .configuration.epoch_digest.to_hex().c_str(),
+                        lease.key().block_hash.to_hex().c_str(),
+                        static_cast<unsigned long long>(
+                            response_monotonic_ns),
+                        static_cast<unsigned long long>(
+                            experiment_response_evidence_duplicate_probe_window_end_ns),
+                        second_call_recorded ? 1U : 0U);
+                }
+            }
             if (emit_positive_suppression_marker)
             {
                 const auto marker_monotonic_ns =
@@ -10362,6 +10422,14 @@ namespace hotstuff
             options.rotating_omission->local_replica != get_id())
             throw std::invalid_argument(
                 "scheduled omission local replica does not match runtime");
+        if (!options.response_evidence_duplicate_probe.empty() &&
+            (options.response_evidence_duplicate_probe !=
+                 kExperimentResponseEvidenceDuplicateProbeMode ||
+             !options.rotating_omission.has_value() ||
+             options.rotating_omission->mode !=
+                 "tiered_persistent_responsive_omission_v2"))
+            throw std::invalid_argument(
+                "response-evidence duplicate probe configuration is invalid");
         const auto false_timeout_context_bound =
             options.false_report_target.has_value()
                 ? options.maximum_false_report_contexts
@@ -10407,12 +10475,23 @@ namespace hotstuff
                 };
         }
         auto diagnostic_window = options.diagnostic_window;
+        auto response_evidence_duplicate_probe =
+            options.response_evidence_duplicate_probe;
+        const auto response_evidence_duplicate_probe_window_end_ns =
+            response_evidence_duplicate_probe.empty()
+                ? std::uint64_t{0}
+                : options.rotating_omission->window_end_monotonic_ns;
         auto adapter =
             std::make_unique<ExperimentByzantineAdapter>(
                 std::move(options));
         maximum_experiment_false_timeout_contexts =
             false_timeout_context_bound;
         experiment_diagnostic_window = std::move(diagnostic_window);
+        experiment_response_evidence_duplicate_probe =
+            std::move(response_evidence_duplicate_probe);
+        experiment_response_evidence_duplicate_probe_window_end_ns =
+            response_evidence_duplicate_probe_window_end_ns;
+        experiment_response_evidence_duplicate_probe_consumed.store(false);
         experiment_byzantine_adapter = std::move(adapter);
     }
 

@@ -2187,7 +2187,12 @@ TEST_CASE(
     "replica CLI keeps Byzantine injection disabled unless explicitly configured",
     "[adaptive-v2][experiment][byzantine][runtime][cli]")
 {
+    const hotstuff::ExperimentByzantineOptions disabled_options;
+    CHECK(disabled_options.response_evidence_duplicate_probe.empty());
+
     const auto application = source("examples/hotstuff_app.cpp");
+    const auto adapter_header =
+        source("include/hotstuff/experiment_byzantine_adapter.h");
     const auto declarations = source_slice(
         application,
         "auto opt_blk_size",
@@ -2253,6 +2258,10 @@ TEST_CASE(
             "opt_experiment_rotating_omission_context_limit") !=
         std::string::npos);
     CHECK(
+        declarations.find(
+            "opt_experiment_response_evidence_duplicate_probe") !=
+        std::string::npos);
+    CHECK(
         declarations.find("Config::OptValStr::create(\"\")") !=
         std::string::npos);
     CHECK(
@@ -2316,6 +2325,10 @@ TEST_CASE(
         application.find(
             "\"experiment-rotating-omission-context-limit\"") !=
         std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-response-evidence-duplicate-probe\"") !=
+        std::string::npos);
 
     const auto parser = source_slice(
         application,
@@ -2342,6 +2355,25 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         parser.find("responsive_omission_period") !=
+        std::string::npos);
+    CHECK(
+        parser.find("raw_response_evidence_duplicate_probe") !=
+        std::string::npos);
+    CHECK(
+        adapter_header.find(
+            "exact_once_post_fault_epoch1_responsive_internal_child_v1") !=
+        std::string::npos);
+    CHECK(
+        parser.find(
+            "kExperimentResponseEvidenceDuplicateProbeMode") !=
+        std::string::npos);
+    CHECK(
+        parser.find(
+            "response-evidence duplicate probe requires the tiered v2 mode") !=
+        std::string::npos);
+    CHECK(
+        parser.find(
+            "options.response_evidence_duplicate_probe") !=
         std::string::npos);
     CHECK(
         parser.find("tiered omission actor cohorts must be disjoint") !=
