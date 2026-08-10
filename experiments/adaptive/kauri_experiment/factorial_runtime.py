@@ -37,6 +37,7 @@ from .factorial_manifest import (
     V20_MANIFEST_ID,
     V21_MANIFEST_ID,
     V22_MANIFEST_ID,
+    V23_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -152,14 +153,23 @@ V22_SMOKE_RUNTIME_SHA256 = (
 V22_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "b45fdba31d55c70107751cb0f3a00e26a2bf6b49352d50b342cd9768740af4db"
 )
-FROZEN_RUNTIME_SHA256 = (
+V23_RUNTIME_SHA256 = (
     "2eadce094849280fa632cba7064bed822b2e172485e49d084131d09be9e73e42"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V23_SMOKE_RUNTIME_SHA256 = (
     "aa86c344be1df785a3dd0f8602cda5534316b4b0f5e09d45b8605d14f74976d0"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V23_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "8706bc9292691b48c5f5db7728e22bebb6eaae399643da9cee5778d78adb9bd6"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "e8ff4013c5b28c1d6c7650ff1eadce275f8296e6e719d0fbdb39e64d0f1c8b2d"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "dee2b34183787ab7f55555c0fc5ab6e08ea1234e9c1c52aa63967a51b5e63f2c"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "eff1bc9bdbbda5d7dc20a77dd5217ade97d67173b4ac877b9a68f717281088fd"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -407,6 +417,10 @@ class CausalAcceptanceContract(_Document):
     future_tree_proposal_delivery_contract: str | None = None
     source_bound_proposal_witness_contract: str | None = None
     evidence_snapshot_selection_contract: str | None = None
+    epoch1_preselection_residency_ms: int | None = None
+    minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection: (
+        int | None
+    ) = None
 
     def as_document(self) -> dict[str, object]:
         document = _Document.as_document(self)
@@ -419,6 +433,8 @@ class CausalAcceptanceContract(_Document):
             "future_tree_proposal_delivery_contract",
             "source_bound_proposal_witness_contract",
             "evidence_snapshot_selection_contract",
+            "epoch1_preselection_residency_ms",
+            "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection",
         ):
             if document[field] is None:
                 document.pop(field)
@@ -926,6 +942,8 @@ def _causal_acceptance(
     future_tree_proposal_delivery_contract: str | None,
     source_bound_proposal_witness_contract: str | None,
     evidence_snapshot_selection_contract: str | None,
+    epoch1_preselection_residency_ms: int | None,
+    minimum_primary_internal_opportunities: int | None,
 ) -> CausalAcceptanceContract:
     if coverage_gate not in {None, PRECONTAINMENT_FAULT_COVERAGE_GATE_V1}:
         raise FactorialManifestError(
@@ -995,6 +1013,20 @@ def _causal_acceptance(
         raise FactorialManifestError(
             "evidence snapshot selection requires source-bound proposal witnesses"
         )
+    if epoch1_preselection_residency_ms not in {None, 60_000}:
+        raise FactorialManifestError(
+            "causal acceptance Epoch-1 preselection residency drifted"
+        )
+    if minimum_primary_internal_opportunities not in {None, 82}:
+        raise FactorialManifestError(
+            "causal acceptance primary N31/f5 internal opportunity minimum drifted"
+        )
+    if (epoch1_preselection_residency_ms is None) != (
+        minimum_primary_internal_opportunities is None
+    ):
+        raise FactorialManifestError(
+            "causal acceptance v24 timing and opportunity gates must be paired"
+        )
     return CausalAcceptanceContract(
         proof_source="independent_raw_artifact_validation",
         pre_epoch1_required_role="internal",
@@ -1025,6 +1057,10 @@ def _causal_acceptance(
         ),
         evidence_snapshot_selection_contract=(
             evidence_snapshot_selection_contract
+        ),
+        epoch1_preselection_residency_ms=epoch1_preselection_residency_ms,
+        minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection=(
+            minimum_primary_internal_opportunities
         ),
     )
 
@@ -1058,9 +1094,13 @@ def _transition(
         0
         if predecessor == 0
         else (
-            slot.workload.epoch1_stable_bucket_count
-            * slot.workload.bucket_width_s
-            * 1_000
+            slot.workload.epoch1_preselection_residency_ms
+            if slot.workload.epoch1_preselection_residency_ms is not None
+            else (
+                slot.workload.epoch1_stable_bucket_count
+                * slot.workload.bucket_width_s
+                * 1_000
+            )
         )
     )
     minimum_post_baseline_observation_ms = (
@@ -1455,6 +1495,18 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             identity["evidence_snapshot_selection_contract"] = (
                 responsive.evidence_snapshot_selection_contract
             )
+        if slot.workload.epoch1_preselection_residency_ms is not None:
+            identity["epoch1_preselection_residency_ms"] = (
+                slot.workload.epoch1_preselection_residency_ms
+            )
+        if (
+            responsive is not None
+            and responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
+            is not None
+        ):
+            identity[
+                "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection"
+            ] = responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
     if slot.cleanup_contract is not None:
         identity["cleanup_contract"] = slot.cleanup_contract
     return SlotRuntimeSpec(
@@ -1510,6 +1562,12 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             ),
             (
                 slot.byzantine.responsive_degradation.evidence_snapshot_selection_contract
+                if slot.byzantine.responsive_degradation is not None
+                else None
+            ),
+            slot.workload.epoch1_preselection_residency_ms,
+            (
+                slot.byzantine.responsive_degradation.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
                 if slot.byzantine.responsive_degradation is not None
                 else None
             ),
@@ -1855,6 +1913,7 @@ def runtime_preflight(
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
                 V22_MANIFEST_ID,
+                V23_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1867,9 +1926,13 @@ def runtime_preflight(
         policy = slot.responsiveness_policy
         expected_residencies_ms = (
             0,
-            slot.cutoff_contract.epoch1_stable_bucket_count
-            * slot.cutoff_contract.bucket_width_s
-            * 1_000,
+            (
+                60_000
+                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                else slot.cutoff_contract.epoch1_stable_bucket_count
+                * slot.cutoff_contract.bucket_width_s
+                * 1_000
+            ),
         )
         expected_post_baseline_observation_ms = (
             (
@@ -2006,6 +2069,7 @@ def runtime_preflight(
             elif runtime.manifest_id in {
                 V21_MANIFEST_ID,
                 V22_MANIFEST_ID,
+                V23_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }:
                 expected_measurement_contract = (
@@ -2035,6 +2099,7 @@ def runtime_preflight(
                     V20_MANIFEST_ID,
                     V21_MANIFEST_ID,
                     V22_MANIFEST_ID,
+                    V23_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -2054,6 +2119,7 @@ def runtime_preflight(
                     V20_MANIFEST_ID,
                     V21_MANIFEST_ID,
                     V22_MANIFEST_ID,
+                    V23_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -2111,6 +2177,7 @@ def runtime_preflight(
                         V20_MANIFEST_ID,
                         V21_MANIFEST_ID,
                         V22_MANIFEST_ID,
+                        V23_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2318,6 +2385,7 @@ def runtime_preflight(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2355,6 +2423,7 @@ def runtime_preflight(
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
                 V22_MANIFEST_ID,
+                V23_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2366,12 +2435,13 @@ def runtime_preflight(
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
                 V22_MANIFEST_ID,
+                V23_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             (
                 FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-                if runtime.manifest_id == FROZEN_MANIFEST_ID
+                if runtime.manifest_id in {V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             )
             if runtime.manifest_id
@@ -2380,6 +2450,7 @@ def runtime_preflight(
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
                 V22_MANIFEST_ID,
+                V23_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2389,12 +2460,16 @@ def runtime_preflight(
                 V20_MANIFEST_ID,
                 V21_MANIFEST_ID,
                 V22_MANIFEST_ID,
+                V23_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-            if runtime.manifest_id in {V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id
+            in {V22_MANIFEST_ID, V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
+            60_000 if runtime.manifest_id == FROZEN_MANIFEST_ID else None,
+            82 if runtime.manifest_id == FROZEN_MANIFEST_ID else None,
         ):
             raise FactorialManifestError(
                 f"slot lacks the frozen raw causal acceptance gate: {slot.slot_id}"
@@ -2468,6 +2543,9 @@ __all__ = (
     "V22_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V22_RUNTIME_SHA256",
     "V22_SMOKE_RUNTIME_SHA256",
+    "V23_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V23_RUNTIME_SHA256",
+    "V23_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

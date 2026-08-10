@@ -65,6 +65,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v24.json"
+)
+V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
 )
 V22_MANIFEST_PATH = (
@@ -386,6 +389,8 @@ def test_causal_sequence_requires_independent_raw_actor_role_proof(
             "evidence_snapshot_selection_contract": (
                 EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
             ),
+            "epoch1_preselection_residency_ms": 60_000,
+            "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection": 82,
             "proof_source": "independent_raw_artifact_validation",
         }
 
@@ -425,9 +430,7 @@ def test_manager_is_blinded_and_carries_two_live_transition_requests(
             request["minimum_predecessor_residency_ms"] for request in requests
         ] == [
             0,
-            slot.workload.epoch1_stable_bucket_count
-            * slot.workload.bucket_width_s
-            * 1_000,
+            60_000,
         ]
         assert [
             request["minimum_post_baseline_observation_ms"] for request in requests
@@ -725,9 +728,7 @@ def test_two_epoch_sequence_and_artifact_identity_are_deterministic(
         for transition in first.transitions
     ) == (
         0,
-        frozen_plan.slots[0].workload.epoch1_stable_bucket_count
-        * frozen_plan.slots[0].workload.bucket_width_s
-        * 1_000,
+        60_000,
     )
     assert tuple(
         transition.request.minimum_post_baseline_observation_ms
@@ -1123,9 +1124,10 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V20_MANIFEST_PATH,
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v23_and_refuses_prior_production(
+def test_cli_defaults_to_v24_and_refuses_prior_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
@@ -1138,7 +1140,7 @@ def test_cli_defaults_to_v23_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v22 are validation-only" in refusal["reason"]
+    assert "v1 through v23 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(

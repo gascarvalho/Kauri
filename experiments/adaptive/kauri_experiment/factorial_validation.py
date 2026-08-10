@@ -140,6 +140,9 @@ from .factorial_manifest import (
     V22_MANIFEST_ID,
     V22_MANIFEST_SHA256,
     V22_PLAN_SHA256,
+    V23_MANIFEST_ID,
+    V23_MANIFEST_SHA256,
+    V23_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -199,8 +202,11 @@ V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v22-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V23_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v23-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v24-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -352,14 +358,23 @@ V22_SMOKE_RUNTIME_SHA256 = (
 V22_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "b45fdba31d55c70107751cb0f3a00e26a2bf6b49352d50b342cd9768740af4db"
 )
-FROZEN_RUNTIME_SHA256 = (
+V23_RUNTIME_SHA256 = (
     "2eadce094849280fa632cba7064bed822b2e172485e49d084131d09be9e73e42"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V23_SMOKE_RUNTIME_SHA256 = (
     "aa86c344be1df785a3dd0f8602cda5534316b4b0f5e09d45b8605d14f74976d0"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V23_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "8706bc9292691b48c5f5db7728e22bebb6eaae399643da9cee5778d78adb9bd6"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "e8ff4013c5b28c1d6c7650ff1eadce275f8296e6e719d0fbdb39e64d0f1c8b2d"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "dee2b34183787ab7f55555c0fc5ab6e08ea1234e9c1c52aa63967a51b5e63f2c"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "eff1bc9bdbbda5d7dc20a77dd5217ade97d67173b4ac877b9a68f717281088fd"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -437,6 +452,9 @@ _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
 )
 _V8_RESPONSIVE_OMISSION_PERIOD = 32
 _RESPONSIVE_OMISSION_PERIOD = 41
+_V24_MANIFEST_ID = "shape-placement-factorial-v24"
+_V24_EPOCH1_PRESELECTION_RESIDENCY_MS = 60_000
+_V24_PRIMARY_INTERNAL_ROLE_OPPORTUNITIES = 82
 _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
     "{{fault_containment_evidence_start_monotonic_ns}}"
 )
@@ -460,9 +478,65 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V20_MANIFEST_ID,
         V21_MANIFEST_ID,
         V22_MANIFEST_ID,
+        V23_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
+
+
+def _v24_preselection_contract(
+    manifest: FrozenFactorialManifest,
+) -> tuple[int, int] | None:
+    """Independently bind the prospective timing/exposure fields."""
+
+    if manifest.manifest_id != _V24_MANIFEST_ID:
+        return None
+    responsive = manifest.byzantine.responsive_degradation
+    residency_ms = getattr(
+        manifest.workload,
+        "epoch1_preselection_residency_ms",
+        None,
+    )
+    minimum_opportunities = (
+        None
+        if responsive is None
+        else getattr(
+            responsive,
+            "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection",
+            None,
+        )
+    )
+    if (
+        residency_ms != _V24_EPOCH1_PRESELECTION_RESIDENCY_MS
+        or minimum_opportunities != _V24_PRIMARY_INTERNAL_ROLE_OPPORTUNITIES
+        or manifest.workload.bucket_width_s != 5
+        or manifest.workload.epoch1_stable_bucket_count != 6
+    ):
+        _fail("v24 Epoch1 preselection contract or measured window drifted")
+    return residency_ms, minimum_opportunities
+
+
+def _primary_epoch1_internal_role_opportunity_minimum(
+    manifest: FrozenFactorialManifest,
+    *,
+    replica_count: int,
+    initial_fanout: int,
+    arm_code: str,
+    campaign_member: bool,
+    coverage_smoke: bool,
+) -> int | None:
+    """Dispatch the v24 D-021 exposure gate to its exact primary slots."""
+
+    contract = _v24_preselection_contract(manifest)
+    if contract is None or not (campaign_member or coverage_smoke):
+        return None
+    if (
+        replica_count != 31
+        or initial_fanout != 5
+        or arm_code not in {"P", "PS"}
+    ):
+        return None
+    return contract[1]
 
 
 def _expected_responsive_omission_period(manifest_id: str) -> int:
@@ -526,7 +600,12 @@ def _uses_selection_visible_hard_timeout_witnesses(
         )
     return (
         manifest.manifest_id
-        in {V21_MANIFEST_ID, V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
     )
@@ -538,7 +617,12 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V21_MANIFEST_ID, V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and responsive.causal_timeout_eligibility
         == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
@@ -561,6 +645,7 @@ def _uses_source_bound_contribution_opportunities(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -582,6 +667,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -603,6 +689,7 @@ def _uses_precontainment_fault_coverage(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -624,6 +711,7 @@ def _uses_precontainment_shape_preservation(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -648,6 +736,7 @@ def _uses_precontainment_guarded_selection_contract(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -671,6 +760,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V20_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
         V21_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
         V22_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
+        V23_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -693,6 +783,7 @@ def _uses_source_bound_proposal_witness_contract(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -710,7 +801,8 @@ def _uses_evidence_snapshot_selection_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V22_MANIFEST_ID, V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -983,6 +1075,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V22_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V22_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V23_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V23_MANIFEST_ID,
+            manifest_sha256=V23_MANIFEST_SHA256,
+            plan_sha256=V23_PLAN_SHA256,
+            runtime_sha256=V23_RUNTIME_SHA256,
+            smoke_runtime_sha256=V23_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V23_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2654,6 +2756,11 @@ def _is_excluded_coverage_smoke_slot(
             V22_COVERAGE_SMOKE_RUNTIME_SHA256,
             V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V23_MANIFEST_ID: (
+            V23_RUNTIME_SHA256,
+            V23_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V23_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2704,6 +2811,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V21_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V22_MANIFEST_ID:
         return V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V23_MANIFEST_ID:
+        return V23_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -2968,6 +3077,7 @@ def _validate_runtime_slot(
     evidence_snapshot_selection = (
         _uses_evidence_snapshot_selection_contract(manifest)
     )
+    v24_preselection_contract = _v24_preselection_contract(manifest)
     if (
         manifest.manifest_id
         in {
@@ -2975,6 +3085,7 @@ def _validate_runtime_slot(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -2986,6 +3097,7 @@ def _validate_runtime_slot(
             V20_MANIFEST_ID,
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -2993,7 +3105,12 @@ def _validate_runtime_slot(
         _fail("source-bound proposal witness contract drifted")
     if (
         manifest.manifest_id
-        in {V21_MANIFEST_ID, V22_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V21_MANIFEST_ID,
+            V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
             manifest
         )
@@ -3001,6 +3118,7 @@ def _validate_runtime_slot(
         _fail("responsive timeout nonwitness contract drifted")
     if manifest.manifest_id in {
         V22_MANIFEST_ID,
+        V23_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
@@ -3084,7 +3202,8 @@ def _validate_runtime_slot(
                 "future_tree_proposal_delivery_contract"
             ] = (
                 FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-                if manifest.manifest_id == FROZEN_MANIFEST_ID
+                if manifest.manifest_id
+                in {V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             )
         if source_bound_proposal_witnesses:
@@ -3095,6 +3214,13 @@ def _validate_runtime_slot(
             artifact_identity[
                 "evidence_snapshot_selection_contract"
             ] = EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+        if v24_preselection_contract is not None:
+            artifact_identity["epoch1_preselection_residency_ms"] = (
+                v24_preselection_contract[0]
+            )
+            artifact_identity[
+                "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection"
+            ] = v24_preselection_contract[1]
     else:
         artifact_identity = {
             "arm_code": expected.arm_code,
@@ -3235,7 +3361,7 @@ def _validate_runtime_slot(
             "future_tree_proposal_delivery_contract"
         ] = (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-            if manifest.manifest_id == FROZEN_MANIFEST_ID
+            if manifest.manifest_id in {V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
         )
     if source_bound_proposal_witnesses:
@@ -3246,6 +3372,13 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "evidence_snapshot_selection_contract"
         ] = EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+    if v24_preselection_contract is not None:
+        expected_causal_acceptance["epoch1_preselection_residency_ms"] = (
+            v24_preselection_contract[0]
+        )
+        expected_causal_acceptance[
+            "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection"
+        ] = v24_preselection_contract[1]
     if dict(
         _mapping(runtime.get("causal_acceptance"), "runtime causal acceptance")
     ) != expected_causal_acceptance:
@@ -3321,6 +3454,7 @@ def _validate_runtime_slot(
         V20_MANIFEST_ID,
         V21_MANIFEST_ID,
         V22_MANIFEST_ID,
+        V23_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -3346,9 +3480,13 @@ def _validate_runtime_slot(
         _fail("runtime must contain exactly two transition requests")
     expected_residencies_ms = (
         0,
-        manifest.workload.epoch1_stable_bucket_count
-        * manifest.workload.bucket_width_s
-        * 1_000,
+        (
+            v24_preselection_contract[0]
+            if v24_preselection_contract is not None
+            else manifest.workload.epoch1_stable_bucket_count
+            * manifest.workload.bucket_width_s
+            * 1_000
+        ),
     )
     expected_post_baseline_observation_ms = (
         (
@@ -6333,6 +6471,145 @@ def _validate_role_scoped_epoch1_internal_opportunities(
         )
 
 
+def _validate_primary_epoch1_internal_role_opportunity_exposure(
+    *,
+    opportunities: Sequence[FaultContributionOpportunity],
+    responsive_degraded_actor_ids: Sequence[int],
+    epoch1_digest: str,
+    epoch1_trees: Mapping[int, Tree],
+    epoch2_selection_ns: int,
+    minimum_opportunities: int,
+    responsive_omission_period: int,
+) -> None:
+    """Require the prospective primary's exact two-period internal prefix."""
+
+    degraded = tuple(sorted(responsive_degraded_actor_ids))
+    if (
+        not degraded
+        or len(set(degraded)) != len(degraded)
+        or type(epoch2_selection_ns) is not int
+        or epoch2_selection_ns <= 0
+        or type(minimum_opportunities) is not int
+        or type(responsive_omission_period) is not int
+        or responsive_omission_period <= 0
+        or minimum_opportunities != 2 * responsive_omission_period
+    ):
+        _fail("primary Epoch1 internal opportunity exposure contract is invalid")
+
+    required_ordinals = {
+        responsive_omission_period,
+        minimum_opportunities,
+    }
+    for actor in degraded:
+        prefix = sorted(
+            (
+                opportunity
+                for opportunity in opportunities
+                if opportunity.actor == actor
+                and opportunity.epoch_number == 1
+                and opportunity.epoch_digest == epoch1_digest
+                and opportunity.physical_role == "internal"
+                and opportunity.decision_monotonic_ns < epoch2_selection_ns
+                and opportunity.event_monotonic_ns < epoch2_selection_ns
+            ),
+            key=lambda opportunity: opportunity.source_sequence,
+        )
+        if len(prefix) < minimum_opportunities:
+            _incomplete(
+                "primary responsive-degraded actor lacks "
+                f"{minimum_opportunities} unique exact Epoch1 internal-role "
+                f"source-bound opportunities before selection: {actor}"
+            )
+
+        proposal_keys: set[tuple[int, int, str, str]] = set()
+        role_ordinals: list[int] = []
+        previous_sequence = 0
+        previous_decision_ns = 0
+        by_role_ordinal: dict[int, FaultContributionOpportunity] = {}
+        for opportunity in prefix:
+            if (
+                opportunity.source_replica != actor
+                or opportunity.cohort != "responsive_degraded"
+                or opportunity.expected_message_type != "aggregate_relay"
+                or opportunity.source_sequence <= previous_sequence
+                or opportunity.decision_monotonic_ns <= previous_decision_ns
+            ):
+                _fail(
+                    "primary Epoch1 internal opportunity source/cohort/order "
+                    "contract drifted"
+                )
+            tree = epoch1_trees.get(opportunity.tree_id)
+            if tree is None or actor not in tree.members:
+                _fail(
+                    "primary Epoch1 internal opportunity has no exact physical tree"
+                )
+            position = tree.members.index(actor)
+            leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+            if not 0 < position < leaf_start:
+                _fail(
+                    "primary Epoch1 internal opportunity is not an exact internal role"
+                )
+            if opportunity.proposal_key in proposal_keys:
+                _fail(
+                    "primary Epoch1 internal opportunity repeats an exact ProposalKey"
+                )
+            proposal_keys.add(opportunity.proposal_key)
+            role_ordinals.append(opportunity.role_contribution_ordinal)
+            by_role_ordinal[opportunity.role_contribution_ordinal] = opportunity
+            previous_sequence = opportunity.source_sequence
+            previous_decision_ns = opportunity.decision_monotonic_ns
+
+        if role_ordinals != list(range(1, len(prefix) + 1)):
+            _fail(
+                "primary Epoch1 internal opportunity role ordinals are not a "
+                "contiguous prefix from one"
+            )
+        if any(
+            ordinal not in by_role_ordinal
+            or by_role_ordinal[ordinal].scheduled_action != "omit_aggregate"
+            for ordinal in required_ordinals
+        ):
+            _fail(
+                "primary Epoch1 internal opportunity prefix does not include "
+                f"exact scheduled omission ordinals {sorted(required_ordinals)}"
+            )
+
+
+def _validate_epoch1_preselection_residency(
+    *,
+    epoch1_activation_ns: int,
+    epoch1_convergence_ns: int,
+    epoch2_selection_ns: int,
+    minimum_residency_ms: int,
+) -> None:
+    """Bind the second selection to the later exact Epoch1 live anchor."""
+
+    if (
+        any(
+            type(value) is not int or value <= 0
+            for value in (
+                epoch1_activation_ns,
+                epoch1_convergence_ns,
+                epoch2_selection_ns,
+                minimum_residency_ms,
+            )
+        )
+        or minimum_residency_ms > _UINT64_MAX // 1_000_000
+    ):
+        _fail("Epoch1 preselection residency inputs are invalid")
+    if epoch1_convergence_ns < epoch1_activation_ns:
+        _fail("Epoch1 convergence anchor predates exact activation")
+    duration_ns = minimum_residency_ms * 1_000_000
+    anchor_ns = max(epoch1_activation_ns, epoch1_convergence_ns)
+    if anchor_ns > _UINT64_MAX - duration_ns:
+        _fail("Epoch1 preselection residency deadline overflows")
+    if epoch2_selection_ns < anchor_ns + duration_ns:
+        _fail(
+            "Epoch2 selection violates the fixed "
+            f"{minimum_residency_ms} ms Epoch1 preselection residency"
+        )
+
+
 def _outstanding_timeout_index(
     records: Sequence[_EvidenceRecord],
     *,
@@ -6444,6 +6721,9 @@ def validate_fault_causality(
     | None = None,
     selection_visible_hard_timeout_witnesses: bool = False,
     selection_visible_responsive_timeout_nonwitnesses: bool = False,
+    minimum_epoch1_internal_role_opportunities_per_actor_before_selection: (
+        int | None
+    ) = None,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
@@ -6454,6 +6734,18 @@ def validate_fault_causality(
         _fail(
             "responsive timeout nonwitnesses require explicit phase-edge "
             "eligibility"
+        )
+    if (
+        minimum_epoch1_internal_role_opportunities_per_actor_before_selection
+        is not None
+        and (
+            not source_bound_contribution_opportunities
+            or not source_bound_proposal_configuration_witnesses
+        )
+    ):
+        _fail(
+            "primary Epoch1 opportunity exposure requires source-bound "
+            "opportunity bijection and proposal/configuration validation"
         )
     actors = tuple(sorted(actor_ids))
     degraded = tuple(sorted(responsive_degraded_actor_ids))
@@ -6882,6 +7174,21 @@ def validate_fault_causality(
             causal_reporters[marker.actor].add(expected_reporter)
             if is_internal:
                 internal_actors.add(marker.actor)
+    if (
+        minimum_epoch1_internal_role_opportunities_per_actor_before_selection
+        is not None
+    ):
+        _validate_primary_epoch1_internal_role_opportunity_exposure(
+            opportunities=contribution_opportunities,
+            responsive_degraded_actor_ids=degraded,
+            epoch1_digest=epoch1_digest,
+            epoch1_trees=epoch1_tree_by_id,
+            epoch2_selection_ns=selection_deadlines[1],
+            minimum_opportunities=(
+                minimum_epoch1_internal_role_opportunities_per_actor_before_selection
+            ),
+            responsive_omission_period=responsive_omission_period,
+        )
     if role_scoped:
         _validate_role_scoped_epoch1_internal_opportunities(
             markers=markers,
@@ -9003,6 +9310,14 @@ def _validate_native_transitions(
         )
         if identity != command_identity_by_epoch[cycle + 1]:
             _fail("manager winning activation differs from replica command consensus")
+    v24_preselection_contract = _v24_preselection_contract(manifest)
+    if v24_preselection_contract is not None:
+        _validate_epoch1_preselection_residency(
+            epoch1_activation_ns=cutoff_times["epoch1_activation"],
+            epoch1_convergence_ns=terminals[0].monotonic_ns,
+            epoch2_selection_ns=selection_events[1].monotonic_ns,
+            minimum_residency_ms=v24_preselection_contract[0],
+        )
 
 
 def _validate_guarded_actor_evidence(
@@ -9765,6 +10080,16 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             == manifest.claim_scope.placement_headline_initial_fanout
             and expected.arm_code in {"P", "PS"}
         )
+        minimum_primary_internal_opportunities = (
+            _primary_epoch1_internal_role_opportunity_minimum(
+                manifest,
+                replica_count=expected.replica_count,
+                initial_fanout=expected.initial_fanout,
+                arm_code=expected.arm_code,
+                campaign_member=campaign_member,
+                coverage_smoke=coverage_smoke,
+            )
+        )
         responsive_contract = manifest.byzantine.responsive_degradation
         explicit_phase_edge_eligibility = (
             _uses_explicit_phase_edge_eligibility(manifest)
@@ -9861,6 +10186,9 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 _uses_selection_visible_responsive_timeout_nonwitnesses(
                     manifest
                 )
+            ),
+            minimum_epoch1_internal_role_opportunities_per_actor_before_selection=(
+                minimum_primary_internal_opportunities
             ),
         )
 

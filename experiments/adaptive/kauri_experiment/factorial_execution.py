@@ -4317,6 +4317,7 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v21/slot-066-n31-f5-b05-P": "v21",
         "results/shape-placement-factorial-v22/slot-066-n31-f5-b05-P": "v22",
         "results/shape-placement-factorial-v23/slot-066-n31-f5-b05-P": "v23",
+        "results/shape-placement-factorial-v24/slot-066-n31-f5-b05-P": "v24",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
@@ -4329,21 +4330,23 @@ def build_n31_coverage_smoke_slot(
         "v21": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v22": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v23": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v24": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
         if manifest_version
-        in {"v17", "v18", "v19", "v20", "v21", "v22", "v23"}
+        in {"v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24"}
         else None
     )
     expected_guarded_selection_contract = (
         PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
-        if manifest_version in {"v18", "v19", "v20", "v21", "v22", "v23"}
+        if manifest_version
+        in {"v18", "v19", "v20", "v21", "v22", "v23", "v24"}
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-        if manifest_version == "v23"
+        if manifest_version in {"v23", "v24"}
         else (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_version in {"v19", "v20", "v21", "v22"}
@@ -4352,12 +4355,12 @@ def build_n31_coverage_smoke_slot(
     )
     expected_source_bound_proposal_witness_contract = (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-        if manifest_version in {"v20", "v21", "v22", "v23"}
+        if manifest_version in {"v20", "v21", "v22", "v23", "v24"}
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-        if manifest_version in {"v22", "v23"}
+        if manifest_version in {"v22", "v23", "v24"}
         else None
     )
     if (
@@ -4429,6 +4432,10 @@ def build_n31_coverage_smoke_slot(
         != expected_source_bound_proposal_witness_contract
         or responsive.evidence_snapshot_selection_contract
         != expected_evidence_snapshot_selection_contract
+        or template.workload.epoch1_preselection_residency_ms
+        != (60_000 if manifest_version == "v24" else None)
+        or responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
+        != (82 if manifest_version == "v24" else None)
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "

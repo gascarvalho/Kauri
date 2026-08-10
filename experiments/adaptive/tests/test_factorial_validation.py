@@ -44,6 +44,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v24.json"
+)
+V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
 )
 V22_MANIFEST_PATH = (
@@ -142,6 +145,12 @@ def test_v23_future_tree_delivery_dispatch_is_version_and_field_exact() -> None:
     )
     assert validation._uses_future_tree_proposal_delivery_contract(
         manifest(
+            validation.V23_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         )
@@ -150,14 +159,23 @@ def test_v23_future_tree_delivery_dispatch_is_version_and_field_exact() -> None:
         manifest(validation.V22_MANIFEST_ID, FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2)
     )
     assert not validation._uses_future_tree_proposal_delivery_contract(
-        manifest(validation.FROZEN_MANIFEST_ID, FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT)
+        manifest(validation.V23_MANIFEST_ID, FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT)
     )
     assert not validation._uses_future_tree_proposal_delivery_contract(
-        manifest(validation.FROZEN_MANIFEST_ID, None)
+        manifest(validation.V23_MANIFEST_ID, None)
     )
     assert not validation._uses_future_tree_proposal_delivery_contract(
         manifest(validation.V18_MANIFEST_ID, None)
     )
+
+
+def test_v23_responsive_omission_period_remains_41_after_v24_dispatch() -> None:
+    assert validation._expected_responsive_omission_period(
+        "shape-placement-factorial-v23"
+    ) == 41
+    assert validation._expected_responsive_omission_period(
+        "shape-placement-factorial-v24"
+    ) == 41
 
 
 def _canonical(value: object) -> bytes:
@@ -339,7 +357,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v23_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v24_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -367,7 +385,8 @@ def test_validator_retains_exact_v1_through_v23_artifact_identities() -> None:
             (20, V20_MANIFEST_PATH),
             (21, V21_MANIFEST_PATH),
             (22, V22_MANIFEST_PATH),
-            (23, MANIFEST_PATH),
+            (23, V23_MANIFEST_PATH),
+            (24, MANIFEST_PATH),
         )
     }
 
@@ -513,17 +532,34 @@ def test_validator_retains_exact_v1_through_v23_artifact_identities() -> None:
         identities[22].coverage_smoke_runtime_sha256
         == validation.V22_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[23].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[23].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[23].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[23].manifest_sha256 == validation.V23_MANIFEST_SHA256
+    assert identities[23].plan_sha256 == validation.V23_PLAN_SHA256
+    assert identities[23].runtime_sha256 == validation.V23_RUNTIME_SHA256
     assert (
         identities[23].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V23_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[23].coverage_smoke_runtime_sha256
+        == validation.V23_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[24].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[24].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[24].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[24].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[24].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
+    assert validation._coverage_smoke_result_root(
+        validation.V23_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v23-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v24-coverage-smoke"
 
 
 @pytest.mark.parametrize(
@@ -548,6 +584,7 @@ def test_validator_retains_exact_v1_through_v23_artifact_identities() -> None:
         V20_MANIFEST_PATH,
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -603,6 +640,7 @@ def test_validator_requires_v9_through_v22_causal_contracts_but_accepts_v8() -> 
         V20_MANIFEST_PATH,
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -665,6 +703,7 @@ def test_validator_requires_v9_through_v22_causal_contracts_but_accepts_v8() -> 
                 V20_MANIFEST_PATH,
                 V21_MANIFEST_PATH,
                 V22_MANIFEST_PATH,
+                V23_MANIFEST_PATH,
                 MANIFEST_PATH,
             ):
                 assert document["tiered_cohorts"][
@@ -685,7 +724,12 @@ def test_validator_requires_v9_through_v22_causal_contracts_but_accepts_v8() -> 
                     else (
                         validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
                         if manifest_path
-                        in (V21_MANIFEST_PATH, V22_MANIFEST_PATH, MANIFEST_PATH)
+                        in (
+                            V21_MANIFEST_PATH,
+                            V22_MANIFEST_PATH,
+                            V23_MANIFEST_PATH,
+                            MANIFEST_PATH,
+                        )
                         else validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
                     )
                 )
@@ -746,7 +790,7 @@ def test_v17_runtime_mirrors_precontainment_shape_contract_only_in_causal_accept
     )
 
 
-def test_v18_through_v23_guarded_selection_contract_dispatch_is_exact() -> None:
+def test_v18_through_v24_guarded_selection_contract_dispatch_is_exact() -> None:
     contract = validation.PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
 
     def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
@@ -775,6 +819,9 @@ def test_v18_through_v23_guarded_selection_contract_dispatch_is_exact() -> None:
     )
     assert validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V22_MANIFEST_ID, contract)
+    )
+    assert validation._uses_precontainment_guarded_selection_contract(
+        manifest(validation.V23_MANIFEST_ID, contract)
     )
     assert not validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V17_MANIFEST_ID, contract)
@@ -838,7 +885,7 @@ def test_v19_through_v22_future_tree_delivery_dispatch_is_exact() -> None:
     )
 
 
-def test_v20_through_v23_source_bound_proposal_witness_dispatch_is_exact() -> None:
+def test_v20_through_v24_source_bound_proposal_witness_dispatch_is_exact() -> None:
     contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
     assert contract == (
         "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
@@ -865,6 +912,9 @@ def test_v20_through_v23_source_bound_proposal_witness_dispatch_is_exact() -> No
         manifest(validation.V22_MANIFEST_ID, contract)
     )
     assert validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.V23_MANIFEST_ID, contract)
+    )
+    assert validation._uses_source_bound_proposal_witness_contract(
         manifest(validation.FROZEN_MANIFEST_ID, contract)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
@@ -878,7 +928,7 @@ def test_v20_through_v23_source_bound_proposal_witness_dispatch_is_exact() -> No
     )
 
 
-def test_v21_through_v23_timeout_nonwitness_dispatch_is_field_exact() -> None:
+def test_v21_through_v24_timeout_nonwitness_dispatch_is_field_exact() -> None:
     contract = validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
     assert contract == (
         "selection_visible_exact_outstanding_timeout_witnesses_with_internal_"
@@ -902,6 +952,9 @@ def test_v21_through_v23_timeout_nonwitness_dispatch_is_field_exact() -> None:
     assert validation._uses_selection_visible_responsive_timeout_nonwitnesses(
         manifest(validation.V22_MANIFEST_ID, contract)
     )
+    assert validation._uses_selection_visible_responsive_timeout_nonwitnesses(
+        manifest(validation.V23_MANIFEST_ID, contract)
+    )
     assert not validation._uses_selection_visible_responsive_timeout_nonwitnesses(
         manifest(validation.V20_MANIFEST_ID, contract)
     )
@@ -919,7 +972,7 @@ def test_v21_through_v23_timeout_nonwitness_dispatch_is_field_exact() -> None:
     )
 
 
-def test_v22_through_v23_snapshot_selection_contract_dispatch_is_field_exact() -> None:
+def test_v22_through_v24_snapshot_selection_contract_dispatch_is_field_exact() -> None:
     contract = validation.EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
     assert contract == (
         "full_prefix_without_inherited_consensus_wait_exempt_and_baseline_"
@@ -940,6 +993,9 @@ def test_v22_through_v23_snapshot_selection_contract_dispatch_is_field_exact() -
     )
     assert validation._uses_evidence_snapshot_selection_contract(
         manifest(validation.V22_MANIFEST_ID, contract)
+    )
+    assert validation._uses_evidence_snapshot_selection_contract(
+        manifest(validation.V23_MANIFEST_ID, contract)
     )
     assert not validation._uses_evidence_snapshot_selection_contract(
         manifest(validation.V21_MANIFEST_ID, contract)
@@ -1073,9 +1129,15 @@ def test_v19_binds_future_tree_contract_to_runtime_identity_and_acceptance() -> 
 
 @pytest.mark.parametrize(
     "manifest_path",
-    (V20_MANIFEST_PATH, V21_MANIFEST_PATH, V22_MANIFEST_PATH, MANIFEST_PATH),
+    (
+        V20_MANIFEST_PATH,
+        V21_MANIFEST_PATH,
+        V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
+        MANIFEST_PATH,
+    ),
 )
-def test_v20_through_v23_bind_source_bound_witness_to_runtime_identity_and_acceptance(
+def test_v20_through_v24_bind_source_bound_witness_to_runtime_identity_and_acceptance(
     manifest_path: Path,
 ) -> None:
     manifest = load_frozen_manifest(manifest_path)
@@ -1147,8 +1209,11 @@ def test_v20_through_v23_bind_source_bound_witness_to_runtime_identity_and_accep
         )
 
 
-@pytest.mark.parametrize("manifest_path", (V22_MANIFEST_PATH, MANIFEST_PATH))
-def test_v22_through_v23_bind_snapshot_selection_to_runtime_identity_and_acceptance(
+@pytest.mark.parametrize(
+    "manifest_path",
+    (V22_MANIFEST_PATH, V23_MANIFEST_PATH, MANIFEST_PATH),
+)
+def test_v22_through_v24_bind_snapshot_selection_to_runtime_identity_and_acceptance(
     manifest_path: Path,
 ) -> None:
     manifest = load_frozen_manifest(manifest_path)
@@ -1243,6 +1308,70 @@ def test_v22_through_v23_bind_snapshot_selection_to_runtime_identity_and_accepta
             v21_expected_by_id[v21_runtime.slots[0].slot_id],
             v21,
         )
+
+
+def test_v24_binds_preselection_fields_to_runtime_identity_acceptance_and_transition() -> None:
+    manifest = load_frozen_manifest(MANIFEST_PATH)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    slot = runtime.slots[0]
+    document = json.loads(json.dumps(slot.as_document()))
+    residency_field = "epoch1_preselection_residency_ms"
+    opportunity_field = (
+        "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_"
+        "actor_before_selection"
+    )
+
+    assert document["causal_acceptance"][residency_field] == 60_000
+    assert document["causal_acceptance"][opportunity_field] == 82
+    assert residency_field not in document["tiered_cohorts"]
+    assert opportunity_field not in document["tiered_cohorts"]
+    assert document["cutoff_contract"]["epoch1_stable_bucket_count"] == 6
+    assert document["transitions"][1]["request"][
+        "minimum_predecessor_residency_ms"
+    ] == 60_000
+    validation._validate_runtime_slot(
+        document,
+        expected_by_id[slot.slot_id],
+        manifest,
+    )
+
+    for field in (residency_field, opportunity_field):
+        missing = copy.deepcopy(document)
+        del missing["causal_acceptance"][field]
+        with pytest.raises(
+            FactorialValidationError,
+            match="causal acceptance contract",
+        ):
+            validation._validate_runtime_slot(
+                missing,
+                expected_by_id[slot.slot_id],
+                manifest,
+            )
+
+    short = copy.deepcopy(document)
+    short["transitions"][1]["request"][
+        "minimum_predecessor_residency_ms"
+    ] = 30_000
+    with pytest.raises(FactorialValidationError, match="transition sequence"):
+        validation._validate_runtime_slot(
+            short,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+
+    v23 = load_frozen_manifest(V23_MANIFEST_PATH)
+    v23_runtime = build_factorial_runtime(build_factorial_plan(v23))
+    v23_document = json.loads(json.dumps(v23_runtime.slots[0].as_document()))
+    assert residency_field not in v23_document["causal_acceptance"]
+    assert opportunity_field not in v23_document["causal_acceptance"]
+    assert v23_document["transitions"][1]["request"][
+        "minimum_predecessor_residency_ms"
+    ] == 30_000
+    assert slot.artifact_id != v23_runtime.slots[0].artifact_id
 
 
 def test_v19_rejects_forged_v20_source_bound_witness_runtime_field() -> None:
@@ -1378,7 +1507,7 @@ def test_v17_rejects_forged_v18_guarded_selection_runtime_field() -> None:
         )
 
 
-def test_v10_through_v23_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v24_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -1422,11 +1551,14 @@ def test_v10_through_v23_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V22_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V23_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_through_v23_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v24_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
@@ -1467,11 +1599,14 @@ def test_v11_through_v23_route_through_explicit_phase_edge_eligibility() -> None
         load_frozen_manifest(V22_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V23_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v16_through_v23_use_selection_visible_hard_timeout_witnesses() -> None:
+def test_v16_through_v24_use_selection_visible_hard_timeout_witnesses() -> None:
     assert not validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(V15_MANIFEST_PATH)
     )
@@ -1497,14 +1632,14 @@ def test_v16_through_v23_use_selection_visible_hard_timeout_witnesses() -> None:
         load_frozen_manifest(V22_MANIFEST_PATH)
     )
     assert validation._uses_selection_visible_hard_timeout_witnesses(
-        load_frozen_manifest(V22_MANIFEST_PATH)
+        load_frozen_manifest(V23_MANIFEST_PATH)
     )
     assert validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v14_through_v23_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
+def test_v14_through_v24_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
     v13 = load_frozen_manifest(V13_MANIFEST_PATH)
 
     assert not validation._uses_source_bound_contribution_opportunities(v13)
@@ -1519,6 +1654,7 @@ def test_v14_through_v23_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         V20_MANIFEST_PATH,
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1526,7 +1662,7 @@ def test_v14_through_v23_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         assert validation._uses_strict_sigint_cleanup(manifest)
 
 
-def test_validator_binds_v14_through_v23_cleanup_without_changing_v13() -> None:
+def test_validator_binds_v14_through_v24_cleanup_without_changing_v13() -> None:
     for manifest_path in (
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
@@ -1538,6 +1674,7 @@ def test_validator_binds_v14_through_v23_cleanup_without_changing_v13() -> None:
         V20_MANIFEST_PATH,
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1588,6 +1725,7 @@ def test_validator_binds_v14_through_v23_cleanup_without_changing_v13() -> None:
         V20_MANIFEST_PATH,
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
         MANIFEST_PATH,
     ),
 )
@@ -1617,7 +1755,7 @@ def test_validator_requires_each_explicit_causal_linkage_field(
     "field",
     ("marker_completeness_witness", "causal_timeout_eligibility"),
 )
-def test_validator_requires_each_explicit_v11_through_v23_phase_edge_field(
+def test_validator_requires_each_explicit_v11_through_v24_phase_edge_field(
     field: str,
 ) -> None:
     for manifest_path in (
@@ -1633,6 +1771,7 @@ def test_validator_requires_each_explicit_v11_through_v23_phase_edge_field(
         V20_MANIFEST_PATH,
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
+        V23_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -3945,6 +4084,277 @@ def test_role_scoped_schedule_requires_41_epoch1_internal_opportunities() -> Non
         validation._validate_role_scoped_epoch1_internal_opportunities(
             markers=(replace(markers[0], contribution_role="leaf"), *markers[1:]),
             **arguments,
+        )
+
+
+def _v24_primary_epoch1_internal_opportunities(
+    *,
+    count: int = 82,
+) -> tuple[
+    tuple[validation.FaultContributionOpportunity, ...],
+    Tree,
+    str,
+]:
+    actor = 2
+    digest = "11" * 32
+    tree = Tree(
+        tree_id=4,
+        fanout=2,
+        pipeline_stretch=2,
+        members=(0, actor, 1, 3, 4, 5, 6),
+        wait_exempt=(),
+    )
+    opportunities = tuple(
+        validation.FaultContributionOpportunity(
+            source_replica=actor,
+            relative_path=f"raw/replica-{actor}.jsonl",
+            line_number=ordinal,
+            source_sequence=ordinal,
+            event_monotonic_ns=1_000 + ordinal,
+            line_sha256=f"{ordinal:064x}",
+            actor=actor,
+            epoch_number=1,
+            tree_id=tree.tree_id,
+            epoch_digest=digest,
+            block_hash=f"{ordinal + 100:064x}",
+            view_generation=(1 << 32) + 5,
+            physical_role="internal",
+            parent_replica=0,
+            expected_message_type="aggregate_relay",
+            cohort="responsive_degraded",
+            window="v24-window",
+            window_start_ns=100,
+            window_end_ns=10_000,
+            decision_monotonic_ns=1_000 + ordinal,
+            contribution_ordinal=ordinal,
+            role_contribution_ordinal=ordinal,
+            scheduled_action=(
+                "omit_aggregate" if ordinal in {41, 82} else "forward"
+            ),
+            responsive_omission_period=41,
+            fault_threshold=2,
+            hard_actor_count=1,
+            responsive_degraded_actor_count=1,
+            fault_mode="tiered_persistent_responsive_omission_v2",
+        )
+        for ordinal in range(1, count + 1)
+    )
+    return opportunities, tree, digest
+
+
+def test_v24_primary_requires_82_source_bound_epoch1_internal_opportunities() -> None:
+    opportunities, tree, digest = _v24_primary_epoch1_internal_opportunities()
+    arguments = {
+        "responsive_degraded_actor_ids": (2,),
+        "epoch1_digest": digest,
+        "epoch1_trees": {tree.tree_id: tree},
+        "epoch2_selection_ns": 2_000,
+        "minimum_opportunities": 82,
+        "responsive_omission_period": 41,
+    }
+
+    validation._validate_primary_epoch1_internal_role_opportunity_exposure(
+        opportunities=opportunities,
+        **arguments,
+    )
+
+    with pytest.raises(FactorialValidationError, match="82.*internal.*opportunities"):
+        validation._validate_primary_epoch1_internal_role_opportunity_exposure(
+            opportunities=opportunities[:81],
+            **arguments,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        (
+            lambda rows: (
+                *rows[:40],
+                replace(rows[40], role_contribution_ordinal=42),
+                *rows[41:],
+            ),
+            "contiguous",
+        ),
+        (
+            lambda rows: (
+                *rows[:40],
+                replace(rows[40], scheduled_action="forward"),
+                *rows[41:],
+            ),
+            "41.*82",
+        ),
+        (
+            lambda rows: (
+                replace(rows[0], physical_role="leaf"),
+                *rows[1:],
+            ),
+            "82.*internal.*opportunities",
+        ),
+        (
+            lambda rows: (
+                replace(rows[0], event_monotonic_ns=2_000),
+                *rows[1:],
+            ),
+            "82.*internal.*opportunities",
+        ),
+        (
+            lambda rows: (
+                replace(rows[0], decision_monotonic_ns=2_000),
+                *rows[1:],
+            ),
+            "82.*internal.*opportunities",
+        ),
+        (
+            lambda rows: (
+                *rows[:40],
+                replace(rows[40], source_sequence=40),
+                *rows[41:],
+            ),
+            "source/cohort/order",
+        ),
+    ),
+)
+def test_v24_primary_internal_opportunity_prefix_is_fail_closed(
+    mutation: object,
+    reason: str,
+) -> None:
+    opportunities, tree, digest = _v24_primary_epoch1_internal_opportunities()
+    assert callable(mutation)
+    mutated = mutation(opportunities)
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_primary_epoch1_internal_role_opportunity_exposure(
+            opportunities=mutated,
+            responsive_degraded_actor_ids=(2,),
+            epoch1_digest=digest,
+            epoch1_trees={tree.tree_id: tree},
+            epoch2_selection_ns=2_000,
+            minimum_opportunities=82,
+            responsive_omission_period=41,
+        )
+
+
+def test_v24_epoch1_preselection_residency_uses_later_activation_convergence_anchor() -> None:
+    arguments = {
+        "epoch1_activation_ns": 1_000_000_000,
+        "epoch1_convergence_ns": 2_000_000_000,
+        "minimum_residency_ms": 60_000,
+    }
+    validation._validate_epoch1_preselection_residency(
+        epoch2_selection_ns=62_000_000_000,
+        **arguments,
+    )
+
+    with pytest.raises(FactorialValidationError, match="60.*residency"):
+        validation._validate_epoch1_preselection_residency(
+            epoch2_selection_ns=61_999_999_999,
+            **arguments,
+        )
+
+    with pytest.raises(FactorialValidationError, match="anchor"):
+        validation._validate_epoch1_preselection_residency(
+            epoch1_activation_ns=3_000_000_000,
+            epoch1_convergence_ns=2_000_000_000,
+            epoch2_selection_ns=62_000_000_000,
+            minimum_residency_ms=60_000,
+        )
+
+
+def _v24_preselection_manifest() -> SimpleNamespace:
+    return SimpleNamespace(
+        manifest_id="shape-placement-factorial-v24",
+        workload=SimpleNamespace(
+            bucket_width_s=5,
+            epoch1_stable_bucket_count=6,
+            epoch1_preselection_residency_ms=60_000,
+        ),
+        byzantine=SimpleNamespace(
+            responsive_degradation=SimpleNamespace(
+                minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection=82,
+            )
+        ),
+    )
+
+
+def test_v24_preselection_contract_is_version_exact_and_keeps_six_measured_buckets() -> None:
+    assert validation._v24_preselection_contract(
+        _v24_preselection_manifest()
+    ) == (60_000, 82)
+
+    v23 = _v24_preselection_manifest()
+    v23.manifest_id = "shape-placement-factorial-v23"
+    v23.workload.epoch1_preselection_residency_ms = 30_000
+    v23.byzantine.responsive_degradation.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection = 41
+    assert validation._v24_preselection_contract(v23) is None
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    (
+        ("residency", 59_999),
+        ("opportunities", 81),
+        ("bucket_width", 6),
+        ("bucket_count", 12),
+    ),
+)
+def test_v24_preselection_contract_rejects_field_or_measurement_drift(
+    path: str,
+    value: int,
+) -> None:
+    manifest = _v24_preselection_manifest()
+    if path == "residency":
+        manifest.workload.epoch1_preselection_residency_ms = value
+    elif path == "opportunities":
+        manifest.byzantine.responsive_degradation.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection = value
+    elif path == "bucket_width":
+        manifest.workload.bucket_width_s = value
+    else:
+        manifest.workload.epoch1_stable_bucket_count = value
+
+    with pytest.raises(FactorialValidationError, match="v24.*preselection"):
+        validation._v24_preselection_contract(manifest)
+
+
+@pytest.mark.parametrize(
+    "manifest_id,replica_count,initial_fanout,arm_code,campaign_member,coverage_smoke,expected",
+    (
+        ("shape-placement-factorial-v24", 31, 5, "P", True, False, 82),
+        ("shape-placement-factorial-v24", 31, 5, "PS", False, True, 82),
+        ("shape-placement-factorial-v23", 31, 5, "P", True, False, None),
+        ("shape-placement-factorial-v24", 7, 5, "P", True, False, None),
+        ("shape-placement-factorial-v24", 31, 2, "P", True, False, None),
+        ("shape-placement-factorial-v24", 31, 5, "S", True, False, None),
+        ("shape-placement-factorial-v24", 31, 5, "00", True, False, None),
+        ("shape-placement-factorial-v24", 31, 5, "P", False, False, None),
+    ),
+)
+def test_v24_primary_exposure_dispatch_is_exact(
+    manifest_id: str,
+    replica_count: int,
+    initial_fanout: int,
+    arm_code: str,
+    campaign_member: bool,
+    coverage_smoke: bool,
+    expected: int | None,
+) -> None:
+    manifest = _v24_preselection_manifest()
+    manifest.manifest_id = manifest_id
+    assert validation._primary_epoch1_internal_role_opportunity_minimum(
+        manifest,
+        replica_count=replica_count,
+        initial_fanout=initial_fanout,
+        arm_code=arm_code,
+        campaign_member=campaign_member,
+        coverage_smoke=coverage_smoke,
+    ) == expected
+
+
+def test_v24_primary_exposure_requires_source_bound_opportunity_dispatch() -> None:
+    with pytest.raises(FactorialValidationError, match="source-bound"):
+        validate_fault_causality(
+            **_epoch1_causal_prefix_fixture(),
+            minimum_epoch1_internal_role_opportunities_per_actor_before_selection=82,
         )
 
 

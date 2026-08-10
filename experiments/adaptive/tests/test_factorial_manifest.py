@@ -93,7 +93,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v24.json"
 )
 V14_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
@@ -357,7 +357,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v23/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v24/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -724,8 +724,9 @@ def test_plan_seals_preflight_parameters_but_never_authorizes_execution() -> Non
     assert manifest.workload.as_document() == {
         "baseline_bucket_count": 6,
         "block_size": 1000,
-        "bucket_width_s": 5,
-        "epoch1_stable_bucket_count": 6,
+            "bucket_width_s": 5,
+            "epoch1_preselection_residency_ms": 60_000,
+            "epoch1_stable_bucket_count": 6,
         "epoch2_stable_bucket_count": 6,
         "fault_evidence_bucket_count": 6,
         "piped_latency_ms": 1,
