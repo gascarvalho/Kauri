@@ -211,7 +211,12 @@ EpochRotationResult HotStuffEpochLiveBinding::rotate_to_tree(
 {
     auto result = adapter_.rotate_to_tree(tree_id);
     if (result.error == EpochIngressError::none && result.update.has_value())
+    {
         live_effects_.apply_update(*result.update);
+        // Rotation is already published.  Buffered proposal replay remains
+        // retryable and cannot retroactively report the rotation as failed.
+        static_cast<void>(adapter_.drain_activated_futures());
+    }
     return result;
 }
 

@@ -2,8 +2,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -198,6 +200,16 @@ EpochDefinitionInput rooted_epoch_v2_input(
     return input;
 }
 
+EpochDefinitionInput rotating_epoch_v2_input()
+{
+    auto input = rooted_epoch_v2_input(0, {0, 1, 2});
+    input.trees[0].tree_id = 6;
+    input.trees[1].tree_id = 42;
+    input.trees[2].tree_id = 77;
+    input.epoch_digest.reset();
+    return input;
+}
+
 EpochDefinitionInput shaped_epoch_v2_input(
     std::uint32_t epoch_number,
     const std::vector<ReplicaID> &roots,
@@ -363,20 +375,49 @@ class ProposalEffectsSpy final : public ProposalAdmissionEffects
 {
 public:
     std::size_t relay_count{0};
+    std::size_t process_attempt_count{0};
     std::size_t process_count{0};
+    std::size_t local_vote_count{0};
+    std::size_t expected_vote_state_count{0};
+    std::size_t latency_deadline_count{0};
+    std::size_t aggregation_timer_count{0};
+    std::size_t timeout_report_count{0};
+    std::size_t apply_count_seen_on_process{0};
+    const std::size_t *live_apply_count{nullptr};
+    bool fail_process{false};
     bytearray_t processed_body;
 
     void relay_once(const BufferedProposal &) override { ++relay_count; }
     void process_active(const BufferedProposal &proposal) override
     {
+        ++process_attempt_count;
+        if (live_apply_count != nullptr)
+            apply_count_seen_on_process = *live_apply_count;
+        if (fail_process)
+            throw std::runtime_error("injected proposal processing failure");
         ++process_count;
         processed_body = hotstuff_epoch_processing_payload(proposal);
     }
-    void local_vote_authorized(const ProposalKey &) override {}
-    void create_expected_vote_state(const ProposalKey &) override {}
-    void start_latency_deadline(const ProposalKey &) override {}
-    void start_aggregation_timer(const ProposalKey &) override {}
-    void emit_timeout_report(const ProposalKey &) override {}
+    void local_vote_authorized(const ProposalKey &) override
+    {
+        ++local_vote_count;
+    }
+    void create_expected_vote_state(const ProposalKey &) override
+    {
+        ++expected_vote_state_count;
+    }
+    void start_latency_deadline(const ProposalKey &) override
+    {
+        ++latency_deadline_count;
+    }
+    void start_aggregation_timer(const ProposalKey &) override
+    {
+        ++aggregation_timer_count;
+    }
+    void emit_timeout_report(const ProposalKey &) override
+    {
+        ++timeout_report_count;
+    }
 };
 
 class BodyValidatorSpy final : public EpochConsensusBodyValidator
@@ -675,6 +716,82 @@ struct V2Harness
         return value;
     }
 };
+
+struct RotatingProposalHarness
+{
+    EpochStore store{membership()};
+    const EpochDefinition &epoch0;
+    ReplicaEpochActivation activation;
+    FutureProposalBuffer future;
+    ProposalContextLifecycle contexts;
+    ProposalEffectsSpy proposal_effects;
+    ProposalAdmissionCoordinator admission;
+    HotStuffRetryableFutureProposalStore retryable_future;
+    BodyValidatorSpy validator;
+    LiveEffectsSpy live_effects;
+    HotStuffEpochRuntimeTransaction transaction;
+    HotStuffEpochRuntimeAdapter adapter;
+    ManagerEgressSpy manager_egress;
+    ContinuationsSpy continuations;
+    HotStuffEpochLiveBinding binding;
+
+    explicit RotatingProposalHarness(
+        std::uint32_t rotation_ordinal = 0,
+        std::uint32_t active_tree_id = 6)
+        : epoch0(store.stage(
+              rotating_epoch_v2_input(), validation_context(0))),
+          activation(
+              store,
+              epoch0,
+              0,
+              active_tree_id,
+              rotation_ordinal),
+          admission(
+              store,
+              activation.active_effect().configuration,
+              future,
+              proposal_effects),
+          retryable_future(future, admission),
+          transaction(admission, contexts, live_effects),
+          adapter(
+              activation,
+              contexts,
+              admission,
+              retryable_future,
+              validator,
+              EpochProtocolMode::adaptive_v2,
+              limits(),
+              transaction),
+          binding(
+              adapter,
+              activation,
+              live_effects,
+              manager_egress,
+              continuations)
+    {
+        contexts.activate_configuration(
+            activation.active_effect().configuration);
+        proposal_effects.live_apply_count = &live_effects.apply_count;
+    }
+};
+
+EpochConsensusEnvelope rotation_proposal(
+    ConfigurationId configuration,
+    std::uint64_t generation,
+    ReplicaID proposer,
+    const char *label)
+{
+    return {
+        std::move(configuration),
+        generation,
+        digest(label),
+        proposer,
+        proposer,
+        bytearray_t{0xA1, 0xB2},
+        kEpochConsensusWireSchemaVersion,
+        EpochProtocolMode::adaptive_v2,
+        EpochConsensusWireKind::proposal};
+}
 
 struct AdversarialV2Replica
 {
@@ -1106,6 +1223,340 @@ TEST_CASE("adaptive v2 live binding cycles non-contiguous tree identifiers",
           second.update->activation.generation);
     CHECK(harness.live_effects.rotation_arm_count == 2);
     CHECK(harness.live_effects.apply_count == 2);
+}
+
+TEST_CASE("adaptive v2 buffers only the exact immediate next tree until live rotation",
+          "[adaptive-v2][epoch-live-binding][rotation][future-proposal]")
+{
+    RotatingProposalHarness harness;
+    const auto active = harness.activation.active_effect();
+    REQUIRE(active.configuration.tree_id == 6);
+    const ConfigurationId next{
+        active.configuration.epoch_number,
+        42,
+        active.configuration.epoch_digest};
+    const auto next_generation = checked_activation_generation(
+        active.configuration.epoch_number,
+        static_cast<std::uint64_t>(active.rotation_ordinal) + 1);
+    REQUIRE(next_generation.has_value());
+    const auto proposal = rotation_proposal(
+        next, *next_generation, 1, "next-tree-before-rotation");
+
+    const auto buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(buffered.error == EpochIngressError::none);
+    REQUIRE(buffered.permission ==
+            EpochConsensusPermission::admit_or_buffer);
+    REQUIRE(buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    CHECK(harness.proposal_effects.expected_vote_state_count == 0);
+    CHECK(harness.proposal_effects.latency_deadline_count == 0);
+    CHECK(harness.proposal_effects.aggregation_timer_count == 0);
+    CHECK(harness.proposal_effects.timeout_report_count == 0);
+
+    const auto duplicate_before = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(duplicate_before.error == EpochIngressError::none);
+    CHECK(duplicate_before.admission_disposition ==
+          ProposalDisposition::duplicate);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
+
+    const auto rotated = harness.binding.rotate_to_tree(42);
+    REQUIRE(rotated.error == EpochIngressError::none);
+    REQUIRE(rotated.update.has_value());
+    CHECK(rotated.update->activation.configuration == next);
+    CHECK(rotated.update->activation.generation == *next_generation);
+    CHECK(harness.live_effects.apply_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 1);
+    CHECK(harness.proposal_effects.process_count == 1);
+    CHECK(harness.proposal_effects.apply_count_seen_on_process == 1);
+    CHECK(harness.proposal_effects.processed_body == proposal.body);
+    CHECK(harness.future.size() == 0);
+    CHECK_FALSE(
+        harness.adapter.buffered_proposal_identity(proposal.key())
+            .has_value());
+    const auto processed =
+        harness.adapter.processed_proposal_identity(proposal.key());
+    REQUIRE(processed.has_value());
+    CHECK(processed->view_generation == *next_generation);
+
+    const auto duplicate_after = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(duplicate_after.error == EpochIngressError::none);
+    CHECK(duplicate_after.admission_disposition ==
+          ProposalDisposition::duplicate);
+    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 1);
+    CHECK(harness.proposal_effects.process_count == 1);
+
+    const auto idempotent = harness.adapter.drain_activated_futures();
+    CHECK(idempotent.status == EpochFutureDrainStatus::complete);
+    CHECK(idempotent.processed == 0);
+    CHECK(idempotent.remaining == 0);
+}
+
+TEST_CASE("adaptive v2 prospective tree gate rejects inexact identities",
+          "[adaptive-v2][epoch-runtime][rotation][future-proposal][fail-closed]")
+{
+    RotatingProposalHarness harness;
+    const auto active = harness.activation.active_effect();
+    const auto next_generation = checked_activation_generation(
+        active.configuration.epoch_number,
+        static_cast<std::uint64_t>(active.rotation_ordinal) + 1);
+    REQUIRE(next_generation.has_value());
+    const ConfigurationId next{
+        active.configuration.epoch_number,
+        42,
+        active.configuration.epoch_digest};
+
+    const auto rejects = [&harness](
+                             const EpochConsensusEnvelope &proposal,
+                             ReplicaID source) {
+        const auto rejected = harness.binding.handle_proposal(
+            consensus_message<MsgPropose>(proposal),
+            AuthenticatedEpochPeer::replica(source));
+        CHECK(rejected.error == EpochIngressError::state_rejected);
+        CHECK(rejected.permission ==
+              EpochConsensusPermission::rejected_identity);
+        CHECK_FALSE(rejected.admission_disposition.has_value());
+    };
+
+    rejects(
+        rotation_proposal(
+            active.configuration,
+            *next_generation,
+            0,
+            "current-tree-future-generation"),
+        0);
+    rejects(
+        rotation_proposal(
+            next,
+            active.generation,
+            1,
+            "next-tree-stale-generation"),
+        1);
+    rejects(
+        rotation_proposal(
+            next,
+            *next_generation + 1,
+            1,
+            "next-tree-nonexact-generation"),
+        1);
+    rejects(
+        rotation_proposal(
+            ConfigurationId{
+                active.configuration.epoch_number,
+                77,
+                active.configuration.epoch_digest},
+            *next_generation,
+            2,
+            "non-immediate-tree"),
+        2);
+    rejects(
+        rotation_proposal(
+            ConfigurationId{
+                active.configuration.epoch_number,
+                42,
+                digest("wrong-current-epoch-digest")},
+            *next_generation,
+            1,
+            "wrong-digest"),
+        1);
+
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.relay_count == 0);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
+
+    REQUIRE(harness.binding.rotate_to_tree(42).update.has_value());
+    rejects(
+        rotation_proposal(
+            active.configuration,
+            active.generation,
+            0,
+            "retired-tree-generation"),
+        0);
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.relay_count == 0);
+}
+
+TEST_CASE("adaptive v2 prospective proposal wraps from last tree to first",
+          "[adaptive-v2][epoch-live-binding][rotation][future-proposal][wrap]")
+{
+    RotatingProposalHarness harness(2, 77);
+    const auto active = harness.activation.active_effect();
+    REQUIRE(active.configuration.tree_id == 77);
+    const ConfigurationId wrapped{
+        active.configuration.epoch_number,
+        6,
+        active.configuration.epoch_digest};
+    const auto wrapped_generation = checked_activation_generation(
+        active.configuration.epoch_number,
+        static_cast<std::uint64_t>(active.rotation_ordinal) + 1);
+    REQUIRE(wrapped_generation.has_value());
+    const auto proposal = rotation_proposal(
+        wrapped, *wrapped_generation, 0, "wrapped-next-tree");
+
+    const auto buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(0));
+    REQUIRE(buffered.error == EpochIngressError::none);
+    REQUIRE(buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
+
+    const auto rotated = harness.binding.rotate_to_tree(6);
+    REQUIRE(rotated.error == EpochIngressError::none);
+    REQUIRE(rotated.update.has_value());
+    CHECK(rotated.update->activation.configuration == wrapped);
+    CHECK(rotated.update->activation.generation == *wrapped_generation);
+    CHECK(harness.live_effects.apply_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 1);
+    CHECK(harness.proposal_effects.process_count == 1);
+    CHECK(harness.proposal_effects.apply_count_seen_on_process == 1);
+    CHECK(harness.future.size() == 0);
+}
+
+TEST_CASE("adaptive v2 drain retires stale A-B-A generations without processing",
+          "[adaptive-v2][epoch-live-binding][rotation][future-proposal][generation]")
+{
+    RotatingProposalHarness harness;
+    const auto a = harness.activation.active_effect();
+    const ConfigurationId b{
+        a.configuration.epoch_number,
+        42,
+        a.configuration.epoch_digest};
+    const auto b_generation = checked_activation_generation(
+        a.configuration.epoch_number,
+        static_cast<std::uint64_t>(a.rotation_ordinal) + 1);
+    REQUIRE(b_generation.has_value());
+    const auto stale_b = rotation_proposal(
+        b, *b_generation, 1, "stale-b-buffered-generation");
+
+    REQUIRE(harness.binding.handle_proposal(
+                consensus_message<MsgPropose>(stale_b),
+                AuthenticatedEpochPeer::replica(1))
+                .admission_disposition ==
+            ProposalDisposition::buffered_future);
+    harness.proposal_effects.fail_process = true;
+    const auto first_b = harness.binding.rotate_to_tree(42);
+    REQUIRE(first_b.error == EpochIngressError::none);
+    REQUIRE(first_b.update.has_value());
+    CHECK(first_b.update->activation.generation == *b_generation);
+    CHECK(harness.live_effects.apply_count == 1);
+    CHECK(harness.proposal_effects.process_attempt_count == 1);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.future.size() == 1);
+
+    harness.proposal_effects.fail_process = false;
+    const auto second_a = harness.binding.rotate_to_tree(6);
+    REQUIRE(second_a.error == EpochIngressError::none);
+    REQUIRE(second_a.update.has_value());
+    const auto second_b = harness.binding.rotate_to_tree(42);
+    REQUIRE(second_b.error == EpochIngressError::none);
+    REQUIRE(second_b.update.has_value());
+    CHECK(second_b.update->activation.generation > *b_generation);
+    CHECK(harness.live_effects.apply_count == 3);
+    CHECK(harness.proposal_effects.process_attempt_count == 1);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.future.size() == 0);
+    CHECK_FALSE(
+        harness.adapter.buffered_proposal_identity(stale_b.key())
+            .has_value());
+    CHECK_FALSE(
+        harness.adapter.processed_proposal_identity(stale_b.key())
+            .has_value());
+
+    // ProposalKey deliberately omits the generation.  Keep the received-key
+    // tombstone so the same block cannot be revived under the later B
+    // generation after its stale claim was retired.
+    auto current_b = stale_b;
+    current_b.view_generation = second_b.update->activation.generation;
+    const auto replay = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(current_b),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(replay.error == EpochIngressError::none);
+    CHECK(replay.admission_disposition == ProposalDisposition::duplicate);
+    CHECK(harness.proposal_effects.process_attempt_count == 1);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.future.size() == 0);
+    CHECK_FALSE(
+        harness.adapter.buffered_proposal_identity(stale_b.key())
+            .has_value());
+    CHECK_FALSE(
+        harness.adapter.processed_proposal_identity(stale_b.key())
+            .has_value());
+}
+
+TEST_CASE("adaptive v2 prospective rotation fails closed at ordinal exhaustion",
+          "[adaptive-v2][epoch-runtime][rotation][future-proposal][overflow]")
+{
+    RotatingProposalHarness harness(
+        std::numeric_limits<std::uint32_t>::max());
+    const auto active = harness.activation.active_effect();
+    const auto proposal = rotation_proposal(
+        ConfigurationId{
+            active.configuration.epoch_number,
+            42,
+            active.configuration.epoch_digest},
+        active.generation + 1,
+        1,
+        "ordinal-exhausted-next-tree");
+
+    const auto rejected = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(1));
+    CHECK(rejected.error == EpochIngressError::state_rejected);
+    CHECK(rejected.permission ==
+          EpochConsensusPermission::rejected_identity);
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.relay_count == 0);
+
+    const auto rotation = harness.binding.rotate_to_tree(42);
+    CHECK(rotation.error == EpochIngressError::state_rejected);
+    CHECK_FALSE(rotation.update.has_value());
+    CHECK(harness.live_effects.apply_count == 0);
+}
+
+TEST_CASE("adaptive v1 retains same-epoch future-tree rejection",
+          "[adaptive-v1][epoch-runtime][rotation][future-proposal][compatibility]")
+{
+    Harness harness;
+    const auto active = harness.activation.active_effect();
+    const auto generation = checked_activation_generation(
+        active.configuration.epoch_number,
+        static_cast<std::uint64_t>(active.rotation_ordinal) + 1);
+    REQUIRE(generation.has_value());
+    auto proposal = rotation_proposal(
+        ConfigurationId{
+            active.configuration.epoch_number,
+            1,
+            active.configuration.epoch_digest},
+        *generation,
+        1,
+        "adaptive-v1-next-tree");
+    proposal.protocol_mode = EpochProtocolMode::adaptive_v1;
+
+    const auto rejected = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(1));
+    CHECK(rejected.error == EpochIngressError::state_rejected);
+    CHECK(rejected.permission ==
+          EpochConsensusPermission::rejected_identity);
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.relay_count == 0);
+    CHECK(harness.proposal_effects.process_attempt_count == 0);
 }
 
 TEST_CASE("live binding emits only a successful stage acknowledgement",

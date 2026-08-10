@@ -641,6 +641,47 @@ struct HotStuffEpochRuntimeAdapter::State
         const auto active = activation.active_effect();
         if (envelope.configuration == active.configuration)
             return envelope.view_generation == active.generation;
+        if (mode == EpochProtocolMode::adaptive_v2 &&
+            active.definition != nullptr &&
+            envelope.configuration.epoch_number ==
+                active.configuration.epoch_number &&
+            envelope.configuration.epoch_digest ==
+                active.configuration.epoch_digest &&
+            active.rotation_ordinal !=
+                std::numeric_limits<std::uint32_t>::max())
+        {
+            const auto &trees = active.definition->trees();
+            if (trees.size() > 1)
+            {
+                const auto current = std::find_if(
+                    trees.begin(),
+                    trees.end(),
+                    [&active](const EpochTreeDefinition &tree) {
+                        return tree.tree_id ==
+                               active.configuration.tree_id;
+                    });
+                if (current != trees.end())
+                {
+                    auto next = current;
+                    ++next;
+                    if (next == trees.end())
+                        next = trees.begin();
+                    const auto generation =
+                        checked_activation_generation(
+                            active.configuration.epoch_number,
+                            static_cast<std::uint64_t>(
+                                active.rotation_ordinal) +
+                                1);
+                    if (next->tree_id !=
+                            active.configuration.tree_id &&
+                        envelope.configuration.tree_id ==
+                            next->tree_id &&
+                        generation.has_value() &&
+                        envelope.view_generation == *generation)
+                        return true;
+                }
+            }
+        }
         return std::any_of(
             staged_configurations.begin(),
             staged_configurations.end(),
@@ -1090,6 +1131,13 @@ EpochRotationResult HotStuffEpochRuntimeAdapter::rotate_to_tree(
             update.activation, update.leader_view});
         state_->retire_staged_epoch(update.activation.configuration);
         state_->draining_effect.emplace(previous);
+        if (state_->mode == EpochProtocolMode::adaptive_v2)
+        {
+            state_->future_drain_configuration =
+                update.activation.configuration;
+            state_->completed_drain_configuration.reset();
+            state_->remaining_hint.reset();
+        }
         return {EpochIngressError::none, update};
     }
     catch (...)
@@ -1381,6 +1429,20 @@ HotStuffEpochRuntimeAdapter::drain_activated_futures() noexcept
         FutureProposalClaimOwner owner(state_->future, claim->token);
         try
         {
+            const auto active = state_->activation.active_effect();
+            if (active.configuration != configuration)
+                return {
+                    EpochFutureDrainStatus::inactive_configuration,
+                    processed,
+                    state_->future.size()};
+            if (state_->mode == EpochProtocolMode::adaptive_v2 &&
+                claim->proposal.view_generation != active.generation)
+            {
+                const auto key = claim->proposal.metadata.key();
+                owner.acknowledge();
+                state_->identities.erase(key);
+                continue;
+            }
             state_->future.process_active(*claim);
             owner.acknowledge();
             const auto identity = state_->identities.find(
