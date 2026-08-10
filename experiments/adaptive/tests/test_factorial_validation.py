@@ -63,8 +63,11 @@ V28_MANIFEST_PATH = (
 V29_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v29.json"
 )
-FROZEN_MANIFEST_PATH = (
+V30_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v30.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v31.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -216,6 +219,12 @@ def test_v26_and_v27_duplicate_delivery_dispatch_is_version_and_field_exact() ->
     )
     assert validation._uses_verified_response_duplicate_delivery_contract(
         manifest(
+            validation.V30_MANIFEST_ID,
+            VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_verified_response_duplicate_delivery_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         )
@@ -273,6 +282,12 @@ def test_v23_future_tree_delivery_dispatch_is_version_and_field_exact() -> None:
     )
     assert validation._uses_future_tree_proposal_delivery_contract(
         manifest(
+            validation.V30_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         )
@@ -319,6 +334,12 @@ def test_v25_inherited_wait_exempt_placement_dispatch_is_version_and_field_exact
     assert validation._uses_inherited_consensus_wait_exempt_placement_contract(
         manifest(
             validation.V25_MANIFEST_ID,
+            INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
+        )
+    )
+    assert validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(
+            validation.V30_MANIFEST_ID,
             INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
         )
     )
@@ -403,7 +424,20 @@ def _v29_candidate_manifest(
 def _v30_candidate_manifest(
     _monkeypatch: pytest.MonkeyPatch,
 ):
+    payload = V30_MANIFEST_PATH.read_bytes()
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v31_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
     payload = FROZEN_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
     return manifest_module.parse_manifest_bytes(payload)
 
 
@@ -573,7 +607,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v30_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v31_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -615,6 +649,9 @@ def test_validator_retains_exact_v1_through_v30_artifact_identities() -> None:
         validation.V29_MANIFEST_ID
     )
     identities[30] = validation._frozen_artifact_identity(
+        validation.V30_MANIFEST_ID
+    )
+    identities[31] = validation._frozen_artifact_identity(
         validation.FROZEN_MANIFEST_ID
     )
 
@@ -834,15 +871,26 @@ def test_validator_retains_exact_v1_through_v30_artifact_identities() -> None:
         identities[29].coverage_smoke_runtime_sha256
         == validation.V29_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[30].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[30].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[30].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[30].manifest_sha256 == validation.V30_MANIFEST_SHA256
+    assert identities[30].plan_sha256 == validation.V30_PLAN_SHA256
+    assert identities[30].runtime_sha256 == validation.V30_RUNTIME_SHA256
     assert (
         identities[30].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V30_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[30].coverage_smoke_runtime_sha256
+        == validation.V30_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[31].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[31].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[31].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[31].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[31].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
     assert validation._coverage_smoke_result_root(
@@ -867,8 +915,11 @@ def test_validator_retains_exact_v1_through_v30_artifact_identities() -> None:
         validation.V29_MANIFEST_ID
     ) == "results/shape-placement-factorial-v29-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V30_MANIFEST_ID
     ) == "results/shape-placement-factorial-v30-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v31-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -989,6 +1040,41 @@ def test_validator_v29_identities_match_independent_artifact_recomputation() -> 
 
 
 def test_validator_v30_identities_match_independent_artifact_recomputation() -> None:
+    manifest_payload = V30_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(V30_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    runtime = build_factorial_runtime(plan)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+
+    recomputed = (
+        hashlib.sha256(manifest_payload).hexdigest(),
+        hashlib.sha256(_canonical(json.loads(manifest_payload))).hexdigest(),
+        plan.plan_sha256,
+        hashlib.sha256(canonical_runtime_bytes(runtime)).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(smoke.runtime.as_document())
+        ).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest(),
+    )
+    assert recomputed == (
+        manifest_module.V30_MANIFEST_SHA256,
+        manifest_module.V30_SEMANTIC_SHA256,
+        manifest_module.V30_PLAN_SHA256,
+        validation.V30_RUNTIME_SHA256,
+        validation.V30_SMOKE_RUNTIME_SHA256,
+        validation.V30_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+
+
+def test_validator_v31_identities_match_independent_artifact_recomputation() -> None:
     manifest_payload = FROZEN_MANIFEST_PATH.read_bytes()
     manifest = load_frozen_manifest(FROZEN_MANIFEST_PATH)
     plan = build_factorial_plan(manifest)
@@ -7557,15 +7643,326 @@ def _v28_duplicate_probe_fixture(
     return arguments, log_path
 
 
+def _v31_relay_result_schema_fixture(
+    tmp_path: Path,
+) -> tuple[dict[int, tuple[str, ...]], Path]:
+    reporter = 6
+    child = 1
+    proposal_block_hash = "88" * 32
+    relative = f"raw/process/replica-{reporter}.stderr.log"
+    log_path = tmp_path / relative
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "\n".join(
+            (
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root={reporter} "
+                "error=0 wire_error=0 permission=3 envelope=1 "
+                f"epoch=1 tree={reporter} block={proposal_block_hash} "
+                "generation=4294967303",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root={reporter} "
+                "dispatched=1",
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root=0 "
+                "error=0 wire_error=0 permission=3 envelope=1 "
+                f"epoch=0 tree=0 block={proposal_block_hash} generation=1",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root=0 dispatched=1",
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root=0 "
+                "error=3 wire_error=0 permission=5 envelope=0 "
+                "epoch=0 tree=0 block=none generation=0",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root=0 dispatched=0",
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root=0 "
+                "error=2 wire_error=1 permission=5 envelope=0 "
+                "epoch=0 tree=0 block=none generation=0",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root=0 dispatched=0",
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root=0 "
+                "error=2 wire_error=9 permission=5 envelope=0 "
+                "epoch=0 tree=0 block=none generation=0",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root=0 dispatched=0",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {reporter: (relative,)}, log_path
+
+
+def test_v31_relay_result_schema_accepts_exact_rejected_no_envelope_sentinel(
+    tmp_path: Path,
+) -> None:
+    paths_by_replica, _ = _v31_relay_result_schema_fixture(tmp_path)
+    witnesses, _ = validation._relay_ingress_witnesses(
+        tmp_path,
+        paths_by_replica,
+    )
+
+    assert len(witnesses) == 5
+    (
+        accepted,
+        accepted_zero_identity,
+        state_rejected,
+        decode_rejected_low,
+        decode_rejected_high,
+    ) = witnesses
+    assert accepted.accepted
+    assert accepted_zero_identity.accepted
+    assert (
+        accepted_zero_identity.root_id,
+        accepted_zero_identity.epoch_number,
+        accepted_zero_identity.tree_id,
+    ) == (0, 0, 0)
+    assert not state_rejected.accepted
+    assert not decode_rejected_low.accepted
+    assert not decode_rejected_high.accepted
+    assert (
+        state_rejected.ingress_error,
+        state_rejected.wire_error,
+        state_rejected.permission,
+        state_rejected.envelope_present,
+        state_rejected.root_id,
+        state_rejected.epoch_number,
+        state_rejected.tree_id,
+        state_rejected.block_hash,
+        state_rejected.view_generation,
+        state_rejected.dispatched,
+    ) == (3, 0, 5, 0, 0, 0, 0, "none", 0, 0)
+    assert (decode_rejected_low.ingress_error, decode_rejected_low.wire_error) == (
+        2,
+        1,
+    )
+    assert (decode_rejected_high.ingress_error, decode_rejected_high.wire_error) == (
+        2,
+        9,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        ("envelope-one-generation-zero", "enveloped relay result generation"),
+        ("envelope-one-block-none", "enveloped relay result block"),
+        ("envelope-zero-generation", "no-envelope relay result sentinel"),
+        ("envelope-zero-root", "no-envelope relay result sentinel"),
+        ("envelope-zero-epoch", "no-envelope relay result sentinel"),
+        ("envelope-zero-tree", "no-envelope relay result sentinel"),
+        ("envelope-zero-block", "no-envelope relay result sentinel"),
+        ("decode-reject-wire-zero", "no-envelope relay result sentinel"),
+        ("state-reject-wire-nonzero", "no-envelope relay result sentinel"),
+        ("envelope-zero-unreachable-error", "no-envelope relay result sentinel"),
+        ("envelope-zero-other-error", "no-envelope relay result sentinel"),
+        ("envelope-zero-permission", "no-envelope relay result sentinel"),
+        ("envelope-zero-dispatched", "no-envelope relay result sentinel"),
+        ("envelope-outside-binary", "relay result envelope indicator"),
+        ("accepted-error", "enveloped relay result tuple"),
+        ("accepted-wire-error", "enveloped relay result tuple"),
+        ("accepted-permission", "enveloped relay result tuple"),
+        ("accepted-not-dispatched", "enveloped relay result tuple"),
+        ("begin-recipient-overflow", "relay begin recipient.*unsigned 16-bit"),
+        ("begin-source-overflow", "relay begin source.*unsigned 16-bit"),
+        ("result-recipient-overflow", "relay result recipient.*unsigned 16-bit"),
+        ("result-source-overflow", "relay result source.*unsigned 16-bit"),
+        ("result-root-overflow", "relay result root.*unsigned 16-bit"),
+        ("result-epoch-overflow", "relay epoch.*unsigned 32-bit"),
+        ("result-tree-overflow", "relay tree.*unsigned 32-bit"),
+        ("complete-recipient-overflow", "relay complete recipient.*unsigned 16-bit"),
+        ("complete-source-overflow", "relay complete source.*unsigned 16-bit"),
+        ("complete-root-overflow", "relay complete root.*unsigned 16-bit"),
+        ("generation-overflow", "relay view generation.*unsigned 64-bit"),
+    ),
+)
+def test_v31_relay_result_schema_is_fail_closed(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    paths_by_replica, log_path = _v31_relay_result_schema_fixture(tmp_path)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    accepted_result = 1
+    accepted_complete = 2
+    rejected_result = 7
+    rejected_complete = 8
+    if mutation == "envelope-one-generation-zero":
+        lines[accepted_result] = lines[accepted_result].replace(
+            "generation=4294967303", "generation=0"
+        )
+    elif mutation == "envelope-one-block-none":
+        lines[accepted_result] = lines[accepted_result].replace(
+            f"block={'88' * 32}", "block=none"
+        )
+    elif mutation == "envelope-zero-generation":
+        lines[rejected_result] = lines[rejected_result].replace(
+            "generation=0", "generation=1"
+        )
+    elif mutation == "envelope-zero-root":
+        lines[rejected_result] = lines[rejected_result].replace("root=0", "root=1")
+    elif mutation == "envelope-zero-epoch":
+        lines[rejected_result] = lines[rejected_result].replace(
+            "epoch=0", "epoch=1"
+        )
+    elif mutation == "envelope-zero-tree":
+        lines[rejected_result] = lines[rejected_result].replace("tree=0", "tree=1")
+    elif mutation == "envelope-zero-block":
+        lines[rejected_result] = lines[rejected_result].replace(
+            "block=none", f"block={'99' * 32}"
+        )
+    elif mutation == "decode-reject-wire-zero":
+        lines[rejected_result] = lines[rejected_result].replace("error=3", "error=2")
+    elif mutation == "state-reject-wire-nonzero":
+        lines[rejected_result] = lines[rejected_result].replace(
+            "wire_error=0", "wire_error=1"
+        )
+    elif mutation == "envelope-zero-unreachable-error":
+        lines[rejected_result] = lines[rejected_result].replace("error=3", "error=1")
+    elif mutation == "envelope-zero-other-error":
+        lines[rejected_result] = lines[rejected_result].replace("error=3", "error=4")
+    elif mutation == "envelope-zero-permission":
+        lines[rejected_result] = lines[rejected_result].replace(
+            "permission=5", "permission=3"
+        )
+    elif mutation == "envelope-zero-dispatched":
+        lines[rejected_complete] = lines[rejected_complete].replace(
+            "dispatched=0", "dispatched=1"
+        )
+    elif mutation == "envelope-outside-binary":
+        lines[rejected_result] = lines[rejected_result].replace(
+            "envelope=0", "envelope=2"
+        )
+    elif mutation == "accepted-error":
+        lines[accepted_result] = lines[accepted_result].replace(
+            " error=0 wire_error=0 ",
+            " error=1 wire_error=0 ",
+        )
+    elif mutation == "accepted-wire-error":
+        lines[accepted_result] = lines[accepted_result].replace(
+            "wire_error=0", "wire_error=1"
+        )
+    elif mutation == "accepted-permission":
+        lines[accepted_result] = lines[accepted_result].replace(
+            "permission=3", "permission=5"
+        )
+    elif mutation == "accepted-not-dispatched":
+        lines[accepted_complete] = lines[accepted_complete].replace(
+            "dispatched=1", "dispatched=0"
+        )
+    elif mutation == "begin-recipient-overflow":
+        lines[0] = lines[0].replace("recipient=6", "recipient=65536")
+    elif mutation == "begin-source-overflow":
+        lines[0] = lines[0].replace("source_replica=1", "source_replica=65536")
+    elif mutation == "result-recipient-overflow":
+        lines[accepted_result] = lines[accepted_result].replace(
+            "recipient=6", "recipient=65536"
+        )
+    elif mutation == "result-source-overflow":
+        lines[accepted_result] = lines[accepted_result].replace(
+            "source_replica=1", "source_replica=65536"
+        )
+    elif mutation == "result-root-overflow":
+        lines[accepted_result] = lines[accepted_result].replace("root=6", "root=65536")
+    elif mutation == "result-epoch-overflow":
+        lines[accepted_result] = lines[accepted_result].replace(
+            "epoch=1", "epoch=4294967296"
+        )
+    elif mutation == "result-tree-overflow":
+        lines[accepted_result] = lines[accepted_result].replace(
+            "tree=6", "tree=4294967296"
+        )
+    elif mutation == "complete-recipient-overflow":
+        lines[accepted_complete] = lines[accepted_complete].replace(
+            "recipient=6", "recipient=65536"
+        )
+    elif mutation == "complete-source-overflow":
+        lines[accepted_complete] = lines[accepted_complete].replace(
+            "source_replica=1", "source_replica=65536"
+        )
+    elif mutation == "complete-root-overflow":
+        lines[accepted_complete] = lines[accepted_complete].replace(
+            "root=6", "root=65536"
+        )
+    else:
+        lines[accepted_result] = lines[accepted_result].replace(
+            "generation=4294967303", "generation=18446744073709551616"
+        )
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._relay_ingress_witnesses(tmp_path, paths_by_replica)
+
+
+@pytest.mark.parametrize("error,wire_error", ((3, 0), (2, 1), (2, 9)))
+def test_v31_rejected_no_envelope_sentinel_cannot_satisfy_probe_ingress(
+    tmp_path: Path,
+    error: int,
+    wire_error: int,
+) -> None:
+    arguments, log_path = _v28_duplicate_probe_fixture(tmp_path)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    lines[1:4] = (
+        "KAURI_RELAY_INGRESS stage=begin recipient=6 source_replica=1",
+        "KAURI_RELAY_INGRESS stage=result recipient=6 source_replica=1 root=0 "
+        f"error={error} wire_error={wire_error} permission=5 envelope=0 "
+        "epoch=0 tree=0 "
+        "block=none generation=0",
+        "KAURI_RELAY_INGRESS stage=dispatch_complete recipient=6 "
+        "source_replica=1 root=0 dispatched=0",
+    )
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="lacks its original accepted ingress",
+    ):
+        validation._validate_v28_verified_response_duplicate_probe(**arguments)
+
+
+def test_v31_repair_probe_permits_exact_rejected_no_envelope_sentinels(
+    tmp_path: Path,
+) -> None:
+    arguments, log_path = _v28_duplicate_probe_fixture(tmp_path)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    for error, wire_error in ((3, 0), (2, 1), (2, 9)):
+        lines.extend(
+            (
+                "KAURI_RELAY_INGRESS stage=begin recipient=6 source_replica=1",
+                "KAURI_RELAY_INGRESS stage=result recipient=6 source_replica=1 "
+                f"root=0 error={error} wire_error={wire_error} permission=5 "
+                "envelope=0 epoch=0 tree=0 block=none generation=0",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete recipient=6 "
+                "source_replica=1 root=0 dispatched=0",
+            )
+        )
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert validation._validate_v28_verified_response_duplicate_probe(**arguments)
+
+
 @pytest.mark.parametrize(
     "manifest_id",
     (
         validation.V28_MANIFEST_ID,
         validation.V29_MANIFEST_ID,
+        validation.V30_MANIFEST_ID,
         validation.FROZEN_MANIFEST_ID,
     ),
 )
-def test_v28_through_v30_slot037_bind_exact_bridge_only_duplicate_probe(
+def test_v28_through_v31_slot037_bind_exact_bridge_only_duplicate_probe(
     tmp_path: Path,
     manifest_id: str,
 ) -> None:
@@ -7718,8 +8115,14 @@ def test_v28_response_duplicate_probe_is_fail_closed(
         result_index = next(
             index for index, line in enumerate(lines) if "stage=result" in line
         )
-        lines[result_index] = lines[result_index].replace(
-            "permission=3", "permission=2"
+        lines[result_index] = (
+            "KAURI_RELAY_INGRESS stage=result recipient=6 "
+            "source_replica=1 root=0 error=3 wire_error=0 permission=5 "
+            "envelope=0 epoch=0 tree=0 block=none generation=0"
+        )
+        lines[result_index + 1] = (
+            "KAURI_RELAY_INGRESS stage=dispatch_complete recipient=6 "
+            "source_replica=1 root=0 dispatched=0"
         )
     elif mutation == "missing-arm":
         lines = [line for line in lines if "response_attempt_armed" not in line]
@@ -7798,7 +8201,15 @@ def test_v27_slot037_duplicate_delivery_proof_is_fail_closed(
     elif mutation == "single-ingress":
         lines = (*lines[:1], *lines[4:])
     elif mutation == "rejected-ingress":
-        lines[2] = lines[2].replace("permission=3", "permission=2")
+        lines[2] = (
+            "KAURI_RELAY_INGRESS stage=result recipient=6 "
+            "source_replica=1 root=0 error=3 wire_error=0 permission=5 "
+            "envelope=0 epoch=0 tree=0 block=none generation=0"
+        )
+        lines[3] = (
+            "KAURI_RELAY_INGRESS stage=dispatch_complete recipient=6 "
+            "source_replica=1 root=0 dispatched=0"
+        )
     elif mutation == "intervening-begin":
         lines.insert(
             7,
@@ -7875,6 +8286,9 @@ def test_v25_slot037_coverage_proves_exact_inherited_leaf_placement() -> None:
     )
     assert validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
         **{**arguments, "manifest_id": validation.V29_MANIFEST_ID}
+    )
+    assert validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+        **{**arguments, "manifest_id": validation.V30_MANIFEST_ID}
     )
     assert validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
         **{**arguments, "manifest_id": validation.FROZEN_MANIFEST_ID}
@@ -8596,6 +9010,7 @@ def _v28_repair_observation_fixture(
         28: _v28_candidate_manifest,
         29: _v29_candidate_manifest,
         30: _v30_candidate_manifest,
+        31: _v31_candidate_manifest,
     }[version](monkeypatch)
     expected = _v25_inherited_placement_expected_slot()
     digests = ("10" * 32, "11" * 32, "22" * 32)
@@ -8803,8 +9218,8 @@ def _v28_repair_observation_fixture(
     return document, arguments
 
 
-@pytest.mark.parametrize("version", (28, 29, 30))
-def test_v28_through_v30_excluded_repair_observation_bind_exact_grouped_chronology(
+@pytest.mark.parametrize("version", (28, 29, 30, 31))
+def test_v28_through_v31_excluded_repair_observation_bind_exact_grouped_chronology(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
 ) -> None:
@@ -9214,6 +9629,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
+    assert validation._coverage_smoke_slot_ids(validation.V30_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
     assert validation._coverage_smoke_slot_ids(validation.FROZEN_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
@@ -9277,6 +9696,7 @@ def _v25_coverage_runtime_fixture(
         28: _v28_candidate_manifest,
         29: _v29_candidate_manifest,
         30: _v30_candidate_manifest,
+        31: _v31_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -9389,12 +9809,17 @@ def test_v27_coverage_runtime_binds_v2_timing_and_ordered_lifecycle(
         ),
         (
             30,
-            validation.FROZEN_MANIFEST_ID,
+            validation.V30_MANIFEST_ID,
             "results/shape-placement-factorial-v30/slot-037-n31-f2-b04-00",
+        ),
+        (
+            31,
+            validation.FROZEN_MANIFEST_ID,
+            "results/shape-placement-factorial-v31/slot-037-n31-f2-b04-00",
         ),
     ),
 )
-def test_v28_through_v30_campaign_and_exact_repair_runtime_are_independently_bound(
+def test_v28_through_v31_campaign_and_exact_repair_runtime_are_independently_bound(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     manifest_id: str,
@@ -9456,7 +9881,7 @@ def test_v28_through_v30_campaign_and_exact_repair_runtime_are_independently_bou
 
 @pytest.mark.parametrize(
     "version",
-    (28, 29, 30),
+    (28, 29, 30, 31),
 )
 @pytest.mark.parametrize(
     "mutation,reason",
@@ -9471,7 +9896,7 @@ def test_v28_through_v30_campaign_and_exact_repair_runtime_are_independently_bou
         ("missing-causal-contract", "causal acceptance contract"),
     ),
 )
-def test_v28_through_v30_exact_repair_runtime_are_fail_closed(
+def test_v28_through_v31_exact_repair_runtime_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     mutation: str,
@@ -9902,7 +10327,8 @@ def _v25_coverage_lifecycle_fixture(
         27: V27_MANIFEST_PATH,
         28: V28_MANIFEST_PATH,
         29: V29_MANIFEST_PATH,
-        30: FROZEN_MANIFEST_PATH,
+        30: V30_MANIFEST_PATH,
+        31: FROZEN_MANIFEST_PATH,
     }[version].read_bytes()
     runtime_bytes = _canonical(runtime_document)
     static_artifacts = {
@@ -10149,8 +10575,8 @@ def test_v25_repair_coverage_lifecycle_binds_independent_predecessor(
     )
 
 
-@pytest.mark.parametrize("version", (26, 27, 28, 29, 30))
-def test_v26_through_v30_repair_coverage_lifecycle_inherit_exact_predecessor_binding(
+@pytest.mark.parametrize("version", (26, 27, 28, 29, 30, 31))
+def test_v26_through_v31_repair_coverage_lifecycle_inherit_exact_predecessor_binding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     version: int,
@@ -10194,15 +10620,30 @@ def test_v28_three_row_prelaunch_rejection_cannot_validate_as_completed(
         )
 
 
-def test_v29_preserved_official_failure_cannot_validate_as_completed(
+@pytest.mark.parametrize(
+    ("version", "official_reason"),
+    (
+        (
+            29,
+            "v26 cycle-1 adaptive_v2_converged event is absent or duplicated",
+        ),
+        (
+            30,
+            "relay view generation exceeds its unsigned 64-bit bound",
+        ),
+    ),
+)
+def test_v29_and_v30_preserved_official_failures_cannot_validate_as_completed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    version: int,
+    official_reason: str,
 ) -> None:
     fixture = _v25_coverage_lifecycle_fixture(
         monkeypatch,
         tmp_path,
         row_count=4,
-        version=29,
+        version=version,
     )
     root = fixture["recorded_result_root"]
     assert isinstance(root, Path)
@@ -10213,9 +10654,7 @@ def test_v29_preserved_official_failure_cannot_validate_as_completed(
         "figure_eligible": False,
         "integrity_valid": False,
         "outcome": "FAIL",
-        "reason": (
-            "v26 cycle-1 adaptive_v2_converged event is absent or duplicated"
-        ),
+        "reason": official_reason,
     }
     ledger_path.write_bytes(b"".join(_canonical(row) for row in rows))
     expected_by_id = fixture["expected_by_id"]

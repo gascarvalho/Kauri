@@ -1,4 +1,4 @@
-"""Prospective producer contract for the validation-only v30 version roll."""
+"""Prospective producer contract for the validation-only v31 version roll."""
 
 from __future__ import annotations
 
@@ -20,9 +20,6 @@ V31_MANIFEST = (
 V30_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v30.json"
 )
-V29_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v29.json"
-)
 
 
 def _canonical(value: object) -> bytes:
@@ -30,7 +27,7 @@ def _canonical(value: object) -> bytes:
 
 
 def _candidate_plan(monkeypatch: pytest.MonkeyPatch):
-    payload = V30_MANIFEST.read_bytes()
+    payload = V31_MANIFEST.read_bytes()
     semantic_sha256 = hashlib.sha256(_canonical(json.loads(payload))).hexdigest()
     monkeypatch.setattr(
         manifest_module,
@@ -70,50 +67,40 @@ def _static_artifacts(manifest_path: Path, plan, coverage) -> dict[str, bytes]:
     return {
         "manifest.json": manifest_path.read_bytes(),
         "plan.json": plan.canonical_bytes,
-        "runtime.json": execution._canonical_json_bytes(
-            coverage.runtime.as_document()
-        ),
+        "runtime.json": execution._canonical_json_bytes(coverage.runtime.as_document()),
     }
 
 
-def test_v30_profile_delta_is_only_identity_and_results_root() -> None:
-    v30 = json.loads(V30_MANIFEST.read_bytes())
-    v29 = json.loads(V29_MANIFEST.read_bytes())
+def test_v31_profile_is_one_lf_and_delta_is_only_identity_and_results_root() -> None:
+    v31_payload = V31_MANIFEST.read_bytes()
+    v30_payload = V30_MANIFEST.read_bytes()
 
+    assert v31_payload.endswith(b"\n")
+    assert not v31_payload.endswith(b"\n\n")
+    assert v31_payload.count(b"shape-placement-factorial-v31") == 2
+    assert (
+        v31_payload.replace(
+            b"shape-placement-factorial-v31",
+            b"shape-placement-factorial-v30",
+        )
+        == v30_payload
+    )
+    v31 = json.loads(v31_payload)
+    v30 = json.loads(v30_payload)
+    assert v31.pop("manifest_id") == "shape-placement-factorial-v31"
     assert v30.pop("manifest_id") == "shape-placement-factorial-v30"
-    assert v29.pop("manifest_id") == "shape-placement-factorial-v29"
+    assert v31["artifacts"].pop("results_root") == (  # type: ignore[index]
+        "results/shape-placement-factorial-v31"
+    )
     assert v30["artifacts"].pop("results_root") == (  # type: ignore[index]
         "results/shape-placement-factorial-v30"
     )
-    assert v29["artifacts"].pop("results_root") == (  # type: ignore[index]
-        "results/shape-placement-factorial-v29"
-    )
-    assert v30 == v29
+    assert v31 == v30
 
 
-def test_v29_identities_are_explicit_historical_aliases() -> None:
+def test_v30_identities_are_explicit_historical_aliases() -> None:
     assert (
-        manifest_module.V29_MANIFEST_ID,
-        manifest_module.V29_MANIFEST_SHA256,
-        manifest_module.V29_SEMANTIC_SHA256,
-        manifest_module.V29_PLAN_SHA256,
-        runtime_module.V29_RUNTIME_SHA256,
-        runtime_module.V29_SMOKE_RUNTIME_SHA256,
-        runtime_module.V29_COVERAGE_SMOKE_RUNTIME_SHA256,
-    ) == (
-        "shape-placement-factorial-v29",
-        "e012be15b6193263138de7b5aee5f78eb67de10182bc07e4494373d648fde5fa",
-        "605992c544a12c3652f1279bb960325bc94fe7cd72ebb251d1c5b8e101701361",
-        "8ca31c9d0ae26c7deedbb1932a161652f146e2ee6cb54bf08e9bf4ae5088bc91",
-        "162531c501ba866b51033af411b5debb7d1e805c254d5a8fedcd29b59337a026",
-        "5780c65662cbb1312f61f753e8d66237005ef666264bf99351b2d33f15d6680c",
-        "4042c313856f722a5abef6e537a8a73de1699dfdde17da0d9ab2bc8a628c995a",
-    )
-
-
-def test_v30_six_identities_are_exact_historical_values() -> None:
-    assert manifest_module.V30_MANIFEST_ID == "shape-placement-factorial-v30"
-    assert (
+        manifest_module.V30_MANIFEST_ID,
         manifest_module.V30_MANIFEST_SHA256,
         manifest_module.V30_SEMANTIC_SHA256,
         manifest_module.V30_PLAN_SHA256,
@@ -121,6 +108,7 @@ def test_v30_six_identities_are_exact_historical_values() -> None:
         runtime_module.V30_SMOKE_RUNTIME_SHA256,
         runtime_module.V30_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
+        "shape-placement-factorial-v30",
         "c868d9ebce0f3afbdfd6011787f385395b6df43b633f6cfad284726c2d3f52e4",
         "4d3130b1a02c9a0f4c67f8a29fb22000e15c2d9bf64ebd87af32518f22fb15b2",
         "3ed7a8a9b80f18c4b48d2a3daf16c44fba458f47ae84c6e4a4bdf907b4d65e1f",
@@ -130,24 +118,46 @@ def test_v30_six_identities_are_exact_historical_values() -> None:
     )
 
 
-def test_v29_exact_history_remains_loadable() -> None:
-    manifest = manifest_module.load_frozen_manifest(V29_MANIFEST)
+def test_v31_six_identities_are_exact_frozen_values() -> None:
+    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v31"
+    assert (
+        manifest_module.FROZEN_MANIFEST_SHA256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.FROZEN_PLAN_SHA256,
+        runtime_module.FROZEN_RUNTIME_SHA256,
+        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
+        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+    ) == (
+        "fce9417a0f50b5a741069730d479dcb58d9502c86d3bc53a51bb06def07592c7",
+        "d09a082b895e88360b236b49998d8671440189dedbacbe1bfdd9d2ae5090a95c",
+        "f589888a4456910f3188ee602565e990ea7c4fb45dedd798d8804b679b1591fa",
+        "935e3f2418b3d24e4e535fcffb4ebc096eafe4ccc93f5468331e4c8d9552621c",
+        "d7026d8577928eb4660dd54240f7ce014a77f46d037b67801a7c0c6764706203",
+        "2a01a9cfad5b5ca7df9dfe3ce9b58bf894f0a1e7da523423ba8b98b5177fafe1",
+    )
+
+
+def test_v30_exact_history_remains_loadable() -> None:
+    manifest = manifest_module.load_frozen_manifest(V30_MANIFEST)
     plan = manifest_module.build_factorial_plan(manifest)
     runtime = runtime_module.build_factorial_runtime(plan)
     coverage = _coverage(plan)
 
-    assert manifest.manifest_id == manifest_module.V29_MANIFEST_ID
-    assert manifest.manifest_sha256 == manifest_module.V29_MANIFEST_SHA256
-    assert plan.plan_sha256 == manifest_module.V29_PLAN_SHA256
-    assert hashlib.sha256(runtime_module.canonical_runtime_bytes(runtime)).hexdigest() == (
-        runtime_module.V29_RUNTIME_SHA256
-    )
+    assert manifest.manifest_id == manifest_module.V30_MANIFEST_ID
+    assert manifest.manifest_sha256 == manifest_module.V30_MANIFEST_SHA256
+    assert plan.plan_sha256 == manifest_module.V30_PLAN_SHA256
     assert hashlib.sha256(
-        execution._canonical_json_bytes(coverage.runtime.as_document())
-    ).hexdigest() == runtime_module.V29_COVERAGE_SMOKE_RUNTIME_SHA256
+        runtime_module.canonical_runtime_bytes(runtime)
+    ).hexdigest() == (runtime_module.V30_RUNTIME_SHA256)
+    assert (
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest()
+        == runtime_module.V30_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
 
 
-def test_v30_preserves_v29_timing_and_exact_repair_contract(
+def test_v31_preserves_v30_timing_and_exact_repair_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, coverage = _candidate_coverage(monkeypatch)
@@ -164,56 +174,56 @@ def test_v30_preserves_v29_timing_and_exact_repair_contract(
     probe = repair_runtime.excluded_repair_smoke_probe
     assert probe is not None
     assert probe.source_campaign_result_path == (
-        "results/shape-placement-factorial-v30/slot-037-n31-f2-b04-00"
+        "results/shape-placement-factorial-v31/slot-037-n31-f2-b04-00"
     )
     assert coverage.runtime.excluded_repair_smoke_probe == probe
 
 
-def test_v29_and_v30_exact_static_bindings_pass_but_cross_binding_fails(
+def test_v30_and_v31_exact_static_bindings_pass_but_cross_binding_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    v29_manifest = manifest_module.load_frozen_manifest(V29_MANIFEST)
-    v29_plan = manifest_module.build_factorial_plan(v29_manifest)
-    v29_coverage = _coverage(v29_plan)
-    _, v30_plan, v30_coverage = _candidate_coverage(monkeypatch)
-    v29_artifacts = _static_artifacts(V29_MANIFEST, v29_plan, v29_coverage)
+    v30_manifest = manifest_module.load_frozen_manifest(V30_MANIFEST)
+    v30_plan = manifest_module.build_factorial_plan(v30_manifest)
+    v30_coverage = _coverage(v30_plan)
+    _, v31_plan, v31_coverage = _candidate_coverage(monkeypatch)
     v30_artifacts = _static_artifacts(V30_MANIFEST, v30_plan, v30_coverage)
+    v31_artifacts = _static_artifacts(V31_MANIFEST, v31_plan, v31_coverage)
 
-    execution._bind_static_artifacts(
-        v29_coverage.slots[1],
-        v29_coverage.runtimes[1],
-        v29_artifacts,
-        campaign_member=False,
-    )
     execution._bind_static_artifacts(
         v30_coverage.slots[1],
         v30_coverage.runtimes[1],
         v30_artifacts,
         campaign_member=False,
     )
+    execution._bind_static_artifacts(
+        v31_coverage.slots[1],
+        v31_coverage.runtimes[1],
+        v31_artifacts,
+        campaign_member=False,
+    )
+    with pytest.raises(execution.FactorialExecutionError):
+        execution._bind_static_artifacts(
+            v31_coverage.slots[1],
+            v31_coverage.runtimes[1],
+            v30_artifacts,
+            campaign_member=False,
+        )
     with pytest.raises(execution.FactorialExecutionError):
         execution._bind_static_artifacts(
             v30_coverage.slots[1],
             v30_coverage.runtimes[1],
-            v29_artifacts,
-            campaign_member=False,
-        )
-    with pytest.raises(execution.FactorialExecutionError):
-        execution._bind_static_artifacts(
-            v29_coverage.slots[1],
-            v29_coverage.runtimes[1],
-            v30_artifacts,
+            v31_artifacts,
             campaign_member=False,
         )
 
 
-def test_v29_runtime_cannot_bind_to_v30_repair_slot(
+def test_v30_runtime_cannot_bind_to_v31_repair_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    v29_manifest = manifest_module.load_frozen_manifest(V29_MANIFEST)
-    v29_plan = manifest_module.build_factorial_plan(v29_manifest)
-    v29_coverage = _coverage(v29_plan)
-    _, v30_plan, v30_coverage = _candidate_coverage(monkeypatch)
+    v30_manifest = manifest_module.load_frozen_manifest(V30_MANIFEST)
+    v30_plan = manifest_module.build_factorial_plan(v30_manifest)
+    v30_coverage = _coverage(v30_plan)
+    _, v31_plan, v31_coverage = _candidate_coverage(monkeypatch)
 
     with pytest.raises(
         execution.FactorialExecutionError,
@@ -223,9 +233,9 @@ def test_v29_runtime_cannot_bind_to_v30_repair_slot(
         ),
     ):
         execution._bind_static_artifacts(
-            v30_coverage.slots[1],
-            v29_coverage.runtimes[1],
-            _static_artifacts(V30_MANIFEST, v30_plan, v30_coverage),
+            v31_coverage.slots[1],
+            v30_coverage.runtimes[1],
+            _static_artifacts(V31_MANIFEST, v31_plan, v31_coverage),
             campaign_member=False,
         )
 
