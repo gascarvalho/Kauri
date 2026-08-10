@@ -784,8 +784,8 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
                     "reporter=%u child=%u epoch=%u tree=%u "
                     "digest=%s block=%s message_type=%s "
                     "attempt_generation=%llu",
-                    state_->reporter_id,
-                    authenticated_sender,
+                    static_cast<unsigned>(state_->reporter_id),
+                    static_cast<unsigned>(authenticated_sender),
                     proposal.configuration.epoch_number,
                     proposal.configuration.tree_id,
                     proposal.configuration.epoch_digest.to_hex().c_str(),
