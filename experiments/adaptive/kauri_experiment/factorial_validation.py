@@ -65,6 +65,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
@@ -128,6 +129,9 @@ from .factorial_manifest import (
     V19_MANIFEST_ID,
     V19_MANIFEST_SHA256,
     V19_PLAN_SHA256,
+    V20_MANIFEST_ID,
+    V20_MANIFEST_SHA256,
+    V20_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -178,8 +182,11 @@ V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v19-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v20-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v21-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -304,14 +311,23 @@ V19_SMOKE_RUNTIME_SHA256 = (
 V19_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "538740a2d5421d80994bc7007421fe57a10e965fb1e5f71f1bc57b78c037b3d6"
 )
-FROZEN_RUNTIME_SHA256 = (
+V20_RUNTIME_SHA256 = (
     "df50a0202818bcafc699dd266dab6f97147659b0a09c4362207b90bd74d773a7"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V20_SMOKE_RUNTIME_SHA256 = (
     "cdcb497c77d92ef66618980b3c710d3702d9e43d92802a8c95e745ace611b96e"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V20_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "31f2a2a6d35c5f7c115b1dc6c321e92dc54f9edfd37ba9a9d9ac61c45d21f611"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "c553c6bbbb6ff9014d5935eb1e0d939757eb9ea90a16038b7fefd34fada3ad8b"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "c6d0a7e10b45c37072fd1dcc363f72d982efb726e57f1efe0f88dddf8f2f843c"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "5f0fa01ac8f5368cc09eff70d0a30f22156275e86683a627f54840caaa0eaa0c"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -409,6 +425,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V17_MANIFEST_ID,
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
+        V20_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -451,6 +468,7 @@ def _uses_explicit_phase_edge_eligibility(
         in {
             RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
             RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+            RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         }
     )
 
@@ -459,18 +477,35 @@ def _uses_selection_visible_hard_timeout_witnesses(
     manifest: FrozenFactorialManifest,
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
+    if responsive is None:
+        return False
+    if manifest.manifest_id in {
+        V16_MANIFEST_ID,
+        V17_MANIFEST_ID,
+        V18_MANIFEST_ID,
+        V19_MANIFEST_ID,
+        V20_MANIFEST_ID,
+    }:
+        return (
+            responsive.causal_timeout_eligibility
+            == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
+        )
     return (
-        manifest.manifest_id
-        in {
-            V16_MANIFEST_ID,
-            V17_MANIFEST_ID,
-            V18_MANIFEST_ID,
-            V19_MANIFEST_ID,
-            FROZEN_MANIFEST_ID,
-        }
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive.causal_timeout_eligibility
+        == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
+    )
+
+
+def _uses_selection_visible_responsive_timeout_nonwitnesses(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
         and responsive is not None
         and responsive.causal_timeout_eligibility
-        == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
+        == RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
     )
 
 
@@ -487,6 +522,7 @@ def _uses_source_bound_contribution_opportunities(
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -505,6 +541,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -523,6 +560,7 @@ def _uses_precontainment_fault_coverage(
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -541,6 +579,7 @@ def _uses_precontainment_shape_preservation(
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -559,7 +598,12 @@ def _uses_precontainment_guarded_selection_contract(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V18_MANIFEST_ID, V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V18_MANIFEST_ID,
+            V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and getattr(
             responsive,
@@ -575,7 +619,8 @@ def _uses_future_tree_proposal_delivery_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id in {V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V19_MANIFEST_ID, V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -591,7 +636,7 @@ def _uses_source_bound_proposal_witness_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and responsive is not None
         and getattr(
             responsive,
@@ -834,6 +879,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V19_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V19_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V20_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V20_MANIFEST_ID,
+            manifest_sha256=V20_MANIFEST_SHA256,
+            plan_sha256=V20_PLAN_SHA256,
+            runtime_sha256=V20_RUNTIME_SHA256,
+            smoke_runtime_sha256=V20_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V20_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2490,6 +2545,11 @@ def _is_excluded_coverage_smoke_slot(
             V19_COVERAGE_SMOKE_RUNTIME_SHA256,
             V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V20_MANIFEST_ID: (
+            V20_RUNTIME_SHA256,
+            V20_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2534,6 +2594,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V18_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V19_MANIFEST_ID:
         return V19_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V20_MANIFEST_ID:
+        return V20_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -2796,15 +2858,23 @@ def _validate_runtime_slot(
         _uses_source_bound_proposal_witness_contract(manifest)
     )
     if (
-        manifest.manifest_id in {V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V19_MANIFEST_ID, V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and not future_tree_proposal_delivery
     ):
-        _fail("v19 future-tree proposal delivery contract drifted")
+        _fail("future-tree proposal delivery contract drifted")
     if (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and not source_bound_proposal_witnesses
     ):
-        _fail("v20 source-bound proposal witness contract drifted")
+        _fail("source-bound proposal witness contract drifted")
+    if (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and not _uses_selection_visible_responsive_timeout_nonwitnesses(
+            manifest
+        )
+    ):
+        _fail("v21 responsive timeout nonwitness contract drifted")
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -3101,6 +3171,7 @@ def _validate_runtime_slot(
         V17_MANIFEST_ID,
         V18_MANIFEST_ID,
         V19_MANIFEST_ID,
+        V20_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -6118,9 +6189,18 @@ def validate_fault_causality(
     ]
     | None = None,
     selection_visible_hard_timeout_witnesses: bool = False,
+    selection_visible_responsive_timeout_nonwitnesses: bool = False,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
+    if (
+        selection_visible_responsive_timeout_nonwitnesses
+        and not explicit_phase_edge_eligibility
+    ):
+        _fail(
+            "responsive timeout nonwitnesses require explicit phase-edge "
+            "eligibility"
+        )
     actors = tuple(sorted(actor_ids))
     degraded = tuple(sorted(responsive_degraded_actor_ids))
     all_fault_actors = frozenset((*actors, *degraded))
@@ -6454,6 +6534,17 @@ def validate_fault_causality(
                     "response-attempt arm"
                 )
             if exact_arm.absolute_deadline_ns >= decision_deadline:
+                if (
+                    selection_visible_responsive_timeout_nonwitnesses
+                    and causal_timeout_indexes.get(
+                        marker.epoch_number,
+                        {},
+                    ).get(timeout_key, ())
+                ):
+                    _fail(
+                        "responsive-degraded selection-prefix timeout fails "
+                        "its exact reporter/role/message/duration/timing join"
+                    )
                 continue
         matched_timeouts = causal_timeout_indexes.get(
             marker.epoch_number,
@@ -6486,7 +6577,17 @@ def validate_fault_causality(
             )
         ]
         if marker.actor in degraded:
+            if (
+                selection_visible_responsive_timeout_nonwitnesses
+                and len(exact_timeouts) != len(matched_timeouts)
+            ):
+                _fail(
+                    "responsive-degraded selection-prefix timeout fails its "
+                    "exact reporter/role/message/duration/timing join"
+                )
             if not exact_timeouts:
+                if selection_visible_responsive_timeout_nonwitnesses:
+                    continue
                 _fail(
                     "responsive-degraded omission has no exact outstanding raw "
                     "timeout before the selecting transition"
@@ -9495,6 +9596,11 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             ),
             selection_visible_hard_timeout_witnesses=(
                 _uses_selection_visible_hard_timeout_witnesses(manifest)
+            ),
+            selection_visible_responsive_timeout_nonwitnesses=(
+                _uses_selection_visible_responsive_timeout_nonwitnesses(
+                    manifest
+                )
             ),
         )
 

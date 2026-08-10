@@ -1,0 +1,252 @@
+{
+  "schema_version": 1,
+  "manifest_id": "shape-placement-factorial-v21",
+  "frozen": true,
+  "execution_authorized": false,
+  "execution_receipt_required": true,
+  "replica_counts": [13, 22, 31],
+  "initial_fanouts": [2, 3, 5],
+  "candidate_fanouts": [2, 3, 5],
+  "pipeline_stretch": 2,
+  "shape_constraints": {
+    "epoch_fanout_policy": "one_uniform_fanout_per_epoch",
+    "pipeline_policy": "fixed_first_slice"
+  },
+  "arms": [
+    {
+      "code": "00",
+      "placement_adaptation": false,
+      "shape_adaptation": false
+    },
+    {
+      "code": "P",
+      "placement_adaptation": true,
+      "shape_adaptation": false
+    },
+    {
+      "code": "S",
+      "placement_adaptation": false,
+      "shape_adaptation": true
+    },
+    {
+      "code": "PS",
+      "placement_adaptation": true,
+      "shape_adaptation": true
+    }
+  ],
+  "repetitions": {
+    "default_blocks_per_cell": 1,
+    "cell_overrides": [
+      {
+        "replica_count": 31,
+        "initial_fanout": 2,
+        "blocks": 5
+      },
+      {
+        "replica_count": 31,
+        "initial_fanout": 5,
+        "blocks": 5
+      }
+    ]
+  },
+  "byzantine": {
+    "mode": "tiered_persistent_responsive_omission_v2",
+    "actor_count": 3,
+    "actor_count_rule": "fixed_3_bounded_by_derived_f",
+    "actor_selection": "sha256_ranked_canonical_epoch0_non_reference_roots_v1",
+    "actor_selection_preimage": "ascii_csv_membership_nul_decimal_q_nul_decimal_scientific_seed_nul_decimal_replica_id_v1",
+    "actor_selection_inputs": [
+      "membership",
+      "derived_q",
+      "canonical_epoch0_reference_roots_0_through_q_minus_1_v1",
+      "scientific_block_seed"
+    ],
+    "actor_selection_vectors": [
+      {
+        "replica_count": 13,
+        "q": 9,
+        "scientific_seed": 41719,
+        "selected_actor_ids": [9, 10, 12]
+      },
+      {
+        "replica_count": 22,
+        "q": 15,
+        "scientific_seed": 41722,
+        "selected_actor_ids": [15, 16, 17]
+      },
+      {
+        "replica_count": 31,
+        "q": 21,
+        "scientific_seed": 41725,
+        "selected_actor_ids": [25, 27, 29]
+      }
+    ],
+    "actor_schedule": "all_hard_actors_per_proposal_v1",
+    "responsive_degradation": {
+      "actor_count_rule": "derived_f_minus_hard_actor_count_v1",
+      "actor_selection": "sha256_ranked_canonical_epoch0_reference_roots_excluding_commit_observer_v1",
+      "actor_selection_preimage": "kauri.shape25.responsive-degraded.v1\\0{membership_csv}\\0{q}\\0{scientific_seed}\\0{replica_id}",
+      "actor_selection_inputs": [
+        "membership",
+        "derived_q",
+        "canonical_epoch0_reference_roots_1_through_q_minus_1_v1",
+        "replica_0_reserved_authoritative_commit_observer_v1",
+        "scientific_block_seed"
+      ],
+      "actor_selection_vectors": [
+        {
+          "replica_count": 13,
+          "q": 9,
+          "scientific_seed": 41719,
+          "selected_actor_ids": [2]
+        },
+        {
+          "replica_count": 22,
+          "q": 15,
+          "scientific_seed": 41722,
+          "selected_actor_ids": [1, 9, 10, 14]
+        },
+        {
+          "replica_count": 31,
+          "q": 21,
+          "scientific_seed": 41725,
+          "selected_actor_ids": [2, 5, 7, 8, 12, 18, 19]
+        }
+      ],
+      "observer_isolation": "replica_0_reserved_authoritative_commit_observer_v1",
+      "actor_schedule": "omit_every_41st_unique_non_root_contribution_per_exact_epoch_identity_physical_role_stream_v1",
+      "omission_period": 41,
+      "pending_attempt_retention": "retain_unanswered_exact_parent_child_attempt_across_consensus_commit_until_original_aggregation_derived_deadline_observational_only_no_consensus_authority_v1",
+      "causal_timeout_linkage": "fault_marker_to_exact_parent_attempt_to_scored_timeout_required_v1",
+      "causal_timeout_provenance_window": "epoch1_manager_ingestion_sequence_full_prefix_zero_exclusive_current_inclusive_v1",
+      "causal_internal_witness_candidates": "actor_level_strict_reporter_local_epoch1_internal_omit_aggregate_cross_commit_v1",
+      "causal_selection_linkage_window": "epoch1_manager_ingestion_sequence_baseline_exclusive_current_inclusive_v1",
+      "marker_completeness_witness": "source_bound_fault_contribution_opportunity_to_kauri_fault_exact_bijection_with_per_phase_actor_nonvacuity_v2",
+      "causal_timeout_eligibility": "selection_visible_exact_outstanding_timeout_witnesses_with_internal_and_f_plus_one_actor_gates_hard_and_responsive_degraded_absent_prefix_timeout_nonwitness_present_prefix_mismatch_fatal_v3",
+      "precontainment_fault_coverage_gate": "all_exact_predecessor_tree_ids_have_accepted_on_time_direct_vote_proposal_keys_with_conservative_attempt_start_lower_bound_at_or_after_sealed_fault_open_and_guarded_reporter_timeouts_restricted_to_that_exact_post_fault_proposal_key_set_v1",
+      "precontainment_shape_evaluation_contract": "epoch_zero_fault_containment_preserves_current_fanout_without_shape_v1_decision_later_transition_retains_exact_shape_v1_v1",
+      "precontainment_guarded_selection_contract": "post_baseline_high_water_drawdown_and_exact_post_fault_proposal_key_timeout_witnesses_are_independent_factory_validated_domains_v1",
+      "future_tree_proposal_delivery_contract": "exact_immediate_successor_tree_proposals_relayed_and_buffered_without_pre_activation_protocol_effects_then_revalidated_and_replayed_once_after_exact_activation_v1",
+      "source_bound_proposal_witness_contract": "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_keys_are_native_proposal_configuration_witnesses_after_exact_topology_validation_v1"
+    },
+    "maximum_rotating_contexts": 100000,
+    "window": {
+      "start_after_prelaunch_anchor_s": 150,
+      "duration_s": 300
+    },
+    "max_omissions_per_proposal_rule": "derived_f_per_slot_v1",
+    "actions": {
+      "root": "normal",
+      "internal": "omit_aggregate",
+      "leaf": "omit_direct_vote"
+    }
+  },
+  "workload": {
+    "block_size": 1000,
+    "piped_latency_ms": 1,
+    "tree_switch_period_blocks": 1,
+    "bucket_width_s": 5,
+    "baseline_bucket_count": 6,
+    "fault_evidence_bucket_count": 6,
+    "epoch1_stable_bucket_count": 6,
+    "epoch2_stable_bucket_count": 6
+  },
+  "responsiveness_policy": {
+    "policy_version": "shape25-direct-vote-responsiveness-v2",
+    "attempt_window": 128,
+    "minimum_attempts": 60,
+    "minimum_response_rate_ppm": 950000,
+    "maximum_timeout_rate_ppm": 50000,
+    "trailing_timeout_streak": 7,
+    "latency_percentile_basis_points": 5000
+  },
+  "timers": {
+    "depth_policy": "global_worst_candidate_depth_linear_v1",
+    "global_worst_candidate_depth": 4,
+    "aggregation_timeout_ms_per_depth": 125,
+    "leader_progress_timeout_ms_per_depth": 5000,
+    "leader_activation_grace_ms": 1000,
+    "activation_delay_blocks": 5,
+    "transition_convergence_deadline_s": 20,
+    "schedule_slack_s": 30,
+    "drain_margin_s": 20,
+    "startup_timeout_s": 120,
+    "hard_timeout_s": 500,
+    "transition_observation_bound_rule": "shared_slot_hard_deadline_until_manager_selection_v1"
+  },
+  "scheduling": {
+    "scientific_seed_base": 41719,
+    "scientific_seed_rule": "seed_base_plus_zero_based_block_ordinal_v1",
+    "slot_order": "replica_count_initial_fanout_block_arm_v1",
+    "slot_nonce_rule": "frozen_block_arm_ordinal_v1",
+    "campaign_order_seed": 88421,
+    "execution_block_order": "sha256_ranked_block_ids_v1",
+    "arm_counterbalancing": "stratified_greedy_minimum_position_imbalance_sha256_tiebreak_v2",
+    "outcome_dependent_order": false
+  },
+  "claim_scope": {
+    "other_cells": "parameter_coverage_only",
+    "causal_inference": "matched_repeated_blocks_within_prespecified_strata_only",
+    "headline_estimator": "arithmetic_mean_of_five_matched_block_contrasts_v1",
+    "uncertainty_interval": "two_sided_student_t_95_df4_v1",
+    "directional_claim_rule": "lower_95_ci_strictly_greater_than_zero_v1",
+    "phase_sequence_endpoint": "adaptive_arms_mean_tps_matched_by_block_v1",
+    "breakthrough_scope": "n31_f5_placement_arms_p_and_ps_five_matched_blocks_v1",
+    "breakthrough_structural_gate": "all_n31_f5_p_ps_slots_validate_source_bound_fault_contribution_opportunity_to_kauri_fault_exact_bijection_with_per_phase_actor_nonvacuity_and_tiered_markers_match_hard_and_every_41st_unique_non_root_responsive_degraded_omission_schedule_and_each_hard_actor_has_f_plus_1_distinct_exact_role_bound_timeout_reporters_and_at_least_one_internal_omit_aggregate_proof_and_each_responsive_degraded_actor_has_its_own_exact_reporter_local_epoch1_internal_omit_aggregate_cross_commit_witness_and_responsive_degraded_replicas_rank_below_every_fast_replica_and_epoch1_places_every_responsive_degraded_replica_as_a_root_and_exposes_each_in_an_internal_role_and_epoch2_roots_equal_top_q_fast_replicas_with_only_fast_replicas_in_root_and_internal_roles_and_all_f_worse_replicas_as_physical_leaves_and_only_hard_cohort_wait_exempt_v4",
+    "breakthrough_structural_required_slot_count": 10,
+    "breakthrough_realized_placement_rule": "for_each_p_and_ps_arm_all_5_of_5_n31_f5_blocks_have_epoch1_to_epoch2_demoted_set_exactly_responsive_degraded_cohort_and_promoted_set_exactly_canonical_non_reference_root_pool_minus_hard_cohort_v2",
+    "breakthrough_realized_placement_per_arm_requirement": 5,
+    "breakthrough_primary_throughput_estimand": "d_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+log((PS_e2/PS_e1)/(S_e2/S_e1))]",
+    "breakthrough_throughput_claim_rule": "two_sided_student_t_95_df4_lower_log_bound_strictly_greater_than_zero_and_at_least_4_of_5_block_effects_strictly_greater_than_zero_and_absolute_fault_drop_containment_recovery_and_pooled_optimization_each_two_sided_student_t_95_df4_lower_tps_bound_strictly_greater_than_zero_and_at_least_4_of_5_blocks_strictly_greater_than_zero_and_p_and_ps_each_absolute_epoch2_minus_epoch1_tps_strictly_greater_than_zero_in_at_least_4_of_5_blocks_v2",
+    "breakthrough_positive_block_requirement": 4,
+    "breakthrough_epoch1_baseline_ratio_role": "descriptive_only_no_noninferiority_threshold_v1",
+    "breakthrough_absolute_phase_sequence_estimands": "fault_drop_b=0.5*((P_baseline-P_fault)+(PS_baseline-PS_fault));containment_recovery_b=0.5*((P_e1-P_fault)+(PS_e1-PS_fault));pooled_optimization_b=0.5*((P_e2-P_e1)+(PS_e2-PS_e1));per_arm_optimization_b=(P_e2-P_e1,PS_e2-PS_e1)_v1",
+    "breakthrough_phase_window_interpretation": "fixed_six_5_second_bucket_windows_with_epoch_windows_anchored_at_first_authoritative_post_activation_commit_and_a_common_q_commit_required_within_each_window_not_steady_state_v1",
+    "breakthrough_pre_epoch1_placebo_estimand": "pP_b=log((P_fault/P_baseline)/(00_fault/00_baseline));pPS_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))",
+    "breakthrough_placebo_equivalence_rule": "both_component_two_one_sided_5_percent_tests_df4_90_cis_strictly_within_plus_minus_log_1p10_v2",
+    "breakthrough_placebo_equivalence_margin_log": 0.09531017980432493,
+    "breakthrough_secondary_scope": "n31_f2_placement_arms_p_and_ps_five_matched_blocks_prespecified_secondary_v1",
+    "breakthrough_secondary_status_rule": "supported_only_if_primary_f5_supported_and_all_secondary_f2_gates_pass_not_supported_if_primary_f5_supported_and_any_secondary_gate_fails_descriptive_only_if_primary_f5_not_supported_v1",
+    "breakthrough_secondary_structural_gate": "all_n31_f2_p_ps_slots_validate_existing_tiered_full_hierarchy_and_exact_epoch1_to_epoch2_degraded_demotion_and_fast_promotion_proofs_v1",
+    "breakthrough_secondary_structural_required_slot_count": 10,
+    "breakthrough_secondary_realized_placement_rule": "for_each_p_and_ps_arm_all_5_of_5_n31_f2_blocks_have_epoch1_to_epoch2_demoted_set_exactly_responsive_degraded_cohort_and_promoted_set_exactly_canonical_non_reference_root_pool_minus_hard_cohort_v1",
+    "breakthrough_secondary_realized_placement_per_arm_requirement": 5,
+    "breakthrough_secondary_throughput_estimand": "d2_b=0.5*[log((P_e2/P_e1)/(00_e2/00_e1))+log((PS_e2/PS_e1)/(S_e2/S_e1))]",
+    "breakthrough_secondary_throughput_claim_rule": "two_sided_student_t_95_df4_lower_log_bound_strictly_greater_than_zero_and_at_least_4_of_5_block_effects_strictly_greater_than_zero_v1",
+    "breakthrough_secondary_positive_block_requirement": 4,
+    "breakthrough_secondary_pre_epoch1_placebo_estimand": "pP2_b=log((P_fault/P_baseline)/(00_fault/00_baseline));pPS2_b=log((PS_fault/PS_baseline)/(S_fault/S_baseline))",
+    "breakthrough_secondary_placebo_equivalence_rule": "both_component_two_one_sided_5_percent_tests_df4_90_cis_strictly_within_plus_minus_log_1p10_v2",
+    "breakthrough_secondary_placebo_equivalence_margin_log": 0.09531017980432493,
+    "placement_headline_replica_count": 31,
+    "placement_headline_initial_fanout": 5,
+    "placement_headline_block_count": 5,
+    "shape_and_joint_headline_replica_count": 31,
+    "shape_and_joint_headline_initial_fanout": 2,
+    "shape_and_joint_headline_block_count": 5
+  },
+  "artifacts": {
+    "results_root": "results/shape-placement-factorial-v21",
+    "canonical_plan_filename": "plan.json",
+    "one_directory_per_slot": true,
+    "preserve_outcomes": ["NOT_STARTED", "PASS", "FAIL", "INCOMPLETE"],
+    "evidence_snapshot_format": "digest_commitment_v2"
+  },
+  "resources": {
+    "minimum_free_bytes": 10000000000,
+    "minimum_free_bytes_interpretation": "preflight_threshold_not_scientific_value",
+    "max_parallel_slots": 1,
+    "port_bases": {
+      "peer": 25100,
+      "client": 26100,
+      "manager": 27100
+    },
+    "slot_port_stride": 100
+  },
+  "execution": {
+    "mode": "fixed_sequential",
+    "automatic_retries": 0,
+    "replacement_policy": "none",
+    "outcome_dependent_order": false,
+    "cleanup_contract": "replicas_sigint_only_manager_sigint_or_exact_terminal_authorized_zero_v1"
+  }
+}

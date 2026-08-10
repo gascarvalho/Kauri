@@ -40,6 +40,7 @@ from .factorial_manifest import (
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
     PortAllocation,
     build_factorial_plan,
@@ -4311,6 +4312,7 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v18/slot-066-n31-f5-b05-P": "v18",
         "results/shape-placement-factorial-v19/slot-066-n31-f5-b05-P": "v19",
         "results/shape-placement-factorial-v20/slot-066-n31-f5-b05-P": "v20",
+        "results/shape-placement-factorial-v21/slot-066-n31-f5-b05-P": "v21",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
@@ -4320,25 +4322,26 @@ def build_n31_coverage_smoke_slot(
         "v18": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
         "v19": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
         "v20": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        "v21": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
-        if manifest_version in {"v17", "v18", "v19", "v20"}
+        if manifest_version in {"v17", "v18", "v19", "v20", "v21"}
         else None
     )
     expected_guarded_selection_contract = (
         PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
-        if manifest_version in {"v18", "v19", "v20"}
+        if manifest_version in {"v18", "v19", "v20", "v21"}
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
-        if manifest_version in {"v19", "v20"}
+        if manifest_version in {"v19", "v20", "v21"}
         else None
     )
     expected_source_bound_proposal_witness_contract = (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-        if manifest_version == "v20"
+        if manifest_version in {"v20", "v21"}
         else None
     )
     if (

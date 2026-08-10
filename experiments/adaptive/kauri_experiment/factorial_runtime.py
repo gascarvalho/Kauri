@@ -32,6 +32,7 @@ from .factorial_manifest import (
     V17_MANIFEST_ID,
     V18_MANIFEST_ID,
     V19_MANIFEST_ID,
+    V20_MANIFEST_ID,
     V9_MANIFEST_ID,
     FactorialManifestError,
     FactorialPlan,
@@ -40,6 +41,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V1,
@@ -119,14 +121,23 @@ V19_SMOKE_RUNTIME_SHA256 = (
 V19_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "538740a2d5421d80994bc7007421fe57a10e965fb1e5f71f1bc57b78c037b3d6"
 )
-FROZEN_RUNTIME_SHA256 = (
+V20_RUNTIME_SHA256 = (
     "df50a0202818bcafc699dd266dab6f97147659b0a09c4362207b90bd74d773a7"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V20_SMOKE_RUNTIME_SHA256 = (
     "cdcb497c77d92ef66618980b3c710d3702d9e43d92802a8c95e745ace611b96e"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V20_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "31f2a2a6d35c5f7c115b1dc6c321e92dc54f9edfd37ba9a9d9ac61c45d21f611"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "c553c6bbbb6ff9014d5935eb1e0d939757eb9ea90a16038b7fefd34fada3ad8b"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "c6d0a7e10b45c37072fd1dcc363f72d982efb726e57f1efe0f88dddf8f2f843c"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "5f0fa01ac8f5368cc09eff70d0a30f22156275e86683a627f54840caaa0eaa0c"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -782,6 +793,15 @@ def _tiered_cohort_contract(
             RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
             RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
             RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        ),
+        (
+            RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+            RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+            RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+            RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+            RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
+            RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         ),
     }:
         raise FactorialManifestError(
@@ -1778,6 +1798,7 @@ def runtime_preflight(
                 V17_MANIFEST_ID,
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
+                V20_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1915,7 +1936,7 @@ def runtime_preflight(
                 V17_MANIFEST_ID,
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
-                FROZEN_MANIFEST_ID,
+                V20_MANIFEST_ID,
             }:
                 expected_measurement_contract = (
                     RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
@@ -1925,6 +1946,16 @@ def runtime_preflight(
                     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
                     RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
                     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+                )
+            elif runtime.manifest_id == FROZEN_MANIFEST_ID:
+                expected_measurement_contract = (
+                    RESPONSIVE_PENDING_ATTEMPT_RETENTION_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
+                    RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1,
+                    RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
+                    RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
+                    RESPONSIVE_MARKER_COMPLETENESS_WITNESS_V2,
+                    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
                 )
             expected_responsive_period = (
                 41
@@ -1941,6 +1972,7 @@ def runtime_preflight(
                     V17_MANIFEST_ID,
                     V18_MANIFEST_ID,
                     V19_MANIFEST_ID,
+                    V20_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -1957,6 +1989,7 @@ def runtime_preflight(
                     V17_MANIFEST_ID,
                     V18_MANIFEST_ID,
                     V19_MANIFEST_ID,
+                    V20_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -2011,6 +2044,7 @@ def runtime_preflight(
                         V17_MANIFEST_ID,
                         V18_MANIFEST_ID,
                         V19_MANIFEST_ID,
+                        V20_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2215,6 +2249,7 @@ def runtime_preflight(
             V17_MANIFEST_ID,
             V18_MANIFEST_ID,
             V19_MANIFEST_ID,
+            V20_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2249,18 +2284,25 @@ def runtime_preflight(
                 V17_MANIFEST_ID,
                 V18_MANIFEST_ID,
                 V19_MANIFEST_ID,
+                V20_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
             if runtime.manifest_id
-            in {V18_MANIFEST_ID, V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            in {
+                V18_MANIFEST_ID,
+                V19_MANIFEST_ID,
+                V20_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }
             else None,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
-            if runtime.manifest_id in {V19_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id
+            in {V19_MANIFEST_ID, V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
             SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            if runtime.manifest_id in {V20_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
         ):
             raise FactorialManifestError(
@@ -2326,6 +2368,9 @@ __all__ = (
     "V19_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V19_RUNTIME_SHA256",
     "V19_SMOKE_RUNTIME_SHA256",
+    "V20_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V20_RUNTIME_SHA256",
+    "V20_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

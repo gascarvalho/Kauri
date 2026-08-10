@@ -21,6 +21,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FROZEN_SEMANTIC_SHA256,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+    RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_LINKAGE_V1,
@@ -92,7 +93,7 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v20.json"
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v21.json"
 )
 V14_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v14.json"
@@ -356,7 +357,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v20/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v21/{slot.slot_id}"
         for slot in first.slots
     )
 
@@ -430,7 +431,7 @@ def test_each_slot_derives_disjoint_tiered_cohorts_and_common_timers() -> None:
     )
     assert manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
     assert responsive.causal_timeout_eligibility == (
-        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2
+        RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
     )
 
     actors_by_block: dict[str, tuple[int, ...]] = {}

@@ -44,6 +44,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v21.json"
+)
+V20_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v20.json"
 )
 V19_MANIFEST_PATH = (
@@ -289,7 +292,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v20_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v21_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -314,7 +317,8 @@ def test_validator_retains_exact_v1_through_v20_artifact_identities() -> None:
             (17, V17_MANIFEST_PATH),
             (18, V18_MANIFEST_PATH),
             (19, V19_MANIFEST_PATH),
-            (20, MANIFEST_PATH),
+            (20, V20_MANIFEST_PATH),
+            (21, MANIFEST_PATH),
         )
     }
 
@@ -427,15 +431,26 @@ def test_validator_retains_exact_v1_through_v20_artifact_identities() -> None:
         identities[19].coverage_smoke_runtime_sha256
         == validation.V19_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[20].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[20].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[20].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[20].manifest_sha256 == validation.V20_MANIFEST_SHA256
+    assert identities[20].plan_sha256 == validation.V20_PLAN_SHA256
+    assert identities[20].runtime_sha256 == validation.V20_RUNTIME_SHA256
     assert (
         identities[20].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V20_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[20].coverage_smoke_runtime_sha256
+        == validation.V20_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[21].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[21].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[21].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[21].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[21].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
 
@@ -459,6 +474,7 @@ def test_validator_retains_exact_v1_through_v20_artifact_identities() -> None:
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
+        V20_MANIFEST_PATH,
     ),
 )
 def test_exact_prior_runtime_remains_validator_compatible(
@@ -478,7 +494,7 @@ def test_exact_prior_runtime_remains_validator_compatible(
     )
 
 
-def test_validator_requires_v9_through_v20_causal_contracts_but_accepts_v8() -> None:
+def test_validator_requires_v9_through_v21_causal_contracts_but_accepts_v8() -> None:
     explicit_v10_fields = {
         "causal_timeout_provenance_window": (
             validation.RESPONSIVE_CAUSAL_TIMEOUT_PROVENANCE_WINDOW_V1
@@ -511,6 +527,7 @@ def test_validator_requires_v9_through_v20_causal_contracts_but_accepts_v8() -> 
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
+        V20_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -570,6 +587,7 @@ def test_validator_requires_v9_through_v20_causal_contracts_but_accepts_v8() -> 
                 V17_MANIFEST_PATH,
                 V18_MANIFEST_PATH,
                 V19_MANIFEST_PATH,
+                V20_MANIFEST_PATH,
                 MANIFEST_PATH,
             ):
                 assert document["tiered_cohorts"][
@@ -585,9 +603,13 @@ def test_validator_requires_v9_through_v20_causal_contracts_but_accepts_v8() -> 
                         V17_MANIFEST_PATH,
                         V18_MANIFEST_PATH,
                         V19_MANIFEST_PATH,
-                        MANIFEST_PATH,
+                        V20_MANIFEST_PATH,
                     )
-                    else validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+                    else (
+                        validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
+                        if manifest_path == MANIFEST_PATH
+                        else validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1
+                    )
                 )
             else:
                 assert not set(explicit_v11_fields).intersection(
@@ -646,7 +668,7 @@ def test_v17_runtime_mirrors_precontainment_shape_contract_only_in_causal_accept
     )
 
 
-def test_v18_through_v20_guarded_selection_contract_dispatch_is_exact() -> None:
+def test_v18_through_v21_guarded_selection_contract_dispatch_is_exact() -> None:
     contract = validation.PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
 
     def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
@@ -666,6 +688,9 @@ def test_v18_through_v20_guarded_selection_contract_dispatch_is_exact() -> None:
     )
     assert validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V19_MANIFEST_ID, contract)
+    )
+    assert validation._uses_precontainment_guarded_selection_contract(
+        manifest(validation.V20_MANIFEST_ID, contract)
     )
     assert not validation._uses_precontainment_guarded_selection_contract(
         manifest(validation.V17_MANIFEST_ID, contract)
@@ -696,6 +721,12 @@ def test_v19_future_tree_proposal_delivery_dispatch_is_version_exact() -> None:
     )
     assert validation._uses_future_tree_proposal_delivery_contract(
         manifest(
+            validation.V20_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT,
         )
@@ -717,7 +748,7 @@ def test_v19_future_tree_proposal_delivery_dispatch_is_version_exact() -> None:
     )
 
 
-def test_v20_source_bound_proposal_witness_dispatch_is_version_exact() -> None:
+def test_v20_through_v21_source_bound_proposal_witness_dispatch_is_exact() -> None:
     contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
     assert contract == (
         "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
@@ -735,15 +766,53 @@ def test_v20_source_bound_proposal_witness_dispatch_is_version_exact() -> None:
         )
 
     assert validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.V20_MANIFEST_ID, contract)
+    )
+    assert validation._uses_source_bound_proposal_witness_contract(
         manifest(validation.FROZEN_MANIFEST_ID, contract)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
         manifest(validation.V19_MANIFEST_ID, contract)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.FROZEN_MANIFEST_ID, None)
+        manifest(validation.V20_MANIFEST_ID, None)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.V20_MANIFEST_ID, contract + "-forged")
+    )
+
+
+def test_v21_responsive_timeout_nonwitness_dispatch_is_field_exact() -> None:
+    contract = validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
+    assert contract == (
+        "selection_visible_exact_outstanding_timeout_witnesses_with_internal_"
+        "and_f_plus_one_actor_gates_hard_and_responsive_degraded_absent_prefix_"
+        "timeout_nonwitness_present_prefix_mismatch_fatal_v3"
+    )
+
+    def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
+        responsive = SimpleNamespace(causal_timeout_eligibility=value)
+        return SimpleNamespace(
+            manifest_id=manifest_id,
+            byzantine=SimpleNamespace(responsive_degradation=responsive),
+        )
+
+    assert validation._uses_selection_visible_responsive_timeout_nonwitnesses(
+        manifest(validation.FROZEN_MANIFEST_ID, contract)
+    )
+    assert not validation._uses_selection_visible_responsive_timeout_nonwitnesses(
+        manifest(validation.V20_MANIFEST_ID, contract)
+    )
+    assert not validation._uses_selection_visible_responsive_timeout_nonwitnesses(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
+            validation.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
+        )
+    )
+    assert not validation._uses_selection_visible_responsive_timeout_nonwitnesses(
+        manifest(validation.FROZEN_MANIFEST_ID, None)
+    )
+    assert not validation._uses_selection_visible_responsive_timeout_nonwitnesses(
         manifest(validation.FROZEN_MANIFEST_ID, contract + "-forged")
     )
 
@@ -858,7 +927,7 @@ def test_v19_binds_future_tree_contract_to_runtime_identity_and_acceptance() -> 
     )
     with pytest.raises(
         FactorialValidationError,
-        match="v19 future-tree proposal delivery contract",
+        match="future-tree proposal delivery contract",
     ):
         validation._validate_runtime_slot(
             document,
@@ -867,9 +936,11 @@ def test_v19_binds_future_tree_contract_to_runtime_identity_and_acceptance() -> 
         )
 
 
-def test_v20_binds_source_bound_witness_to_runtime_identity_and_acceptance(
+@pytest.mark.parametrize("manifest_path", (V20_MANIFEST_PATH, MANIFEST_PATH))
+def test_v20_through_v21_bind_source_bound_witness_to_runtime_identity_and_acceptance(
+    manifest_path: Path,
 ) -> None:
-    manifest = load_frozen_manifest(MANIFEST_PATH)
+    manifest = load_frozen_manifest(manifest_path)
     runtime = build_factorial_runtime(build_factorial_plan(manifest))
     expected_by_id = {
         expected.slot_id: expected
@@ -929,7 +1000,7 @@ def test_v20_binds_source_bound_witness_to_runtime_identity_and_acceptance(
     )
     with pytest.raises(
         FactorialValidationError,
-        match="v20 source-bound proposal witness contract",
+        match="source-bound proposal witness contract",
     ):
         validation._validate_runtime_slot(
             document,
@@ -1071,7 +1142,7 @@ def test_v17_rejects_forged_v18_guarded_selection_runtime_field() -> None:
         )
 
 
-def test_v10_through_v20_route_through_explicit_causal_linkage_windows() -> None:
+def test_v10_through_v21_route_through_explicit_causal_linkage_windows() -> None:
     assert not validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(V9_MANIFEST_PATH)
     )
@@ -1106,11 +1177,14 @@ def test_v10_through_v20_route_through_explicit_causal_linkage_windows() -> None
         load_frozen_manifest(V19_MANIFEST_PATH)
     )
     assert validation._uses_explicit_causal_linkage_windows(
+        load_frozen_manifest(V20_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_causal_linkage_windows(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v11_through_v20_route_through_explicit_phase_edge_eligibility() -> None:
+def test_v11_through_v21_route_through_explicit_phase_edge_eligibility() -> None:
     assert not validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(V10_MANIFEST_PATH)
     )
@@ -1142,11 +1216,14 @@ def test_v11_through_v20_route_through_explicit_phase_edge_eligibility() -> None
         load_frozen_manifest(V19_MANIFEST_PATH)
     )
     assert validation._uses_explicit_phase_edge_eligibility(
+        load_frozen_manifest(V20_MANIFEST_PATH)
+    )
+    assert validation._uses_explicit_phase_edge_eligibility(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v16_through_v20_use_selection_visible_hard_timeout_witnesses() -> None:
+def test_v16_through_v21_use_selection_visible_hard_timeout_witnesses() -> None:
     assert not validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(V15_MANIFEST_PATH)
     )
@@ -1163,11 +1240,14 @@ def test_v16_through_v20_use_selection_visible_hard_timeout_witnesses() -> None:
         load_frozen_manifest(V19_MANIFEST_PATH)
     )
     assert validation._uses_selection_visible_hard_timeout_witnesses(
+        load_frozen_manifest(V20_MANIFEST_PATH)
+    )
+    assert validation._uses_selection_visible_hard_timeout_witnesses(
         load_frozen_manifest(MANIFEST_PATH)
     )
 
 
-def test_v14_through_v20_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
+def test_v14_through_v21_dispatch_source_bound_witnesses_and_sigint_cleanup() -> None:
     v13 = load_frozen_manifest(V13_MANIFEST_PATH)
 
     assert not validation._uses_source_bound_contribution_opportunities(v13)
@@ -1179,6 +1259,7 @@ def test_v14_through_v20_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
+        V20_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1186,7 +1267,7 @@ def test_v14_through_v20_dispatch_source_bound_witnesses_and_sigint_cleanup() ->
         assert validation._uses_strict_sigint_cleanup(manifest)
 
 
-def test_validator_binds_v14_through_v20_cleanup_without_changing_v13() -> None:
+def test_validator_binds_v14_through_v21_cleanup_without_changing_v13() -> None:
     for manifest_path in (
         V13_MANIFEST_PATH,
         V14_MANIFEST_PATH,
@@ -1195,6 +1276,7 @@ def test_validator_binds_v14_through_v20_cleanup_without_changing_v13() -> None:
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
+        V20_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -1242,6 +1324,7 @@ def test_validator_binds_v14_through_v20_cleanup_without_changing_v13() -> None:
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
+        V20_MANIFEST_PATH,
         MANIFEST_PATH,
     ),
 )
@@ -1271,7 +1354,7 @@ def test_validator_requires_each_explicit_causal_linkage_field(
     "field",
     ("marker_completeness_witness", "causal_timeout_eligibility"),
 )
-def test_validator_requires_each_explicit_v11_through_v20_phase_edge_field(
+def test_validator_requires_each_explicit_v11_through_v21_phase_edge_field(
     field: str,
 ) -> None:
     for manifest_path in (
@@ -1284,6 +1367,7 @@ def test_validator_requires_each_explicit_v11_through_v20_phase_edge_field(
         V17_MANIFEST_PATH,
         V18_MANIFEST_PATH,
         V19_MANIFEST_PATH,
+        V20_MANIFEST_PATH,
         MANIFEST_PATH,
     ):
         manifest = load_frozen_manifest(manifest_path)
@@ -4107,6 +4191,279 @@ def test_timeout_causality_excludes_only_exact_arms_maturing_after_selection(
                     else record
                     for record in explicit_arguments["accepted_epoch1"]
                 ),
+            }
+        )
+
+
+def _selection_visible_responsive_tail_fixture() -> dict[str, object]:
+    """Model the sealed N31 acceptance-lag tail at a compact time scale."""
+
+    arguments = _epoch1_causal_prefix_fixture()
+    original_markers = arguments["markers"]
+    assert isinstance(original_markers, tuple)
+    actor = original_markers[0].actor
+    tail_marker = replace(
+        original_markers[-1],
+        line_number=3,
+        block_hash=f"{902:064x}",
+        monotonic_ns=8_500,
+        raw_line_sha256="d" * 64,
+    )
+    markers = (*original_markers, tail_marker)
+    arm_markers = tuple(
+        validation.ResponseAttemptArmMarker(
+            source_replica=0,
+            line_number=index,
+            reporter_id=0,
+            child_id=actor,
+            epoch_number=marker.epoch_number,
+            tree_id=marker.tree_id,
+            epoch_digest=marker.epoch_digest,
+            block_hash=marker.block_hash,
+            expected_message_type="direct_vote",
+            start_monotonic_ns=(
+                marker.monotonic_ns - 500
+                if marker is not tail_marker
+                else 7_899
+            ),
+            deadline_duration_us=1,
+            absolute_deadline_ns=(
+                marker.monotonic_ns + 500
+                if marker is not tail_marker
+                else 8_899
+            ),
+            raw_line_sha256=f"{index + 10:064x}",
+        )
+        for index, marker in enumerate(markers, start=1)
+    )
+    replica_events = dict(arguments["replica_events"])
+    replica_events[0] = (
+        *replica_events[0],
+        _commit_event(
+            3,
+            8_600,
+            902,
+            epoch_number=1,
+            epoch_digest=tail_marker.epoch_digest,
+            tree_id=tail_marker.tree_id,
+        ),
+    )
+    accepted_epoch1 = tuple(
+        replace(record, deadline_duration_us=1)
+        for record in arguments["accepted_epoch1"]
+    )
+    tail_timeout = validation._EvidenceRecord(
+        ingestion_sequence=4,
+        acceptance_monotonic_ns=8_920,
+        observation_id="d" * 64,
+        reporter_id=0,
+        target_id=actor,
+        epoch_number=tail_marker.epoch_number,
+        tree_id=tail_marker.tree_id,
+        epoch_digest=tail_marker.epoch_digest,
+        block_hash=tail_marker.block_hash,
+        message_type="direct_vote",
+        outcome="timeout",
+        response_duration_us=0,
+        deadline_duration_us=1,
+        reporter_monotonic_ns=8_899,
+        reporter_sequence=4,
+        signer_set=(),
+    )
+    return {
+        **arguments,
+        "markers": markers,
+        "arm_markers": arm_markers,
+        "replica_events": replica_events,
+        "accepted_epoch1": (*accepted_epoch1, tail_timeout),
+        "explicit_causal_linkage_windows": True,
+        "explicit_phase_edge_eligibility": True,
+        "epoch1_selection_ns": 800,
+        "epoch2_selection_ns": 8_900,
+    }
+
+
+def test_v21_responsive_acceptance_lag_tail_is_a_nonwitness_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    arguments = _selection_visible_responsive_tail_fixture()
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="responsive-degraded omission has no exact outstanding raw timeout",
+    ):
+        validate_fault_causality(**arguments)
+
+    assert validate_fault_causality(
+        **arguments,
+        selection_visible_responsive_timeout_nonwitnesses=True,
+    ) == 0
+
+    accepted_epoch1 = arguments["accepted_epoch1"]
+    assert isinstance(accepted_epoch1, tuple)
+    assert validate_fault_causality(
+        **{
+            **arguments,
+            "accepted_epoch1": accepted_epoch1[:-1],
+            "selection_visible_responsive_timeout_nonwitnesses": True,
+        }
+    ) == 0
+
+    arm_markers = arguments["arm_markers"]
+    assert isinstance(arm_markers, tuple)
+    with pytest.raises(
+        FactorialValidationError,
+        match="exact parent response-attempt arm",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "arm_markers": arm_markers[:-1],
+                "selection_visible_responsive_timeout_nonwitnesses": True,
+            }
+        )
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="responsive timeout nonwitnesses require explicit phase-edge",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "explicit_phase_edge_eligibility": False,
+                "selection_visible_responsive_timeout_nonwitnesses": True,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"reporter_id": 1},
+        {"message_type": "aggregate_relay"},
+        {"deadline_duration_us": 2},
+        {"reporter_monotonic_ns": 8_400},
+        {"acceptance_monotonic_ns": 8_900},
+    ),
+)
+def test_v21_responsive_present_prefix_timeout_mismatch_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: dict[str, object],
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    arguments = _selection_visible_responsive_tail_fixture()
+    accepted_epoch1 = arguments["accepted_epoch1"]
+    assert isinstance(accepted_epoch1, tuple)
+    valid_prefix_tail = replace(
+        accepted_epoch1[-1],
+        ingestion_sequence=3,
+        acceptance_monotonic_ns=8_899,
+    )
+    mismatched_prefix_tail = replace(valid_prefix_tail, **mutation)
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="responsive-degraded selection-prefix timeout fails its exact",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "accepted_epoch1": (
+                    *accepted_epoch1[:-1],
+                    mismatched_prefix_tail,
+                ),
+                "selection_visible_responsive_timeout_nonwitnesses": True,
+            }
+        )
+
+
+def test_v21_responsive_mismatch_cannot_hide_beside_an_exact_prefix_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    arguments = _selection_visible_responsive_tail_fixture()
+    accepted_epoch1 = arguments["accepted_epoch1"]
+    assert isinstance(accepted_epoch1, tuple)
+    valid_prefix_tail = replace(
+        accepted_epoch1[-1],
+        ingestion_sequence=3,
+        acceptance_monotonic_ns=8_899,
+    )
+    mismatched_prefix_tail = replace(
+        valid_prefix_tail,
+        observation_id="e" * 64,
+        reporter_id=1,
+    )
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="responsive-degraded selection-prefix timeout fails its exact",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "accepted_epoch1": (
+                    *accepted_epoch1[:-1],
+                    valid_prefix_tail,
+                    mismatched_prefix_tail,
+                ),
+                "selection_visible_responsive_timeout_nonwitnesses": True,
+            }
+        )
+
+
+def test_v21_responsive_immature_arm_cannot_hide_a_prefix_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    arguments = _selection_visible_responsive_tail_fixture()
+    arm_markers = arguments["arm_markers"]
+    accepted_epoch1 = arguments["accepted_epoch1"]
+    assert isinstance(arm_markers, tuple)
+    assert isinstance(accepted_epoch1, tuple)
+
+    immature_arm = replace(
+        arm_markers[-1],
+        absolute_deadline_ns=9_899,
+        deadline_duration_us=2,
+    )
+    prefix_tail = replace(
+        accepted_epoch1[-1],
+        ingestion_sequence=3,
+        acceptance_monotonic_ns=8_899,
+    )
+    with pytest.raises(
+        FactorialValidationError,
+        match="responsive-degraded selection-prefix timeout fails its exact",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "arm_markers": (*arm_markers[:-1], immature_arm),
+                "accepted_epoch1": (*accepted_epoch1[:-1], prefix_tail),
+                "selection_visible_responsive_timeout_nonwitnesses": True,
+            }
+        )
+
+
+def test_v21_responsive_nonwitness_cannot_replace_actor_selection_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_tiered_schedule_shape_checks(monkeypatch)
+    arguments = _selection_visible_responsive_tail_fixture()
+    accepted_epoch1 = arguments["accepted_epoch1"]
+    assert isinstance(accepted_epoch1, tuple)
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="performance-selection evidence",
+    ):
+        validate_fault_causality(
+            **{
+                **arguments,
+                "accepted_epoch1": (accepted_epoch1[-1],),
+                "selection_visible_responsive_timeout_nonwitnesses": True,
             }
         )
 

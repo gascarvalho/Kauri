@@ -11,14 +11,14 @@ import pytest
 
 from experiments.adaptive import run_shape_factorial_campaign as cli
 from experiments.adaptive.kauri_experiment import factorial_execution as execution
-from experiments.adaptive.kauri_experiment import factorial_manifest as manifest_module
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
     SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
     FactorialManifestError,
-    FROZEN_MANIFEST_SHA256,
-    FROZEN_PLAN_SHA256,
-    FROZEN_SEMANTIC_SHA256,
+    V20_MANIFEST_ID,
+    V20_MANIFEST_SHA256,
+    V20_PLAN_SHA256,
+    V20_SEMANTIC_SHA256,
     V19_MANIFEST_SHA256,
     V19_PLAN_SHA256,
     V19_SEMANTIC_SHA256,
@@ -27,9 +27,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     parse_manifest_bytes,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
-    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
+    V20_COVERAGE_SMOKE_RUNTIME_SHA256,
+    V20_RUNTIME_SHA256,
+    V20_SMOKE_RUNTIME_SHA256,
     V19_COVERAGE_SMOKE_RUNTIME_SHA256,
     V19_RUNTIME_SHA256,
     V19_SMOKE_RUNTIME_SHA256,
@@ -104,7 +104,7 @@ def test_v20_only_changes_identity_root_and_proposal_witness_contract() -> None:
     assert SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1 == (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT
     )
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v20"
+    assert V20_MANIFEST_ID == "shape-placement-factorial-v20"
 
 
 @pytest.mark.parametrize("replacement", (None, "accept_unpaired_shutdown_marker"))
@@ -189,22 +189,22 @@ def test_v20_witness_contract_is_bound_into_slot_artifact_identity() -> None:
 
 def test_v20_all_six_static_identities_are_frozen() -> None:
     assert _runtime_identities(V20_MANIFEST) == (
-        FROZEN_MANIFEST_SHA256,
-        FROZEN_SEMANTIC_SHA256,
-        FROZEN_PLAN_SHA256,
-        FROZEN_RUNTIME_SHA256,
-        FROZEN_SMOKE_RUNTIME_SHA256,
-        FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        V20_MANIFEST_SHA256,
+        V20_SEMANTIC_SHA256,
+        V20_PLAN_SHA256,
+        V20_RUNTIME_SHA256,
+        V20_SMOKE_RUNTIME_SHA256,
+        V20_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
 
 
-def test_v20_default_refuses_v19_and_keeps_ordered_fresh_roots(
+def test_v20_is_validation_only_and_keeps_ordered_fresh_roots(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V20_MANIFEST
-    assert cli.main(["--manifest", str(V19_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST != V20_MANIFEST
+    assert cli.main(["--manifest", str(V20_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v19 are validation-only" in refusal["reason"]
+    assert "v1 through v20 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V20_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])
