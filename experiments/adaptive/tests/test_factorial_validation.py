@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from experiments.adaptive.kauri_experiment import factorial_execution as execution
+from experiments.adaptive.kauri_experiment import factorial_manifest as manifest_module
 from experiments.adaptive.kauri_experiment import factorial_validation as validation
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
     build_factorial_plan,
@@ -45,6 +46,9 @@ from experiments.adaptive.kauri_experiment.factorial_validation import (
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v24.json"
+)
+V25_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v25.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -125,6 +129,10 @@ FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2 = (
     "is_capacity_bounded_relayed_and_buffered_without_pre_activation_protocol_"
     "effects_then_revalidated_and_replayed_once_after_each_exact_activation_v2"
 )
+INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT = (
+    "exact_selected_wait_exempt_replicas_are_excluded_from_root_and_internal_"
+    "assignment_and_placed_as_leaves_in_every_successor_tree_v1"
+)
 
 
 def test_v23_future_tree_delivery_dispatch_is_version_and_field_exact() -> None:
@@ -176,8 +184,48 @@ def test_v23_responsive_omission_period_remains_41_after_v24_dispatch() -> None:
     assert validation._expected_responsive_omission_period(
         "shape-placement-factorial-v24"
     ) == 41
+    assert validation._expected_responsive_omission_period(
+        "shape-placement-factorial-v25"
+    ) == 41
 
 
+def test_v25_inherited_wait_exempt_placement_dispatch_is_version_and_field_exact() -> None:
+    def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
+        responsive = SimpleNamespace()
+        if value is not None:
+            responsive.inherited_consensus_wait_exempt_placement_contract = value
+        return SimpleNamespace(
+            manifest_id=manifest_id,
+            byzantine=SimpleNamespace(responsive_degradation=responsive),
+        )
+
+    assert validation.INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1 == (
+        INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT
+    )
+    assert validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
+            INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
+        )
+    )
+    assert not validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(validation.V24_MANIFEST_ID, None)
+    )
+    assert not validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(
+            validation.V24_MANIFEST_ID,
+            INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
+        )
+    )
+    assert not validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, None)
+    )
+    assert not validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
+            f"{INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT}-drift",
+        )
+    )
 def _canonical(value: object) -> bytes:
     return (
         json.dumps(
@@ -189,6 +237,19 @@ def _canonical(value: object) -> bytes:
         ).encode("utf-8")
         + b"\n"
     )
+
+
+def _v25_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = V25_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    return manifest_module.parse_manifest_bytes(payload)
 
 
 def _native_event(
@@ -543,23 +604,26 @@ def test_validator_retains_exact_v1_through_v24_artifact_identities() -> None:
         identities[23].coverage_smoke_runtime_sha256
         == validation.V23_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[24].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[24].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[24].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[24].manifest_sha256 == validation.V24_MANIFEST_SHA256
+    assert identities[24].plan_sha256 == validation.V24_PLAN_SHA256
+    assert identities[24].runtime_sha256 == validation.V24_RUNTIME_SHA256
     assert (
         identities[24].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V24_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[24].coverage_smoke_runtime_sha256
-        == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+        == validation.V24_COVERAGE_SMOKE_RUNTIME_SHA256
     )
     assert validation._coverage_smoke_result_root(
         validation.V23_MANIFEST_ID
     ) == "results/shape-placement-factorial-v23-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V24_MANIFEST_ID
     ) == "results/shape-placement-factorial-v24-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v25-coverage-smoke"
 
 
 @pytest.mark.parametrize(
@@ -4282,6 +4346,10 @@ def test_v24_preselection_contract_is_version_exact_and_keeps_six_measured_bucke
         _v24_preselection_manifest()
     ) == (60_000, 82)
 
+    v25 = _v24_preselection_manifest()
+    v25.manifest_id = "shape-placement-factorial-v25"
+    assert validation._v24_preselection_contract(v25) == (60_000, 82)
+
     v23 = _v24_preselection_manifest()
     v23.manifest_id = "shape-placement-factorial-v23"
     v23.workload.epoch1_preselection_residency_ms = 30_000
@@ -6128,6 +6196,209 @@ def test_tiered_successor_structure_proves_e1_exposure_and_e2_hierarchy() -> Non
         )
 
 
+def _v25_inherited_placement_expected_slot() -> validation._ExpectedSlot:
+    return replace(
+        _tiered_expected_slot(),
+        slot_id="slot-037-n31-f2-b04-00",
+        block_id="n31-f2-b04",
+        arm_code="00",
+        ordinal=37,
+        slot_nonce=36,
+        block_index=4,
+        blocks_in_cell=5,
+        block_execution_ordinal=2,
+        arm_execution_position=1,
+        execution_ordinal=5,
+        scientific_seed=41_728,
+        replica_count=31,
+        f=10,
+        q=21,
+        tree_count=21,
+        initial_fanout=2,
+        initial_depth=4,
+        candidate_depths=((2, 4), (3, 3), (5, 2)),
+        worst_candidate_depth=4,
+        candidate_fanouts=(2, 3, 5),
+        pipeline_stretch=2,
+        placement_adaptation=False,
+        shape_adaptation=False,
+        actor_ids=(26, 27, 28),
+        responsive_degraded_actor_ids=(1, 7, 8, 12, 16, 19, 20),
+        fast_replica_ids=(
+            0,
+            2,
+            3,
+            4,
+            5,
+            6,
+            9,
+            10,
+            11,
+            13,
+            14,
+            15,
+            17,
+            18,
+            21,
+            22,
+            23,
+            24,
+            25,
+            29,
+            30,
+        ),
+        peer_base=28_700,
+        client_base=29_700,
+        manager_port=30_700,
+    )
+
+
+def _v25_inherited_placement_trees(
+    expected: validation._ExpectedSlot,
+) -> tuple[Tree, ...]:
+    membership = tuple(range(expected.replica_count))
+    return tuple(
+        Tree(
+            tree_id=tree_id,
+            fanout=expected.initial_fanout,
+            pipeline_stretch=expected.pipeline_stretch,
+            members=(root, *(member for member in membership if member != root)),
+            wait_exempt=expected.actor_ids,
+        )
+        for tree_id, root in enumerate(range(expected.q))
+    )
+
+
+def _v25_inherited_placement_scores(
+    expected: validation._ExpectedSlot,
+) -> tuple[ReplicaScore, ...]:
+    return tuple(
+        ReplicaScore(
+            replica_id=replica_id,
+            classification="responsive",
+            eligible=True,
+            attempt_count=1,
+            response_rate_ppm=1_000_000,
+            timeout_rate_ppm=0,
+            latency_percentile_us=10,
+        )
+        for replica_id in range(expected.replica_count)
+    )
+
+
+def test_v25_slot037_coverage_proves_exact_inherited_leaf_placement() -> None:
+    expected = _v25_inherited_placement_expected_slot()
+    trees = _v25_inherited_placement_trees(expected)
+    arguments = {
+        "manifest_id": validation.FROZEN_MANIFEST_ID,
+        "coverage_smoke": True,
+        "expected": expected,
+        "cycle": 1,
+        "intent": "fault_containment",
+        "predecessor_trees": trees,
+        "successor_trees": trees,
+        "scores": _v25_inherited_placement_scores(expected),
+    }
+
+    assert validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+        **arguments
+    )
+    assert not validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+        **{**arguments, "manifest_id": validation.V24_MANIFEST_ID}
+    )
+    assert not validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+        **{**arguments, "coverage_smoke": False}
+    )
+    assert not validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+        **{**arguments, "expected": replace(expected, slot_id="campaign-slot")}
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        ("missing-score", "responsive and eligible"),
+        ("wrong-score", "responsive and eligible"),
+        ("stale-selected", "exact selected actor"),
+        ("unsorted-selected", "sorted"),
+        ("mixed-selected", "differ|mix"),
+        ("selected-root", "physical leaf"),
+        ("selected-internal", "physical leaf"),
+        ("wrong-successor", "successor.*wait-exempt"),
+    ),
+)
+def test_v25_slot037_coverage_placement_witness_is_fail_closed(
+    mutation: str,
+    reason: str,
+) -> None:
+    expected = _v25_inherited_placement_expected_slot()
+    predecessor = list(_v25_inherited_placement_trees(expected))
+    successor = list(_v25_inherited_placement_trees(expected))
+    scores = list(_v25_inherited_placement_scores(expected))
+
+    if mutation == "missing-score":
+        scores = [score for score in scores if score.replica_id != 26]
+    elif mutation == "wrong-score":
+        scores[26] = replace(scores[26], classification="nonresponsive", eligible=False)
+    elif mutation == "stale-selected":
+        predecessor = [
+            replace(tree, wait_exempt=(21, 27, 28)) for tree in predecessor
+        ]
+    elif mutation == "unsorted-selected":
+        predecessor = [
+            replace(tree, wait_exempt=(28, 27, 26)) for tree in predecessor
+        ]
+    elif mutation == "mixed-selected":
+        predecessor[1] = replace(predecessor[1], wait_exempt=())
+    elif mutation in {"selected-root", "selected-internal"}:
+        selected = 26
+        target_position = 0 if mutation == "selected-root" else 1
+        members = list(successor[0].members)
+        selected_position = members.index(selected)
+        members[target_position], members[selected_position] = (
+            members[selected_position],
+            members[target_position],
+        )
+        successor[0] = replace(successor[0], members=tuple(members))
+    else:
+        successor[0] = replace(successor[0], wait_exempt=(26, 27))
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+            manifest_id=validation.FROZEN_MANIFEST_ID,
+            coverage_smoke=True,
+            expected=expected,
+            cycle=1,
+            intent="fault_containment",
+            predecessor_trees=tuple(predecessor),
+            successor_trees=tuple(successor),
+            scores=tuple(scores),
+        )
+
+
+@pytest.mark.parametrize(
+    "cycle,intent",
+    ((0, "fault_containment"), (1, "performance_optimization")),
+)
+def test_v25_slot037_coverage_requires_cycle1_fault_containment(
+    cycle: int,
+    intent: str,
+) -> None:
+    expected = _v25_inherited_placement_expected_slot()
+    trees = _v25_inherited_placement_trees(expected)
+    with pytest.raises(FactorialValidationError, match="cycle-1 fault containment"):
+        validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+            manifest_id=validation.FROZEN_MANIFEST_ID,
+            coverage_smoke=True,
+            expected=expected,
+            cycle=cycle,
+            intent=intent,
+            predecessor_trees=trees,
+            successor_trees=trees,
+            scores=_v25_inherited_placement_scores(expected),
+        )
+
+
 def test_persistent_interior_proposal_accepts_exact_non_root_actor_actions() -> None:
     actors = (1, 2, 9)
     tree = Tree(
@@ -6895,9 +7166,9 @@ def _relocated_receipt_fixture(
         "schema_version": 1,
         "slot_id": spec.slot_id,
         "runtime_artifact_id": spec.artifact_id,
-        "manifest_sha256": validation.FROZEN_MANIFEST_SHA256,
-        "plan_sha256": validation.FROZEN_PLAN_SHA256,
-        "runtime_sha256": validation.FROZEN_RUNTIME_SHA256,
+        "manifest_sha256": validation.V24_MANIFEST_SHA256,
+        "plan_sha256": validation.V24_PLAN_SHA256,
+        "runtime_sha256": validation.V24_RUNTIME_SHA256,
         "execution_ordinal": spec.execution_ordinal,
         "attempt_ordinal": 1,
         "retry_of": None,
@@ -7045,6 +7316,911 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
     )
 
 
+def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
+    assert validation._coverage_smoke_slot_ids(validation.V24_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+    )
+    assert validation._coverage_smoke_slot_ids(validation.FROZEN_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
+
+    v25_root = Path(validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+    assert validation._is_excluded_coverage_smoke_slot(
+        v25_root / "slot-066-n31-f5-b05-P",
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert validation._is_excluded_coverage_smoke_slot(
+        v25_root / "slot-037-n31-f2-b04-00",
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        Path(validation.V24_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+        / "slot-037-n31-f2-b04-00",
+        manifest_id=validation.V24_MANIFEST_ID,
+    )
+
+
+def _v25_coverage_runtime_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    object,
+    dict[str, object],
+    dict[str, validation._ExpectedSlot],
+]:
+    manifest = _v25_candidate_manifest(monkeypatch)
+    plan = build_factorial_plan(manifest)
+    primary = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-037-n31-f2-b04-00"
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    runtime = json.loads(json.dumps(coverage.runtime.as_document()))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    return manifest, runtime, expected_by_id
+
+
+def test_v25_coverage_runtime_binds_exact_order_and_stop_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(monkeypatch)
+    validated = validation._validate_v25_coverage_runtime_document(
+        runtime,
+        manifest=manifest,
+        expected_by_id=expected_by_id,
+    )
+
+    assert tuple(validated) == validation.V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    assert runtime["automatic_retries"] == 0
+    assert runtime["replacement_policy"] == "none"
+    assert runtime["stop_on_first_non_pass"] is True
+    assert runtime["minimum_free_bytes"] == 10_000_000_000
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        ("missing-slot", "slot order"),
+        ("reversed", "slot order"),
+        ("duplicate", "slot order"),
+        ("wrong-runtime-id", "sequencing"),
+        ("retry", "sequencing"),
+        ("replacement", "sequencing"),
+        ("continue-after-failure", "sequencing"),
+        ("missing-minimum-free", "invalid field set"),
+        ("zero-minimum-free", "sequencing"),
+        ("wrong-minimum-free", "sequencing"),
+        ("wrong-result-path", "result path"),
+        ("missing-causal-field", "causal acceptance contract"),
+    ),
+)
+def test_v25_coverage_runtime_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    reason: str,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(monkeypatch)
+    slots = runtime["slots"]
+    assert isinstance(slots, list)
+    if mutation == "missing-slot":
+        runtime["slots"] = slots[:1]
+    elif mutation == "reversed":
+        runtime["slots"] = list(reversed(slots))
+    elif mutation == "duplicate":
+        runtime["slots"] = [slots[0], slots[0]]
+    elif mutation == "wrong-runtime-id":
+        runtime["runtime_id"] = f"{runtime['runtime_id']}-drift"
+    elif mutation == "retry":
+        runtime["automatic_retries"] = 1
+    elif mutation == "replacement":
+        runtime["replacement_policy"] = "replace"
+    elif mutation == "continue-after-failure":
+        runtime["stop_on_first_non_pass"] = False
+    elif mutation == "missing-minimum-free":
+        del runtime["minimum_free_bytes"]
+    elif mutation == "zero-minimum-free":
+        runtime["minimum_free_bytes"] = 0
+    elif mutation == "wrong-minimum-free":
+        runtime["minimum_free_bytes"] += 1
+    elif mutation == "wrong-result-path":
+        slots[1]["result_path"] = slots[0]["result_path"]
+    else:
+        del slots[1]["causal_acceptance"][
+            "inherited_consensus_wait_exempt_placement_contract"
+        ]
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+def test_v25_runtime_binds_placement_contract_and_v24_rejects_forgery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(monkeypatch)
+    slot = runtime["slots"][1]
+    assert slot["causal_acceptance"][
+        "inherited_consensus_wait_exempt_placement_contract"
+    ] == INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT
+    validation._validate_runtime_slot(
+        slot,
+        expected_by_id["slot-037-n31-f2-b04-00"],
+        manifest,
+    )
+
+    responsive = manifest.byzantine.responsive_degradation
+    assert responsive is not None
+    missing_manifest_contract = replace(
+        manifest,
+        byzantine=replace(
+            manifest.byzantine,
+            responsive_degradation=replace(
+                responsive,
+                inherited_consensus_wait_exempt_placement_contract=None,
+            ),
+        ),
+    )
+    with pytest.raises(FactorialValidationError, match="placement contract"):
+        validation._validate_runtime_slot(
+            slot,
+            expected_by_id["slot-037-n31-f2-b04-00"],
+            missing_manifest_contract,
+        )
+
+    v24 = load_frozen_manifest(MANIFEST_PATH)
+    v24_slot = build_factorial_runtime(build_factorial_plan(v24)).slots[0]
+    v24_document = json.loads(json.dumps(v24_slot.as_document()))
+    v24_document["causal_acceptance"][
+        "inherited_consensus_wait_exempt_placement_contract"
+    ] = INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT
+    v24_expected = {
+        expected.slot_id: expected for expected in validation._expected_slots(v24)
+    }
+    with pytest.raises(FactorialValidationError, match="causal acceptance contract"):
+        validation._validate_runtime_slot(
+            v24_document,
+            v24_expected[v24_slot.slot_id],
+            v24,
+        )
+
+
+@pytest.mark.parametrize(
+    "authorized_slot_ids",
+    (
+        ("slot-066-n31-f5-b05-P",),
+        ("slot-037-n31-f2-b04-00",),
+        ("slot-037-n31-f2-b04-00", "slot-066-n31-f5-b05-P"),
+        (
+            "slot-066-n31-f5-b05-P",
+            "slot-037-n31-f2-b04-00",
+            "slot-001-n13-f2-b01-00",
+        ),
+    ),
+)
+def test_v25_coverage_authorization_rejects_missing_reversed_or_extra_slots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authorized_slot_ids: tuple[str, ...],
+) -> None:
+    manifest = _v25_candidate_manifest(monkeypatch)
+    plan = build_factorial_plan(manifest)
+    primary = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-037-n31-f2-b04-00"
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    runtime_bytes = execution._canonical_json_bytes(coverage.runtime.as_document())
+    static_artifacts = {
+        validation.MANIFEST_FILENAME: V25_MANIFEST_PATH.read_bytes(),
+        validation.PLAN_FILENAME: plan.canonical_bytes,
+        validation.RUNTIME_FILENAME: runtime_bytes,
+    }
+    authorization = execution.build_execution_authorization_receipt(
+        scope="excluded_n31_coverage_smoke",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-10T00:00:00+00:00",
+        kauri_revision="ab" * 20,
+        slot_ids=authorized_slot_ids,
+        result_root="results/shape-placement-factorial-v25-coverage-smoke",
+        static_artifacts=static_artifacts,
+        build_provenance_sha256="cd" * 32,
+    )
+    monkeypatch.setattr(
+        validation,
+        "FROZEN_MANIFEST_SHA256",
+        hashlib.sha256(static_artifacts[validation.MANIFEST_FILENAME]).hexdigest(),
+    )
+    monkeypatch.setattr(validation, "FROZEN_PLAN_SHA256", plan.plan_sha256)
+    monkeypatch.setattr(
+        validation,
+        "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
+        hashlib.sha256(runtime_bytes).hexdigest(),
+    )
+    result_root = tmp_path / "shape-placement-factorial-v25-coverage-smoke"
+    result_root.mkdir()
+    (result_root / validation.COVERAGE_SMOKE_AUTHORIZATION_FILENAME).write_bytes(
+        authorization
+    )
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    for slot in coverage.slots:
+        slot_root = result_root / slot.slot_id
+        slot_root.mkdir()
+        (slot_root / validation.RUNTIME_FILENAME).write_bytes(runtime_bytes)
+        (slot_root / validation.AUTHORIZATION_FILENAME).write_bytes(authorization)
+        with pytest.raises(FactorialValidationError, match="authorization receipt"):
+            validation._validate_execution_authorization(
+                slot_root,
+                manifest=manifest,
+                expected=expected_by_id[slot.slot_id],
+                plan=json.loads(plan.canonical_bytes),
+                runtime_sha256=hashlib.sha256(runtime_bytes).hexdigest(),
+                campaign_member=False,
+            )
+
+
+def test_v25_coverage_authorization_binds_same_ordered_pair_to_each_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _v25_candidate_manifest(monkeypatch)
+    plan = build_factorial_plan(manifest)
+    primary = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-037-n31-f2-b04-00"
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    runtime_bytes = execution._canonical_json_bytes(coverage.runtime.as_document())
+    static_artifacts = {
+        validation.MANIFEST_FILENAME: V25_MANIFEST_PATH.read_bytes(),
+        validation.PLAN_FILENAME: plan.canonical_bytes,
+        validation.RUNTIME_FILENAME: runtime_bytes,
+    }
+    ordered_ids = tuple(slot.slot_id for slot in coverage.slots)
+    authorization = execution.build_execution_authorization_receipt(
+        scope="excluded_n31_coverage_smoke",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-10T00:00:00+00:00",
+        kauri_revision="ab" * 20,
+        slot_ids=ordered_ids,
+        result_root="results/shape-placement-factorial-v25-coverage-smoke",
+        static_artifacts=static_artifacts,
+        build_provenance_sha256="cd" * 32,
+    )
+    monkeypatch.setattr(
+        validation,
+        "FROZEN_MANIFEST_SHA256",
+        hashlib.sha256(static_artifacts[validation.MANIFEST_FILENAME]).hexdigest(),
+    )
+    monkeypatch.setattr(validation, "FROZEN_PLAN_SHA256", plan.plan_sha256)
+    monkeypatch.setattr(
+        validation,
+        "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
+        hashlib.sha256(runtime_bytes).hexdigest(),
+    )
+    result_root = tmp_path / "shape-placement-factorial-v25-coverage-smoke"
+    result_root.mkdir()
+    (result_root / validation.COVERAGE_SMOKE_AUTHORIZATION_FILENAME).write_bytes(
+        authorization
+    )
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    for slot in coverage.slots:
+        slot_root = result_root / slot.slot_id
+        slot_root.mkdir()
+        (slot_root / validation.RUNTIME_FILENAME).write_bytes(runtime_bytes)
+        (slot_root / validation.AUTHORIZATION_FILENAME).write_bytes(authorization)
+        document, _ = validation._validate_execution_authorization(
+            slot_root,
+            manifest=manifest,
+            expected=expected_by_id[slot.slot_id],
+            plan=json.loads(plan.canonical_bytes),
+            runtime_sha256=hashlib.sha256(runtime_bytes).hexdigest(),
+            campaign_member=False,
+        )
+        assert document["slot_ids"] == list(ordered_ids)
+
+
+def test_v25_static_loader_extracts_each_exact_constituent_from_shared_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _v25_candidate_manifest(monkeypatch)
+    plan = build_factorial_plan(manifest)
+    primary = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-037-n31-f2-b04-00"
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    manifest_bytes = V25_MANIFEST_PATH.read_bytes()
+    runtime_bytes = execution._canonical_json_bytes(coverage.runtime.as_document())
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    runtime_sha256 = hashlib.sha256(runtime_bytes).hexdigest()
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_MANIFEST_SHA256",
+        manifest_sha256,
+    )
+    monkeypatch.setattr(validation, "FROZEN_MANIFEST_SHA256", manifest_sha256)
+    monkeypatch.setattr(validation, "FROZEN_PLAN_SHA256", plan.plan_sha256)
+    monkeypatch.setattr(
+        validation,
+        "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
+        runtime_sha256,
+    )
+
+    result_root = tmp_path / "shape-placement-factorial-v25-coverage-smoke"
+    for slot in coverage.slots:
+        slot_root = result_root / slot.slot_id
+        slot_root.mkdir(parents=True)
+        (slot_root / validation.MANIFEST_FILENAME).write_bytes(manifest_bytes)
+        (slot_root / validation.PLAN_FILENAME).write_bytes(plan.canonical_bytes)
+        (slot_root / validation.RUNTIME_FILENAME).write_bytes(runtime_bytes)
+        loaded_manifest, _, loaded_runtime, expected, loaded_sha256 = (
+            validation._load_static_contracts(slot_root)
+        )
+        assert loaded_manifest.manifest_id == validation.FROZEN_MANIFEST_ID
+        assert expected.slot_id == slot.slot_id
+        assert loaded_runtime["slot_id"] == slot.slot_id
+        assert loaded_sha256 == runtime_sha256
+
+
+def _pass_coverage_validation(
+    expected: validation._ExpectedSlot,
+) -> validation.SlotValidationResult:
+    return validation.SlotValidationResult(
+        slot_id=expected.slot_id,
+        outcome="PASS",
+        reason=None,
+        block_id=expected.block_id,
+        arm_code=expected.arm_code,
+        replica_count=expected.replica_count,
+        initial_fanout=expected.initial_fanout,
+        integrity_valid=True,
+        campaign_member=False,
+    )
+
+
+def _seal_pass_outcome(slot_root: Path, slot_id: str) -> bytes:
+    sealed_files = {
+        path.relative_to(slot_root).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in sorted(slot_root.rglob("*"))
+        if path.is_file() and path.name != validation.OUTCOME_FILENAME
+    }
+    payload = _canonical(
+        {
+            "schema_version": 1,
+            "slot_id": slot_id,
+            "history": [
+                {"sequence": 0, "state": "NOT_STARTED", "reason": None},
+                {"sequence": 1, "state": "PASS", "reason": None},
+            ],
+            "sealed_files": sealed_files,
+        }
+    )
+    (slot_root / validation.OUTCOME_FILENAME).write_bytes(payload)
+    return payload
+
+
+def _v25_coverage_lifecycle_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    row_count: int,
+) -> dict[str, object]:
+    manifest, runtime_document, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch
+    )
+    plan = build_factorial_plan(manifest)
+    primary = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-037-n31-f2-b04-00"
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    root = (tmp_path / "shape-placement-factorial-v25-coverage-smoke").resolve()
+    root.mkdir()
+    (root / validation.BUILD_EVIDENCE_DIRECTORY).mkdir()
+    manifest_bytes = V25_MANIFEST_PATH.read_bytes()
+    runtime_bytes = _canonical(runtime_document)
+    static_artifacts = {
+        validation.MANIFEST_FILENAME: manifest_bytes,
+        validation.PLAN_FILENAME: plan.canonical_bytes,
+        validation.RUNTIME_FILENAME: runtime_bytes,
+    }
+    revision = "ab" * 20
+    build_provenance = {
+        "schema_version": 1,
+        "revision": revision,
+        "producer": "validator-lifecycle-test",
+    }
+    build_provenance_bytes = _canonical(build_provenance)
+    authorization_bytes = execution.build_execution_authorization_receipt(
+        scope="excluded_n31_coverage_smoke",
+        approval_reference="test thesis-author approval",
+        approved_utc="2026-08-10T00:00:00+00:00",
+        kauri_revision=revision,
+        slot_ids=tuple(slot.slot_id for slot in coverage.slots),
+        result_root="results/shape-placement-factorial-v25-coverage-smoke",
+        static_artifacts=static_artifacts,
+        build_provenance_sha256=hashlib.sha256(
+            build_provenance_bytes
+        ).hexdigest(),
+    )
+    authorization = json.loads(authorization_bytes)
+    contract = execution.build_coverage_smoke_execution_contract(
+        runtime=coverage.runtime,
+        static_artifacts=static_artifacts,
+        authorization=authorization,
+        authorization_payload=authorization_bytes,
+        build_provenance=build_provenance,
+    )
+    contract_bytes = _canonical(contract)
+    (root / execution.COVERAGE_SMOKE_AUTHORIZATION_FILENAME).write_bytes(
+        authorization_bytes
+    )
+    (root / execution.COVERAGE_SMOKE_CONTRACT_FILENAME).write_bytes(
+        contract_bytes
+    )
+
+    expected_validation = {
+        "outcome": "PASS",
+        "reason": None,
+        "integrity_valid": True,
+        "campaign_member": False,
+        "figure_eligible": False,
+    }
+    rows: list[bytes] = []
+    previous = "0" * 64
+    for index, spec in enumerate(coverage.runtimes, 1):
+        preflight = SimpleNamespace(
+            revision=revision,
+            result_root=root,
+            slot_directory=root / spec.slot_id,
+            free_bytes=20_000_000_000,
+            build_provenance=build_provenance,
+        )
+        started = execution.build_coverage_smoke_started_record(
+            runtime=coverage.runtime,
+            spec=spec,
+            coverage_execution_ordinal=index,
+            preflight=preflight,
+            static_artifacts=static_artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_bytes,
+            contract_payload=contract_bytes,
+            previous_record_sha256=previous,
+            recorded_utc=f"2026-08-10T00:00:0{index * 2 - 1}+00:00",
+            recorded_monotonic_ns=index * 2 - 1,
+        )
+        started_bytes = _canonical(started)
+        rows.append(started_bytes)
+        previous = hashlib.sha256(started_bytes).hexdigest()
+        terminal = execution.build_coverage_smoke_terminal_record(
+            runtime=coverage.runtime,
+            spec=spec,
+            coverage_execution_ordinal=index,
+            execution=SimpleNamespace(
+                slot_directory=root / spec.slot_id,
+                outcome="PASS",
+                reason=None,
+                launch_count=spec.replica_count + 1,
+            ),
+            validation=expected_validation,
+            static_artifacts=static_artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_bytes,
+            contract_payload=contract_bytes,
+            build_provenance=build_provenance,
+            previous_record_sha256=previous,
+            recorded_utc=f"2026-08-10T00:00:0{index * 2}+00:00",
+            recorded_monotonic_ns=index * 2,
+        )
+        terminal_bytes = _canonical(terminal)
+        rows.append(terminal_bytes)
+        previous = hashlib.sha256(terminal_bytes).hexdigest()
+    ledger_bytes = b"".join(rows[:row_count])
+    (root / execution.COVERAGE_SMOKE_LEDGER_FILENAME).write_bytes(ledger_bytes)
+
+    present_count = 1 if row_count <= 2 else 2
+    slot_roots: dict[str, Path] = {}
+    for index, spec in enumerate(coverage.runtimes[:present_count], 1):
+        slot_root = root / spec.slot_id
+        slot_root.mkdir()
+        slot_roots[spec.slot_id] = slot_root
+        for name, payload in static_artifacts.items():
+            (slot_root / name).write_bytes(payload)
+        (slot_root / validation.AUTHORIZATION_FILENAME).write_bytes(
+            authorization_bytes
+        )
+        provenance = slot_root / validation.BUILD_PROVENANCE_FILENAME
+        provenance.parent.mkdir()
+        provenance.write_bytes(build_provenance_bytes)
+        (slot_root / execution.COVERAGE_SMOKE_CONTRACT_FILENAME).write_bytes(
+            contract_bytes
+        )
+        prefix_count = 1 if index == 1 else 3
+        (slot_root / execution.COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME).write_bytes(
+            b"".join(rows[:prefix_count])
+        )
+
+    primary_id, repair_id = validation.V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    primary_root = slot_roots[primary_id]
+    primary_outcome_bytes = _seal_pass_outcome(primary_root, primary_id)
+    if repair_id in slot_roots:
+        primary_outcome = json.loads(primary_outcome_bytes)
+        receipt = {
+            "schema_version": 1,
+            "coverage_smoke_id": coverage.runtime.runtime_id,
+            "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
+            "authorization_id": authorization["authorization_id"],
+            "authorization_sha256": hashlib.sha256(
+                authorization_bytes
+            ).hexdigest(),
+            "predecessor_coverage_execution_ordinal": 1,
+            "predecessor_slot_id": primary_id,
+            "predecessor_terminal_record_sha256": hashlib.sha256(
+                rows[1]
+            ).hexdigest(),
+            "predecessor_outcome_sha256": hashlib.sha256(
+                primary_outcome_bytes
+            ).hexdigest(),
+            "predecessor_sealed_files_sha256": hashlib.sha256(
+                _canonical(primary_outcome["sealed_files"])
+            ).hexdigest(),
+            "predecessor_validation": expected_validation,
+        }
+        repair_root = slot_roots[repair_id]
+        (
+            repair_root
+            / execution.COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME
+        ).write_bytes(_canonical(receipt))
+        _seal_pass_outcome(repair_root, repair_id)
+
+    return {
+        "manifest": manifest,
+        "plan": json.loads(plan.canonical_bytes),
+        "runtime_sha256": hashlib.sha256(runtime_bytes).hexdigest(),
+        "authorization": authorization,
+        "authorization_bytes": authorization_bytes,
+        "build_provenance_bytes": build_provenance_bytes,
+        "recorded_result_root": root,
+        "expected_by_id": expected_by_id,
+        "slot_roots": slot_roots,
+        "rows": rows,
+    }
+
+
+def _validate_v25_coverage_fixture(
+    fixture: dict[str, object],
+    slot_id: str,
+    *,
+    predecessor_result: validation.SlotValidationResult | None = None,
+    allow_predecessor_replay: bool = False,
+) -> None:
+    expected_by_id = fixture["expected_by_id"]
+    assert isinstance(expected_by_id, dict)
+    expected = expected_by_id[slot_id]
+    slot_roots = fixture["slot_roots"]
+    assert isinstance(slot_roots, dict)
+    validation._validate_v25_coverage_execution_lifecycle(
+        slot_root=slot_roots[slot_id],
+        manifest=fixture["manifest"],
+        plan=fixture["plan"],
+        expected=expected,
+        runtime_sha256=fixture["runtime_sha256"],
+        authorization=fixture["authorization"],
+        authorization_bytes=fixture["authorization_bytes"],
+        build_provenance_bytes=fixture["build_provenance_bytes"],
+        recorded_result_root=fixture["recorded_result_root"],
+        result=_pass_coverage_validation(expected),
+        predecessor_result=predecessor_result,
+        allow_predecessor_replay=allow_predecessor_replay,
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_count", "slot_id"),
+    (
+        (1, "slot-066-n31-f5-b05-P"),
+        (2, "slot-066-n31-f5-b05-P"),
+        (4, "slot-066-n31-f5-b05-P"),
+    ),
+)
+def test_v25_primary_coverage_lifecycle_accepts_only_exact_valid_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    row_count: int,
+    slot_id: str,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(
+        monkeypatch,
+        tmp_path,
+        row_count=row_count,
+    )
+    _validate_v25_coverage_fixture(fixture, slot_id)
+
+
+@pytest.mark.parametrize("row_count", (3, 4))
+def test_v25_repair_coverage_lifecycle_binds_independent_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    row_count: int,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(
+        monkeypatch,
+        tmp_path,
+        row_count=row_count,
+    )
+    expected_by_id = fixture["expected_by_id"]
+    assert isinstance(expected_by_id, dict)
+    _validate_v25_coverage_fixture(
+        fixture,
+        "slot-037-n31-f2-b04-00",
+        predecessor_result=_pass_coverage_validation(
+            expected_by_id["slot-066-n31-f5-b05-P"]
+        ),
+    )
+
+
+def test_v25_primary_rejects_later_partial_except_scoped_predecessor_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(monkeypatch, tmp_path, row_count=3)
+    with pytest.raises(FactorialValidationError, match="ledger stage"):
+        _validate_v25_coverage_fixture(
+            fixture,
+            "slot-066-n31-f5-b05-P",
+        )
+    _validate_v25_coverage_fixture(
+        fixture,
+        "slot-066-n31-f5-b05-P",
+        allow_predecessor_replay=True,
+    )
+
+
+def test_v25_private_predecessor_replay_accepts_row3_before_repair_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(monkeypatch, tmp_path, row_count=3)
+    slot_roots = fixture["slot_roots"]
+    assert isinstance(slot_roots, dict)
+    repair_id = "slot-037-n31-f2-b04-00"
+    shutil.rmtree(slot_roots.pop(repair_id))
+
+    with pytest.raises(FactorialValidationError, match="ledger stage"):
+        _validate_v25_coverage_fixture(
+            fixture,
+            "slot-066-n31-f5-b05-P",
+        )
+    _validate_v25_coverage_fixture(
+        fixture,
+        "slot-066-n31-f5-b05-P",
+        allow_predecessor_replay=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing-contract-copy", "sealed contract"),
+        ("missing-prefix", "prelaunch prefix"),
+        ("missing-receipt", "predecessor receipt"),
+        ("tampered-chain", "hash chain"),
+        ("reversed", "identity/order"),
+        ("extra-row", "ledger stage"),
+        ("retry", "identity/order"),
+        ("replacement", "identity/order"),
+        ("wrong-predecessor-validation", "predecessor receipt"),
+        ("wrong-predecessor-outcome", "predecessor receipt"),
+        ("receipt-extra-field", "predecessor receipt"),
+        ("contract-extra-field", "exact schedule"),
+        ("ledger-extra-field", "invalid field set"),
+        ("missing-root-contract", "execution-contract"),
+        ("missing-root-ledger", "attempt-ledger"),
+        ("prior-zero-free", "preflight"),
+        ("prior-below-free", "preflight"),
+        ("current-zero-free", "preflight"),
+        ("current-below-free", "preflight"),
+        ("wrong-slot-path", "slot path"),
+        ("timestamp-regression", "chronology"),
+        ("extra-root-state", "lifecycle state"),
+        ("shared-build-drift", "authorization/build"),
+        ("continued-after-nonpass", "non-PASS"),
+    ),
+)
+def test_v25_coverage_lifecycle_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(monkeypatch, tmp_path, row_count=4)
+    root = fixture["recorded_result_root"]
+    assert isinstance(root, Path)
+    slot_roots = fixture["slot_roots"]
+    assert isinstance(slot_roots, dict)
+    repair_root = slot_roots["slot-037-n31-f2-b04-00"]
+    ledger_path = root / execution.COVERAGE_SMOKE_LEDGER_FILENAME
+    rows = [json.loads(raw) for raw in ledger_path.read_bytes().splitlines()]
+    if mutation == "missing-contract-copy":
+        (repair_root / execution.COVERAGE_SMOKE_CONTRACT_FILENAME).unlink()
+    elif mutation == "missing-prefix":
+        (repair_root / execution.COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME).unlink()
+    elif mutation == "missing-receipt":
+        (
+            repair_root
+            / execution.COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME
+        ).unlink()
+    elif mutation == "tampered-chain":
+        rows[2]["previous_record_sha256"] = "ff" * 32
+    elif mutation == "reversed":
+        rows[0]["slot_id"], rows[2]["slot_id"] = (
+            rows[2]["slot_id"],
+            rows[0]["slot_id"],
+        )
+    elif mutation == "extra-row":
+        rows.append(dict(rows[-1]))
+    elif mutation == "retry":
+        rows[2]["attempt_ordinal"] = 2
+    elif mutation == "replacement":
+        rows[2]["replacement_policy"] = "replace"
+    elif mutation == "wrong-predecessor-validation":
+        receipt_path = (
+            repair_root
+            / execution.COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME
+        )
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["predecessor_validation"]["integrity_valid"] = False
+        receipt_path.write_bytes(_canonical(receipt))
+    elif mutation == "wrong-predecessor-outcome":
+        receipt_path = (
+            repair_root
+            / execution.COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME
+        )
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["predecessor_outcome_sha256"] = "ff" * 32
+        receipt_path.write_bytes(_canonical(receipt))
+    elif mutation == "receipt-extra-field":
+        receipt_path = (
+            repair_root
+            / execution.COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME
+        )
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt["unexpected"] = True
+        receipt_path.write_bytes(_canonical(receipt))
+    elif mutation == "contract-extra-field":
+        contract_path = root / execution.COVERAGE_SMOKE_CONTRACT_FILENAME
+        contract = json.loads(contract_path.read_bytes())
+        contract["unexpected"] = True
+        contract_path.write_bytes(_canonical(contract))
+    elif mutation == "ledger-extra-field":
+        rows[2]["unexpected"] = True
+    elif mutation == "missing-root-contract":
+        (root / execution.COVERAGE_SMOKE_CONTRACT_FILENAME).unlink()
+    elif mutation == "missing-root-ledger":
+        ledger_path.unlink()
+    elif mutation == "prior-zero-free":
+        rows[0]["preflight_free_bytes"] = 0
+    elif mutation == "prior-below-free":
+        rows[0]["preflight_free_bytes"] = 9_999_999_999
+    elif mutation == "current-zero-free":
+        rows[2]["preflight_free_bytes"] = 0
+    elif mutation == "current-below-free":
+        rows[2]["preflight_free_bytes"] = 9_999_999_999
+    elif mutation == "wrong-slot-path":
+        rows[2]["slot_directory"] = rows[0]["slot_directory"]
+    elif mutation == "timestamp-regression":
+        rows[2]["recorded_monotonic_ns"] = rows[1][
+            "recorded_monotonic_ns"
+        ]
+    elif mutation == "extra-root-state":
+        (root / "unexpected.json").write_bytes(_canonical({"unexpected": True}))
+    elif mutation == "shared-build-drift":
+        provenance_path = repair_root / validation.BUILD_PROVENANCE_FILENAME
+        provenance_path.write_bytes(_canonical({"drift": True}))
+    else:
+        rows[1]["validation"]["integrity_valid"] = False
+
+    if mutation in {
+        "tampered-chain",
+        "reversed",
+        "extra-row",
+        "retry",
+        "replacement",
+        "ledger-extra-field",
+        "prior-zero-free",
+        "prior-below-free",
+        "current-zero-free",
+        "current-below-free",
+        "wrong-slot-path",
+        "timestamp-regression",
+        "continued-after-nonpass",
+    }:
+        ledger_path.write_bytes(b"".join(_canonical(row) for row in rows))
+    expected_by_id = fixture["expected_by_id"]
+    assert isinstance(expected_by_id, dict)
+    with pytest.raises(FactorialValidationError, match=reason):
+        _validate_v25_coverage_fixture(
+            fixture,
+            "slot-037-n31-f2-b04-00",
+            predecessor_result=_pass_coverage_validation(
+                expected_by_id["slot-066-n31-f5-b05-P"]
+            ),
+        )
+
+
+def test_v25_coverage_lifecycle_supports_relocated_sealed_copy_but_not_path_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(monkeypatch, tmp_path, row_count=4)
+    original_root = fixture["recorded_result_root"]
+    assert isinstance(original_root, Path)
+    relocated_root = tmp_path / "relocated-coverage-smoke"
+    original_root.rename(relocated_root)
+    fixture["slot_roots"] = {
+        slot_id: relocated_root / slot_id
+        for slot_id in validation.V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    }
+    expected_by_id = fixture["expected_by_id"]
+    assert isinstance(expected_by_id, dict)
+    predecessor = _pass_coverage_validation(
+        expected_by_id["slot-066-n31-f5-b05-P"]
+    )
+    _validate_v25_coverage_fixture(
+        fixture,
+        "slot-037-n31-f2-b04-00",
+        predecessor_result=predecessor,
+    )
+
+    fixture["recorded_result_root"] = relocated_root
+    with pytest.raises(FactorialValidationError, match="slot path"):
+        _validate_v25_coverage_fixture(
+            fixture,
+            "slot-037-n31-f2-b04-00",
+            predecessor_result=predecessor,
+        )
+
+
 def test_n31_coverage_smoke_relocates_by_exact_runtime_and_authorization(
     tmp_path: Path,
 ) -> None:
@@ -7070,7 +8246,7 @@ def test_n31_coverage_smoke_relocates_by_exact_runtime_and_authorization(
         approved_utc="2026-08-09T00:00:00+00:00",
         kauri_revision="ab" * 20,
         slot_ids=(coverage.slot.slot_id,),
-        result_root=validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        result_root=validation.V24_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         static_artifacts=static_artifacts,
         build_provenance_sha256="cd" * 32,
     )
@@ -7097,7 +8273,7 @@ def test_n31_coverage_smoke_relocates_by_exact_runtime_and_authorization(
     ) = validation._load_static_contracts(slot_root)
     assert loaded_manifest == manifest
     assert loaded_plan == json.loads(plan.canonical_bytes)
-    assert runtime_sha256 == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+    assert runtime_sha256 == validation.V24_COVERAGE_SMOKE_RUNTIME_SHA256
     assert validation._is_excluded_coverage_smoke_slot(
         slot_root,
         manifest_id=manifest.manifest_id,
@@ -7115,7 +8291,7 @@ def test_n31_coverage_smoke_relocates_by_exact_runtime_and_authorization(
     assert document["scope"] == "excluded_n31_coverage_smoke"
     assert document["slot_ids"] == [coverage.slot.slot_id]
     assert document["result_root"] == (
-        validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+        validation.V24_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     )
 
 
@@ -7152,7 +8328,7 @@ def test_receipt_and_build_provenance_validate_after_archive_relocation(
         manifest=load_frozen_manifest(MANIFEST_PATH),
         expected=expected,
         runtime=runtime,
-        runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
+        runtime_sha256=validation.V24_RUNTIME_SHA256,
         authorization_bytes=authorization_bytes,
     )
 
@@ -7264,7 +8440,7 @@ def test_v15_receipt_rejects_fault_open_or_q_sized_manager_coverage(
             manifest=load_frozen_manifest(MANIFEST_PATH),
             expected=expected,
             runtime=runtime,
-            runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
+            runtime_sha256=validation.V24_RUNTIME_SHA256,
             authorization_bytes=authorization,
         )
 
@@ -7285,7 +8461,7 @@ def test_v9_receipt_rejects_an_exact_legacy_manifest_plan_pair(
             manifest=load_frozen_manifest(MANIFEST_PATH),
             expected=expected,
             runtime=runtime,
-            runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
+            runtime_sha256=validation.V24_RUNTIME_SHA256,
             authorization_bytes=authorization,
         )
 
@@ -7368,7 +8544,7 @@ def test_relocated_receipt_rejects_authorization_tamper_and_identity_symlink(
             manifest=load_frozen_manifest(MANIFEST_PATH),
             expected=expected,
             runtime=runtime,
-            runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
+            runtime_sha256=validation.V24_RUNTIME_SHA256,
             authorization_bytes=authorization + b"tamper",
         )
 
@@ -7384,7 +8560,7 @@ def test_relocated_receipt_rejects_authorization_tamper_and_identity_symlink(
             manifest=load_frozen_manifest(MANIFEST_PATH),
             expected=expected,
             runtime=runtime,
-            runtime_sha256=validation.FROZEN_RUNTIME_SHA256,
+            runtime_sha256=validation.V24_RUNTIME_SHA256,
             authorization_bytes=authorization,
         )
 
@@ -9836,9 +11012,9 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
         "schema_version": 1,
         "campaign_id": runtime_plan.runtime_id,
         "manifest_id": runtime_plan.manifest_id,
-        "manifest_sha256": validation.FROZEN_MANIFEST_SHA256,
-        "plan_sha256": validation.FROZEN_PLAN_SHA256,
-        "runtime_sha256": validation.FROZEN_RUNTIME_SHA256,
+        "manifest_sha256": validation.V24_MANIFEST_SHA256,
+        "plan_sha256": validation.V24_PLAN_SHA256,
+        "runtime_sha256": validation.V24_RUNTIME_SHA256,
         "authorization_id": authorization["authorization_id"],
         "authorization_sha256": hashlib.sha256(authorization_bytes).hexdigest(),
         "kauri_revision": "cd" * 20,
@@ -9907,9 +11083,9 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
         return {
             "schema_version": 1,
             "campaign_id": runtime_plan.runtime_id,
-            "manifest_sha256": validation.FROZEN_MANIFEST_SHA256,
-            "source_plan_sha256": validation.FROZEN_PLAN_SHA256,
-            "runtime_sha256": validation.FROZEN_RUNTIME_SHA256,
+            "manifest_sha256": validation.V24_MANIFEST_SHA256,
+            "source_plan_sha256": validation.V24_PLAN_SHA256,
+            "runtime_sha256": validation.V24_RUNTIME_SHA256,
             "contract_sha256": contract_digest,
             "authorization_id": authorization["authorization_id"],
             "authorization_sha256": hashlib.sha256(authorization_bytes).hexdigest(),

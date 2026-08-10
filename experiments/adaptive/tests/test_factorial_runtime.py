@@ -37,8 +37,6 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     load_frozen_manifest,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
     ManagerSecretMaterial,
     V11_RUNTIME_SHA256,
     V11_SMOKE_RUNTIME_SHA256,
@@ -48,6 +46,8 @@ from experiments.adaptive.kauri_experiment.factorial_runtime import (
     V13_SMOKE_RUNTIME_SHA256,
     V14_RUNTIME_SHA256,
     V14_SMOKE_RUNTIME_SHA256,
+    V24_RUNTIME_SHA256,
+    V24_SMOKE_RUNTIME_SHA256,
     build_factorial_runtime,
     build_slot_runtime,
     build_smoke_metadata,
@@ -848,12 +848,12 @@ def test_campaign_runtime_is_execution_ordered_and_cannot_launch(
 
     encoded = canonical_runtime_bytes(runtime_plan)
     assert encoded == canonical_runtime_bytes(build_factorial_runtime(frozen_plan))
-    assert hashlib.sha256(encoded).hexdigest() == FROZEN_RUNTIME_SHA256
+    assert hashlib.sha256(encoded).hexdigest() == V24_RUNTIME_SHA256
     smoke = factorial_execution.build_n7_ps_smoke_slot(frozen_plan.slots[0])
     smoke_payload = factorial_execution._canonical_json_bytes(
         smoke.runtime.as_document()
     )
-    assert hashlib.sha256(smoke_payload).hexdigest() == FROZEN_SMOKE_RUNTIME_SHA256
+    assert hashlib.sha256(smoke_payload).hexdigest() == V24_SMOKE_RUNTIME_SHA256
     document = json.loads(encoded)
     assert document["slot_count"] == len(frozen_plan.slots)
     assert "selected_fanout" not in document
@@ -1080,24 +1080,20 @@ def test_preflight_rejects_low_disk_and_output_namespace_collisions(
         )
 
 
-def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
+@pytest.mark.parametrize("command", ("preflight", "run"))
+def test_cli_v24_production_commands_are_validation_only(
+    command: str,
+    capsys,
+) -> None:
     assert (
         run_shape_factorial_campaign.main(
-            ["--manifest", str(MANIFEST_PATH), "preflight"]
+            ["--manifest", str(MANIFEST_PATH), command]
         )
-        == 0
-    )
-    preflight = json.loads(capsys.readouterr().out)
-    assert preflight["status"] == "PASS"
-    assert preflight["launch_permitted"] is False
-
-    assert (
-        run_shape_factorial_campaign.main(["--manifest", str(MANIFEST_PATH), "run"])
         == 2
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "authorized" in refusal["reason"] or "receipt" in refusal["reason"]
+    assert "v1 through v24 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1125,13 +1121,16 @@ def test_cli_preflight_passes_but_run_refuses(capsys) -> None:
         V21_MANIFEST_PATH,
         V22_MANIFEST_PATH,
         V23_MANIFEST_PATH,
+        MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v24_and_refuses_prior_production(
+def test_cli_defaults_to_v25_and_refuses_historical_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
-    assert run_shape_factorial_campaign.DEFAULT_MANIFEST == MANIFEST_PATH
+    assert run_shape_factorial_campaign.DEFAULT_MANIFEST.name == (
+        "shape-placement-factorial-v25.json"
+    )
     assert (
         run_shape_factorial_campaign.main(
             ["--manifest", str(prior_manifest), "plan"]
@@ -1140,7 +1139,7 @@ def test_cli_defaults_to_v24_and_refuses_prior_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v23 are validation-only" in refusal["reason"]
+    assert "v1 through v24 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(

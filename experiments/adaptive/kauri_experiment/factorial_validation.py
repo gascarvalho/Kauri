@@ -60,6 +60,7 @@ from .factorial_manifest import (
     FROZEN_MANIFEST_ID,
     FROZEN_MANIFEST_SHA256,
     FROZEN_PLAN_SHA256,
+    INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1,
     LEGACY_MANIFEST_ID,
     LEGACY_MANIFEST_SHA256,
     LEGACY_PLAN_SHA256,
@@ -143,6 +144,9 @@ from .factorial_manifest import (
     V23_MANIFEST_ID,
     V23_MANIFEST_SHA256,
     V23_PLAN_SHA256,
+    V24_MANIFEST_ID,
+    V24_MANIFEST_SHA256,
+    V24_PLAN_SHA256,
     FrozenFactorialManifest,
     load_frozen_manifest_bytes,
 )
@@ -168,6 +172,14 @@ CAMPAIGN_SUMMARY_FILENAME = "campaign-execution-summary.json"
 COVERAGE_SMOKE_AUTHORIZATION_FILENAME = (
     "coverage-smoke-execution-authorization.json"
 )
+COVERAGE_SMOKE_CONTRACT_FILENAME = "coverage-smoke-execution-contract.json"
+COVERAGE_SMOKE_LEDGER_FILENAME = "coverage-smoke-attempt-ledger.jsonl"
+COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME = (
+    "coverage-smoke-prelaunch-ledger-prefix.jsonl"
+)
+COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME = (
+    "coverage-smoke-predecessor-receipt.json"
+)
 BUILD_EVIDENCE_DIRECTORY = "build-evidence"
 _BUILD_EVIDENCE_GROUPS = {
     "binaries": "binaries",
@@ -178,6 +190,10 @@ REPLICA_EVENTS_PATTERN = "raw/replica-{replica_id}.jsonl"
 REPLICA_STDERR_PATTERN = "raw/process/replica-{replica_id}.stderr.log"
 EXCLUDED_SMOKE_SLOT_ID = "smoke-n7-f2-PS"
 EXCLUDED_COVERAGE_SMOKE_SLOT_ID = "slot-066-n31-f5-b05-P"
+V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 V15_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v15-coverage-smoke"
 )
@@ -205,8 +221,11 @@ V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V23_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v23-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V24_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v24-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v25-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -367,14 +386,23 @@ V23_SMOKE_RUNTIME_SHA256 = (
 V23_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "8706bc9292691b48c5f5db7728e22bebb6eaae399643da9cee5778d78adb9bd6"
 )
-FROZEN_RUNTIME_SHA256 = (
+V24_RUNTIME_SHA256 = (
     "e8ff4013c5b28c1d6c7650ff1eadce275f8296e6e719d0fbdb39e64d0f1c8b2d"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V24_SMOKE_RUNTIME_SHA256 = (
     "dee2b34183787ab7f55555c0fc5ab6e08ea1234e9c1c52aa63967a51b5e63f2c"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V24_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "eff1bc9bdbbda5d7dc20a77dd5217ade97d67173b4ac877b9a68f717281088fd"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "c0b5195113defdc86cb959f32181436e288241eb2d3091c6d7f43accd2ebaea2"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "a6f5cc32088a7d8006623536b8aada8378493fa97b72e21d2d5b9ed4e3ed0d47"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "034bd2a7e0b12677845554a1ed46c6053457e1c23476a696d4a246e3ef070149"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -452,7 +480,6 @@ _RESPONSIVE_DEGRADED_OBSERVER_EXCLUSION = (
 )
 _V8_RESPONSIVE_OMISSION_PERIOD = 32
 _RESPONSIVE_OMISSION_PERIOD = 41
-_V24_MANIFEST_ID = "shape-placement-factorial-v24"
 _V24_EPOCH1_PRESELECTION_RESIDENCY_MS = 60_000
 _V24_PRIMARY_INTERNAL_ROLE_OPPORTUNITIES = 82
 _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
@@ -479,6 +506,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V21_MANIFEST_ID,
         V22_MANIFEST_ID,
         V23_MANIFEST_ID,
+        V24_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -489,7 +517,7 @@ def _v24_preselection_contract(
 ) -> tuple[int, int] | None:
     """Independently bind the prospective timing/exposure fields."""
 
-    if manifest.manifest_id != _V24_MANIFEST_ID:
+    if manifest.manifest_id not in {V24_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         return None
     responsive = manifest.byzantine.responsive_degradation
     residency_ms = getattr(
@@ -512,7 +540,7 @@ def _v24_preselection_contract(
         or manifest.workload.bucket_width_s != 5
         or manifest.workload.epoch1_stable_bucket_count != 6
     ):
-        _fail("v24 Epoch1 preselection contract or measured window drifted")
+        _fail("v24+ Epoch1 preselection contract or measured window drifted")
     return residency_ms, minimum_opportunities
 
 
@@ -604,6 +632,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -621,6 +650,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -646,6 +676,7 @@ def _uses_source_bound_contribution_opportunities(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -668,6 +699,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -690,6 +722,7 @@ def _uses_precontainment_fault_coverage(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -712,6 +745,7 @@ def _uses_precontainment_shape_preservation(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -737,6 +771,7 @@ def _uses_precontainment_guarded_selection_contract(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -761,6 +796,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V21_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
         V22_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
         V23_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V24_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -784,6 +820,7 @@ def _uses_source_bound_proposal_witness_contract(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -802,7 +839,12 @@ def _uses_evidence_snapshot_selection_contract(
     responsive = manifest.byzantine.responsive_degradation
     return (
         manifest.manifest_id
-        in {V22_MANIFEST_ID, V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V22_MANIFEST_ID,
+            V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         and responsive is not None
         and getattr(
             responsive,
@@ -810,6 +852,22 @@ def _uses_evidence_snapshot_selection_contract(
             None,
         )
         == EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+    )
+
+
+def _uses_inherited_consensus_wait_exempt_placement_contract(
+    manifest: FrozenFactorialManifest,
+) -> bool:
+    responsive = manifest.byzantine.responsive_degradation
+    return (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and responsive is not None
+        and getattr(
+            responsive,
+            "inherited_consensus_wait_exempt_placement_contract",
+            None,
+        )
+        == INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
     )
 
 
@@ -1085,6 +1143,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V23_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V23_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V24_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V24_MANIFEST_ID,
+            manifest_sha256=V24_MANIFEST_SHA256,
+            plan_sha256=V24_PLAN_SHA256,
+            runtime_sha256=V24_RUNTIME_SHA256,
+            smoke_runtime_sha256=V24_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V24_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -2710,6 +2778,25 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
         _fail("plan execution schedule differs from independent derivation")
 
 
+def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
+    if manifest_id == FROZEN_MANIFEST_ID:
+        return V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id in {
+        V15_MANIFEST_ID,
+        V16_MANIFEST_ID,
+        V17_MANIFEST_ID,
+        V18_MANIFEST_ID,
+        V19_MANIFEST_ID,
+        V20_MANIFEST_ID,
+        V21_MANIFEST_ID,
+        V22_MANIFEST_ID,
+        V23_MANIFEST_ID,
+        V24_MANIFEST_ID,
+    }:
+        return (EXCLUDED_COVERAGE_SMOKE_SLOT_ID,)
+    return ()
+
+
 def _is_excluded_coverage_smoke_slot(
     slot_root: Path,
     *,
@@ -2761,6 +2848,11 @@ def _is_excluded_coverage_smoke_slot(
             V23_COVERAGE_SMOKE_RUNTIME_SHA256,
             V23_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V24_MANIFEST_ID: (
+            V24_RUNTIME_SHA256,
+            V24_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V24_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -2770,7 +2862,7 @@ def _is_excluded_coverage_smoke_slot(
     contract = contract_by_manifest.get(manifest_id)
     if (
         contract is None
-        or slot_root.name != EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+        or slot_root.name not in _coverage_smoke_slot_ids(manifest_id)
     ):
         return False
     runtime_sha256_expected, coverage_sha256_expected, result_root = contract
@@ -2813,10 +2905,75 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V22_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V23_MANIFEST_ID:
         return V23_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V24_MANIFEST_ID:
+        return V24_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
     raise AssertionError("unreachable")
+
+
+def _validate_v25_coverage_runtime_document(
+    runtime: Mapping[str, Any],
+    *,
+    manifest: FrozenFactorialManifest,
+    expected_by_id: Mapping[str, _ExpectedSlot],
+) -> dict[str, Mapping[str, Any]]:
+    _fields(
+        runtime,
+        {
+            "schema_version",
+            "runtime_id",
+            "manifest_id",
+            "execution_mode",
+            "automatic_retries",
+            "replacement_policy",
+            "stop_on_first_non_pass",
+            "minimum_free_bytes",
+            "slots",
+        },
+        "v25 N=31 coverage runtime",
+    )
+    if (
+        manifest.manifest_id != FROZEN_MANIFEST_ID
+        or runtime.get("schema_version") != 1
+        or runtime.get("runtime_id")
+        != "shape-placement-factorial-v25-excluded-n31-coverage-smoke-v1"
+        or runtime.get("manifest_id") != FROZEN_MANIFEST_ID
+        or runtime.get("execution_mode") != "fixed_sequential"
+        or runtime.get("automatic_retries") != 0
+        or runtime.get("replacement_policy") != "none"
+        or runtime.get("stop_on_first_non_pass") is not True
+        or type(runtime.get("minimum_free_bytes")) is not int
+        or runtime.get("minimum_free_bytes")
+        != manifest.resources.minimum_free_bytes
+    ):
+        _fail("v25 N=31 coverage runtime sequencing contract drifted")
+    raw_slots = _array(runtime.get("slots"), "v25 N=31 coverage runtime slots")
+    expected_ids = _coverage_smoke_slot_ids(manifest.manifest_id)
+    observed_ids = tuple(
+        _string(
+            _mapping(raw, "v25 N=31 coverage runtime slot").get("slot_id"),
+            "v25 N=31 coverage runtime slot ID",
+        )
+        for raw in raw_slots
+    )
+    if observed_ids != expected_ids:
+        _fail("v25 N=31 coverage runtime slot order is not exact")
+
+    validated: dict[str, Mapping[str, Any]] = {}
+    for slot_id, raw in zip(expected_ids, raw_slots, strict=True):
+        expected = expected_by_id.get(slot_id)
+        if expected is None:
+            _fail("v25 coverage runtime slot is absent from the frozen plan")
+        slot_runtime = _mapping(raw, f"v25 coverage runtime {slot_id}")
+        if slot_runtime.get("result_path") != (
+            f"{_coverage_smoke_result_root(manifest.manifest_id)}/{slot_id}"
+        ):
+            _fail("v25 coverage constituent runtime result path drifted")
+        _validate_runtime_slot(slot_runtime, expected, manifest)
+        validated[slot_id] = slot_runtime
+    return validated
 
 
 def _load_static_contracts(
@@ -2927,7 +3084,7 @@ def _load_static_contracts(
         manifest_id=manifest.manifest_id,
     )
     if coverage_smoke:
-        expected = expected_by_id.get(EXCLUDED_COVERAGE_SMOKE_SLOT_ID)
+        expected = expected_by_id.get(slot_root.name)
         if expected is None:
             _fail("coverage smoke slot is absent from the frozen campaign plan")
         loaded_runtime = _read_json(slot_root, RUNTIME_FILENAME)
@@ -2942,9 +3099,22 @@ def _load_static_contracts(
                 "runtime.json drifted from the exact frozen N=31 coverage "
                 "smoke identity"
             )
+        if manifest.manifest_id == FROZEN_MANIFEST_ID:
+            constituents = _validate_v25_coverage_runtime_document(
+                runtime,
+                manifest=manifest,
+                expected_by_id=expected_by_id,
+            )
+            return (
+                manifest,
+                plan,
+                dict(constituents[slot_root.name]),
+                expected,
+                _sha256(runtime_payload),
+            )
         if runtime.get("result_path") != (
             f"{_coverage_smoke_result_root(manifest.manifest_id)}/"
-            f"{EXCLUDED_COVERAGE_SMOKE_SLOT_ID}"
+            f"{slot_root.name}"
         ):
             _fail("coverage smoke runtime result path drifted")
         _validate_runtime_slot(runtime, expected, manifest)
@@ -3077,6 +3247,9 @@ def _validate_runtime_slot(
     evidence_snapshot_selection = (
         _uses_evidence_snapshot_selection_contract(manifest)
     )
+    inherited_wait_exempt_placement = (
+        _uses_inherited_consensus_wait_exempt_placement_contract(manifest)
+    )
     v24_preselection_contract = _v24_preselection_contract(manifest)
     if (
         manifest.manifest_id
@@ -3086,6 +3259,7 @@ def _validate_runtime_slot(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -3098,6 +3272,7 @@ def _validate_runtime_slot(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -3109,6 +3284,7 @@ def _validate_runtime_slot(
             V21_MANIFEST_ID,
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
+            V24_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -3119,11 +3295,17 @@ def _validate_runtime_slot(
     if manifest.manifest_id in {
         V22_MANIFEST_ID,
         V23_MANIFEST_ID,
+        V24_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
     ):
         _fail("evidence snapshot selection contract drifted")
+    if (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and not inherited_wait_exempt_placement
+    ):
+        _fail("inherited consensus wait-exempt placement contract drifted")
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
     )
@@ -3203,7 +3385,7 @@ def _validate_runtime_slot(
             ] = (
                 FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
                 if manifest.manifest_id
-                in {V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                in {V23_MANIFEST_ID, V24_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             )
         if source_bound_proposal_witnesses:
@@ -3214,6 +3396,10 @@ def _validate_runtime_slot(
             artifact_identity[
                 "evidence_snapshot_selection_contract"
             ] = EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+        if inherited_wait_exempt_placement:
+            artifact_identity[
+                "inherited_consensus_wait_exempt_placement_contract"
+            ] = INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
         if v24_preselection_contract is not None:
             artifact_identity["epoch1_preselection_residency_ms"] = (
                 v24_preselection_contract[0]
@@ -3361,7 +3547,8 @@ def _validate_runtime_slot(
             "future_tree_proposal_delivery_contract"
         ] = (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-            if manifest.manifest_id in {V23_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if manifest.manifest_id
+            in {V23_MANIFEST_ID, V24_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
         )
     if source_bound_proposal_witnesses:
@@ -3372,6 +3559,10 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "evidence_snapshot_selection_contract"
         ] = EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+    if inherited_wait_exempt_placement:
+        expected_causal_acceptance[
+            "inherited_consensus_wait_exempt_placement_contract"
+        ] = INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
     if v24_preselection_contract is not None:
         expected_causal_acceptance["epoch1_preselection_residency_ms"] = (
             v24_preselection_contract[0]
@@ -3455,6 +3646,7 @@ def _validate_runtime_slot(
         V21_MANIFEST_ID,
         V22_MANIFEST_ID,
         V23_MANIFEST_ID,
+        V24_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -7711,7 +7903,7 @@ def _validate_execution_authorization(
         root_authorization_filename: str | None = None
     elif coverage_smoke:
         expected_scope = "excluded_n31_coverage_smoke"
-        expected_slots = [expected.slot_id]
+        expected_slots = list(_coverage_smoke_slot_ids(manifest.manifest_id))
         expected_result_root = _coverage_smoke_result_root(manifest.manifest_id)
         root_authorization_filename = COVERAGE_SMOKE_AUTHORIZATION_FILENAME
     else:
@@ -8998,6 +9190,97 @@ def _validate_successor_trees(
     )
 
 
+def _validate_v25_inherited_wait_exempt_placement_live_exercise(
+    *,
+    manifest_id: str,
+    coverage_smoke: bool,
+    expected: _ExpectedSlot,
+    cycle: int,
+    intent: str,
+    predecessor_trees: Sequence[Tree],
+    successor_trees: Sequence[Tree],
+    scores: Sequence[ReplicaScore],
+) -> bool:
+    """Prove the repaired inherited-placement branch in exact v25 slot037."""
+
+    if (
+        manifest_id != FROZEN_MANIFEST_ID
+        or not coverage_smoke
+        or expected.slot_id != V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]
+    ):
+        return False
+    if (
+        expected.block_id != "n31-f2-b04"
+        or expected.arm_code != "00"
+        or expected.ordinal != 37
+        or expected.execution_ordinal != 5
+        or expected.replica_count != 31
+        or expected.f != 10
+        or expected.q != 21
+        or expected.tree_count != 21
+        or expected.initial_fanout != 2
+        or expected.placement_adaptation
+        or expected.shape_adaptation
+        or expected.actor_ids != (26, 27, 28)
+    ):
+        _fail("v25 slot037 coverage placement proof scope drifted")
+    if cycle != 1 or intent != "fault_containment":
+        _fail("v25 slot037 coverage does not exercise cycle-1 fault containment")
+
+    membership = tuple(range(expected.replica_count))
+    actors = tuple(expected.actor_ids)
+    if not _snapshot_uses_inherited_constraint_suffix(
+        predecessor_trees,
+        membership=membership,
+        required_nonresponsive=len(actors),
+    ):
+        _fail("v25 slot037 coverage lacks inherited selected constraints")
+    inherited = tuple(predecessor_trees[0].wait_exempt)
+    if inherited != actors:
+        _fail("v25 slot037 coverage does not inherit the exact selected actor set")
+
+    scores_by_replica: dict[int, ReplicaScore] = {}
+    for score in scores:
+        if score.replica_id in scores_by_replica:
+            _fail("v25 slot037 selected suffix contains duplicate replica scores")
+        scores_by_replica[score.replica_id] = score
+    if any(
+        actor not in scores_by_replica
+        or scores_by_replica[actor].classification != "responsive"
+        or not scores_by_replica[actor].eligible
+        for actor in actors
+    ):
+        _fail(
+            "v25 slot037 inherited selected actors are not responsive and "
+            "eligible in the selected suffix"
+        )
+
+    if (
+        len(successor_trees) != expected.q
+        or tuple(tree.tree_id for tree in successor_trees)
+        != tuple(range(expected.q))
+    ):
+        _fail("v25 slot037 successor tree set is not exact")
+    for tree in successor_trees:
+        if (
+            tuple(sorted(tree.members)) != membership
+            or len(set(tree.members)) != len(membership)
+            or tree.fanout != expected.initial_fanout
+            or tree.pipeline_stretch != expected.pipeline_stretch
+        ):
+            _fail("v25 slot037 successor topology is not exact")
+        if tuple(tree.wait_exempt) != actors:
+            _fail("v25 slot037 successor wait-exempt set is not exact")
+        leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+        for actor in actors:
+            if tree.members.index(actor) < leaf_start:
+                _fail(
+                    "v25 slot037 inherited selected actor is not a physical "
+                    "leaf in every successor tree"
+                )
+    return True
+
+
 def _activation_identity(payload: Mapping[str, Any], label: str) -> dict[str, Any]:
     """Decode the exact flat payload emitted by native epoch lifecycle events."""
 
@@ -9445,6 +9728,10 @@ def _validate_adaptation_cycles(
     cutoff_times: Mapping[str, int],
 ) -> tuple[DecodedBundle, DecodedBundle, _HierarchyProof]:
     compact_snapshot = manifest.evidence_snapshot_format == "digest_commitment_v2"
+    coverage_smoke = _is_excluded_coverage_smoke_slot(
+        slot_root,
+        manifest_id=manifest.manifest_id,
+    )
     issuer_payload = _read_bytes(slot_root, "runtime/issuer-identities.txt")
     assert issuer_payload is not None
     issuer_public_key = _identity_rows(
@@ -9731,6 +10018,17 @@ def _validate_adaptation_cycles(
             cycle=cycle,
             intent=intent,
         )
+        if cycle == 1:
+            _validate_v25_inherited_wait_exempt_placement_live_exercise(
+                manifest_id=manifest.manifest_id,
+                coverage_smoke=coverage_smoke,
+                expected=expected,
+                cycle=cycle,
+                intent=intent,
+                predecessor_trees=predecessor_trees,
+                successor_trees=bundle.trees,
+                scores=scores,
+            )
         if cycle == 0:
             epoch1_degraded_root_count = structure[0]
             epoch1_degraded_internal_count = structure[1]
@@ -9781,7 +10079,426 @@ def _validate_adaptation_cycles(
     )
 
 
-def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
+def _coverage_validation_document(
+    result: SlotValidationResult,
+) -> dict[str, object]:
+    return {
+        "outcome": result.outcome,
+        "reason": result.reason,
+        "integrity_valid": result.integrity_valid,
+        "campaign_member": result.campaign_member,
+        "figure_eligible": result.figure_eligible,
+    }
+
+
+def _validate_v25_coverage_execution_lifecycle(
+    *,
+    slot_root: Path,
+    manifest: FrozenFactorialManifest,
+    plan: Mapping[str, Any],
+    expected: _ExpectedSlot,
+    runtime_sha256: str,
+    authorization: Mapping[str, Any],
+    authorization_bytes: bytes,
+    build_provenance_bytes: bytes,
+    recorded_result_root: Path,
+    result: SlotValidationResult,
+    predecessor_result: SlotValidationResult | None,
+    allow_predecessor_replay: bool,
+) -> None:
+    """Replay the exact sealed-prefix or completed v25 coverage lifecycle."""
+
+    primary_id, repair_id = V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if (
+        manifest.manifest_id != FROZEN_MANIFEST_ID
+        or expected.slot_id not in V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+        or result.slot_id != expected.slot_id
+    ):
+        _fail("v25 coverage lifecycle is rebound outside its exact slot scope")
+    expected_validation = {
+        "outcome": "PASS",
+        "reason": None,
+        "integrity_valid": True,
+        "campaign_member": False,
+        "figure_eligible": False,
+    }
+    if not _exact_json_value(
+        _coverage_validation_document(result), expected_validation
+    ):
+        _fail("v25 coverage lifecycle current slot is not an independent PASS")
+
+    loaded_manifest = _read_bytes(slot_root, MANIFEST_FILENAME)
+    loaded_plan = _read_json(slot_root, PLAN_FILENAME)
+    loaded_runtime = _read_json(slot_root, RUNTIME_FILENAME)
+    assert (
+        loaded_manifest is not None
+        and loaded_plan is not None
+        and loaded_runtime is not None
+    )
+    plan_document, plan_bytes = loaded_plan
+    runtime_document, runtime_bytes = loaded_runtime
+    if not _exact_json_value(plan_document, plan):
+        _fail("v25 coverage lifecycle plan differs from the validated slot plan")
+    if _sha256(runtime_bytes) != _digest(
+        runtime_sha256, "v25 coverage runtime digest"
+    ):
+        _fail("v25 coverage lifecycle runtime digest drifted")
+    expected_by_id = {
+        item.slot_id: item for item in _expected_slots(manifest)
+    }
+    constituents = _validate_v25_coverage_runtime_document(
+        runtime_document,
+        manifest=manifest,
+        expected_by_id=expected_by_id,
+    )
+    minimum_free_bytes = _integer(
+        runtime_document.get("minimum_free_bytes"),
+        "v25 coverage minimum free bytes",
+        1,
+    )
+    static_payloads = {
+        MANIFEST_FILENAME: loaded_manifest,
+        PLAN_FILENAME: plan_bytes,
+        RUNTIME_FILENAME: runtime_bytes,
+    }
+    static_hashes = {
+        name: _sha256(payload) for name, payload in static_payloads.items()
+    }
+    authorization_static_hashes = dict(
+        _mapping(
+            authorization.get("static_artifacts_sha256"),
+            "v25 coverage authorization static hashes",
+        )
+    )
+    build_provenance_sha256 = _sha256(build_provenance_bytes)
+    if (
+        authorization_static_hashes != static_hashes
+        or authorization.get("build_provenance_sha256")
+        != build_provenance_sha256
+    ):
+        _fail("v25 coverage authorization/static/build identity drifted")
+
+    root = slot_root.parent
+    if root.is_symlink() or not root.is_dir():
+        _fail("v25 coverage root is absent or unsafe")
+    root_authorization = _read_bytes(
+        root, COVERAGE_SMOKE_AUTHORIZATION_FILENAME
+    )
+    assert root_authorization is not None
+    if root_authorization != authorization_bytes:
+        _fail("v25 coverage root authorization differs from the slot receipt")
+    loaded_contract = _read_json(root, COVERAGE_SMOKE_CONTRACT_FILENAME)
+    assert loaded_contract is not None
+    _, contract_bytes = loaded_contract
+    execution_schedule = []
+    for coverage_ordinal, slot_id in enumerate(
+        V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS, 1
+    ):
+        item = expected_by_id.get(slot_id)
+        if item is None:
+            _fail("v25 coverage lifecycle slot is absent from the frozen plan")
+        execution_schedule.append(
+            {
+                "coverage_execution_ordinal": coverage_ordinal,
+                "source_campaign_execution_ordinal": item.execution_ordinal,
+                "slot_id": item.slot_id,
+                "block_id": item.block_id,
+                "arm_code": item.arm_code,
+            }
+        )
+    expected_contract = {
+        "schema_version": 1,
+        "coverage_smoke_id": runtime_document["runtime_id"],
+        "manifest_id": manifest.manifest_id,
+        "manifest_sha256": static_hashes[MANIFEST_FILENAME],
+        "plan_sha256": static_hashes[PLAN_FILENAME],
+        "runtime_sha256": static_hashes[RUNTIME_FILENAME],
+        "authorization_id": authorization["authorization_id"],
+        "authorization_sha256": _sha256(authorization_bytes),
+        "kauri_revision": authorization["kauri_revision"],
+        "build_provenance_sha256": build_provenance_sha256,
+        "execution_mode": "fixed_sequential",
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "stop_on_first_non_pass": True,
+        "minimum_free_bytes": minimum_free_bytes,
+        "expected_slot_count": 2,
+        "execution_schedule": execution_schedule,
+    }
+    if contract_bytes != _canonical_json_bytes(expected_contract):
+        _fail("v25 coverage execution contract differs from the exact schedule")
+
+    ledger_bytes = _read_bytes(root, COVERAGE_SMOKE_LEDGER_FILENAME)
+    assert ledger_bytes is not None
+    if not ledger_bytes or not ledger_bytes.endswith(b"\n"):
+        _incomplete("v25 coverage attempt ledger ends with a partial record")
+    raw_rows = ledger_bytes.splitlines(keepends=True)
+    row_count = len(raw_rows)
+    if expected.slot_id == primary_id:
+        allowed_counts = {1, 2, 4}
+        if allow_predecessor_replay:
+            allowed_counts.add(3)
+    else:
+        if allow_predecessor_replay:
+            _fail("v25 coverage predecessor replay is scoped only to slot066")
+        allowed_counts = {3, 4}
+    if row_count not in allowed_counts:
+        _fail("v25 coverage ledger stage is not exact for the validated slot")
+
+    repair_path = root / repair_id
+    private_prelaunch_replay = (
+        row_count == 3
+        and expected.slot_id == primary_id
+        and allow_predecessor_replay
+        and not repair_path.exists()
+        and not repair_path.is_symlink()
+    )
+    present_slot_ids = (
+        (primary_id,)
+        if row_count <= 2 or private_prelaunch_replay
+        else V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    )
+    expected_root_entries = {
+        BUILD_EVIDENCE_DIRECTORY,
+        COVERAGE_SMOKE_AUTHORIZATION_FILENAME,
+        COVERAGE_SMOKE_CONTRACT_FILENAME,
+        COVERAGE_SMOKE_LEDGER_FILENAME,
+        *present_slot_ids,
+    }
+    actual_root_entries = {path.name: path for path in root.iterdir()}
+    if set(actual_root_entries) != expected_root_entries:
+        _fail("v25 coverage root contains extra or missing lifecycle state")
+    for name, path in actual_root_entries.items():
+        should_be_directory = name == BUILD_EVIDENCE_DIRECTORY or name.startswith(
+            "slot-"
+        )
+        if path.is_symlink() or (
+            should_be_directory and not path.is_dir()
+        ) or (not should_be_directory and not path.is_file()):
+            _fail("v25 coverage root contains unsafe lifecycle state")
+
+    rows: list[Mapping[str, Any]] = []
+    previous_record_sha256 = "0" * 64
+    previous_monotonic_ns = 0
+    previous_utc = _aware_utc(
+        authorization.get("approved_utc"),
+        "v25 coverage authorization UTC",
+    )
+    expected_states = (
+        (primary_id, "STARTED"),
+        (primary_id, "TERMINAL"),
+        (repair_id, "STARTED"),
+        (repair_id, "TERMINAL"),
+    )
+    for index, raw in enumerate(raw_rows):
+        row = _parse_json_bytes(
+            raw, f"{COVERAGE_SMOKE_LEDGER_FILENAME}:{index + 1}"
+        )
+        if raw != _canonical_json_bytes(row):
+            _fail("v25 coverage attempt ledger contains a noncanonical record")
+        slot_id, state = expected_states[index]
+        coverage_ordinal = 1 if index < 2 else 2
+        slot_expected = expected_by_id[slot_id]
+        common = {
+            "schema_version": 1,
+            "coverage_smoke_id": runtime_document["runtime_id"],
+            "manifest_sha256": static_hashes[MANIFEST_FILENAME],
+            "plan_sha256": static_hashes[PLAN_FILENAME],
+            "runtime_sha256": static_hashes[RUNTIME_FILENAME],
+            "contract_sha256": _sha256(contract_bytes),
+            "authorization_id": authorization["authorization_id"],
+            "authorization_sha256": _sha256(authorization_bytes),
+            "kauri_revision": authorization["kauri_revision"],
+            "build_provenance_sha256": build_provenance_sha256,
+            "coverage_execution_ordinal": coverage_ordinal,
+            "source_campaign_execution_ordinal": (
+                slot_expected.execution_ordinal
+            ),
+            "slot_id": slot_expected.slot_id,
+            "block_id": slot_expected.block_id,
+            "arm_code": slot_expected.arm_code,
+            "attempt_ordinal": 1,
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "previous_record_sha256": previous_record_sha256,
+        }
+        if state == "STARTED":
+            fields = set(common) | {
+                "state",
+                "recorded_utc",
+                "recorded_monotonic_ns",
+                "slot_directory",
+                "preflight_revision",
+                "preflight_free_bytes",
+            }
+        else:
+            fields = set(common) | {
+                "state",
+                "recorded_utc",
+                "recorded_monotonic_ns",
+                "slot_directory",
+                "execution_outcome",
+                "execution_reason",
+                "launch_count",
+                "validation",
+            }
+        _fields(row, fields, f"v25 coverage ledger row {index + 1}")
+        if row.get("previous_record_sha256") != previous_record_sha256:
+            _fail("v25 coverage attempt ledger hash chain drifted")
+        if any(
+            not _exact_json_value(row.get(key), value)
+            for key, value in common.items()
+        ) or row.get("state") != state:
+            _fail("v25 coverage ledger schema/identity/order binding drifted")
+        expected_slot_directory = str(recorded_result_root / slot_id)
+        if row.get("slot_directory") != expected_slot_directory:
+            _fail("v25 coverage ledger slot path differs from the exact launch")
+        if state == "STARTED":
+            free_bytes = _integer(
+                row.get("preflight_free_bytes"),
+                f"v25 coverage row {index + 1} preflight free bytes",
+            )
+            if (
+                row.get("preflight_revision")
+                != authorization["kauri_revision"]
+                or free_bytes < minimum_free_bytes
+            ):
+                _fail("v25 coverage STARTED row preflight is below the contract")
+        elif (
+            row.get("execution_outcome") != "PASS"
+            or row.get("execution_reason") is not None
+            or row.get("launch_count") != slot_expected.replica_count + 1
+            or not _exact_json_value(
+                row.get("validation"), expected_validation
+            )
+        ):
+            _fail("v25 coverage sequence contains a non-PASS terminal")
+        recorded_utc = _aware_utc(
+            row.get("recorded_utc"),
+            f"v25 coverage ledger row {index + 1} UTC",
+        )
+        monotonic_ns = _integer(
+            row.get("recorded_monotonic_ns"),
+            f"v25 coverage ledger row {index + 1} monotonic timestamp",
+            1,
+        )
+        if recorded_utc < previous_utc or monotonic_ns <= previous_monotonic_ns:
+            _fail("v25 coverage ledger chronology is not strictly ordered")
+        rows.append(row)
+        previous_utc = recorded_utc
+        previous_monotonic_ns = monotonic_ns
+        previous_record_sha256 = _sha256(raw)
+
+    slot_outcomes: dict[str, tuple[Mapping[str, Any], bytes]] = {}
+    for ordinal, slot_id in enumerate(present_slot_ids, 1):
+        preserved_slot = root / slot_id
+        for name, payload in static_payloads.items():
+            preserved = _read_bytes(preserved_slot, name)
+            assert preserved is not None
+            if preserved != payload:
+                _fail("v25 coverage slots do not share exact static artifacts")
+        preserved_authorization = _read_bytes(
+            preserved_slot, AUTHORIZATION_FILENAME
+        )
+        preserved_build = _read_bytes(
+            preserved_slot, BUILD_PROVENANCE_FILENAME
+        )
+        if (
+            preserved_authorization != authorization_bytes
+            or preserved_build != build_provenance_bytes
+        ):
+            _fail("v25 coverage slot authorization/build identity drifted")
+        preserved_contract = _read_bytes(
+            preserved_slot,
+            COVERAGE_SMOKE_CONTRACT_FILENAME,
+            required=False,
+        )
+        if preserved_contract != contract_bytes:
+            _fail("v25 coverage slot lacks its exact sealed contract")
+        preserved_prefix = _read_bytes(
+            preserved_slot,
+            COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME,
+            required=False,
+        )
+        prefix_count = 1 if ordinal == 1 else 3
+        if preserved_prefix != b"".join(raw_rows[:prefix_count]):
+            _fail("v25 coverage slot lacks its exact prelaunch prefix")
+        predecessor_path = (
+            preserved_slot / COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME
+        )
+        if ordinal == 1:
+            if predecessor_path.exists() or predecessor_path.is_symlink():
+                _fail("v25 primary coverage slot has a predecessor receipt")
+        else:
+            receipt_predecessor_result = predecessor_result
+            if (
+                receipt_predecessor_result is None
+                and result.slot_id == primary_id
+            ):
+                receipt_predecessor_result = result
+            if receipt_predecessor_result is None or not _exact_json_value(
+                _coverage_validation_document(receipt_predecessor_result),
+                expected_validation,
+            ) or receipt_predecessor_result.slot_id != primary_id:
+                _fail("v25 repair coverage lacks an independent predecessor PASS")
+            primary_outcome, primary_outcome_bytes = slot_outcomes[primary_id]
+            sealed_files = dict(
+                _mapping(
+                    primary_outcome.get("sealed_files"),
+                    "v25 coverage predecessor sealed files",
+                )
+            )
+            expected_receipt = {
+                "schema_version": 1,
+                "coverage_smoke_id": runtime_document["runtime_id"],
+                "contract_sha256": _sha256(contract_bytes),
+                "authorization_id": authorization["authorization_id"],
+                "authorization_sha256": _sha256(authorization_bytes),
+                "predecessor_coverage_execution_ordinal": 1,
+                "predecessor_slot_id": primary_id,
+                "predecessor_terminal_record_sha256": _sha256(raw_rows[1]),
+                "predecessor_outcome_sha256": _sha256(primary_outcome_bytes),
+                "predecessor_sealed_files_sha256": _sha256(
+                    _canonical_json_bytes(sealed_files)
+                ),
+                "predecessor_validation": expected_validation,
+            }
+            receipt_bytes = _read_bytes(
+                preserved_slot,
+                COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME,
+                required=False,
+            )
+            if receipt_bytes != _canonical_json_bytes(expected_receipt):
+                _fail(
+                    "v25 coverage predecessor receipt does not reconstruct "
+                    "exactly"
+                )
+        loaded_outcome = _read_json(preserved_slot, OUTCOME_FILENAME)
+        assert loaded_outcome is not None
+        outcome, outcome_bytes = loaded_outcome
+        declared, reason = _validate_outcome(
+            preserved_slot, outcome, slot_id
+        )
+        if declared != "PASS" or reason is not None:
+            _fail("v25 coverage preserved slot outcome is not PASS")
+        slot_outcomes[slot_id] = (outcome, outcome_bytes)
+
+    current_terminal_index = 1 if expected.slot_id == primary_id else 3
+    if row_count > current_terminal_index and not _exact_json_value(
+        _mapping(
+            rows[current_terminal_index].get("validation"),
+            "v25 current coverage terminal validation",
+        ),
+        _coverage_validation_document(result),
+    ):
+        _fail("v25 coverage terminal differs from independent revalidation")
+
+
+def validate_slot(
+    slot_directory: str | Path,
+    *,
+    _coverage_predecessor_replay: bool = False,
+) -> SlotValidationResult:
     """Validate one preserved slot without executing campaign code."""
 
     slot_root = Path(slot_directory)
@@ -9792,6 +10509,11 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
     )
     expected: _ExpectedSlot | None = None
     try:
+        if (
+            _coverage_predecessor_replay
+            and slot_id != V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[0]
+        ):
+            _fail("coverage predecessor replay is scoped only to v25 slot066")
         if slot_root.is_symlink() or not slot_root.is_dir():
             _incomplete("slot directory is absent or is not a regular directory")
         manifest, plan, runtime, expected, runtime_sha256 = _load_static_contracts(slot_root)
@@ -10257,7 +10979,7 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
                 event_contract.get("commit_observer_instance"), "commit observer instance"
             ),
         )
-        return SlotValidationResult(
+        result = SlotValidationResult(
             slot_id=expected.slot_id,
             outcome="PASS",
             reason=None,
@@ -10299,6 +11021,31 @@ def validate_slot(slot_directory: str | Path) -> SlotValidationResult:
             ),
             full_hierarchy_gate_passed=hierarchy.full_gate_passed,
         )
+        if (
+            coverage_smoke
+            and manifest.manifest_id == FROZEN_MANIFEST_ID
+        ):
+            predecessor_result = None
+            if expected.slot_id == V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[1]:
+                predecessor_result = validate_slot(
+                    slot_root.parent / V25_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS[0],
+                    _coverage_predecessor_replay=True,
+                )
+            _validate_v25_coverage_execution_lifecycle(
+                slot_root=slot_root,
+                manifest=manifest,
+                plan=plan,
+                expected=expected,
+                runtime_sha256=runtime_sha256,
+                authorization=authorization,
+                authorization_bytes=authorization_bytes,
+                build_provenance_bytes=build_provenance_bytes,
+                recorded_result_root=recorded_slot_root.parent,
+                result=result,
+                predecessor_result=predecessor_result,
+                allow_predecessor_replay=_coverage_predecessor_replay,
+            )
+        return result
     except _Incomplete as error:
         return SlotValidationResult(
             slot_id=slot_id,

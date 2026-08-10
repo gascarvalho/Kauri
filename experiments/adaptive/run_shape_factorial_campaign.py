@@ -22,17 +22,30 @@ from experiments.adaptive.kauri_experiment.factorial_execution import (  # noqa:
     CAMPAIGN_CONTRACT_FILENAME,
     CAMPAIGN_LEDGER_FILENAME,
     CAMPAIGN_SUMMARY_FILENAME,
+    COVERAGE_SMOKE_AUTHORIZATION_FILENAME,
+    COVERAGE_SMOKE_CONTRACT_FILENAME,
+    COVERAGE_SMOKE_LEDGER_FILENAME,
+    COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME,
+    COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME,
     ExecutionPreflight,
     FactorialExecutionError,
+    N31CoverageSmokeRuntime,
+    N31CoverageSmokeSlot,
     SlotExecutionResult,
     append_campaign_ledger_record,
+    append_coverage_smoke_ledger_record,
     build_campaign_execution_contract,
+    build_coverage_smoke_execution_contract,
+    build_coverage_smoke_started_record,
+    build_coverage_smoke_terminal_record,
     build_execution_authorization_receipt,
     build_n31_coverage_smoke_slot,
     build_n7_ps_smoke_slot,
     execute_slot_once,
+    coverage_smoke_previous_record_sha256,
     preserve_build_evidence,
     publish_campaign_summary,
+    verify_completed_coverage_smoke_sequence,
     verify_evidence_preflight,
 )
 from experiments.adaptive.kauri_experiment.factorial_manifest import (  # noqa: E402
@@ -67,13 +80,10 @@ from experiments.adaptive.kauri_experiment.profiled_fault_runtime import (  # no
 
 
 DEFAULT_MANIFEST = (
-    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v24.json"
+    Path(__file__).resolve().parent / "profiles/shape-placement-factorial-v25.json"
 )
 REPOSITORY = Path(__file__).resolve().parents[2]
 SMOKE_AUTHORIZATION_FILENAME = "smoke-execution-authorization.json"
-COVERAGE_SMOKE_AUTHORIZATION_FILENAME = (
-    "coverage-smoke-execution-authorization.json"
-)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -152,8 +162,40 @@ def _append_canonical_jsonl(path: Path, value: object) -> None:
     append_campaign_ledger_record(path, value)
 
 
-def _direct_runtime_bytes(spec: SlotRuntimeSpec) -> bytes:
+def _direct_runtime_bytes(
+    spec: SlotRuntimeSpec | N31CoverageSmokeRuntime,
+) -> bytes:
     return _canonical_json_bytes(spec.as_document())
+
+
+def _n31_coverage_smoke(plan: FactorialPlan) -> N31CoverageSmokeSlot:
+    primary = next(
+        (slot for slot in plan.slots if slot.execution_ordinal == 1),
+        None,
+    )
+    if primary is None:
+        raise FactorialExecutionError(
+            "coverage smoke requires the exact first campaign slot"
+        )
+    repair = (
+        next(
+            (slot for slot in plan.slots if slot.execution_ordinal == 5),
+            None,
+        )
+        if plan.manifest_id == FROZEN_MANIFEST_ID
+        else None
+    )
+    return build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+
+
+def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
+    primary = "slot-066-n31-f5-b05-P"
+    if manifest_id == FROZEN_MANIFEST_ID:
+        return (primary, "slot-037-n31-f2-b04-00")
+    return (primary,)
 
 
 def _static_artifacts(
@@ -327,21 +369,21 @@ def _require_frozen_artifacts(
     plan: FactorialPlan,
     runtime: FactorialRuntimePlan,
 ) -> bytes:
-    """Fail before any result claim if producer bytes drift from v24."""
+    """Fail before any result claim if producer bytes drift from v25."""
 
     if (
         manifest.manifest_id != FROZEN_MANIFEST_ID
         or manifest.manifest_sha256 != FROZEN_MANIFEST_SHA256
     ):
-        raise FactorialExecutionError("campaign production requires exact frozen v24")
+        raise FactorialExecutionError("campaign production requires exact frozen v25")
     if plan.plan_sha256 != FROZEN_PLAN_SHA256:
         raise FactorialExecutionError(
-            "campaign plan bytes differ from the exact frozen v24 identity"
+            "campaign plan bytes differ from the exact frozen v25 identity"
         )
     payload = canonical_runtime_bytes(runtime)
     if _sha256(payload) != FROZEN_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "campaign runtime bytes differ from the exact frozen v24 identity"
+            "campaign runtime bytes differ from the exact frozen v25 identity"
         )
     return payload
 
@@ -529,43 +571,112 @@ def _require_validated_coverage_smoke(
     expected_revision: str,
     expected_build_provenance: Mapping[str, object],
     expected_static_artifacts_sha256: Mapping[str, str],
+    expected_slot_ids: Sequence[str] = ("slot-066-n31-f5-b05-P",),
+    expected_runtime: N31CoverageSmokeRuntime | None = None,
+    expected_static_artifacts: Mapping[str, bytes] | None = None,
 ) -> SlotValidationResult:
-    slot_root = coverage_smoke_root / "slot-066-n31-f5-b05-P"
-    result = validate_slot(slot_root)
-    if not (
-        result.outcome == "PASS"
-        and result.integrity_valid
-        and not result.campaign_member
-        and not result.figure_eligible
-    ):
+    slot_ids = tuple(expected_slot_ids)
+    if not slot_ids or len(set(slot_ids)) != len(slot_ids):
         raise FactorialExecutionError(
-            "campaign launch requires the canonical excluded N=31 coverage "
-            "smoke to independently validate PASS"
+            "coverage-smoke validation slot sequence is not exact"
         )
-    authorization, _ = _read_canonical_json(
-        slot_root / "execution-authorization.json",
-        "coverage-smoke execution authorization",
-    )
-    build_provenance, _ = _read_canonical_json(
-        slot_root / "runtime/exact-build-provenance.json",
-        "coverage-smoke build provenance",
-    )
-    if (
-        authorization.get("kauri_revision") != expected_revision
-        or build_provenance != dict(expected_build_provenance)
-    ):
-        raise FactorialExecutionError(
-            "campaign launch requires the passing N=31 coverage smoke from "
-            "this exact revision and build provenance"
+    common_authorization_payload: bytes | None = None
+    result: SlotValidationResult | None = None
+    validations: list[SlotValidationResult] = []
+    for slot_id in slot_ids:
+        slot_root = coverage_smoke_root / slot_id
+        result = validate_slot(slot_root)
+        if not (
+            result.outcome == "PASS"
+            and result.integrity_valid
+            and not result.campaign_member
+            and not result.figure_eligible
+        ):
+            raise FactorialExecutionError(
+                "campaign launch requires every canonical excluded N=31 "
+                "coverage-smoke slot to independently validate PASS"
+            )
+        authorization, authorization_payload = _read_canonical_json(
+            slot_root / "execution-authorization.json",
+            "coverage-smoke execution authorization",
         )
-    if authorization.get("static_artifacts_sha256") != dict(
-        expected_static_artifacts_sha256
-    ):
-        raise FactorialExecutionError(
-            "campaign launch requires the passing N=31 coverage smoke from "
-            "the exact frozen static artifacts"
+        build_provenance, _ = _read_canonical_json(
+            slot_root / "runtime/exact-build-provenance.json",
+            "coverage-smoke build provenance",
+        )
+        if (
+            authorization.get("kauri_revision") != expected_revision
+            or authorization.get("slot_ids") != list(slot_ids)
+            or build_provenance != dict(expected_build_provenance)
+        ):
+            raise FactorialExecutionError(
+                "campaign launch requires every passing N=31 coverage-smoke "
+                "slot from this exact revision and build provenance under one "
+                "authorization"
+            )
+        if authorization.get("static_artifacts_sha256") != dict(
+            expected_static_artifacts_sha256
+        ):
+            raise FactorialExecutionError(
+                "campaign launch requires every passing N=31 coverage-smoke "
+                "slot from the exact frozen static artifacts"
+            )
+        if (
+            common_authorization_payload is not None
+            and authorization_payload != common_authorization_payload
+        ):
+            raise FactorialExecutionError(
+                "coverage-smoke slots do not share one exact authorization"
+            )
+        common_authorization_payload = authorization_payload
+        validations.append(result)
+    assert result is not None
+    if len(slot_ids) == 2:
+        if (
+            not isinstance(expected_runtime, N31CoverageSmokeRuntime)
+            or expected_static_artifacts is None
+            or common_authorization_payload is None
+        ):
+            raise FactorialExecutionError(
+                "v25 coverage-smoke gate lacks its ordered runtime/static contract"
+            )
+        _require_completed_coverage_smoke_sequence(
+            coverage_smoke_root,
+            runtime=expected_runtime,
+            static_artifacts=expected_static_artifacts,
+            authorization_payload=common_authorization_payload,
+            build_provenance=expected_build_provenance,
+            validations=validations,
         )
     return result
+
+
+def _require_completed_coverage_smoke_sequence(
+    root: Path,
+    *,
+    runtime: N31CoverageSmokeRuntime,
+    static_artifacts: Mapping[str, bytes],
+    authorization_payload: bytes,
+    build_provenance: Mapping[str, object],
+    validations: Sequence[SlotValidationResult],
+) -> None:
+    """Replay the exact completed two-slot ledger and both sealed prefixes."""
+
+    replayed = verify_completed_coverage_smoke_sequence(
+        root,
+        runtime=runtime,
+        static_artifacts=static_artifacts,
+        authorization_payload=authorization_payload,
+        build_provenance=build_provenance,
+        require_canonical_root=True,
+    )
+    if len(replayed) != len(validations) or any(
+        _validation_document(actual) != _validation_document(expected)
+        for actual, expected in zip(replayed, validations, strict=True)
+    ):
+        raise FactorialExecutionError(
+            "coverage-smoke completed replay differs from the gate validations"
+        )
 
 
 def _validation_document(result: SlotValidationResult) -> dict[str, object]:
@@ -743,7 +854,7 @@ def _run_smoke(
     smoke_runtime_payload = _direct_runtime_bytes(smoke.runtime)
     if _sha256(smoke_runtime_payload) != FROZEN_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "smoke runtime bytes differ from the exact frozen v24 identity"
+            "smoke runtime bytes differ from the exact frozen v25 identity"
         )
     _require_fresh_result_root(smoke_root, "smoke")
     artifacts = _static_artifacts(
@@ -815,19 +926,11 @@ def _run_coverage_smoke(
     coverage_smoke_root: Path,
 ) -> tuple[int, dict[str, object]]:
     _require_authorization_input(arguments)
-    first = next(
-        (slot for slot in plan.slots if slot.execution_ordinal == 1),
-        None,
-    )
-    if first is None:
-        raise FactorialExecutionError(
-            "coverage smoke requires the exact first campaign slot"
-        )
-    coverage = build_n31_coverage_smoke_slot(first)
+    coverage = _n31_coverage_smoke(plan)
     coverage_runtime_payload = _direct_runtime_bytes(coverage.runtime)
     if _sha256(coverage_runtime_payload) != FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256:
         raise FactorialExecutionError(
-            "coverage-smoke runtime bytes differ from the exact frozen v24 identity"
+            "coverage-smoke runtime bytes differ from the exact frozen v25 identity"
         )
     _require_fresh_result_root(coverage_smoke_root, "coverage-smoke")
     artifacts = _static_artifacts(
@@ -857,40 +960,131 @@ def _run_coverage_smoke(
         arguments,
         scope="excluded_n31_coverage_smoke",
         preflight=preflight,
-        slot_ids=(coverage.slot.slot_id,),
+        slot_ids=tuple(slot.slot_id for slot in coverage.slots),
         static_artifacts=artifacts,
     )
+    if not isinstance(coverage.runtime, N31CoverageSmokeRuntime):
+        raise FactorialExecutionError(
+            "v25 coverage-smoke launch lacks the ordered runtime"
+        )
+    contract = build_coverage_smoke_execution_contract(
+        runtime=coverage.runtime,
+        static_artifacts=artifacts,
+        authorization=authorization,
+        authorization_payload=authorization_payload,
+        build_provenance=preflight.build_provenance,
+    )
+    contract_payload = _canonical_json_bytes(contract)
     preserve_build_evidence(
         coverage_smoke_root,
         preflight.build_provenance,
         initial_files={
-            COVERAGE_SMOKE_AUTHORIZATION_FILENAME: authorization_payload
+            COVERAGE_SMOKE_AUTHORIZATION_FILENAME: authorization_payload,
+            COVERAGE_SMOKE_CONTRACT_FILENAME: contract_payload,
         },
     )
-    execution = execute_slot_once(
-        coverage.slot,
-        coverage.runtime,
-        preflight=preflight,
-        static_artifacts=artifacts,
-        authorization_receipt=authorization_payload,
-        campaign_member=False,
-    )
-    validation = validate_slot(execution.slot_directory)
-    accepted = (
-        execution.outcome == "PASS"
-        and validation.outcome == "PASS"
-        and validation.integrity_valid
-        and not validation.campaign_member
-        and not validation.figure_eligible
-    )
+    ledger_path = coverage_smoke_root / COVERAGE_SMOKE_LEDGER_FILENAME
+    attempts: list[dict[str, object]] = []
+    accepted = True
+    stopped_reason: str | None = None
+    for index, (slot, spec) in enumerate(
+        zip(coverage.slots, coverage.runtimes, strict=True)
+    ):
+        current_preflight = preflight
+        if index:
+            current_preflight = _preflight(
+                slot,
+                repository=repository,
+                build_directory=build_directory,
+                build_provenance=build_provenance,
+                result_root=coverage_smoke_root,
+                minimum_free_bytes=runtime.minimum_free_bytes,
+            )
+            if (
+                current_preflight.revision != preflight.revision
+                or current_preflight.build_provenance
+                != preflight.build_provenance
+            ):
+                raise FactorialExecutionError(
+                    "coverage-smoke revision or build provenance drifted "
+                    "between ordered slots"
+                )
+        started = build_coverage_smoke_started_record(
+            runtime=coverage.runtime,
+            spec=spec,
+            coverage_execution_ordinal=index + 1,
+            preflight=current_preflight,
+            static_artifacts=artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_payload,
+            contract_payload=contract_payload,
+            previous_record_sha256=coverage_smoke_previous_record_sha256(
+                ledger_path
+            ),
+            recorded_utc=_utc_now(),
+            recorded_monotonic_ns=time.monotonic_ns(),
+        )
+        append_coverage_smoke_ledger_record(ledger_path, started)
+        execution = execute_slot_once(
+            slot,
+            spec,
+            preflight=current_preflight,
+            static_artifacts=artifacts,
+            authorization_receipt=authorization_payload,
+            campaign_member=False,
+        )
+        validation = _validate_attempt(
+            execution.slot_directory,
+            campaign_member=False,
+        )
+        slot_accepted = (
+            execution.outcome == "PASS"
+            and validation.outcome == "PASS"
+            and validation.integrity_valid
+            and not validation.campaign_member
+            and not validation.figure_eligible
+        )
+        terminal = build_coverage_smoke_terminal_record(
+            runtime=coverage.runtime,
+            spec=spec,
+            coverage_execution_ordinal=index + 1,
+            execution=execution,
+            validation=_validation_document(validation),
+            static_artifacts=artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_payload,
+            contract_payload=contract_payload,
+            build_provenance=current_preflight.build_provenance,
+            previous_record_sha256=coverage_smoke_previous_record_sha256(
+                ledger_path
+            ),
+            recorded_utc=_utc_now(),
+            recorded_monotonic_ns=time.monotonic_ns(),
+        )
+        append_coverage_smoke_ledger_record(ledger_path, terminal)
+        attempts.append(
+            {
+                "slot_directory": str(execution.slot_directory),
+                "execution_outcome": execution.outcome,
+                "execution_reason": execution.reason,
+                "validation": _validation_document(validation),
+            }
+        )
+        if not slot_accepted:
+            accepted = False
+            stopped_reason = (
+                f"coverage-smoke slot {slot.slot_id} did not independently "
+                "validate PASS"
+            )
+            break
     return (
         0 if accepted else 1,
         {
             "command": "coverage-smoke",
-            "slot_directory": str(execution.slot_directory),
-            "execution_outcome": execution.outcome,
-            "execution_reason": execution.reason,
-            "validation": _validation_document(validation),
+            "attempted_slot_count": len(attempts),
+            "expected_slot_count": len(coverage.slots),
+            "attempts": attempts,
+            "stopped_reason": stopped_reason,
             "authorization_id": authorization["authorization_id"],
             "authorization_sha256": _sha256(authorization_payload),
             "campaign_member": False,
@@ -937,6 +1131,16 @@ def _run_campaign(
             "runtime.json": FROZEN_SMOKE_RUNTIME_SHA256,
         },
     )
+    coverage = _n31_coverage_smoke(plan)
+    if not isinstance(coverage.runtime, N31CoverageSmokeRuntime):
+        raise FactorialExecutionError(
+            "v25 campaign gate lacks the ordered coverage-smoke runtime"
+        )
+    coverage_artifacts = _static_artifacts(
+        arguments.manifest.resolve(),
+        plan,
+        _direct_runtime_bytes(coverage.runtime),
+    )
     _require_validated_coverage_smoke(
         coverage_smoke_root,
         expected_revision=first_preflight.revision,
@@ -946,6 +1150,9 @@ def _run_campaign(
             "plan.json": FROZEN_PLAN_SHA256,
             "runtime.json": FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
         },
+        expected_slot_ids=tuple(slot.slot_id for slot in coverage.slots),
+        expected_runtime=coverage.runtime,
+        expected_static_artifacts=coverage_artifacts,
     )
     authorization_payload, authorization = _authorization_receipt(
         arguments,
@@ -1141,25 +1348,109 @@ def main(argv: Sequence[str] | None = None) -> int:
                     and not result.figure_eligible
                 ) else 1
             if arguments.command == "validate-coverage-smoke":
-                slot_directory = (
-                    coverage_smoke_root / "slot-066-n31-f5-b05-P"
-                )
-                result = validate_slot(slot_directory)
-                _emit(
-                    {
+                slot_ids = _coverage_smoke_slot_ids(manifest.manifest_id)
+                if manifest.manifest_id == FROZEN_MANIFEST_ID:
+                    plan = build_factorial_plan(manifest)
+                    coverage = _n31_coverage_smoke(plan)
+                    if not isinstance(
+                        coverage.runtime,
+                        N31CoverageSmokeRuntime,
+                    ):
+                        raise FactorialExecutionError(
+                            "v25 coverage validation lacks the ordered runtime"
+                        )
+                    static_artifacts = _static_artifacts(
+                        manifest_path,
+                        plan,
+                        _direct_runtime_bytes(coverage.runtime),
+                    )
+                    authorization_path = (
+                        coverage_smoke_root
+                        / COVERAGE_SMOKE_AUTHORIZATION_FILENAME
+                    )
+                    if (
+                        authorization_path.is_symlink()
+                        or not authorization_path.is_file()
+                    ):
+                        raise FactorialExecutionError(
+                            "coverage-smoke root authorization is absent or unsafe"
+                        )
+                    authorization_payload = authorization_path.read_bytes()
+                    build_document, _ = _read_canonical_json(
+                        coverage_smoke_root
+                        / slot_ids[0]
+                        / "runtime/exact-build-provenance.json",
+                        "coverage-smoke build provenance",
+                    )
+                    replayed = verify_completed_coverage_smoke_sequence(
+                        coverage_smoke_root,
+                        runtime=coverage.runtime,
+                        static_artifacts=static_artifacts,
+                        authorization_payload=authorization_payload,
+                        build_provenance=build_document,
+                    )
+                    validations = [
+                        {
+                            "slot_directory": str(coverage_smoke_root / slot_id),
+                            "validation": asdict(result),
+                        }
+                        for slot_id, result in zip(
+                            slot_ids,
+                            replayed,
+                            strict=True,
+                        )
+                    ]
+                    _emit(
+                        {
+                            "command": "validate-coverage-smoke",
+                            "expected_slot_count": len(slot_ids),
+                            "validated_slot_count": len(validations),
+                            "validations": validations,
+                            "sequence_integrity_valid": True,
+                            "figure_eligible": False,
+                        },
+                        stream=sys.stdout,
+                    )
+                    return 0
+                validations: list[dict[str, object]] = []
+                accepted = True
+                for slot_id in slot_ids:
+                    slot_directory = coverage_smoke_root / slot_id
+                    result = _validate_attempt(
+                        slot_directory,
+                        campaign_member=False,
+                    )
+                    slot_accepted = (
+                        result.outcome == "PASS"
+                        and result.integrity_valid
+                        and not result.campaign_member
+                        and not result.figure_eligible
+                    )
+                    validations.append(
+                        {
+                            "slot_directory": str(slot_directory),
+                            "validation": asdict(result),
+                        }
+                    )
+                    if not slot_accepted:
+                        accepted = False
+                        break
+                if len(slot_ids) == 1:
+                    output = {
                         "command": "validate-coverage-smoke",
-                        "slot_directory": str(slot_directory),
-                        "validation": asdict(result),
+                        **validations[0],
                         "figure_eligible": False,
-                    },
-                    stream=sys.stdout,
-                )
-                return 0 if (
-                    result.outcome == "PASS"
-                    and result.integrity_valid
-                    and not result.campaign_member
-                    and not result.figure_eligible
-                ) else 1
+                    }
+                else:
+                    output = {
+                        "command": "validate-coverage-smoke",
+                        "expected_slot_count": len(slot_ids),
+                        "validated_slot_count": len(validations),
+                        "validations": validations,
+                        "figure_eligible": False,
+                    }
+                _emit(output, stream=sys.stdout)
+                return 0 if accepted else 1
             result = validate_campaign(campaign_root)
             ledger_path = campaign_root / CAMPAIGN_LEDGER_FILENAME
             ledger_sha256 = (
@@ -1182,8 +1473,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) else 1
         if manifest.manifest_id != FROZEN_MANIFEST_ID:
             raise FactorialExecutionError(
-                "shape-placement-factorial-v1 through v23 are validation-only; "
-                "production commands require shape-placement-factorial-v24"
+                "shape-placement-factorial-v1 through v24 are validation-only; "
+                "production commands require shape-placement-factorial-v25"
             )
         plan = build_factorial_plan(manifest)
         runtime = build_factorial_runtime(plan)
@@ -1210,7 +1501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target_runtime_sha256 = _sha256(smoke_runtime_payload)
                 if target_runtime_sha256 != FROZEN_SMOKE_RUNTIME_SHA256:
                     raise FactorialExecutionError(
-                        "smoke runtime bytes differ from the exact frozen v24 identity"
+                        "smoke runtime bytes differ from the exact frozen v25 identity"
                     )
                 preflight_root = smoke_root
                 target_runtime_id = smoke.runtime.artifact_id
@@ -1221,10 +1512,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     slots=(smoke.runtime,),
                 )
             elif arguments.preflight_target == "coverage-smoke":
-                first = next(
-                    slot for slot in plan.slots if slot.execution_ordinal == 1
-                )
-                coverage = build_n31_coverage_smoke_slot(first)
+                coverage = _n31_coverage_smoke(plan)
                 coverage_runtime_payload = _direct_runtime_bytes(coverage.runtime)
                 target_runtime_sha256 = _sha256(coverage_runtime_payload)
                 if (
@@ -1233,10 +1521,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ):
                     raise FactorialExecutionError(
                         "coverage-smoke runtime bytes differ from the exact "
-                        "frozen v24 identity"
+                        "frozen v25 identity"
                     )
                 preflight_root = coverage_smoke_root
-                target_runtime_id = coverage.runtime.artifact_id
+                target_runtime_id = (
+                    coverage.runtime.runtime_id
+                    if isinstance(coverage.runtime, N31CoverageSmokeRuntime)
+                    else coverage.runtime.artifact_id
+                )
                 preflight_runtime = replace(
                     runtime,
                     runtime_id=(
@@ -1244,7 +1536,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "smoke-preflight-v1"
                     ),
                     results_root=Path(coverage.slot.result_path).parent.as_posix(),
-                    slots=(coverage.runtime,),
+                    slots=coverage.runtimes,
                 )
             pure = runtime_preflight(
                 preflight_runtime,

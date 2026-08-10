@@ -35,8 +35,10 @@ from .factorial_manifest import (
     FactorialArm,
     FactorialManifestError,
     FactorialSlot,
+    FROZEN_MANIFEST_ID,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1,
     FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+    INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1,
     PRECONTAINMENT_FAULT_COVERAGE_GATE_V1,
     PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1,
     PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1,
@@ -93,6 +95,17 @@ CAMPAIGN_AUTHORIZATION_FILENAME = "campaign-authorization.json"
 CAMPAIGN_CONTRACT_FILENAME = "campaign-execution-contract.json"
 CAMPAIGN_LEDGER_FILENAME = "campaign-attempt-ledger.jsonl"
 CAMPAIGN_SUMMARY_FILENAME = "campaign-execution-summary.json"
+COVERAGE_SMOKE_CONTRACT_FILENAME = "coverage-smoke-execution-contract.json"
+COVERAGE_SMOKE_LEDGER_FILENAME = "coverage-smoke-attempt-ledger.jsonl"
+COVERAGE_SMOKE_AUTHORIZATION_FILENAME = (
+    "coverage-smoke-execution-authorization.json"
+)
+COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME = (
+    "coverage-smoke-prelaunch-ledger-prefix.jsonl"
+)
+COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME = (
+    "coverage-smoke-predecessor-receipt.json"
+)
 MAX_CAMPAIGN_ROOT_ARTIFACT_BYTES = 4 << 20
 _BUILD_EVIDENCE_GROUPS = {
     "binaries": "binaries",
@@ -199,14 +212,51 @@ class N7SmokeSlot:
 
 @dataclass(frozen=True, slots=True)
 class N31CoverageSmokeSlot:
-    """Excluded N=31 precontainment-coverage proof using campaign slot 066."""
+    """Excluded N=31 coverage proof with an exact versioned slot sequence."""
 
     slot: FactorialSlot
-    runtime: SlotRuntimeSpec
+    runtime: SlotRuntimeSpec | N31CoverageSmokeRuntime
+    slots: tuple[FactorialSlot, ...]
+    runtimes: tuple[SlotRuntimeSpec, ...]
     campaign_member: bool = False
     figure_eligible: bool = False
     denominator_contribution: int = 0
     source_campaign_slot_id: str = "slot-066-n31-f5-b05-P"
+
+
+@dataclass(frozen=True, slots=True)
+class N31CoverageSmokeRuntime:
+    """Canonical ordered runtime identity for the v25 two-slot proof."""
+
+    schema_version: int
+    runtime_id: str
+    manifest_id: str
+    execution_mode: str
+    automatic_retries: int
+    replacement_policy: str
+    stop_on_first_non_pass: bool
+    minimum_free_bytes: int
+    slots: tuple[SlotRuntimeSpec, ...]
+
+    def as_document(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "runtime_id": self.runtime_id,
+            "manifest_id": self.manifest_id,
+            "execution_mode": self.execution_mode,
+            "automatic_retries": self.automatic_retries,
+            "replacement_policy": self.replacement_policy,
+            "stop_on_first_non_pass": self.stop_on_first_non_pass,
+            "minimum_free_bytes": self.minimum_free_bytes,
+            "slots": [slot.as_document() for slot in self.slots],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageSmokeLaunchBinding:
+    contract_payload: bytes
+    ledger_prefix_payload: bytes
+    predecessor_receipt_payload: bytes | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +459,116 @@ def append_campaign_ledger_record(path: Path, value: object) -> None:
             with os.fdopen(descriptor, "ab") as output:
                 descriptor = -1
                 output.write(_canonical_json_bytes(value))
+                output.flush()
+                os.fsync(output.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        _assert_campaign_root_identity(root, root_descriptor)
+    finally:
+        _release_campaign_root_lock(root_descriptor)
+
+
+def coverage_smoke_previous_record_sha256(path: Path) -> str:
+    """Return the exact hash-chain head for a canonical coverage ledger."""
+
+    path = Path(path)
+    if path.name != COVERAGE_SMOKE_LEDGER_FILENAME:
+        raise FactorialExecutionError("coverage-smoke ledger path is not exact")
+    if path.is_symlink():
+        raise FactorialExecutionError(
+            "coverage-smoke attempt ledger must not be a symlink"
+        )
+    if not path.exists():
+        return "0" * 64
+    payload = _read_stable_regular_file(path, "coverage-smoke attempt ledger")
+    if not payload or not payload.endswith(b"\n"):
+        raise FactorialExecutionError(
+            "coverage-smoke attempt ledger is not complete canonical JSONL"
+        )
+    rows = payload.splitlines(keepends=True)
+    previous = "0" * 64
+    for index, raw in enumerate(rows, 1):
+        row = _parse_canonical_object(
+            raw,
+            f"coverage-smoke attempt ledger row {index}",
+        )
+        if row.get("previous_record_sha256") != previous:
+            raise FactorialExecutionError(
+                "coverage-smoke attempt ledger hash chain drifted"
+            )
+        previous = _sha256_bytes(raw)
+    return previous
+
+
+def append_coverage_smoke_ledger_record(path: Path, value: object) -> None:
+    """Append one exact hash-chained coverage row under the root lock."""
+
+    path = Path(path)
+    if path.name != COVERAGE_SMOKE_LEDGER_FILENAME:
+        raise FactorialExecutionError("coverage-smoke ledger path is not exact")
+    root = path.parent
+    root_descriptor = _acquire_campaign_root_lock(root)
+    try:
+        _assert_campaign_root_identity(root, root_descriptor)
+        if path.is_symlink():
+            raise FactorialExecutionError(
+                "coverage-smoke attempt ledger must not be a symlink"
+            )
+        if path.exists() and not stat.S_ISREG(path.stat().st_mode):
+            raise FactorialExecutionError(
+                "coverage-smoke attempt ledger must be a regular file"
+            )
+        existing = path.read_bytes() if path.exists() else b""
+        rows = existing.splitlines(keepends=True)
+        if existing and (not existing.endswith(b"\n") or len(rows) > 3):
+            raise FactorialExecutionError(
+                "coverage-smoke attempt ledger prefix is not appendable"
+            )
+        previous = "0" * 64
+        for index, raw in enumerate(rows, 1):
+            prior = _parse_canonical_object(
+                raw,
+                f"coverage-smoke attempt ledger row {index}",
+            )
+            if prior.get("previous_record_sha256") != previous:
+                raise FactorialExecutionError(
+                    "coverage-smoke attempt ledger hash chain drifted"
+                )
+            previous = _sha256_bytes(raw)
+        payload = _canonical_json_bytes(value)
+        document = _parse_canonical_object(
+            payload,
+            "coverage-smoke attempt ledger append",
+        )
+        expected_sequence = (
+            ("slot-066-n31-f5-b05-P", "STARTED"),
+            ("slot-066-n31-f5-b05-P", "TERMINAL"),
+            ("slot-037-n31-f2-b04-00", "STARTED"),
+            ("slot-037-n31-f2-b04-00", "TERMINAL"),
+        )
+        if (
+            len(rows) >= len(expected_sequence)
+            or (document.get("slot_id"), document.get("state"))
+            != expected_sequence[len(rows)]
+            or document.get("coverage_execution_ordinal")
+            != (1 if len(rows) < 2 else 2)
+            or document.get("previous_record_sha256") != previous
+        ):
+            raise FactorialExecutionError(
+                "coverage-smoke attempt ledger append order drifted"
+            )
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_APPEND
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "ab") as output:
+                descriptor = -1
+                output.write(payload)
                 output.flush()
                 os.fsync(output.fileno())
         finally:
@@ -1141,6 +1301,237 @@ def build_campaign_execution_contract(
         ) from error
 
 
+def build_coverage_smoke_execution_contract(
+    *,
+    runtime: N31CoverageSmokeRuntime,
+    static_artifacts: Mapping[str, bytes],
+    authorization: Mapping[str, object],
+    authorization_payload: bytes,
+    build_provenance: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind the exact two-slot coverage sequence before either launch."""
+
+    if not isinstance(runtime, N31CoverageSmokeRuntime):
+        raise FactorialExecutionError(
+            "v25 coverage-smoke contract requires the ordered runtime"
+        )
+    if set(static_artifacts) != {"manifest.json", "plan.json", "runtime.json"}:
+        raise FactorialExecutionError(
+            "coverage-smoke contract static artifacts drifted"
+        )
+    slots = runtime.slots
+    if (
+        runtime.schema_version != 1
+        or runtime.manifest_id != FROZEN_MANIFEST_ID
+        or runtime.execution_mode != "fixed_sequential"
+        or runtime.automatic_retries != 0
+        or runtime.replacement_policy != "none"
+        or runtime.stop_on_first_non_pass is not True
+        or runtime.minimum_free_bytes != 10_000_000_000
+        or tuple(slot.slot_id for slot in slots)
+        != ("slot-066-n31-f5-b05-P", "slot-037-n31-f2-b04-00")
+        or tuple(slot.execution_ordinal for slot in slots) != (1, 5)
+        or authorization.get("slot_ids")
+        != ["slot-066-n31-f5-b05-P", "slot-037-n31-f2-b04-00"]
+    ):
+        raise FactorialExecutionError(
+            "coverage-smoke contract order or execution policy drifted"
+        )
+    try:
+        return {
+            "schema_version": 1,
+            "coverage_smoke_id": runtime.runtime_id,
+            "manifest_id": runtime.manifest_id,
+            "manifest_sha256": _sha256_bytes(static_artifacts["manifest.json"]),
+            "plan_sha256": _sha256_bytes(static_artifacts["plan.json"]),
+            "runtime_sha256": _sha256_bytes(static_artifacts["runtime.json"]),
+            "authorization_id": authorization["authorization_id"],
+            "authorization_sha256": _sha256_bytes(authorization_payload),
+            "kauri_revision": authorization["kauri_revision"],
+            "build_provenance_sha256": _sha256_bytes(
+                _canonical_json_bytes(build_provenance)
+            ),
+            "execution_mode": runtime.execution_mode,
+            "automatic_retries": runtime.automatic_retries,
+            "replacement_policy": runtime.replacement_policy,
+            "stop_on_first_non_pass": runtime.stop_on_first_non_pass,
+            "minimum_free_bytes": runtime.minimum_free_bytes,
+            "expected_slot_count": len(slots),
+            "execution_schedule": [
+                {
+                    "coverage_execution_ordinal": index,
+                    "source_campaign_execution_ordinal": slot.execution_ordinal,
+                    "slot_id": slot.slot_id,
+                    "block_id": slot.block_id,
+                    "arm_code": slot.arm_code,
+                }
+                for index, slot in enumerate(slots, 1)
+            ],
+        }
+    except KeyError as error:
+        raise FactorialExecutionError(
+            "coverage-smoke authorization is malformed"
+        ) from error
+
+
+def _coverage_smoke_ledger_common(
+    *,
+    runtime: N31CoverageSmokeRuntime,
+    spec: SlotRuntimeSpec,
+    coverage_execution_ordinal: int,
+    static_artifacts: Mapping[str, bytes],
+    authorization: Mapping[str, object],
+    authorization_payload: bytes,
+    contract_payload: bytes,
+    build_provenance: Mapping[str, object],
+    previous_record_sha256: str,
+) -> dict[str, object]:
+    if (
+        coverage_execution_ordinal not in {1, 2}
+        or runtime.slots[coverage_execution_ordinal - 1] != spec
+        or len(previous_record_sha256) != 64
+        or any(character not in _HEX_DIGITS for character in previous_record_sha256)
+    ):
+        raise FactorialExecutionError(
+            "coverage-smoke ledger identity or hash-chain predecessor drifted"
+        )
+    return {
+        "schema_version": 1,
+        "coverage_smoke_id": runtime.runtime_id,
+        "manifest_sha256": _sha256_bytes(static_artifacts["manifest.json"]),
+        "plan_sha256": _sha256_bytes(static_artifacts["plan.json"]),
+        "runtime_sha256": _sha256_bytes(static_artifacts["runtime.json"]),
+        "contract_sha256": _sha256_bytes(contract_payload),
+        "authorization_id": authorization["authorization_id"],
+        "authorization_sha256": _sha256_bytes(authorization_payload),
+        "kauri_revision": authorization["kauri_revision"],
+        "build_provenance_sha256": _sha256_bytes(
+            _canonical_json_bytes(build_provenance)
+        ),
+        "coverage_execution_ordinal": coverage_execution_ordinal,
+        "source_campaign_execution_ordinal": spec.execution_ordinal,
+        "slot_id": spec.slot_id,
+        "block_id": spec.block_id,
+        "arm_code": spec.arm_code,
+        "attempt_ordinal": 1,
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "previous_record_sha256": previous_record_sha256,
+    }
+
+
+def build_coverage_smoke_started_record(
+    *,
+    runtime: N31CoverageSmokeRuntime,
+    spec: SlotRuntimeSpec,
+    coverage_execution_ordinal: int,
+    preflight: ExecutionPreflight,
+    static_artifacts: Mapping[str, bytes],
+    authorization: Mapping[str, object],
+    authorization_payload: bytes,
+    contract_payload: bytes,
+    previous_record_sha256: str,
+    recorded_utc: str,
+    recorded_monotonic_ns: int,
+) -> dict[str, object]:
+    return {
+        **_coverage_smoke_ledger_common(
+            runtime=runtime,
+            spec=spec,
+            coverage_execution_ordinal=coverage_execution_ordinal,
+            static_artifacts=static_artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_payload,
+            contract_payload=contract_payload,
+            build_provenance=preflight.build_provenance,
+            previous_record_sha256=previous_record_sha256,
+        ),
+        "state": "STARTED",
+        "recorded_utc": recorded_utc,
+        "recorded_monotonic_ns": recorded_monotonic_ns,
+        "slot_directory": str(preflight.slot_directory),
+        "preflight_revision": preflight.revision,
+        "preflight_free_bytes": preflight.free_bytes,
+    }
+
+
+def build_coverage_smoke_terminal_record(
+    *,
+    runtime: N31CoverageSmokeRuntime,
+    spec: SlotRuntimeSpec,
+    coverage_execution_ordinal: int,
+    execution: SlotExecutionResult,
+    validation: Mapping[str, object],
+    static_artifacts: Mapping[str, bytes],
+    authorization: Mapping[str, object],
+    authorization_payload: bytes,
+    contract_payload: bytes,
+    build_provenance: Mapping[str, object],
+    previous_record_sha256: str,
+    recorded_utc: str,
+    recorded_monotonic_ns: int,
+) -> dict[str, object]:
+    return {
+        **_coverage_smoke_ledger_common(
+            runtime=runtime,
+            spec=spec,
+            coverage_execution_ordinal=coverage_execution_ordinal,
+            static_artifacts=static_artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_payload,
+            contract_payload=contract_payload,
+            build_provenance=build_provenance,
+            previous_record_sha256=previous_record_sha256,
+        ),
+        "state": "TERMINAL",
+        "recorded_utc": recorded_utc,
+        "recorded_monotonic_ns": recorded_monotonic_ns,
+        "slot_directory": str(execution.slot_directory),
+        "execution_outcome": execution.outcome,
+        "execution_reason": execution.reason,
+        "launch_count": execution.launch_count,
+        "validation": dict(validation),
+    }
+
+
+def _coverage_predecessor_receipt_payload(
+    *,
+    runtime: N31CoverageSmokeRuntime,
+    authorization: Mapping[str, object],
+    authorization_payload: bytes,
+    contract_payload: bytes,
+    predecessor_coverage_execution_ordinal: int,
+    predecessor_spec: SlotRuntimeSpec,
+    predecessor_terminal_raw: bytes,
+    predecessor_outcome_payload: bytes,
+    predecessor_sealed_files: Mapping[str, object],
+    predecessor_validation: Mapping[str, object],
+) -> bytes:
+    return _canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "coverage_smoke_id": runtime.runtime_id,
+            "contract_sha256": _sha256_bytes(contract_payload),
+            "authorization_id": authorization["authorization_id"],
+            "authorization_sha256": _sha256_bytes(authorization_payload),
+            "predecessor_coverage_execution_ordinal": (
+                predecessor_coverage_execution_ordinal
+            ),
+            "predecessor_slot_id": predecessor_spec.slot_id,
+            "predecessor_terminal_record_sha256": _sha256_bytes(
+                predecessor_terminal_raw
+            ),
+            "predecessor_outcome_sha256": _sha256_bytes(
+                predecessor_outcome_payload
+            ),
+            "predecessor_sealed_files_sha256": _sha256_bytes(
+                _canonical_json_bytes(dict(predecessor_sealed_files))
+            ),
+            "predecessor_validation": dict(predecessor_validation),
+        }
+    )
+
+
 def _bind_execution_authorization(
     payload: bytes,
     *,
@@ -1185,11 +1576,21 @@ def _bind_execution_authorization(
             else "excluded_n31_coverage_smoke"
         )
     )
-    expected_slots = (
-        [planned.slot_id for planned in plan.slots]
-        if campaign_member
-        else [slot.slot_id]
-    )
+    if campaign_member:
+        expected_slots = [planned.slot_id for planned in plan.slots]
+    elif slot.replica_count == 31 and manifest.manifest_id == FROZEN_MANIFEST_ID:
+        expected_slots = [
+            item.slot_id
+            for execution_ordinal in (1, 5)
+            for item in plan.slots
+            if item.execution_ordinal == execution_ordinal
+        ]
+        if len(expected_slots) != 2 or slot.slot_id not in expected_slots:
+            raise FactorialExecutionError(
+                "v25 coverage-smoke authorization slot sequence drifted"
+            )
+    else:
+        expected_slots = [slot.slot_id]
     expected_hashes = {
         name: _sha256_bytes(static_artifacts[name])
         for name in sorted(static_artifacts)
@@ -1553,6 +1954,706 @@ def _validate_campaign_launch_order(
             previous_monotonic_ns = monotonic_ns
 
 
+def _validate_coverage_smoke_launch_order(
+    *,
+    spec: SlotRuntimeSpec,
+    preflight: ExecutionPreflight,
+    static_artifacts: Mapping[str, bytes],
+    authorization_receipt: bytes,
+    authorization: Mapping[str, object],
+) -> CoverageSmokeLaunchBinding:
+    """Replay the exact v25 coverage prefix before creating the next slot."""
+
+    root = preflight.result_root
+    if root.is_symlink() or not root.is_dir():
+        raise FactorialExecutionError(
+            "coverage-smoke result root is not a safe directory"
+        )
+    preserved_authorization = _read_stable_regular_file(
+        root / COVERAGE_SMOKE_AUTHORIZATION_FILENAME,
+        "coverage-smoke authorization",
+    )
+    if preserved_authorization != authorization_receipt:
+        raise FactorialExecutionError(
+            "coverage-smoke root authorization differs from the launch receipt"
+        )
+    try:
+        manifest = load_frozen_manifest_bytes(static_artifacts["manifest.json"])
+        plan = build_factorial_plan(manifest)
+        primary = next(
+            item for item in plan.slots if item.execution_ordinal == 1
+        )
+        repair = next(item for item in plan.slots if item.execution_ordinal == 5)
+        coverage = build_n31_coverage_smoke_slot(
+            primary,
+            repair_template=repair,
+        )
+    except (KeyError, StopIteration, FactorialManifestError) as error:
+        raise FactorialExecutionError(
+            "coverage-smoke launch order cannot derive the frozen runtime"
+        ) from error
+    if not isinstance(coverage.runtime, N31CoverageSmokeRuntime):
+        raise FactorialExecutionError(
+            "coverage-smoke launch order lacks the ordered runtime"
+        )
+    try:
+        coverage_execution_ordinal = coverage.runtimes.index(spec) + 1
+    except ValueError as error:
+        raise FactorialExecutionError(
+            "coverage-smoke runtime is not an exact ordered member"
+        ) from error
+    expected_contract = build_coverage_smoke_execution_contract(
+        runtime=coverage.runtime,
+        static_artifacts=static_artifacts,
+        authorization=authorization,
+        authorization_payload=authorization_receipt,
+        build_provenance=preflight.build_provenance,
+    )
+    contract_payload = _read_stable_regular_file(
+        root / COVERAGE_SMOKE_CONTRACT_FILENAME,
+        "coverage-smoke execution contract",
+    )
+    if contract_payload != _canonical_json_bytes(expected_contract):
+        raise FactorialExecutionError(
+            "coverage-smoke execution contract differs from the exact schedule"
+        )
+    ledger_payload = _read_stable_regular_file(
+        root / COVERAGE_SMOKE_LEDGER_FILENAME,
+        "coverage-smoke attempt ledger",
+    )
+    if not ledger_payload or not ledger_payload.endswith(b"\n"):
+        raise FactorialExecutionError(
+            "coverage-smoke attempt ledger has no complete STARTED record"
+        )
+    raw_rows = ledger_payload.splitlines(keepends=True)
+    expected_row_count = coverage_execution_ordinal * 2 - 1
+    if len(raw_rows) != expected_row_count:
+        raise FactorialExecutionError(
+            "coverage-smoke ledger is not the exact next-slot prefix"
+        )
+    rows = [
+        _parse_canonical_object(
+            raw,
+            f"coverage-smoke attempt ledger row {index}",
+        )
+        for index, raw in enumerate(raw_rows, 1)
+    ]
+    expected_root_entries = {
+        BUILD_EVIDENCE_DIRECTORY,
+        COVERAGE_SMOKE_AUTHORIZATION_FILENAME,
+        COVERAGE_SMOKE_CONTRACT_FILENAME,
+        COVERAGE_SMOKE_LEDGER_FILENAME,
+        *(
+            item.slot_id
+            for item in coverage.slots[: coverage_execution_ordinal - 1]
+        ),
+    }
+    actual_root_entries = {path.name: path for path in root.iterdir()}
+    if set(actual_root_entries) != expected_root_entries:
+        raise FactorialExecutionError(
+            "coverage-smoke root is not the exact completed-slot prefix"
+        )
+    for name, path in actual_root_entries.items():
+        should_be_directory = name == BUILD_EVIDENCE_DIRECTORY or name.startswith(
+            "slot-"
+        )
+        if path.is_symlink() or (
+            should_be_directory and not path.is_dir()
+        ) or (not should_be_directory and not path.is_file()):
+            raise FactorialExecutionError(
+                "coverage-smoke root contains an unsafe prefix artifact"
+            )
+    expected_validation = {
+        "outcome": "PASS",
+        "reason": None,
+        "integrity_valid": True,
+        "campaign_member": False,
+        "figure_eligible": False,
+    }
+    previous_record_sha256 = "0" * 64
+    previous_monotonic_ns = 0
+    predecessor_receipt_payload: bytes | None = None
+    for ordinal in range(1, coverage_execution_ordinal + 1):
+        expected = coverage.runtimes[ordinal - 1]
+        expected_common = _coverage_smoke_ledger_common(
+            runtime=coverage.runtime,
+            spec=expected,
+            coverage_execution_ordinal=ordinal,
+            static_artifacts=static_artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_receipt,
+            contract_payload=contract_payload,
+            build_provenance=preflight.build_provenance,
+            previous_record_sha256=previous_record_sha256,
+        )
+        started = rows[(ordinal - 1) * 2]
+        started_fields = set(expected_common) | {
+            "state",
+            "recorded_utc",
+            "recorded_monotonic_ns",
+            "slot_directory",
+            "preflight_revision",
+            "preflight_free_bytes",
+        }
+        if set(started) != started_fields or any(
+            not _exact_json_value(started.get(key), value)
+            for key, value in expected_common.items()
+        ):
+            raise FactorialExecutionError(
+                "coverage-smoke STARTED ledger identity/order binding drifted"
+            )
+        if (
+            started["state"] != "STARTED"
+            or started["slot_directory"]
+            != str(root / expected.slot_id)
+            or started["preflight_revision"] != preflight.revision
+            or type(started["preflight_free_bytes"]) is not int
+            or started["preflight_free_bytes"]
+            < coverage.runtime.minimum_free_bytes
+        ):
+            raise FactorialExecutionError(
+                "coverage-smoke STARTED row does not bind an exact preflight"
+            )
+        if ordinal == coverage_execution_ordinal and (
+            started["preflight_free_bytes"] != preflight.free_bytes
+            or started["slot_directory"] != str(preflight.slot_directory)
+        ):
+            raise FactorialExecutionError(
+                "current coverage-smoke STARTED row differs from this preflight"
+            )
+        records = [(started, raw_rows[(ordinal - 1) * 2])]
+        previous_record_sha256 = _sha256_bytes(records[0][1])
+        if ordinal < coverage_execution_ordinal:
+            terminal = rows[(ordinal - 1) * 2 + 1]
+            terminal_common = _coverage_smoke_ledger_common(
+                runtime=coverage.runtime,
+                spec=expected,
+                coverage_execution_ordinal=ordinal,
+                static_artifacts=static_artifacts,
+                authorization=authorization,
+                authorization_payload=authorization_receipt,
+                contract_payload=contract_payload,
+                build_provenance=preflight.build_provenance,
+                previous_record_sha256=previous_record_sha256,
+            )
+            terminal_fields = set(terminal_common) | {
+                "state",
+                "recorded_utc",
+                "recorded_monotonic_ns",
+                "slot_directory",
+                "execution_outcome",
+                "execution_reason",
+                "launch_count",
+                "validation",
+            }
+            if set(terminal) != terminal_fields or any(
+                not _exact_json_value(terminal.get(key), value)
+                for key, value in terminal_common.items()
+            ):
+                raise FactorialExecutionError(
+                    "coverage-smoke TERMINAL ledger identity/order binding drifted"
+                )
+            if (
+                terminal["state"] != "TERMINAL"
+                or terminal["slot_directory"] != str(root / expected.slot_id)
+                or terminal["execution_outcome"] != "PASS"
+                or terminal["execution_reason"] is not None
+                or terminal["launch_count"] != expected.replica_count + 1
+                or not _exact_json_value(
+                    terminal["validation"],
+                    expected_validation,
+                )
+            ):
+                raise FactorialExecutionError(
+                    "coverage-smoke cannot continue after a non-PASS terminal"
+                )
+            prior_directory = root / expected.slot_id
+            prior_authorization = _read_stable_regular_file(
+                prior_directory / "execution-authorization.json",
+                "coverage-smoke predecessor authorization",
+            )
+            prior_build_provenance = _read_stable_regular_file(
+                prior_directory / "runtime/exact-build-provenance.json",
+                "coverage-smoke predecessor build provenance",
+            )
+            if (
+                prior_authorization != authorization_receipt
+                or prior_build_provenance
+                != _canonical_json_bytes(preflight.build_provenance)
+            ):
+                raise FactorialExecutionError(
+                    "coverage-smoke predecessor authorization/build drifted"
+                )
+            from .factorial_validation import validate_slot
+
+            replayed = validate_slot(
+                prior_directory,
+                _coverage_predecessor_replay=True,
+            )
+            replayed_validation = {
+                "outcome": replayed.outcome,
+                "reason": replayed.reason,
+                "integrity_valid": replayed.integrity_valid,
+                "campaign_member": replayed.campaign_member,
+                "figure_eligible": replayed.figure_eligible,
+            }
+            if (
+                replayed.slot_id != expected.slot_id
+                or not _exact_json_value(
+                    replayed_validation,
+                    expected_validation,
+                )
+                or not _exact_json_value(
+                    terminal["validation"],
+                    replayed_validation,
+                )
+            ):
+                raise FactorialExecutionError(
+                    "coverage-smoke repair requires the independently validated "
+                    "primary predecessor"
+                )
+            outcome_payload = _read_stable_regular_file(
+                prior_directory / "outcome.json",
+                "coverage-smoke predecessor outcome",
+            )
+            outcome = _parse_canonical_object(
+                outcome_payload,
+                "coverage-smoke predecessor outcome",
+            )
+            sealed_files = outcome.get("sealed_files")
+            if not isinstance(sealed_files, Mapping) or not sealed_files:
+                raise FactorialExecutionError(
+                    "coverage-smoke predecessor lacks an exact file seal"
+                )
+            terminal_raw = raw_rows[(ordinal - 1) * 2 + 1]
+            predecessor_receipt_payload = _coverage_predecessor_receipt_payload(
+                runtime=coverage.runtime,
+                authorization=authorization,
+                authorization_payload=authorization_receipt,
+                contract_payload=contract_payload,
+                predecessor_coverage_execution_ordinal=ordinal,
+                predecessor_spec=expected,
+                predecessor_terminal_raw=terminal_raw,
+                predecessor_outcome_payload=outcome_payload,
+                predecessor_sealed_files=dict(sealed_files),
+                predecessor_validation=replayed_validation,
+            )
+            records.append((terminal, terminal_raw))
+            previous_record_sha256 = _sha256_bytes(terminal_raw)
+        for record, _ in records:
+            try:
+                recorded = dt.datetime.fromisoformat(
+                    str(record["recorded_utc"]).replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise FactorialExecutionError(
+                    "coverage-smoke ledger UTC timestamp is invalid"
+                ) from error
+            monotonic_ns = record["recorded_monotonic_ns"]
+            if (
+                recorded.tzinfo is None
+                or recorded.utcoffset() is None
+                or type(monotonic_ns) is not int
+                or monotonic_ns <= 0
+                or monotonic_ns < previous_monotonic_ns
+            ):
+                raise FactorialExecutionError(
+                    "coverage-smoke ledger timestamps are invalid or regress"
+                )
+            previous_monotonic_ns = monotonic_ns
+    return CoverageSmokeLaunchBinding(
+        contract_payload=contract_payload,
+        ledger_prefix_payload=ledger_payload,
+        predecessor_receipt_payload=predecessor_receipt_payload,
+    )
+
+
+def verify_completed_coverage_smoke_sequence(
+    root: Path,
+    *,
+    runtime: N31CoverageSmokeRuntime,
+    static_artifacts: Mapping[str, bytes],
+    authorization_payload: bytes,
+    build_provenance: Mapping[str, object],
+    require_canonical_root: bool = False,
+) -> tuple[object, ...]:
+    """Recompute the exact four-row sequence and both sealed slot receipts."""
+
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise FactorialExecutionError(
+            "completed coverage-smoke root is absent or unsafe"
+        )
+    authorization = _parse_canonical_object(
+        authorization_payload,
+        "coverage-smoke authorization",
+    )
+    try:
+        manifest = load_frozen_manifest_bytes(static_artifacts["manifest.json"])
+        plan = build_factorial_plan(manifest)
+        primary = next(item for item in plan.slots if item.execution_ordinal == 1)
+        repair = next(item for item in plan.slots if item.execution_ordinal == 5)
+        coverage = build_n31_coverage_smoke_slot(
+            primary,
+            repair_template=repair,
+        )
+    except (KeyError, StopIteration, FactorialManifestError) as error:
+        raise FactorialExecutionError(
+            "completed coverage-smoke cannot derive the frozen plan/runtime"
+        ) from error
+    if (
+        not isinstance(coverage.runtime, N31CoverageSmokeRuntime)
+        or coverage.runtime != runtime
+        or static_artifacts.get("plan.json") != plan.canonical_bytes
+        or static_artifacts.get("runtime.json")
+        != _canonical_json_bytes(runtime.as_document())
+    ):
+        raise FactorialExecutionError(
+            "completed coverage-smoke static/runtime identity drifted"
+        )
+    try:
+        expected_authorization = build_execution_authorization_receipt(
+            scope="excluded_n31_coverage_smoke",
+            approval_reference=str(authorization["approval_reference"]),
+            approved_utc=str(authorization["approved_utc"]),
+            kauri_revision=str(authorization["kauri_revision"]),
+            slot_ids=tuple(slot.slot_id for slot in coverage.slots),
+            result_root=Path(coverage.slot.result_path).parent.as_posix(),
+            static_artifacts=static_artifacts,
+            build_provenance_sha256=_sha256_bytes(
+                _canonical_json_bytes(build_provenance)
+            ),
+        )
+    except KeyError as error:
+        raise FactorialExecutionError(
+            "completed coverage-smoke authorization is malformed"
+        ) from error
+    if expected_authorization != authorization_payload:
+        raise FactorialExecutionError(
+            "completed coverage-smoke authorization identity drifted"
+        )
+    expected_contract = build_coverage_smoke_execution_contract(
+        runtime=runtime,
+        static_artifacts=static_artifacts,
+        authorization=authorization,
+        authorization_payload=authorization_payload,
+        build_provenance=build_provenance,
+    )
+    contract_payload = _read_stable_regular_file(
+        root / COVERAGE_SMOKE_CONTRACT_FILENAME,
+        "coverage-smoke execution contract",
+    )
+    if contract_payload != _canonical_json_bytes(expected_contract):
+        raise FactorialExecutionError(
+            "completed coverage-smoke execution contract drifted"
+        )
+    if _read_stable_regular_file(
+        root / COVERAGE_SMOKE_AUTHORIZATION_FILENAME,
+        "coverage-smoke root authorization",
+    ) != authorization_payload:
+        raise FactorialExecutionError(
+            "completed coverage-smoke root authorization drifted"
+        )
+    expected_root_entries = {
+        BUILD_EVIDENCE_DIRECTORY,
+        COVERAGE_SMOKE_AUTHORIZATION_FILENAME,
+        COVERAGE_SMOKE_CONTRACT_FILENAME,
+        COVERAGE_SMOKE_LEDGER_FILENAME,
+        *(slot.slot_id for slot in coverage.slots),
+    }
+    actual_root_entries = {path.name: path for path in root.iterdir()}
+    if set(actual_root_entries) != expected_root_entries:
+        missing = sorted(expected_root_entries - set(actual_root_entries))
+        extra = sorted(set(actual_root_entries) - expected_root_entries)
+        raise FactorialExecutionError(
+            "completed coverage-smoke root contains extra or missing state: "
+            f"missing={missing}, extra={extra}"
+        )
+    for name, path in actual_root_entries.items():
+        should_be_directory = name == BUILD_EVIDENCE_DIRECTORY or name.startswith(
+            "slot-"
+        )
+        if path.is_symlink() or (
+            should_be_directory and not path.is_dir()
+        ) or (not should_be_directory and not path.is_file()):
+            raise FactorialExecutionError(
+                "completed coverage-smoke root contains unsafe state"
+            )
+    ledger_payload = _read_stable_regular_file(
+        root / COVERAGE_SMOKE_LEDGER_FILENAME,
+        "coverage-smoke attempt ledger",
+    )
+    raw_rows = ledger_payload.splitlines(keepends=True)
+    if len(raw_rows) != 4 or not ledger_payload.endswith(b"\n"):
+        raise FactorialExecutionError(
+            "completed coverage-smoke ledger must contain exactly four rows"
+        )
+    rows = [
+        _parse_canonical_object(
+            raw,
+            f"coverage-smoke attempt ledger row {index}",
+        )
+        for index, raw in enumerate(raw_rows, 1)
+    ]
+    expected_validation = {
+        "outcome": "PASS",
+        "reason": None,
+        "integrity_valid": True,
+        "campaign_member": False,
+        "figure_eligible": False,
+    }
+    previous_record_sha256 = "0" * 64
+    previous_monotonic_ns = 0
+    replayed_results: list[object] = []
+    outcome_payloads: list[bytes] = []
+    outcome_documents: list[Mapping[str, object]] = []
+    for ordinal, spec in enumerate(runtime.slots, 1):
+        started_raw = raw_rows[(ordinal - 1) * 2]
+        started = rows[(ordinal - 1) * 2]
+        expected_started_common = _coverage_smoke_ledger_common(
+            runtime=runtime,
+            spec=spec,
+            coverage_execution_ordinal=ordinal,
+            static_artifacts=static_artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_payload,
+            contract_payload=contract_payload,
+            build_provenance=build_provenance,
+            previous_record_sha256=previous_record_sha256,
+        )
+        started_fields = set(expected_started_common) | {
+            "state",
+            "recorded_utc",
+            "recorded_monotonic_ns",
+            "slot_directory",
+            "preflight_revision",
+            "preflight_free_bytes",
+        }
+        if set(started) != started_fields or any(
+            not _exact_json_value(started.get(key), value)
+            for key, value in expected_started_common.items()
+        ):
+            raise FactorialExecutionError(
+                "completed coverage-smoke STARTED row schema/identity drifted"
+            )
+        slot_root = root / spec.slot_id
+        slot_receipt = _parse_canonical_object(
+            _read_stable_regular_file(
+                slot_root / "slot.json",
+                "coverage-smoke slot launch receipt",
+            ),
+            "coverage-smoke slot launch receipt",
+        )
+        replica_rows = slot_receipt.get("replica_argv")
+        if isinstance(replica_rows, (str, bytes)) or not isinstance(
+            replica_rows,
+            Sequence,
+        ):
+            raise FactorialExecutionError(
+                "coverage-smoke launch receipt lacks replica argv"
+            )
+        replica_zero = [
+            row
+            for row in replica_rows
+            if isinstance(row, Mapping) and row.get("replica_id") == 0
+        ]
+        if len(replica_zero) != 1:
+            raise FactorialExecutionError(
+                "coverage-smoke launch receipt lacks one replica-0 vector"
+            )
+        argv = replica_zero[0].get("argv")
+        if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
+            raise FactorialExecutionError(
+                "coverage-smoke launch receipt replica-0 argv is malformed"
+            )
+        suffix = "/runtime/main.conf"
+        original_roots = [
+            value[: -len(suffix)]
+            for value in argv
+            if isinstance(value, str) and value.endswith(suffix)
+        ]
+        if len(original_roots) != 1:
+            raise FactorialExecutionError(
+                "coverage-smoke launch receipt lacks one original slot root"
+            )
+        original_slot_directory = original_roots[0]
+        if (
+            started.get("state") != "STARTED"
+            or started.get("slot_directory") != original_slot_directory
+            or started.get("preflight_revision")
+            != authorization["kauri_revision"]
+            or type(started.get("preflight_free_bytes")) is not int
+            or started["preflight_free_bytes"] < runtime.minimum_free_bytes
+        ):
+            raise FactorialExecutionError(
+                "completed coverage-smoke STARTED preflight drifted"
+            )
+        if require_canonical_root and original_slot_directory != str(slot_root):
+            raise FactorialExecutionError(
+                "canonical coverage-smoke gate rejects a relocated slot path"
+            )
+        previous_record_sha256 = _sha256_bytes(started_raw)
+        terminal_raw = raw_rows[(ordinal - 1) * 2 + 1]
+        terminal = rows[(ordinal - 1) * 2 + 1]
+        expected_terminal_common = _coverage_smoke_ledger_common(
+            runtime=runtime,
+            spec=spec,
+            coverage_execution_ordinal=ordinal,
+            static_artifacts=static_artifacts,
+            authorization=authorization,
+            authorization_payload=authorization_payload,
+            contract_payload=contract_payload,
+            build_provenance=build_provenance,
+            previous_record_sha256=previous_record_sha256,
+        )
+        terminal_fields = set(expected_terminal_common) | {
+            "state",
+            "recorded_utc",
+            "recorded_monotonic_ns",
+            "slot_directory",
+            "execution_outcome",
+            "execution_reason",
+            "launch_count",
+            "validation",
+        }
+        if set(terminal) != terminal_fields or any(
+            not _exact_json_value(terminal.get(key), value)
+            for key, value in expected_terminal_common.items()
+        ):
+            raise FactorialExecutionError(
+                "completed coverage-smoke TERMINAL row schema/identity drifted"
+            )
+        if (
+            terminal.get("state") != "TERMINAL"
+            or terminal.get("slot_directory") != started.get("slot_directory")
+            or terminal.get("execution_outcome") != "PASS"
+            or terminal.get("execution_reason") is not None
+            or terminal.get("launch_count") != spec.replica_count + 1
+            or not _exact_json_value(
+                terminal.get("validation"),
+                expected_validation,
+            )
+        ):
+            raise FactorialExecutionError(
+                "completed coverage-smoke contains a non-PASS terminal"
+            )
+        previous_record_sha256 = _sha256_bytes(terminal_raw)
+        for record in (started, terminal):
+            try:
+                recorded = dt.datetime.fromisoformat(
+                    str(record["recorded_utc"]).replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise FactorialExecutionError(
+                    "completed coverage-smoke ledger UTC timestamp is invalid"
+                ) from error
+            monotonic_ns = record["recorded_monotonic_ns"]
+            if (
+                recorded.tzinfo is None
+                or recorded.utcoffset() is None
+                or type(monotonic_ns) is not int
+                or monotonic_ns <= 0
+                or monotonic_ns < previous_monotonic_ns
+            ):
+                raise FactorialExecutionError(
+                    "completed coverage-smoke ledger timestamps regress"
+                )
+            previous_monotonic_ns = monotonic_ns
+        if _read_stable_regular_file(
+            slot_root / "execution-authorization.json",
+            "coverage-smoke slot authorization",
+        ) != authorization_payload or _read_stable_regular_file(
+            slot_root / "runtime/exact-build-provenance.json",
+            "coverage-smoke slot build provenance",
+        ) != _canonical_json_bytes(build_provenance):
+            raise FactorialExecutionError(
+                "completed coverage-smoke slot authorization/build drifted"
+            )
+        if _read_stable_regular_file(
+            slot_root / COVERAGE_SMOKE_CONTRACT_FILENAME,
+            "sealed coverage-smoke execution contract",
+        ) != contract_payload:
+            raise FactorialExecutionError(
+                "completed coverage-smoke sealed contract drifted"
+            )
+        expected_prefix = b"".join(raw_rows[: 1 if ordinal == 1 else 3])
+        if _read_stable_regular_file(
+            slot_root / COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME,
+            "sealed coverage-smoke prelaunch prefix",
+        ) != expected_prefix:
+            raise FactorialExecutionError(
+                "completed coverage-smoke sealed ledger prefix drifted"
+            )
+        from .factorial_validation import validate_slot
+
+        replayed = validate_slot(slot_root)
+        replayed_validation = {
+            "outcome": replayed.outcome,
+            "reason": replayed.reason,
+            "integrity_valid": replayed.integrity_valid,
+            "campaign_member": replayed.campaign_member,
+            "figure_eligible": replayed.figure_eligible,
+        }
+        if (
+            replayed.slot_id != spec.slot_id
+            or not _exact_json_value(replayed_validation, expected_validation)
+            or not _exact_json_value(
+                terminal["validation"],
+                replayed_validation,
+            )
+        ):
+            raise FactorialExecutionError(
+                "completed coverage-smoke slot does not independently revalidate"
+            )
+        outcome_payload = _read_stable_regular_file(
+            slot_root / "outcome.json",
+            "coverage-smoke slot outcome",
+        )
+        outcome = _parse_canonical_object(
+            outcome_payload,
+            "coverage-smoke slot outcome",
+        )
+        sealed_files = outcome.get("sealed_files")
+        if not isinstance(sealed_files, Mapping) or not sealed_files:
+            raise FactorialExecutionError(
+                "completed coverage-smoke slot lacks its file seal"
+            )
+        outcome_payloads.append(outcome_payload)
+        outcome_documents.append(outcome)
+        predecessor_path = (
+            slot_root / COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME
+        )
+        if ordinal == 1:
+            if predecessor_path.exists() or predecessor_path.is_symlink():
+                raise FactorialExecutionError(
+                    "primary coverage-smoke slot contains a predecessor receipt"
+                )
+        else:
+            predecessor_sealed_files = outcome_documents[0].get("sealed_files")
+            assert isinstance(predecessor_sealed_files, Mapping)
+            expected_receipt = _coverage_predecessor_receipt_payload(
+                runtime=runtime,
+                authorization=authorization,
+                authorization_payload=authorization_payload,
+                contract_payload=contract_payload,
+                predecessor_coverage_execution_ordinal=1,
+                predecessor_spec=runtime.slots[0],
+                predecessor_terminal_raw=raw_rows[1],
+                predecessor_outcome_payload=outcome_payloads[0],
+                predecessor_sealed_files=dict(predecessor_sealed_files),
+                predecessor_validation=expected_validation,
+            )
+            if _read_stable_regular_file(
+                predecessor_path,
+                "sealed coverage-smoke predecessor receipt",
+            ) != expected_receipt:
+                raise FactorialExecutionError(
+                    "completed coverage-smoke predecessor receipt drifted"
+                )
+        replayed_results.append(replayed)
+    return tuple(replayed_results)
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -1682,13 +2783,14 @@ def _bind_static_artifacts(
             )
         return normalized
 
-    expected_runtime_bytes = _canonical_json_bytes(spec.as_document())
-    if normalized["runtime.json"] != expected_runtime_bytes:
-        raise FactorialExecutionError(
-            "runtime.json does not match the exact direct excluded-smoke runtime document"
-        )
-    smoke_matches: list[N7SmokeSlot | N31CoverageSmokeSlot] = []
     if slot.replica_count == 7:
+        expected_runtime_bytes = _canonical_json_bytes(spec.as_document())
+        if normalized["runtime.json"] != expected_runtime_bytes:
+            raise FactorialExecutionError(
+                "runtime.json does not match the exact direct excluded-smoke "
+                "runtime document"
+            )
+        smoke_matches: list[N7SmokeSlot] = []
         for template in plan.slots:
             try:
                 candidate = build_n7_ps_smoke_slot(
@@ -1703,24 +2805,58 @@ def _bind_static_artifacts(
                 continue
             if candidate.slot == slot and candidate.runtime == spec:
                 smoke_matches.append(candidate)
+        if not smoke_matches:
+            raise FactorialExecutionError(
+                "supplied excluded smoke is not derivable from the exact frozen plan"
+            )
+        return normalized
     elif slot.replica_count == 31:
-        for template in plan.slots:
-            try:
-                candidate = build_n31_coverage_smoke_slot(
-                    template,
-                    result_path=slot.result_path,
-                )
-            except FactorialExecutionError:
-                continue
-            if candidate.slot == slot and candidate.runtime == spec:
-                smoke_matches.append(candidate)
-    if not smoke_matches or (
-        slot.replica_count == 31 and len(smoke_matches) != 1
-    ):
-        raise FactorialExecutionError(
-            "supplied excluded smoke is not derivable from the exact frozen plan"
+        primary = next(
+            (item for item in plan.slots if item.execution_ordinal == 1),
+            None,
         )
-    return normalized
+        repair = (
+            next(
+                (item for item in plan.slots if item.execution_ordinal == 5),
+                None,
+            )
+            if manifest.manifest_id == FROZEN_MANIFEST_ID
+            else None
+        )
+        if primary is None:
+            raise FactorialExecutionError(
+                "frozen plan lacks the N=31 coverage-smoke primary slot"
+            )
+        candidate = build_n31_coverage_smoke_slot(
+            primary,
+            repair_template=repair,
+        )
+        expected_runtime_bytes = _canonical_json_bytes(
+            candidate.runtime.as_document()
+        )
+        if normalized["runtime.json"] != expected_runtime_bytes:
+            raise FactorialExecutionError(
+                "runtime.json does not match the exact ordered N=31 "
+                "coverage-smoke runtime document"
+            )
+        matches = tuple(
+            (candidate_slot, candidate_runtime)
+            for candidate_slot, candidate_runtime in zip(
+                candidate.slots,
+                candidate.runtimes,
+                strict=True,
+            )
+            if candidate_slot == slot and candidate_runtime == spec
+        )
+        if len(matches) != 1:
+            raise FactorialExecutionError(
+                "supplied N=31 coverage smoke is not derivable from the exact "
+                "frozen plan"
+            )
+        return normalized
+    raise FactorialExecutionError(
+        "supplied excluded smoke is not derivable from the exact frozen plan"
+    )
 
 
 def verify_evidence_preflight(
@@ -3779,12 +4915,27 @@ def execute_slot_once(
         static_artifacts=static_artifacts,
         campaign_member=campaign_member,
     )
+    ordered_coverage_smoke = (
+        not campaign_member
+        and slot.replica_count == 31
+        and authorization.get("slot_ids")
+        == ["slot-066-n31-f5-b05-P", "slot-037-n31-f2-b04-00"]
+    )
+    coverage_binding: CoverageSmokeLaunchBinding | None = None
     root_lock: int | None = None
-    if campaign_member:
+    if campaign_member or ordered_coverage_smoke:
         root_lock = _acquire_campaign_root_lock(preflight.result_root)
     try:
         if campaign_member:
             _validate_campaign_launch_order(
+                spec=spec,
+                preflight=preflight,
+                static_artifacts=static_artifacts,
+                authorization_receipt=authorization_receipt,
+                authorization=authorization,
+            )
+        elif ordered_coverage_smoke:
+            coverage_binding = _validate_coverage_smoke_launch_order(
                 spec=spec,
                 preflight=preflight,
                 static_artifacts=static_artifacts,
@@ -3809,6 +4960,20 @@ def execute_slot_once(
             _release_campaign_root_lock(root_lock)
     for relative, payload in static_artifacts.items():
         _write_exclusive(slot_directory / relative, bytes(payload))
+    if coverage_binding is not None:
+        _write_exclusive(
+            slot_directory / COVERAGE_SMOKE_CONTRACT_FILENAME,
+            coverage_binding.contract_payload,
+        )
+        _write_exclusive(
+            slot_directory / COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME,
+            coverage_binding.ledger_prefix_payload,
+        )
+        if coverage_binding.predecessor_receipt_payload is not None:
+            _write_exclusive(
+                slot_directory / COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME,
+                coverage_binding.predecessor_receipt_payload,
+            )
     _write_exclusive(
         slot_directory / "execution-authorization.json",
         authorization_receipt,
@@ -4298,9 +5463,11 @@ def build_n7_ps_smoke_slot(
 def build_n31_coverage_smoke_slot(
     template: FactorialSlot,
     *,
+    repair_template: FactorialSlot | None = None,
     result_path: str | None = None,
+    repair_result_path: str | None = None,
 ) -> N31CoverageSmokeSlot:
-    """Derive the excluded N=31 coverage smoke from exact campaign slot 066."""
+    """Derive the exact versioned excluded N=31 coverage-smoke sequence."""
 
     if not isinstance(template, FactorialSlot):
         raise FactorialExecutionError(
@@ -4318,6 +5485,7 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v22/slot-066-n31-f5-b05-P": "v22",
         "results/shape-placement-factorial-v23/slot-066-n31-f5-b05-P": "v23",
         "results/shape-placement-factorial-v24/slot-066-n31-f5-b05-P": "v24",
+        "results/shape-placement-factorial-v25/slot-066-n31-f5-b05-P": "v25",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
@@ -4331,22 +5499,23 @@ def build_n31_coverage_smoke_slot(
         "v22": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v23": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v24": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v25": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
         if manifest_version
-        in {"v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24"}
+        in {"v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25"}
         else None
     )
     expected_guarded_selection_contract = (
         PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
         if manifest_version
-        in {"v18", "v19", "v20", "v21", "v22", "v23", "v24"}
+        in {"v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25"}
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-        if manifest_version in {"v23", "v24"}
+        if manifest_version in {"v23", "v24", "v25"}
         else (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_version in {"v19", "v20", "v21", "v22"}
@@ -4355,12 +5524,17 @@ def build_n31_coverage_smoke_slot(
     )
     expected_source_bound_proposal_witness_contract = (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-        if manifest_version in {"v20", "v21", "v22", "v23", "v24"}
+        if manifest_version in {"v20", "v21", "v22", "v23", "v24", "v25"}
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-        if manifest_version in {"v22", "v23", "v24"}
+        if manifest_version in {"v22", "v23", "v24", "v25"}
+        else None
+    )
+    expected_inherited_wait_exempt_placement_contract = (
+        INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
+        if manifest_version == "v25"
         else None
     )
     if (
@@ -4432,10 +5606,12 @@ def build_n31_coverage_smoke_slot(
         != expected_source_bound_proposal_witness_contract
         or responsive.evidence_snapshot_selection_contract
         != expected_evidence_snapshot_selection_contract
+        or responsive.inherited_consensus_wait_exempt_placement_contract
+        != expected_inherited_wait_exempt_placement_contract
         or template.workload.epoch1_preselection_residency_ms
-        != (60_000 if manifest_version == "v24" else None)
+        != (60_000 if manifest_version in {"v24", "v25"} else None)
         or responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
-        != (82 if manifest_version == "v24" else None)
+        != (82 if manifest_version in {"v24", "v25"} else None)
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "
@@ -4452,13 +5628,140 @@ def build_n31_coverage_smoke_slot(
             "N=31 coverage smoke result path must be the exact canonical root"
         )
     smoke = replace(template, result_path=result_path)
+    primary_runtime = build_slot_runtime(smoke)
+    if manifest_version != "v25":
+        if repair_template is not None or repair_result_path is not None:
+            raise FactorialExecutionError(
+                "historical N=31 coverage smoke must remain single-slot"
+            )
+        return N31CoverageSmokeSlot(
+            slot=smoke,
+            runtime=primary_runtime,
+            slots=(smoke,),
+            runtimes=(primary_runtime,),
+        )
+
+    if not isinstance(repair_template, FactorialSlot):
+        raise FactorialExecutionError(
+            "v25 N=31 coverage smoke requires exact campaign slot 037"
+        )
+    repair_responsive = repair_template.byzantine.responsive_degradation
+    expected_repair_campaign_path = (
+        "results/shape-placement-factorial-v25/slot-037-n31-f2-b04-00"
+    )
+    if (
+        repair_template.slot_id != "slot-037-n31-f2-b04-00"
+        or repair_template.result_path != expected_repair_campaign_path
+        or repair_template.ordinal != 37
+        or repair_template.execution_ordinal != 5
+        or repair_template.block_id != "n31-f2-b04"
+        or repair_template.block_index != 4
+        or repair_template.blocks_in_cell != 5
+        or repair_template.block_execution_ordinal != 2
+        or repair_template.arm_execution_position != 1
+        or repair_template.scientific_seed != 41_728
+        or repair_template.replica_count != 31
+        or repair_template.f != 10
+        or repair_template.q != 21
+        or repair_template.tree_count != 21
+        or repair_template.initial_fanout != 2
+        or repair_template.candidate_fanouts != (2, 3, 5)
+        or repair_template.arm_code != "00"
+        or repair_template.placement_adaptation
+        or repair_template.shape_adaptation
+        or repair_template.byzantine_actor_ids != (26, 27, 28)
+        or repair_template.responsive_degraded_actor_ids
+        != (1, 7, 8, 12, 16, 19, 20)
+        or repair_template.fast_replica_ids
+        != (
+            0,
+            2,
+            3,
+            4,
+            5,
+            6,
+            9,
+            10,
+            11,
+            13,
+            14,
+            15,
+            17,
+            18,
+            21,
+            22,
+            23,
+            24,
+            25,
+            29,
+            30,
+        )
+        or repair_template.maximum_omissions_per_proposal != 10
+        or repair_template.ports
+        != PortAllocation(peer_base=28_700, client_base=29_700, manager=30_700)
+        or repair_responsive is None
+        or repair_responsive.precontainment_fault_coverage_gate
+        != PRECONTAINMENT_FAULT_COVERAGE_GATE_V1
+        or repair_responsive.causal_timeout_eligibility
+        != RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
+        or repair_responsive.precontainment_shape_evaluation_contract
+        != PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
+        or repair_responsive.precontainment_guarded_selection_contract
+        != PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
+        or repair_responsive.future_tree_proposal_delivery_contract
+        != FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
+        or repair_responsive.source_bound_proposal_witness_contract
+        != SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+        or repair_responsive.evidence_snapshot_selection_contract
+        != EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
+        or repair_responsive.inherited_consensus_wait_exempt_placement_contract
+        != INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
+        or repair_template.workload.epoch1_preselection_residency_ms != 60_000
+        or repair_responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
+        != 82
+    ):
+        raise FactorialExecutionError(
+            "v25 N=31 coverage smoke must derive from exact campaign slot 037"
+        )
+    expected_repair_result_path = (
+        "results/shape-placement-factorial-v25-coverage-smoke/"
+        "slot-037-n31-f2-b04-00"
+    )
+    if repair_result_path is None:
+        repair_result_path = expected_repair_result_path
+    if repair_result_path != expected_repair_result_path:
+        raise FactorialExecutionError(
+            "v25 N=31 repair coverage result path must be the exact canonical root"
+        )
+    repair_smoke = replace(repair_template, result_path=repair_result_path)
+    repair_runtime = build_slot_runtime(repair_smoke)
+    ordered_runtimes = (primary_runtime, repair_runtime)
+    coverage_runtime = N31CoverageSmokeRuntime(
+        schema_version=1,
+        runtime_id="shape-placement-factorial-v25-excluded-n31-coverage-smoke-v1",
+        manifest_id="shape-placement-factorial-v25",
+        execution_mode="fixed_sequential",
+        automatic_retries=0,
+        replacement_policy="none",
+        stop_on_first_non_pass=True,
+        minimum_free_bytes=10_000_000_000,
+        slots=ordered_runtimes,
+    )
     return N31CoverageSmokeSlot(
         slot=smoke,
-        runtime=build_slot_runtime(smoke),
+        runtime=coverage_runtime,
+        slots=(smoke, repair_smoke),
+        runtimes=ordered_runtimes,
     )
 
 
 __all__ = (
+    "COVERAGE_SMOKE_AUTHORIZATION_FILENAME",
+    "COVERAGE_SMOKE_CONTRACT_FILENAME",
+    "COVERAGE_SMOKE_LEDGER_FILENAME",
+    "COVERAGE_SMOKE_LEDGER_PREFIX_FILENAME",
+    "COVERAGE_SMOKE_PREDECESSOR_RECEIPT_FILENAME",
+    "CoverageSmokeLaunchBinding",
     "ExecutionBinaries",
     "ExecutionPreflight",
     "FactorialExecutionError",
@@ -4467,10 +5770,16 @@ __all__ = (
     "MaterializedLaunch",
     "N7SmokeSlot",
     "N31CoverageSmokeSlot",
+    "N31CoverageSmokeRuntime",
     "SlotExecutionResult",
+    "append_coverage_smoke_ledger_record",
+    "build_coverage_smoke_execution_contract",
+    "build_coverage_smoke_started_record",
+    "build_coverage_smoke_terminal_record",
     "build_execution_authorization_receipt",
     "build_n7_ps_smoke_slot",
     "build_n31_coverage_smoke_slot",
+    "coverage_smoke_previous_record_sha256",
     "execute_slot_once",
     "generate_identities",
     "materialize_launch",
@@ -4481,6 +5790,7 @@ __all__ = (
     "slot_ports",
     "spawn_exclusive_owned_process",
     "verify_evidence_preflight",
+    "verify_completed_coverage_smoke_sequence",
     "verify_preserved_build_evidence",
     "write_slot_configs",
 )

@@ -13,9 +13,9 @@ from experiments.adaptive import run_shape_factorial_campaign as cli
 from experiments.adaptive.kauri_experiment import factorial_execution as execution
 from experiments.adaptive.kauri_experiment import factorial_manifest as manifest_module
 from experiments.adaptive.kauri_experiment.factorial_manifest import (
-    FROZEN_MANIFEST_SHA256,
-    FROZEN_PLAN_SHA256,
-    FROZEN_SEMANTIC_SHA256,
+    V24_MANIFEST_SHA256,
+    V24_PLAN_SHA256,
+    V24_SEMANTIC_SHA256,
     V23_MANIFEST_ID,
     V23_MANIFEST_SHA256,
     V23_PLAN_SHA256,
@@ -26,9 +26,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     parse_manifest_bytes,
 )
 from experiments.adaptive.kauri_experiment.factorial_runtime import (
-    FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
-    FROZEN_RUNTIME_SHA256,
-    FROZEN_SMOKE_RUNTIME_SHA256,
+    V24_COVERAGE_SMOKE_RUNTIME_SHA256,
+    V24_RUNTIME_SHA256,
+    V24_SMOKE_RUNTIME_SHA256,
     V23_COVERAGE_SMOKE_RUNTIME_SHA256,
     V23_RUNTIME_SHA256,
     V23_SMOKE_RUNTIME_SHA256,
@@ -96,7 +96,7 @@ def test_v24_profile_delta_is_exactly_identity_root_and_two_new_fields() -> None
     responsive = v24["byzantine"]["responsive_degradation"]  # type: ignore[index]
     assert responsive.pop(PRIMARY_GATE_FIELD) == MINIMUM_PRIMARY_INTERNAL_OPPORTUNITIES
     assert v24 == v23
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v24"
+    assert manifest_module.V24_MANIFEST_ID == "shape-placement-factorial-v24"
 
 
 @pytest.mark.parametrize(
@@ -227,22 +227,22 @@ def test_v24_binds_both_new_fields_into_slot_artifact_identity() -> None:
 
 def test_v24_all_six_static_identities_are_frozen() -> None:
     assert _runtime_identities(V24_MANIFEST) == (
-        FROZEN_MANIFEST_SHA256,
-        FROZEN_SEMANTIC_SHA256,
-        FROZEN_PLAN_SHA256,
-        FROZEN_RUNTIME_SHA256,
-        FROZEN_SMOKE_RUNTIME_SHA256,
-        FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        V24_MANIFEST_SHA256,
+        V24_SEMANTIC_SHA256,
+        V24_PLAN_SHA256,
+        V24_RUNTIME_SHA256,
+        V24_SMOKE_RUNTIME_SHA256,
+        V24_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
 
 
-def test_v24_default_refuses_v23_and_keeps_zero_retry_roots(
+def test_v24_is_validation_only_and_keeps_single_slot_zero_retry_roots(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V24_MANIFEST
-    assert cli.main(["--manifest", str(V23_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v25.json"
+    assert cli.main(["--manifest", str(V24_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v23 are validation-only" in refusal["reason"]
+    assert "v1 through v24 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V24_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

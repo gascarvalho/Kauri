@@ -93,6 +93,9 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v25.json"
+)
+V24_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v24.json"
 )
 V14_MANIFEST_PATH = (
@@ -357,7 +360,7 @@ def test_slots_are_immutable_deterministic_and_self_contained() -> None:
     }
     assert first.slots[1].ports.peer_base == 25200
     assert all(
-        slot.result_path == f"results/shape-placement-factorial-v24/{slot.slot_id}"
+        slot.result_path == f"results/shape-placement-factorial-v25/{slot.slot_id}"
         for slot in first.slots
     )
 
