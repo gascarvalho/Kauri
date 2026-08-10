@@ -1,4 +1,4 @@
-"""Pure launch contracts for the frozen SHAPE33 factorial campaign.
+"""Pure launch contracts for the frozen SHAPE34 factorial campaign.
 
 This module does not predict adaptive outcomes and never starts a process.
 It freezes only the inputs, live-evidence acceptance predicates, relative
@@ -17,6 +17,7 @@ from typing import Any
 from .factorial_manifest import (
     EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
     EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2,
     EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     FROZEN_MANIFEST_ID,
@@ -50,6 +51,7 @@ from .factorial_manifest import (
     V30_MANIFEST_ID,
     V31_MANIFEST_ID,
     V32_MANIFEST_ID,
+    V33_MANIFEST_ID,
     V9_MANIFEST_ID,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
@@ -257,14 +259,23 @@ V32_SMOKE_RUNTIME_SHA256 = (
 V32_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "45da6535ee0bf9035b9f61375e03afd7737b6f0d8920431cb5f0248a58a06f86"
 )
-FROZEN_RUNTIME_SHA256 = (
+V33_RUNTIME_SHA256 = (
     "597bddecd5ada141dfaf1830cabb645fa5f50aaf20abd198c134a48e2d1e4e2b"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V33_SMOKE_RUNTIME_SHA256 = (
     "c0b96dfaaf73a374113a0c6ba98f87c06a934eb6b40202d96a51b6182c714c05"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V33_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "18d9dd6841b3dc69a3797d9473aa0f14df2bc793cf3354abd67be91000e7007e"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "73dc1bd18235fe2ef9a565b2486cd48ba49fe10b3e89adc7666d5baee6ba985b"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "b004afbe823f75bc96521dcc7202cfdbb91930eea6286730f17e316308c0107f"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "f79fa73e1af6c2be6b2284d9d9a0b56224dcca94c153f7e91e2220ae49266d5e"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -1178,6 +1189,7 @@ def _causal_acceptance(
     if excluded_repair_smoke_observation_contract not in {
         None,
         EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2,
     }:
         raise FactorialManifestError(
             "causal acceptance excluded repair observation contract drifted"
@@ -1214,7 +1226,7 @@ def _causal_acceptance(
         minimum_primary_internal_opportunities is None
     ):
         raise FactorialManifestError(
-            "causal acceptance v24/v25/v26/v27/v28/v29/v30/v31/v32/v33 timing and opportunity "
+            "causal acceptance v24/v25/v26/v27/v28/v29/v30/v31/v32/v33/v34 timing and opportunity "
             "gates must "
             "be paired"
         )
@@ -1604,10 +1616,12 @@ def _validate_excluded_repair_smoke_probe(
             f"results/shape-placement-factorial-{version}-coverage-smoke/"
             "slot-037-n31-f2-b04-00",
         )
-        for version in ("v28", "v29", "v30", "v31", "v32", "v33")
+        for version in ("v28", "v29", "v30", "v31", "v32", "v33", "v34")
     }
     matching_paths = tuple(
-        paths for paths in versioned_paths.values() if slot.result_path == paths[1]
+        (version, paths)
+        for version, paths in versioned_paths.items()
+        if slot.result_path == paths[1]
     )
     if (
         len(matching_paths) != 1
@@ -1616,9 +1630,9 @@ def _validate_excluded_repair_smoke_probe(
         or slot.common_timers.hard_timeout_s != 650
     ):
         raise FactorialManifestError(
-            "excluded repair smoke probe is restricted to exact v28/v29/v30/v31/v32/v33 slot 037"
+            "excluded repair smoke probe is restricted to exact v28/v29/v30/v31/v32/v33/v34 slot 037"
         )
-    source_path, _ = matching_paths[0]
+    version, (source_path, _) = matching_paths[0]
     source_slot = replace(
         slot,
         result_path=source_path,
@@ -1633,7 +1647,11 @@ def _validate_excluded_repair_smoke_probe(
         source_fault_window_duration_s=450,
         effective_fault_window_duration_s=300,
         hard_timeout_s=650,
-        observation_contract=EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+        observation_contract=(
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            if version == "v34"
+            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+        ),
         verified_response_duplicate_probe_contract=(
             EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
         ),
@@ -2273,6 +2291,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -2298,6 +2317,7 @@ def runtime_preflight(
                     V30_MANIFEST_ID,
                     V31_MANIFEST_ID,
                     V32_MANIFEST_ID,
+                    V33_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else slot.cutoff_contract.epoch1_stable_bucket_count
@@ -2450,6 +2470,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }:
                 expected_measurement_contract = (
@@ -2489,6 +2510,7 @@ def runtime_preflight(
                     V30_MANIFEST_ID,
                     V31_MANIFEST_ID,
                     V32_MANIFEST_ID,
+                    V33_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -2518,6 +2540,7 @@ def runtime_preflight(
                     V30_MANIFEST_ID,
                     V31_MANIFEST_ID,
                     V32_MANIFEST_ID,
+                    V33_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -2584,6 +2607,8 @@ def runtime_preflight(
                         V29_MANIFEST_ID,
                         V30_MANIFEST_ID,
                         V31_MANIFEST_ID,
+                        V32_MANIFEST_ID,
+                        V33_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2801,6 +2826,7 @@ def runtime_preflight(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2848,6 +2874,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2869,6 +2896,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2886,6 +2914,7 @@ def runtime_preflight(
                     V30_MANIFEST_ID,
                     V31_MANIFEST_ID,
                     V32_MANIFEST_ID,
+                    V33_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -2906,6 +2935,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2925,6 +2955,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2942,6 +2973,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2956,6 +2988,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2968,6 +3001,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else (
@@ -2975,11 +3009,23 @@ def runtime_preflight(
                 if runtime.manifest_id == V26_MANIFEST_ID
                 else None
             ),
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
-            if runtime.manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, FROZEN_MANIFEST_ID}
-            else None,
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            if runtime.manifest_id == FROZEN_MANIFEST_ID
+            else (
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+                if runtime.manifest_id
+                in {
+                    V28_MANIFEST_ID,
+                    V29_MANIFEST_ID,
+                    V30_MANIFEST_ID,
+                    V31_MANIFEST_ID,
+                    V32_MANIFEST_ID,
+                    V33_MANIFEST_ID,
+                }
+                else None
+            ),
             EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
-            if runtime.manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, V33_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
             60_000
             if runtime.manifest_id
@@ -2993,6 +3039,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -3008,6 +3055,7 @@ def runtime_preflight(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -3118,6 +3166,9 @@ __all__ = (
     "V32_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V32_RUNTIME_SHA256",
     "V32_SMOKE_RUNTIME_SHA256",
+    "V33_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V33_RUNTIME_SHA256",
+    "V33_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",

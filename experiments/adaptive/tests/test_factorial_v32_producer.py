@@ -20,6 +20,9 @@ V32_MANIFEST = (
 V33_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v33.json"
 )
+V34_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v34.json"
+)
 V31_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v31.json"
 )
@@ -246,7 +249,7 @@ def test_v31_runtime_cannot_bind_to_v32_repair_slot(
 def test_v32_is_validation_only_after_v33_roll(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V33_MANIFEST
+    assert cli.DEFAULT_MANIFEST == V34_MANIFEST
     assert cli.main(["--manifest", str(V32_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v32 are validation-only" in refusal["reason"]
+    assert "v1 through v33 are validation-only" in refusal["reason"]

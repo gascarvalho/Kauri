@@ -52,6 +52,7 @@ from typing import Any
 from .factorial_manifest import (
     EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
     EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2,
     EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     EXPECTED_ARM_CODES,
@@ -173,6 +174,9 @@ from .factorial_manifest import (
     V32_MANIFEST_ID,
     V32_MANIFEST_SHA256,
     V32_PLAN_SHA256,
+    V33_MANIFEST_ID,
+    V33_MANIFEST_SHA256,
+    V33_PLAN_SHA256,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     FrozenFactorialManifest,
@@ -246,6 +250,10 @@ V32_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
 )
+V33_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
@@ -308,8 +316,11 @@ V31_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V32_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v32-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V33_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v33-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v34-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -551,14 +562,23 @@ V32_SMOKE_RUNTIME_SHA256 = (
 V32_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "45da6535ee0bf9035b9f61375e03afd7737b6f0d8920431cb5f0248a58a06f86"
 )
-FROZEN_RUNTIME_SHA256 = (
+V33_RUNTIME_SHA256 = (
     "597bddecd5ada141dfaf1830cabb645fa5f50aaf20abd198c134a48e2d1e4e2b"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V33_SMOKE_RUNTIME_SHA256 = (
     "c0b96dfaaf73a374113a0c6ba98f87c06a934eb6b40202d96a51b6182c714c05"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V33_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "18d9dd6841b3dc69a3797d9473aa0f14df2bc793cf3354abd67be91000e7007e"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "73dc1bd18235fe2ef9a565b2486cd48ba49fe10b3e89adc7666d5baee6ba985b"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "b004afbe823f75bc96521dcc7202cfdbb91930eea6286730f17e316308c0107f"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "f79fa73e1af6c2be6b2284d9d9a0b56224dcca94c153f7e91e2220ae49266d5e"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -690,6 +710,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -710,6 +731,7 @@ def _v24_preselection_contract(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return None
@@ -835,6 +857,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -861,6 +884,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -895,6 +919,7 @@ def _uses_source_bound_contribution_opportunities(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -926,6 +951,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -957,6 +983,7 @@ def _uses_precontainment_fault_coverage(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -988,6 +1015,7 @@ def _uses_precontainment_shape_preservation(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1022,6 +1050,7 @@ def _uses_precontainment_guarded_selection_contract(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1055,6 +1084,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V30_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V31_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V32_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V33_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -1087,6 +1117,7 @@ def _uses_source_bound_proposal_witness_contract(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1117,6 +1148,7 @@ def _uses_evidence_snapshot_selection_contract(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1144,6 +1176,7 @@ def _uses_inherited_consensus_wait_exempt_placement_contract(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1168,6 +1201,7 @@ def _uses_verified_response_duplicate_delivery_contract(
         V30_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V31_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V32_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        V33_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     }
     return (
@@ -1582,6 +1616,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V32_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V32_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V33_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V33_MANIFEST_ID,
+            manifest_sha256=V33_MANIFEST_SHA256,
+            plan_sha256=V33_PLAN_SHA256,
+            runtime_sha256=V33_RUNTIME_SHA256,
+            smoke_runtime_sha256=V33_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V33_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -3312,6 +3356,8 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
 def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
     if manifest_id == FROZEN_MANIFEST_ID:
         return FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id == V33_MANIFEST_ID:
+        return V33_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V32_MANIFEST_ID:
         return V32_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V31_MANIFEST_ID:
@@ -3440,6 +3486,11 @@ def _is_excluded_coverage_smoke_slot(
             V32_COVERAGE_SMOKE_RUNTIME_SHA256,
             V32_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V33_MANIFEST_ID: (
+            V33_RUNTIME_SHA256,
+            V33_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V33_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -3510,6 +3561,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V31_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V32_MANIFEST_ID:
         return V32_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V33_MANIFEST_ID:
+        return V33_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -3540,6 +3593,7 @@ def _validate_v25_coverage_runtime_document(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fields.add("excluded_repair_smoke_probe")
@@ -3559,6 +3613,7 @@ def _validate_v25_coverage_runtime_document(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.get("schema_version") != 1
@@ -3604,6 +3659,7 @@ def _validate_v25_coverage_runtime_document(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         repair = validated[_coverage_smoke_slot_ids(manifest_id)[1]]
@@ -3746,6 +3802,7 @@ def _load_static_contracts(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             constituents = _validate_v25_coverage_runtime_document(
@@ -3880,7 +3937,7 @@ def _validate_v33_static_timing_contract(
 ) -> None:
     """Pin the v33 deadline change without weakening its frozen schedule."""
 
-    if manifest.manifest_id != FROZEN_MANIFEST_ID:
+    if manifest.manifest_id not in {V33_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         return
     timers = manifest.common_timers
     if (
@@ -3895,6 +3952,149 @@ def _validate_v33_static_timing_contract(
             "v33 exact 30s convergence/20s leader/450s fault/650s hard "
             "timing contract drifted"
         )
+
+
+def _expected_excluded_repair_observation_contract(
+    manifest_id: str,
+) -> str | None:
+    if manifest_id in {
+        V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
+        V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
+    }:
+        return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+    if (
+        manifest_id == FROZEN_MANIFEST_ID
+        and manifest_id == "shape-placement-factorial-v34"
+    ):
+        return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+    return None
+
+
+def _uses_excluded_repair_observation(
+    *,
+    manifest_id: str,
+    coverage_smoke: bool,
+    slot_id: str,
+) -> bool:
+    """Dispatch the isolated repair chronology across its exact history."""
+
+    return (
+        manifest_id
+        in {
+            V28_MANIFEST_ID,
+            V29_MANIFEST_ID,
+            V30_MANIFEST_ID,
+            V31_MANIFEST_ID,
+            V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
+        and coverage_smoke
+        and slot_id == _coverage_smoke_slot_ids(manifest_id)[1]
+    )
+
+
+def _v34_excluded_repair_fault_active_phase_contract(
+    *,
+    manifest: FrozenFactorialManifest,
+    expected: _ExpectedSlot,
+    runtime: Mapping[str, Any],
+    coverage_smoke: bool,
+    validated_observation_contract: str | None,
+) -> str | None:
+    """Discriminate the one authorized post-fault Epoch2 repair runtime."""
+
+    if (
+        manifest.manifest_id != FROZEN_MANIFEST_ID
+        or manifest.manifest_id != "shape-placement-factorial-v34"
+        or not coverage_smoke
+        or expected.slot_id != "slot-037-n31-f2-b04-00"
+    ):
+        return None
+    responsive = manifest.byzantine.responsive_degradation
+    manifest_contract = (
+        None
+        if responsive is None
+        else getattr(
+            responsive,
+            "excluded_repair_smoke_observation_contract",
+            None,
+        )
+    )
+    causal_acceptance = _mapping(
+        runtime.get("causal_acceptance"),
+        "v34 repair runtime causal acceptance",
+    )
+    fault_window = _mapping(
+        runtime.get("fault_window"),
+        "v34 repair runtime fault window",
+    )
+    probe = _mapping(
+        runtime.get("excluded_repair_smoke_probe"),
+        "v34 repair runtime probe",
+    )
+    expected_probe_fields = {
+        "source_campaign_slot_id",
+        "source_campaign_result_path",
+        "source_campaign_artifact_id",
+        "semantic_delta",
+        "source_fault_window_duration_s",
+        "effective_fault_window_duration_s",
+        "hard_timeout_s",
+        "observation_contract",
+        "verified_response_duplicate_probe_contract",
+        "verified_response_duplicate_probe_mode",
+    }
+    source_artifact_id = probe.get("source_campaign_artifact_id")
+    if not (
+        expected.execution_ordinal == 5
+        and expected.replica_count == 31
+        and expected.f == 10
+        and expected.q == 21
+        and expected.block_id == "n31-f2-b04"
+        and expected.arm_code == "00"
+        and runtime.get("result_path")
+        == (
+            "results/shape-placement-factorial-v34-coverage-smoke/"
+            "slot-037-n31-f2-b04-00"
+        )
+        and manifest_contract == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        and validated_observation_contract
+        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        and causal_acceptance.get(
+            "excluded_repair_smoke_observation_contract"
+        )
+        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        and fault_window.get("duration_s")
+        == _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+        and fault_window.get("hard_timeout_s") == _V27_HARD_TIMEOUT_S
+        and set(probe) == expected_probe_fields
+        and probe.get("source_campaign_slot_id") == expected.slot_id
+        and probe.get("source_campaign_result_path")
+        == f"results/{manifest.manifest_id}/{expected.slot_id}"
+        and isinstance(source_artifact_id, str)
+        and re.fullmatch(r"slot-runtime-[0-9a-f]{24}", source_artifact_id)
+        is not None
+        and probe.get("semantic_delta")
+        == "byzantine.window.duration_s:450->300"
+        and probe.get("source_fault_window_duration_s")
+        == _V27_FAULT_WINDOW_DURATION_S
+        and probe.get("effective_fault_window_duration_s")
+        == _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+        and probe.get("hard_timeout_s") == _V27_HARD_TIMEOUT_S
+        and probe.get("observation_contract")
+        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        and probe.get("verified_response_duplicate_probe_contract")
+        == EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
+        and probe.get("verified_response_duplicate_probe_mode")
+        == RESPONSE_DUPLICATE_PROBE_MODE_V1
+    ):
+        _fail("v34 excluded repair fault-active phase scope binding drifted")
+    return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
 
 
 def _validate_runtime_slot(
@@ -3933,6 +4133,7 @@ def _validate_runtime_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected.slot_id == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
@@ -3971,17 +4172,13 @@ def _validate_runtime_slot(
             None,
         )
     )
-    if manifest.manifest_id in {
-        V28_MANIFEST_ID,
-        V29_MANIFEST_ID,
-        V30_MANIFEST_ID,
-        V31_MANIFEST_ID,
-        V32_MANIFEST_ID,
-        FROZEN_MANIFEST_ID,
-    }:
+    expected_repair_observation_contract = (
+        _expected_excluded_repair_observation_contract(manifest.manifest_id)
+    )
+    if expected_repair_observation_contract is not None:
         if (
             excluded_repair_observation_contract
-            != EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+            != expected_repair_observation_contract
             or excluded_repair_duplicate_probe_contract
             != EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
         ):
@@ -3999,6 +4196,7 @@ def _validate_runtime_slot(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and (
         manifest.byzantine.duration_s != _V27_FAULT_WINDOW_DURATION_S
@@ -4022,6 +4220,7 @@ def _validate_runtime_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -4043,6 +4242,7 @@ def _validate_runtime_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -4063,6 +4263,7 @@ def _validate_runtime_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -4082,6 +4283,7 @@ def _validate_runtime_slot(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
@@ -4098,6 +4300,7 @@ def _validate_runtime_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not inherited_wait_exempt_placement
@@ -4111,6 +4314,7 @@ def _validate_runtime_slot(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         if not verified_response_duplicate_delivery:
@@ -4207,6 +4411,7 @@ def _validate_runtime_slot(
                     V30_MANIFEST_ID,
                     V31_MANIFEST_ID,
                     V32_MANIFEST_ID,
+                    V33_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4234,12 +4439,13 @@ def _validate_runtime_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity.update(
                 {
                     "excluded_repair_smoke_observation_contract": (
-                        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+                        expected_repair_observation_contract
                     ),
                     "excluded_repair_smoke_verified_response_duplicate_probe_contract": (
                         EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
@@ -4260,6 +4466,7 @@ def _validate_runtime_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity["fault_window_duration_s"] = (
@@ -4294,7 +4501,7 @@ def _validate_runtime_slot(
             ),
             "hard_timeout_s": _V27_HARD_TIMEOUT_S,
             "observation_contract": (
-                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+                expected_repair_observation_contract
             ),
             "verified_response_duplicate_probe_contract": (
                 EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
@@ -4453,6 +4660,7 @@ def _validate_runtime_slot(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4474,18 +4682,11 @@ def _validate_runtime_slot(
         expected_causal_acceptance[
             "verified_response_duplicate_delivery_contract"
         ] = duplicate_contract_value
-    if manifest.manifest_id in {
-        V28_MANIFEST_ID,
-        V29_MANIFEST_ID,
-        V30_MANIFEST_ID,
-        V31_MANIFEST_ID,
-        V32_MANIFEST_ID,
-        FROZEN_MANIFEST_ID,
-    }:
+    if expected_repair_observation_contract is not None:
         expected_causal_acceptance.update(
             {
                 "excluded_repair_smoke_observation_contract": (
-                    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1
+                    expected_repair_observation_contract
                 ),
                 "excluded_repair_smoke_verified_response_duplicate_probe_contract": (
                     EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
@@ -4584,6 +4785,7 @@ def _validate_runtime_slot(
         V30_MANIFEST_ID,
         V31_MANIFEST_ID,
         V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -4750,7 +4952,7 @@ def _validate_runtime_slot(
         manager_argv,
         (),
     )
-    if manifest.manifest_id == FROZEN_MANIFEST_ID:
+    if manifest.manifest_id in {V33_MANIFEST_ID, FROZEN_MANIFEST_ID}:
         deadline_option = "--convergence-deadline-seconds"
         if (
             manager_argv.count(deadline_option) != 1
@@ -8311,6 +8513,7 @@ def validate_fault_causality(
     minimum_epoch1_internal_role_opportunities_per_actor_before_selection: (
         int | None
     ) = None,
+    fault_active_phase_contract: str | None = None,
 ) -> int:
     """Bind scheduled omissions to raw timeouts and exact physical roles."""
 
@@ -8403,18 +8606,50 @@ def validate_fault_causality(
     fault_phase = phase_windows["fault_evidence"][:2]
     epoch1_phase = phase_windows["epoch1_stable"][:2]
     epoch2_phase = phase_windows["epoch2_stable"][:2]
-    if not (
-        window_start_ns <= fault_phase[0] < fault_phase[1]
-        and epoch1_activation_ns <= epoch1_phase[0] < epoch1_phase[1]
-        <= epoch2_command_ns
-        and epoch2_phase[0] < epoch2_phase[1] <= window_end_ns
-    ):
-        _fail("fault causality phase windows are outside their exact live bounds")
     phase_configurations = (
         ("fault_evidence", 0, initial_epoch_digest, tree_by_id),
         ("epoch1_stable", 1, epoch1_digest, epoch1_tree_by_id),
         ("epoch2_stable", 2, epoch2_digest, epoch2_tree_by_id),
     )
+    repair_fault_active_scope = fault_active_phase_contract is not None
+    if repair_fault_active_scope:
+        if (
+            fault_active_phase_contract
+            != EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        ):
+            _fail("fault causality received an unknown fault-active phase contract")
+        if any(marker.epoch_number == 2 for marker in markers):
+            _fail("v34 repair fault-active scope contains an Epoch2 KAURI_FAULT marker")
+        if any(
+            opportunity.epoch_number == 2
+            for opportunity in contribution_opportunities
+        ):
+            _fail(
+                "v34 repair fault-active scope contains an Epoch2 contribution "
+                "opportunity"
+            )
+        if not (
+            window_start_ns <= fault_phase[0] < fault_phase[1]
+            <= epoch1_command_ns
+            and fault_phase[1] <= window_end_ns
+            and epoch1_activation_ns <= epoch1_phase[0] < epoch1_phase[1]
+            < window_end_ns
+            and window_end_ns < epoch2_phase[0] < epoch2_phase[1]
+        ):
+            _fail(
+                "v34 repair fault-active phase windows are outside their exact "
+                "physical-fault bounds"
+            )
+        fault_active_phase_configurations = phase_configurations[:2]
+    else:
+        if not (
+            window_start_ns <= fault_phase[0] < fault_phase[1]
+            and epoch1_activation_ns <= epoch1_phase[0] < epoch1_phase[1]
+            <= epoch2_command_ns
+            and epoch2_phase[0] < epoch2_phase[1] <= window_end_ns
+        ):
+            _fail("fault causality phase windows are outside their exact live bounds")
+        fault_active_phase_configurations = phase_configurations
     if (
         source_bound_proposal_configuration_witnesses
         and not source_bound_contribution_opportunities
@@ -8434,14 +8669,14 @@ def validate_fault_causality(
             opportunities=contribution_opportunities,
             fault_actor_ids=tuple(all_fault_actors),
             phase_windows=phase_windows,
-            phase_configurations=phase_configurations,
+            phase_configurations=fault_active_phase_configurations,
         )
         if source_bound_proposal_configuration_witnesses:
             proposals.update(
                 _source_bound_proposal_configuration_witnesses(
                     opportunities=contribution_opportunities,
                     replica_events=replica_events,
-                    phase_configurations=phase_configurations,
+                    phase_configurations=fault_active_phase_configurations,
                 )
             )
     elif tiered:
@@ -8455,7 +8690,7 @@ def validate_fault_causality(
                 else None
             ),
             phase_windows=phase_windows,
-            phase_configurations=phase_configurations,
+            phase_configurations=fault_active_phase_configurations,
         )
     if not source_bound_contribution_opportunities and fault_mode in {
         "persistent_selected_omission_v1",
@@ -8469,7 +8704,7 @@ def validate_fault_causality(
             ),
             actor_ids=actors,
             phase_windows=phase_windows,
-            phase_configurations=phase_configurations,
+            phase_configurations=fault_active_phase_configurations,
         )
     qualifying_epoch0 = (
         None
@@ -8833,7 +9068,7 @@ def validate_fault_causality(
             f"{sorted(missing_epoch1_leaf)}"
         )
     missing_epoch2_leaf = set(actors) - epoch2_leaf_actors
-    if missing_epoch2_leaf:
+    if missing_epoch2_leaf and not repair_fault_active_scope:
         _fail(
             "actors lack Epoch2-stable wait-exempt leaf omit_direct_vote proof: "
             f"{sorted(missing_epoch2_leaf)}"
@@ -10380,7 +10615,7 @@ def _validate_v28_excluded_repair_observation(
     phase_windows: Mapping[str, tuple[int, int, int]],
     fault_window_end_ns: int,
     hard_deadline_ns: int,
-) -> None:
+) -> str:
     """Validate the isolated v28+ repair chronology without changing legacy cutoffs."""
 
     if (
@@ -10391,6 +10626,7 @@ def _validate_v28_excluded_repair_observation(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id
@@ -10509,9 +10745,14 @@ def _validate_v28_excluded_repair_observation(
         document.get("excluded_repair_observation"),
         "phase-cutoffs.excluded_repair_observation",
     )
+    expected_observation_contract = (
+        _expected_excluded_repair_observation_contract(manifest.manifest_id)
+    )
+    if expected_observation_contract is None:
+        _fail("v28+ excluded repair observation contract is not versioned")
     expected_observation = {
         "schema_version": 1,
-        "observation_contract": EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
+        "observation_contract": expected_observation_contract,
         "fault_window_end_monotonic_ns": fault_end,
         "hard_deadline_monotonic_ns": hard_deadline,
         "rows": expected_rows,
@@ -10562,6 +10803,7 @@ def _validate_v28_excluded_repair_observation(
         or cutoff_times["epoch2_drain_complete"] != drain_event.monotonic_ns
     ):
         _fail("v28 excluded repair observation is detached from legacy cutoffs")
+    return expected_observation_contract
 
 
 def _expected_snapshot_payload_observations(
@@ -10888,6 +11130,7 @@ def _validate_v25_inherited_wait_exempt_placement_live_exercise(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or not coverage_smoke
@@ -11833,6 +12076,7 @@ def _validate_v28_verified_response_duplicate_probe(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -12361,7 +12605,7 @@ def _validate_native_transitions(
             minimum_residency_ms=v24_preselection_contract[0],
         )
     if (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id in {V33_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and expected.replica_count == 31
     ):
         if hard_deadline_ns is None:
@@ -12900,6 +13144,7 @@ def _validate_v25_coverage_execution_lifecycle(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id not in coverage_slot_ids
@@ -13308,6 +13553,7 @@ def validate_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         )
     )
@@ -13455,19 +13701,10 @@ def validate_slot(
             events_by_ref[key] = event
 
         cutoff_contract = _mapping(runtime.get("cutoff_contract"), "runtime cutoff contract")
-        v28_excluded_repair = (
-            manifest.manifest_id
-            in {
-                V28_MANIFEST_ID,
-                V29_MANIFEST_ID,
-                V30_MANIFEST_ID,
-                V31_MANIFEST_ID,
-                V32_MANIFEST_ID,
-                FROZEN_MANIFEST_ID,
-            }
-            and coverage_smoke
-            and expected.slot_id
-            == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
+        v28_excluded_repair = _uses_excluded_repair_observation(
+            manifest_id=manifest.manifest_id,
+            coverage_smoke=coverage_smoke,
+            slot_id=expected.slot_id,
         )
         hard_deadline_ns = anchor_ns + _integer(
             _mapping(runtime.get("fault_window"), "runtime fault window").get(
@@ -13534,8 +13771,9 @@ def validate_slot(
             cutoff_times=cutoff_times,
         )
         bundles = (epoch1_bundle, epoch2_bundle)
+        fault_active_phase_contract: str | None = None
         if v28_excluded_repair:
-            _validate_v28_excluded_repair_observation(
+            validated_observation_contract = _validate_v28_excluded_repair_observation(
                 cutoff_document,
                 manifest=manifest,
                 expected=expected,
@@ -13546,6 +13784,17 @@ def validate_slot(
                 phase_windows=phase_windows,
                 fault_window_end_ns=window_end_ns,
                 hard_deadline_ns=hard_deadline_ns,
+            )
+            fault_active_phase_contract = (
+                _v34_excluded_repair_fault_active_phase_contract(
+                    manifest=manifest,
+                    expected=expected,
+                    runtime=runtime,
+                    coverage_smoke=coverage_smoke,
+                    validated_observation_contract=(
+                        validated_observation_contract
+                    ),
+                )
             )
         epoch1_roots = tuple(tree.members[0] for tree in bundles[0].trees)
         epoch2_roots = tuple(tree.members[0] for tree in bundles[1].trees)
@@ -13647,6 +13896,7 @@ def validate_slot(
             V30_MANIFEST_ID,
             V31_MANIFEST_ID,
             V32_MANIFEST_ID,
+            V33_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             _validate_v28_verified_response_duplicate_probe(
@@ -13803,6 +14053,7 @@ def validate_slot(
             minimum_epoch1_internal_role_opportunities_per_actor_before_selection=(
                 minimum_primary_internal_opportunities
             ),
+            fault_active_phase_contract=fault_active_phase_contract,
         )
 
         loaded_throughput = _read_json(slot_root, THROUGHPUT_FILENAME)
@@ -13924,6 +14175,7 @@ def validate_slot(
                 V30_MANIFEST_ID,
                 V31_MANIFEST_ID,
                 V32_MANIFEST_ID,
+                V33_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         ):

@@ -20,6 +20,9 @@ V33_MANIFEST = (
 V32_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v32.json"
 )
+V34_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v34.json"
+)
 
 
 def _canonical(value: object) -> bytes:
@@ -122,14 +125,14 @@ def test_v32_identities_are_explicit_historical_aliases() -> None:
 
 
 def test_v33_six_identities_are_frozen_after_semantic_ack() -> None:
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v33"
+    assert manifest_module.V33_MANIFEST_ID == "shape-placement-factorial-v33"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V33_MANIFEST_SHA256,
+        manifest_module.V33_SEMANTIC_SHA256,
+        manifest_module.V33_PLAN_SHA256,
+        runtime_module.V33_RUNTIME_SHA256,
+        runtime_module.V33_SMOKE_RUNTIME_SHA256,
+        runtime_module.V33_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         "aa109a401ef88f7d135ff7f590ae1f372329ed5165c223ce0e3bf44536cf61fc",
         "8faee7b8cf1148a7acec48b75f02ca3f5b864ee6981555ae78624664e246509f",
@@ -292,10 +295,10 @@ def test_v32_and_v33_repair_runtimes_reject_bidirectional_cross_binding(
         )
 
 
-def test_v33_is_default_and_v32_is_validation_only(
+def test_v34_is_default_and_v33_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V33_MANIFEST
-    assert cli.main(["--manifest", str(V32_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST == V34_MANIFEST
+    assert cli.main(["--manifest", str(V33_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v32 are validation-only" in refusal["reason"]
+    assert "v1 through v33 are validation-only" in refusal["reason"]
