@@ -36,9 +36,6 @@ V17_MANIFEST = (
 V16_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v16.json"
 )
-V25_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v25.json"
-)
 PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT = (
     "epoch_zero_fault_containment_preserves_current_fanout_without_shape_v1_"
     "decision_later_transition_retains_exact_shape_v1_v1"
@@ -151,10 +148,10 @@ def test_v17_all_six_static_identities_are_frozen() -> None:
 def test_v17_is_validation_only_and_keeps_historical_smoke_roots(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V25_MANIFEST
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v26.json"
     assert cli.main(["--manifest", str(V17_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v24 are validation-only" in refusal["reason"]
+    assert "v1 through v25 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V17_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

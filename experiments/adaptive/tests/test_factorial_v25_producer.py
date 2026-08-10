@@ -370,7 +370,10 @@ def _runtime_identities(path: Path) -> tuple[str, str, str, str, str, str]:
     runtime = runtime_module.build_factorial_runtime(plan)
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])
     first = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
-    if manifest.manifest_id == manifest_module.FROZEN_MANIFEST_ID:
+    if manifest.manifest_id in {
+        manifest_module.V25_MANIFEST_ID,
+        manifest_module.FROZEN_MANIFEST_ID,
+    }:
         repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
         n31 = execution.build_n31_coverage_smoke_slot(
             first,
@@ -513,23 +516,23 @@ def test_v24_preserves_all_six_frozen_identities() -> None:
 
 def test_v25_freezes_all_six_recomputed_identities() -> None:
     assert _runtime_identities(V25_MANIFEST) == (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V25_MANIFEST_SHA256,
+        manifest_module.V25_SEMANTIC_SHA256,
+        manifest_module.V25_PLAN_SHA256,
+        runtime_module.V25_RUNTIME_SHA256,
+        runtime_module.V25_SMOKE_RUNTIME_SHA256,
+        runtime_module.V25_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
 
 
-def test_v25_is_the_only_production_default_and_keeps_v24_validation_only(
+def test_v25_is_validation_only_and_keeps_its_ordered_zero_retry_roots(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V25_MANIFEST
-    assert cli.main(["--manifest", str(V24_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v26.json"
+    assert cli.main(["--manifest", str(V25_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v24 are validation-only" in refusal["reason"]
+    assert "v1 through v25 are validation-only" in refusal["reason"]
 
     manifest = _parse_candidate(monkeypatch)
     plan = manifest_module.build_factorial_plan(manifest)

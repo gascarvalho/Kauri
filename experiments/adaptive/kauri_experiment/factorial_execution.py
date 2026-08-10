@@ -1,4 +1,4 @@
-"""Fail-closed local execution for one SHAPE25 factorial slot.
+"""Fail-closed local execution for one SHAPE26 factorial slot.
 
 The frozen factorial modules describe *what* may be run.  This module owns the
 small, deliberately local execution boundary: it proves an exact pushed
@@ -46,6 +46,8 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
+    V25_MANIFEST_ID,
+    VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     PortAllocation,
     build_factorial_plan,
     derive_actor_ids,
@@ -226,7 +228,7 @@ class N31CoverageSmokeSlot:
 
 @dataclass(frozen=True, slots=True)
 class N31CoverageSmokeRuntime:
-    """Canonical ordered runtime identity for the v25 two-slot proof."""
+    """Canonical ordered runtime identity for the v25+ two-slot proof."""
 
     schema_version: int
     runtime_id: str
@@ -1313,7 +1315,7 @@ def build_coverage_smoke_execution_contract(
 
     if not isinstance(runtime, N31CoverageSmokeRuntime):
         raise FactorialExecutionError(
-            "v25 coverage-smoke contract requires the ordered runtime"
+            "v25+ coverage-smoke contract requires the ordered runtime"
         )
     if set(static_artifacts) != {"manifest.json", "plan.json", "runtime.json"}:
         raise FactorialExecutionError(
@@ -1322,7 +1324,7 @@ def build_coverage_smoke_execution_contract(
     slots = runtime.slots
     if (
         runtime.schema_version != 1
-        or runtime.manifest_id != FROZEN_MANIFEST_ID
+        or runtime.manifest_id not in {V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
         or runtime.execution_mode != "fixed_sequential"
         or runtime.automatic_retries != 0
         or runtime.replacement_policy != "none"
@@ -1578,7 +1580,10 @@ def _bind_execution_authorization(
     )
     if campaign_member:
         expected_slots = [planned.slot_id for planned in plan.slots]
-    elif slot.replica_count == 31 and manifest.manifest_id == FROZEN_MANIFEST_ID:
+    elif slot.replica_count == 31 and manifest.manifest_id in {
+        V25_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         expected_slots = [
             item.slot_id
             for execution_ordinal in (1, 5)
@@ -1587,7 +1592,7 @@ def _bind_execution_authorization(
         ]
         if len(expected_slots) != 2 or slot.slot_id not in expected_slots:
             raise FactorialExecutionError(
-                "v25 coverage-smoke authorization slot sequence drifted"
+                "v25+ coverage-smoke authorization slot sequence drifted"
             )
     else:
         expected_slots = [slot.slot_id]
@@ -1962,7 +1967,7 @@ def _validate_coverage_smoke_launch_order(
     authorization_receipt: bytes,
     authorization: Mapping[str, object],
 ) -> CoverageSmokeLaunchBinding:
-    """Replay the exact v25 coverage prefix before creating the next slot."""
+    """Replay the exact v25+ coverage prefix before creating the next slot."""
 
     root = preflight.result_root
     if root.is_symlink() or not root.is_dir():
@@ -2665,7 +2670,7 @@ def monotonic_raw_ns() -> int:
     reader = getattr(time, "clock_gettime_ns", None)
     if clock_id is None or not callable(reader):
         raise FactorialExecutionError(
-            "CLOCK_MONOTONIC_RAW is required for SHAPE25 execution"
+            "CLOCK_MONOTONIC_RAW is required for SHAPE26 execution"
         )
     value = int(reader(clock_id))
     if value <= 0:
@@ -2820,7 +2825,7 @@ def _bind_static_artifacts(
                 (item for item in plan.slots if item.execution_ordinal == 5),
                 None,
             )
-            if manifest.manifest_id == FROZEN_MANIFEST_ID
+            if manifest.manifest_id in {V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         if primary is None:
@@ -5486,6 +5491,7 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v23/slot-066-n31-f5-b05-P": "v23",
         "results/shape-placement-factorial-v24/slot-066-n31-f5-b05-P": "v24",
         "results/shape-placement-factorial-v25/slot-066-n31-f5-b05-P": "v25",
+        "results/shape-placement-factorial-v26/slot-066-n31-f5-b05-P": "v26",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_timeout_eligibility = {
@@ -5500,22 +5506,34 @@ def build_n31_coverage_smoke_slot(
         "v23": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v24": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v25": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v26": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
         if manifest_version
-        in {"v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25"}
+        in {
+            "v17",
+            "v18",
+            "v19",
+            "v20",
+            "v21",
+            "v22",
+            "v23",
+            "v24",
+            "v25",
+            "v26",
+        }
         else None
     )
     expected_guarded_selection_contract = (
         PRECONTAINMENT_GUARDED_SELECTION_CONTRACT_V1
         if manifest_version
-        in {"v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25"}
+        in {"v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26"}
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
-        if manifest_version in {"v23", "v24", "v25"}
+        if manifest_version in {"v23", "v24", "v25", "v26"}
         else (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_version in {"v19", "v20", "v21", "v22"}
@@ -5524,17 +5542,23 @@ def build_n31_coverage_smoke_slot(
     )
     expected_source_bound_proposal_witness_contract = (
         SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-        if manifest_version in {"v20", "v21", "v22", "v23", "v24", "v25"}
+        if manifest_version
+        in {"v20", "v21", "v22", "v23", "v24", "v25", "v26"}
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
-        if manifest_version in {"v22", "v23", "v24", "v25"}
+        if manifest_version in {"v22", "v23", "v24", "v25", "v26"}
         else None
     )
     expected_inherited_wait_exempt_placement_contract = (
         INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
-        if manifest_version == "v25"
+        if manifest_version in {"v25", "v26"}
+        else None
+    )
+    expected_verified_response_duplicate_delivery_contract = (
+        VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
+        if manifest_version == "v26"
         else None
     )
     if (
@@ -5608,10 +5632,12 @@ def build_n31_coverage_smoke_slot(
         != expected_evidence_snapshot_selection_contract
         or responsive.inherited_consensus_wait_exempt_placement_contract
         != expected_inherited_wait_exempt_placement_contract
+        or responsive.verified_response_duplicate_delivery_contract
+        != expected_verified_response_duplicate_delivery_contract
         or template.workload.epoch1_preselection_residency_ms
-        != (60_000 if manifest_version in {"v24", "v25"} else None)
+        != (60_000 if manifest_version in {"v24", "v25", "v26"} else None)
         or responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
-        != (82 if manifest_version in {"v24", "v25"} else None)
+        != (82 if manifest_version in {"v24", "v25", "v26"} else None)
     ):
         raise FactorialExecutionError(
             "N=31 coverage smoke must derive from an exact frozen campaign "
@@ -5629,7 +5655,7 @@ def build_n31_coverage_smoke_slot(
         )
     smoke = replace(template, result_path=result_path)
     primary_runtime = build_slot_runtime(smoke)
-    if manifest_version != "v25":
+    if manifest_version not in {"v25", "v26"}:
         if repair_template is not None or repair_result_path is not None:
             raise FactorialExecutionError(
                 "historical N=31 coverage smoke must remain single-slot"
@@ -5643,11 +5669,12 @@ def build_n31_coverage_smoke_slot(
 
     if not isinstance(repair_template, FactorialSlot):
         raise FactorialExecutionError(
-            "v25 N=31 coverage smoke requires exact campaign slot 037"
+            "v25+ N=31 coverage smoke requires exact campaign slot 037"
         )
     repair_responsive = repair_template.byzantine.responsive_degradation
     expected_repair_campaign_path = (
-        "results/shape-placement-factorial-v25/slot-037-n31-f2-b04-00"
+        f"results/shape-placement-factorial-{manifest_version}/"
+        "slot-037-n31-f2-b04-00"
     )
     if (
         repair_template.slot_id != "slot-037-n31-f2-b04-00"
@@ -5716,30 +5743,35 @@ def build_n31_coverage_smoke_slot(
         != EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
         or repair_responsive.inherited_consensus_wait_exempt_placement_contract
         != INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
+        or repair_responsive.verified_response_duplicate_delivery_contract
+        != expected_verified_response_duplicate_delivery_contract
         or repair_template.workload.epoch1_preselection_residency_ms != 60_000
         or repair_responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
         != 82
     ):
         raise FactorialExecutionError(
-            "v25 N=31 coverage smoke must derive from exact campaign slot 037"
+            "v25+ N=31 coverage smoke must derive from exact campaign slot 037"
         )
     expected_repair_result_path = (
-        "results/shape-placement-factorial-v25-coverage-smoke/"
+        f"results/shape-placement-factorial-{manifest_version}-coverage-smoke/"
         "slot-037-n31-f2-b04-00"
     )
     if repair_result_path is None:
         repair_result_path = expected_repair_result_path
     if repair_result_path != expected_repair_result_path:
         raise FactorialExecutionError(
-            "v25 N=31 repair coverage result path must be the exact canonical root"
+            "v25+ N=31 repair coverage result path must be the exact canonical root"
         )
     repair_smoke = replace(repair_template, result_path=repair_result_path)
     repair_runtime = build_slot_runtime(repair_smoke)
     ordered_runtimes = (primary_runtime, repair_runtime)
     coverage_runtime = N31CoverageSmokeRuntime(
         schema_version=1,
-        runtime_id="shape-placement-factorial-v25-excluded-n31-coverage-smoke-v1",
-        manifest_id="shape-placement-factorial-v25",
+        runtime_id=(
+            f"shape-placement-factorial-{manifest_version}-"
+            "excluded-n31-coverage-smoke-v1"
+        ),
+        manifest_id=f"shape-placement-factorial-{manifest_version}",
         execution_mode="fixed_sequential",
         automatic_retries=0,
         replacement_policy="none",

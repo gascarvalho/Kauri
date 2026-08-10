@@ -50,6 +50,9 @@ MANIFEST_PATH = (
 V25_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v25.json"
 )
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v26.json"
+)
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
 )
@@ -133,6 +136,46 @@ INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT = (
     "exact_selected_wait_exempt_replicas_are_excluded_from_root_and_internal_"
     "assignment_and_placed_as_leaves_in_every_successor_tree_v1"
 )
+VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT = (
+    "exact_duplicate_verified_child_response_is_idempotent_and_cannot_fail_"
+    "the_response_deadline_or_suppress_later_convergence_observations_v1"
+)
+
+
+def test_v26_verified_response_duplicate_delivery_dispatch_is_version_and_field_exact() -> None:
+    def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
+        responsive = SimpleNamespace()
+        if value is not None:
+            responsive.verified_response_duplicate_delivery_contract = value
+        return SimpleNamespace(
+            manifest_id=manifest_id,
+            byzantine=SimpleNamespace(responsive_degradation=responsive),
+        )
+
+    assert validation.VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1 == (
+        VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT
+    )
+    assert validation._uses_verified_response_duplicate_delivery_contract(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
+            VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT,
+        )
+    )
+    assert not validation._uses_verified_response_duplicate_delivery_contract(
+        manifest(
+            validation.V25_MANIFEST_ID,
+            VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT,
+        )
+    )
+    assert not validation._uses_verified_response_duplicate_delivery_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, None)
+    )
+    assert not validation._uses_verified_response_duplicate_delivery_contract(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
+            f"{VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT}-drift",
+        )
+    )
 
 
 def test_v23_future_tree_delivery_dispatch_is_version_and_field_exact() -> None:
@@ -204,6 +247,12 @@ def test_v25_inherited_wait_exempt_placement_dispatch_is_version_and_field_exact
     )
     assert validation._uses_inherited_consensus_wait_exempt_placement_contract(
         manifest(
+            validation.V25_MANIFEST_ID,
+            INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
+        )
+    )
+    assert validation._uses_inherited_consensus_wait_exempt_placement_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT,
         )
@@ -243,6 +292,19 @@ def _v25_candidate_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ):
     payload = V25_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v26_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = FROZEN_MANIFEST_PATH.read_bytes()
     semantic = _canonical(json.loads(payload))
     monkeypatch.setattr(
         manifest_module,
@@ -418,7 +480,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v24_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v25_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -448,6 +510,7 @@ def test_validator_retains_exact_v1_through_v24_artifact_identities() -> None:
             (22, V22_MANIFEST_PATH),
             (23, V23_MANIFEST_PATH),
             (24, MANIFEST_PATH),
+            (25, V25_MANIFEST_PATH),
         )
     }
 
@@ -615,6 +678,17 @@ def test_validator_retains_exact_v1_through_v24_artifact_identities() -> None:
         identities[24].coverage_smoke_runtime_sha256
         == validation.V24_COVERAGE_SMOKE_RUNTIME_SHA256
     )
+    assert identities[25].manifest_sha256 == validation.V25_MANIFEST_SHA256
+    assert identities[25].plan_sha256 == validation.V25_PLAN_SHA256
+    assert identities[25].runtime_sha256 == validation.V25_RUNTIME_SHA256
+    assert (
+        identities[25].smoke_runtime_sha256
+        == validation.V25_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[25].coverage_smoke_runtime_sha256
+        == validation.V25_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
     assert validation._coverage_smoke_result_root(
         validation.V23_MANIFEST_ID
     ) == "results/shape-placement-factorial-v23-coverage-smoke"
@@ -622,8 +696,11 @@ def test_validator_retains_exact_v1_through_v24_artifact_identities() -> None:
         validation.V24_MANIFEST_ID
     ) == "results/shape-placement-factorial-v24-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V25_MANIFEST_ID
     ) == "results/shape-placement-factorial-v25-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v26-coverage-smoke"
 
 
 @pytest.mark.parametrize(
@@ -1436,6 +1513,108 @@ def test_v24_binds_preselection_fields_to_runtime_identity_acceptance_and_transi
         "minimum_predecessor_residency_ms"
     ] == 30_000
     assert slot.artifact_id != v23_runtime.slots[0].artifact_id
+
+
+def test_v26_binds_duplicate_delivery_to_runtime_identity_and_rejects_v25_forgery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _v26_candidate_manifest(monkeypatch)
+    runtime = build_factorial_runtime(build_factorial_plan(manifest))
+    expected_by_id = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(manifest)
+    }
+    slot = runtime.slots[0]
+    document = json.loads(json.dumps(slot.as_document()))
+    field = "verified_response_duplicate_delivery_contract"
+
+    assert document["causal_acceptance"][field] == (
+        VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT
+    )
+    assert field not in document["tiered_cohorts"]
+    validation._validate_runtime_slot(
+        document,
+        expected_by_id[slot.slot_id],
+        manifest,
+    )
+
+    for value in (None, f"{VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT}-drift"):
+        drifted = copy.deepcopy(document)
+        if value is None:
+            del drifted["causal_acceptance"][field]
+        else:
+            drifted["causal_acceptance"][field] = value
+        with pytest.raises(
+            FactorialValidationError,
+            match="causal acceptance contract",
+        ):
+            validation._validate_runtime_slot(
+                drifted,
+                expected_by_id[slot.slot_id],
+                manifest,
+            )
+
+    responsive = manifest.byzantine.responsive_degradation
+    assert responsive is not None
+    for value in (None, f"{VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT}-drift"):
+        drifted_manifest = replace(
+            manifest,
+            byzantine=replace(
+                manifest.byzantine,
+                responsive_degradation=replace(
+                    responsive,
+                    verified_response_duplicate_delivery_contract=value,
+                ),
+            ),
+        )
+        with pytest.raises(
+            FactorialValidationError,
+            match="verified response duplicate delivery contract",
+        ):
+            validation._validate_runtime_slot(
+                document,
+                expected_by_id[slot.slot_id],
+                drifted_manifest,
+            )
+
+    v25 = _v25_candidate_manifest(monkeypatch)
+    v25_runtime = build_factorial_runtime(build_factorial_plan(v25))
+    v25_slot = v25_runtime.slots[0]
+    v25_document = json.loads(json.dumps(v25_slot.as_document()))
+    assert field not in v25_document["causal_acceptance"]
+    assert slot.artifact_id != v25_slot.artifact_id
+    v25_document["causal_acceptance"][field] = (
+        VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT
+    )
+    v25_expected = {
+        expected.slot_id: expected
+        for expected in validation._expected_slots(v25)
+    }
+    with pytest.raises(FactorialValidationError, match="causal acceptance contract"):
+        validation._validate_runtime_slot(
+            v25_document,
+            v25_expected[v25_slot.slot_id],
+            v25,
+        )
+
+    forged_v25_manifest = replace(
+        v25,
+        byzantine=replace(
+            v25.byzantine,
+            responsive_degradation=replace(
+                v25.byzantine.responsive_degradation,
+                verified_response_duplicate_delivery_contract=(
+                    VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(FactorialValidationError, match="v26-only"):
+        validation._validate_runtime_slot(
+            json.loads(json.dumps(v25_slot.as_document())),
+            v25_expected[v25_slot.slot_id],
+            forged_v25_manifest,
+        )
 
 
 def test_v19_rejects_forged_v20_source_bound_witness_runtime_field() -> None:
@@ -6286,11 +6465,302 @@ def _v25_inherited_placement_scores(
     )
 
 
+def _v26_duplicate_delivery_live_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, object], Path]:
+    expected = _v25_inherited_placement_expected_slot()
+    predecessor_trees = _v25_inherited_placement_trees(expected)
+    successor_trees = _v25_inherited_placement_trees(expected)
+    predecessor_digest = "11" * 32
+    successor_digest = "22" * 32
+    command_payload_digest = "33" * 32
+    command_block_hash = "44" * 32
+    proposal_block_hash = "88" * 32
+    reporter = 6
+    child = 1
+    tree_id = 6
+    view_generation = ((1 << 32) | tree_id) + 1
+    activation_delay = 5
+    command_height = 100
+    command_payload = {
+        "command_block_height": command_height,
+        "command_block_hash": command_block_hash,
+        "payload_digest": command_payload_digest,
+        "predecessor_epoch_number": 1,
+        "predecessor_epoch_digest": predecessor_digest,
+        "successor_epoch_number": 2,
+        "successor_epoch_digest": successor_digest,
+        "activation_delay_blocks": activation_delay,
+        "activation_height": command_height + activation_delay,
+    }
+    replica_events = {
+        replica_id: (
+            _native_event(
+                source_id=f"replica-{replica_id}",
+                sequence=1,
+                monotonic_ns=1_000 + replica_id,
+                event_type="epoch.command_committed",
+                payload=dict(command_payload),
+            ),
+            _native_event(
+                source_id=f"replica-{replica_id}",
+                sequence=2,
+                monotonic_ns=2_000 + replica_id,
+                event_type="epoch.activated",
+                payload={
+                    "epoch_number": 2,
+                    "tree_id": 0,
+                    "epoch_digest": successor_digest,
+                    "activation_height": command_height + activation_delay,
+                },
+            ),
+        )
+        for replica_id in range(expected.replica_count)
+    }
+    convergence_payload = {
+        "replica_id": None,
+        "delivery_attempt": None,
+        "disposition": None,
+        "identity": {
+            "predecessor_epoch_number": 1,
+            "predecessor_epoch_digest": predecessor_digest,
+            "successor_epoch_number": 2,
+            "successor_epoch_digest": successor_digest,
+            "command_payload_digest": command_payload_digest,
+            "command_block_height": command_height,
+            "command_block_hash": command_block_hash,
+            "activation_delay_blocks": activation_delay,
+            "activation_height": command_height + activation_delay,
+        },
+        "accepted_commit_count": expected.q,
+        "accepted_activation_count": expected.q,
+        "required_activation_count": expected.q,
+        "canonical_payload_digest": None,
+        "failure_reason": None,
+    }
+    terminal_payload = {
+        "cycle_ordinal": 1,
+        "outcome": "advanced",
+        "reason": "successor_converged",
+        "predecessor_epoch_number": 1,
+        "predecessor_epoch_digest": predecessor_digest,
+        "successor_epoch_number": 2,
+        "successor_epoch_digest": successor_digest,
+        "command_payload_digest": command_payload_digest,
+    }
+    manager_events = (
+        validation._NativeEvent(
+            relative_path="raw/adaptive-manager.jsonl",
+            line_number=1,
+            source_kind="adaptation_manager",
+            source_id="adaptive-manager",
+            source_instance="slot-adaptive-manager",
+            source_sequence=1,
+            monotonic_ns=3_000,
+            event_type="adaptive_v2_converged",
+            payload=convergence_payload,
+            line_sha256="55" * 32,
+        ),
+        validation._NativeEvent(
+            relative_path="raw/adaptive-manager.jsonl",
+            line_number=2,
+            source_kind="adaptation_manager",
+            source_id="adaptive-manager",
+            source_instance="slot-adaptive-manager",
+            source_sequence=2,
+            monotonic_ns=3_100,
+            event_type="adaptive_v2_session_terminal",
+            payload=terminal_payload,
+            line_sha256="66" * 32,
+        ),
+    )
+    paths_by_replica: dict[int, tuple[str, ...]] = {}
+    for replica_id in range(expected.replica_count):
+        relative = f"raw/process/replica-{replica_id}.stderr.log"
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        paths_by_replica[replica_id] = (relative,)
+    log_path = tmp_path / paths_by_replica[reporter][0]
+    log_path.write_text(
+        "\n".join(
+            (
+                "KAURI_EVIDENCE response_attempt_armed "
+                f"reporter={reporter} child={child} epoch=1 tree={tree_id} "
+                f"epoch_digest={predecessor_digest} block={proposal_block_hash} "
+                "expected_message_type=aggregate_relay start_monotonic_ns=10 "
+                "deadline_duration_us=20 absolute_deadline_ns=20010",
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root={reporter} "
+                "error=0 wire_error=0 permission=3 envelope=1 "
+                f"epoch=1 tree={tree_id} block={proposal_block_hash} "
+                f"generation={view_generation}",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root={reporter} "
+                "dispatched=1",
+                "KAURI_RELAY_INGRESS stage=begin "
+                f"recipient={reporter} source_replica={child}",
+                "KAURI_RESPONSE_EVIDENCE disposition=idempotent_duplicate "
+                f"reporter={reporter} child={child} epoch=1 tree={tree_id} "
+                f"digest={predecessor_digest} block={proposal_block_hash} "
+                "message_type=aggregate_relay attempt_generation=7 "
+                "response_monotonic_ns=900",
+                "KAURI_RELAY_INGRESS stage=result "
+                f"recipient={reporter} source_replica={child} root={reporter} "
+                "error=0 wire_error=0 permission=3 envelope=1 "
+                f"epoch=1 tree={tree_id} block={proposal_block_hash} "
+                f"generation={view_generation}",
+                "KAURI_RELAY_INGRESS stage=dispatch_complete "
+                f"recipient={reporter} source_replica={child} root={reporter} "
+                "dispatched=1",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return (
+        {
+            "manifest_id": validation.FROZEN_MANIFEST_ID,
+            "coverage_smoke": True,
+            "expected": expected,
+            "slot_root": tmp_path,
+            "paths_by_replica": paths_by_replica,
+            "manager_events": manager_events,
+            "replica_events": replica_events,
+            "predecessor_epoch_digest": predecessor_digest,
+            "predecessor_trees": predecessor_trees,
+            "successor_epoch_digest": successor_digest,
+            "successor_trees": successor_trees,
+            "command_payload_digest": command_payload_digest,
+            "activation_delay_blocks": activation_delay,
+        },
+        log_path,
+    )
+
+
+def test_v26_slot037_requires_live_idempotent_duplicate_delivery_proof(
+    tmp_path: Path,
+) -> None:
+    arguments, _ = _v26_duplicate_delivery_live_fixture(tmp_path)
+    assert validation._validate_v26_verified_response_duplicate_live_exercise(
+        **arguments
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    (
+        ("missing-marker", "idempotent duplicate guard marker"),
+        ("single-ingress", "repeated authenticated aggregate ingress"),
+        ("wrong-child", "repeated authenticated aggregate ingress|active topology"),
+        ("direct-vote", "aggregate relay"),
+        ("early-marker", "active topology/response-attempt arm"),
+        ("late-marker", "active topology/response-attempt arm"),
+        ("deadline-poison", "convergence poison"),
+        ("missing-activation", "cycle-1 commit/activation convergence"),
+        ("missing-converged", "cycle-1 adaptive_v2_converged"),
+        ("drifted-converged", "cycle-1 adaptive_v2_converged"),
+        ("short-converged", "cycle-1 adaptive_v2_converged"),
+        ("required-count-drift", "cycle-1 adaptive_v2_converged"),
+        ("failed-terminal", "cycle-1 commit/activation convergence"),
+    ),
+)
+def test_v26_slot037_duplicate_delivery_proof_is_fail_closed(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments, log_path = _v26_duplicate_delivery_live_fixture(tmp_path)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    if mutation == "missing-marker":
+        lines = [line for line in lines if "KAURI_RESPONSE_EVIDENCE" not in line]
+    elif mutation == "single-ingress":
+        lines = lines[4:]
+    elif mutation == "wrong-child":
+        lines[5] = lines[5].replace("child=1", "child=2")
+    elif mutation == "direct-vote":
+        lines[5] = lines[5].replace(
+            "message_type=aggregate_relay", "message_type=direct_vote"
+        )
+    elif mutation == "early-marker":
+        lines[5] = lines[5].replace(
+            "response_monotonic_ns=900", "response_monotonic_ns=9"
+        )
+    elif mutation == "late-marker":
+        lines[5] = lines[5].replace(
+            "response_monotonic_ns=900", "response_monotonic_ns=1006"
+        )
+    elif mutation == "deadline-poison":
+        lines.append(
+            "[EPOCH] Adaptive-v2 convergence evidence unhealthy: "
+            "response_deadline_evidence_failed"
+        )
+    elif mutation == "missing-activation":
+        replica_events = dict(arguments["replica_events"])
+        replica_events[30] = replica_events[30][:1]
+        arguments["replica_events"] = replica_events
+    elif mutation == "missing-converged":
+        arguments["manager_events"] = arguments["manager_events"][1:]
+    elif mutation == "drifted-converged":
+        converged, terminal = arguments["manager_events"]
+        identity = dict(converged.payload["identity"])
+        identity["command_block_hash"] = "77" * 32
+        arguments["manager_events"] = (
+            replace(converged, payload={**converged.payload, "identity": identity}),
+            terminal,
+        )
+    elif mutation == "short-converged":
+        converged, terminal = arguments["manager_events"]
+        expected = arguments["expected"]
+        arguments["manager_events"] = (
+            replace(
+                converged,
+                payload={
+                    **converged.payload,
+                    "accepted_commit_count": expected.q - 1,
+                },
+            ),
+            terminal,
+        )
+    elif mutation == "required-count-drift":
+        converged, terminal = arguments["manager_events"]
+        expected = arguments["expected"]
+        arguments["manager_events"] = (
+            replace(
+                converged,
+                payload={
+                    **converged.payload,
+                    "accepted_commit_count": expected.q + 1,
+                    "accepted_activation_count": expected.q + 1,
+                    "required_activation_count": expected.q + 1,
+                },
+            ),
+            terminal,
+        )
+    else:
+        converged, terminal = arguments["manager_events"]
+        arguments["manager_events"] = (
+            converged,
+            replace(
+                terminal,
+                payload={**terminal.payload, "reason": "convergence_retry_exhausted"},
+            ),
+        )
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v26_verified_response_duplicate_live_exercise(
+            **arguments
+        )
+
+
 def test_v25_slot037_coverage_proves_exact_inherited_leaf_placement() -> None:
     expected = _v25_inherited_placement_expected_slot()
     trees = _v25_inherited_placement_trees(expected)
     arguments = {
-        "manifest_id": validation.FROZEN_MANIFEST_ID,
+        "manifest_id": validation.V25_MANIFEST_ID,
         "coverage_smoke": True,
         "expected": expected,
         "cycle": 1,
@@ -6302,6 +6772,9 @@ def test_v25_slot037_coverage_proves_exact_inherited_leaf_placement() -> None:
 
     assert validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
         **arguments
+    )
+    assert validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
+        **{**arguments, "manifest_id": validation.FROZEN_MANIFEST_ID}
     )
     assert not validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
         **{**arguments, "manifest_id": validation.V24_MANIFEST_ID}
@@ -6365,7 +6838,7 @@ def test_v25_slot037_coverage_placement_witness_is_fail_closed(
 
     with pytest.raises(FactorialValidationError, match=reason):
         validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
-            manifest_id=validation.FROZEN_MANIFEST_ID,
+            manifest_id=validation.V25_MANIFEST_ID,
             coverage_smoke=True,
             expected=expected,
             cycle=1,
@@ -6388,7 +6861,7 @@ def test_v25_slot037_coverage_requires_cycle1_fault_containment(
     trees = _v25_inherited_placement_trees(expected)
     with pytest.raises(FactorialValidationError, match="cycle-1 fault containment"):
         validation._validate_v25_inherited_wait_exempt_placement_live_exercise(
-            manifest_id=validation.FROZEN_MANIFEST_ID,
+            manifest_id=validation.V25_MANIFEST_ID,
             coverage_smoke=True,
             expected=expected,
             cycle=cycle,
@@ -7320,19 +7793,23 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
     assert validation._coverage_smoke_slot_ids(validation.V24_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
     )
+    assert validation._coverage_smoke_slot_ids(validation.V25_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
     assert validation._coverage_smoke_slot_ids(validation.FROZEN_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
 
-    v25_root = Path(validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+    v25_root = Path(validation.V25_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
     assert validation._is_excluded_coverage_smoke_slot(
         v25_root / "slot-066-n31-f5-b05-P",
-        manifest_id=validation.FROZEN_MANIFEST_ID,
+        manifest_id=validation.V25_MANIFEST_ID,
     )
     assert validation._is_excluded_coverage_smoke_slot(
         v25_root / "slot-037-n31-f2-b04-00",
-        manifest_id=validation.FROZEN_MANIFEST_ID,
+        manifest_id=validation.V25_MANIFEST_ID,
     )
     assert not validation._is_excluded_coverage_smoke_slot(
         Path(validation.V24_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
@@ -7341,14 +7818,44 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "result_root",
+    (
+        validation.V25_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+    ),
+)
+def test_v25_plus_coverage_membership_is_preserved_before_static_load(
+    tmp_path: Path,
+    result_root: str,
+) -> None:
+    slot_root = (
+        tmp_path
+        / Path(result_root).name
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
+    slot_root.mkdir(parents=True)
+
+    result = validation.validate_slot(slot_root)
+
+    assert result.outcome == "INCOMPLETE"
+    assert result.campaign_member is False
+
+
 def _v25_coverage_runtime_fixture(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    v26: bool = False,
 ) -> tuple[
     object,
     dict[str, object],
     dict[str, validation._ExpectedSlot],
 ]:
-    manifest = _v25_candidate_manifest(monkeypatch)
+    manifest = (
+        _v26_candidate_manifest(monkeypatch)
+        if v26
+        else _v25_candidate_manifest(monkeypatch)
+    )
     plan = build_factorial_plan(manifest)
     primary = next(
         slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
@@ -7383,6 +7890,35 @@ def test_v25_coverage_runtime_binds_exact_order_and_stop_first(
     assert runtime["replacement_policy"] == "none"
     assert runtime["stop_on_first_non_pass"] is True
     assert runtime["minimum_free_bytes"] == 10_000_000_000
+
+
+def test_v26_coverage_runtime_inherits_exact_two_slot_lifecycle_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        v26=True,
+    )
+    validated = validation._validate_v25_coverage_runtime_document(
+        runtime,
+        manifest=manifest,
+        expected_by_id=expected_by_id,
+    )
+
+    assert tuple(validated) == validation.FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    assert runtime["runtime_id"] == (
+        "shape-placement-factorial-v26-excluded-n31-coverage-smoke-v1"
+    )
+    assert runtime["automatic_retries"] == 0
+    assert runtime["replacement_policy"] == "none"
+    assert runtime["stop_on_first_non_pass"] is True
+    assert all(
+        slot["causal_acceptance"][
+            "verified_response_duplicate_delivery_contract"
+        ]
+        == VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT
+        for slot in runtime["slots"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -7543,13 +8079,13 @@ def test_v25_coverage_authorization_rejects_missing_reversed_or_extra_slots(
     )
     monkeypatch.setattr(
         validation,
-        "FROZEN_MANIFEST_SHA256",
+        "V25_MANIFEST_SHA256",
         hashlib.sha256(static_artifacts[validation.MANIFEST_FILENAME]).hexdigest(),
     )
-    monkeypatch.setattr(validation, "FROZEN_PLAN_SHA256", plan.plan_sha256)
+    monkeypatch.setattr(validation, "V25_PLAN_SHA256", plan.plan_sha256)
     monkeypatch.setattr(
         validation,
-        "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
+        "V25_COVERAGE_SMOKE_RUNTIME_SHA256",
         hashlib.sha256(runtime_bytes).hexdigest(),
     )
     result_root = tmp_path / "shape-placement-factorial-v25-coverage-smoke"
@@ -7612,13 +8148,13 @@ def test_v25_coverage_authorization_binds_same_ordered_pair_to_each_slot(
     )
     monkeypatch.setattr(
         validation,
-        "FROZEN_MANIFEST_SHA256",
+        "V25_MANIFEST_SHA256",
         hashlib.sha256(static_artifacts[validation.MANIFEST_FILENAME]).hexdigest(),
     )
-    monkeypatch.setattr(validation, "FROZEN_PLAN_SHA256", plan.plan_sha256)
+    monkeypatch.setattr(validation, "V25_PLAN_SHA256", plan.plan_sha256)
     monkeypatch.setattr(
         validation,
-        "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
+        "V25_COVERAGE_SMOKE_RUNTIME_SHA256",
         hashlib.sha256(runtime_bytes).hexdigest(),
     )
     result_root = tmp_path / "shape-placement-factorial-v25-coverage-smoke"
@@ -7668,14 +8204,14 @@ def test_v25_static_loader_extracts_each_exact_constituent_from_shared_runtime(
     runtime_sha256 = hashlib.sha256(runtime_bytes).hexdigest()
     monkeypatch.setattr(
         manifest_module,
-        "FROZEN_MANIFEST_SHA256",
+        "V25_MANIFEST_SHA256",
         manifest_sha256,
     )
-    monkeypatch.setattr(validation, "FROZEN_MANIFEST_SHA256", manifest_sha256)
-    monkeypatch.setattr(validation, "FROZEN_PLAN_SHA256", plan.plan_sha256)
+    monkeypatch.setattr(validation, "V25_MANIFEST_SHA256", manifest_sha256)
+    monkeypatch.setattr(validation, "V25_PLAN_SHA256", plan.plan_sha256)
     monkeypatch.setattr(
         validation,
-        "FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256",
+        "V25_COVERAGE_SMOKE_RUNTIME_SHA256",
         runtime_sha256,
     )
 
@@ -7689,7 +8225,7 @@ def test_v25_static_loader_extracts_each_exact_constituent_from_shared_runtime(
         loaded_manifest, _, loaded_runtime, expected, loaded_sha256 = (
             validation._load_static_contracts(slot_root)
         )
-        assert loaded_manifest.manifest_id == validation.FROZEN_MANIFEST_ID
+        assert loaded_manifest.manifest_id == validation.V25_MANIFEST_ID
         assert expected.slot_id == slot.slot_id
         assert loaded_runtime["slot_id"] == slot.slot_id
         assert loaded_sha256 == runtime_sha256
@@ -7739,9 +8275,11 @@ def _v25_coverage_lifecycle_fixture(
     tmp_path: Path,
     *,
     row_count: int,
+    v26: bool = False,
 ) -> dict[str, object]:
     manifest, runtime_document, expected_by_id = _v25_coverage_runtime_fixture(
-        monkeypatch
+        monkeypatch,
+        v26=v26,
     )
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -7754,10 +8292,15 @@ def _v25_coverage_lifecycle_fixture(
         primary,
         repair_template=repair,
     )
-    root = (tmp_path / "shape-placement-factorial-v25-coverage-smoke").resolve()
+    version = "v26" if v26 else "v25"
+    root = (tmp_path / f"shape-placement-factorial-{version}-coverage-smoke").resolve()
     root.mkdir()
     (root / validation.BUILD_EVIDENCE_DIRECTORY).mkdir()
-    manifest_bytes = V25_MANIFEST_PATH.read_bytes()
+    manifest_bytes = (
+        FROZEN_MANIFEST_PATH.read_bytes()
+        if v26
+        else V25_MANIFEST_PATH.read_bytes()
+    )
     runtime_bytes = _canonical(runtime_document)
     static_artifacts = {
         validation.MANIFEST_FILENAME: manifest_bytes,
@@ -7777,7 +8320,7 @@ def _v25_coverage_lifecycle_fixture(
         approved_utc="2026-08-10T00:00:00+00:00",
         kauri_revision=revision,
         slot_ids=tuple(slot.slot_id for slot in coverage.slots),
-        result_root="results/shape-placement-factorial-v25-coverage-smoke",
+        result_root=f"results/shape-placement-factorial-{version}-coverage-smoke",
         static_artifacts=static_artifacts,
         build_provenance_sha256=hashlib.sha256(
             build_provenance_bytes
@@ -7987,6 +8530,27 @@ def test_v25_repair_coverage_lifecycle_binds_independent_predecessor(
         monkeypatch,
         tmp_path,
         row_count=row_count,
+    )
+    expected_by_id = fixture["expected_by_id"]
+    assert isinstance(expected_by_id, dict)
+    _validate_v25_coverage_fixture(
+        fixture,
+        "slot-037-n31-f2-b04-00",
+        predecessor_result=_pass_coverage_validation(
+            expected_by_id["slot-066-n31-f5-b05-P"]
+        ),
+    )
+
+
+def test_v26_repair_coverage_lifecycle_inherits_exact_predecessor_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixture = _v25_coverage_lifecycle_fixture(
+        monkeypatch,
+        tmp_path,
+        row_count=4,
+        v26=True,
     )
     expected_by_id = fixture["expected_by_id"]
     assert isinstance(expected_by_id, dict)

@@ -15,10 +15,10 @@ from experiments.adaptive.kauri_experiment.factorial_manifest import (
     BREAKTHROUGH_STRUCTURAL_GATE_V4,
     EXECUTION_CLEANUP_CONTRACT_V1,
     EXPECTED_SLOT_COUNT,
-    FROZEN_MANIFEST_ID,
-    FROZEN_MANIFEST_SHA256,
-    FROZEN_PLAN_SHA256,
-    FROZEN_SEMANTIC_SHA256,
+    V25_MANIFEST_ID,
+    V25_MANIFEST_SHA256,
+    V25_PLAN_SHA256,
+    V25_SEMANTIC_SHA256,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
@@ -162,10 +162,10 @@ def _encoded(document: object) -> bytes:
 def test_loader_binds_the_exact_duplicate_free_manifest_bytes(tmp_path: Path) -> None:
     manifest = _manifest()
 
-    assert manifest.manifest_id == FROZEN_MANIFEST_ID
-    assert manifest.manifest_sha256 == FROZEN_MANIFEST_SHA256
+    assert manifest.manifest_id == V25_MANIFEST_ID
+    assert manifest.manifest_sha256 == V25_MANIFEST_SHA256
     assert hashlib.sha256(MANIFEST_PATH.read_bytes()).hexdigest() == (
-        FROZEN_MANIFEST_SHA256
+        V25_MANIFEST_SHA256
     )
     assert hashlib.sha256(
         json.dumps(
@@ -176,7 +176,7 @@ def test_loader_binds_the_exact_duplicate_free_manifest_bytes(tmp_path: Path) ->
             sort_keys=True,
         ).encode("utf-8")
         + b"\n"
-    ).hexdigest() == FROZEN_SEMANTIC_SHA256
+    ).hexdigest() == V25_SEMANTIC_SHA256
     assert manifest.evidence_snapshot_format == "digest_commitment_v2"
 
     changed = tmp_path / "changed.json"
@@ -885,9 +885,9 @@ def test_canonical_plan_bytes_are_stable_and_bind_source_byte_identity() -> None
 
     assert encoded.endswith(b"\n")
     assert encoded == canonical_plan_bytes(build_factorial_plan(manifest))
-    assert json.loads(encoded)["manifest_sha256"] == FROZEN_MANIFEST_SHA256
+    assert json.loads(encoded)["manifest_sha256"] == V25_MANIFEST_SHA256
     assert hashlib.sha256(encoded).hexdigest() == plan.plan_sha256
-    assert plan.plan_sha256 == FROZEN_PLAN_SHA256
+    assert plan.plan_sha256 == V25_PLAN_SHA256
 
     changed_bytes = MANIFEST_PATH.read_bytes() + b" "
     changed_manifest = parse_manifest_bytes(changed_bytes)

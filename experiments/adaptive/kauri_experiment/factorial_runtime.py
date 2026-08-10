@@ -1,4 +1,4 @@
-"""Pure launch contracts for the frozen SHAPE25 factorial campaign.
+"""Pure launch contracts for the frozen SHAPE26 factorial campaign.
 
 This module does not predict adaptive outcomes and never starts a process.
 It freezes only the inputs, live-evidence acceptance predicates, relative
@@ -40,7 +40,9 @@ from .factorial_manifest import (
     V22_MANIFEST_ID,
     V23_MANIFEST_ID,
     V24_MANIFEST_ID,
+    V25_MANIFEST_ID,
     V9_MANIFEST_ID,
+    VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     FactorialManifestError,
     FactorialPlan,
     FactorialSlot,
@@ -173,14 +175,23 @@ V24_SMOKE_RUNTIME_SHA256 = (
 V24_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "eff1bc9bdbbda5d7dc20a77dd5217ade97d67173b4ac877b9a68f717281088fd"
 )
-FROZEN_RUNTIME_SHA256 = (
+V25_RUNTIME_SHA256 = (
     "c0b5195113defdc86cb959f32181436e288241eb2d3091c6d7f43accd2ebaea2"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V25_SMOKE_RUNTIME_SHA256 = (
     "a6f5cc32088a7d8006623536b8aada8378493fa97b72e21d2d5b9ed4e3ed0d47"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V25_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "034bd2a7e0b12677845554a1ed46c6053457e1c23476a696d4a246e3ef070149"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "35697be425688fb82aaff82452f3699ae5e275b5fb2f6d4759079b07b1b7f641"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "e5c36ce0dfd244869d622db8b12a05e120f6faf4a5407f651849a2dd539ec12b"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "34b7cfacebf3c3998a01b1432a3b7b5a10efc51ea23c4e807365b085f838e62f"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -429,6 +440,7 @@ class CausalAcceptanceContract(_Document):
     source_bound_proposal_witness_contract: str | None = None
     evidence_snapshot_selection_contract: str | None = None
     inherited_consensus_wait_exempt_placement_contract: str | None = None
+    verified_response_duplicate_delivery_contract: str | None = None
     epoch1_preselection_residency_ms: int | None = None
     minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection: (
         int | None
@@ -446,6 +458,7 @@ class CausalAcceptanceContract(_Document):
             "source_bound_proposal_witness_contract",
             "evidence_snapshot_selection_contract",
             "inherited_consensus_wait_exempt_placement_contract",
+            "verified_response_duplicate_delivery_contract",
             "epoch1_preselection_residency_ms",
             "minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection",
         ):
@@ -956,6 +969,7 @@ def _causal_acceptance(
     source_bound_proposal_witness_contract: str | None,
     evidence_snapshot_selection_contract: str | None,
     inherited_wait_exempt_placement_contract: str | None,
+    verified_response_duplicate_delivery_contract: str | None,
     epoch1_preselection_residency_ms: int | None,
     minimum_primary_internal_opportunities: int | None,
 ) -> CausalAcceptanceContract:
@@ -1040,6 +1054,19 @@ def _causal_acceptance(
         raise FactorialManifestError(
             "inherited wait-exempt placement requires evidence snapshot selection"
         )
+    if verified_response_duplicate_delivery_contract not in {
+        None,
+        VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
+    }:
+        raise FactorialManifestError(
+            "causal acceptance verified-response duplicate delivery contract drifted"
+        )
+    if verified_response_duplicate_delivery_contract is not None and (
+        inherited_wait_exempt_placement_contract is None
+    ):
+        raise FactorialManifestError(
+            "verified-response duplicate delivery requires inherited placement"
+        )
     if epoch1_preselection_residency_ms not in {None, 60_000}:
         raise FactorialManifestError(
             "causal acceptance Epoch-1 preselection residency drifted"
@@ -1052,7 +1079,8 @@ def _causal_acceptance(
         minimum_primary_internal_opportunities is None
     ):
         raise FactorialManifestError(
-            "causal acceptance v24/v25 timing and opportunity gates must be paired"
+            "causal acceptance v24/v25/v26 timing and opportunity gates must "
+            "be paired"
         )
     return CausalAcceptanceContract(
         proof_source="independent_raw_artifact_validation",
@@ -1087,6 +1115,9 @@ def _causal_acceptance(
         ),
         inherited_consensus_wait_exempt_placement_contract=(
             inherited_wait_exempt_placement_contract
+        ),
+        verified_response_duplicate_delivery_contract=(
+            verified_response_duplicate_delivery_contract
         ),
         epoch1_preselection_residency_ms=epoch1_preselection_residency_ms,
         minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection=(
@@ -1533,6 +1564,13 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             identity["inherited_consensus_wait_exempt_placement_contract"] = (
                 responsive.inherited_consensus_wait_exempt_placement_contract
             )
+        if (
+            responsive is not None
+            and responsive.verified_response_duplicate_delivery_contract is not None
+        ):
+            identity["verified_response_duplicate_delivery_contract"] = (
+                responsive.verified_response_duplicate_delivery_contract
+            )
         if slot.workload.epoch1_preselection_residency_ms is not None:
             identity["epoch1_preselection_residency_ms"] = (
                 slot.workload.epoch1_preselection_residency_ms
@@ -1605,6 +1643,11 @@ def build_slot_runtime(slot: FactorialSlot) -> SlotRuntimeSpec:
             ),
             (
                 slot.byzantine.responsive_degradation.inherited_consensus_wait_exempt_placement_contract
+                if slot.byzantine.responsive_degradation is not None
+                else None
+            ),
+            (
+                slot.byzantine.responsive_degradation.verified_response_duplicate_delivery_contract
                 if slot.byzantine.responsive_degradation is not None
                 else None
             ),
@@ -1958,6 +2001,7 @@ def runtime_preflight(
                 V22_MANIFEST_ID,
                 V23_MANIFEST_ID,
                 V24_MANIFEST_ID,
+                V25_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -1972,7 +2016,8 @@ def runtime_preflight(
             0,
             (
                 60_000
-                if runtime.manifest_id in {V24_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                if runtime.manifest_id
+                in {V24_MANIFEST_ID, V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else slot.cutoff_contract.epoch1_stable_bucket_count
                 * slot.cutoff_contract.bucket_width_s
                 * 1_000
@@ -2115,6 +2160,7 @@ def runtime_preflight(
                 V22_MANIFEST_ID,
                 V23_MANIFEST_ID,
                 V24_MANIFEST_ID,
+                V25_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }:
                 expected_measurement_contract = (
@@ -2146,6 +2192,7 @@ def runtime_preflight(
                     V22_MANIFEST_ID,
                     V23_MANIFEST_ID,
                     V24_MANIFEST_ID,
+                    V25_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -2167,6 +2214,7 @@ def runtime_preflight(
                     V22_MANIFEST_ID,
                     V23_MANIFEST_ID,
                     V24_MANIFEST_ID,
+                    V25_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -2226,6 +2274,7 @@ def runtime_preflight(
                         V22_MANIFEST_ID,
                         V23_MANIFEST_ID,
                         V24_MANIFEST_ID,
+                        V25_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -2435,6 +2484,7 @@ def runtime_preflight(
             V22_MANIFEST_ID,
             V23_MANIFEST_ID,
             V24_MANIFEST_ID,
+            V25_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -2474,6 +2524,7 @@ def runtime_preflight(
                 V22_MANIFEST_ID,
                 V23_MANIFEST_ID,
                 V24_MANIFEST_ID,
+                V25_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2487,13 +2538,19 @@ def runtime_preflight(
                 V22_MANIFEST_ID,
                 V23_MANIFEST_ID,
                 V24_MANIFEST_ID,
+                V25_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             (
                 FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
                 if runtime.manifest_id
-                in {V23_MANIFEST_ID, V24_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                in {
+                    V23_MANIFEST_ID,
+                    V24_MANIFEST_ID,
+                    V25_MANIFEST_ID,
+                    FROZEN_MANIFEST_ID,
+                }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             )
             if runtime.manifest_id
@@ -2504,6 +2561,7 @@ def runtime_preflight(
                 V22_MANIFEST_ID,
                 V23_MANIFEST_ID,
                 V24_MANIFEST_ID,
+                V25_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2515,6 +2573,7 @@ def runtime_preflight(
                 V22_MANIFEST_ID,
                 V23_MANIFEST_ID,
                 V24_MANIFEST_ID,
+                V25_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -2524,17 +2583,23 @@ def runtime_preflight(
                 V22_MANIFEST_ID,
                 V23_MANIFEST_ID,
                 V24_MANIFEST_ID,
+                V25_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
             INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
+            if runtime.manifest_id in {V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            else None,
+            VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
             if runtime.manifest_id == FROZEN_MANIFEST_ID
             else None,
             60_000
-            if runtime.manifest_id in {V24_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id
+            in {V24_MANIFEST_ID, V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
             82
-            if runtime.manifest_id in {V24_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id
+            in {V24_MANIFEST_ID, V25_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
         ):
             raise FactorialManifestError(
@@ -2615,6 +2680,9 @@ __all__ = (
     "V24_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V24_RUNTIME_SHA256",
     "V24_SMOKE_RUNTIME_SHA256",
+    "V25_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V25_RUNTIME_SHA256",
+    "V25_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",
