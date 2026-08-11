@@ -106,6 +106,9 @@ V42_MANIFEST_PATH = (
 V43_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v43.json"
 )
+V44_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v44.json"
+)
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
 )
@@ -878,6 +881,12 @@ def _v42_candidate_plan(monkeypatch: pytest.MonkeyPatch):
 def _v43_candidate_plan(monkeypatch: pytest.MonkeyPatch):
     del monkeypatch
     manifest = load_frozen_manifest(V43_MANIFEST_PATH)
+    return manifest, build_factorial_plan(manifest)
+
+
+def _v44_candidate_plan(monkeypatch: pytest.MonkeyPatch):
+    del monkeypatch
+    manifest = load_frozen_manifest(V44_MANIFEST_PATH)
     return manifest, build_factorial_plan(manifest)
 
 
@@ -2143,7 +2152,7 @@ def test_validator_v42_identities_are_exactly_frozen() -> None:
 
 def test_validator_v43_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V43_MANIFEST_ID
     )
     manifest_payload = V43_MANIFEST_PATH.read_bytes()
     manifest = load_frozen_manifest(V43_MANIFEST_PATH)
@@ -2163,6 +2172,65 @@ def test_validator_v43_identities_are_exactly_frozen() -> None:
         "eab2f59024b777435b1713ec279adca86c8ea1ec18197da24c90f4480a441764",
         "48f966751d6da4fea160ed9787c560df8768ef9893d2e262d56a16af66ccee8c",
         "0ba89d2ba5e07db1a7adb03258330c527d95d1240ba7a1598686de3474541809",
+    )
+    producer_six = (
+        manifest_module.V43_MANIFEST_SHA256,
+        manifest_module.V43_SEMANTIC_SHA256,
+        manifest_module.V43_PLAN_SHA256,
+        runtime_module.V43_RUNTIME_SHA256,
+        runtime_module.V43_SMOKE_RUNTIME_SHA256,
+        runtime_module.V43_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+    validator_six = (
+        identity.manifest_sha256,
+        manifest_module.V43_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    )
+    disk_six = (
+        hashlib.sha256(manifest_payload).hexdigest(),
+        hashlib.sha256(_canonical(json.loads(manifest_payload))).hexdigest(),
+        plan.plan_sha256,
+        hashlib.sha256(canonical_runtime_bytes(campaign_runtime)).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(smoke.runtime.as_document())
+        ).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest(),
+    )
+
+    assert validation.V43_MANIFEST_ID == "shape-placement-factorial-v43"
+    assert producer_six == validator_six == disk_six == expected_six
+    assert validation._coverage_smoke_result_root(
+        validation.V43_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v43-coverage-smoke"
+
+
+def test_validator_v44_identities_are_exactly_frozen() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+    manifest_payload = V44_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(V44_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    campaign_runtime = build_factorial_runtime(plan)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    expected_six = (
+        "eaf0d7e756c3ed54a4ebbf2ebc10701494829f315bed4efb7c021ae14f8f93c2",
+        "69db86cf3573bbf153150e1208c6bb76e791fb9f1642430797ffa6daeeff6498",
+        "91725b2c029407b53247447c7c46c82e69a8025d9043907412adcde7d4a2ef80",
+        "fa6cb7313c58aaa45a859d3193d499ebc0fd811253ae19350ac5af8bc21065a5",
+        "17bb2b9be77edc679be895beabcd06e9714bf72ae39c4e41d2c3a38ac70fcee0",
+        "5508460d3488e830e43c6898c5396dcffa0478c8f98d0035f61571cd708d66fa",
     )
     producer_six = (
         manifest_module.FROZEN_MANIFEST_SHA256,
@@ -2193,11 +2261,11 @@ def test_validator_v43_identities_are_exactly_frozen() -> None:
         ).hexdigest(),
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v43"
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v44"
     assert producer_six == validator_six == disk_six == expected_six
     assert validation._coverage_smoke_result_root(
         validation.FROZEN_MANIFEST_ID
-    ) == "results/shape-placement-factorial-v43-coverage-smoke"
+    ) == "results/shape-placement-factorial-v44-coverage-smoke"
 
 
 @pytest.mark.parametrize(
@@ -4749,6 +4817,433 @@ def _v42_retention_ready_fixture() -> dict[str, object]:
     }
 
 
+def _v44_retention_ready_fixture() -> dict[str, object]:
+    arguments = _v42_retention_ready_fixture()
+    records = tuple(arguments["accepted_epoch1"])
+    trigger_records = records[1:]
+    causal_records = tuple(
+        SimpleNamespace(
+            **{
+                **vars(
+                    _v40_retention_record(
+                        actor=trigger.target_id,
+                        reporter=trigger.reporter_id,
+                        sequence=sequence,
+                        height=2_100 + sequence,
+                        message_type="aggregate_relay",
+                    )
+                ),
+                "tree_id": trigger.tree_id,
+            }
+        )
+        for sequence, trigger in enumerate(trigger_records, start=4)
+    )
+    accepted = (*records, *causal_records)
+    ready = arguments["manager_events"][0]
+    payload = {
+        **ready.payload,
+        "evidence_cutoff": len(accepted),
+    }
+    markers = [
+        replace(marker, action="forward")
+        for marker in arguments["markers"]
+    ]
+    markers.extend(
+        FaultMarker(
+            source_replica=record.target_id,
+            line_number=index,
+            fault_mode="tiered_persistent_responsive_omission_v2",
+            epoch_number=record.epoch_number,
+            tree_id=record.tree_id,
+            epoch_digest=record.epoch_digest,
+            block_hash=record.block_hash,
+            window=arguments["actor_origin_marker_window_id"],
+            window_start_ns=1,
+            window_end_ns=arguments["epoch2_selection_ns"],
+            actor=record.target_id,
+            action="omit_aggregate",
+            monotonic_ns=record.attempt_start_monotonic_ns + 500,
+            raw_line_sha256=f"{index + 500:064x}",
+            cohort="responsive_degraded",
+            contribution_role="internal",
+        )
+        for index, record in enumerate(causal_records, start=1)
+    )
+    arms = list(arguments["arm_markers"])
+    arms.extend(
+        validation.ResponseAttemptArmMarker(
+            source_replica=record.reporter_id,
+            line_number=index,
+            reporter_id=record.reporter_id,
+            child_id=record.target_id,
+            epoch_number=record.epoch_number,
+            tree_id=record.tree_id,
+            epoch_digest=record.epoch_digest,
+            block_hash=record.block_hash,
+            expected_message_type=record.message_type,
+            start_monotonic_ns=record.attempt_start_monotonic_ns,
+            deadline_duration_us=record.deadline_duration_us,
+            absolute_deadline_ns=(
+                record.attempt_start_monotonic_ns
+                + record.deadline_duration_us * 1_000
+            ),
+            raw_line_sha256=f"{index + 600:064x}",
+            relative_path=(
+                f"raw/process/replica-{record.reporter_id}.stdout.log"
+            ),
+        )
+        for index, record in enumerate(causal_records, start=1)
+    )
+    replica_events = {
+        replica_id: list(events)
+        for replica_id, events in arguments["replica_events"].items()
+    }
+    for index, record in enumerate(causal_records, start=2):
+        replica_events[record.reporter_id].append(
+            _commit_event(
+                index,
+                record.reporter_local_commit_monotonic_ns + 50,
+                int(record.block_hash, 16),
+                epoch_number=record.epoch_number,
+                epoch_digest=record.epoch_digest,
+                tree_id=record.tree_id,
+                replica_id=record.reporter_id,
+                reporter_local_commit_monotonic_ns=(
+                    record.reporter_local_commit_monotonic_ns
+                ),
+            )
+        )
+        replica_events[0].append(
+            _commit_event(
+                index + 2,
+                record.reporter_local_commit_monotonic_ns + 250,
+                int(record.block_hash, 16),
+                epoch_number=record.epoch_number,
+                epoch_digest=record.epoch_digest,
+                tree_id=record.tree_id,
+                replica_id=0,
+            )
+        )
+    return {
+        **arguments,
+        "manager_events": (replace(ready, payload=payload),),
+        "accepted_epoch1": accepted,
+        "selection_current_cutoff": len(accepted),
+        "markers": tuple(markers),
+        "arm_markers": tuple(arms),
+        "replica_events": {
+            replica_id: tuple(events)
+            for replica_id, events in replica_events.items()
+        },
+        "causal_records": causal_records,
+    }
+
+
+def test_v44_retention_ready_selects_later_exact_causal_facts_independently(
+) -> None:
+    arguments = _v44_retention_ready_fixture()
+    causal_records = arguments.pop("causal_records")
+
+    with pytest.raises(FactorialValidationError) as v43_failure:
+        validation._validate_v42_cross_commit_retention_ready(**arguments)
+    assert str(v43_failure.value) == (
+        "v42 admitted fact lacks one exact actor-origin fault marker"
+    )
+
+    selected = validation._validate_v44_cross_commit_retention_ready(
+        **arguments
+    )
+    assert tuple(record.observation_id for record in selected) == tuple(
+        record.observation_id for record in causal_records
+    )
+
+
+def test_validate_slot_dispatches_v44_only_to_independent_causal_selection(
+) -> None:
+    source = inspect.getsource(validation.validate_slot)
+    dispatch = """retention_validator = (
+                _validate_v44_cross_commit_retention_ready
+                if manifest.manifest_id == FROZEN_MANIFEST_ID
+                else _validate_v42_cross_commit_retention_ready
+            )"""
+
+    assert dispatch in source
+    assert source.index(dispatch) < source.index(
+        "internal_cross_commit_witness_count = validate_fault_causality("
+    )
+    assert "elif v40_plus_repair:" in source
+
+
+def test_v44_retention_ready_uses_shared_sample_not_outer_commit_time(
+) -> None:
+    arguments = _v44_retention_ready_fixture()
+    causal_records = arguments.pop("causal_records")
+    first = causal_records[0]
+    arm = next(
+        arm
+        for arm in arguments["arm_markers"]
+        if arm.block_hash == first.block_hash
+    )
+    replica_events = {
+        replica_id: list(events)
+        for replica_id, events in arguments["replica_events"].items()
+    }
+    event_index = next(
+        index
+        for index, event in enumerate(replica_events[first.reporter_id])
+        if event.payload["block_hash"] == first.block_hash
+    )
+    event = replica_events[first.reporter_id][event_index]
+    assert first.reporter_local_commit_monotonic_ns < arm.absolute_deadline_ns
+    replica_events[first.reporter_id][event_index] = replace(
+        event,
+        monotonic_ns=arm.absolute_deadline_ns + 1,
+    )
+
+    selected = validation._validate_v44_cross_commit_retention_ready(
+        **{
+            **arguments,
+            "replica_events": {
+                replica_id: tuple(events)
+                for replica_id, events in replica_events.items()
+            },
+        }
+    )
+    assert selected[0].observation_id == first.observation_id
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing-marker", "lacks one exact causal"),
+        ("wrong-window", "lacks one exact causal"),
+        ("duplicate-marker", "duplicate or conflicting fault markers"),
+        ("conflicting-marker", "duplicate or conflicting fault markers"),
+        ("conflicting-window-marker", "duplicate or conflicting fault markers"),
+        ("prearm-marker", "chronology"),
+        ("wrong-parent", "physical parent"),
+        ("missing-arm", "response-attempt arm"),
+        ("duplicate-arm", "response-attempt arm"),
+        ("conflicting-arm", "response-attempt arm"),
+        ("conflicting-arm-message", "response-attempt arm"),
+        ("wrong-arm-start", "attempt start"),
+        ("missing-reporter-commit", "reporter-local rich commit"),
+        ("duplicate-reporter-commit", "reporter-local rich commit"),
+        ("missing-observer-commit", "observer-0 rich commit"),
+        ("duplicate-observer-commit", "observer-0 rich commit"),
+        ("sample-mismatch", "commit timestamp"),
+        ("outer-before-sample", "structured commit event"),
+        ("observer-before-marker", "observer-0 rich commit"),
+        ("accepted-after-ready", "accepted before readiness"),
+        ("noncanonical-trigger-id", "canonical aggregate_relay facts"),
+        ("cutoff-before-causal", "lacks one exact causal"),
+        ("superseded-causal", "lacks one exact causal"),
+    ),
+)
+def test_v44_retention_ready_fails_closed_on_each_broken_causal_join(
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments = _v44_retention_ready_fixture()
+    causal_records = arguments.pop("causal_records")
+    first = causal_records[0]
+    records = list(arguments["accepted_epoch1"])
+    markers = list(arguments["markers"])
+    arms = list(arguments["arm_markers"])
+    trees = dict(arguments["epoch1_trees"])
+    replica_events = {
+        replica_id: list(events)
+        for replica_id, events in arguments["replica_events"].items()
+    }
+    marker_index = next(
+        index
+        for index, marker in enumerate(markers)
+        if marker.block_hash == first.block_hash
+        and marker.action == "omit_aggregate"
+    )
+    arm_index = next(
+        index
+        for index, arm in enumerate(arms)
+        if arm.block_hash == first.block_hash
+    )
+    reporter_event_index = next(
+        index
+        for index, event in enumerate(replica_events[first.reporter_id])
+        if event.payload["block_hash"] == first.block_hash
+    )
+    observer_event_index = next(
+        index
+        for index, event in enumerate(replica_events[0])
+        if event.payload["block_hash"] == first.block_hash
+    )
+
+    if mutation == "missing-marker":
+        markers.pop(marker_index)
+    elif mutation == "wrong-window":
+        markers[marker_index] = replace(
+            markers[marker_index],
+            window="wrong-materialized-window",
+        )
+    elif mutation == "duplicate-marker":
+        markers.append(replace(markers[marker_index], line_number=99))
+    elif mutation == "conflicting-marker":
+        markers.append(
+            replace(
+                markers[marker_index],
+                line_number=99,
+                action="forward",
+            )
+        )
+    elif mutation == "conflicting-window-marker":
+        markers.append(
+            replace(
+                markers[marker_index],
+                line_number=99,
+                window="conflicting-materialized-window",
+            )
+        )
+    elif mutation == "prearm-marker":
+        markers[marker_index] = replace(
+            markers[marker_index],
+            monotonic_ns=arms[arm_index].start_monotonic_ns - 1,
+        )
+    elif mutation == "wrong-parent":
+        tree = trees[first.tree_id]
+        members = list(tree.members)
+        members[0], members[2] = members[2], members[0]
+        trees[first.tree_id] = replace(tree, members=tuple(members))
+    elif mutation == "missing-arm":
+        arms.pop(arm_index)
+    elif mutation == "duplicate-arm":
+        arms.append(replace(arms[arm_index], line_number=99))
+    elif mutation == "conflicting-arm":
+        arms.append(
+            replace(
+                arms[arm_index],
+                line_number=99,
+                source_replica=arms[arm_index].source_replica + 1,
+                reporter_id=arms[arm_index].reporter_id + 1,
+            )
+        )
+    elif mutation == "conflicting-arm-message":
+        arms.append(
+            replace(
+                arms[arm_index],
+                line_number=99,
+                expected_message_type="direct_vote",
+            )
+        )
+    elif mutation == "wrong-arm-start":
+        arms[arm_index] = replace(
+            arms[arm_index],
+            start_monotonic_ns=arms[arm_index].start_monotonic_ns + 1,
+        )
+    elif mutation == "missing-reporter-commit":
+        replica_events[first.reporter_id].pop(reporter_event_index)
+    elif mutation == "duplicate-reporter-commit":
+        replica_events[first.reporter_id].append(
+            replace(
+                replica_events[first.reporter_id][reporter_event_index],
+                line_number=99,
+                source_sequence=99,
+            )
+        )
+    elif mutation == "missing-observer-commit":
+        replica_events[0].pop(observer_event_index)
+    elif mutation == "duplicate-observer-commit":
+        replica_events[0].append(
+            replace(
+                replica_events[0][observer_event_index],
+                line_number=99,
+                source_sequence=99,
+            )
+        )
+    elif mutation == "sample-mismatch":
+        event = replica_events[first.reporter_id][reporter_event_index]
+        payload = dict(event.payload)
+        payload["reporter_local_commit_monotonic_ns"] += 1
+        replica_events[first.reporter_id][reporter_event_index] = replace(
+            event,
+            payload=payload,
+        )
+    elif mutation == "outer-before-sample":
+        event = replica_events[first.reporter_id][reporter_event_index]
+        replica_events[first.reporter_id][reporter_event_index] = replace(
+            event,
+            monotonic_ns=first.reporter_local_commit_monotonic_ns - 1,
+        )
+    elif mutation == "observer-before-marker":
+        event = replica_events[0][observer_event_index]
+        replica_events[0][observer_event_index] = replace(
+            event,
+            monotonic_ns=markers[marker_index].monotonic_ns - 1,
+        )
+    elif mutation == "accepted-after-ready":
+        record_index = records.index(first)
+        records[record_index] = SimpleNamespace(
+            **{
+                **vars(first),
+                "acceptance_monotonic_ns": (
+                    arguments["manager_events"][0].monotonic_ns + 1
+                ),
+            }
+        )
+    elif mutation == "noncanonical-trigger-id":
+        ready = arguments["manager_events"][0]
+        payload = dict(ready.payload)
+        payload["admitted_observation_ids"] = [
+            first.observation_id,
+            payload["admitted_observation_ids"][1],
+        ]
+        arguments["manager_events"] = (replace(ready, payload=payload),)
+    elif mutation == "cutoff-before-causal":
+        ready = arguments["manager_events"][0]
+        trigger_cutoff = (
+            min(record.ingestion_sequence for record in causal_records) - 1
+        )
+        arguments["manager_events"] = (
+            replace(
+                ready,
+                payload={**ready.payload, "evidence_cutoff": trigger_cutoff},
+            ),
+        )
+        arguments["selection_current_cutoff"] = trigger_cutoff
+    else:
+        late = SimpleNamespace(
+            **{
+                **vars(first),
+                "ingestion_sequence": len(records) + 1,
+                "acceptance_source_sequence": len(records) + 1,
+                "acceptance_monotonic_ns": first.acceptance_monotonic_ns + 1,
+                "schema_version": 1,
+                "outcome": "late",
+            }
+        )
+        records.append(late)
+        ready = arguments["manager_events"][0]
+        payload = {
+            **ready.payload,
+            "evidence_cutoff": len(records),
+        }
+        arguments["manager_events"] = (replace(ready, payload=payload),)
+        arguments["selection_current_cutoff"] = len(records)
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v44_cross_commit_retention_ready(
+            **{
+                **arguments,
+                "accepted_epoch1": tuple(records),
+                "markers": tuple(markers),
+                "arm_markers": tuple(arms),
+                "epoch1_trees": trees,
+                "replica_events": {
+                    replica_id: tuple(events)
+                    for replica_id, events in replica_events.items()
+                },
+            }
+        )
+
+
 def test_v42_retention_ready_rejects_s030_like_direct_id_then_accepts_aggregate(
 ) -> None:
     arguments = _v42_retention_ready_fixture()
@@ -4940,6 +5435,30 @@ def _assert_v42_plus_runtime_retention_scope_partition(
     for spec, scope, policy, repair_runtime in scoped:
         document = json.loads(_canonical(spec.as_document()))
         expected = expected_by_id[spec.slot_id]
+        contract = document["cycle1_responsive_cross_commit_retention"]
+        expected_fields = {
+            "scope",
+            "observation_schema_version",
+            "responsive_degraded_actor_ids",
+            "admission_policy",
+        }
+        if (
+            manifest.manifest_id == validation.FROZEN_MANIFEST_ID
+            and not repair_runtime
+        ):
+            expected_fields.update(
+                {
+                    "online_readiness_admitted_observation_ids_contract",
+                    "sealed_validation_causal_witness_selection_contract",
+                }
+            )
+            assert contract[
+                "online_readiness_admitted_observation_ids_contract"
+            ] == validation._V44_ONLINE_READINESS_ADMITTED_IDS_CONTRACT_V1
+            assert contract[
+                "sealed_validation_causal_witness_selection_contract"
+            ] == validation._V44_SEALED_CAUSAL_WITNESS_SELECTION_CONTRACT_V1
+        assert set(contract) == expected_fields
         validation._validate_runtime_slot(document, expected, manifest)
         assert validation._v42_cycle1_retention_contract(
             document,
@@ -4983,6 +5502,14 @@ def test_v43_runtime_retention_scope_partition_is_exact(
     )
 
 
+def test_v44_runtime_retention_scope_partition_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_v42_plus_runtime_retention_scope_partition(
+        *_v44_candidate_plan(monkeypatch)
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     (
@@ -4994,18 +5521,18 @@ def test_v43_runtime_retention_scope_partition_is_exact(
         ("extra", "field set"),
     ),
 )
-@pytest.mark.parametrize("manifest_version", ("v42", "v43"))
+@pytest.mark.parametrize("manifest_version", ("v42", "v43", "v44"))
 def test_v42_plus_runtime_retention_contract_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
     reason: str,
     manifest_version: str,
 ) -> None:
-    candidate_plan = (
-        _v42_candidate_plan
-        if manifest_version == "v42"
-        else _v43_candidate_plan
-    )
+    candidate_plan = {
+        "v42": _v42_candidate_plan,
+        "v43": _v43_candidate_plan,
+        "v44": _v44_candidate_plan,
+    }[manifest_version]
     manifest, plan = candidate_plan(monkeypatch)
     spec = build_factorial_runtime(plan).slots[0]
     document = json.loads(_canonical(spec.as_document()))
@@ -5044,8 +5571,49 @@ def test_v42_plus_runtime_retention_contract_fails_closed(
 
 
 @pytest.mark.parametrize(
+    "field",
+    (
+        "online_readiness_admitted_observation_ids_contract",
+        "sealed_validation_causal_witness_selection_contract",
+    ),
+)
+@pytest.mark.parametrize("mutation", ("missing", "wrong"))
+def test_v44_runtime_two_stage_retention_contract_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    mutation: str,
+) -> None:
+    manifest, plan = _v44_candidate_plan(monkeypatch)
+    spec = build_factorial_runtime(plan).slots[0]
+    document = json.loads(_canonical(spec.as_document()))
+    expected = next(
+        slot
+        for slot in validation._expected_slots(manifest)
+        if slot.slot_id == spec.slot_id
+    )
+    contract = dict(document["cycle1_responsive_cross_commit_retention"])
+    if mutation == "missing":
+        contract.pop(field)
+    else:
+        contract[field] = "wrong-v44-retention-contract"
+    document["cycle1_responsive_cross_commit_retention"] = contract
+
+    with pytest.raises(FactorialValidationError, match="field set|drifted"):
+        validation._v42_cycle1_retention_contract(
+            document,
+            expected=expected,
+            manifest=manifest,
+            excluded_repair_runtime=False,
+        )
+
+
+@pytest.mark.parametrize(
     "manifest_id",
-    (validation.V42_MANIFEST_ID, validation.FROZEN_MANIFEST_ID),
+    (
+        validation.V42_MANIFEST_ID,
+        validation.V43_MANIFEST_ID,
+        validation.FROZEN_MANIFEST_ID,
+    ),
 )
 def test_v42_plus_retention_receipt_exactly_repeats_runtime_contract(
     manifest_id: str,
@@ -15284,6 +15852,20 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-037-n31-f2-b04-00",
     )
     assert validation._coverage_smoke_slot_ids(validation.V41_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
+    assert validation._coverage_smoke_slot_ids(validation.V42_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
+    assert validation._coverage_smoke_slot_ids(validation.V43_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
+    assert validation._coverage_smoke_slot_ids(
+        validation.FROZEN_MANIFEST_ID
+    ) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )

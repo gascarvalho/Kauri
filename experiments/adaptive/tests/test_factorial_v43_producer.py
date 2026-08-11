@@ -93,7 +93,7 @@ def test_v43_profile_is_exact_two_path_delta_from_v42() -> None:
     assert v43 == v42
 
 
-def test_v42_is_historical_and_v43_is_exactly_frozen() -> None:
+def test_v42_and_v43_historical_identities_are_exact() -> None:
     assert manifest_module.V42_MANIFEST_ID == "shape-placement-factorial-v42"
     assert (
         manifest_module.V42_MANIFEST_SHA256,
@@ -103,14 +103,13 @@ def test_v42_is_historical_and_v43_is_exactly_frozen() -> None:
         runtime_module.V42_SMOKE_RUNTIME_SHA256,
         runtime_module.V42_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == V42_SIX
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v43"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V43_MANIFEST_SHA256,
+        manifest_module.V43_SEMANTIC_SHA256,
+        manifest_module.V43_PLAN_SHA256,
+        runtime_module.V43_RUNTIME_SHA256,
+        runtime_module.V43_SMOKE_RUNTIME_SHA256,
+        runtime_module.V43_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == V43_SIX
 
 
@@ -204,7 +203,7 @@ def test_v43_repair_terminal_rejects_v42_result_path_alias(
 
     with pytest.raises(
         execution.FactorialExecutionError,
-        match="exact v40/v41/v42/v43 repair runtime",
+        match="exact v40/v41/v42/v43/v44 repair runtime",
     ):
         execution._assert_v40_repair_runner_terminal_before_hard_deadline(
             aliased,
@@ -257,10 +256,10 @@ def test_n7_static_binding_rejects_cross_version_result_path_alias(
         )
 
 
-def test_v43_is_default_and_v42_is_validation_only(
+def test_v44_is_default_and_v43_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V43_MANIFEST
-    assert cli.main(["--manifest", str(V42_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v44.json"
+    assert cli.main(["--manifest", str(V43_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v42 are validation-only" in refusal["reason"]
+    assert "v1 through v43 are validation-only" in refusal["reason"]

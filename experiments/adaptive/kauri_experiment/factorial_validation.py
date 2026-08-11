@@ -74,6 +74,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_INTERNAL_WITNESS_CANDIDATES_V1,
     RESPONSIVE_CAUSAL_SELECTION_LINKAGE_WINDOW_V1,
     RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V1,
+    RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V2,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
@@ -211,6 +212,9 @@ from .factorial_manifest import (
     V42_MANIFEST_ID,
     V42_MANIFEST_SHA256,
     V42_PLAN_SHA256,
+    V43_MANIFEST_ID,
+    V43_MANIFEST_SHA256,
+    V43_PLAN_SHA256,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     FrozenFactorialManifest,
@@ -324,6 +328,10 @@ V42_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
 )
+V43_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
@@ -416,8 +424,11 @@ V41_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V42_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v42-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V43_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v43-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v44-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -749,14 +760,23 @@ V42_SMOKE_RUNTIME_SHA256 = (
 V42_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "7ac3945187626a337f2c2866784400ae012b879bbcffd311efe6cb4a30764458"
 )
-FROZEN_RUNTIME_SHA256 = (
+V43_RUNTIME_SHA256 = (
     "eab2f59024b777435b1713ec279adca86c8ea1ec18197da24c90f4480a441764"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V43_SMOKE_RUNTIME_SHA256 = (
     "48f966751d6da4fea160ed9787c560df8768ef9893d2e262d56a16af66ccee8c"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V43_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "0ba89d2ba5e07db1a7adb03258330c527d95d1240ba7a1598686de3474541809"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "fa6cb7313c58aaa45a859d3193d499ebc0fd811253ae19350ac5af8bc21065a5"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "17bb2b9be77edc679be895beabcd06e9714bf72ae39c4e41d2c3a38ac70fcee0"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "5508460d3488e830e43c6898c5396dcffa0478c8f98d0035f61571cd708d66fa"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -868,6 +888,7 @@ _V36_PLUS_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS = frozenset(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -878,6 +899,7 @@ _V38_OBSERVER_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS = frozenset(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -910,6 +932,15 @@ _AGGREGATE_RELAY_PER_ACTOR_ADMISSION_POLICY_V1 = (
 )
 _ONE_PER_ACTOR_WITH_GLOBAL_AGGREGATE_ADMISSION_POLICY_V1 = (
     "one_per_actor_with_global_aggregate_v1"
+)
+_V44_ONLINE_READINESS_ADMITTED_IDS_CONTRACT_V1 = (
+    "trigger_ids_proving_one_outstanding_epoch1_schema_v2_aggregate_relay_"
+    "attempt_start_and_reporter_local_commit_timeout_fact_per_canonical_"
+    "responsive_degraded_actor_at_the_evidence_high_water_cutoff_v1"
+)
+_V44_SEALED_CAUSAL_WITNESS_SELECTION_CONTRACT_V1 = (
+    "independently_select_earliest_exact_actor_origin_omit_aggregate_causal_"
+    "witness_per_actor_from_the_same_evidence_high_water_cutoff_v1"
 )
 _V40_RESPONSIVE_DEGRADED_ACTORS = (1, 7, 8, 12, 16, 19, 20)
 _V40_RESPONSIVE_DEGRADED_ACTORS_CSV = "1,7,8,12,16,19,20"
@@ -984,6 +1015,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -1014,6 +1046,7 @@ def _v24_preselection_contract(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return None
@@ -1149,6 +1182,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -1185,6 +1219,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1229,6 +1264,7 @@ def _uses_source_bound_contribution_opportunities(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1270,6 +1306,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -1311,6 +1348,7 @@ def _uses_precontainment_fault_coverage(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1352,6 +1390,7 @@ def _uses_precontainment_shape_preservation(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1396,6 +1435,7 @@ def _uses_precontainment_guarded_selection_contract(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1439,6 +1479,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V40_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V41_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V42_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V43_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -1481,6 +1522,7 @@ def _uses_source_bound_proposal_witness_contract(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1521,6 +1563,7 @@ def _uses_evidence_snapshot_selection_contract(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1558,6 +1601,7 @@ def _uses_inherited_consensus_wait_exempt_placement_contract(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1592,6 +1636,7 @@ def _uses_verified_response_duplicate_delivery_contract(
         V40_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V41_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V42_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        V43_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     }
     return (
@@ -1630,6 +1675,9 @@ def _uses_post_final_convergence_unmatched_commit_evidence_contract(
             POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V2
         ),
         V42_MANIFEST_ID: (
+            POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V2
+        ),
+        V43_MANIFEST_ID: (
             POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V2
         ),
         FROZEN_MANIFEST_ID: (
@@ -2148,6 +2196,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V42_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V42_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V43_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V43_MANIFEST_ID,
+            manifest_sha256=V43_MANIFEST_SHA256,
+            plan_sha256=V43_PLAN_SHA256,
+            runtime_sha256=V43_RUNTIME_SHA256,
+            smoke_runtime_sha256=V43_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V43_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -3881,6 +3939,8 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
 def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
     if manifest_id == FROZEN_MANIFEST_ID:
         return FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id == V43_MANIFEST_ID:
+        return V43_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V42_MANIFEST_ID:
         return V42_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V41_MANIFEST_ID:
@@ -4079,6 +4139,11 @@ def _is_excluded_coverage_smoke_slot(
             V42_COVERAGE_SMOKE_RUNTIME_SHA256,
             V42_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V43_MANIFEST_ID: (
+            V43_RUNTIME_SHA256,
+            V43_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V43_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -4169,6 +4234,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V41_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V42_MANIFEST_ID:
         return V42_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V43_MANIFEST_ID:
+        return V43_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -4209,6 +4276,7 @@ def _validate_v25_coverage_runtime_document(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fields.add("excluded_repair_smoke_probe")
@@ -4238,6 +4306,7 @@ def _validate_v25_coverage_runtime_document(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.get("schema_version") != 1
@@ -4293,6 +4362,7 @@ def _validate_v25_coverage_runtime_document(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         repair = validated[_coverage_smoke_slot_ids(manifest_id)[1]]
@@ -4445,6 +4515,7 @@ def _load_static_contracts(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             constituents = _validate_v25_coverage_runtime_document(
@@ -4590,6 +4661,7 @@ def _validate_v33_static_timing_contract(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return
@@ -4615,6 +4687,7 @@ def _validate_v33_static_timing_contract(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and timers.aggregation_timeout_ms_per_depth
@@ -4650,6 +4723,7 @@ def _expected_excluded_repair_observation_contract(
     if manifest_id in {
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
@@ -4661,6 +4735,7 @@ def _excluded_repair_fault_window_duration_s(manifest_id: str) -> int | None:
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return _V40_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
@@ -4711,6 +4786,7 @@ def _uses_excluded_repair_observation(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -4733,6 +4809,7 @@ def _uses_excluded_repair_cycle1_selection_gate(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -4762,6 +4839,7 @@ def _v34_excluded_repair_fault_active_phase_contract(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or not coverage_smoke
@@ -4806,6 +4884,7 @@ def _v34_excluded_repair_fault_active_phase_contract(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_probe_fields.update(
@@ -4828,7 +4907,12 @@ def _v34_excluded_repair_fault_active_phase_contract(
     expected_semantic_delta = (
         _EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
         if manifest.manifest_id
-        in {V41_MANIFEST_ID, V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        in {
+            V41_MANIFEST_ID,
+            V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         else (
             _EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
             if manifest.manifest_id == V40_MANIFEST_ID
@@ -4885,6 +4969,7 @@ def _v34_excluded_repair_fault_active_phase_contract(
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
                 V42_MANIFEST_ID,
+                V43_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             or (
@@ -4935,7 +5020,11 @@ def _v42_cycle1_retention_contract(
 
     field = "cycle1_responsive_cross_commit_retention"
     raw = runtime.get(field)
-    if manifest.manifest_id not in {V42_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest.manifest_id not in {
+        V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }:
         if raw is not None:
             _fail("v42+ reporter-retention contract escaped historical manifests")
         return None
@@ -4972,14 +5061,30 @@ def _v42_cycle1_retention_contract(
         _fail("v42 reporter-retention contract escaped its exact slot scope")
 
     contract = _mapping(raw, "v42 cycle-1 reporter-retention contract")
+    contract_fields = {
+        "scope",
+        "observation_schema_version",
+        "responsive_degraded_actor_ids",
+        "admission_policy",
+    }
+    v44_generic = (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and expected_scope
+        in {
+            _FACTORIAL_CAMPAIGN_RETENTION_SCOPE_V1,
+            _ORDERED_S066_COVERAGE_RETENTION_SCOPE_V1,
+        }
+    )
+    if v44_generic:
+        contract_fields.update(
+            {
+                "online_readiness_admitted_observation_ids_contract",
+                "sealed_validation_causal_witness_selection_contract",
+            }
+        )
     _fields(
         contract,
-        {
-            "scope",
-            "observation_schema_version",
-            "responsive_degraded_actor_ids",
-            "admission_policy",
-        },
+        contract_fields,
         "v42 cycle-1 reporter-retention contract",
     )
     actors = tuple(
@@ -4997,6 +5102,16 @@ def _v42_cycle1_retention_contract(
         or actors != tuple(sorted(set(actors)))
         or not actors
         or contract["admission_policy"] != expected_policy
+        or (
+            v44_generic
+            and contract["online_readiness_admitted_observation_ids_contract"]
+            != _V44_ONLINE_READINESS_ADMITTED_IDS_CONTRACT_V1
+        )
+        or (
+            v44_generic
+            and contract["sealed_validation_causal_witness_selection_contract"]
+            != _V44_SEALED_CAUSAL_WITNESS_SELECTION_CONTRACT_V1
+        )
     ):
         _fail("v42 cycle-1 reporter-retention contract drifted")
     return expected_scope, expected_policy, actors
@@ -5044,12 +5159,18 @@ def _validate_runtime_slot(
             None,
         )
     )
-    if manifest.manifest_id in {V42_MANIFEST_ID, FROZEN_MANIFEST_ID}:
+    if manifest.manifest_id in {V42_MANIFEST_ID, V43_MANIFEST_ID}:
         if (
             reporter_retention_gate
             != RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V1
         ):
             _fail("v42 reporter-retention profile gate drifted")
+    elif manifest.manifest_id == FROZEN_MANIFEST_ID:
+        if (
+            reporter_retention_gate
+            != RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V2
+        ):
+            _fail("v44 reporter-retention profile gate drifted")
     elif reporter_retention_gate is not None:
         _fail("v42+ reporter-retention profile gate escaped historical manifests")
     v28_repair_runtime = (
@@ -5070,6 +5191,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected.slot_id == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
@@ -5160,6 +5282,7 @@ def _validate_runtime_slot(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and (
         manifest.byzantine.duration_s != _V27_FAULT_WINDOW_DURATION_S
@@ -5193,6 +5316,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -5224,6 +5348,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -5254,6 +5379,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -5283,6 +5409,7 @@ def _validate_runtime_slot(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
@@ -5309,6 +5436,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not inherited_wait_exempt_placement
@@ -5332,6 +5460,7 @@ def _validate_runtime_slot(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         if not verified_response_duplicate_delivery:
@@ -5452,6 +5581,7 @@ def _validate_runtime_slot(
                     V40_MANIFEST_ID,
                     V41_MANIFEST_ID,
                     V42_MANIFEST_ID,
+                    V43_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -5494,6 +5624,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity.update(
@@ -5530,6 +5661,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity["fault_window_duration_s"] = (
@@ -5557,7 +5689,7 @@ def _validate_runtime_slot(
             if v28_repair_runtime
             else v42_retention_contract[1]
         )
-        artifact_identity["cycle1_responsive_cross_commit_retention"] = {
+        retention_identity = {
             "scope": source_scope,
             "observation_schema_version": 2,
             "responsive_degraded_actor_ids": list(
@@ -5565,6 +5697,20 @@ def _validate_runtime_slot(
             ),
             "admission_policy": source_policy,
         }
+        if manifest.manifest_id == FROZEN_MANIFEST_ID:
+            retention_identity.update(
+                {
+                    "online_readiness_admitted_observation_ids_contract": (
+                        _V44_ONLINE_READINESS_ADMITTED_IDS_CONTRACT_V1
+                    ),
+                    "sealed_validation_causal_witness_selection_contract": (
+                        _V44_SEALED_CAUSAL_WITNESS_SELECTION_CONTRACT_V1
+                    ),
+                }
+            )
+        artifact_identity["cycle1_responsive_cross_commit_retention"] = (
+            retention_identity
+        )
     source_campaign_artifact_id = (
         "slot-runtime-" + _sha256(_canonical_json_bytes(artifact_identity))[:24]
     )
@@ -5580,7 +5726,12 @@ def _validate_runtime_slot(
             "semantic_delta": (
                 _EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
                 if manifest.manifest_id
-                in {V41_MANIFEST_ID, V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                in {
+                    V41_MANIFEST_ID,
+                    V42_MANIFEST_ID,
+                    V43_MANIFEST_ID,
+                    FROZEN_MANIFEST_ID,
+                }
                 else (
                     _EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
                     if manifest.manifest_id == V40_MANIFEST_ID
@@ -5615,6 +5766,7 @@ def _validate_runtime_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             expected_repair_probe.update(
@@ -5800,6 +5952,7 @@ def _validate_runtime_slot(
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
                 V42_MANIFEST_ID,
+                V43_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -5948,6 +6101,7 @@ def _validate_runtime_slot(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -6261,6 +6415,7 @@ def _validate_runtime_slot(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         deadline_option = "--convergence-deadline-seconds"
@@ -6702,8 +6857,10 @@ def _validate_v40_cross_commit_retention_ready(
         diagnostic_version = 41
     elif manifest_id == V42_MANIFEST_ID:
         diagnostic_version = 42
-    elif manifest_id == FROZEN_MANIFEST_ID:
+    elif manifest_id == V43_MANIFEST_ID:
         diagnostic_version = 43
+    elif manifest_id == FROZEN_MANIFEST_ID:
+        diagnostic_version = 44
     else:
         _fail("cross-commit retention manifest ID is unsupported")
 
@@ -7310,6 +7467,340 @@ def _validate_v42_cross_commit_retention_ready(
         if not marker.monotonic_ns < observer_commit.monotonic_ns < selection_ns:
             _fail("v42 admitted fact observer-0 rich commit is outside its window")
     return tuple(selected)
+
+
+def _validate_v44_cross_commit_retention_ready(
+    *,
+    manager_events: Sequence[_NativeEvent],
+    accepted_epoch1: Sequence[_EvidenceRecord],
+    responsive_degraded_actor_ids: Sequence[int],
+    predecessor_epoch_digest: str,
+    selection_current_cutoff: int,
+    epoch2_selection_ns: int,
+    markers: Sequence[FaultMarker],
+    arm_markers: Sequence[ResponseAttemptArmMarker],
+    replica_events: Mapping[int, Sequence[_NativeEvent]],
+    epoch1_trees: Mapping[int, Tree],
+    actor_origin_marker_window_id: str,
+    scope: str,
+    admission_policy: str,
+) -> tuple[_EvidenceRecord, ...]:
+    """Replay v44 trigger IDs, then independently select causal witnesses."""
+
+    if scope not in {
+        _FACTORIAL_CAMPAIGN_RETENTION_SCOPE_V1,
+        _ORDERED_S066_COVERAGE_RETENTION_SCOPE_V1,
+    }:
+        _fail("v44 cross-commit retention scope is not generic or ordered S066")
+    if admission_policy != _AGGREGATE_RELAY_PER_ACTOR_ADMISSION_POLICY_V1:
+        _fail("v44 cross-commit retention policy is not aggregate_relay per actor")
+    expected_marker_window = _string(
+        actor_origin_marker_window_id,
+        "v44 actor-origin marker omission window",
+    )
+    ready_events = tuple(
+        event
+        for event in manager_events
+        if event.event_type == "adaptive_v2.cross_commit_retention_ready"
+    )
+    if len(ready_events) != 1:
+        _fail("v44 cross-commit retention readiness is absent or duplicated")
+    ready = ready_events[0]
+    if (
+        ready.source_kind != "adaptation_manager"
+        or ready.source_id != "adaptive-manager"
+        or ready.relative_path != MANAGER_EVENTS_FILENAME
+    ):
+        _fail("v44 cross-commit retention readiness source identity drifted")
+    payload = ready.payload
+    _fields(
+        payload,
+        {
+            "cycle_ordinal",
+            "predecessor_epoch_number",
+            "predecessor_epoch_digest",
+            "evidence_cutoff",
+            "responsive_degraded_actor_ids",
+            "admitted_observation_ids",
+        },
+        "v44 cross-commit retention readiness payload",
+    )
+    expected_digest = _digest(
+        predecessor_epoch_digest,
+        "v44 cross-commit retention predecessor digest",
+    )
+    cutoff = _integer(
+        selection_current_cutoff,
+        "v44 cross-commit retention selection cutoff",
+        1,
+    )
+    selection_ns = _integer(
+        epoch2_selection_ns,
+        "v44 cross-commit retention Epoch2 selection",
+        1,
+    )
+    if cutoff > _UINT64_MAX:
+        _fail("v44 cross-commit retention selection cutoff exceeds u64")
+    if (
+        payload["cycle_ordinal"] != 1
+        or payload["predecessor_epoch_number"] != 1
+        or payload["predecessor_epoch_digest"] != expected_digest
+    ):
+        _fail("v44 retention readiness is not bound to the exact cycle-1 predecessor")
+    ready_cutoff = _integer(
+        payload["evidence_cutoff"],
+        "v44 cross-commit retention readiness evidence cutoff",
+        1,
+    )
+    if ready_cutoff != cutoff or ready_cutoff > _UINT64_MAX:
+        _fail("v44 retention readiness does not use the same evidence cutoff")
+    if not ready.monotonic_ns < selection_ns:
+        _fail("v44 retention readiness does not strictly precede Epoch2 selection")
+
+    expected_actors = tuple(
+        _integer(actor, "v44 responsive-degraded actor", 0)
+        for actor in responsive_degraded_actor_ids
+    )
+    if (
+        not expected_actors
+        or expected_actors != tuple(sorted(set(expected_actors)))
+        or any(actor > (1 << 32) - 1 for actor in expected_actors)
+    ):
+        _fail("v44 responsive-degraded actor cohort is not canonical")
+    ready_actors = tuple(
+        _integer(actor, "v44 readiness responsive-degraded actor", 0)
+        for actor in _array(
+            payload["responsive_degraded_actor_ids"],
+            "v44 readiness responsive-degraded actor IDs",
+        )
+    )
+    if ready_actors != expected_actors:
+        _fail("v44 retention readiness actor cohort drifted")
+    admitted_ids = tuple(
+        _digest(value, "v44 readiness admitted observation ID")
+        for value in _array(
+            payload["admitted_observation_ids"],
+            "v44 readiness admitted observation IDs",
+        )
+    )
+    if (
+        len(admitted_ids) != len(expected_actors)
+        or len(set(admitted_ids)) != len(admitted_ids)
+    ):
+        _fail("v44 readiness canonical observation membership drifted")
+
+    latest_at_cutoff: dict[str, _EvidenceRecord] = {}
+    for record in accepted_epoch1:
+        if record.ingestion_sequence > cutoff:
+            continue
+        previous = latest_at_cutoff.get(record.observation_id)
+        if (
+            previous is not None
+            and record.ingestion_sequence <= previous.ingestion_sequence
+        ):
+            _fail("v44 readiness observation state ordering is corrupted")
+        latest_at_cutoff[record.observation_id] = record
+    for actor, observation_id in zip(expected_actors, admitted_ids):
+        admitted = latest_at_cutoff.get(observation_id)
+        if admitted is None:
+            _fail("v44 readiness admitted ID lacks one canonical observation")
+        if (
+            admitted.schema_version != 2
+            or admitted.outcome != "timeout"
+            or admitted.message_type != "aggregate_relay"
+        ):
+            _fail(
+                "v44 readiness admitted ID is not an outstanding schema-v2 "
+                "aggregate_relay timeout at the evidence cutoff"
+            )
+        if admitted.target_id != actor:
+            _fail("v44 readiness admitted ID actor differs from its observation")
+
+    expected_actor_set = frozenset(expected_actors)
+    candidates: dict[int, list[_EvidenceRecord]] = defaultdict(list)
+    for record in latest_at_cutoff.values():
+        if (
+            record.schema_version != 2
+            or record.outcome != "timeout"
+            or record.message_type != "aggregate_relay"
+            or record.epoch_number != 1
+            or record.epoch_digest != expected_digest
+            or record.target_id not in expected_actor_set
+        ):
+            continue
+        if record.acceptance_monotonic_ns >= selection_ns:
+            _fail("v44 retention fact does not strictly precede Epoch2 selection")
+        if (
+            record.acceptance_source_sequence >= ready.source_sequence
+            or record.acceptance_monotonic_ns > ready.monotonic_ns
+        ):
+            _fail("v44 retention fact was not accepted before readiness/selection")
+        if (
+            record.attempt_start_monotonic_ns is None
+            or record.reporter_local_commit_monotonic_ns is None
+        ):
+            _fail("v44 readiness references a malformed schema-v2 timeout fact")
+        candidates[record.target_id].append(record)
+
+    ordered_by_actor: dict[int, tuple[_EvidenceRecord, ...]] = {}
+    trigger_records: list[_EvidenceRecord] = []
+    for actor in expected_actors:
+        ordered = tuple(
+            sorted(
+                candidates.get(actor, ()),
+                key=lambda record: (
+                    record.ingestion_sequence,
+                    record.observation_id,
+                ),
+            )
+        )
+        if not ordered:
+            _fail("v44 readiness lacks one aggregate_relay observation per actor")
+        ordered_by_actor[actor] = ordered
+        trigger_records.append(ordered[0])
+    if tuple(record.observation_id for record in trigger_records) != admitted_ids:
+        _fail("v44 readiness admitted IDs differ from canonical aggregate_relay facts")
+
+    def proposal_key(record: _EvidenceRecord) -> tuple[int, int, str, str]:
+        return (
+            record.epoch_number,
+            record.tree_id,
+            record.epoch_digest,
+            record.block_hash,
+        )
+
+    def commit_events(
+        replica_id: int,
+        key: tuple[int, int, str, str],
+    ) -> tuple[_NativeEvent, ...]:
+        return tuple(
+            event
+            for event in replica_events.get(replica_id, ())
+            if event.event_type == "block.committed"
+            and _proposal_commit_identity(
+                event,
+                replica_id=replica_id,
+                require_exact_source_binding=True,
+                allow_reporter_local_commit_sample=True,
+            )
+            == key
+        )
+
+    causal_records: list[_EvidenceRecord] = []
+    for actor in expected_actors:
+        selected: _EvidenceRecord | None = None
+        for record in ordered_by_actor[actor]:
+            key = proposal_key(record)
+            proposal_markers = tuple(
+                marker
+                for marker in markers
+                if marker.source_replica == record.target_id
+                and marker.actor == record.target_id
+                and (
+                    marker.epoch_number,
+                    marker.tree_id,
+                    marker.epoch_digest,
+                    marker.block_hash,
+                )
+                == key
+            )
+            if not proposal_markers:
+                continue
+            if len(proposal_markers) != 1:
+                _fail("v44 causal fact has duplicate or conflicting fault markers")
+            marker = proposal_markers[0]
+            if (
+                marker.action != "omit_aggregate"
+                or marker.fault_mode != _TIERED_OMISSION_MODE_V2
+                or marker.window != expected_marker_window
+                or marker.cohort != "responsive_degraded"
+            ):
+                continue
+
+            tree = epoch1_trees.get(record.tree_id)
+            if tree is None or record.target_id not in tree.members:
+                _fail("v44 causal fact has no exact Epoch1 tree role")
+            position = tree.members.index(record.target_id)
+            leaf_start = _first_leaf_index(len(tree.members), tree.fanout)
+            if not 0 < position < leaf_start:
+                _fail("v44 causal aggregate_relay actor is not an internal role")
+            physical_parent = tree.members[(position - 1) // tree.fanout]
+            if record.reporter_id != physical_parent:
+                _fail("v44 causal fact differs from its exact physical parent")
+
+            proposal_arms = tuple(
+                arm
+                for arm in arm_markers
+                if arm.child_id == record.target_id
+                and arm.proposal_key == key
+            )
+            if len(proposal_arms) != 1:
+                _fail("v44 causal fact lacks one exact response-attempt arm")
+            arm = proposal_arms[0]
+            if (
+                arm.reporter_id != record.reporter_id
+                or arm.source_replica != record.reporter_id
+                or arm.expected_message_type != "aggregate_relay"
+            ):
+                _fail("v44 causal fact arm differs from its authenticated reporter")
+            if arm.start_monotonic_ns != record.attempt_start_monotonic_ns:
+                _fail("v44 causal fact attempt start differs from its raw arm")
+            if arm.deadline_duration_us != record.deadline_duration_us:
+                _fail("v44 causal fact deadline duration differs from its raw arm")
+            if (
+                arm.deadline_duration_us <= 0
+                or arm.deadline_duration_us > _UINT64_MAX // 1_000
+                or arm.start_monotonic_ns
+                > _UINT64_MAX - arm.deadline_duration_us * 1_000
+                or arm.absolute_deadline_ns
+                != arm.start_monotonic_ns + arm.deadline_duration_us * 1_000
+            ):
+                _fail("v44 causal fact arm absolute deadline is invalid")
+
+            reporter_commits = commit_events(record.reporter_id, key)
+            if len(reporter_commits) != 1:
+                _fail("v44 causal fact lacks one exact reporter-local rich commit")
+            reporter_commit = reporter_commits[0]
+            reporter_commit_payload = _commit_payload(
+                reporter_commit,
+                authoritative=record.reporter_id == 0,
+                allow_reporter_local_commit_sample=True,
+            )
+            reporter_commit_sample = reporter_commit_payload[
+                "reporter_local_commit_monotonic_ns"
+            ]
+            if reporter_commit_sample is None:
+                _fail("v44 causal fact lacks its reporter-local commit sample")
+            if reporter_commit_sample != record.reporter_local_commit_monotonic_ns:
+                _fail("v44 causal fact reporter-local commit timestamp drifted")
+            if not 0 < reporter_commit_sample <= reporter_commit.monotonic_ns:
+                _fail("v44 causal fact sample exceeds its rich commit outer event time")
+            if reporter_commit.monotonic_ns >= selection_ns:
+                _fail("v44 causal fact reporter rich commit is not pre-selection")
+
+            observer_commits = commit_events(0, key)
+            if len(observer_commits) != 1:
+                _fail("v44 causal fact lacks one exact observer-0 rich commit")
+            observer_commit = observer_commits[0]
+            if not (
+                record.attempt_start_monotonic_ns
+                <= marker.monotonic_ns
+                < reporter_commit_sample
+                < arm.absolute_deadline_ns
+                <= record.reporter_monotonic_ns
+                <= record.acceptance_monotonic_ns
+                <= ready.monotonic_ns
+                < selection_ns
+            ):
+                _fail("v44 causal fact violates its strict shared-sample chronology")
+            if not marker.monotonic_ns < observer_commit.monotonic_ns < selection_ns:
+                _fail("v44 causal fact observer-0 rich commit is outside its window")
+            selected = record
+            break
+        if selected is None:
+            _fail("v44 retention lacks one exact causal aggregate_relay fact per actor")
+        causal_records.append(selected)
+    return tuple(causal_records)
 
 
 def _conservative_attempt_started_at_or_after(
@@ -8947,6 +9438,7 @@ def _uses_authoritative_observer_commit_completeness(manifest_id: str) -> bool:
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 
@@ -11984,7 +12476,8 @@ def _validate_v42_retention_receipt_binding(
     field = "cycle1_responsive_cross_commit_retention"
     expected = runtime.get(field)
     required = (
-        manifest_id in {V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest_id
+        in {V42_MANIFEST_ID, V43_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and expected is not None
     )
     if required:
@@ -12019,7 +12512,8 @@ def _validate_slot_receipt(
         "cycle1_responsive_cross_commit_retention"
     )
     v42_retention = (
-        manifest.manifest_id in {V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        manifest.manifest_id
+        in {V42_MANIFEST_ID, V43_MANIFEST_ID, FROZEN_MANIFEST_ID}
         and runtime_retention is not None
     )
     readiness_required = historical_repair_readiness or v42_retention
@@ -12935,6 +13429,7 @@ def _validate_runner_state(
         V40_MANIFEST_ID,
         V41_MANIFEST_ID,
         V42_MANIFEST_ID,
+        V43_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         hard_deadline = _integer(
@@ -13661,6 +14156,7 @@ def _validate_v28_excluded_repair_observation(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id
@@ -13817,6 +14313,7 @@ def _validate_v28_excluded_repair_observation(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected_observation_contract
@@ -14204,6 +14701,7 @@ def _validate_v25_inherited_wait_exempt_placement_live_exercise(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or not coverage_smoke
@@ -15159,6 +15657,7 @@ def _validate_v28_verified_response_duplicate_probe(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -15699,6 +16198,7 @@ def _validate_native_transitions(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected.replica_count == 31
@@ -16249,6 +16749,7 @@ def _validate_v25_coverage_execution_lifecycle(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id not in coverage_slot_ids
@@ -16667,6 +17168,7 @@ def validate_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         )
     )
@@ -16768,6 +17270,7 @@ def validate_slot(
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
                 V42_MANIFEST_ID,
+                V43_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             and coverage_smoke
@@ -16845,13 +17348,19 @@ def validate_slot(
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
                 V42_MANIFEST_ID,
+                V43_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             and v28_excluded_repair
         )
         exact_v41_plus_repair = (
             manifest.manifest_id
-            in {V41_MANIFEST_ID, V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            in {
+                V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
+                V43_MANIFEST_ID,
+                FROZEN_MANIFEST_ID,
+            }
             and v28_excluded_repair
         )
         raw_replica_events = replica_events
@@ -17141,6 +17650,7 @@ def validate_slot(
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
             V42_MANIFEST_ID,
+            V43_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             _validate_v28_verified_response_duplicate_probe(
@@ -17178,7 +17688,7 @@ def validate_slot(
         expected_window, expected_max_omissions = _effective_omission_contract(
             manifest, expected
         )
-        generic_v42_retention_witness_actor_ids: tuple[int, ...] = ()
+        generic_retention_witness_actor_ids: tuple[int, ...] = ()
         if (
             slot_v42_retention is not None
             and slot_v42_retention[0]
@@ -17187,7 +17697,12 @@ def validate_slot(
                 _ORDERED_S066_COVERAGE_RETENTION_SCOPE_V1,
             }
         ):
-            selected = _validate_v42_cross_commit_retention_ready(
+            retention_validator = (
+                _validate_v44_cross_commit_retention_ready
+                if manifest.manifest_id == FROZEN_MANIFEST_ID
+                else _validate_v42_cross_commit_retention_ready
+            )
+            selected = retention_validator(
                 manager_events=manager_events,
                 accepted_epoch1=accepted.get(
                     (1, bundles[0].epoch_digest),
@@ -17211,7 +17726,7 @@ def validate_slot(
                 scope=slot_v42_retention[0],
                 admission_policy=slot_v42_retention[1],
             )
-            generic_v42_retention_witness_actor_ids = tuple(
+            generic_retention_witness_actor_ids = tuple(
                 record.target_id for record in selected
             )
         elif v40_plus_repair:
@@ -17367,7 +17882,7 @@ def validate_slot(
             ),
             fault_active_phase_contract=fault_active_phase_contract,
             prevalidated_internal_retention_witness_actor_ids=(
-                generic_v42_retention_witness_actor_ids
+                generic_retention_witness_actor_ids
             ),
         )
 
@@ -17500,6 +18015,7 @@ def validate_slot(
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
                 V42_MANIFEST_ID,
+                V43_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         ):

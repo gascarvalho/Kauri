@@ -203,7 +203,7 @@ def test_v23_is_validation_only_and_keeps_historical_ordered_roots(
 ) -> None:
     assert cli.main(["--manifest", str(V23_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v42 are validation-only" in refusal["reason"]
+    assert "v1 through v43 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V23_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

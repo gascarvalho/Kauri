@@ -1096,7 +1096,7 @@ def test_cli_v24_production_commands_are_validation_only(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v42 are validation-only" in refusal["reason"]
+    assert "v1 through v43 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
@@ -1128,12 +1128,12 @@ def test_cli_v24_production_commands_are_validation_only(
         V25_MANIFEST_PATH,
     ),
 )
-def test_cli_defaults_to_v43_and_refuses_historical_production(
+def test_cli_defaults_to_v44_and_refuses_historical_production(
     prior_manifest: Path,
     capsys,
 ) -> None:
     assert run_shape_factorial_campaign.DEFAULT_MANIFEST.name == (
-        "shape-placement-factorial-v43.json"
+        "shape-placement-factorial-v44.json"
     )
     assert (
         run_shape_factorial_campaign.main(
@@ -1143,7 +1143,7 @@ def test_cli_defaults_to_v43_and_refuses_historical_production(
     )
     refusal = json.loads(capsys.readouterr().err)
     assert refusal["status"] == "REJECT"
-    assert "v1 through v42 are validation-only" in refusal["reason"]
+    assert "v1 through v43 are validation-only" in refusal["reason"]
 
 
 @pytest.mark.parametrize(
