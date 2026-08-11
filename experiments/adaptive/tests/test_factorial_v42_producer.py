@@ -214,7 +214,7 @@ def test_v42_profile_is_one_lf_and_exact_three_path_delta() -> None:
     assert v42 == v41
 
 
-def test_v41_is_historical_and_v42_is_exactly_frozen() -> None:
+def test_v41_and_v42_are_historical() -> None:
     assert manifest_module.V41_MANIFEST_ID == "shape-placement-factorial-v41"
     assert (
         manifest_module.V41_MANIFEST_SHA256,
@@ -224,14 +224,14 @@ def test_v41_is_historical_and_v42_is_exactly_frozen() -> None:
         runtime_module.V41_SMOKE_RUNTIME_SHA256,
         runtime_module.V41_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == V41_SIX
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v42"
+    assert manifest_module.V42_MANIFEST_ID == "shape-placement-factorial-v42"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V42_MANIFEST_SHA256,
+        manifest_module.V42_SEMANTIC_SHA256,
+        manifest_module.V42_PLAN_SHA256,
+        runtime_module.V42_RUNTIME_SHA256,
+        runtime_module.V42_SMOKE_RUNTIME_SHA256,
+        runtime_module.V42_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == V42_SIX
 
 
@@ -431,7 +431,7 @@ def test_v42_repair_terminal_rejects_v41_path_alias_and_missing_contract(
     for candidate in mutations:
         with pytest.raises(
             execution.FactorialExecutionError,
-            match="exact v40/v41/v42 repair runtime",
+            match="exact v40/v41/v42/v43 repair runtime",
         ):
             execution._assert_v40_repair_runner_terminal_before_hard_deadline(
                 candidate,
@@ -519,10 +519,10 @@ def test_v42_retention_scopes_reject_result_path_and_scope_mutations(
             )
 
 
-def test_v42_is_default_and_v41_is_validation_only(
+def test_v42_is_validation_only_after_v43_rollover(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V42_MANIFEST
-    assert cli.main(["--manifest", str(V41_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST != V42_MANIFEST
+    assert cli.main(["--manifest", str(V42_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v41 are validation-only" in refusal["reason"]
+    assert "v1 through v42 are validation-only" in refusal["reason"]

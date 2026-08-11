@@ -103,6 +103,9 @@ V41_MANIFEST_PATH = (
 V42_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v42.json"
 )
+V43_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v43.json"
+)
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
 )
@@ -860,33 +863,22 @@ def _v41_candidate_manifest(
     semantic = _canonical(json.loads(payload))
     monkeypatch.setattr(
         manifest_module,
-        "FROZEN_SEMANTIC_SHA256",
+        "V41_SEMANTIC_SHA256",
         hashlib.sha256(semantic).hexdigest(),
     )
     return manifest_module.parse_manifest_bytes(payload)
 
 
 def _v42_candidate_plan(monkeypatch: pytest.MonkeyPatch):
-    payload = V42_MANIFEST_PATH.read_bytes()
-    semantic = _canonical(json.loads(payload))
-    monkeypatch.setattr(
-        manifest_module,
-        "FROZEN_SEMANTIC_SHA256",
-        hashlib.sha256(semantic).hexdigest(),
-    )
-    manifest = manifest_module.parse_manifest_bytes(payload)
-    plan = build_factorial_plan(manifest)
-    monkeypatch.setattr(
-        manifest_module,
-        "FROZEN_MANIFEST_SHA256",
-        manifest.manifest_sha256,
-    )
-    monkeypatch.setattr(
-        manifest_module,
-        "FROZEN_PLAN_SHA256",
-        plan.plan_sha256,
-    )
-    return manifest, plan
+    del monkeypatch
+    manifest = load_frozen_manifest(V42_MANIFEST_PATH)
+    return manifest, build_factorial_plan(manifest)
+
+
+def _v43_candidate_plan(monkeypatch: pytest.MonkeyPatch):
+    del monkeypatch
+    manifest = load_frozen_manifest(V43_MANIFEST_PATH)
+    return manifest, build_factorial_plan(manifest)
 
 
 def _native_event(
@@ -2092,7 +2084,7 @@ def test_validator_v41_identities_are_exactly_frozen() -> None:
 
 def test_validator_v42_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V42_MANIFEST_ID
     )
     manifest_payload = V42_MANIFEST_PATH.read_bytes()
     manifest = load_frozen_manifest(V42_MANIFEST_PATH)
@@ -2112,6 +2104,65 @@ def test_validator_v42_identities_are_exactly_frozen() -> None:
         "4239c82b2d4c67676c30765357a7a27404d15865add450ed798cc7c89ca37ea0",
         "2c699550b483316e7309de6cf2f74262462277fcf113dcbc21ed29d27827a4c9",
         "7ac3945187626a337f2c2866784400ae012b879bbcffd311efe6cb4a30764458",
+    )
+    producer_six = (
+        manifest_module.V42_MANIFEST_SHA256,
+        manifest_module.V42_SEMANTIC_SHA256,
+        manifest_module.V42_PLAN_SHA256,
+        runtime_module.V42_RUNTIME_SHA256,
+        runtime_module.V42_SMOKE_RUNTIME_SHA256,
+        runtime_module.V42_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+    validator_six = (
+        identity.manifest_sha256,
+        manifest_module.V42_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    )
+    disk_six = (
+        hashlib.sha256(manifest_payload).hexdigest(),
+        hashlib.sha256(_canonical(json.loads(manifest_payload))).hexdigest(),
+        plan.plan_sha256,
+        hashlib.sha256(canonical_runtime_bytes(campaign_runtime)).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(smoke.runtime.as_document())
+        ).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest(),
+    )
+
+    assert validation.V42_MANIFEST_ID == "shape-placement-factorial-v42"
+    assert producer_six == validator_six == disk_six == expected_six
+    assert validation._coverage_smoke_result_root(
+        validation.V42_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v42-coverage-smoke"
+
+
+def test_validator_v43_identities_are_exactly_frozen() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+    manifest_payload = V43_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(V43_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    campaign_runtime = build_factorial_runtime(plan)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    expected_six = (
+        "2a50d4d50b8518d50c1c2b40695ef74f82b7cec1d7f1e0ef8a54311468c119da",
+        "23e07694e85686bbfbbe91cbe76fcb01d7a8ebf1009ad2747036af0956167347",
+        "4ce4cb5e699c3fc87ec988755e9be73a1fec68edc71154faf050c64bed5f9366",
+        "eab2f59024b777435b1713ec279adca86c8ea1ec18197da24c90f4480a441764",
+        "48f966751d6da4fea160ed9787c560df8768ef9893d2e262d56a16af66ccee8c",
+        "0ba89d2ba5e07db1a7adb03258330c527d95d1240ba7a1598686de3474541809",
     )
     producer_six = (
         manifest_module.FROZEN_MANIFEST_SHA256,
@@ -2142,11 +2193,11 @@ def test_validator_v42_identities_are_exactly_frozen() -> None:
         ).hexdigest(),
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v42"
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v43"
     assert producer_six == validator_six == disk_six == expected_six
     assert validation._coverage_smoke_result_root(
         validation.FROZEN_MANIFEST_ID
-    ) == "results/shape-placement-factorial-v42-coverage-smoke"
+    ) == "results/shape-placement-factorial-v43-coverage-smoke"
 
 
 @pytest.mark.parametrize(
@@ -4852,10 +4903,10 @@ def test_v42_retention_ready_uses_shared_sample_before_deadline_not_outer_time(
     )
 
 
-def test_v42_runtime_retention_scope_partition_is_exact(
-    monkeypatch: pytest.MonkeyPatch,
+def _assert_v42_plus_runtime_retention_scope_partition(
+    manifest: manifest_module.FrozenFactorialManifest,
+    plan: manifest_module.FactorialPlan,
 ) -> None:
-    manifest, plan = _v42_candidate_plan(monkeypatch)
     campaign = build_factorial_runtime(plan)
     primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
     repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
@@ -4916,6 +4967,22 @@ def test_v42_runtime_retention_scope_partition_is_exact(
     )
 
 
+def test_v42_runtime_retention_scope_partition_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_v42_plus_runtime_retention_scope_partition(
+        *_v42_candidate_plan(monkeypatch)
+    )
+
+
+def test_v43_runtime_retention_scope_partition_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_v42_plus_runtime_retention_scope_partition(
+        *_v43_candidate_plan(monkeypatch)
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     (
@@ -4927,12 +4994,19 @@ def test_v42_runtime_retention_scope_partition_is_exact(
         ("extra", "field set"),
     ),
 )
-def test_v42_runtime_retention_contract_fails_closed(
+@pytest.mark.parametrize("manifest_version", ("v42", "v43"))
+def test_v42_plus_runtime_retention_contract_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
     reason: str,
+    manifest_version: str,
 ) -> None:
-    manifest, plan = _v42_candidate_plan(monkeypatch)
+    candidate_plan = (
+        _v42_candidate_plan
+        if manifest_version == "v42"
+        else _v43_candidate_plan
+    )
+    manifest, plan = candidate_plan(monkeypatch)
     spec = build_factorial_runtime(plan).slots[0]
     document = json.loads(_canonical(spec.as_document()))
     expected = next(
@@ -4969,7 +5043,13 @@ def test_v42_runtime_retention_contract_fails_closed(
         )
 
 
-def test_v42_retention_receipt_exactly_repeats_runtime_contract() -> None:
+@pytest.mark.parametrize(
+    "manifest_id",
+    (validation.V42_MANIFEST_ID, validation.FROZEN_MANIFEST_ID),
+)
+def test_v42_plus_retention_receipt_exactly_repeats_runtime_contract(
+    manifest_id: str,
+) -> None:
     contract = {
         "scope": _V42_RETENTION_SCOPE,
         "observation_schema_version": 2,
@@ -4980,7 +5060,7 @@ def test_v42_retention_receipt_exactly_repeats_runtime_contract() -> None:
     validation._validate_v42_retention_receipt_binding(
         {"cycle1_responsive_cross_commit_retention": contract},
         runtime,
-        manifest_id=validation.FROZEN_MANIFEST_ID,
+        manifest_id=manifest_id,
     )
     with pytest.raises(FactorialValidationError, match="receipt.*drifted"):
         validation._validate_v42_retention_receipt_binding(
@@ -4993,7 +5073,7 @@ def test_v42_retention_receipt_exactly_repeats_runtime_contract() -> None:
                 }
             },
             runtime,
-            manifest_id=validation.FROZEN_MANIFEST_ID,
+            manifest_id=manifest_id,
         )
     with pytest.raises(FactorialValidationError, match="escaped"):
         validation._validate_v42_retention_receipt_binding(

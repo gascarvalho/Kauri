@@ -148,10 +148,10 @@ def test_v17_all_six_static_identities_are_frozen() -> None:
 def test_v17_is_validation_only_and_keeps_historical_smoke_roots(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v42.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v43.json"
     assert cli.main(["--manifest", str(V17_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v41 are validation-only" in refusal["reason"]
+    assert "v1 through v42 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V17_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

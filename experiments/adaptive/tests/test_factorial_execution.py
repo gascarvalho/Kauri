@@ -35,6 +35,9 @@ MANIFEST = REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial
 V28_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v28.json"
 )
+V42_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v42.json"
+)
 V27_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v27.json"
 )
@@ -458,6 +461,36 @@ def test_static_artifacts_bind_exact_excluded_repair_probe_runtime() -> None:
     execution._bind_static_artifacts(
         repair_slot,
         repair_runtime,
+        artifacts,
+        campaign_member=False,
+    )
+
+
+@pytest.mark.parametrize("coverage_index", (0, 1))
+def test_static_artifacts_bind_exact_v42_retention_contract(
+    coverage_index: int,
+) -> None:
+    plan = build_factorial_plan(load_frozen_manifest(V42_MANIFEST))
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    slot = coverage.slots[coverage_index]
+    spec = coverage.runtimes[coverage_index]
+    assert spec.cycle1_responsive_cross_commit_retention is not None
+    artifacts = {
+        "manifest.json": V42_MANIFEST.read_bytes(),
+        "plan.json": plan.canonical_bytes,
+        "runtime.json": execution._canonical_json_bytes(
+            coverage.runtime.as_document()
+        ),
+    }
+
+    execution._bind_static_artifacts(
+        slot,
+        spec,
         artifacts,
         campaign_member=False,
     )

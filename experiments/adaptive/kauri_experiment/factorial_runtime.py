@@ -1,4 +1,4 @@
-"""Pure launch contracts for the frozen SHAPE42 factorial campaign.
+"""Pure launch contracts for the frozen SHAPE43 factorial campaign.
 
 This module does not predict adaptive outcomes and never starts a process.
 It freezes only the inputs, live-evidence acceptance predicates, relative
@@ -66,6 +66,7 @@ from .factorial_manifest import (
     V39_MANIFEST_ID,
     V40_MANIFEST_ID,
     V41_MANIFEST_ID,
+    V42_MANIFEST_ID,
     V9_MANIFEST_ID,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
@@ -355,14 +356,23 @@ V41_SMOKE_RUNTIME_SHA256 = (
 V41_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "e27e4848510b4c92440edebc2a658a38a5d69464adab795219f09482af3154e6"
 )
-FROZEN_RUNTIME_SHA256 = (
+V42_RUNTIME_SHA256 = (
     "4239c82b2d4c67676c30765357a7a27404d15865add450ed798cc7c89ca37ea0"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V42_SMOKE_RUNTIME_SHA256 = (
     "2c699550b483316e7309de6cf2f74262462277fcf113dcbc21ed29d27827a4c9"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V42_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "7ac3945187626a337f2c2866784400ae012b879bbcffd311efe6cb4a30764458"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "eab2f59024b777435b1713ec279adca86c8ea1ec18197da24c90f4480a441764"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "48f966751d6da4fea160ed9787c560df8768ef9893d2e262d56a16af66ccee8c"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "0ba89d2ba5e07db1a7adb03258330c527d95d1240ba7a1598686de3474541809"
 )
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -1958,6 +1968,7 @@ def _validate_excluded_repair_smoke_probe(
             "v40",
             "v41",
             "v42",
+            "v43",
         )
     }
     matching_paths = tuple(
@@ -1971,7 +1982,8 @@ def _validate_excluded_repair_smoke_probe(
         or slot.byzantine.duration_s
         != (
             360
-            if matching_paths and matching_paths[0][0] in {"v40", "v41", "v42"}
+            if matching_paths
+            and matching_paths[0][0] in {"v40", "v41", "v42", "v43"}
             else 330
             if matching_paths and matching_paths[0][0] in {"v37", "v38", "v39"}
             else 300
@@ -1979,12 +1991,12 @@ def _validate_excluded_repair_smoke_probe(
         or slot.common_timers.hard_timeout_s != 650
     ):
         raise FactorialManifestError(
-            "excluded repair smoke probe is restricted to exact v28 through v42 slot 037"
+            "excluded repair smoke probe is restricted to exact v28 through v43 slot 037"
         )
     version, (source_path, _) = matching_paths[0]
     effective_duration_s = (
         360
-        if version in {"v40", "v41", "v42"}
+        if version in {"v40", "v41", "v42", "v43"}
         else 330
         if version in {"v37", "v38", "v39"}
         else 300
@@ -2007,7 +2019,7 @@ def _validate_excluded_repair_smoke_probe(
                     AGGREGATE_RELAY_PER_ACTOR_ADMISSION_POLICY_V1
                 ),
             )
-            if version == "v42"
+            if version in {"v42", "v43"}
             else None
         ),
     )
@@ -2017,7 +2029,7 @@ def _validate_excluded_repair_smoke_probe(
         source_campaign_artifact_id=source_runtime.artifact_id,
         semantic_delta=(
             EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
-            if version in {"v41", "v42"}
+            if version in {"v41", "v42", "v43"}
             else EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
             if version == "v40"
             else EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
@@ -2031,7 +2043,7 @@ def _validate_excluded_repair_smoke_probe(
         hard_timeout_s=650,
         observation_contract=(
             EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
-            if version in {"v41", "v42"}
+            if version in {"v41", "v42", "v43"}
             else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
             if version == "v40"
             else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
@@ -2050,25 +2062,25 @@ def _validate_excluded_repair_smoke_probe(
         ),
         post_fault_observation_grace_s=(
             EXCLUDED_REPAIR_SMOKE_POST_FAULT_OBSERVATION_GRACE_S
-            if version in {"v40", "v41", "v42"}
+            if version in {"v40", "v41", "v42", "v43"}
             else None
         ),
         cycle1_inherited_wait_exempt_eligibility_gate=(
-            True if version in {"v40", "v41", "v42"} else None
+            True if version in {"v40", "v41", "v42", "v43"} else None
         ),
         cycle1_responsive_cross_commit_retention_readiness_gate=(
-            True if version in {"v40", "v41", "v42"} else None
+            True if version in {"v40", "v41", "v42", "v43"} else None
         ),
         canonical_responsive_degraded_actor_ids=(
             EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
-            if version in {"v40", "v41", "v42"}
+            if version in {"v40", "v41", "v42", "v43"}
             else None
         ),
         response_evidence_timeout_retention_schema_version=(
-            2 if version in {"v40", "v41", "v42"} else None
+            2 if version in {"v40", "v41", "v42", "v43"} else None
         ),
         runner_terminal_strictly_before_hard_deadline=(
-            True if version in {"v40", "v41", "v42"} else None
+            True if version in {"v40", "v41", "v42", "v43"} else None
         ),
     )
     if probe != expected:
@@ -2095,7 +2107,7 @@ def _validate_cycle1_responsive_cross_commit_retention(
         != RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V1
     ):
         raise FactorialManifestError(
-            "cycle-1 reporter-retention readiness scope lacks the exact v42 manifest gate"
+            "cycle-1 reporter-retention readiness scope lacks the exact v42/v43 manifest gate"
         )
     actors = contract.responsive_degraded_actor_ids
     expected_policy_by_scope = {
@@ -2125,7 +2137,10 @@ def _validate_cycle1_responsive_cross_commit_retention(
             probe is not None
             or slot.slot_id == "smoke-n7-f2-PS"
             or slot.result_path
-            != f"results/shape-placement-factorial-v42/{slot.slot_id}"
+            not in {
+                f"results/shape-placement-factorial-v42/{slot.slot_id}",
+                f"results/shape-placement-factorial-v43/{slot.slot_id}",
+            }
         ):
             raise FactorialManifestError(
                 "factorial reporter-retention scope escaped exact campaign slots"
@@ -2135,10 +2150,12 @@ def _validate_cycle1_responsive_cross_commit_retention(
             probe is not None
             or slot.slot_id != "slot-066-n31-f5-b05-P"
             or slot.result_path
-            != (
+            not in {
                 "results/shape-placement-factorial-v42-coverage-smoke/"
-                "slot-066-n31-f5-b05-P"
-            )
+                "slot-066-n31-f5-b05-P",
+                "results/shape-placement-factorial-v43-coverage-smoke/"
+                "slot-066-n31-f5-b05-P",
+            }
         ):
             raise FactorialManifestError(
                 "ordered S066 reporter-retention scope drifted"
@@ -2148,10 +2165,12 @@ def _validate_cycle1_responsive_cross_commit_retention(
             probe is None
             or slot.slot_id != "slot-037-n31-f2-b04-00"
             or slot.result_path
-            != (
+            not in {
                 "results/shape-placement-factorial-v42-coverage-smoke/"
-                "slot-037-n31-f2-b04-00"
-            )
+                "slot-037-n31-f2-b04-00",
+                "results/shape-placement-factorial-v43-coverage-smoke/"
+                "slot-037-n31-f2-b04-00",
+            }
             or actors
             != EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
             or probe.observation_contract
@@ -2649,11 +2668,42 @@ def materialize_manager_argv(
         and spec.causal_acceptance.excluded_repair_smoke_observation_contract
         == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
     )
+    v43_gate_enabled = bool(
+        probe is not None
+        and probe.observation_contract
+        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
+        and probe.semantic_delta == EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
+        and probe.source_campaign_slot_id == "slot-037-n31-f2-b04-00"
+        and probe.source_campaign_result_path
+        == "results/shape-placement-factorial-v43/slot-037-n31-f2-b04-00"
+        and probe.source_fault_window_duration_s == 450
+        and probe.effective_fault_window_duration_s == 360
+        and probe.hard_timeout_s == 650
+        and probe.post_fault_observation_grace_s
+        == EXCLUDED_REPAIR_SMOKE_POST_FAULT_OBSERVATION_GRACE_S
+        and probe.cycle1_inherited_wait_exempt_eligibility_gate is True
+        and probe.cycle1_responsive_cross_commit_retention_readiness_gate is True
+        and probe.canonical_responsive_degraded_actor_ids
+        == EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
+        and probe.response_evidence_timeout_retention_schema_version == 2
+        and probe.runner_terminal_strictly_before_hard_deadline is True
+        and spec.slot_id == "slot-037-n31-f2-b04-00"
+        and spec.result_path
+        == (
+            "results/shape-placement-factorial-v43-coverage-smoke/"
+            "slot-037-n31-f2-b04-00"
+        )
+        and spec.fault_window.duration_s == 360
+        and spec.fault_window.hard_timeout_s == 650
+        and spec.causal_acceptance.excluded_repair_smoke_observation_contract
+        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
+    )
     gate_enabled = (
         v39_gate_enabled
         or v40_gate_enabled
         or v41_gate_enabled
         or v42_gate_enabled
+        or v43_gate_enabled
     )
     if gate_claimed and not gate_enabled:
         raise FactorialManifestError(
@@ -2985,7 +3035,7 @@ def build_factorial_runtime(plan: FactorialPlan) -> FactorialRuntimePlan:
                     AGGREGATE_RELAY_PER_ACTOR_ADMISSION_POLICY_V1
                 ),
             )
-            if plan.manifest_id == FROZEN_MANIFEST_ID
+            if plan.manifest_id in {V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None
         )
         return build_slot_runtime(
@@ -3065,8 +3115,14 @@ def runtime_preflight(
             EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6,
             True,
         ),
-        FROZEN_MANIFEST_ID: (
+        V42_MANIFEST_ID: (
             "v42",
+            EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5,
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6,
+            True,
+        ),
+        FROZEN_MANIFEST_ID: (
+            "v43",
             EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5,
             EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6,
             True,
@@ -3105,6 +3161,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -3139,6 +3196,7 @@ def runtime_preflight(
                     V39_MANIFEST_ID,
                     V40_MANIFEST_ID,
                     V41_MANIFEST_ID,
+                    V42_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else slot.cutoff_contract.epoch1_stable_bucket_count
@@ -3300,6 +3358,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }:
                 expected_measurement_contract = (
@@ -3348,6 +3407,7 @@ def runtime_preflight(
                     V39_MANIFEST_ID,
                     V40_MANIFEST_ID,
                     V41_MANIFEST_ID,
+                    V42_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else 32
@@ -3386,6 +3446,7 @@ def runtime_preflight(
                     V39_MANIFEST_ID,
                     V40_MANIFEST_ID,
                     V41_MANIFEST_ID,
+                    V42_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else "tiered_persistent_responsive_omission_v1"
@@ -3462,6 +3523,7 @@ def runtime_preflight(
                         V39_MANIFEST_ID,
                         V40_MANIFEST_ID,
                         V41_MANIFEST_ID,
+                        V42_MANIFEST_ID,
                         FROZEN_MANIFEST_ID,
                     }
                     else None
@@ -3688,6 +3750,7 @@ def runtime_preflight(
             V39_MANIFEST_ID,
             V40_MANIFEST_ID,
             V41_MANIFEST_ID,
+            V42_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         if (
@@ -3752,12 +3815,18 @@ def runtime_preflight(
             == 2
         )
         retention = slot.cycle1_responsive_cross_commit_retention
-        if runtime.manifest_id == FROZEN_MANIFEST_ID:
+        if runtime.manifest_id in {V42_MANIFEST_ID, FROZEN_MANIFEST_ID}:
             if slot.slot_id == "smoke-n7-f2-PS":
                 expected_retention_scope = None
             elif (
                 slot.slot_id == "slot-066-n31-f5-b05-P"
-                and "-coverage-smoke/" in slot.result_path
+                and slot.result_path
+                in {
+                    "results/shape-placement-factorial-v42-coverage-smoke/"
+                    "slot-066-n31-f5-b05-P",
+                    "results/shape-placement-factorial-v43-coverage-smoke/"
+                    "slot-066-n31-f5-b05-P",
+                }
             ):
                 expected_retention_scope = ORDERED_S066_COVERAGE_RETENTION_SCOPE_V1
             elif (
@@ -3892,6 +3961,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -3922,6 +3992,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -3948,6 +4019,7 @@ def runtime_preflight(
                     V39_MANIFEST_ID,
                     V40_MANIFEST_ID,
                     V41_MANIFEST_ID,
+                    V42_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -3977,6 +4049,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -4005,6 +4078,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -4031,6 +4105,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -4054,6 +4129,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -4075,6 +4151,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else (
@@ -4083,7 +4160,8 @@ def runtime_preflight(
                 else None
             ),
             EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
-            if runtime.manifest_id in {V41_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id
+            in {V41_MANIFEST_ID, V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else (
                 EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
                 if runtime.manifest_id == V40_MANIFEST_ID
@@ -4115,11 +4193,11 @@ def runtime_preflight(
                 )
             ),
             EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
-            if runtime.manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, V33_MANIFEST_ID, V34_MANIFEST_ID, V35_MANIFEST_ID, V36_MANIFEST_ID, V37_MANIFEST_ID, V38_MANIFEST_ID, V39_MANIFEST_ID, V40_MANIFEST_ID, V41_MANIFEST_ID, FROZEN_MANIFEST_ID}
+            if runtime.manifest_id in {V28_MANIFEST_ID, V29_MANIFEST_ID, V30_MANIFEST_ID, V31_MANIFEST_ID, V32_MANIFEST_ID, V33_MANIFEST_ID, V34_MANIFEST_ID, V35_MANIFEST_ID, V36_MANIFEST_ID, V37_MANIFEST_ID, V38_MANIFEST_ID, V39_MANIFEST_ID, V40_MANIFEST_ID, V41_MANIFEST_ID, V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
             else None,
             (
                 POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V2
-                if runtime.manifest_id in {V38_MANIFEST_ID, V39_MANIFEST_ID, V40_MANIFEST_ID, V41_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                if runtime.manifest_id in {V38_MANIFEST_ID, V39_MANIFEST_ID, V40_MANIFEST_ID, V41_MANIFEST_ID, V42_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else (
                     POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1
                     if runtime.manifest_id in {V36_MANIFEST_ID, V37_MANIFEST_ID}
@@ -4147,6 +4225,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -4171,6 +4250,7 @@ def runtime_preflight(
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
                 V41_MANIFEST_ID,
+                V42_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None,
@@ -4329,6 +4409,9 @@ __all__ = (
     "V41_COVERAGE_SMOKE_RUNTIME_SHA256",
     "V41_RUNTIME_SHA256",
     "V41_SMOKE_RUNTIME_SHA256",
+    "V42_COVERAGE_SMOKE_RUNTIME_SHA256",
+    "V42_RUNTIME_SHA256",
+    "V42_SMOKE_RUNTIME_SHA256",
     "build_factorial_runtime",
     "build_slot_runtime",
     "build_smoke_metadata",
