@@ -580,7 +580,10 @@ public:
     }
     void local_vote_authorized(const ProposalKey &) override {}
     void create_expected_vote_state(const ProposalKey &) override {}
-    void start_latency_deadline(const ProposalKey &) override {}
+    bool start_latency_deadline(const ProposalKey &) override
+    {
+        return true;
+    }
     void start_aggregation_timer(const ProposalKey &) override {}
     void emit_timeout_report(const ProposalKey &) override {}
 };

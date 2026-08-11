@@ -967,6 +967,7 @@ public:
         processed_generation{};
     std::size_t relay_count{0};
     std::size_t process_count{0};
+    bool relay_during_processing{false};
 
     void relay_once(const BufferedProposal &proposal) override
     {
@@ -986,11 +987,16 @@ public:
         processed_generation[process_count] =
             hotstuff::buffered_proposal_view_generation(proposal);
         ++process_count;
+        if (relay_during_processing)
+            relay_once(proposal);
     }
 
     void local_vote_authorized(const ProposalKey &) override {}
     void create_expected_vote_state(const ProposalKey &) override {}
-    void start_latency_deadline(const ProposalKey &) override {}
+    bool start_latency_deadline(const ProposalKey &) override
+    {
+        return true;
+    }
     void start_aggregation_timer(const ProposalKey &) override {}
     void emit_timeout_report(const ProposalKey &) override {}
 };
@@ -1028,7 +1034,10 @@ public:
 
     void local_vote_authorized(const ProposalKey &) override {}
     void create_expected_vote_state(const ProposalKey &) override {}
-    void start_latency_deadline(const ProposalKey &) override {}
+    bool start_latency_deadline(const ProposalKey &) override
+    {
+        return true;
+    }
     void start_aggregation_timer(const ProposalKey &) override {}
     void emit_timeout_report(const ProposalKey &) override {}
 };
@@ -1827,8 +1836,15 @@ struct RuntimeHarness
             store, *epoch0, local_replica, 0);
         const auto initial = configuration(*epoch0, 0);
         contexts.activate_configuration(initial);
+        const auto relay_policy =
+            expected_mode == EpochProtocolMode::adaptive_v2
+                ? hotstuff::ProposalRelayPolicy::
+                      adaptive_v2_deferred_until_arm_attempt
+                : hotstuff::ProposalRelayPolicy::eager_before_processing;
+        proposal_effects.relay_during_processing =
+            expected_mode == EpochProtocolMode::adaptive_v2;
         admission = std::make_unique<ProposalAdmissionCoordinator>(
-            store, initial, future, proposal_effects);
+            store, initial, future, proposal_effects, relay_policy);
         transaction.contexts = &contexts;
         transaction.tree_configuration = initial;
         transaction.context_configuration = initial;
@@ -3484,8 +3500,8 @@ TEST_CASE("future drain releases concrete first claim when reserve fails",
     CHECK(effects.process_count == 1);
 }
 
-TEST_CASE("MsgPropose generation survives buffer relay and activation drain",
-          "[rem-d11][epoch-runtime][msg-propose][buffer][relay][drain]"
+TEST_CASE("MsgPropose generation survives inert buffer and activation drain",
+          "[rem-d11][epoch-runtime][msg-propose][buffer][drain]"
           "[intentional-red]")
 {
     RuntimeHarness harness;
@@ -3516,10 +3532,6 @@ TEST_CASE("MsgPropose generation survives buffer relay and activation drain",
           ProposalDisposition::buffered_future);
     CHECK(harness.body_validator.proposal_calls == 1);
     REQUIRE(harness.proposal_effects.relay_count == 1);
-    CHECK(harness.proposal_effects.relayed[0] == envelope.key());
-    CHECK(harness.proposal_effects.relayed_wire[0] == encoded);
-    REQUIRE(harness.proposal_effects.relayed_generation[0].has_value());
-    CHECK(*harness.proposal_effects.relayed_generation[0] == *generation);
     CHECK(harness.proposal_effects.process_count == 0);
     CHECK(harness.retryable_future.size() == 1);
 
@@ -3556,6 +3568,7 @@ TEST_CASE("MsgPropose generation survives buffer relay and activation drain",
     CHECK(processed->key == envelope.key());
     CHECK(processed->view_generation == *generation);
     CHECK(processed->wire_digest == wire_digest);
+    CHECK(harness.proposal_effects.relay_count == 1);
     REQUIRE(harness.retryable_future.completed_count == 1);
     CHECK(harness.retryable_future.completed[0] == envelope.key());
     CHECK_FALSE(harness.retryable_future.invariant_failed);
@@ -3903,8 +3916,6 @@ TEST_CASE("concrete runtime activation advances admission without draining",
           ProposalDisposition::buffered_future);
     CHECK(effects.relay_count == 1);
     CHECK(effects.process_count == 0);
-    CHECK(effects.relayed_outer_wire[0] == future_outer);
-    CHECK(effects.relayed_source[0] == source_peer);
     CHECK(future.contains(future_with_real_hash.key()));
     CHECK(future.size() == 1);
     CHECK(retryable.size() == 1);
@@ -3965,6 +3976,11 @@ TEST_CASE("concrete runtime activation advances admission without draining",
     CHECK(effects.processed[1] == future_with_real_hash.key());
     CHECK(effects.processed_inner_wire[1] == future_body);
     CHECK(effects.processed_source[1] == source_peer);
+    REQUIRE(effects.relay_count == 2);
+    CHECK(effects.relayed[0] == future_with_real_hash.key());
+    CHECK(effects.relayed[1] == direct_envelope.key());
+    CHECK(effects.relayed_outer_wire[0] == future_outer);
+    CHECK(effects.relayed_source[0] == source_peer);
     CHECK(future.size() == 0);
     CHECK(retryable.size() == 0);
 }
@@ -4146,8 +4162,6 @@ TEST_CASE("concrete proposal body validation binds both representations and sour
           ProposalDisposition::buffered_future);
     CHECK(effects.relay_count == 2);
     CHECK(effects.process_count == 1);
-    CHECK(effects.relayed_outer_wire[1] == future_outer);
-    CHECK(effects.relayed_source[1] == future_source_peer);
     CHECK(future.size() == 1);
     CHECK(retryable.size() == 1);
 

@@ -139,6 +139,7 @@ struct FaultContributionOpportunityStructuredEvent
     std::uint64_t view_generation{0};
     ExperimentReplicaRole physical_role{ExperimentReplicaRole::root};
     ReplicaID parent_replica{0};
+    ReplicaID authenticated_proposal_source_replica{0};
     ExpectedMessageType expected_message_type{
         ExpectedMessageType::direct_vote};
     ExperimentOmissionCohort cohort{ExperimentOmissionCohort::none};

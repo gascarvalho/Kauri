@@ -415,6 +415,92 @@ namespace hotstuff
                 };
             }
         };
+
+        class ProposalProcessingAttempt final
+        {
+        public:
+            void install_completion(
+                ProposalProcessingCompletion completion) noexcept
+            {
+                completion_ = std::move(completion);
+            }
+
+            bool begin_processing() noexcept
+            {
+                AggregationScheduler::Cancellation cancellation;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (phase_ != Phase::waiting)
+                        return false;
+                    phase_ = Phase::processing;
+                    cancellation = std::move(cancellation_);
+                }
+                cancel(std::move(cancellation));
+                return true;
+            }
+
+            void install_timeout(
+                AggregationScheduler::Cancellation cancellation) noexcept
+            {
+                bool cancel_now = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (phase_ == Phase::waiting)
+                        cancellation_ = std::move(cancellation);
+                    else
+                        cancel_now = true;
+                }
+                if (cancel_now)
+                    cancel(std::move(cancellation));
+            }
+
+            void resolve(ProposalProcessingOutcome outcome) noexcept
+            {
+                ProposalProcessingCompletion completion;
+                AggregationScheduler::Cancellation cancellation;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (phase_ == Phase::resolved)
+                        return;
+                    phase_ = Phase::resolved;
+                    completion = std::move(completion_);
+                    cancellation = std::move(cancellation_);
+                }
+                cancel(std::move(cancellation));
+                try
+                {
+                    if (completion)
+                        completion(outcome);
+                }
+                catch (...)
+                {}
+            }
+
+        private:
+            enum class Phase
+            {
+                waiting,
+                processing,
+                resolved,
+            };
+
+            static void cancel(
+                AggregationScheduler::Cancellation cancellation) noexcept
+            {
+                try
+                {
+                    if (cancellation)
+                        cancellation();
+                }
+                catch (...)
+                {}
+            }
+
+            std::mutex mutex_;
+            Phase phase_{Phase::waiting};
+            ProposalProcessingCompletion completion_;
+            AggregationScheduler::Cancellation cancellation_;
+        };
     }
 
     const TreeNetwork *find_message_tree(const std::vector<Epoch> &epochs,
@@ -1936,7 +2022,11 @@ namespace hotstuff
                     *exact_epochs,
                     configuration,
                     future_proposals,
-                    static_cast<ProposalAdmissionEffects &>(*this));
+                    static_cast<ProposalAdmissionEffects &>(*this),
+                    epoch_protocol_mode == EpochProtocolMode::adaptive_v2
+                        ? ProposalRelayPolicy::
+                              adaptive_v2_deferred_until_arm_attempt
+                        : ProposalRelayPolicy::eager_before_processing);
             return;
         }
         proposal_admission->activate(configuration);
@@ -2815,10 +2905,66 @@ namespace hotstuff
 
     void HotStuffBase::process_active(const BufferedProposal &proposal)
     {
+        static_cast<void>(process_active(proposal, {}));
+    }
+
+    void HotStuffBase::cleanup_retryable_proposal_attempt(
+        const ProposalKey &key) noexcept
+    {
+        try
+        {
+            erase_deferred_epoch_change(key);
+        }
+        catch (...)
+        {}
+        try
+        {
+            proposal_contexts->close(
+                key, ProposalContextEvent::proposal_aborted);
+        }
+        catch (...)
+        {}
+        forget_proposal_view_generation(key);
+        try
+        {
+            purge_pending_exact_contributions(key);
+        }
+        catch (...)
+        {}
+    }
+
+    bool HotStuffBase::process_active(
+        const BufferedProposal &proposal,
+        ProposalProcessingCompletion completion)
+    {
+        const bool retryable_claim = static_cast<bool>(completion);
+        std::shared_ptr<ProposalProcessingAttempt> attempt_state;
+        if (completion)
+        {
+            try
+            {
+                attempt_state =
+                    std::make_shared<ProposalProcessingAttempt>();
+                attempt_state->install_completion(std::move(completion));
+            }
+            catch (...)
+            {
+                completion(
+                    ProposalProcessingOutcome::retryable_pre_relay_failure);
+                return true;
+            }
+        }
+        const auto resolve_processing =
+            [attempt_state](ProposalProcessingOutcome outcome) noexcept {
+                if (attempt_state != nullptr)
+                    attempt_state->resolve(outcome);
+            };
         const auto proposal_key = proposal.metadata.key();
         static_cast<void>(observe_proposal_view_generation(
             proposal_key, proposal.view_generation));
-        if (proposal.source_peer.is_null())
+        if (proposal.source_peer.is_null() ||
+            (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+             !proposal.authenticated_proposal_source_replica.has_value()))
         {
             erase_deferred_epoch_change(proposal_key);
             proposal_contexts->close(
@@ -2830,8 +2976,17 @@ namespace hotstuff
             purge_pending_exact_contributions(proposal_key);
             HOTSTUFF_LOG_WARN(
                 "[PROP HANDLER] Active proposal has no authenticated source");
-            return;
+            resolve_processing(
+                ProposalProcessingOutcome::terminal_pre_relay);
+            return true;
         }
+
+        if (proposal.authenticated_proposal_source_replica.has_value())
+            authenticated_proposal_ingress.insert_or_assign(
+                proposal_key,
+                AuthenticatedProposalIngress{
+                    proposal.view_generation,
+                    *proposal.authenticated_proposal_source_replica});
 
         try
         {
@@ -2856,6 +3011,48 @@ namespace hotstuff
 
             auto delivery = async_deliver_blk(block->get_hash(), source);
             const auto access = exact_runtime_access;
+            if (attempt_state != nullptr)
+            {
+                const std::weak_ptr<ProposalProcessingAttempt> weak_attempt(
+                    attempt_state);
+                const auto expire_attempt =
+                    [weak_attempt, access, proposal_key]() noexcept {
+                        const auto attempt = weak_attempt.lock();
+                        if (attempt == nullptr ||
+                            !attempt->begin_processing())
+                            return;
+                        const auto runtime = access->acquire();
+                        if (runtime.has_value())
+                            runtime->owner()
+                                .cleanup_retryable_proposal_attempt(
+                                    proposal_key);
+                        attempt->resolve(
+                            ProposalProcessingOutcome::
+                                retryable_pre_relay_failure);
+                    };
+                try
+                {
+                    if (aggregation_scheduler == nullptr)
+                        expire_attempt();
+                    else
+                    {
+                        auto cancellation =
+                            aggregation_scheduler->schedule_after(
+                                adaptive_timeout_from_seconds(
+                                    ent_waiting_timeout),
+                                expire_attempt);
+                        if (!cancellation)
+                            expire_attempt();
+                        else
+                            attempt_state->install_timeout(
+                                std::move(cancellation));
+                    }
+                }
+                catch (...)
+                {
+                    expire_attempt();
+                }
+            }
             const auto delivery_key = metadata->key;
             const auto delivery_recipient = metadata->tree.local_replica;
             const auto delivery_root = metadata->tree.root;
@@ -2863,9 +3060,15 @@ namespace hotstuff
                 [access,
                  metadata = std::move(*metadata),
                  parsed = std::move(parsed),
-                 deferred = proposal](
+                 deferred = proposal,
+                 retryable_claim,
+                 attempt_state,
+                 resolve_processing](
                     const block_t &delivered) mutable
                 {
+                    if (attempt_state != nullptr &&
+                        !attempt_state->begin_processing())
+                        return;
                     const auto log_callback = [&metadata](
                         const char *stage, const char *outcome) {
                         HOTSTUFF_LOG_INFO(
@@ -2887,31 +3090,65 @@ namespace hotstuff
                     {
                         log_callback(
                             "callback_abort", "runtime_unavailable");
+                        resolve_processing(
+                            ProposalProcessingOutcome::terminal_pre_relay);
                         return;
                     }
                     auto &owner = runtime->owner();
                     const auto abort =
-                        [&owner, &metadata, &log_callback](
-                            const char *reason) {
+                        [&owner,
+                         &metadata,
+                         &log_callback,
+                         &resolve_processing](
+                            const char *reason,
+                            ProposalProcessingOutcome outcome,
+                            bool retire_admission) {
                         owner.erase_deferred_epoch_change(metadata.key);
                         owner.proposal_contexts->close(
                             metadata.key,
                             ProposalContextEvent::proposal_aborted);
                         owner.forget_proposal_view_generation(metadata.key);
-                        if (owner.proposal_admission != nullptr)
+                        if (retire_admission &&
+                            owner.proposal_admission != nullptr)
                             owner.proposal_admission->retire_proposal(
                                 metadata.key);
                         owner.purge_pending_exact_contributions(metadata.key);
                         log_callback("callback_abort", reason);
+                        resolve_processing(outcome);
                     };
 
-                    if (delivered == nullptr || !delivered->delivered ||
-                        delivered->get_hash() != metadata.key.block_hash)
+                    if (delivered == nullptr || !delivered->delivered)
                     {
-                        abort("delivery_invalid");
+                        abort(
+                            "delivery_unavailable",
+                            retryable_claim
+                                ? ProposalProcessingOutcome::
+                                      retryable_pre_relay_failure
+                                : ProposalProcessingOutcome::
+                                      terminal_pre_relay,
+                            !retryable_claim);
+                        return;
+                    }
+                    if (delivered->get_hash() != metadata.key.block_hash)
+                    {
+                        abort(
+                            "delivery_hash_mismatch",
+                            ProposalProcessingOutcome::terminal_pre_relay,
+                            true);
+                        return;
+                    }
+                    if (owner.proposal_admission == nullptr ||
+                        !owner.proposal_admission->contains_admitted(
+                            metadata.key))
+                    {
+                        abort(
+                            "proposal_retired",
+                            ProposalProcessingOutcome::terminal_pre_relay,
+                            true);
                         return;
                     }
 
+                    bool relay_exposure_attempted = false;
                     try
                     {
                         const auto gate =
@@ -2928,12 +3165,25 @@ namespace hotstuff
                                 !owner.retain_deferred_epoch_change(
                                     std::move(deferred),
                                     *gate.recovery_request))
-                                abort("defer_retention_failed");
+                                abort(
+                                    "defer_retention_failed",
+                                    ProposalProcessingOutcome::
+                                        terminal_pre_relay,
+                                    true);
                             else
+                            {
                                 log_callback("callback_end", "deferred");
+                                resolve_processing(
+                                    ProposalProcessingOutcome::
+                                        completed_ownership_transferred);
+                            }
                             return;
                         case EpochChangeProposalDisposition::rejected:
-                            abort("epoch_change_rejected");
+                            abort(
+                                "epoch_change_rejected",
+                                ProposalProcessingOutcome::
+                                    terminal_pre_relay,
+                                true);
                             return;
                         }
 
@@ -2942,9 +3192,35 @@ namespace hotstuff
                             ProposalContextOrigin::remote);
                         if (!lease.has_value())
                         {
-                            abort("context_admission_failed");
+                            abort(
+                                "context_admission_failed",
+                                ProposalProcessingOutcome::
+                                    terminal_pre_relay,
+                                true);
                             return;
                         }
+                        if (owner.epoch_protocol_mode ==
+                            EpochProtocolMode::adaptive_v2)
+                        {
+                            owner.attempt_proposal_evidence_before_exposure(
+                                metadata.key,
+                                "response_deadline_arm_failed_before_"
+                                "proposal_exposure");
+                        }
+                        else
+                        {
+                            owner.create_expected_vote_state(metadata.key);
+                            static_cast<void>(
+                                owner.start_latency_deadline(metadata.key));
+                            owner.start_aggregation_timer(metadata.key);
+                        }
+                        if (owner.epoch_protocol_mode ==
+                            EpochProtocolMode::adaptive_v2)
+                        {
+                            relay_exposure_attempted = true;
+                            owner.relay_once(deferred);
+                        }
+
                         if (owner.on_receive_proposal(parsed))
                         {
                             owner.pmaker->record_verified_progress(
@@ -2965,24 +3241,46 @@ namespace hotstuff
                                 metadata.key, true);
                             log_callback(
                                 "callback_end", "context_closed");
+                            resolve_processing(
+                                ProposalProcessingOutcome::
+                                    completed_exposed);
                             return;
                         }
-                        owner.create_expected_vote_state(metadata.key);
-                        owner.start_latency_deadline(metadata.key);
-                        owner.start_aggregation_timer(metadata.key);
                         owner.drain_pending_exact_contributions(metadata.key);
                         log_callback("callback_end", "complete");
+                        resolve_processing(
+                            ProposalProcessingOutcome::completed_exposed);
                     }
                     catch (const std::exception &error)
                     {
-                        abort("processing_exception");
+                        if (relay_exposure_attempted)
+                            owner.mark_adaptive_v2_convergence_evidence_unhealthy(
+                                "proposal_processing_failed_after_exposure");
+                        abort(
+                            "processing_exception",
+                            relay_exposure_attempted
+                                ? ProposalProcessingOutcome::
+                                      terminal_post_relay
+                                : ProposalProcessingOutcome::
+                                      terminal_pre_relay,
+                            true);
                         HOTSTUFF_LOG_WARN(
                             "[PROP HANDLER] Active proposal failed: %s",
                             error.what());
                     }
                     catch (...)
                     {
-                        abort("processing_exception");
+                        if (relay_exposure_attempted)
+                            owner.mark_adaptive_v2_convergence_evidence_unhealthy(
+                                "proposal_processing_failed_after_exposure");
+                        abort(
+                            "processing_exception",
+                            relay_exposure_attempted
+                                ? ProposalProcessingOutcome::
+                                      terminal_post_relay
+                                : ProposalProcessingOutcome::
+                                      terminal_pre_relay,
+                            true);
                         HOTSTUFF_LOG_WARN(
                             "[PROP HANDLER] Active proposal failed");
                     }
@@ -2990,7 +3288,13 @@ namespace hotstuff
                 [access,
                  delivery_key,
                  delivery_recipient,
-                 delivery_root]() {
+                 delivery_root,
+                 retryable_claim,
+                 attempt_state,
+                 resolve_processing]() {
+                    if (attempt_state != nullptr &&
+                        !attempt_state->begin_processing())
+                        return;
                     HOTSTUFF_LOG_INFO(
                         "KAURI_PROPOSAL_PROCESS stage=callback_begin "
                         "outcome=delivery_rejected recipient=%u root=%u "
@@ -3012,6 +3316,8 @@ namespace hotstuff
                             delivery_key.configuration.epoch_number,
                             delivery_key.configuration.tree_id,
                             delivery_key.block_hash.to_hex().c_str());
+                        resolve_processing(
+                            ProposalProcessingOutcome::terminal_pre_relay);
                         return;
                     }
                     auto &owner = runtime->owner();
@@ -3020,7 +3326,8 @@ namespace hotstuff
                         delivery_key,
                         ProposalContextEvent::proposal_aborted);
                     owner.forget_proposal_view_generation(delivery_key);
-                    if (owner.proposal_admission != nullptr)
+                    if (!retryable_claim &&
+                        owner.proposal_admission != nullptr)
                         owner.proposal_admission->retire_proposal(
                             delivery_key);
                     owner.purge_pending_exact_contributions(delivery_key);
@@ -3033,7 +3340,31 @@ namespace hotstuff
                         delivery_key.configuration.epoch_number,
                         delivery_key.configuration.tree_id,
                         delivery_key.block_hash.to_hex().c_str());
+                    resolve_processing(
+                        retryable_claim
+                            ? ProposalProcessingOutcome::
+                                  retryable_pre_relay_failure
+                            : ProposalProcessingOutcome::terminal_pre_relay);
                 });
+            return true;
+        }
+        catch (const std::bad_alloc &)
+        {
+            erase_deferred_epoch_change(proposal_key);
+            proposal_contexts->close(
+                proposal_key,
+                ProposalContextEvent::proposal_aborted);
+            forget_proposal_view_generation(proposal_key);
+            if (!retryable_claim && proposal_admission != nullptr)
+                proposal_admission->retire_proposal(proposal_key);
+            purge_pending_exact_contributions(proposal_key);
+            HOTSTUFF_LOG_WARN(
+                "[PROP HANDLER] Active proposal allocation failed");
+            resolve_processing(
+                retryable_claim
+                    ? ProposalProcessingOutcome::
+                          retryable_pre_relay_failure
+                    : ProposalProcessingOutcome::terminal_pre_relay);
         }
         catch (const std::exception &error)
         {
@@ -3042,12 +3373,14 @@ namespace hotstuff
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
             forget_proposal_view_generation(proposal_key);
-            if (proposal_admission != nullptr)
+            if (!retryable_claim && proposal_admission != nullptr)
                 proposal_admission->retire_proposal(proposal_key);
             purge_pending_exact_contributions(proposal_key);
             HOTSTUFF_LOG_WARN(
                 "[PROP HANDLER] Rejecting malformed active proposal: %s",
                 error.what());
+            resolve_processing(
+                ProposalProcessingOutcome::terminal_pre_relay);
         }
         catch (...)
         {
@@ -3056,12 +3389,15 @@ namespace hotstuff
                 proposal_key,
                 ProposalContextEvent::proposal_aborted);
             forget_proposal_view_generation(proposal_key);
-            if (proposal_admission != nullptr)
+            if (!retryable_claim && proposal_admission != nullptr)
                 proposal_admission->retire_proposal(proposal_key);
             purge_pending_exact_contributions(proposal_key);
             HOTSTUFF_LOG_WARN(
                 "[PROP HANDLER] Rejecting malformed active proposal");
+            resolve_processing(
+                ProposalProcessingOutcome::terminal_pre_relay);
         }
+        return true;
     }
 
     promise_t HotStuffBase::verify_exact_contribution(
@@ -3172,6 +3508,9 @@ namespace hotstuff
         discard_exact_fallbacks(
             key, preserve_scheduled_vote_fallback);
         exact_root_repair_deliveries.erase(key);
+        if (!preserve_scheduled_vote_fallback &&
+            !preserve_response_evidence_until_deadline)
+            authenticated_proposal_ingress.erase(key);
         static_cast<void>(pending_exact_contributions.purge(key));
         if (adaptive_v2_response_evidence != nullptr)
         {
@@ -3266,6 +3605,20 @@ namespace hotstuff
             experiment_diagnostic_window};
         context.view_generation = proposal_view_generation(key);
         context.physical_parent = tree.parent;
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            experiment_byzantine_adapter->scheduled_omission_enabled())
+        {
+            const auto ingress = authenticated_proposal_ingress.find(key);
+            if (!context.view_generation.has_value() ||
+                ingress == authenticated_proposal_ingress.end() ||
+                ingress->second.view_generation !=
+                    *context.view_generation ||
+                ingress->second.authenticated_proposal_source_replica !=
+                    *tree.parent)
+                return false;
+            context.authenticated_proposal_source_replica =
+                ingress->second.authenticated_proposal_source_replica;
+        }
         context.expected_message_type =
             ExpectedMessageType::direct_vote;
         const auto disposition = experiment_byzantine_adapter
@@ -3316,6 +3669,21 @@ namespace hotstuff
             key, experiment_diagnostic_window};
         context.view_generation = proposal_view_generation(key);
         context.physical_parent = tree.parent;
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            experiment_byzantine_adapter->scheduled_omission_enabled())
+        {
+            const auto ingress = authenticated_proposal_ingress.find(key);
+            if (!context.view_generation.has_value() ||
+                !tree.parent.has_value() ||
+                ingress == authenticated_proposal_ingress.end() ||
+                ingress->second.view_generation !=
+                    *context.view_generation ||
+                ingress->second.authenticated_proposal_source_replica !=
+                    *tree.parent)
+                return false;
+            context.authenticated_proposal_source_replica =
+                ingress->second.authenticated_proposal_source_replica;
+        }
         context.expected_message_type =
             ExpectedMessageType::aggregate_relay;
         const auto omission_monotonic_ns =
@@ -5544,6 +5912,38 @@ namespace hotstuff
                     std::move(job->second->cancellation));
             job = exact_proposal_fallback_jobs.erase(job);
         }
+        for (auto ingress = authenticated_proposal_ingress.begin();
+             ingress != authenticated_proposal_ingress.end();)
+        {
+            if (ingress->first.configuration.epoch_number >=
+                first_live_epoch)
+            {
+                ++ingress;
+                continue;
+            }
+            ingress = authenticated_proposal_ingress.erase(ingress);
+        }
+        for (auto arm =
+                 successful_response_attempt_arm_provenance.begin();
+             arm != successful_response_attempt_arm_provenance.end();)
+        {
+            if (arm->first.configuration.epoch_number >= first_live_epoch)
+            {
+                ++arm;
+                continue;
+            }
+            arm = successful_response_attempt_arm_provenance.erase(arm);
+        }
+        for (auto failure = response_attempt_arm_failure_markers.begin();
+             failure != response_attempt_arm_failure_markers.end();)
+        {
+            if (failure->configuration.epoch_number >= first_live_epoch)
+            {
+                ++failure;
+                continue;
+            }
+            failure = response_attempt_arm_failure_markers.erase(failure);
+        }
         for (auto &cancel : cancellations)
             try
             {
@@ -5566,6 +5966,9 @@ namespace hotstuff
                     std::move(entry.second->cancellation));
         exact_vote_fallback_jobs.clear();
         exact_root_repair_deliveries.clear();
+        authenticated_proposal_ingress.clear();
+        successful_response_attempt_arm_provenance.clear();
+        response_attempt_arm_failure_markers.clear();
         exact_proposal_fallback_jobs.clear();
         for (auto &cancel : cancellations)
             try
@@ -5782,6 +6185,9 @@ namespace hotstuff
             marker.physical_role == ExperimentReplicaRole::root ||
             !marker.view_generation.has_value() ||
             !marker.physical_parent.has_value() ||
+            !marker.authenticated_proposal_source_replica.has_value() ||
+            marker.authenticated_proposal_source_replica !=
+                marker.physical_parent ||
             !marker.expected_message_type.has_value() ||
             marker.fault_mode !=
                 "tiered_persistent_responsive_omission_v2")
@@ -5794,6 +6200,8 @@ namespace hotstuff
             event.view_generation = *marker.view_generation;
             event.physical_role = marker.physical_role;
             event.parent_replica = *marker.physical_parent;
+            event.authenticated_proposal_source_replica =
+                *marker.authenticated_proposal_source_replica;
             event.expected_message_type =
                 *marker.expected_message_type;
             event.cohort = marker.cohort;
@@ -6689,25 +7097,131 @@ namespace hotstuff
                 proposal_contexts->pending_children(*lease));
     }
 
-    void HotStuffBase::start_latency_deadline(const ProposalKey &key)
+    void HotStuffBase::poison_response_attempt_arm_once(
+        const ProposalKey &key,
+        const char *reason) noexcept
+    {
+        try
+        {
+            successful_response_attempt_arm_provenance.erase(key);
+            if (response_attempt_arm_failure_markers.insert(key).second)
+            {
+                HOTSTUFF_LOG_WARN(
+                    "KAURI_EVIDENCE response_attempt_arm_marker_failed "
+                    "reason=%s reporter=%u epoch=%u tree=%u "
+                    "epoch_digest=%s block=%s",
+                    reason == nullptr ? "unknown" : reason,
+                    get_id(),
+                    key.configuration.epoch_number,
+                    key.configuration.tree_id,
+                    key.configuration.epoch_digest.to_hex().c_str(),
+                    key.block_hash.to_hex().c_str());
+            }
+        }
+        catch (...)
+        {
+            // Evidence bookkeeping failure cannot gate consensus transport.
+            HOTSTUFF_LOG_WARN(
+                "KAURI_EVIDENCE response_attempt_arm_marker_failed "
+                "reason=poison_bookkeeping reporter=%u epoch=%u tree=%u "
+                "epoch_digest=%s block=%s",
+                get_id(),
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.configuration.epoch_digest.to_hex().c_str(),
+                key.block_hash.to_hex().c_str());
+        }
+        mark_adaptive_v2_convergence_evidence_unhealthy(reason);
+    }
+
+    void HotStuffBase::record_successful_response_attempt_arm(
+        const ProposalKey &key) noexcept
+    {
+        const auto generation =
+            find_exact_runtime_generation(key.configuration);
+        if (!generation.has_value())
+            return;
+        try
+        {
+            if (successful_response_attempt_arm_provenance.size() >=
+                    maximum_proposal_view_generation_observations &&
+                successful_response_attempt_arm_provenance.count(key) == 0)
+                return;
+            successful_response_attempt_arm_provenance.insert_or_assign(
+                key, *generation);
+        }
+        catch (...)
+        {
+            // Missing retransmit provenance later fails closed, while this
+            // already-armed dissemination remains consensus-live.
+        }
+    }
+
+    bool HotStuffBase::has_successful_response_attempt_arm(
+        const ProposalKey &key) const noexcept
+    {
+        const auto generation =
+            find_exact_runtime_generation(key.configuration);
+        if (!generation.has_value())
+            return false;
+        try
+        {
+            const auto found =
+                successful_response_attempt_arm_provenance.find(key);
+            return found !=
+                       successful_response_attempt_arm_provenance.end() &&
+                   found->second == *generation;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void HotStuffBase::
+    ensure_finalized_proposal_evidence_before_exposure(
+        const ProposalKey &key,
+        const char *arm_failure_reason) noexcept
+    {
+        if (!has_successful_response_attempt_arm(key))
+            attempt_proposal_evidence_before_exposure(
+                key, arm_failure_reason);
+    }
+
+    bool HotStuffBase::start_latency_deadline(const ProposalKey &key)
     {
         bool normal_evidence_armed = false;
         const auto lease = proposal_contexts->acquire_open_context(key);
         if (!lease.has_value())
-            return;
-        for (const auto child : lease->tree().direct_children)
-            proposal_contexts->record_latency_start(*lease, child);
-
-        arm_experiment_post_qc_audit(*lease);
-
-        if (adaptive_v2_response_evidence == nullptr ||
-            lease->tree().direct_children.empty())
-            return;
-        const auto *tree = find_exact_runtime_tree(key.configuration);
-        if (tree == nullptr)
-            return;
+        {
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+                poison_response_attempt_arm_once(
+                    key, "proposal_context_unavailable");
+            return false;
+        }
         try
         {
+            for (const auto child : lease->tree().direct_children)
+                proposal_contexts->record_latency_start(*lease, child);
+
+            arm_experiment_post_qc_audit(*lease);
+
+            if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+                lease->tree().direct_children.empty())
+                return true;
+            if (adaptive_v2_response_evidence == nullptr)
+            {
+                poison_response_attempt_arm_once(
+                    key, "response_evidence_unavailable");
+                return false;
+            }
+            const auto *tree = find_exact_runtime_tree(key.configuration);
+            if (tree == nullptr)
+            {
+                poison_response_attempt_arm_once(
+                    key, "runtime_tree_unavailable");
+                return false;
+            }
             const auto duration = aggregation_timeout_policy.timeout_for(
                 static_cast<std::uint32_t>(tree->get_level(get_id())),
                 static_cast<std::uint32_t>(tree->get_max_level()));
@@ -6783,7 +7297,9 @@ namespace hotstuff
                     suppress_adaptive_v2_lifecycle_reporting(
                         "false_report_evidence_arm_failed");
                 }
-                return;
+                poison_response_attempt_arm_once(
+                    key, "deadline_arm_failed");
+                return false;
             }
             if (false_report_target.has_value())
             {
@@ -6798,6 +7314,8 @@ namespace hotstuff
                     experiment_diagnostic_window.c_str());
                 schedule_experiment_false_timeout(
                     key, *false_report_target, duration);
+                record_successful_response_attempt_arm(key);
+                return true;
             }
             else
             {
@@ -6819,7 +7337,10 @@ namespace hotstuff
                                            child);
                         });
                 if (!tiered_marker_required)
-                    return;
+                {
+                    record_successful_response_attempt_arm(key);
+                    return true;
+                }
                 const auto armed_deadlines_after =
                     adaptive_v2_response_evidence->diagnostics()
                         .armed_deadlines;
@@ -6836,7 +7357,8 @@ namespace hotstuff
                         key.configuration.tree_id,
                         key.configuration.epoch_digest.to_hex().c_str(),
                         key.block_hash.to_hex().c_str());
-                    return;
+                    record_successful_response_attempt_arm(key);
+                    return true;
                 }
 
                 constexpr std::uint64_t nanoseconds_per_microsecond =
@@ -6858,25 +7380,16 @@ namespace hotstuff
                 if (invalid_deadline_counter ||
                     absolute_deadline_overflow)
                 {
-                    HOTSTUFF_LOG_WARN(
-                        "KAURI_EVIDENCE "
-                        "response_attempt_arm_marker_failed "
-                        "reason=%s reporter=%u epoch=%u tree=%u "
-                        "start_monotonic_ns=%llu "
-                        "deadline_duration_us=%llu",
-                        invalid_deadline_counter
-                            ? "deadline_counter"
-                            : "deadline_overflow",
-                        get_id(),
-                        key.configuration.epoch_number,
-                        key.configuration.tree_id,
-                        static_cast<unsigned long long>(start_ns),
-                        static_cast<unsigned long long>(deadline_us));
                     static_cast<void>(
                         adaptive_v2_response_evidence->retire(key));
                     suppress_adaptive_v2_lifecycle_reporting(
                         "response_attempt_arm_marker_failed");
-                    return;
+                    poison_response_attempt_arm_once(
+                        key,
+                        invalid_deadline_counter
+                            ? "deadline_counter"
+                            : "deadline_overflow");
+                    return false;
                 }
                 const auto absolute_deadline_ns =
                     start_ns + deadline_duration_ns;
@@ -6898,20 +7411,13 @@ namespace hotstuff
                             lease->tree().child_subtrees.end() ||
                         subtree->second.empty())
                     {
-                        HOTSTUFF_LOG_WARN(
-                            "KAURI_EVIDENCE "
-                            "response_attempt_arm_marker_failed "
-                            "reason=topology reporter=%u child=%u "
-                            "epoch=%u tree=%u",
-                            get_id(),
-                            child,
-                            key.configuration.epoch_number,
-                            key.configuration.tree_id);
                         static_cast<void>(
                             adaptive_v2_response_evidence->retire(key));
                         suppress_adaptive_v2_lifecycle_reporting(
                             "response_attempt_arm_marker_failed");
-                        return;
+                        poison_response_attempt_arm_once(
+                            key, "topology");
+                        return false;
                     }
                     const char *expected_message_type =
                         subtree->second.size() > 1
@@ -6937,6 +7443,8 @@ namespace hotstuff
                         static_cast<unsigned long long>(
                             absolute_deadline_ns));
                 }
+                record_successful_response_attempt_arm(key);
+                return true;
             }
         }
         catch (...)
@@ -6950,14 +7458,39 @@ namespace hotstuff
                     adaptive_v2_response_evidence->retire(key));
                 suppress_adaptive_v2_lifecycle_reporting(
                     "response_attempt_arm_marker_exception");
-                HOTSTUFF_LOG_WARN(
-                    "KAURI_EVIDENCE "
-                    "response_attempt_arm_marker_failed "
-                    "reason=exception reporter=%u epoch=%u tree=%u",
-                    get_id(),
-                    key.configuration.epoch_number,
-                    key.configuration.tree_id);
             }
+            poison_response_attempt_arm_once(key, "exception");
+            return false;
+        }
+        return true;
+    }
+
+    void HotStuffBase::attempt_proposal_evidence_before_exposure(
+        const ProposalKey &key,
+        const char *arm_failure_reason) noexcept
+    {
+        bool armed = false;
+        try
+        {
+            create_expected_vote_state(key);
+            armed = start_latency_deadline(key);
+        }
+        catch (...)
+        {
+            armed = false;
+        }
+        if (!armed)
+            poison_response_attempt_arm_once(key, arm_failure_reason);
+
+        try
+        {
+            start_aggregation_timer(key);
+        }
+        catch (...)
+        {
+            poison_response_attempt_arm_once(
+                key,
+                "aggregation_timer_failed_before_proposal_exposure");
         }
     }
 
@@ -7304,10 +7837,13 @@ namespace hotstuff
     {
         const auto *tree = find_exact_runtime_tree(key.configuration);
         const auto lease = proposal_contexts->acquire_open_context(key);
-        if (tree == nullptr || !lease.has_value() ||
-            lease->tree().direct_children.empty() ||
+        const bool leaf = lease.has_value() &&
+                          lease->tree().direct_children.empty();
+        const bool missing_required_state =
+            tree == nullptr || !lease.has_value() ||
             aggregation_timeout_coordinator == nullptr ||
-            aggregation_scheduler == nullptr)
+            aggregation_scheduler == nullptr;
+        if (missing_required_state || leaf)
         {
             HOTSTUFF_LOG_INFO(
                 "KAURI_PROPOSAL_BROADCAST stage=aggregation_timer "
@@ -7325,6 +7861,17 @@ namespace hotstuff
                     : std::size_t{0},
                 aggregation_timeout_coordinator != nullptr ? 1U : 0U,
                 aggregation_scheduler != nullptr ? 1U : 0U);
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+                !leaf)
+                poison_response_attempt_arm_once(
+                    key,
+                    tree == nullptr
+                        ? "aggregation_timer_tree_unavailable"
+                        : !lease.has_value()
+                            ? "aggregation_timer_context_unavailable"
+                            : aggregation_timeout_coordinator == nullptr
+                                ? "aggregation_timer_coordinator_unavailable"
+                                : "aggregation_timer_scheduler_unavailable");
             return;
         }
 
@@ -7334,6 +7881,10 @@ namespace hotstuff
             *aggregation_scheduler,
             static_cast<std::uint32_t>(tree->get_level(get_id())),
             static_cast<std::uint32_t>(tree->get_max_level()));
+        if (timer_generation == 0 &&
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+            poison_response_attempt_arm_once(
+                key, "aggregation_timer_arm_rejected");
         HOTSTUFF_LOG_INFO(
             "KAURI_PROPOSAL_BROADCAST stage=aggregation_timer outcome=%s "
             "reason=%s replica=%u epoch=%u tree=%u block=%s "
@@ -9437,8 +9988,19 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::retire_authoritative_absent_context(
+        const std::optional<ProposalKey> &authoritative_key,
+        bool authoritative_key_has_local_context) noexcept
+    {
+        if (authoritative_key.has_value() &&
+            !authoritative_key_has_local_context &&
+            proposal_admission != nullptr)
+            proposal_admission->retire_proposal(*authoritative_key);
+    }
+
     void HotStuffBase::report_adaptive_v2_committed(
-        const std::optional<ProposalKey> &key) noexcept
+        const std::optional<ProposalKey> &key,
+        bool initialization_predecessor_required) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
@@ -9518,6 +10080,12 @@ namespace hotstuff
                 experiment_false_timeout_states.find(*key);
             if (pending != experiment_false_timeout_states.end())
             {
+                if (!initialization_predecessor_required)
+                {
+                    suppress_adaptive_v2_lifecycle_reporting(
+                        "commit_without_context_has_false_report_state");
+                    return;
+                }
                 const bool retain_response_evidence =
                     experiment_byzantine_adapter != nullptr &&
                     experiment_byzantine_adapter
@@ -9548,6 +10116,17 @@ namespace hotstuff
                 adaptive_v2_durable_commit_reports.find(*key);
             if (durable != adaptive_v2_durable_commit_reports.end())
             {
+                if (durable->second.initialization_predecessor_required !=
+                        initialization_predecessor_required ||
+                    (!initialization_predecessor_required &&
+                     (durable->second.phase ==
+                          AdaptiveV2DurableCommitPhase::awaiting_evidence ||
+                      durable->second.experiment_false_report)))
+                {
+                    suppress_adaptive_v2_lifecycle_reporting(
+                        "commit_initialization_predecessor_conflicted");
+                    return;
+                }
                 if (durable->second.phase ==
                     AdaptiveV2DurableCommitPhase::ready_to_enqueue)
                     static_cast<void>(
@@ -9558,7 +10137,16 @@ namespace hotstuff
                 adaptive_v2_response_evidence != nullptr &&
                 adaptive_v2_response_evidence
                     ->should_defer_commit_report(*key);
+            if (!initialization_predecessor_required &&
+                defer_for_response_evidence)
+            {
+                suppress_adaptive_v2_lifecycle_reporting(
+                    "commit_without_context_has_response_evidence_state");
+                return;
+            }
             AdaptiveV2DurableCommitReportState state;
+            state.initialization_predecessor_required =
+                initialization_predecessor_required;
             state.phase = defer_for_response_evidence
                 ? AdaptiveV2DurableCommitPhase::awaiting_evidence
                 : AdaptiveV2DurableCommitPhase::ready_to_enqueue;
@@ -9695,7 +10283,15 @@ namespace hotstuff
             const auto initialized =
                 adaptive_v2_durable_initialization_reports.find(key);
             if (initialized ==
-                    adaptive_v2_durable_initialization_reports.end() ||
+                    adaptive_v2_durable_initialization_reports.end() &&
+                durable->second.initialization_predecessor_required)
+            {
+                suppress_adaptive_v2_lifecycle_reporting(
+                    "commit_without_runtime_initialization");
+                return false;
+            }
+            if (initialized !=
+                    adaptive_v2_durable_initialization_reports.end() &&
                 initialized->second ==
                     AdaptiveV2DurableInitializationPhase::suppressed)
             {
@@ -9703,7 +10299,9 @@ namespace hotstuff
                     "commit_without_runtime_initialization");
                 return false;
             }
-            if (initialized->second ==
+            if (initialized !=
+                    adaptive_v2_durable_initialization_reports.end() &&
+                initialized->second ==
                     AdaptiveV2DurableInitializationPhase::
                         ready_to_enqueue &&
                 !try_enqueue_adaptive_v2_runtime_initialized_report(key))
@@ -10462,6 +11060,13 @@ namespace hotstuff
                 }
                 emit_adaptive_aggregation_event(
                     transition, lease, &signers);
+            };
+        aggregation_effects.record_timer_failure =
+            [this](const ProposalKey &key)
+            {
+                if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+                    poison_response_attempt_arm_once(
+                        key, "aggregation_timer_rearm_failed");
             };
         aggregation_timeout_coordinator =
             std::make_unique<AggregationTimeoutCoordinator>(
@@ -11592,9 +12197,17 @@ namespace hotstuff
                 prop.configuration().epoch_number,
                 prop.configuration().tree_id,
                 prop.key().block_hash.to_hex().c_str());
-            create_expected_vote_state(prop.key());
-            start_latency_deadline(prop.key());
-            start_aggregation_timer(prop.key());
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+                attempt_proposal_evidence_before_exposure(
+                    prop.key(),
+                    "root_response_deadline_arm_failed_before_"
+                    "proposal_exposure");
+            else
+            {
+                create_expected_vote_state(prop.key());
+                static_cast<void>(start_latency_deadline(prop.key()));
+                start_aggregation_timer(prop.key());
+            }
             HOTSTUFF_LOG_INFO(
                 "KAURI_PROPOSAL_BROADCAST stage=local_timers "
                 "outcome=returned reason=none replica=%u epoch=%u tree=%u "
@@ -11603,6 +12216,16 @@ namespace hotstuff
                 prop.configuration().epoch_number,
                 prop.configuration().tree_id,
                 prop.key().block_hash.to_hex().c_str());
+        }
+        else if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        {
+            // A finalized retransmit may reuse only a successful exact arm
+            // from this live view generation. Without that provenance it
+            // remains consensus-live but poisons evidence before transport.
+            ensure_finalized_proposal_evidence_before_exposure(
+                prop.key(),
+                "root_response_deadline_arm_failed_before_"
+                "proposal_exposure");
         }
 
         bytearray_t adaptive_payload;
@@ -12106,6 +12729,8 @@ namespace hotstuff
         try
         {
             proposal_view_generations.erase(key);
+            successful_response_attempt_arm_provenance.erase(key);
+            response_attempt_arm_failure_markers.erase(key);
         }
         catch (...)
         {}
@@ -12124,6 +12749,31 @@ namespace hotstuff
                     observation = proposal_view_generations.erase(observation);
                 else
                     ++observation;
+            }
+        }
+        catch (...)
+        {}
+        try
+        {
+            for (auto arm =
+                     successful_response_attempt_arm_provenance.begin();
+                 arm != successful_response_attempt_arm_provenance.end();)
+            {
+                if (arm->first.block_hash == block_hash)
+                    arm = successful_response_attempt_arm_provenance.erase(
+                        arm);
+                else
+                    ++arm;
+            }
+            for (auto failure =
+                     response_attempt_arm_failure_markers.begin();
+                 failure != response_attempt_arm_failure_markers.end();)
+            {
+                if (failure->block_hash == block_hash)
+                    failure =
+                        response_attempt_arm_failure_markers.erase(failure);
+                else
+                    ++failure;
             }
         }
         catch (...)
@@ -12165,6 +12815,32 @@ namespace hotstuff
                     observation = proposal_view_generations.erase(observation);
                 else
                     ++observation;
+            }
+        }
+        catch (...)
+        {}
+        try
+        {
+            for (auto arm =
+                     successful_response_attempt_arm_provenance.begin();
+                 arm != successful_response_attempt_arm_provenance.end();)
+            {
+                if (arm->first.configuration.epoch_number <
+                    first_live_epoch)
+                    arm = successful_response_attempt_arm_provenance.erase(
+                        arm);
+                else
+                    ++arm;
+            }
+            for (auto failure =
+                     response_attempt_arm_failure_markers.begin();
+                 failure != response_attempt_arm_failure_markers.end();)
+            {
+                if (failure->configuration.epoch_number < first_live_epoch)
+                    failure =
+                        response_attempt_arm_failure_markers.erase(failure);
+                else
+                    ++failure;
             }
         }
         catch (...)
@@ -12591,6 +13267,12 @@ namespace hotstuff
         const auto identity = resolve_committed_proposal_identity(
             blk, keys, verified_direct_certifier, provenance);
         const auto &authoritative_key = identity.key;
+        const bool authoritative_key_has_local_context =
+            authoritative_key.has_value() &&
+            std::find(
+                keys.begin(), keys.end(), *authoritative_key) != keys.end();
+        retire_authoritative_absent_context(
+            authoritative_key, authoritative_key_has_local_context);
         const auto committed_payload_digest =
             adaptive_v2_committed_epoch_change_payload_digest(blk);
         observe_authoritative_commit(
@@ -12604,7 +13286,9 @@ namespace hotstuff
         report_adaptive_v2_committed(
             pending_adaptive_v2_commit.has_value()
                 ? pending_adaptive_v2_commit->committed_key
-                : std::nullopt);
+                : std::nullopt,
+            !authoritative_key.has_value() ||
+                authoritative_key_has_local_context);
         record_adaptive_commit_marker(blk, authoritative_key);
         pending_exact_contributions.purge_block(blk->get_hash());
         for (const auto &key : keys)

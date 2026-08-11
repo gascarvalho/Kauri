@@ -44,11 +44,13 @@ ProposalAdmissionCoordinator::ProposalAdmissionCoordinator(
     const EpochStore &epochs,
     ConfigurationId active_configuration,
     FutureProposalBuffer &future_proposals,
-    ProposalAdmissionEffects &effects)
+    ProposalAdmissionEffects &effects,
+    ProposalRelayPolicy relay_policy)
     : epochs_(epochs),
       active_configuration_(std::move(active_configuration)),
       future_proposals_(future_proposals),
-      effects_(effects)
+      effects_(effects),
+      relay_policy_(relay_policy)
 {
 }
 
@@ -133,22 +135,45 @@ ProposalAdmissionResult ProposalAdmissionCoordinator::receive(
                 future_proposals_.erase(key);
                 return result(ProposalDisposition::duplicate, key);
             }
-            effects_.relay_once(proposal);
         }
         catch (...)
         {
-            received_.erase(key);
             future_proposals_.erase(key);
             throw;
+        }
+        if (relay_policy_ ==
+            ProposalRelayPolicy::eager_before_processing)
+        {
+            try
+            {
+                effects_.relay_once(proposal);
+            }
+            catch (...)
+            {
+                received_.erase(key);
+                future_proposals_.erase(key);
+                throw;
+            }
         }
         return result(ProposalDisposition::buffered_future, key);
     }
 
     if (!received_.insert(key).second)
         return result(ProposalDisposition::duplicate, key);
-    effects_.relay_once(proposal);
-    admitted_.insert(key);
-    effects_.process_active(proposal);
+    const auto admitted = admitted_.insert(key);
+    try
+    {
+        if (relay_policy_ ==
+            ProposalRelayPolicy::eager_before_processing)
+            effects_.relay_once(proposal);
+        effects_.process_active(proposal);
+    }
+    catch (...)
+    {
+        admitted_.erase(admitted.first);
+        received_.erase(key);
+        throw;
+    }
     return result(ProposalDisposition::admitted_active, key);
 }
 
@@ -156,6 +181,12 @@ std::vector<ProposalAdmissionResult>
 ProposalAdmissionCoordinator::activate(
     const ConfigurationId &configuration)
 {
+    // Adaptive-v2 activation must retain each buffered proposal until its
+    // asynchronous arm-attempt/relay completion resolves through the
+    // retryable store. The destructive legacy drain is never safe here.
+    if (relay_policy_ ==
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt)
+        return {};
     if (!activate_without_draining(configuration))
     {
         return {};
@@ -193,6 +224,13 @@ bool ProposalAdmissionCoordinator::activate_without_draining(
 bool ProposalAdmissionCoordinator::process_claimed_active(
     const BufferedProposal &proposal)
 {
+    return process_claimed_active(proposal, {});
+}
+
+bool ProposalAdmissionCoordinator::process_claimed_active(
+    const BufferedProposal &proposal,
+    ProposalProcessingCompletion completion)
+{
     const auto validation = validate(proposal);
     if (validation.disposition != ProposalDisposition::admitted_active ||
         proposal.metadata.configuration != active_configuration_)
@@ -200,12 +238,24 @@ bool ProposalAdmissionCoordinator::process_claimed_active(
 
     const auto key = proposal.metadata.key();
     if (admitted_.count(key) != 0)
-        return true;
+        return false;
 
     const auto inserted = admitted_.insert(key);
     try
     {
-        effects_.process_active(proposal);
+        if (completion)
+        {
+            if (!effects_.process_active(
+                    proposal, std::move(completion)))
+            {
+                admitted_.erase(inserted.first);
+                return false;
+            }
+        }
+        else
+        {
+            effects_.process_active(proposal);
+        }
     }
     catch (...)
     {
@@ -213,6 +263,14 @@ bool ProposalAdmissionCoordinator::process_claimed_active(
         throw;
     }
     return true;
+}
+
+bool ProposalAdmissionCoordinator::rollback_claimed_active(
+    const ProposalKey &key) noexcept
+{
+    bool rolled_back = admitted_.erase(key) != 0;
+    rolled_back = locally_authorized_.erase(key) != 0 || rolled_back;
+    return rolled_back;
 }
 
 bool ProposalAdmissionCoordinator::authorize_local_vote(

@@ -203,7 +203,7 @@ def test_v43_repair_terminal_rejects_v42_result_path_alias(
 
     with pytest.raises(
         execution.FactorialExecutionError,
-        match="exact v40/v41/v42/v43/v44/v45 repair runtime",
+        match="exact v40/v41/v42/v43/v44/v45/v46 repair runtime",
     ):
         execution._assert_v40_repair_runner_terminal_before_hard_deadline(
             aliased,
@@ -259,7 +259,7 @@ def test_n7_static_binding_rejects_cross_version_result_path_alias(
 def test_v44_is_default_and_v43_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v45.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v46.json"
     assert cli.main(["--manifest", str(V43_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v44 are validation-only" in refusal["reason"]
+    assert "v1 through v45 are validation-only" in refusal["reason"]

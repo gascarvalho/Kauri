@@ -184,6 +184,7 @@ public:
     {
         ++active_processing;
         processed.push_back(proposal.metadata.key());
+        relay_once(proposal);
     }
 
     void local_vote_authorized(const ProposalKey &) override
@@ -196,9 +197,10 @@ public:
         ++expected_vote_states;
     }
 
-    void start_latency_deadline(const ProposalKey &) override
+    bool start_latency_deadline(const ProposalKey &) override
     {
         ++latency_deadlines;
+        return true;
     }
 
     void start_aggregation_timer(const ProposalKey &) override
@@ -378,7 +380,9 @@ void check_rejected_body_is_not_poisoning(
         harness.coordinator);
     CHECK(admitted.disposition == valid_disposition);
     CHECK(admitted.key == key);
-    CHECK(harness.effects.relays == 1);
+    const std::size_t expected_relays =
+        valid_disposition == ProposalDisposition::admitted_active ? 1 : 0;
+    CHECK(harness.effects.relays == expected_relays);
     CHECK_FALSE(harness.decoder_has_fixture_block());
 
     const auto duplicate = admit_proposal_payload(
@@ -388,7 +392,7 @@ void check_rejected_body_is_not_poisoning(
         harness.coordinator);
     CHECK(duplicate.disposition == ProposalDisposition::duplicate);
     CHECK(duplicate.key == key);
-    CHECK(harness.effects.relays == 1);
+    CHECK(harness.effects.relays == expected_relays);
     CHECK_FALSE(harness.decoder_has_fixture_block());
 }
 
@@ -492,7 +496,7 @@ TEST_CASE("metadata parsing is bounded and cannot reserve a proposal key",
     CHECK(accepted.key == key);
     CHECK(harness.buffer.size() == 1);
     CHECK(harness.buffer.contains(key));
-    CHECK(harness.effects.relays == 1);
+    CHECK(harness.effects.relays == 0);
 }
 
 TEST_CASE("unknown and digest mismatched metadata controls still reject",

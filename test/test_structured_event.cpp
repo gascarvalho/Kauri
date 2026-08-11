@@ -723,6 +723,7 @@ FaultContributionOpportunityStructuredEvent contribution_opportunity_event()
     event.view_generation = 19;
     event.physical_role = ExperimentReplicaRole::internal;
     event.parent_replica = 0;
+    event.authenticated_proposal_source_replica = 0;
     event.expected_message_type = ExpectedMessageType::aggregate_relay;
     event.cohort = ExperimentOmissionCohort::responsive_degraded;
     event.diagnostic_window = "factorial-window-1";
@@ -5256,6 +5257,9 @@ TEST_CASE(
     CHECK(record.find("\"physical_role\":\"internal\"") !=
           std::string::npos);
     CHECK(record.find("\"parent_replica\":0") != std::string::npos);
+    CHECK(record.find(
+              "\"authenticated_proposal_source_replica\":0") !=
+          std::string::npos);
     CHECK(record.find("\"expected_message_type\":\"aggregate_relay\"") !=
           std::string::npos);
     CHECK(record.find("\"cohort\":\"responsive_degraded\"") !=
@@ -5329,6 +5333,10 @@ TEST_CASE(
     auto impossible_role_ordinal = event;
     impossible_role_ordinal.role_contribution_ordinal = 82;
     CHECK(rejects(std::move(impossible_role_ordinal)));
+
+    auto root_repair_source = event;
+    root_repair_source.authenticated_proposal_source_replica = 7;
+    CHECK(rejects(std::move(root_repair_source)));
 }
 
 TEST_CASE(

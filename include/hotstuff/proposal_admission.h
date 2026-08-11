@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <set>
 #include <vector>
 
@@ -29,6 +30,27 @@ enum class ProposalDisposition
     admitted_active
 };
 
+enum class ProposalRelayPolicy
+{
+    eager_before_processing,
+    adaptive_v2_deferred_until_arm_attempt
+};
+
+// Completion of adaptive-v2 active processing is asynchronous. The outcome
+// records the proposal transport exposure boundary so buffered bytes are
+// never replayed after any child may have observed them.
+enum class ProposalProcessingOutcome
+{
+    completed_exposed,
+    completed_ownership_transferred,
+    retryable_pre_relay_failure,
+    terminal_pre_relay,
+    terminal_post_relay
+};
+
+using ProposalProcessingCompletion =
+    std::function<void(ProposalProcessingOutcome)>;
+
 struct ProposalAdmissionResult
 {
     ProposalDisposition disposition;
@@ -48,11 +70,23 @@ class ProposalAdmissionEffects
 public:
     virtual ~ProposalAdmissionEffects() = default;
 
+    // Adaptive-v2 process_active attempts exact-context initialization and
+    // response-evidence arming before relay. Evidence failure poisons the run
+    // but never gates consensus dissemination.
     virtual void relay_once(const BufferedProposal &proposal) = 0;
     virtual void process_active(const BufferedProposal &proposal) = 0;
+    virtual bool process_active(
+        const BufferedProposal &proposal,
+        ProposalProcessingCompletion completion)
+    {
+        process_active(proposal);
+        if (completion)
+            completion(ProposalProcessingOutcome::completed_exposed);
+        return true;
+    }
     virtual void local_vote_authorized(const ProposalKey &key) = 0;
     virtual void create_expected_vote_state(const ProposalKey &key) = 0;
-    virtual void start_latency_deadline(const ProposalKey &key) = 0;
+    virtual bool start_latency_deadline(const ProposalKey &key) = 0;
     virtual void start_aggregation_timer(const ProposalKey &key) = 0;
     virtual void emit_timeout_report(const ProposalKey &key) = 0;
 };
@@ -64,7 +98,9 @@ public:
         const EpochStore &epochs,
         ConfigurationId active_configuration,
         FutureProposalBuffer &future_proposals,
-        ProposalAdmissionEffects &effects);
+        ProposalAdmissionEffects &effects,
+        ProposalRelayPolicy relay_policy =
+            ProposalRelayPolicy::eager_before_processing);
 
     ProposalAdmissionResult receive(BufferedProposal proposal);
     std::vector<ProposalAdmissionResult> activate(
@@ -72,6 +108,10 @@ public:
     bool activate_without_draining(
         const ConfigurationId &configuration) noexcept;
     bool process_claimed_active(const BufferedProposal &proposal);
+    bool process_claimed_active(
+        const BufferedProposal &proposal,
+        ProposalProcessingCompletion completion);
+    bool rollback_claimed_active(const ProposalKey &key) noexcept;
     bool authorize_local_vote(const ProposalKey &key);
     bool retire_proposal(const ProposalKey &key);
     std::size_t retire_configuration(
@@ -95,6 +135,7 @@ private:
     ConfigurationId active_configuration_;
     FutureProposalBuffer &future_proposals_;
     ProposalAdmissionEffects &effects_;
+    ProposalRelayPolicy relay_policy_;
     std::set<ProposalKey> received_;
     std::set<ProposalKey> admitted_;
     std::set<ProposalKey> locally_authorized_;

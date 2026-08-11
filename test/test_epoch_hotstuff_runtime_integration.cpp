@@ -415,9 +415,10 @@ public:
     {
         ++expected_vote_state_count;
     }
-    void start_latency_deadline(const ProposalKey &) override
+    bool start_latency_deadline(const ProposalKey &) override
     {
         ++latency_deadline_count;
+        return true;
     }
     void start_aggregation_timer(const ProposalKey &) override
     {

@@ -340,6 +340,13 @@ void AggregationTimeoutCoordinator::schedule_until_deadline(
             {
                 // A scheduling failure cannot authorize early timeout
                 // effects. Leave the exact context open and fail closed.
+                try
+                {
+                    if (effects_.record_timer_failure)
+                        effects_.record_timer_failure(key);
+                }
+                catch (...)
+                {}
             }
         });
     if (!scheduled)

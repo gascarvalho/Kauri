@@ -587,6 +587,8 @@ std::optional<std::uint64_t> buffered_proposal_view_generation(
 }
 
 struct HotStuffEpochRuntimeAdapter::State
+    : public std::enable_shared_from_this<
+          HotStuffEpochRuntimeAdapter::State>
 {
     struct IdentityRecord
     {
@@ -756,8 +758,67 @@ struct HotStuffEpochRuntimeAdapter::State
         }
         for (const auto token : tokens)
             future.release(token);
-        return tokens.size() + 1;
+        return tokens.size();
     }
+
+    struct FutureAttemptState
+    {
+        std::size_t attempts{0};
+        std::optional<std::uint64_t> retained_exhausted_token;
+    };
+
+    struct InFlightFuture
+    {
+        std::uint64_t token{0};
+        ProposalKey key;
+        ConfigurationId configuration;
+    };
+
+    static constexpr std::size_t maximum_future_delivery_attempts = 3;
+
+    bool has_retry_exhausted(
+        const ConfigurationId &configuration) const noexcept
+    {
+        return std::any_of(
+            future_attempts.begin(),
+            future_attempts.end(),
+            [&configuration](const auto &entry) {
+                return entry.first.configuration == configuration &&
+                       entry.second.retained_exhausted_token.has_value();
+            });
+    }
+
+    void retire_exhausted_configuration(
+        const ConfigurationId &configuration) noexcept
+    {
+        for (auto attempt = future_attempts.begin();
+             attempt != future_attempts.end();)
+        {
+            if (attempt->first.configuration != configuration ||
+                !attempt->second.retained_exhausted_token.has_value())
+            {
+                ++attempt;
+                continue;
+            }
+            future.acknowledge(
+                *attempt->second.retained_exhausted_token);
+            try
+            {
+                admission.retire_proposal(attempt->first);
+            }
+            catch (...)
+            {
+            }
+            identities.erase(attempt->first);
+            attempt = future_attempts.erase(attempt);
+        }
+    }
+
+    EpochFutureDrainResult drain_futures() noexcept;
+    void resolve_future(
+        std::uint64_t token,
+        const ProposalKey &key,
+        ProposalProcessingOutcome outcome) noexcept;
 
     ReplicaEpochActivation &activation;
     ProposalContextLifecycle &contexts;
@@ -774,6 +835,10 @@ struct HotStuffEpochRuntimeAdapter::State
     std::optional<ConfigurationId> completed_drain_configuration;
     std::optional<std::size_t> remaining_hint;
     std::map<ProposalKey, IdentityRecord> identities;
+    std::map<ProposalKey, FutureAttemptState> future_attempts;
+    std::optional<InFlightFuture> in_flight_future;
+    std::size_t completed_future_callbacks{0};
+    bool draining_futures{false};
     bool stopped{false};
 };
 
@@ -786,7 +851,7 @@ HotStuffEpochRuntimeAdapter::HotStuffEpochRuntimeAdapter(
     EpochProtocolMode expected_mode,
     EpochWireLimits wire_limits,
     EpochRuntimeTransaction &transaction)
-    : state_(new State(
+    : state_(std::make_shared<State>(
           activation,
           contexts,
           admission,
@@ -1002,6 +1067,11 @@ EpochCommitIngressResult finish_commit(
         state.transaction.commit(std::move(prepared), update);
         state.retire_staged_epoch(update.activation.configuration);
         state.draining_effect.emplace(previous);
+        if (state.future_drain_configuration &&
+            *state.future_drain_configuration !=
+                update.activation.configuration)
+            state.retire_exhausted_configuration(
+                *state.future_drain_configuration);
         state.future_drain_configuration = update.activation.configuration;
         state.completed_drain_configuration.reset();
         state.remaining_hint.reset();
@@ -1144,6 +1214,11 @@ EpochRotationResult HotStuffEpochRuntimeAdapter::rotate_to_tree(
         state_->draining_effect.emplace(previous);
         if (state_->mode == EpochProtocolMode::adaptive_v2)
         {
+            if (state_->future_drain_configuration &&
+                *state_->future_drain_configuration !=
+                    update.activation.configuration)
+                state_->retire_exhausted_configuration(
+                    *state_->future_drain_configuration);
             state_->future_drain_configuration =
                 update.activation.configuration;
             state_->completed_drain_configuration.reset();
@@ -1203,7 +1278,8 @@ EpochConsensusIngressResult HotStuffEpochRuntimeAdapter::handle_proposal(
             authenticated_peer.source_peer,
             envelope.view_generation,
             DataStream(raw).get_hash(),
-            envelope.body};
+            envelope.body,
+            authenticated_peer.replica_id};
         auto retryable = proposal;
         const auto admission = state_->admission.receive(std::move(proposal));
         if (admission.disposition == ProposalDisposition::buffered_future)
@@ -1391,20 +1467,42 @@ HotStuffEpochRuntimeAdapter::processed_proposal_identity(
 }
 
 EpochFutureDrainResult
-HotStuffEpochRuntimeAdapter::drain_activated_futures() noexcept
+HotStuffEpochRuntimeAdapter::State::drain_futures() noexcept
 {
-    if (state_->stopped)
-        return {EpochFutureDrainStatus::stopped, 0, state_->future.size()};
-    if (!state_->future_drain_configuration ||
-        state_->activation.active_effect().configuration !=
-            *state_->future_drain_configuration)
+    if (stopped)
+        return {EpochFutureDrainStatus::stopped, 0, future.size()};
+    if (!future_drain_configuration ||
+        activation.active_effect().configuration !=
+            *future_drain_configuration)
         return {
             EpochFutureDrainStatus::inactive_configuration,
             0,
-            state_->future.size()};
-    const auto configuration = *state_->future_drain_configuration;
-    if (state_->completed_drain_configuration == configuration)
+            future.size()};
+    const auto configuration = *future_drain_configuration;
+    if (completed_drain_configuration == configuration)
         return {EpochFutureDrainStatus::complete, 0, 0};
+    if (in_flight_future.has_value())
+        return {
+            EpochFutureDrainStatus::in_progress,
+            0,
+            future.size()};
+    if (has_retry_exhausted(configuration))
+        return {
+            EpochFutureDrainStatus::retry_exhausted,
+            0,
+            future.size()};
+    if (draining_futures)
+        return {
+            EpochFutureDrainStatus::in_progress,
+            0,
+            future.size()};
+
+    struct DrainGuard
+    {
+        bool &draining;
+        ~DrainGuard() { draining = false; }
+    } guard{draining_futures};
+    draining_futures = true;
 
     std::size_t processed = 0;
     for (;;)
@@ -1412,70 +1510,133 @@ HotStuffEpochRuntimeAdapter::drain_activated_futures() noexcept
         std::optional<FutureProposalClaim> claim;
         try
         {
-            claim = state_->future.claim_next(configuration);
+            claim = future.claim_next(configuration);
         }
         catch (const std::bad_alloc &)
         {
             return {
                 EpochFutureDrainStatus::allocation_failed,
                 processed,
-                state_->remaining_hint.value_or(state_->future.size())};
+                remaining_hint.value_or(future.size())};
         }
         catch (...)
         {
             return {
                 EpochFutureDrainStatus::process_failed,
                 processed,
-                state_->future.size()};
+                future.size()};
         }
 
         if (!claim)
         {
-            state_->future.complete(configuration);
-            state_->completed_drain_configuration = configuration;
-            state_->remaining_hint.reset();
+            if (has_retry_exhausted(configuration))
+                return {
+                    EpochFutureDrainStatus::retry_exhausted,
+                    processed,
+                    future.size()};
+            future.complete(configuration);
+            completed_drain_configuration = configuration;
+            remaining_hint.reset();
             return {EpochFutureDrainStatus::complete, processed, 0};
         }
 
-        FutureProposalClaimOwner owner(state_->future, claim->token);
+        FutureProposalClaimOwner owner(future, claim->token);
         try
         {
-            const auto active = state_->activation.active_effect();
+            const auto active = activation.active_effect();
             if (active.configuration != configuration)
                 return {
                     EpochFutureDrainStatus::inactive_configuration,
                     processed,
-                    state_->future.size()};
-            if (state_->mode == EpochProtocolMode::adaptive_v2 &&
+                    future.size()};
+            if (mode == EpochProtocolMode::adaptive_v2 &&
                 claim->proposal.view_generation != active.generation)
             {
                 const auto key = claim->proposal.metadata.key();
                 owner.acknowledge();
-                state_->identities.erase(key);
+                identities.erase(key);
                 continue;
             }
-            state_->future.process_active(*claim);
-            owner.acknowledge();
-            const auto identity = state_->identities.find(
-                claim->proposal.metadata.key());
-            if (identity != state_->identities.end())
-                identity->second.processed = true;
-            ++processed;
+            const auto key = claim->proposal.metadata.key();
+            auto attempt = future_attempts.try_emplace(key).first;
+            if (attempt->second.attempts >=
+                maximum_future_delivery_attempts)
+                throw std::logic_error(
+                    "future proposal retry bound was exceeded");
+            ++attempt->second.attempts;
+            in_flight_future.emplace(
+                InFlightFuture{claim->token, key, configuration});
+            const auto completed_before = completed_future_callbacks;
+            const std::weak_ptr<State> weak(shared_from_this());
+            const bool started = future.process_active(
+                *claim,
+                [weak, token = claim->token, key](
+                    ProposalProcessingOutcome outcome) noexcept {
+                    const auto state = weak.lock();
+                    if (state != nullptr)
+                        state->resolve_future(token, key, outcome);
+                });
+            owner.release_ownership();
+            if (!started && in_flight_future.has_value())
+                resolve_future(
+                    claim->token,
+                    key,
+                    ProposalProcessingOutcome::terminal_pre_relay);
+            if (in_flight_future.has_value())
+                return {
+                    EpochFutureDrainStatus::in_progress,
+                    processed,
+                    future.size()};
+            processed += completed_future_callbacks - completed_before;
         }
         catch (const std::bad_alloc &)
         {
+            const auto key = claim->proposal.metadata.key();
+            admission.rollback_claimed_active(key);
+            in_flight_future.reset();
+            const auto attempt = future_attempts.find(key);
+            if (attempt != future_attempts.end() &&
+                attempt->second.attempts >=
+                    maximum_future_delivery_attempts)
+            {
+                attempt->second.retained_exhausted_token = claim->token;
+                owner.release_ownership();
+                return {
+                    EpochFutureDrainStatus::retry_exhausted,
+                    processed,
+                    future.size()};
+            }
+            future.release(claim->token);
+            owner.release_ownership();
             return {
                 EpochFutureDrainStatus::allocation_failed,
                 processed,
-                state_->remaining_hint.value_or(state_->future.size())};
+                remaining_hint.value_or(future.size())};
         }
         catch (...)
         {
+            const auto key = claim->proposal.metadata.key();
+            admission.rollback_claimed_active(key);
+            in_flight_future.reset();
+            const auto attempt = future_attempts.find(key);
+            if (attempt != future_attempts.end() &&
+                attempt->second.attempts >=
+                    maximum_future_delivery_attempts)
+            {
+                attempt->second.retained_exhausted_token = claim->token;
+                owner.release_ownership();
+                return {
+                    EpochFutureDrainStatus::retry_exhausted,
+                    processed,
+                    future.size()};
+            }
+            future.release(claim->token);
+            owner.release_ownership();
             try
             {
-                const auto remaining = state_->release_and_count_remaining(
+                const auto remaining = release_and_count_remaining(
                     configuration);
-                state_->remaining_hint = remaining;
+                remaining_hint = remaining;
                 return {
                     EpochFutureDrainStatus::process_failed,
                     processed,
@@ -1486,10 +1647,97 @@ HotStuffEpochRuntimeAdapter::drain_activated_futures() noexcept
                 return {
                     EpochFutureDrainStatus::allocation_failed,
                     processed,
-                    state_->future.size()};
+                    future.size()};
             }
         }
     }
+}
+
+void HotStuffEpochRuntimeAdapter::State::resolve_future(
+    std::uint64_t token,
+    const ProposalKey &key,
+    ProposalProcessingOutcome outcome) noexcept
+{
+    if (!in_flight_future.has_value() ||
+        in_flight_future->token != token ||
+        in_flight_future->key != key)
+        return;
+    const auto resolved_configuration =
+        in_flight_future->configuration;
+    in_flight_future.reset();
+
+    const auto attempt = future_attempts.find(key);
+    switch (outcome)
+    {
+    case ProposalProcessingOutcome::completed_exposed:
+        future.acknowledge(token);
+        if (auto identity = identities.find(key);
+            identity != identities.end())
+            identity->second.processed = true;
+        if (attempt != future_attempts.end())
+            future_attempts.erase(attempt);
+        ++completed_future_callbacks;
+        break;
+    case ProposalProcessingOutcome::completed_ownership_transferred:
+        future.acknowledge(token);
+        if (attempt != future_attempts.end())
+            future_attempts.erase(attempt);
+        break;
+    case ProposalProcessingOutcome::retryable_pre_relay_failure:
+        admission.rollback_claimed_active(key);
+        if (attempt == future_attempts.end())
+        {
+            future.acknowledge(token);
+            identities.erase(key);
+            break;
+        }
+        if (!future_drain_configuration.has_value() ||
+            *future_drain_configuration != resolved_configuration ||
+            activation.active_effect().configuration !=
+                resolved_configuration)
+        {
+            future.acknowledge(token);
+            try
+            {
+                admission.retire_proposal(key);
+            }
+            catch (...)
+            {
+            }
+            identities.erase(key);
+            future_attempts.erase(attempt);
+            break;
+        }
+        if (attempt->second.attempts >=
+            maximum_future_delivery_attempts)
+            attempt->second.retained_exhausted_token = token;
+        else
+            future.release(token);
+        break;
+    case ProposalProcessingOutcome::terminal_pre_relay:
+    case ProposalProcessingOutcome::terminal_post_relay:
+        future.acknowledge(token);
+        try
+        {
+            admission.retire_proposal(key);
+        }
+        catch (...)
+        {
+        }
+        identities.erase(key);
+        if (attempt != future_attempts.end())
+            future_attempts.erase(attempt);
+        break;
+    }
+
+    if (!draining_futures && !stopped)
+        static_cast<void>(drain_futures());
+}
+
+EpochFutureDrainResult
+HotStuffEpochRuntimeAdapter::drain_activated_futures() noexcept
+{
+    return state_->drain_futures();
 }
 
 struct ManagerEpochAckEndpoint::State

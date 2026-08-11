@@ -1231,6 +1231,7 @@ namespace hotstuff
         {
             AdaptiveV2DurableCommitPhase phase{
                 AdaptiveV2DurableCommitPhase::awaiting_evidence};
+            bool initialization_predecessor_required{true};
             bool experiment_false_report{false};
             ReplicaID experiment_false_target{0};
             std::size_t experiment_false_recorded_evidence{0};
@@ -1264,6 +1265,24 @@ namespace hotstuff
         // waiting for the ordinary full-tree vote fallback deadline.
         std::map<ProposalKey, std::uint64_t>
             exact_root_repair_deliveries;
+        struct AuthenticatedProposalIngress
+        {
+            std::uint64_t view_generation{0};
+            ReplicaID authenticated_proposal_source_replica{0};
+        };
+        // Exact local provenance for deciding whether a scheduled omission
+        // is auditable. Root-to-descendant repair remains consensus-valid but
+        // must never consume a physical-parent contribution ordinal.
+        std::map<ProposalKey, AuthenticatedProposalIngress>
+            authenticated_proposal_ingress;
+        // A finalized local retransmit may have lost its open context after
+        // an earlier successful response-evidence arm. Reuse is legal only
+        // for the same exact proposal and live view generation.
+        std::map<ProposalKey, std::uint64_t>
+            successful_response_attempt_arm_provenance;
+        // Canonical arm-failure poison is emitted at most once per exact key.
+        // These bounded replay guards retire with the same proposal identity.
+        std::set<ProposalKey> response_attempt_arm_failure_markers;
         std::map<ProposalKey,
                  std::shared_ptr<ExactProposalFallbackJob>>
             exact_proposal_fallback_jobs;
@@ -1469,8 +1488,12 @@ namespace hotstuff
         void enqueue_initial_adaptive_v2_readiness() noexcept;
         void report_adaptive_v2_runtime_initialized(
             const ProposalKey &key) noexcept;
+        void retire_authoritative_absent_context(
+            const std::optional<ProposalKey> &authoritative_key,
+            bool authoritative_key_has_local_context) noexcept;
         void report_adaptive_v2_committed(
-            const std::optional<ProposalKey> &key) noexcept;
+            const std::optional<ProposalKey> &key,
+            bool initialization_predecessor_required = true) noexcept;
         bool try_enqueue_adaptive_v2_runtime_initialized_report(
             const ProposalKey &key) noexcept;
         void retry_ready_adaptive_v2_runtime_initialized_reports()
@@ -1775,10 +1798,28 @@ namespace hotstuff
 
         void relay_once(const BufferedProposal &proposal) override;
         void process_active(const BufferedProposal &proposal) override;
+        bool process_active(
+            const BufferedProposal &proposal,
+            ProposalProcessingCompletion completion) override;
+        void cleanup_retryable_proposal_attempt(
+            const ProposalKey &key) noexcept;
         void local_vote_authorized(const ProposalKey &key) override;
         void create_expected_vote_state(const ProposalKey &key) override;
-        void start_latency_deadline(const ProposalKey &key) override;
+        bool start_latency_deadline(const ProposalKey &key) override;
         void start_aggregation_timer(const ProposalKey &key) override;
+        void attempt_proposal_evidence_before_exposure(
+            const ProposalKey &key,
+            const char *arm_failure_reason) noexcept;
+        void poison_response_attempt_arm_once(
+            const ProposalKey &key,
+            const char *reason) noexcept;
+        void record_successful_response_attempt_arm(
+            const ProposalKey &key) noexcept;
+        bool has_successful_response_attempt_arm(
+            const ProposalKey &key) const noexcept;
+        void ensure_finalized_proposal_evidence_before_exposure(
+            const ProposalKey &key,
+            const char *arm_failure_reason) noexcept;
         void emit_timeout_report(const ProposalKey &key) override;
 
         /** deliver consensus message: <propose> */

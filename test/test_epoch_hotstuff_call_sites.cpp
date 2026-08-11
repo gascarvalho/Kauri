@@ -947,6 +947,11 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
     CHECK(contains_in_order(
         remote,
         {"delivered->get_hash() != metadata.key.block_hash",
+         "owner.proposal_admission == nullptr",
+         "!owner.proposal_admission->contains_admitted(",
+         "metadata.key",
+         "abort(\"proposal_retired\")",
+         "return;",
          "pre_vote_epoch_change_gate(",
          "EpochChangeProposalDisposition::defer",
          "retain_deferred_epoch_change(",
@@ -986,6 +991,91 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
     REQUIRE_FALSE(ingress.empty());
     CHECK(ingress.find("pre_vote_epoch_change_gate(") ==
           std::string::npos);
+}
+
+TEST_CASE(
+    "authoritative absent-context commits retire delayed callbacks before reporting",
+    "[adaptive-v2][commit][no-local-context][proposal-retirement][wiring]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto admission_implementation =
+        source("src/proposal_admission.cpp");
+    const auto remote = function_body(
+        implementation, "void HotStuffBase::process_active(");
+    const auto receive = function_body(
+        admission_implementation,
+        "ProposalAdmissionResult ProposalAdmissionCoordinator::receive(");
+    const auto consensus = hotstuff_consensus_body(implementation);
+    const auto retire_absent = function_body(
+        implementation,
+        "void HotStuffBase::retire_authoritative_absent_context(");
+    const auto committed = function_body(
+        implementation, "void HotStuffBase::report_adaptive_v2_committed(");
+    const auto enqueue = function_body(
+        implementation,
+        "bool HotStuffBase::try_enqueue_adaptive_v2_commit_report(");
+
+    REQUIRE_FALSE(remote.empty());
+    CHECK(contains_in_order(
+        remote,
+        {"delivered == nullptr",
+         "owner.proposal_admission == nullptr",
+         "contains_admitted(",
+         "metadata.key",
+         "abort(\"proposal_retired\")",
+         "return;",
+         "pre_vote_epoch_change_gate(",
+         "admit_exact_context(",
+         "start_latency_deadline(metadata.key)",
+         "start_aggregation_timer(metadata.key)",
+         "relay_once(deferred)",
+         "drain_pending_exact_contributions(metadata.key)"}));
+    REQUIRE_FALSE(receive.empty());
+    CHECK(receive.find("effects_.relay_once(") == std::string::npos);
+
+    REQUIRE_FALSE(consensus.empty());
+    CHECK(contains_in_order(
+        consensus,
+        {"proposal_contexts->close_committed_block(",
+         "resolve_committed_proposal_identity(",
+         "const auto &authoritative_key = identity.key",
+         "authoritative_key_has_local_context",
+         "std::find(",
+         "keys.begin(), keys.end(), *authoritative_key",
+         "retire_authoritative_absent_context(",
+         "authoritative_key_has_local_context",
+         "cache_adaptive_v2_commit(",
+         "report_adaptive_v2_committed(",
+         "authoritative_key_has_local_context"}));
+
+    REQUIRE_FALSE(retire_absent.empty());
+    CHECK(contains_in_order(
+        retire_absent,
+        {"authoritative_key.has_value()",
+         "!authoritative_key_has_local_context",
+         "proposal_admission != nullptr",
+         "proposal_admission->retire_proposal(*authoritative_key)"}));
+
+    CHECK(header.find(
+              "bool initialization_predecessor_required{true};") !=
+          std::string::npos);
+    REQUIRE_FALSE(committed.empty());
+    CHECK(contains_in_order(
+        committed,
+        {"commit_without_context_has_false_report_state",
+         "commit_initialization_predecessor_conflicted",
+         "should_defer_commit_report",
+         "commit_without_context_has_response_evidence_state",
+         "state.initialization_predecessor_required =",
+         "initialization_predecessor_required"}));
+    REQUIRE_FALSE(enqueue.empty());
+    CHECK(contains_in_order(
+        enqueue,
+        {"adaptive_v2_durable_initialization_reports.find(key)",
+         "durable->second.initialization_predecessor_required",
+         "ProposalCommitted{key}",
+         "enqueue_lifecycle(fact)"}));
 }
 
 TEST_CASE("adaptive v2 definition recovery is bounded and digest coalesced",
@@ -2857,6 +2947,79 @@ TEST_CASE("leader timeout rotates adaptively without falling into legacy mutatio
 }
 
 TEST_CASE(
+    "adaptive v2 attempts deadline arm before exposure without gating consensus",
+    "[adaptive-v2][evidence][deadline-arm][relay-order][wiring]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto remote = function_body(
+        implementation, "bool HotStuffBase::process_active(");
+    const auto root = function_body(
+        implementation, "void HotStuffBase::do_broadcast_proposal(");
+    const auto attempt = function_body(
+        implementation,
+        "void HotStuffBase::attempt_proposal_evidence_before_exposure(");
+    const auto poison = function_body(
+        implementation,
+        "void HotStuffBase::poison_response_attempt_arm_once(");
+    const auto finalized = function_body(
+        implementation,
+        "void HotStuffBase::\n"
+        "    ensure_finalized_proposal_evidence_before_exposure(");
+
+    REQUIRE_FALSE(remote.empty());
+    CHECK(contains_in_order(
+        remote,
+        {"attempt_proposal_evidence_before_exposure(",
+         "relay_once(deferred)",
+         "on_receive_proposal(parsed)"}));
+
+    REQUIRE_FALSE(attempt.empty());
+    CHECK(contains_in_order(
+        attempt,
+        {"create_expected_vote_state(key)",
+         "start_latency_deadline(key)",
+         "poison_response_attempt_arm_once(key, arm_failure_reason)",
+         "start_aggregation_timer(key)",
+         "aggregation_timer_failed_before_proposal_exposure"}));
+    CHECK(attempt.find("catch (...)") != std::string::npos);
+
+    REQUIRE_FALSE(poison.empty());
+    CHECK(contains_all(
+        poison,
+        {"response_attempt_arm_failure_markers.insert(key).second",
+         "KAURI_EVIDENCE response_attempt_arm_marker_failed",
+         "successful_response_attempt_arm_provenance.erase(key)",
+         "mark_adaptive_v2_convergence_evidence_unhealthy(reason)"}));
+
+    REQUIRE_FALSE(finalized.empty());
+    CHECK(contains_in_order(
+        finalized,
+        {"has_successful_response_attempt_arm(key)",
+         "attempt_proposal_evidence_before_exposure("}));
+
+    REQUIRE_FALSE(root.empty());
+    CHECK(contains_in_order(
+        root,
+        {"attempt_proposal_evidence_before_exposure(",
+         "for (const auto child : metadata->tree.direct_children)",
+         "schedule_exact_proposal_fallback(*lease, prop)"}));
+    CHECK(root.find(
+              "root_response_deadline_arm_failed_before_") !=
+          std::string::npos);
+    CHECK(contains_in_order(
+        root,
+        {"ensure_finalized_proposal_evidence_before_exposure(",
+         "for (const auto child : metadata->tree.direct_children)"}));
+    CHECK(root.find(
+              "if (!has_successful_response_attempt_arm(prop.key()))") ==
+          std::string::npos);
+    CHECK(header.find(
+              "bool start_latency_deadline(const ProposalKey &key) override") !=
+          std::string::npos);
+}
+
+TEST_CASE(
     "adaptive v2 evidence lifecycle failures are globally fail closed",
     "[adaptive-v2][evidence][lifecycle][fail-closed][wiring]")
 {
@@ -2875,7 +3038,7 @@ TEST_CASE(
         "void HotStuffBase::report_adaptive_v2_committed(");
     const auto deadline = function_body(
         implementation,
-        "void HotStuffBase::start_latency_deadline(");
+        "bool HotStuffBase::start_latency_deadline(");
     const auto forget_one = function_body(
         implementation,
         "void HotStuffBase::forget_proposal_view_generation(");

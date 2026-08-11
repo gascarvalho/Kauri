@@ -30,6 +30,7 @@ struct ExperimentByzantineContext final
     std::optional<std::uint64_t> view_generation;
     std::optional<ReplicaID> physical_parent;
     std::optional<ExpectedMessageType> expected_message_type;
+    std::optional<ReplicaID> authenticated_proposal_source_replica;
 };
 
 enum class ExperimentDirectVoteDisposition
@@ -99,6 +100,7 @@ struct ExperimentOmissionMarker final
     std::optional<ReplicaID> physical_parent;
     std::optional<ExpectedMessageType> expected_message_type;
     ExperimentReplicaRole physical_role{ExperimentReplicaRole::root};
+    std::optional<ReplicaID> authenticated_proposal_source_replica;
 };
 
 std::string format_experiment_omission_marker(

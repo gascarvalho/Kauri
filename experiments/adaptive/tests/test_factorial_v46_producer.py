@@ -1,4 +1,4 @@
-"""Producer contract for the behavior-preserving v45 rollover."""
+"""Producer contract for the evidence-safe v46 rollover."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -16,19 +17,11 @@ from experiments.adaptive.kauri_experiment import factorial_runtime as runtime_m
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
+V46_MANIFEST = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v46.json"
+)
 V45_MANIFEST = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v45.json"
-)
-V44_MANIFEST = (
-    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v44.json"
-)
-V44_SIX = (
-    "eaf0d7e756c3ed54a4ebbf2ebc10701494829f315bed4efb7c021ae14f8f93c2",
-    "69db86cf3573bbf153150e1208c6bb76e791fb9f1642430797ffa6daeeff6498",
-    "91725b2c029407b53247447c7c46c82e69a8025d9043907412adcde7d4a2ef80",
-    "fa6cb7313c58aaa45a859d3193d499ebc0fd811253ae19350ac5af8bc21065a5",
-    "17bb2b9be77edc679be895beabcd06e9714bf72ae39c4e41d2c3a38ac70fcee0",
-    "5508460d3488e830e43c6898c5396dcffa0478c8f98d0035f61571cd708d66fa",
 )
 V45_SIX = (
     "aab7a4f9155c3a0a25fb4254a1ace9561fd2e82e7b841e18d42fca78ae578b73",
@@ -38,6 +31,7 @@ V45_SIX = (
     "1233efc18d8c10e04e0d6e82a5ab9fdd85b8f87023d68f3202aa9fa526bf9dad",
     "6d757b20042bd14d915f05f4eea2bc998655778bcb6b20ba2e934b9649e4f4f3",
 )
+V46_SIX = ("0" * 64,) * 6
 
 
 def _canonical(value: object) -> bytes:
@@ -47,8 +41,8 @@ def _canonical(value: object) -> bytes:
     )
 
 
-def _candidate_v45(monkeypatch: pytest.MonkeyPatch):
-    payload = V45_MANIFEST.read_bytes()
+def _candidate_v46(monkeypatch: pytest.MonkeyPatch):
+    payload = V46_MANIFEST.read_bytes()
     semantic_sha256 = hashlib.sha256(_canonical(json.loads(payload))).hexdigest()
     monkeypatch.setattr(
         manifest_module, "FROZEN_SEMANTIC_SHA256", semantic_sha256
@@ -104,30 +98,32 @@ def _coverage_binding(version: str) -> execution.CoverageSmokeLaunchBinding:
     )
 
 
-def test_v45_profile_is_exact_two_field_delta_from_v44() -> None:
-    assert V45_MANIFEST.is_file()
+def test_v46_profile_is_exact_four_field_delta_from_v45() -> None:
+    assert V46_MANIFEST.is_file()
+    v46_payload = V46_MANIFEST.read_bytes()
     v45_payload = V45_MANIFEST.read_bytes()
-    v44_payload = V44_MANIFEST.read_bytes()
-    assert v45_payload.endswith(b"\n")
-    assert not v45_payload.endswith(b"\n\n")
-    assert v45_payload.count(b"shape-placement-factorial-v45") == 2
-    assert v45_payload == v44_payload.replace(
-        b"shape-placement-factorial-v44",
-        b"shape-placement-factorial-v45",
+    assert v46_payload.endswith(b"\n")
+    assert not v46_payload.endswith(b"\n\n")
+    assert v46_payload.count(b"shape-placement-factorial-v46") == 2
+    assert v46_payload == (
+        v45_payload.replace(
+            b"shape-placement-factorial-v45",
+            b"shape-placement-factorial-v46",
+        )
+        .replace(
+            manifest_module.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2.encode(),
+            manifest_module.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V3.encode(),
+        )
+        .replace(
+            manifest_module.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1.encode(),
+            manifest_module.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2.encode(),
+        )
     )
 
 
-def test_v45_rollover_surface_remains_exactly_historical() -> None:
-    assert manifest_module.V44_MANIFEST_ID == "shape-placement-factorial-v44"
+def test_v46_rollover_surface_is_exactly_frozen() -> None:
     assert manifest_module.V45_MANIFEST_ID == "shape-placement-factorial-v45"
-    assert (
-        manifest_module.V44_MANIFEST_SHA256,
-        manifest_module.V44_SEMANTIC_SHA256,
-        manifest_module.V44_PLAN_SHA256,
-        runtime_module.V44_RUNTIME_SHA256,
-        runtime_module.V44_SMOKE_RUNTIME_SHA256,
-        runtime_module.V44_COVERAGE_SMOKE_RUNTIME_SHA256,
-    ) == V44_SIX
+    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v46"
     assert (
         manifest_module.V45_MANIFEST_SHA256,
         manifest_module.V45_SEMANTIC_SHA256,
@@ -136,11 +132,20 @@ def test_v45_rollover_surface_remains_exactly_historical() -> None:
         runtime_module.V45_SMOKE_RUNTIME_SHA256,
         runtime_module.V45_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == V45_SIX
+    assert (
+        manifest_module.FROZEN_MANIFEST_SHA256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.FROZEN_PLAN_SHA256,
+        runtime_module.FROZEN_RUNTIME_SHA256,
+        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
+        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+    ) == V46_SIX
+    assert cli.DEFAULT_MANIFEST == V46_MANIFEST
 
 
-def test_v44_all_six_identities_rehash_exactly() -> None:
-    payload = V44_MANIFEST.read_bytes()
-    manifest = manifest_module.load_frozen_manifest(V44_MANIFEST)
+def test_v45_all_six_identities_rehash_exactly() -> None:
+    payload = V45_MANIFEST.read_bytes()
+    manifest = manifest_module.load_frozen_manifest(V45_MANIFEST)
     plan = manifest_module.build_factorial_plan(manifest)
     runtime = runtime_module.build_factorial_runtime(plan)
     smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
@@ -152,35 +157,62 @@ def test_v44_all_six_identities_rehash_exactly() -> None:
         hashlib.sha256(runtime_module.canonical_runtime_bytes(runtime)).hexdigest(),
         hashlib.sha256(_canonical(smoke.runtime.as_document())).hexdigest(),
         hashlib.sha256(_canonical(coverage.runtime.as_document())).hexdigest(),
-    ) == V44_SIX
+    ) == V45_SIX
 
 
-def test_v45_preserves_v44_plan_and_runtime_behavior(
+def test_v46_changes_only_the_versioned_delivery_and_source_contracts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    v44_manifest = manifest_module.load_frozen_manifest(V44_MANIFEST)
-    v44_plan = manifest_module.build_factorial_plan(v44_manifest)
-    v44_runtime = runtime_module.build_factorial_runtime(v44_plan)
-    v45_manifest, v45_plan, v45_runtime = _candidate_v45(monkeypatch)
+    v45_manifest = manifest_module.load_frozen_manifest(V45_MANIFEST)
+    v45_plan = manifest_module.build_factorial_plan(v45_manifest)
+    v45_runtime = runtime_module.build_factorial_runtime(v45_plan)
+    v46_manifest, v46_plan, v46_runtime = _candidate_v46(monkeypatch)
 
-    v44_document = runtime_module.canonical_runtime_bytes(v44_runtime).decode()
     v45_document = runtime_module.canonical_runtime_bytes(v45_runtime).decode()
-    normalized_v44 = (
-        v44_document.replace(
-            "shape-placement-factorial-v44", "shape-placement-factorial-VERSION"
-        )
-        .replace(v44_manifest.manifest_sha256, "MANIFEST_SHA256")
-        .replace(v44_plan.plan_sha256, "PLAN_SHA256")
-    )
-    normalized_v45 = (
+    v46_document = runtime_module.canonical_runtime_bytes(v46_runtime).decode()
+    normalized_v45 = re.sub(
+        r"slot-runtime-[0-9a-f]+",
+        "slot-runtime-ARTIFACT",
         v45_document.replace(
             "shape-placement-factorial-v45", "shape-placement-factorial-VERSION"
         )
         .replace(v45_manifest.manifest_sha256, "MANIFEST_SHA256")
-        .replace(v45_plan.plan_sha256, "PLAN_SHA256")
+        .replace(v45_plan.plan_sha256, "PLAN_SHA256"),
     )
-    assert normalized_v45 == normalized_v44
-    assert len(v45_runtime.slots) == 68
+    normalized_v46 = re.sub(
+        r"slot-runtime-[0-9a-f]+",
+        "slot-runtime-ARTIFACT",
+        v46_document.replace(
+            "shape-placement-factorial-v46", "shape-placement-factorial-VERSION"
+        )
+        .replace(v46_manifest.manifest_sha256, "MANIFEST_SHA256")
+        .replace(v46_plan.plan_sha256, "PLAN_SHA256"),
+    )
+    assert normalized_v46 == (
+        normalized_v45
+        .replace(
+            manifest_module.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+            manifest_module.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V3,
+        )
+        .replace(
+            manifest_module.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
+            manifest_module.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2,
+        )
+    )
+    assert len(v46_runtime.slots) == 68
+    assert all(
+        spec.tiered_cohorts is not None
+        and spec.tiered_cohorts.causal_timeout_eligibility
+        == manifest_module.RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3
+        for spec in v46_runtime.slots
+    )
+    assert all(
+        spec.causal_acceptance.future_tree_proposal_delivery_contract
+        == manifest_module.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V3
+        and spec.causal_acceptance.source_bound_proposal_witness_contract
+        == manifest_module.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+        for spec in v46_runtime.slots
+    )
     assert all(
         spec.cycle1_responsive_cross_commit_retention is not None
         and spec.cycle1_responsive_cross_commit_retention
@@ -189,14 +221,14 @@ def test_v45_preserves_v44_plan_and_runtime_behavior(
         and spec.cycle1_responsive_cross_commit_retention
         .sealed_validation_causal_witness_selection_contract
         == runtime_module.SEALED_VALIDATION_CAUSAL_WITNESS_SELECTION_CONTRACT_V1
-        for spec in v45_runtime.slots
+        for spec in v46_runtime.slots
     )
 
 
-def test_v44_is_validation_only_before_any_result_claim(
+def test_v45_is_validation_only_before_any_result_claim(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.main(["--manifest", str(V44_MANIFEST), "plan"]) == 2
+    assert cli.main(["--manifest", str(V45_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
     assert refusal == {
         "reason": (
@@ -207,13 +239,43 @@ def test_v44_is_validation_only_before_any_result_claim(
     }
 
 
-def test_v45_s066_and_s037_bind_to_exact_static_artifacts(
+def test_v46_current_cli_default_plans_the_exact_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest, plan, runtime = _candidate_v46(monkeypatch)
+    monkeypatch.setattr(cli, "FROZEN_MANIFEST_SHA256", manifest.manifest_sha256)
+    monkeypatch.setattr(cli, "FROZEN_PLAN_SHA256", plan.plan_sha256)
+    monkeypatch.setattr(
+        cli,
+        "FROZEN_RUNTIME_SHA256",
+        hashlib.sha256(runtime_module.canonical_runtime_bytes(runtime)).hexdigest(),
+    )
+
+    assert cli.main(["plan"]) == 0
+    planned = json.loads(capsys.readouterr().out)
+    assert planned["manifest_id"] == "shape-placement-factorial-v46"
+    assert planned["results_root"] == "results/shape-placement-factorial-v46"
+
+
+def test_v46_n7_s066_and_s037_bind_to_exact_static_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, plan, _ = _candidate_v45(monkeypatch)
+    _, plan, _ = _candidate_v46(monkeypatch)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
     coverage = _coverage(plan)
+    execution._bind_static_artifacts(
+        smoke.slot,
+        smoke.runtime,
+        {
+            "manifest.json": V46_MANIFEST.read_bytes(),
+            "plan.json": plan.canonical_bytes,
+            "runtime.json": _canonical(smoke.runtime.as_document()),
+        },
+        campaign_member=False,
+    )
     artifacts = {
-        "manifest.json": V45_MANIFEST.read_bytes(),
+        "manifest.json": V46_MANIFEST.read_bytes(),
         "plan.json": plan.canonical_bytes,
         "runtime.json": _canonical(coverage.runtime.as_document()),
     }
@@ -227,10 +289,10 @@ def test_v45_s066_and_s037_bind_to_exact_static_artifacts(
         )
 
 
-def test_v45_n7_s066_and_s037_retention_partition_is_exact(
+def test_v46_n7_s066_and_s037_retention_partition_is_exact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, plan, _ = _candidate_v45(monkeypatch)
+    _, plan, _ = _candidate_v46(monkeypatch)
     smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
     coverage = _coverage(plan)
     s066, s037 = coverage.runtimes
@@ -274,17 +336,17 @@ def test_v45_n7_s066_and_s037_retention_partition_is_exact(
     )
     assert execution._uses_exact_excluded_repair_smoke_bound(
         s037,
-        _coverage_binding("v45"),
+        _coverage_binding("v46"),
     )
 
 
 @pytest.mark.parametrize(("offset_ns", "passes"), ((-1, True), (0, False)))
-def test_v45_s037_runner_terminal_is_strictly_before_hard_deadline(
+def test_v46_s037_runner_terminal_is_strictly_before_hard_deadline(
     offset_ns: int,
     passes: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, plan, _ = _candidate_v45(monkeypatch)
+    _, plan, _ = _candidate_v46(monkeypatch)
     repair = _coverage(plan).runtimes[1]
     anchor_ns = 7_000_000_000
     terminal_ns = anchor_ns + 650 * 1_000_000_000 + offset_ns
@@ -309,21 +371,21 @@ def test_v45_s037_runner_terminal_is_strictly_before_hard_deadline(
 
 @pytest.mark.parametrize(
     ("source_version", "alias_version"),
-    (("v44", "v45"), ("v45", "v44")),
+    (("v45", "v46"), ("v46", "v45")),
 )
-def test_v45_s066_binding_rejects_cross_version_result_path_alias(
+def test_v46_s066_binding_rejects_cross_version_result_path_alias(
     source_version: str,
     alias_version: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if source_version == "v45":
-        _, plan, _ = _candidate_v45(monkeypatch)
-        manifest_path = V45_MANIFEST
+    if source_version == "v46":
+        _, plan, _ = _candidate_v46(monkeypatch)
+        manifest_path = V46_MANIFEST
     else:
         plan = manifest_module.build_factorial_plan(
-            manifest_module.load_frozen_manifest(V44_MANIFEST)
+            manifest_module.load_frozen_manifest(V45_MANIFEST)
         )
-        manifest_path = V44_MANIFEST
+        manifest_path = V45_MANIFEST
     coverage = _coverage(plan)
     aliased_path = (
         f"results/shape-placement-factorial-{alias_version}-coverage-smoke/"
@@ -356,21 +418,21 @@ def test_v45_s066_binding_rejects_cross_version_result_path_alias(
 
 @pytest.mark.parametrize(
     ("source_version", "alias_version"),
-    (("v44", "v45"), ("v45", "v44")),
+    (("v45", "v46"), ("v46", "v45")),
 )
-def test_v45_s037_binding_rejects_cross_version_contract_path_alias(
+def test_v46_s037_binding_rejects_cross_version_contract_path_alias(
     source_version: str,
     alias_version: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if source_version == "v45":
-        _, plan, _ = _candidate_v45(monkeypatch)
-        manifest_path = V45_MANIFEST
+    if source_version == "v46":
+        _, plan, _ = _candidate_v46(monkeypatch)
+        manifest_path = V46_MANIFEST
     else:
         plan = manifest_module.build_factorial_plan(
-            manifest_module.load_frozen_manifest(V44_MANIFEST)
+            manifest_module.load_frozen_manifest(V45_MANIFEST)
         )
-        manifest_path = V44_MANIFEST
+        manifest_path = V45_MANIFEST
     coverage = _coverage(plan)
     aliased_path = (
         f"results/shape-placement-factorial-{alias_version}-coverage-smoke/"
@@ -401,21 +463,21 @@ def test_v45_s037_binding_rejects_cross_version_contract_path_alias(
 
 @pytest.mark.parametrize(
     ("source_version", "alias_version"),
-    (("v44", "v45"), ("v45", "v44")),
+    (("v45", "v46"), ("v46", "v45")),
 )
-def test_v45_n7_binding_rejects_cross_version_plan_result_path_alias(
+def test_v46_n7_binding_rejects_cross_version_plan_result_path_alias(
     source_version: str,
     alias_version: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if source_version == "v45":
-        _, plan, _ = _candidate_v45(monkeypatch)
-        manifest_path = V45_MANIFEST
+    if source_version == "v46":
+        _, plan, _ = _candidate_v46(monkeypatch)
+        manifest_path = V46_MANIFEST
     else:
         plan = manifest_module.build_factorial_plan(
-            manifest_module.load_frozen_manifest(V44_MANIFEST)
+            manifest_module.load_frozen_manifest(V45_MANIFEST)
         )
-        manifest_path = V44_MANIFEST
+        manifest_path = V45_MANIFEST
     smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
     aliased_slot = replace(
         smoke.slot,

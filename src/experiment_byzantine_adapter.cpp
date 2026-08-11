@@ -201,7 +201,10 @@ std::string format_experiment_omission_marker(
             encoded << " contribution_role="
                     << replica_role_name(marker.contribution_role)
                     << " role_contribution_ordinal="
-                    << marker.role_contribution_ordinal;
+                    << marker.role_contribution_ordinal
+                    << " authenticated_proposal_source_replica="
+                    << marker.authenticated_proposal_source_replica
+                           .value_or(marker.actor);
     }
     return encoded.str();
 }
@@ -592,6 +595,8 @@ struct ExperimentByzantineAdapter::State
             return;
         marker.view_generation = context.view_generation;
         marker.physical_parent = context.physical_parent;
+        marker.authenticated_proposal_source_replica =
+            context.authenticated_proposal_source_replica;
         marker.expected_message_type = context.expected_message_type;
         marker.physical_role = role;
     }

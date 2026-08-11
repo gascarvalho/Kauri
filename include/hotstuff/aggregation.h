@@ -70,6 +70,9 @@ public:
                        const std::set<ReplicaID> &,
                        AggregationForwardingObservation)>
         record_initial_forwarding;
+    // Scheduling failure invalidates adaptive evidence only. It never
+    // authorizes an early timeout or gates consensus dissemination.
+    std::function<void(const ProposalKey &)> record_timer_failure;
 };
 
 class AggregationTimeoutPolicy

@@ -279,6 +279,14 @@ HotStuffRetryableFutureProposalStore::claim_next(
 void HotStuffRetryableFutureProposalStore::process_active(
     const FutureProposalClaim &claim)
 {
+    if (!process_active(claim, {}))
+        throw std::logic_error("future proposal is not active");
+}
+
+bool HotStuffRetryableFutureProposalStore::process_active(
+    const FutureProposalClaim &claim,
+    ProposalProcessingCompletion completion)
+{
     const auto found = std::find_if(
         state_->reservations.begin(),
         state_->reservations.end(),
@@ -286,9 +294,9 @@ void HotStuffRetryableFutureProposalStore::process_active(
             return reservation.token == claim.token &&
                    reservation.key == claim.proposal.metadata.key();
         });
-    if (found == state_->reservations.end() ||
-        !state_->admission.process_claimed_active(claim.proposal))
-        throw std::logic_error("future proposal is not active");
+    return found != state_->reservations.end() &&
+           state_->admission.process_claimed_active(
+               claim.proposal, std::move(completion));
 }
 
 void HotStuffRetryableFutureProposalStore::acknowledge(

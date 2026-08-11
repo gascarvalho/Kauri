@@ -322,6 +322,11 @@ public:
 
     Cancellation schedule_after(Duration delay, Callback callback) override
     {
+        if (fail_next_schedule_)
+        {
+            fail_next_schedule_ = false;
+            throw std::runtime_error("test rearm failure");
+        }
         const auto generation = ++generation_;
         delay_ = delay;
         callback_ = std::move(callback);
@@ -350,11 +355,17 @@ public:
         return static_cast<bool>(callback_);
     }
 
+    void fail_next_schedule() noexcept
+    {
+        fail_next_schedule_ = true;
+    }
+
 private:
     Duration now_{Duration::zero()};
     Duration delay_{Duration::zero()};
     Callback callback_;
     std::uint64_t generation_{0};
+    bool fail_next_schedule_{false};
 };
 
 struct SigningSpy
@@ -464,6 +475,9 @@ struct Harness
                                             const std::set<ReplicaID> &missing) {
             optional_absence.push_back(missing);
         };
+        value.record_timer_failure = [this](const ProposalKey &key) {
+            timer_failures.push_back(key);
+        };
         return value;
     }
 
@@ -497,6 +511,7 @@ struct Harness
     AggregationTimeoutCoordinator coordinator;
     std::size_t candidate_requests{0};
     std::vector<std::set<ReplicaID>> optional_absence;
+    std::vector<ProposalKey> timer_failures;
 };
 
 constexpr auto test_delay = std::chrono::milliseconds(25);
@@ -562,6 +577,35 @@ TEST_CASE("A06 early timer callbacks wait for the strict deadline",
     CHECK(harness.timeouts.missing_children.front() ==
           std::set<ReplicaID>{3, 4});
     CHECK_FALSE(scheduler.pending());
+}
+
+TEST_CASE("A06 early timer rearm failure is reported without timeout effects",
+          "[a06][aggregation][control][clock][deadline][failure]")
+{
+    Harness harness(1);
+    EarlyAggregationScheduler scheduler;
+    const auto key = make_test_proposal_key(
+        make_digest(0x9c), 0x9d, 9, 1);
+    const auto lease = harness.admit(key, internal_tree());
+    const auto deadline = harness.policy.timeout_for(
+        internal_level, maximum_level);
+
+    REQUIRE(harness.coordinator.arm_timeout(
+                lease,
+                scheduler,
+                internal_level,
+                maximum_level) != 0);
+    scheduler.fail_next_schedule();
+    scheduler.fire_after(deadline - std::chrono::nanoseconds(1));
+
+    CHECK(harness.timer_failures == std::vector<ProposalKey>{key});
+    CHECK(harness.candidate_requests == 0);
+    CHECK(harness.transport.signer_sets.empty());
+    CHECK(harness.timeouts.keys.empty());
+    CHECK_FALSE(scheduler.pending());
+    const auto snapshot = harness.contexts.snapshot(key);
+    REQUIRE(snapshot.has_value());
+    CHECK(snapshot->timer_generation != 0);
 }
 
 TEST_CASE("A06 generic strict deadline timer rearms and cancels",

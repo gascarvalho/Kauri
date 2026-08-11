@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -46,6 +47,12 @@ struct BufferedProposal
     // The adaptive envelope is relayed byte-for-byte through wire_payload,
     // while normal HotStuff processing consumes only this decoded body.
     bytearray_t processing_payload;
+
+    // Authenticated transport provenance for the immediate proposal sender.
+    // This is local evidence metadata only: it is neither serialized nor part
+    // of ProposalKey. Adaptive-v2 uses it to distinguish the ordinary
+    // physical-parent hop from an authenticated root repair delivery.
+    std::optional<ReplicaID> authenticated_proposal_source_replica;
 };
 
 struct FutureProposalBufferLimits

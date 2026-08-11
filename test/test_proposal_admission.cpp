@@ -1,5 +1,6 @@
 #include <stdexcept>
 #include <string>
+#include <optional>
 
 #include "catch.hpp"
 
@@ -36,7 +37,7 @@
  *       virtual void process_active(const BufferedProposal &) = 0;
  *       virtual void local_vote_authorized(const ProposalKey &) = 0;
  *       virtual void create_expected_vote_state(const ProposalKey &) = 0;
- *       virtual void start_latency_deadline(const ProposalKey &) = 0;
+ *       virtual bool start_latency_deadline(const ProposalKey &) = 0;
  *       virtual void start_aggregation_timer(const ProposalKey &) = 0;
  *       virtual void emit_timeout_report(const ProposalKey &) = 0;
  *   };
@@ -57,12 +58,12 @@
  * receive is the factored production entry point called exactly once by
  * HotStuffBase::propose_handler after wire parsing. It must validate the epoch,
  * tree, digest, block identity, and exact tree root before deduplication,
- * relay, buffer, cache, or consensus mutation. process_active is the only
+ * buffer, cache, active processing, or relay mutation. process_active is the only
  * operation allowed to enter HotStuffCore::on_receive_proposal.
  *
  * process_active owns delivered exact-context initialization, including child
- * accounting, latency tracking, and the aggregation deadline, before normal
- * HotStuff safety processing can choose whether to vote. authorize_local_vote
+ * accounting, latency tracking, and the aggregation deadline, and relays only
+ * after that initialization succeeds. authorize_local_vote
  * is the narrower completion boundary called only after safety processing
  * authorizes the optional local contribution. P05 never owns leader liveness;
  * future/rejected traffic remains inert because the admission effects expose
@@ -113,12 +114,14 @@ using hotstuff::FutureProposalBuffer;
 using hotstuff::FutureProposalBufferLimits;
 using hotstuff::ProposalAdmissionCoordinator;
 using hotstuff::ProposalAdmissionEffects;
+using hotstuff::ProposalRelayPolicy;
 using hotstuff::ProposalContextEvent;
 using hotstuff::ProposalContextLifecycle;
 using hotstuff::ProposalContextStatus;
 using hotstuff::ProposalDisposition;
 using hotstuff::ProposalKey;
 using hotstuff::ProposalMetadata;
+using hotstuff::ProposalProcessingOutcome;
 using hotstuff::ProposalTransitionResult;
 using hotstuff::ReplicaID;
 using hotstuff::bytearray_t;
@@ -250,6 +253,7 @@ class EffectSpy final : public ProposalAdmissionEffects
 {
 public:
     bool throw_on_relay{false};
+    bool relay_during_processing{true};
     std::size_t relays{0};
     std::size_t active_processing{0};
     std::size_t local_votes{0};
@@ -274,6 +278,8 @@ public:
         ++active_processing;
         sequence.emplace_back("normal-processing");
         processed.push_back(value.metadata.key());
+        if (relay_during_processing)
+            relay_once(value);
     }
 
     void local_vote_authorized(const ProposalKey &) override
@@ -288,10 +294,11 @@ public:
         sequence.emplace_back("expected-votes");
     }
 
-    void start_latency_deadline(const ProposalKey &) override
+    bool start_latency_deadline(const ProposalKey &) override
     {
         ++latency_deadlines;
         sequence.emplace_back("latency-deadline");
+        return true;
     }
 
     void start_aggregation_timer(const ProposalKey &) override
@@ -314,6 +321,45 @@ public:
 
     std::vector<ProposalKey> relayed;
 };
+
+std::vector<hotstuff::ProposalAdmissionResult>
+activate_deferred_configuration(
+    ProposalAdmissionCoordinator &coordinator,
+    FutureProposalBuffer &buffer,
+    const ConfigurationId &configuration)
+{
+    if (!coordinator.activate_without_draining(configuration))
+        return {};
+
+    std::vector<hotstuff::ProposalAdmissionResult> results;
+    std::set<ProposalKey> claimed;
+    while (const auto *next =
+               buffer.first_unclaimed(configuration, claimed))
+    {
+        const auto proposal = *next;
+        const auto key = proposal.metadata.key();
+        bool completed = false;
+        ProposalProcessingOutcome outcome =
+            ProposalProcessingOutcome::terminal_pre_relay;
+        const auto accepted = coordinator.process_claimed_active(
+            proposal,
+            [&](ProposalProcessingOutcome value) {
+                completed = true;
+                outcome = value;
+            });
+        if (!accepted)
+        {
+            claimed.insert(key);
+            continue;
+        }
+        REQUIRE(completed);
+        REQUIRE(outcome ==
+                ProposalProcessingOutcome::completed_exposed);
+        REQUIRE(buffer.erase(key));
+        results.push_back({ProposalDisposition::admitted_active, key});
+    }
+    return results;
+}
 
 /*
  * Bounded admission-retirement contract
@@ -387,7 +433,12 @@ void check_terminal_proposal_pruning()
         FutureProposalBuffer buffer;
         EffectSpy effects;
         const auto active = configuration(*fixture.epoch0, 7);
-        Coordinator coordinator{fixture.store, active, buffer, effects};
+        Coordinator coordinator{
+            fixture.store,
+            active,
+            buffer,
+            effects,
+            ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
         const auto candidate = proposal(active, "terminal-prune", 0);
         const auto key = candidate.metadata.key();
 
@@ -465,7 +516,12 @@ void check_exact_configuration_retirement()
         const auto active = configuration(*fixture.epoch0, 7);
         const auto retired = configuration(*fixture.epoch1, 7);
         const auto retained = configuration(*fixture.epoch1, 11);
-        Coordinator coordinator{fixture.store, active, buffer, effects};
+        Coordinator coordinator{
+            fixture.store,
+            active,
+            buffer,
+            effects,
+            ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
 
         const auto retired_one = proposal(retired, "retired-one", 2);
         const auto retired_two = proposal(retired, "retired-two", 2);
@@ -519,6 +575,7 @@ void check_retirement_floor_contract()
         StagedEpochs fixture;
         FutureProposalBuffer buffer;
         EffectSpy effects;
+        effects.relay_during_processing = false;
         const auto old = configuration(*fixture.epoch0, 7);
         const auto below_floor = configuration(*fixture.epoch1, 7);
         const auto first_live = configuration(*fixture.epoch2, 7);
@@ -597,6 +654,7 @@ void check_same_epoch_reactivation_contract()
         StagedEpochs fixture;
         FutureProposalBuffer buffer;
         EffectSpy effects;
+        effects.relay_during_processing = false;
         const auto config_a = configuration(*fixture.epoch0, 7);
         const auto config_b = configuration(*fixture.epoch0, 11);
         Coordinator coordinator{
@@ -684,7 +742,11 @@ TEST_CASE("configuration validation fails closed before lookup or mutation",
     EffectSpy effects;
     const auto active = configuration(*fixture.epoch0, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
 
     auto malformed = proposal(active, "malformed", 0);
     malformed.metadata.configuration.epoch_digest = uint256_t{};
@@ -754,7 +816,11 @@ TEST_CASE("stale known configuration is rejected without relaying",
     EffectSpy effects;
     const auto active = configuration(*fixture.epoch1, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
 
     const auto stale = proposal(
         configuration(*fixture.epoch0, 7), "stale-block", 0);
@@ -774,7 +840,11 @@ TEST_CASE("proposer must equal the exact configuration tree root",
     EffectSpy effects;
     const auto active = configuration(*fixture.epoch0, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
 
     // Replica 1 is the other epoch-0 tree root and could satisfy the legacy
     // current-proposer half of the buggy AND predicate. It is not tree 7's
@@ -793,6 +863,86 @@ TEST_CASE("proposer must equal the exact configuration tree root",
     CHECK(effects.active_processing == 1);
 }
 
+TEST_CASE("relay policy preserves eager modes and defers only adaptive v2",
+          "[proposal-admission][relay-policy][adaptive-v2]")
+{
+    StagedEpochs fixture;
+    const auto active = configuration(*fixture.epoch0, 7);
+    const auto future = configuration(*fixture.epoch1, 7);
+
+    SECTION("legacy and adaptive v1 relay active proposals before processing")
+    {
+        FutureProposalBuffer buffer;
+        EffectSpy effects;
+        effects.relay_during_processing = false;
+        ProposalAdmissionCoordinator coordinator{
+            fixture.store,
+            active,
+            buffer,
+            effects,
+            ProposalRelayPolicy::eager_before_processing};
+        const auto candidate = proposal(active, "eager-active", 0);
+
+        REQUIRE(coordinator.receive(candidate).disposition ==
+                ProposalDisposition::admitted_active);
+        CHECK((effects.sequence ==
+               std::vector<std::string>{"relay", "normal-processing"}));
+        CHECK(effects.relays == 1);
+        CHECK(effects.active_processing == 1);
+    }
+
+    SECTION("legacy and adaptive v1 relay future proposals at ingress")
+    {
+        FutureProposalBuffer buffer;
+        EffectSpy effects;
+        effects.relay_during_processing = false;
+        ProposalAdmissionCoordinator coordinator{
+            fixture.store,
+            active,
+            buffer,
+            effects,
+            ProposalRelayPolicy::eager_before_processing};
+        const auto candidate = proposal(future, "eager-future", 2);
+
+        REQUIRE(coordinator.receive(candidate).disposition ==
+                ProposalDisposition::buffered_future);
+        CHECK((effects.sequence == std::vector<std::string>{"relay"}));
+        REQUIRE(coordinator.activate(future).size() == 1);
+        CHECK((effects.sequence ==
+               std::vector<std::string>{"relay", "normal-processing"}));
+        CHECK(effects.relays == 1);
+        CHECK(effects.active_processing == 1);
+    }
+
+    SECTION("adaptive v2 exposes no future proposal before activation")
+    {
+        FutureProposalBuffer buffer;
+        EffectSpy effects;
+        ProposalAdmissionCoordinator coordinator{
+            fixture.store,
+            active,
+            buffer,
+            effects,
+            ProposalRelayPolicy::
+                adaptive_v2_deferred_until_arm_attempt};
+        const auto candidate = proposal(future, "deferred-future", 2);
+
+        REQUIRE(coordinator.receive(candidate).disposition ==
+                ProposalDisposition::buffered_future);
+        CHECK(effects.sequence.empty());
+        CHECK(coordinator.activate(future).empty());
+        CHECK(coordinator.active_configuration() == active);
+        CHECK(buffer.contains(candidate.metadata.key()));
+        REQUIRE(activate_deferred_configuration(
+                    coordinator, buffer, future)
+                    .size() == 1);
+        CHECK((effects.sequence ==
+               std::vector<std::string>{"normal-processing", "relay"}));
+        CHECK(effects.relays == 1);
+        CHECK(effects.active_processing == 1);
+    }
+}
+
 TEST_CASE("local vote authorization does not own aggregation initialization",
           "[p05][proposal-admission][active][authorization]"
           "[a06][non-voting][intentional-red]")
@@ -802,21 +952,25 @@ TEST_CASE("local vote authorization does not own aggregation initialization",
     EffectSpy effects;
     const auto active = configuration(*fixture.epoch0, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
     const auto candidate = proposal(active, "active-block", 0);
 
     const auto result = coordinator.receive(candidate);
     REQUIRE(result.disposition == ProposalDisposition::admitted_active);
     CHECK((effects.sequence ==
-           std::vector<std::string>{"relay", "normal-processing"}));
+           std::vector<std::string>{"normal-processing", "relay"}));
     CHECK(effects.expected_vote_states == 0);
     CHECK(effects.latency_deadlines == 0);
     CHECK(effects.aggregation_timers == 0);
 
     REQUIRE(coordinator.authorize_local_vote(candidate.metadata.key()));
     CHECK((effects.sequence == std::vector<std::string>{
-                                   "relay",
                                    "normal-processing",
+                                   "relay",
                                    "local-vote"}));
     CHECK(effects.expected_vote_states == 0);
     CHECK(effects.local_votes == 1);
@@ -829,7 +983,7 @@ TEST_CASE("local vote authorization does not own aggregation initialization",
     CHECK(effects.timeout_reports == 0);
 }
 
-TEST_CASE("known future proposal is relayed once buffered and otherwise inert",
+TEST_CASE("known future proposal remains inert until activation then relays once",
           "[p05][proposal-admission][future][effects]")
 {
     StagedEpochs fixture;
@@ -838,7 +992,11 @@ TEST_CASE("known future proposal is relayed once buffered and otherwise inert",
     const auto active = configuration(*fixture.epoch0, 7);
     const auto future = configuration(*fixture.epoch1, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
     const auto candidate = proposal(future, "future-block", 2, {0xfa});
 
     const auto result = coordinator.receive(candidate);
@@ -846,7 +1004,7 @@ TEST_CASE("known future proposal is relayed once buffered and otherwise inert",
     CHECK(result.key == candidate.metadata.key());
     CHECK(buffer.size() == 1);
     CHECK(buffer.contains(candidate.metadata.key()));
-    CHECK(effects.relays == 1);
+    CHECK(effects.relays == 0);
     check_no_protocol_side_effects(effects);
     CHECK_FALSE(
         coordinator.authorize_local_vote(candidate.metadata.key()));
@@ -854,10 +1012,14 @@ TEST_CASE("known future proposal is relayed once buffered and otherwise inert",
     const auto duplicate = coordinator.receive(candidate);
     CHECK(duplicate.disposition == ProposalDisposition::duplicate);
     CHECK(buffer.size() == 1);
-    CHECK(effects.relays == 1);
+    CHECK(effects.relays == 0);
     check_no_protocol_side_effects(effects);
 
-    const auto activated = coordinator.activate(future);
+    CHECK(coordinator.activate(future).empty());
+    CHECK(coordinator.active_configuration() == active);
+    CHECK(buffer.contains(candidate.metadata.key()));
+    const auto activated = activate_deferred_configuration(
+        coordinator, buffer, future);
     REQUIRE(activated.size() == 1);
     CHECK(activated.front().disposition ==
           ProposalDisposition::admitted_active);
@@ -871,13 +1033,14 @@ TEST_CASE("known future proposal is relayed once buffered and otherwise inert",
     CHECK(effects.aggregation_timers == 0);
     CHECK(effects.timeout_reports == 0);
 
-    const auto activated_again = coordinator.activate(future);
+    const auto activated_again = activate_deferred_configuration(
+        coordinator, buffer, future);
     CHECK(activated_again.empty());
     CHECK(effects.active_processing == 1);
     CHECK(effects.relays == 1);
 }
 
-TEST_CASE("future capacity rejection precedes relay and received mutation",
+TEST_CASE("future capacity rejection preserves inert buffered proposals",
           "[proposal-admission][future][capacity]")
 {
     StagedEpochs fixture;
@@ -892,7 +1055,11 @@ TEST_CASE("future capacity rejection precedes relay and received mutation",
     const auto future_a = configuration(*fixture.epoch1, 7);
     const auto future_b = configuration(*fixture.epoch1, 11);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
     auto admitted = proposal(future_a, "capacity-first", 2, {0x01});
     auto overflow = proposal(future_b, "capacity-overflow", 3, {0x02});
     admitted.view_generation = 1;
@@ -901,7 +1068,7 @@ TEST_CASE("future capacity rejection precedes relay and received mutation",
     REQUIRE(coordinator.receive(admitted).disposition ==
             ProposalDisposition::buffered_future);
     REQUIRE(buffer.size() == 1);
-    REQUIRE(effects.relays == 1);
+    REQUIRE(effects.relays == 0);
     REQUIRE(coordinator.storage_stats().retained_received == 1);
 
     const auto rejected = coordinator.receive(overflow);
@@ -909,14 +1076,14 @@ TEST_CASE("future capacity rejection precedes relay and received mutation",
           ProposalDisposition::rejected_capacity);
     CHECK_FALSE(buffer.contains(overflow.metadata.key()));
     CHECK(buffer.size() == 1);
-    CHECK(effects.relays == 1);
+    CHECK(effects.relays == 0);
     CHECK(coordinator.storage_stats().retained_received == 1);
     check_no_protocol_side_effects(effects);
 
     // Duplicate classification is stable even while the buffer is full.
     CHECK(coordinator.receive(admitted).disposition ==
           ProposalDisposition::duplicate);
-    CHECK(effects.relays == 1);
+    CHECK(effects.relays == 0);
     CHECK(coordinator.storage_stats().retained_received == 1);
 
     // Releasing the retained entry makes the previously rejected exact key
@@ -925,7 +1092,7 @@ TEST_CASE("future capacity rejection precedes relay and received mutation",
     CHECK(coordinator.receive(overflow).disposition ==
           ProposalDisposition::buffered_future);
     CHECK(buffer.contains(overflow.metadata.key()));
-    CHECK(effects.relays == 2);
+    CHECK(effects.relays == 0);
     CHECK(coordinator.storage_stats().retained_received == 2);
 
     // Configuration retirement uses the same exact accounting path and
@@ -938,10 +1105,10 @@ TEST_CASE("future capacity rejection precedes relay and received mutation",
     CHECK(coordinator.receive(after_retirement).disposition ==
           ProposalDisposition::buffered_future);
     CHECK(buffer.contains(after_retirement.metadata.key()));
-    CHECK(effects.relays == 3);
+    CHECK(effects.relays == 0);
 }
 
-TEST_CASE("future relay exceptions roll back capacity and received state",
+TEST_CASE("future buffering does not execute relay effects before activation",
           "[proposal-admission][future][capacity][exception]")
 {
     StagedEpochs fixture;
@@ -956,20 +1123,26 @@ TEST_CASE("future relay exceptions roll back capacity and received state",
     const auto active = configuration(*fixture.epoch0, 7);
     const auto future = configuration(*fixture.epoch1, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
     auto candidate = proposal(future, "relay-rollback", 2, {0x01});
     candidate.view_generation = 1;
 
-    REQUIRE_THROWS_AS(coordinator.receive(candidate), std::runtime_error);
-    CHECK(buffer.size() == 0);
-    CHECK_FALSE(buffer.contains(candidate.metadata.key()));
-    CHECK(coordinator.storage_stats().retained_received == 0);
-    CHECK(effects.relays == 0);
-
-    effects.throw_on_relay = false;
     CHECK(coordinator.receive(candidate).disposition ==
           ProposalDisposition::buffered_future);
     CHECK(buffer.size() == 1);
+    CHECK(buffer.contains(candidate.metadata.key()));
+    CHECK(coordinator.storage_stats().retained_received == 1);
+    CHECK(effects.relays == 0);
+
+    effects.throw_on_relay = false;
+    REQUIRE(activate_deferred_configuration(
+                coordinator, buffer, future)
+                .size() == 1);
+    CHECK(buffer.size() == 0);
     CHECK(coordinator.storage_stats().retained_received == 1);
     CHECK(effects.relays == 1);
 }
@@ -983,14 +1156,18 @@ TEST_CASE("same tree ID in a future epoch is never treated active",
     const auto active = configuration(*fixture.epoch0, 7);
     const auto future_same_tree_id = configuration(*fixture.epoch1, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
 
     const auto result = coordinator.receive(
         proposal(future_same_tree_id, "same-tree-future", 2));
     CHECK(result.disposition == ProposalDisposition::buffered_future);
     CHECK(coordinator.active_configuration() == active);
     CHECK(buffer.size() == 1);
-    CHECK(effects.relays == 1);
+    CHECK(effects.relays == 0);
     check_no_protocol_side_effects(effects);
 }
 
@@ -1002,7 +1179,11 @@ TEST_CASE("unknown future configuration is rejected rather than guessed",
     EffectSpy effects;
     const auto active = configuration(*fixture.epoch0, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
 
     const ConfigurationId unknown_future{
         3, 7, digest("not-staged")};
@@ -1025,7 +1206,11 @@ TEST_CASE("activation drains exact configuration once without head blocking",
     const auto next_other_tree = configuration(*fixture.epoch1, 11);
     const auto later = configuration(*fixture.epoch2, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
 
     const auto later_first = proposal(later, "later-first", 2, {0x21});
     const auto next_first = proposal(next, "next-first", 2, {0x11});
@@ -1041,7 +1226,7 @@ TEST_CASE("activation drains exact configuration once without head blocking",
     REQUIRE(coordinator.receive(next_other).disposition ==
             ProposalDisposition::buffered_future);
     REQUIRE(buffer.size() == 4);
-    REQUIRE(effects.relays == 4);
+    REQUIRE(effects.relays == 0);
 
     auto wrong_digest = next;
     wrong_digest.epoch_digest = digest("divergent-next-definition");
@@ -1051,7 +1236,11 @@ TEST_CASE("activation drains exact configuration once without head blocking",
     CHECK(buffer.size() == 4);
     CHECK(effects.processed.empty());
 
-    const auto activated = coordinator.activate(next);
+    CHECK(coordinator.activate(next).empty());
+    CHECK(coordinator.active_configuration() == active);
+    CHECK(buffer.size() == 4);
+    const auto activated = activate_deferred_configuration(
+        coordinator, buffer, next);
     REQUIRE(activated.size() == 2);
     CHECK(activated[0].disposition ==
           ProposalDisposition::admitted_active);
@@ -1063,7 +1252,7 @@ TEST_CASE("activation drains exact configuration once without head blocking",
     CHECK(buffer.size() == 2);
     CHECK(buffer.contains(later_first.metadata.key()));
     CHECK(buffer.contains(next_other.metadata.key()));
-    CHECK(effects.relays == 4);
+    CHECK(effects.relays == 2);
     REQUIRE(effects.processed.size() == 2);
     CHECK(effects.processed[0] == next_first.metadata.key());
     CHECK(effects.processed[1] == next_second.metadata.key());
@@ -1076,7 +1265,7 @@ TEST_CASE("activation drains exact configuration once without head blocking",
     const auto activated_again = coordinator.activate(next);
     CHECK(activated_again.empty());
     CHECK(effects.processed.size() == 2);
-    CHECK(effects.relays == 4);
+    CHECK(effects.relays == 2);
 
     REQUIRE(coordinator.authorize_local_vote(
         next_first.metadata.key()));
@@ -1101,7 +1290,11 @@ TEST_CASE("commit retires admission after an earlier terminal transition",
     EffectSpy effects;
     const auto active = configuration(*fixture.epoch0, 7);
     ProposalAdmissionCoordinator coordinator{
-        fixture.store, active, buffer, effects};
+        fixture.store,
+        active,
+        buffer,
+        effects,
+        ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt};
     ProposalContextLifecycle contexts;
     const auto candidate = proposal(
         active, "terminal-before-commit-admission", 0);

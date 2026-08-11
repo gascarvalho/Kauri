@@ -357,7 +357,7 @@ def test_v44_native_manager_policy_and_timing_match_v43(
 def test_v45_is_default_and_v44_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v45.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v46.json"
     assert cli.main(["--manifest", str(V44_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v44 are validation-only" in refusal["reason"]
+    assert "v1 through v45 are validation-only" in refusal["reason"]

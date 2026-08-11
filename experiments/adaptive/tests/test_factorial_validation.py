@@ -112,6 +112,9 @@ V44_MANIFEST_PATH = (
 V45_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v45.json"
 )
+V46_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v46.json"
+)
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
 )
@@ -894,7 +897,13 @@ def _v44_candidate_plan(monkeypatch: pytest.MonkeyPatch):
 
 
 def _v45_candidate_plan(monkeypatch: pytest.MonkeyPatch):
-    payload = V45_MANIFEST_PATH.read_bytes()
+    del monkeypatch
+    manifest = load_frozen_manifest(V45_MANIFEST_PATH)
+    return manifest, build_factorial_plan(manifest)
+
+
+def _v46_candidate_plan(monkeypatch: pytest.MonkeyPatch):
+    payload = V46_MANIFEST_PATH.read_bytes()
     semantic = _canonical(json.loads(payload))
     monkeypatch.setattr(
         manifest_module,
@@ -2296,7 +2305,7 @@ def test_validator_v44_identities_are_exactly_frozen() -> None:
 
 def test_validator_v45_identities_are_exactly_frozen_and_path_isolated() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V45_MANIFEST_ID
     )
     manifest_payload = V45_MANIFEST_PATH.read_bytes()
     manifest = load_frozen_manifest(V45_MANIFEST_PATH)
@@ -2318,16 +2327,16 @@ def test_validator_v45_identities_are_exactly_frozen_and_path_isolated() -> None
         "6d757b20042bd14d915f05f4eea2bc998655778bcb6b20ba2e934b9649e4f4f3",
     )
     producer_six = (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V45_MANIFEST_SHA256,
+        manifest_module.V45_SEMANTIC_SHA256,
+        manifest_module.V45_PLAN_SHA256,
+        runtime_module.V45_RUNTIME_SHA256,
+        runtime_module.V45_SMOKE_RUNTIME_SHA256,
+        runtime_module.V45_COVERAGE_SMOKE_RUNTIME_SHA256,
     )
     validator_six = (
         identity.manifest_sha256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.V45_SEMANTIC_SHA256,
         identity.plan_sha256,
         identity.runtime_sha256,
         identity.smoke_runtime_sha256,
@@ -2346,32 +2355,120 @@ def test_validator_v45_identities_are_exactly_frozen_and_path_isolated() -> None
         ).hexdigest(),
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v45"
+    assert validation.V45_MANIFEST_ID == "shape-placement-factorial-v45"
     assert producer_six == validator_six == disk_six == expected_six
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V45_MANIFEST_ID
     ) == "results/shape-placement-factorial-v45-coverage-smoke"
 
     slot_id = validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     v44_slot = (
         Path(validation.V44_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT) / slot_id
     )
-    v45_slot = Path(validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT) / slot_id
+    v45_slot = (
+        Path(validation.V45_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT) / slot_id
+    )
     assert validation._is_excluded_coverage_smoke_slot(
         v44_slot,
         manifest_id=validation.V44_MANIFEST_ID,
     )
     assert validation._is_excluded_coverage_smoke_slot(
         v45_slot,
-        manifest_id=validation.FROZEN_MANIFEST_ID,
+        manifest_id=validation.V45_MANIFEST_ID,
     )
     assert not validation._is_excluded_coverage_smoke_slot(
         v44_slot,
-        manifest_id=validation.FROZEN_MANIFEST_ID,
+        manifest_id=validation.V45_MANIFEST_ID,
     )
     assert not validation._is_excluded_coverage_smoke_slot(
         v45_slot,
         manifest_id=validation.V44_MANIFEST_ID,
+    )
+
+
+def test_validator_v46_identities_remain_zero_locked_and_path_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+    zero_six = ("0" * 64,) * 6
+    producer_six = (
+        manifest_module.FROZEN_MANIFEST_SHA256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.FROZEN_PLAN_SHA256,
+        runtime_module.FROZEN_RUNTIME_SHA256,
+        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
+        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+    validator_six = (
+        identity.manifest_sha256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    )
+
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v46"
+    assert producer_six == validator_six == zero_six
+
+    manifest_payload = V46_MANIFEST_PATH.read_bytes()
+    with monkeypatch.context() as candidate_patch:
+        manifest, plan = _v46_candidate_plan(candidate_patch)
+        campaign_runtime = build_factorial_runtime(plan)
+        smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+        primary = next(
+            slot for slot in plan.slots if slot.execution_ordinal == 1
+        )
+        repair = next(
+            slot for slot in plan.slots if slot.execution_ordinal == 5
+        )
+        coverage = execution.build_n31_coverage_smoke_slot(
+            primary,
+            repair_template=repair,
+        )
+        disk_six = (
+            hashlib.sha256(manifest_payload).hexdigest(),
+            hashlib.sha256(
+                _canonical(json.loads(manifest_payload))
+            ).hexdigest(),
+            plan.plan_sha256,
+            hashlib.sha256(
+                canonical_runtime_bytes(campaign_runtime)
+            ).hexdigest(),
+            hashlib.sha256(
+                execution._canonical_json_bytes(smoke.runtime.as_document())
+            ).hexdigest(),
+            hashlib.sha256(
+                execution._canonical_json_bytes(
+                    coverage.runtime.as_document()
+                )
+            ).hexdigest(),
+        )
+
+    assert manifest.manifest_id == validation.FROZEN_MANIFEST_ID
+    assert all(value != "0" * 64 for value in disk_six)
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v46-coverage-smoke"
+
+    slot_id = validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    v45_slot = (
+        Path(validation.V45_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT) / slot_id
+    )
+    v46_slot = Path(validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT) / slot_id
+    assert validation._is_excluded_coverage_smoke_slot(
+        v46_slot,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v45_slot,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v46_slot,
+        manifest_id=validation.V45_MANIFEST_ID,
     )
 
 
@@ -2681,6 +2778,18 @@ def test_v19_through_v22_future_tree_delivery_dispatch_is_exact() -> None:
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT,
         )
     )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
+            validation.V45_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
+            validation.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V3,
+        )
+    )
     assert not validation._uses_future_tree_proposal_delivery_contract(
         manifest(
             validation.V18_MANIFEST_ID,
@@ -2696,14 +2805,36 @@ def test_v19_through_v22_future_tree_delivery_dispatch_is_exact() -> None:
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT + "-forged",
         )
     )
+    assert not validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
+            validation.V45_MANIFEST_ID,
+            validation.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V3,
+        )
+    )
+    assert not validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
+            validation.FROZEN_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        )
+    )
 
 
 def test_v20_through_v24_source_bound_proposal_witness_dispatch_is_exact() -> None:
-    contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
-    assert contract == (
+    historical_contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+    v46_contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+    assert historical_contract == (
         "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
         "keys_are_native_proposal_configuration_witnesses_after_exact_topology_"
         "validation_v1"
+    )
+    assert v46_contract == (
+        "strictly_bijected_source_bound_fault_contribution_opportunity_proposal_"
+        "keys_are_native_proposal_configuration_witnesses_after_exact_topology_"
+        "validation_with_authenticated_first_admitted_proposal_source_equal_to_the_"
+        "exact_physical_parent_and_successful_parent_response_attempt_arm_preceding_"
+        "proposal_exposure_with_arm_start_not_after_the_child_marker_while_"
+        "nonphysical_root_repair_ingress_is_omission_ineligible_and_evidence_arm_"
+        "failure_poison_does_not_gate_consensus_transport_v2"
     )
 
     def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
@@ -2716,28 +2847,40 @@ def test_v20_through_v24_source_bound_proposal_witness_dispatch_is_exact() -> No
         )
 
     assert validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.V20_MANIFEST_ID, contract)
+        manifest(validation.V20_MANIFEST_ID, historical_contract)
     )
     assert validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.V21_MANIFEST_ID, contract)
+        manifest(validation.V21_MANIFEST_ID, historical_contract)
     )
     assert validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.V22_MANIFEST_ID, contract)
+        manifest(validation.V22_MANIFEST_ID, historical_contract)
     )
     assert validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.V23_MANIFEST_ID, contract)
+        manifest(validation.V23_MANIFEST_ID, historical_contract)
     )
     assert validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.V41_MANIFEST_ID, contract)
+        manifest(validation.V41_MANIFEST_ID, historical_contract)
+    )
+    assert validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.V45_MANIFEST_ID, historical_contract)
+    )
+    assert validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, v46_contract)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.V19_MANIFEST_ID, contract)
+        manifest(validation.V19_MANIFEST_ID, historical_contract)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
         manifest(validation.V20_MANIFEST_ID, None)
     )
     assert not validation._uses_source_bound_proposal_witness_contract(
-        manifest(validation.V20_MANIFEST_ID, contract + "-forged")
+        manifest(validation.V20_MANIFEST_ID, historical_contract + "-forged")
+    )
+    assert not validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.V45_MANIFEST_ID, v46_contract)
+    )
+    assert not validation._uses_source_bound_proposal_witness_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, historical_contract)
     )
 
 
@@ -3020,6 +3163,77 @@ def test_v20_through_v24_bind_source_bound_witness_to_runtime_identity_and_accep
             expected_by_id[slot.slot_id],
             missing_manifest_contract,
         )
+
+
+def test_v45_v46_source_contract_runtime_dispatch_is_version_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    v45_manifest = load_frozen_manifest(V45_MANIFEST_PATH)
+    v45_runtime = build_factorial_runtime(build_factorial_plan(v45_manifest))
+    with monkeypatch.context() as candidate_patch:
+        v46_manifest, v46_plan = _v46_candidate_plan(candidate_patch)
+        v46_runtime = build_factorial_runtime(v46_plan)
+
+    cases = (
+        (
+            v45_manifest,
+            v45_runtime,
+            validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        ),
+        (
+            v46_manifest,
+            v46_runtime,
+            validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2,
+            validation.FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V3,
+        ),
+    )
+    documents: list[dict[str, object]] = []
+    for manifest, runtime, source_contract, future_contract in cases:
+        expected_by_id = {
+            expected.slot_id: expected
+            for expected in validation._expected_slots(manifest)
+        }
+        slot = runtime.slots[0]
+        document = json.loads(json.dumps(slot.as_document()))
+        causal_acceptance = document["causal_acceptance"]
+        assert isinstance(causal_acceptance, dict)
+        assert (
+            causal_acceptance["source_bound_proposal_witness_contract"]
+            == source_contract
+        )
+        assert (
+            causal_acceptance["future_tree_proposal_delivery_contract"]
+            == future_contract
+        )
+        validation._validate_runtime_slot(
+            document,
+            expected_by_id[slot.slot_id],
+            manifest,
+        )
+        documents.append(document)
+
+    for index, (manifest, runtime, _source_contract, _future_contract) in enumerate(
+        cases
+    ):
+        slot = runtime.slots[0]
+        expected = {
+            value.slot_id: value
+            for value in validation._expected_slots(manifest)
+        }[slot.slot_id]
+        crossed = copy.deepcopy(documents[index])
+        crossed_acceptance = crossed["causal_acceptance"]
+        assert isinstance(crossed_acceptance, dict)
+        other_acceptance = documents[1 - index]["causal_acceptance"]
+        assert isinstance(other_acceptance, dict)
+        crossed_acceptance["source_bound_proposal_witness_contract"] = (
+            other_acceptance["source_bound_proposal_witness_contract"]
+        )
+        with pytest.raises(
+            FactorialValidationError,
+            match="causal acceptance contract",
+        ):
+            validation._validate_runtime_slot(crossed, expected, manifest)
 
 
 @pytest.mark.parametrize(
@@ -5065,13 +5279,17 @@ def test_v44_retention_ready_selects_later_exact_causal_facts_independently(
     )
 
 
-def test_validate_slot_dispatches_v44_v45_only_to_independent_causal_selection(
+def test_validate_slot_dispatches_v44_v45_v46_to_independent_causal_selection(
 ) -> None:
     source = inspect.getsource(validation.validate_slot)
     dispatch = """retention_validator = (
                 _validate_v44_cross_commit_retention_ready
                 if manifest.manifest_id
-                in {V44_MANIFEST_ID, FROZEN_MANIFEST_ID}
+                in {
+                    V44_MANIFEST_ID,
+                    V45_MANIFEST_ID,
+                    FROZEN_MANIFEST_ID,
+                }
                 else _validate_v42_cross_commit_retention_ready
             )"""
 
@@ -5552,7 +5770,11 @@ def _assert_v42_plus_runtime_retention_scope_partition(
         }
         if (
             manifest.manifest_id
-            in {validation.V44_MANIFEST_ID, validation.FROZEN_MANIFEST_ID}
+            in {
+                validation.V44_MANIFEST_ID,
+                validation.V45_MANIFEST_ID,
+                validation.FROZEN_MANIFEST_ID,
+            }
             and not repair_runtime
         ):
             expected_fields.update(
@@ -5627,14 +5849,24 @@ def test_v45_runtime_retention_scope_partition_is_exact(
     )
 
 
+def test_v46_runtime_retention_scope_partition_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_v42_plus_runtime_retention_scope_partition(
+        *_v46_candidate_plan(monkeypatch)
+    )
+
+
 @pytest.mark.parametrize(
     ("source_candidate", "other_candidate"),
     (
         (_v44_candidate_plan, _v45_candidate_plan),
         (_v45_candidate_plan, _v44_candidate_plan),
+        (_v45_candidate_plan, _v46_candidate_plan),
+        (_v46_candidate_plan, _v45_candidate_plan),
     ),
 )
-def test_v44_v45_runtime_paths_and_artifact_identities_are_cross_closed(
+def test_v44_v45_v46_runtime_paths_and_artifact_identities_are_cross_closed(
     monkeypatch: pytest.MonkeyPatch,
     source_candidate,
     other_candidate,
@@ -5676,9 +5908,9 @@ def test_v44_v45_runtime_paths_and_artifact_identities_are_cross_closed(
 
 @pytest.mark.parametrize(
     "candidate_plan",
-    (_v44_candidate_plan, _v45_candidate_plan),
+    (_v44_candidate_plan, _v45_candidate_plan, _v46_candidate_plan),
 )
-def test_v44_v45_s037_stays_legacy_v6_delta_v5_and_n7_stays_ungated(
+def test_v44_v45_v46_s037_stays_legacy_v6_delta_v5_and_n7_stays_ungated(
     monkeypatch: pytest.MonkeyPatch,
     candidate_plan,
 ) -> None:
@@ -5735,7 +5967,10 @@ def test_v44_v45_s037_stays_legacy_v6_delta_v5_and_n7_stays_ungated(
         ("extra", "field set"),
     ),
 )
-@pytest.mark.parametrize("manifest_version", ("v42", "v43", "v44", "v45"))
+@pytest.mark.parametrize(
+    "manifest_version",
+    ("v42", "v43", "v44", "v45", "v46"),
+)
 def test_v42_plus_runtime_retention_contract_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
@@ -5747,6 +5982,7 @@ def test_v42_plus_runtime_retention_contract_fails_closed(
         "v43": _v43_candidate_plan,
         "v44": _v44_candidate_plan,
         "v45": _v45_candidate_plan,
+        "v46": _v46_candidate_plan,
     }[manifest_version]
     manifest, plan = candidate_plan(monkeypatch)
     spec = build_factorial_runtime(plan).slots[0]
@@ -5795,9 +6031,9 @@ def test_v42_plus_runtime_retention_contract_fails_closed(
 @pytest.mark.parametrize("mutation", ("missing", "wrong"))
 @pytest.mark.parametrize(
     "candidate_plan",
-    (_v44_candidate_plan, _v45_candidate_plan),
+    (_v44_candidate_plan, _v45_candidate_plan, _v46_candidate_plan),
 )
-def test_v44_v45_runtime_two_stage_retention_contract_fails_closed(
+def test_v44_v45_v46_runtime_two_stage_retention_contract_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
     mutation: str,
@@ -5833,6 +6069,7 @@ def test_v44_v45_runtime_two_stage_retention_contract_fails_closed(
         validation.V42_MANIFEST_ID,
         validation.V43_MANIFEST_ID,
         validation.V44_MANIFEST_ID,
+        validation.V45_MANIFEST_ID,
         validation.FROZEN_MANIFEST_ID,
     ),
 )
@@ -8278,6 +8515,102 @@ def test_v9_response_attempt_arm_parser_rejects_source_reporter_mismatch(
         )
 
 
+def _v46_process_log_runtime() -> dict[str, object]:
+    return {
+        "process_logs": {
+            "manager_stdout_relative_path": "manager.stdout.log",
+            "manager_stderr_relative_path": "manager.stderr.log",
+            "replica_stdout_relative_paths": ["replica-0.stdout.log"],
+            "replica_stderr_relative_paths": ["replica-0.stderr.log"],
+            "kauri_fault_marker_relative_paths": [
+                "replica-0.stdout.log",
+                "replica-0.stderr.log",
+            ],
+            "exclusive_output_per_process": True,
+        }
+    }
+
+
+def _write_v46_process_logs(slot_root: Path, payload: bytes) -> None:
+    slot_root.mkdir(parents=True)
+    for relative in (
+        "manager.stdout.log",
+        "manager.stderr.log",
+        "replica-0.stdout.log",
+        "replica-0.stderr.log",
+    ):
+        (slot_root / relative).write_bytes(
+            payload if relative == "replica-0.stderr.log" else b"clean\n"
+        )
+
+
+@pytest.mark.parametrize(
+    "slot_id",
+    (
+        validation.EXCLUDED_SMOKE_SLOT_ID,
+        "slot-001-n31-f5-b01-00",
+        validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+        "slot-037-n31-f2-b04-00",
+    ),
+    ids=("n7", "campaign", "s066", "s037"),
+)
+@pytest.mark.parametrize(
+    "poison",
+    (
+        b"response_deadline_evidence_failed\n",
+        b"Adaptive-v2 convergence evidence unhealthy: deadline_arm_failed\n",
+        b"response_deadline_evidence_failed response_deadline_evidence_failed\n",
+        b"malformed:Adaptive-v2 convergence evidence unhealthy\x00\n",
+    ),
+    ids=("deadline", "unhealthy", "duplicate", "malformed"),
+)
+def test_v46_global_process_poison_gate_covers_every_slot_scope(
+    tmp_path: Path,
+    slot_id: str,
+    poison: bytes,
+) -> None:
+    slot_root = tmp_path / slot_id
+    _write_v46_process_logs(slot_root, poison)
+
+    with pytest.raises(FactorialValidationError, match="v46.*poison"):
+        validation._validate_v46_global_process_log_poison_gate(
+            slot_root,
+            manifest_id=validation.FROZEN_MANIFEST_ID,
+            runtime=_v46_process_log_runtime(),
+        )
+
+
+def test_v46_global_process_poison_gate_is_clean_and_version_exact(
+    tmp_path: Path,
+) -> None:
+    slot_root = tmp_path / validation.EXCLUDED_SMOKE_SLOT_ID
+    _write_v46_process_logs(slot_root, b"clean\n")
+    runtime = _v46_process_log_runtime()
+
+    validation._validate_v46_global_process_log_poison_gate(
+        slot_root,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+        runtime=runtime,
+    )
+    (slot_root / "replica-0.stderr.log").write_bytes(
+        b"response_deadline_evidence_failed\n"
+    )
+    validation._validate_v46_global_process_log_poison_gate(
+        slot_root,
+        manifest_id=validation.V45_MANIFEST_ID,
+        runtime=runtime,
+    )
+
+
+def test_v46_global_process_poison_gate_is_on_the_common_pass_path() -> None:
+    source = inspect.getsource(validation.validate_slot)
+    call = "_validate_v46_global_process_log_poison_gate("
+
+    assert source.count(call) == 1
+    assert source.index("_validate_materialized_configs(") < source.index(call)
+    assert source.index(call) < source.index("event_contract =")
+
+
 def test_full_causal_gate_rejects_disjoint_persistent_interior_proposals() -> None:
     replica_count = 13
     actors = (9, 10, 12)
@@ -9036,6 +9369,168 @@ def test_v14_opportunity_parser_rejects_schema_source_and_generation(
 
     with pytest.raises(FactorialValidationError, match=message):
         validation._fault_contribution_opportunities({2: (event,)})
+
+
+def test_v46_opportunity_parser_requires_authenticated_first_source_exactly() -> None:
+    tree = Tree(0, 2, 2, (0, 2, 1), ())
+    marker = _v14_marker(
+        actor=2,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest="11" * 32,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    historical_event = _v14_opportunity_event(marker, tree)
+    v46_event = _v14_opportunity_event(
+        marker,
+        tree,
+        payload_overrides={"authenticated_proposal_source_replica": 0},
+    )
+
+    historical = validation._fault_contribution_opportunities(
+        {2: (historical_event,)},
+        source_bound_proposal_witness_contract=(
+            validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+        ),
+    )
+    assert historical[0].authenticated_proposal_source_replica is None
+    with pytest.raises(FactorialValidationError, match="payload schema"):
+        validation._fault_contribution_opportunities(
+            {2: (v46_event,)},
+            source_bound_proposal_witness_contract=(
+                validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1
+            ),
+        )
+    with pytest.raises(FactorialValidationError, match="payload schema"):
+        validation._fault_contribution_opportunities(
+            {2: (historical_event,)},
+            source_bound_proposal_witness_contract=(
+                validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+            ),
+        )
+
+    parsed = validation._fault_contribution_opportunities(
+        {2: (v46_event,)},
+        source_bound_proposal_witness_contract=(
+            validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+        ),
+    )
+    assert parsed[0].authenticated_proposal_source_replica == 0
+
+    for malformed in (True, -1, "0"):
+        event = _v14_opportunity_event(
+            marker,
+            tree,
+            payload_overrides={
+                "authenticated_proposal_source_replica": malformed,
+            },
+        )
+        with pytest.raises(FactorialValidationError):
+            validation._fault_contribution_opportunities(
+                {2: (event,)},
+                source_bound_proposal_witness_contract=(
+                    validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+                ),
+            )
+
+
+def test_v46_opportunity_rejects_root_repair_false_join_and_duplicate_source() -> None:
+    tree = Tree(0, 2, 2, (0, 2, 1, 3, 4, 5, 6), ())
+    marker = _v14_marker(
+        actor=3,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest="11" * 32,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    physical_parent = tree.members[(tree.members.index(marker.actor) - 1) // tree.fanout]
+    valid_event = _v14_opportunity_event(
+        marker,
+        tree,
+        payload_overrides={
+            "authenticated_proposal_source_replica": physical_parent,
+        },
+    )
+    root_repair_event = _v14_opportunity_event(
+        marker,
+        tree,
+        payload_overrides={"authenticated_proposal_source_replica": tree.members[0]},
+    )
+    contract = validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+    bijection_arguments = {
+        "markers": (marker,),
+        "fault_actor_ids": (marker.actor,),
+        "phase_windows": {"fault_evidence": (100, 700, 6)},
+        "phase_configurations": (
+            ("fault_evidence", 0, marker.epoch_digest, {0: tree}),
+        ),
+        "source_bound_proposal_witness_contract": contract,
+    }
+    valid_opportunities = validation._fault_contribution_opportunities(
+        {marker.actor: (valid_event,)},
+        source_bound_proposal_witness_contract=contract,
+    )
+    validation._validate_fault_contribution_opportunity_bijection(
+        opportunities=valid_opportunities,
+        **bijection_arguments,
+    )
+
+    opportunities = validation._fault_contribution_opportunities(
+        {marker.actor: (root_repair_event,)},
+        source_bound_proposal_witness_contract=contract,
+    )
+    with pytest.raises(
+        FactorialValidationError,
+        match="authenticated.*source.*physical parent",
+    ):
+        validation._validate_fault_contribution_opportunity_bijection(
+            opportunities=opportunities,
+            **bijection_arguments,
+        )
+
+    with pytest.raises(FactorialValidationError, match="duplicate"):
+        validation._fault_contribution_opportunities(
+            {marker.actor: (valid_event, root_repair_event)},
+            source_bound_proposal_witness_contract=contract,
+        )
+
+
+def test_v46_opportunity_rejects_unexpected_extra_field() -> None:
+    tree = Tree(0, 2, 2, (0, 2, 1), ())
+    marker = _v14_marker(
+        actor=2,
+        tree=tree,
+        epoch_number=0,
+        epoch_digest="11" * 32,
+        block_ordinal=1,
+        monotonic_ns=300,
+        cohort="responsive_degraded",
+        contribution_ordinal=1,
+        role_contribution_ordinal=1,
+    )
+    event = _v14_opportunity_event(
+        marker,
+        tree,
+        payload_overrides={
+            "authenticated_proposal_source_replica": 0,
+            "unexpected": 1,
+        },
+    )
+    with pytest.raises(FactorialValidationError, match="payload schema"):
+        validation._fault_contribution_opportunities(
+            {2: (event,)},
+            source_bound_proposal_witness_contract=(
+                validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -10683,6 +11178,14 @@ def test_timeout_causality_excludes_only_exact_arms_maturing_after_selection(
     }
 
     assert validate_fault_causality(**explicit_arguments) == 0
+    assert validate_fault_causality(
+        **{
+            **explicit_arguments,
+            "source_bound_proposal_witness_contract": (
+                validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+            ),
+        }
+    ) == 0
 
     marker_by_hash = {marker.block_hash: marker for marker in original_markers}
     raced_arm_markers = tuple(
@@ -10716,6 +11219,20 @@ def test_timeout_causality_excludes_only_exact_arms_maturing_after_selection(
             "accepted_epoch1": raced_timeouts,
         }
     ) == 0
+    with pytest.raises(
+        FactorialValidationError,
+        match="response-attempt arm starts after its child omission marker",
+    ):
+        validate_fault_causality(
+            **{
+                **explicit_arguments,
+                "arm_markers": raced_arm_markers,
+                "accepted_epoch1": raced_timeouts,
+                "source_bound_proposal_witness_contract": (
+                    validation.SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V2
+                ),
+            }
+        )
 
     equality_arm = replace(
         arm_markers[-1],
@@ -16088,6 +16605,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
+    assert validation._coverage_smoke_slot_ids(validation.V45_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
     assert validation._coverage_smoke_slot_ids(
         validation.FROZEN_MANIFEST_ID
     ) == (
@@ -16123,6 +16644,8 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         validation.V38_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V40_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V41_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        validation.V45_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
     ),
 )
 def test_v25_plus_coverage_membership_is_preserved_before_static_load(

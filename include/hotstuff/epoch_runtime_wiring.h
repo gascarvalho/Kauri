@@ -55,6 +55,9 @@ public:
     std::optional<FutureProposalClaim> claim_next(
         const ConfigurationId &configuration) override;
     void process_active(const FutureProposalClaim &claim) override;
+    bool process_active(
+        const FutureProposalClaim &claim,
+        ProposalProcessingCompletion completion) override;
     void acknowledge(std::uint64_t token) noexcept override;
     void release(std::uint64_t token) noexcept override;
     void complete(

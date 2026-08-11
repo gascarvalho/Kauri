@@ -204,7 +204,7 @@ def test_v20_is_validation_only_and_keeps_ordered_fresh_roots(
     assert cli.DEFAULT_MANIFEST != V20_MANIFEST
     assert cli.main(["--manifest", str(V20_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v44 are validation-only" in refusal["reason"]
+    assert "v1 through v45 are validation-only" in refusal["reason"]
 
     plan = build_factorial_plan(load_frozen_manifest(V20_MANIFEST))
     n7 = execution.build_n7_ps_smoke_slot(plan.slots[0])

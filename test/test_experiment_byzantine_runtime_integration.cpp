@@ -52,6 +52,21 @@ public:
     static void seed_view_generation(
         HotStuffBase &runtime,
         const ProposalKey &key,
+        std::uint64_t generation = 1,
+        ReplicaID authenticated_proposal_source_replica = 0)
+    {
+        runtime.proposal_view_generations.insert_or_assign(
+            key, generation);
+        runtime.authenticated_proposal_ingress.insert_or_assign(
+            key,
+            HotStuffBase::AuthenticatedProposalIngress{
+                generation,
+                authenticated_proposal_source_replica});
+    }
+
+    static void seed_view_generation_without_source(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
         std::uint64_t generation = 1)
     {
         runtime.proposal_view_generations.insert_or_assign(
@@ -114,6 +129,26 @@ public:
     {
         return runtime.proposal_view_generations.find(key) !=
                runtime.proposal_view_generations.end();
+    }
+
+    static bool has_authenticated_proposal_ingress(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.authenticated_proposal_ingress.find(key) !=
+               runtime.authenticated_proposal_ingress.end();
+    }
+
+    static void purge_exact_runtime_state(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        bool preserve_scheduled_vote_fallback,
+        bool preserve_response_evidence_until_deadline)
+    {
+        runtime.purge_pending_exact_contributions(
+            key,
+            preserve_scheduled_vote_fallback,
+            preserve_response_evidence_until_deadline);
     }
 
     static std::size_t runtime_initialization_count(
@@ -186,7 +221,7 @@ public:
             HotStuffBase::PendingAdaptiveV2Commit{
                 block_hash,
                 std::move(committed_key),
-                std::nullopt,
+                std::uint64_t{1},
                 HotStuffBase::CommittedProposalIdentityDisposition::exact};
     }
 
@@ -198,9 +233,214 @@ public:
 
     static void report_committed(
         HotStuffBase &runtime,
-        std::optional<ProposalKey> committed_key)
+        std::optional<ProposalKey> committed_key,
+        bool initialization_predecessor_required = true)
     {
-        runtime.report_adaptive_v2_committed(committed_key);
+        runtime.report_adaptive_v2_committed(
+            committed_key, initialization_predecessor_required);
+    }
+
+    static void retry_ready_commits(HotStuffBase &runtime)
+    {
+        runtime.retry_ready_adaptive_v2_commit_reports();
+    }
+
+    static bool has_durable_commit(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.has_durable_adaptive_v2_commit_report(key);
+    }
+
+    static EvidenceTransportResult enqueue_evidence(
+        HotStuffBase &runtime,
+        const EvidenceReportEnvelope &report)
+    {
+        return runtime.enqueue_adaptive_v2_evidence_report(report);
+    }
+
+    static bool contains_admitted(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.proposal_admission != nullptr &&
+               runtime.proposal_admission->contains_admitted(key);
+    }
+
+    static ProposalContextStatus context_status(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.proposal_contexts->context_status(key);
+    }
+
+    static void reject_response_deadline_scheduling(
+        HotStuffBase &runtime)
+    {
+        if (runtime.adaptive_v2_response_evidence == nullptr)
+            throw std::invalid_argument(
+                "adaptive-v2 response evidence is unavailable");
+        runtime.adaptive_v2_response_evidence->bind_deadline_scheduler(
+            [](const ProposalKey &,
+               std::uint64_t,
+               EvidenceDeadlineCallback,
+               EvidenceDeadlineFailureCallback) {
+                return EvidenceDeadlineCancellation{};
+            });
+    }
+
+    static void remove_response_evidence_bridge(
+        HotStuffBase &runtime)
+    {
+        runtime.adaptive_v2_response_evidence.reset();
+    }
+
+    static bool admit_exact_context(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        const auto metadata = runtime.exact_context_metadata(key);
+        return metadata.has_value() &&
+               runtime.proposal_contexts->admit_remote(*metadata)
+                   .has_value();
+    }
+
+    static bool admit_context_with_tree(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        ProposalTreeSnapshot tree)
+    {
+        return runtime.proposal_contexts
+            ->admit_remote(ProposalContextMetadata{
+                key, std::move(tree), 5})
+            .has_value();
+    }
+
+    static void close_exact_context(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.proposal_contexts->close(
+            key, ProposalContextEvent::proposal_aborted);
+    }
+
+    static bool start_response_attempt_arm(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.start_latency_deadline(key);
+    }
+
+    static void start_aggregation_timer(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.start_aggregation_timer(key);
+    }
+
+    static void remove_aggregation_timeout_coordinator(
+        HotStuffBase &runtime)
+    {
+        runtime.aggregation_timeout_coordinator.reset();
+    }
+
+    static void attempt_evidence_before_exposure(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.attempt_proposal_evidence_before_exposure(
+            key, "test_response_attempt_arm_failed");
+    }
+
+    static void ensure_finalized_evidence_before_exposure(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        runtime.ensure_finalized_proposal_evidence_before_exposure(
+            key, "test_finalized_response_attempt_arm_failed");
+    }
+
+    static bool has_successful_response_attempt_arm(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.has_successful_response_attempt_arm(key);
+    }
+
+    static bool has_response_attempt_arm_failure(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.response_attempt_arm_failure_markers.count(key) != 0;
+    }
+
+    static std::size_t response_attempt_arm_failure_count(
+        const HotStuffBase &runtime)
+    {
+        return runtime.response_attempt_arm_failure_markers.size();
+    }
+
+    static void replace_aggregation_scheduler(
+        HotStuffBase &runtime,
+        std::unique_ptr<AggregationScheduler> scheduler)
+    {
+        runtime.aggregation_scheduler = std::move(scheduler);
+    }
+
+    static ProposalAdmissionResult receive_delayed_proposal(
+        HotStuffBase &runtime,
+        const ConfigurationId &configuration,
+        ReplicaID proposer,
+        const block_t &block,
+        std::uint64_t view_generation = 1)
+    {
+        if (runtime.proposal_admission == nullptr || block == nullptr)
+            throw std::invalid_argument(
+                "delayed proposal admission is unavailable");
+        Proposal proposal(
+            proposer,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            block,
+            &runtime);
+        MsgPropose native(proposal);
+        const auto body = static_cast<bytearray_t>(native.serialized);
+        BufferedProposal buffered{
+            proposal.metadata(),
+            body,
+            runtime.config.get_peer_id(proposer),
+            view_generation,
+            DataStream(body).get_hash(),
+            body};
+        return runtime.proposal_admission->receive(std::move(buffered));
+    }
+
+    static void consensus_with_direct_certifier(
+        HotStuffBase &runtime,
+        const block_t &block,
+        const quorum_cert_bt &certifier)
+    {
+        runtime.do_consensus_with_identity_provenance(
+            block,
+            certifier,
+            HotStuffBase::CommittedProposalIdentityProvenance::
+                verified_direct_certifier);
+    }
+
+    static void resolve_fetched_block(
+        HotStuffBase &runtime,
+        const block_t &block)
+    {
+        const auto fetched = runtime.storage->add_blk(block);
+        runtime.on_fetch_blk(fetched);
+    }
+
+    static bool is_block_delivered(
+        const HotStuffBase &runtime,
+        const uint256_t &block_hash)
+    {
+        return runtime.storage->is_blk_delivered(block_hash);
     }
 
     static ConfigurationId initialize_active_runtime(
@@ -439,6 +679,22 @@ protected:
     void state_machine_execute(const Finality &) override {}
 };
 
+class RelayRecordingHotStuff final : public HotStuffNoSig
+{
+public:
+    using HotStuffNoSig::HotStuffNoSig;
+
+    std::size_t relay_count() const noexcept { return relay_count_; }
+
+protected:
+    void state_machine_execute(const Finality &) override {}
+
+private:
+    void relay_once(const BufferedProposal &) override { ++relay_count_; }
+
+    std::size_t relay_count_{0};
+};
+
 class ActiveRuntimePaceMaker final : public PaceMakerDummy
 {
 public:
@@ -447,6 +703,23 @@ public:
 
     size_t get_current_tid() override { return 0; }
     size_t get_current_epoch() override { return 0; }
+};
+
+class ThrowingAggregationScheduler final : public AggregationScheduler
+{
+public:
+    Duration monotonic_now() const noexcept override
+    {
+        return Duration::zero();
+    }
+
+    Cancellation schedule_after(Duration, Callback) override
+    {
+        ++attempts;
+        throw std::runtime_error("test aggregation scheduler failure");
+    }
+
+    std::size_t attempts{0};
 };
 
 class RecordingOpportunityAuditEmitter final
@@ -620,6 +893,80 @@ ProposalKey proposal_key(
         digest(block_label)};
 }
 
+EvidenceReportEnvelope evidence_report(
+    const ProposalKey &key,
+    ReplicaID observed_replica = 2,
+    std::uint64_t initial_reporter_sequence = 0)
+{
+    EvidenceReporterConfig config;
+    config.trusted_reporter_id = 1;
+    config.initial_reporter_sequence = initial_reporter_sequence;
+    config.initial_reporter_monotonic_ns =
+        initial_reporter_sequence == 0 ? 0 : 999;
+    EvidenceReporter reporter(config);
+    ResponseAttemptFact fact;
+    fact.key = ResponseAttemptKey{
+        key, observed_replica, ExpectedMessageType::direct_vote};
+    fact.outcome = ResponseOutcome::on_time;
+    fact.response_duration_us = 50;
+    fact.deadline_duration_us = 100;
+    fact.fact_monotonic_ns = 1'000;
+    fact.signer_set = {observed_replica};
+    REQUIRE(reporter.enqueue(fact));
+    REQUIRE(reporter.front() != nullptr);
+    return reporter.front()->envelope;
+}
+
+void deliver_and_release(
+    AdaptiveV2ReportingOutbox &outbox,
+    std::uint64_t now)
+{
+    const auto attempt = outbox.begin_delivery(now);
+    REQUIRE(attempt.status == AdaptiveV2ReportingAttemptStatus::started);
+    REQUIRE(attempt.token.has_value());
+    REQUIRE(attempt.report != nullptr);
+    const auto report_id = attempt.report->report_id;
+    REQUIRE(outbox.acknowledge_delivery(
+                *attempt.token,
+                AdaptiveV2ReportingDeliveryResult::delivered,
+                now) ==
+            AdaptiveV2ReportingTransitionStatus::delivered);
+    REQUIRE(outbox.release_terminal(report_id) ==
+            AdaptiveV2ReportingReleaseStatus::released);
+}
+
+struct DelayedProposalBlocks
+{
+    block_t missing_parent;
+    block_t proposal;
+};
+
+DelayedProposalBlocks delayed_proposal_blocks(
+    HotStuffBase &runtime,
+    const std::string &label)
+{
+    const auto genesis = runtime.get_genesis();
+    block_t missing_parent = new Block(
+        std::vector<block_t>{genesis},
+        std::vector<uint256_t>{digest(label + "-parent-command")},
+        ExperimentByzantineRuntimeIntegrationTestAccess::
+            genesis_parent_certificate(runtime),
+        bytearray_t{},
+        1,
+        genesis,
+        nullptr);
+    block_t proposal = new Block(
+        std::vector<block_t>{missing_parent},
+        std::vector<uint256_t>{digest(label + "-proposal-command")},
+        ExperimentByzantineRuntimeIntegrationTestAccess::
+            genesis_parent_certificate(runtime),
+        bytearray_t{},
+        2,
+        genesis,
+        nullptr);
+    return {missing_parent, proposal};
+}
+
 block_t indirect_commit_block(
     TestHotStuff &runtime,
     const std::string &label)
@@ -772,6 +1119,526 @@ TEST_CASE(
     CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
     CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
     CHECK(outbox->diagnostics().pending_reports == 0);
+}
+
+TEST_CASE(
+    "exact authoritative commit without a local context stays proposal local",
+    "[adaptive-v2][evidence][commit][no-local-context]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    auto &outbox = Access::reset_reporting_outbox(runtime);
+    const auto prior_evidence = evidence_report(
+        proposal_key(7, "prior-evidence", "prior-evidence"));
+    REQUIRE(outbox.enqueue_evidence(prior_evidence.canonical_payload) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    deliver_and_release(outbox, 1);
+    const auto committed =
+        proposal_key(7, "commit-without-context", "commit-without-context");
+    Access::seed_pending_commit(runtime, committed.block_hash, committed);
+
+    Access::report_committed(runtime, committed, false);
+
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK(Access::convergence_evidence_healthy(runtime));
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, committed));
+    REQUIRE(outbox.diagnostics().pending_reports == 1);
+    REQUIRE(outbox.front() != nullptr);
+    REQUIRE(outbox.front()->stream ==
+            AdaptiveV2ReportingStream::lifecycle);
+    const auto decoded = decode_proposal_lifecycle_notice(
+        outbox.front()->canonical_payload,
+        ProposalLifecycleWireLimits{});
+    REQUIRE(decoded);
+    REQUIRE(std::holds_alternative<ProposalCommitted>(
+        decoded.notice->fact));
+    const auto &fact =
+        std::get<ProposalCommitted>(decoded.notice->fact);
+    CHECK(fact.proposal == committed);
+    CHECK(fact.evidence_sequence_fence == 1);
+
+    const auto later =
+        proposal_key(7, "later-context", "later-context");
+    Access::report_runtime_initialized(runtime, later);
+    REQUIRE(Access::enqueue_evidence(runtime, evidence_report(later, 2, 1)) ==
+            EvidenceTransportResult::accepted);
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK(Access::convergence_evidence_healthy(runtime));
+    CHECK(outbox.diagnostics().pending_reports == 3);
+}
+
+TEST_CASE(
+    "commit initialization exceptions preserve the fail-closed boundary",
+    "[adaptive-v2][evidence][commit][initialization][fail-closed]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    auto &outbox = Access::reset_reporting_outbox(runtime);
+    const auto committed =
+        proposal_key(7, "missing-init", "missing-init");
+    Access::seed_pending_commit(runtime, committed.block_hash, committed);
+
+    SECTION("ordinary local-context commits still require initialization")
+    {
+        Access::report_committed(runtime, committed, true);
+    }
+    SECTION("a false-report state contradicts an absent local context")
+    {
+        Access::seed_deferred_false_report(runtime, committed);
+        Access::report_committed(runtime, committed, false);
+    }
+    SECTION("a deferred response state contradicts an absent local context")
+    {
+        Access::seed_unsuppressed_commit(runtime, committed);
+        Access::report_committed(runtime, committed, false);
+    }
+
+    CHECK(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(outbox.diagnostics().pending_reports == 0);
+}
+
+TEST_CASE(
+    "absent-context commit survives outbox backpressure exactly once",
+    "[adaptive-v2][evidence][commit][no-local-context][backpressure]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    auto &outbox = Access::reset_reporting_outbox(runtime, 1);
+    const ConfigurationId active{
+        7, 0, digest("backpressure-active")};
+    REQUIRE(outbox.enqueue_readiness(active, 1, 0) ==
+            AdaptiveV2ReportingEnqueueStatus::queued);
+    const auto committed = proposal_key(
+        7, "backpressure-commit", "backpressure-commit");
+    Access::seed_pending_commit(runtime, committed.block_hash, committed);
+
+    Access::report_committed(runtime, committed, false);
+
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK(Access::convergence_evidence_healthy(runtime));
+    CHECK(Access::has_durable_commit(runtime, committed));
+    CHECK(outbox.diagnostics().pending_reports == 1);
+
+    deliver_and_release(outbox, 1);
+    Access::retry_ready_commits(runtime);
+
+    CHECK_FALSE(Access::has_durable_commit(runtime, committed));
+    REQUIRE(outbox.diagnostics().pending_reports == 1);
+    REQUIRE(outbox.front() != nullptr);
+    const auto decoded = decode_proposal_lifecycle_notice(
+        outbox.front()->canonical_payload,
+        ProposalLifecycleWireLimits{});
+    REQUIRE(decoded);
+    REQUIRE(std::holds_alternative<ProposalCommitted>(
+        decoded.notice->fact));
+    CHECK(std::get<ProposalCommitted>(decoded.notice->fact).proposal ==
+          committed);
+
+    Access::retry_ready_commits(runtime);
+    CHECK(outbox.diagnostics().pending_reports == 1);
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+}
+
+TEST_CASE(
+    "authoritative absent-context consensus retires delayed admission",
+    "[adaptive-v2][evidence][commit][no-local-context][proposal-retirement]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    RelayRecordingHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    auto &outbox = Access::reset_reporting_outbox(runtime, 4);
+    const auto blocks = delayed_proposal_blocks(
+        runtime, "commit-before-runtime-initialization");
+    const ProposalKey committed{
+        configuration, blocks.proposal->get_hash()};
+    const auto generation = checked_activation_generation(0, 0);
+    REQUIRE(generation.has_value());
+
+    const auto admitted = Access::receive_delayed_proposal(
+        runtime,
+        configuration,
+        0,
+        blocks.proposal,
+        *generation);
+    REQUIRE(admitted.disposition == ProposalDisposition::admitted_active);
+    REQUIRE(Access::contains_admitted(runtime, committed));
+    REQUIRE(Access::context_status(runtime, committed) ==
+            ProposalContextStatus::unknown);
+    CHECK(runtime.relay_count() == 0);
+
+    const auto certifier = Access::direct_certifier(runtime, committed);
+    Access::consensus_with_direct_certifier(
+        runtime, blocks.proposal, certifier);
+
+    CHECK_FALSE(Access::contains_admitted(runtime, committed));
+    CHECK(Access::context_status(runtime, committed) ==
+          ProposalContextStatus::unknown);
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, committed));
+    CHECK(runtime.relay_count() == 0);
+    CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+    CHECK(Access::convergence_evidence_healthy(runtime));
+    REQUIRE(outbox.diagnostics().pending_reports == 1);
+    REQUIRE(outbox.front() != nullptr);
+    const auto decoded = decode_proposal_lifecycle_notice(
+        outbox.front()->canonical_payload,
+        ProposalLifecycleWireLimits{});
+    REQUIRE(decoded);
+    REQUIRE(std::holds_alternative<ProposalCommitted>(
+        decoded.notice->fact));
+    CHECK(std::get<ProposalCommitted>(decoded.notice->fact).proposal ==
+          committed);
+
+    Access::resolve_fetched_block(runtime, blocks.missing_parent);
+    CHECK(Access::is_block_delivered(
+        runtime, blocks.missing_parent->get_hash()));
+    CHECK(Access::is_block_delivered(
+        runtime, blocks.proposal->get_hash()));
+    CHECK_FALSE(Access::contains_admitted(runtime, committed));
+    CHECK(Access::context_status(runtime, committed) ==
+          ProposalContextStatus::unknown);
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, committed));
+    CHECK(runtime.relay_count() == 0);
+    CHECK(outbox.diagnostics().pending_reports == 1);
+
+    const auto replay = Access::receive_delayed_proposal(
+        runtime,
+        configuration,
+        0,
+        blocks.proposal,
+        *generation);
+    CHECK(replay.disposition == ProposalDisposition::duplicate);
+    CHECK_FALSE(Access::contains_admitted(runtime, committed));
+    CHECK_FALSE(Access::has_runtime_initialization(runtime, committed));
+    CHECK(outbox.diagnostics().pending_reports == 1);
+}
+
+TEST_CASE(
+    "adaptive v2 deadline arm rejection poisons evidence but preserves exposure",
+    "[adaptive-v2][evidence][deadline-arm][relay-order]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    RelayRecordingHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const bytearray_t issuer_secret(32, 1);
+    const PrivKeySecp256k1 issuer_key(issuer_secret);
+    runtime.configure_epoch_change_pre_vote_gate(
+        EpochChangeIssuer{17, PubKeySecp256k1(issuer_key)},
+        EpochChangeDelayBounds{1, 20},
+        4U * 1024U * 1024U,
+        64);
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 4);
+    Access::reject_response_deadline_scheduling(runtime);
+    const auto blocks = delayed_proposal_blocks(
+        runtime, "deadline-arm-rejection");
+    const ProposalKey key{configuration, blocks.proposal->get_hash()};
+    const auto generation = checked_activation_generation(0, 0);
+    REQUIRE(generation.has_value());
+
+    const auto admitted = Access::receive_delayed_proposal(
+        runtime,
+        configuration,
+        0,
+        blocks.proposal,
+        *generation);
+    REQUIRE(admitted.disposition == ProposalDisposition::admitted_active);
+    CHECK(runtime.relay_count() == 0);
+
+    Access::resolve_fetched_block(runtime, blocks.missing_parent);
+
+    CHECK(runtime.relay_count() == 1);
+    CHECK(Access::contains_admitted(runtime, key));
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(Access::has_response_attempt_arm_failure(runtime, key));
+    CHECK(Access::response_attempt_arm_failure_count(runtime) == 1);
+}
+
+TEST_CASE(
+    "adaptive v2 missing response bridge poisons once without gating relay",
+    "[adaptive-v2][evidence][deadline-arm][canonical-poison]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    RelayRecordingHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const bytearray_t issuer_secret(32, 1);
+    const PrivKeySecp256k1 issuer_key(issuer_secret);
+    runtime.configure_epoch_change_pre_vote_gate(
+        EpochChangeIssuer{17, PubKeySecp256k1(issuer_key)},
+        EpochChangeDelayBounds{1, 20},
+        4U * 1024U * 1024U,
+        64);
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 4);
+    Access::remove_response_evidence_bridge(runtime);
+    const auto blocks = delayed_proposal_blocks(
+        runtime, "missing-response-bridge");
+    const ProposalKey key{configuration, blocks.proposal->get_hash()};
+    const auto generation = checked_activation_generation(0, 0);
+    REQUIRE(generation.has_value());
+
+    REQUIRE(Access::receive_delayed_proposal(
+                runtime,
+                configuration,
+                0,
+                blocks.proposal,
+                *generation)
+                .disposition == ProposalDisposition::admitted_active);
+    Access::resolve_fetched_block(runtime, blocks.missing_parent);
+
+    CHECK(runtime.relay_count() == 1);
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(Access::has_response_attempt_arm_failure(runtime, key));
+    CHECK(Access::response_attempt_arm_failure_count(runtime) == 1);
+}
+
+TEST_CASE(
+    "adaptive v2 missing exact tree emits canonical arm poison once",
+    "[adaptive-v2][evidence][deadline-arm][canonical-poison]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    static_cast<void>(Access::initialize_active_runtime(runtime));
+    Access::reset_reporting_outbox(runtime, 4);
+    const ProposalKey key{
+        ConfigurationId{99, 7, digest("missing-exact-tree")},
+        digest("missing-exact-tree-proposal")};
+    REQUIRE(Access::admit_context_with_tree(
+        runtime, key, tree(ExperimentReplicaRole::internal)));
+
+    Access::attempt_evidence_before_exposure(runtime, key);
+    Access::attempt_evidence_before_exposure(runtime, key);
+
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(Access::has_response_attempt_arm_failure(runtime, key));
+    CHECK(Access::response_attempt_arm_failure_count(runtime) == 1);
+}
+
+TEST_CASE(
+    "adaptive v2 scheduler exceptions poison once without gating relay",
+    "[adaptive-v2][evidence][deadline-arm][canonical-poison]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    RelayRecordingHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const bytearray_t issuer_secret(32, 1);
+    const PrivKeySecp256k1 issuer_key(issuer_secret);
+    runtime.configure_epoch_change_pre_vote_gate(
+        EpochChangeIssuer{17, PubKeySecp256k1(issuer_key)},
+        EpochChangeDelayBounds{1, 20},
+        4U * 1024U * 1024U,
+        64);
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 4);
+    auto scheduler = std::make_unique<ThrowingAggregationScheduler>();
+    auto *scheduler_observer = scheduler.get();
+    Access::replace_aggregation_scheduler(runtime, std::move(scheduler));
+    const auto blocks = delayed_proposal_blocks(
+        runtime, "throwing-arm-and-timer-scheduler");
+    const ProposalKey key{configuration, blocks.proposal->get_hash()};
+    const auto generation = checked_activation_generation(0, 0);
+    REQUIRE(generation.has_value());
+
+    REQUIRE(Access::receive_delayed_proposal(
+                runtime,
+                configuration,
+                0,
+                blocks.proposal,
+                *generation)
+                .disposition == ProposalDisposition::admitted_active);
+    Access::resolve_fetched_block(runtime, blocks.missing_parent);
+
+    CHECK(scheduler_observer->attempts >= 1);
+    CHECK(runtime.relay_count() == 1);
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(Access::has_response_attempt_arm_failure(runtime, key));
+    CHECK(Access::response_attempt_arm_failure_count(runtime) == 1);
+}
+
+TEST_CASE(
+    "finalized root reuses only exact successful arm provenance",
+    "[adaptive-v2][evidence][deadline-arm][finalized-retransmit]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 4);
+    const ProposalKey armed{
+        configuration, digest("finalized-prior-successful-arm")};
+    REQUIRE(Access::admit_exact_context(runtime, armed));
+    REQUIRE(Access::start_response_attempt_arm(runtime, armed));
+    REQUIRE(Access::has_successful_response_attempt_arm(runtime, armed));
+    Access::close_exact_context(runtime, armed);
+
+    Access::ensure_finalized_evidence_before_exposure(runtime, armed);
+    CHECK(Access::convergence_evidence_healthy(runtime));
+    CHECK_FALSE(Access::has_response_attempt_arm_failure(runtime, armed));
+
+    const ProposalKey missing{
+        configuration, digest("finalized-missing-prior-arm")};
+    Access::ensure_finalized_evidence_before_exposure(runtime, missing);
+    Access::ensure_finalized_evidence_before_exposure(runtime, missing);
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(Access::has_response_attempt_arm_failure(runtime, missing));
+    CHECK(Access::response_attempt_arm_failure_count(runtime) == 1);
+}
+
+TEST_CASE(
+    "adaptive v2 aggregation timer rejection canonically poisons evidence",
+    "[adaptive-v2][evidence][aggregation-timer][canonical-poison]"
+    "[runtime-integration]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 4);
+    const ProposalKey key{
+        configuration, digest("aggregation-timer-rejection")};
+    REQUIRE(Access::admit_exact_context(runtime, key));
+    REQUIRE(Access::start_response_attempt_arm(runtime, key));
+
+    SECTION("missing coordinator")
+    {
+        Access::remove_aggregation_timeout_coordinator(runtime);
+        Access::start_aggregation_timer(runtime, key);
+    }
+
+    SECTION("zero timer generation")
+    {
+        Access::start_aggregation_timer(runtime, key);
+        REQUIRE(Access::convergence_evidence_healthy(runtime));
+        Access::start_aggregation_timer(runtime, key);
+    }
+
+    CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    CHECK(Access::has_response_attempt_arm_failure(runtime, key));
+    CHECK(Access::response_attempt_arm_failure_count(runtime) == 1);
 }
 
 TEST_CASE(
@@ -1796,6 +2663,7 @@ TEST_CASE(
         CHECK(first.view_generation == 17);
         CHECK(first.physical_role == ExperimentReplicaRole::internal);
         CHECK(first.parent_replica == 0);
+        CHECK(first.authenticated_proposal_source_replica == 0);
         CHECK(first.expected_message_type ==
               ExpectedMessageType::aggregate_relay);
         CHECK(first.cohort ==
@@ -2126,6 +2994,120 @@ TEST_CASE(
               std::string::npos);
         CHECK(encoded.find("physical_role=") == std::string::npos);
     }
+}
+
+TEST_CASE(
+    "scheduled omission ignores root repair ingress before consuming ordinal",
+    "[adaptive-v2][experiment][fault-opportunity][physical-parent]"
+    "[runtime-integration][intentional-red]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        2,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    RecordingOpportunityAuditEmitter emitter;
+    std::vector<ExperimentOmissionMarker> markers;
+    auto options = tiered_v2_options(2, 2, &markers);
+    runtime.bind_structured_event_emitters(nullptr, nullptr, &emitter);
+    runtime.configure_experiment_byzantine_faults(std::move(options));
+
+    const ConfigurationId configuration{
+        7, 3, digest("physical-parent-ingress-epoch")};
+    const ProposalKey missing_source{
+        configuration, digest("missing-source")};
+    const ProposalKey root_repair{
+        configuration, digest("root-repair-source")};
+    const ProposalKey physical_parent{
+        configuration, digest("physical-parent-source")};
+    const auto internal = tree(ExperimentReplicaRole::internal, 2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    Access::seed_view_generation_without_source(
+        runtime, missing_source, 71);
+    Access::seed_view_generation(runtime, root_repair, 72, 7);
+    Access::seed_view_generation(runtime, physical_parent, 73, 0);
+
+    CHECK_FALSE(Access::consume_aggregate(
+        runtime, missing_source, internal));
+    CHECK_FALSE(Access::consume_aggregate(
+        runtime, root_repair, internal));
+    CHECK(markers.empty());
+    CHECK(emitter.events.empty());
+
+    CHECK_FALSE(Access::consume_aggregate(
+        runtime, physical_parent, internal));
+    REQUIRE(markers.size() == 1);
+    REQUIRE(emitter.events.size() == 1);
+    CHECK(markers.front().contribution_ordinal == 1);
+    CHECK(markers.front().role_contribution_ordinal == 1);
+    CHECK(markers.front().authenticated_proposal_source_replica ==
+          std::optional<ReplicaID>{0});
+    CHECK(emitter.events.front().authenticated_proposal_source_replica == 0);
+    CHECK(emitter.events.front().parent_replica == 0);
+}
+
+TEST_CASE(
+    "proposal source qualification survives evidence preserving cleanup",
+    "[adaptive-v2][experiment][fault-opportunity][physical-parent]"
+    "[cleanup][runtime-integration][intentional-red]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        2,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    std::vector<ExperimentOmissionMarker> markers;
+    runtime.configure_experiment_byzantine_faults(
+        tiered_v2_options(2, 2, &markers));
+
+    const ConfigurationId configuration{
+        7, 3, digest("preserved-ingress-epoch")};
+    const ProposalKey vote_fallback{
+        configuration, digest("preserved-vote-fallback")};
+    const ProposalKey response_evidence{
+        configuration, digest("preserved-response-evidence")};
+    const ProposalKey terminal{
+        configuration, digest("terminal-ingress")};
+    const auto internal = tree(ExperimentReplicaRole::internal, 2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    Access::seed_view_generation(runtime, vote_fallback, 81, 0);
+    Access::seed_view_generation(runtime, response_evidence, 82, 0);
+    Access::seed_view_generation(runtime, terminal, 83, 0);
+
+    Access::purge_exact_runtime_state(
+        runtime, vote_fallback, true, false);
+    Access::purge_exact_runtime_state(
+        runtime, response_evidence, false, true);
+    CHECK(Access::has_authenticated_proposal_ingress(
+        runtime, vote_fallback));
+    CHECK(Access::has_authenticated_proposal_ingress(
+        runtime, response_evidence));
+    CHECK_FALSE(Access::consume_aggregate(
+        runtime, vote_fallback, internal));
+    CHECK(Access::consume_aggregate(
+        runtime, response_evidence, internal));
+    REQUIRE(markers.size() == 2);
+
+    Access::purge_exact_runtime_state(runtime, terminal, false, false);
+    CHECK_FALSE(Access::has_authenticated_proposal_ingress(
+        runtime, terminal));
+    CHECK_FALSE(Access::consume_aggregate(runtime, terminal, internal));
+    CHECK(markers.size() == 2);
 }
 
 } // namespace

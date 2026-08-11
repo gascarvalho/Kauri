@@ -215,6 +215,15 @@ public:
     virtual std::optional<FutureProposalClaim> claim_next(
         const ConfigurationId &configuration) = 0;
     virtual void process_active(const FutureProposalClaim &claim) = 0;
+    virtual bool process_active(
+        const FutureProposalClaim &claim,
+        ProposalProcessingCompletion completion)
+    {
+        process_active(claim);
+        if (completion)
+            completion(ProposalProcessingOutcome::completed_exposed);
+        return true;
+    }
     virtual void acknowledge(std::uint64_t token) noexcept = 0;
     virtual void release(std::uint64_t token) noexcept = 0;
     virtual void complete(const ConfigurationId &configuration) noexcept = 0;
@@ -351,6 +360,8 @@ struct EpochCommitIngressResult
 enum class EpochFutureDrainStatus : std::uint8_t
 {
     complete = 1,
+    in_progress,
+    retry_exhausted,
     process_failed,
     allocation_failed,
     inactive_configuration,
@@ -434,7 +445,7 @@ public:
 
 private:
     struct State;
-    std::unique_ptr<State> state_;
+    std::shared_ptr<State> state_;
 };
 
 class ManagerEpochAckEndpoint final

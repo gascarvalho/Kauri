@@ -588,6 +588,8 @@ bool valid_fault_contribution_opportunity(
         event.view_generation == 0 ||
         event.physical_role == ExperimentReplicaRole::root ||
         event.parent_replica == event.actor ||
+        event.authenticated_proposal_source_replica !=
+            event.parent_replica ||
         event.cohort == ExperimentOmissionCohort::none ||
         !valid_identity(event.diagnostic_window) ||
         event.diagnostic_window.size() >
@@ -1573,6 +1575,9 @@ void append_fault_contribution_opportunity_payload(
         experiment_replica_role_name(event.physical_role));
     builder.append(",\"parent_replica\":");
     builder.append_integer(event.parent_replica);
+    builder.append(",\"authenticated_proposal_source_replica\":");
+    builder.append_integer(
+        event.authenticated_proposal_source_replica);
     builder.append(",\"expected_message_type\":");
     builder.append_escaped(
         expected_message_type_name(event.expected_message_type));
