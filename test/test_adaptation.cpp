@@ -434,6 +434,31 @@ AdaptationSnapshot snapshot(
         seed);
 }
 
+ResponseObservation schema_v2_retention_timeout(
+    ResponseObservation observation,
+    std::uint64_t attempt_start_monotonic_ns,
+    std::uint64_t reporter_local_commit_monotonic_ns,
+    std::uint64_t reporter_monotonic_ns)
+{
+    REQUIRE(observation.outcome == ResponseOutcome::timeout);
+    REQUIRE(observation.response_duration_us == 0);
+    REQUIRE(observation.signer_set.empty());
+    observation.schema_version =
+        hotstuff::kResponseObservationSchemaVersionV2;
+    observation.attempt_start_monotonic_ns =
+        attempt_start_monotonic_ns;
+    observation.reporter_local_commit_monotonic_ns =
+        reporter_local_commit_monotonic_ns;
+    observation.reporter_monotonic_ns = reporter_monotonic_ns;
+    REQUIRE(hotstuff::valid_response_observation_retention_witness(
+        observation));
+    REQUIRE(
+        observation.observation_id ==
+        hotstuff::compute_response_observation_id(
+            observation.attempt_identity()));
+    return observation;
+}
+
 const ReplicaAdaptationResult &result_for(
     const AdaptationSnapshot &value,
     ReplicaID replica)
@@ -1249,6 +1274,108 @@ TEST_CASE("snapshot identity binds complete accepted current-epoch evidence",
         const auto variant = snapshot(
             {0, 1}, epoch, changed, builder.cutoff(), {}, 3001);
 
+        CHECK(variant.ranking() == canonical.ranking());
+        CHECK(variant.snapshot_id() != canonical.snapshot_id());
+    }
+}
+
+TEST_CASE("snapshot identity preserves the historical schema-v1 vector",
+          "[r09][adaptation][snapshot][identity][schema-v1][golden][v40]")
+{
+    const auto epoch = epoch_id(40, "v40-snapshot-v1-golden");
+    RecordBuilder builder(epoch);
+    builder.add_on_time(
+        1, 41, ExpectedMessageType::aggregate_relay);
+    builder.add_timeout(2, ExpectedMessageType::direct_vote);
+
+    const auto canonical = snapshot(
+        {2, 1},
+        epoch,
+        builder.records(),
+        builder.cutoff(),
+        AdaptationPolicy{},
+        4001);
+    auto reordered_records = builder.copy_records();
+    std::reverse(reordered_records.begin(), reordered_records.end());
+    const auto reordered = snapshot(
+        {1, 2},
+        epoch,
+        reordered_records,
+        builder.cutoff(),
+        AdaptationPolicy{},
+        4001);
+
+    CHECK(canonical.snapshot_id() ==
+          "012a18843b591c502493e47fb79b21d62"
+          "bfa5bf2bb7a69ce15ae5321ef55ec39");
+    CHECK(reordered.snapshot_id() == canonical.snapshot_id());
+}
+
+TEST_CASE("schema-v2 retention chronology binds the snapshot identity",
+          "[r09][adaptation][snapshot][identity][schema-v2][golden][v40]")
+{
+    const auto epoch = epoch_id(40, "v40-snapshot-v2-golden");
+    RecordBuilder builder(epoch);
+    builder.add_on_time(
+        1, 41, ExpectedMessageType::aggregate_relay);
+    const auto timeout = builder.add_timeout(
+        2, ExpectedMessageType::direct_vote);
+
+    auto records = builder.copy_records();
+    records.back().observation = schema_v2_retention_timeout(
+        timeout,
+        1'000'000,
+        1'040'000,
+        1'100'000);
+    const auto canonical = snapshot(
+        {1, 2},
+        epoch,
+        records,
+        builder.cutoff(),
+        AdaptationPolicy{},
+        4002);
+
+    CHECK(canonical.snapshot_id() ==
+          "97ef0171fd30a5112a910ec506427f35"
+          "aea224f4ee4fd9a6c81304d1db393e6f");
+
+    SECTION("attempt start independently participates")
+    {
+        auto changed = records;
+        --changed.back().observation.attempt_start_monotonic_ns;
+        REQUIRE(hotstuff::valid_response_observation_retention_witness(
+            changed.back().observation));
+        CHECK(changed.back().observation.observation_id ==
+              records.back().observation.observation_id);
+
+        const auto variant = snapshot(
+            {1, 2},
+            epoch,
+            changed,
+            builder.cutoff(),
+            AdaptationPolicy{},
+            4002);
+        CHECK(variant.ranking() == canonical.ranking());
+        CHECK(variant.snapshot_id() != canonical.snapshot_id());
+    }
+
+    SECTION("reporter-local commit independently participates")
+    {
+        auto changed = records;
+        ++changed.back()
+              .observation.reporter_local_commit_monotonic_ns;
+        REQUIRE(hotstuff::valid_response_observation_retention_witness(
+            changed.back().observation));
+        CHECK(changed.back().observation.observation_id ==
+              records.back().observation.observation_id);
+
+        const auto variant = snapshot(
+            {1, 2},
+            epoch,
+            changed,
+            builder.cutoff(),
+            AdaptationPolicy{},
+            4002);
         CHECK(variant.ranking() == canonical.ranking());
         CHECK(variant.snapshot_id() != canonical.snapshot_id());
     }

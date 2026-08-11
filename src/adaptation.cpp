@@ -213,11 +213,16 @@ bool canonical_signers(const std::vector<ReplicaID> &signers) noexcept
 
 void validate_observation(const ResponseObservation &observation)
 {
-    if (observation.schema_version !=
-        kResponseObservationSchemaVersion)
+    if (!is_supported_response_observation_schema(
+            observation.schema_version))
     {
         throw std::invalid_argument(
             "unsupported adaptation evidence schema");
+    }
+    if (!valid_response_observation_retention_witness(observation))
+    {
+        throw std::invalid_argument(
+            "invalid adaptation retention witness");
     }
     if (observation.observation_id !=
         compute_response_observation_id(
@@ -542,6 +547,15 @@ std::string compute_snapshot_id(
         append_big_endian(bytes, observation.deadline_duration_us);
         append_big_endian(bytes, observation.reporter_monotonic_ns);
         append_big_endian(bytes, observation.reporter_sequence);
+        if (observation.schema_version ==
+            kResponseObservationSchemaVersionV2)
+        {
+            append_big_endian(
+                bytes, observation.attempt_start_monotonic_ns);
+            append_big_endian(
+                bytes,
+                observation.reporter_local_commit_monotonic_ns);
+        }
         append_big_endian(
             bytes,
             static_cast<std::uint32_t>(observation.signer_set.size()));

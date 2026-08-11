@@ -91,8 +91,11 @@ V37_MANIFEST_PATH = (
 V38_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v38.json"
 )
-FROZEN_MANIFEST_PATH = (
+V39_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v39.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v40.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -264,6 +267,9 @@ def test_v28_repair_contract_literals_are_exact() -> None:
     assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4 == (
         EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
     )
+    assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5 == (
+        manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
+    )
     assert runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3 == (
         EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
     )
@@ -277,7 +283,26 @@ def test_v28_repair_contract_literals_are_exact() -> None:
     assert validation._EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3 == (
         EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
     )
+    assert validation._EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4 == (
+        runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
+    )
     assert validation._V39_POST_FAULT_SELECTION_OBSERVATION_GRACE_S == 5
+    assert validation._CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION == (
+        runtime_module.CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION
+    )
+    assert (
+        validation._CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION
+        == runtime_module.CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION
+    )
+    assert validation._CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION == (
+        runtime_module.CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION
+    )
+    assert validation._V40_RESPONSIVE_DEGRADED_ACTORS == (
+        runtime_module.EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
+    )
+    assert validation._V40_RETENTION_CONFIG_LINE == (
+        runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+    )
 
 
 def test_v39_preserves_strict_v9_and_v2_identity_validator_source() -> None:
@@ -298,7 +323,7 @@ def test_v39_preserves_strict_v9_and_v2_identity_validator_source() -> None:
         assert hashlib.sha256(source).hexdigest() == expected_hash
 
 
-def test_v38_history_and_v39_cycle1_gate_dispatch_are_exact() -> None:
+def test_v38_v39_history_and_v40_cycle1_gate_dispatch_are_exact() -> None:
     repair_slot = "slot-037-n31-f2-b04-00"
     primary_slot = "slot-066-n31-f5-b05-P"
 
@@ -306,10 +331,18 @@ def test_v38_history_and_v39_cycle1_gate_dispatch_are_exact() -> None:
         validation.V38_MANIFEST_ID
     ) == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
     assert validation._expected_excluded_repair_observation_contract(
-        validation.FROZEN_MANIFEST_ID
+        validation.V39_MANIFEST_ID
     ) == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+    assert validation._expected_excluded_repair_observation_contract(
+        validation.FROZEN_MANIFEST_ID
+    ) == manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
     assert not validation._uses_excluded_repair_cycle1_selection_gate(
         manifest_id=validation.V38_MANIFEST_ID,
+        coverage_smoke=True,
+        slot_id=repair_slot,
+    )
+    assert validation._uses_excluded_repair_cycle1_selection_gate(
+        manifest_id=validation.V39_MANIFEST_ID,
         coverage_smoke=True,
         slot_id=repair_slot,
     )
@@ -777,6 +810,19 @@ def _v38_candidate_manifest(
 def _v39_candidate_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    payload = V39_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "V39_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v40_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
     payload = FROZEN_MANIFEST_PATH.read_bytes()
     semantic = _canonical(json.loads(payload))
     monkeypatch.setattr(
@@ -818,29 +864,35 @@ def _commit_event(
     epoch_digest: str = "11" * 32,
     tree_id: int = 0,
     replica_id: int = 0,
+    reporter_local_commit_monotonic_ns: int | None = None,
 ) -> validation._NativeEvent:
     block_hash = f"{height:064x}"
     parent_hash = None if height == 1 else f"{height - 1:064x}"
+    payload: dict[str, object] = {
+        "block_height": height,
+        "block_hash": block_hash,
+        "parent_hash": parent_hash,
+        "transaction_count": 1000,
+        "designated_observer": replica_id == 0,
+        "decision_proof": {
+            "epoch_number": epoch_number,
+            "tree_id": tree_id,
+            "epoch_digest": epoch_digest,
+            "block_hash": block_hash,
+        },
+        "view_generation": 1,
+        "commit_batch_index": 0,
+    }
+    if reporter_local_commit_monotonic_ns is not None:
+        payload["reporter_local_commit_monotonic_ns"] = (
+            reporter_local_commit_monotonic_ns
+        )
     return _native_event(
         source_id=f"replica-{replica_id}",
         sequence=sequence,
         monotonic_ns=monotonic_ns,
         event_type="block.committed",
-        payload={
-            "block_height": height,
-            "block_hash": block_hash,
-            "parent_hash": parent_hash,
-            "transaction_count": 1000,
-            "designated_observer": replica_id == 0,
-            "decision_proof": {
-                "epoch_number": epoch_number,
-                "tree_id": tree_id,
-                "epoch_digest": epoch_digest,
-                "block_hash": block_hash,
-            },
-            "view_generation": 1,
-            "commit_batch_index": 0,
-        },
+        payload=payload,
     )
 
 
@@ -1004,7 +1056,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v39_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -1068,6 +1120,12 @@ def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
     )
     identities[37] = validation._frozen_artifact_identity(
         validation.V37_MANIFEST_ID
+    )
+    identities[38] = validation._frozen_artifact_identity(
+        validation.V38_MANIFEST_ID
+    )
+    identities[39] = validation._frozen_artifact_identity(
+        validation.V39_MANIFEST_ID
     )
 
     assert identities[1].manifest_sha256 == validation.LEGACY_MANIFEST_SHA256
@@ -1374,6 +1432,12 @@ def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
         identities[37].coverage_smoke_runtime_sha256
         == validation.V37_COVERAGE_SMOKE_RUNTIME_SHA256
     )
+    assert identities[38].manifest_sha256 == validation.V38_MANIFEST_SHA256
+    assert identities[38].plan_sha256 == validation.V38_PLAN_SHA256
+    assert identities[38].runtime_sha256 == validation.V38_RUNTIME_SHA256
+    assert identities[39].manifest_sha256 == validation.V39_MANIFEST_SHA256
+    assert identities[39].plan_sha256 == validation.V39_PLAN_SHA256
+    assert identities[39].runtime_sha256 == validation.V39_RUNTIME_SHA256
     assert validation._coverage_smoke_result_root(
         validation.V23_MANIFEST_ID
     ) == "results/shape-placement-factorial-v23-coverage-smoke"
@@ -1423,8 +1487,11 @@ def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
         validation.V38_MANIFEST_ID
     ) == "results/shape-placement-factorial-v38-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V39_MANIFEST_ID
     ) == "results/shape-placement-factorial-v39-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v40-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -1885,13 +1952,13 @@ def test_validator_v38_identities_are_exactly_frozen() -> None:
 
 def test_validator_v39_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V39_MANIFEST_ID
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v39"
+    assert validation.V39_MANIFEST_ID == "shape-placement-factorial-v39"
     assert (
         identity.manifest_sha256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.V39_SEMANTIC_SHA256,
         identity.plan_sha256,
         identity.runtime_sha256,
         identity.smoke_runtime_sha256,
@@ -1903,6 +1970,29 @@ def test_validator_v39_identities_are_exactly_frozen() -> None:
         "8c46107ccea00424961501d31e9c85534d129353d8ed7fabba65e52c1049b17d",
         "ad75abbf4592661aee236625a18c61a476f730d2825378e6598b42a63882fe65",
         "aba47a1d783aa21769f153236e9f37c755cc7ef2ce6248c17cd21e84b505e856",
+    )
+
+
+def test_validator_v40_identities_are_exactly_frozen() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v40"
+    assert (
+        identity.manifest_sha256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    ) == (
+        "a058ad5ac30aebbf866ba96c3ca60411b831875c36e198d6f6a4de08fbfa476d",
+        "6669bb5c4165eb83e26771348cb2ab06723782a7b3a111342ed56f9740746e5a",
+        "561f6f74fd27e165eed38d24e1aeca6c6fd4acc3f93743a7b2387e8e8da2e8d7",
+        "5286f8815b1812afa13f39d84e872af8dbfe78d675f53e8a02ea1c56e5acccdc",
+        "4522bf796e10f67d2394ceab3399b5755ee41914dc30375ce0f87a8e0e5459eb",
+        "70847285deb39a40addbbd1cc118fff0e3ed97498cb300e1a45564cc13f7d79e",
     )
 
 
@@ -3825,6 +3915,136 @@ def test_v13_snapshot_digest_still_binds_ignored_aggregate_records() -> None:
     )
 
 
+def _native_snapshot_id_reference(
+    records: tuple[validation._EvidenceRecord, ...],
+    *,
+    replica_count: int,
+    epoch_number: int,
+    epoch_digest: str,
+    cutoff: int,
+    policy: dict[str, object],
+) -> str:
+    """Reproduce native compute_snapshot_id byte order independently."""
+
+    result = bytearray(validation._SNAPSHOT_DOMAIN)
+    result += validation._u(1, 4)
+    result += validation._u(epoch_number, 4)
+    result += bytes.fromhex(epoch_digest)
+    result += validation._u(cutoff, 8)
+    result += validation._u(validation._SNAPSHOT_SEED, 8)
+    result += validation._u(replica_count, 4)
+    result += b"".join(
+        validation._u(member, 2) for member in range(replica_count)
+    )
+    result += validation._u(1, 4)
+    result += validation._cstr(str(policy["policy_version"]))
+    result += validation._u(int(policy["attempt_window"]), 4)
+    result += validation._u(int(policy["minimum_attempts"]), 4)
+    result += validation._u(int(policy["minimum_response_rate_ppm"]), 4)
+    result += validation._u(int(policy["maximum_timeout_rate_ppm"]), 4)
+    result += validation._u(int(policy["trailing_timeout_streak"]), 4)
+    result += validation._u(int(policy["latency_percentile_basis_points"]), 2)
+    result += validation._u(len(records), 4)
+    for record in records:
+        result += validation._u(record.ingestion_sequence, 8)
+        result += validation._u(record.schema_version, 4)
+        result += bytes.fromhex(record.observation_id)
+        result += validation._u(record.reporter_id, 2)
+        result += validation._u(record.target_id, 2)
+        result += validation._u(record.epoch_number, 4)
+        result += validation._u(record.tree_id, 4)
+        result += bytes.fromhex(record.epoch_digest)
+        result += bytes.fromhex(record.block_hash)
+        result += validation._u(validation._MESSAGE_TYPE_CODE[record.message_type], 1)
+        result += validation._u(validation._OUTCOME_CODE[record.outcome], 1)
+        result += validation._u(record.response_duration_us, 8)
+        result += validation._u(record.deadline_duration_us, 8)
+        result += validation._u(record.reporter_monotonic_ns, 8)
+        result += validation._u(record.reporter_sequence, 8)
+        if record.schema_version == 2:
+            assert record.attempt_start_monotonic_ns is not None
+            assert record.reporter_local_commit_monotonic_ns is not None
+            result += validation._u(record.attempt_start_monotonic_ns, 8)
+            result += validation._u(record.reporter_local_commit_monotonic_ns, 8)
+        result += validation._u(len(record.signer_set), 4)
+        result += b"".join(
+            validation._u(signer, 2) for signer in record.signer_set
+        )
+    return hashlib.sha256(bytes(result)).hexdigest()
+
+
+def test_snapshot_id_preserves_native_v1_golden_bytes() -> None:
+    records = (
+        _scoring_evidence_record(
+            1,
+            target_id=0,
+            message_type="direct_vote",
+            outcome="on_time",
+        ),
+        _scoring_evidence_record(
+            2,
+            target_id=0,
+            message_type="aggregate_relay",
+            outcome="on_time",
+        ),
+    )
+    common = {
+        "replica_count": 3,
+        "epoch_number": 1,
+        "epoch_digest": "11" * 32,
+        "cutoff": 2,
+        "policy": _scoring_policy("shape25-direct-vote-responsiveness-v2"),
+    }
+
+    expected = "4251bac4c2212fcd7fbc9c784d27ffb984f5dc6816bf8caeb5e86222ffcbbd76"
+    assert _native_snapshot_id_reference(records, **common) == expected
+    assert validation._snapshot_id(records, **common) == expected
+
+
+def test_snapshot_id_matches_native_mixed_v1_v2_bytes_and_binds_timestamps() -> None:
+    v1 = _scoring_evidence_record(
+        1,
+        target_id=0,
+        message_type="direct_vote",
+        outcome="on_time",
+    )
+    v2 = replace(
+        _scoring_evidence_record(
+            2,
+            target_id=0,
+            message_type="aggregate_relay",
+            outcome="timeout",
+        ),
+        schema_version=2,
+        response_duration_us=0,
+        deadline_duration_us=2,
+        reporter_monotonic_ns=12_000,
+        signer_set=(),
+        attempt_start_monotonic_ns=10_000,
+        reporter_local_commit_monotonic_ns=11_000,
+    )
+    records = (v1, v2)
+    common = {
+        "replica_count": 3,
+        "epoch_number": 1,
+        "epoch_digest": "11" * 32,
+        "cutoff": 2,
+        "policy": _scoring_policy("shape25-direct-vote-responsiveness-v2"),
+    }
+
+    expected = "1c2acbd3b72c4153e736691e766abd1f3e96de1f73134365ac20ea6498e33661"
+    assert _native_snapshot_id_reference(records, **common) == expected
+    assert validation._snapshot_id(records, **common) == expected
+    assert validation._snapshot_id(
+        (v1, replace(v2, attempt_start_monotonic_ns=10_001)),
+        **common,
+    ) != expected
+    assert validation._snapshot_id(
+        (v1, replace(v2, reporter_local_commit_monotonic_ns=11_001)),
+        **common,
+    ) != expected
+
+
 def test_compact_snapshot_preserves_sparse_accepted_ledger_integrity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3845,7 +4065,9 @@ def test_compact_snapshot_preserves_sparse_accepted_ledger_integrity(
     monkeypatch.setattr(
         validation,
         "_evidence_record",
-        lambda event, _membership: records[event.payload["record_index"]],
+        lambda event, _membership, **_kwargs: records[
+            event.payload["record_index"]
+        ],
     )
 
     with pytest.raises(FactorialValidationError, match="non-contiguous"):
@@ -3871,6 +4093,916 @@ def test_compact_snapshot_preserves_sparse_accepted_ledger_integrity(
         suffix_only=False,
         allow_high_watermark_gaps=True,
     ) == records
+
+
+_V40_RETENTION_ACTORS = (1, 7, 8, 12, 16, 19, 20)
+_V40_RETENTION_DIGEST = "42" * 32
+
+
+def _v40_retention_record(
+    *,
+    actor: int,
+    reporter: int,
+    sequence: int,
+    height: int,
+    message_type: str,
+) -> SimpleNamespace:
+    start_ns = 10_000 + sequence * 10_000
+    commit_ns = start_ns + 1_000
+    deadline_us = 2
+    timeout_ns = start_ns + deadline_us * 1_000
+    return SimpleNamespace(
+        ingestion_sequence=sequence,
+        acceptance_monotonic_ns=timeout_ns + 100,
+        observation_id=hashlib.sha256(
+            f"v40-retention-{actor}-{sequence}-{message_type}".encode()
+        ).hexdigest(),
+        reporter_id=reporter,
+        target_id=actor,
+        epoch_number=1,
+        tree_id=0,
+        epoch_digest=_V40_RETENTION_DIGEST,
+        block_hash=f"{height:064x}",
+        message_type=message_type,
+        outcome="timeout",
+        response_duration_us=0,
+        deadline_duration_us=deadline_us,
+        reporter_monotonic_ns=timeout_ns,
+        reporter_sequence=sequence,
+        signer_set=(),
+        acceptance_source_sequence=sequence,
+        schema_version=2,
+        attempt_start_monotonic_ns=start_ns,
+        reporter_local_commit_monotonic_ns=commit_ns,
+    )
+
+
+def _v40_retention_ready_fixture() -> dict[str, object]:
+    records = tuple(
+        _v40_retention_record(
+            actor=actor,
+            reporter=reporter,
+            sequence=index,
+            height=1_000 + index,
+            message_type="aggregate_relay" if index == 1 else "direct_vote",
+        )
+        for index, (actor, reporter) in enumerate(
+            zip(
+                _V40_RETENTION_ACTORS,
+                (4, 10, 11, 15, 18, 22, 23),
+            ),
+            start=1,
+        )
+    )
+    ready_ns = 1_000_000
+    selection_ns = 2_000_000
+    ready_event = replace(
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=100,
+            monotonic_ns=ready_ns,
+            event_type="adaptive_v2.cross_commit_retention_ready",
+            payload={
+                "cycle_ordinal": 1,
+                "predecessor_epoch_number": 1,
+                "predecessor_epoch_digest": _V40_RETENTION_DIGEST,
+                "evidence_cutoff": len(records),
+                "responsive_degraded_actor_ids": list(_V40_RETENTION_ACTORS),
+                "admitted_observation_ids": [
+                    record.observation_id for record in records
+                ],
+            },
+        ),
+        source_kind="adaptation_manager",
+        source_instance="slot-adaptive-manager",
+    )
+    arm_markers = tuple(
+        validation.ResponseAttemptArmMarker(
+            source_replica=record.reporter_id,
+            line_number=index,
+            reporter_id=record.reporter_id,
+            child_id=record.target_id,
+            epoch_number=record.epoch_number,
+            tree_id=record.tree_id,
+            epoch_digest=record.epoch_digest,
+            block_hash=record.block_hash,
+            expected_message_type=record.message_type,
+            start_monotonic_ns=record.attempt_start_monotonic_ns,
+            deadline_duration_us=record.deadline_duration_us,
+            absolute_deadline_ns=(
+                record.attempt_start_monotonic_ns
+                + record.deadline_duration_us * 1_000
+            ),
+            raw_line_sha256=f"{index + 100:064x}",
+            relative_path=(
+                f"raw/process/replica-{record.reporter_id}.stdout.log"
+            ),
+        )
+        for index, record in enumerate(records, start=1)
+    )
+    markers = tuple(
+        FaultMarker(
+            source_replica=record.target_id,
+            line_number=index,
+            fault_mode="tiered_persistent_responsive_omission_v2",
+            epoch_number=record.epoch_number,
+            tree_id=record.tree_id,
+            epoch_digest=record.epoch_digest,
+            block_hash=record.block_hash,
+            window="tiered-responsive-omission-v2",
+            window_start_ns=1,
+            window_end_ns=selection_ns,
+            actor=record.target_id,
+            action=(
+                "omit_aggregate"
+                if record.message_type == "aggregate_relay"
+                else "omit_direct_vote"
+            ),
+            monotonic_ns=record.attempt_start_monotonic_ns + 500,
+            raw_line_sha256=f"{index + 200:064x}",
+            cohort="responsive_degraded",
+        )
+        for index, record in enumerate(records, start=1)
+    )
+    replica_events = {
+        record.reporter_id: (
+            _commit_event(
+                1,
+                record.reporter_local_commit_monotonic_ns + 50,
+                int(record.block_hash, 16),
+                epoch_number=record.epoch_number,
+                epoch_digest=record.epoch_digest,
+                tree_id=record.tree_id,
+                replica_id=record.reporter_id,
+                reporter_local_commit_monotonic_ns=(
+                    record.reporter_local_commit_monotonic_ns
+                ),
+            ),
+        )
+        for record in records
+    }
+    replica_events[0] = tuple(
+        _commit_event(
+            index,
+            record.reporter_local_commit_monotonic_ns + 250,
+            int(record.block_hash, 16),
+            epoch_number=record.epoch_number,
+            epoch_digest=record.epoch_digest,
+            tree_id=record.tree_id,
+            replica_id=0,
+            reporter_local_commit_monotonic_ns=(
+                record.reporter_local_commit_monotonic_ns + 200
+            ),
+        )
+        for index, record in enumerate(records, start=1)
+    )
+    return {
+        "manager_events": (ready_event,),
+        "accepted_epoch1": records,
+        "responsive_degraded_actor_ids": _V40_RETENTION_ACTORS,
+        "predecessor_epoch_digest": _V40_RETENTION_DIGEST,
+        "selection_current_cutoff": len(records),
+        "epoch2_selection_ns": selection_ns,
+        "markers": markers,
+        "arm_markers": arm_markers,
+        "replica_events": replica_events,
+    }
+
+
+def test_v40_retention_ready_replays_canonical_v2_facts_and_raw_sources() -> None:
+    arguments = _v40_retention_ready_fixture()
+    selected = validation._validate_v40_cross_commit_retention_ready(
+        **arguments
+    )
+    records = arguments["accepted_epoch1"]
+    assert isinstance(records, tuple)
+    assert all(record.outcome == "timeout" for record in records)
+    assert all(record.reporter_id != record.target_id for record in records)
+    assert tuple(record.observation_id for record in selected) == tuple(
+        record.observation_id for record in records
+    )
+
+
+def _v40_retention_late_transition(
+    record: SimpleNamespace,
+    *,
+    ingestion_sequence: int,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        **{
+            **vars(record),
+            "ingestion_sequence": ingestion_sequence,
+            "acceptance_monotonic_ns": record.acceptance_monotonic_ns + 1,
+            "acceptance_source_sequence": ingestion_sequence,
+            "schema_version": 1,
+            "outcome": "late",
+            "response_duration_us": record.deadline_duration_us,
+            "signer_set": (record.target_id,),
+            "attempt_start_monotonic_ns": None,
+            "reporter_local_commit_monotonic_ns": None,
+        }
+    )
+
+
+def test_v40_retention_ready_excludes_timeout_closed_before_cutoff() -> None:
+    arguments = _v40_retention_ready_fixture()
+    records = list(arguments["accepted_epoch1"])
+    first = records[0]
+    cutoff = len(records) + 1
+    records.append(
+        _v40_retention_late_transition(
+            first,
+            ingestion_sequence=cutoff,
+        )
+    )
+    ready = arguments["manager_events"][0]
+    payload = dict(ready.payload)
+    payload["evidence_cutoff"] = cutoff
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="schema-v2 timeout|canonical observation",
+    ):
+        validation._validate_v40_cross_commit_retention_ready(
+            **{
+                **arguments,
+                "manager_events": (replace(ready, payload=payload),),
+                "accepted_epoch1": tuple(records),
+                "selection_current_cutoff": cutoff,
+            }
+        )
+
+
+def test_v40_retention_ready_ignores_late_transition_after_cutoff() -> None:
+    arguments = _v40_retention_ready_fixture()
+    records = list(arguments["accepted_epoch1"])
+    first = records[0]
+    records.append(
+        _v40_retention_late_transition(
+            first,
+            ingestion_sequence=len(records) + 1,
+        )
+    )
+
+    selected = validation._validate_v40_cross_commit_retention_ready(
+        **{**arguments, "accepted_epoch1": tuple(records)}
+    )
+
+    assert tuple(record.observation_id for record in selected) == tuple(
+        record.observation_id for record in arguments["accepted_epoch1"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing", "absent or duplicated"),
+        ("duplicate", "absent or duplicated"),
+        ("extra-field", "invalid field set"),
+        ("cycle", "exact cycle-1 predecessor"),
+        ("epoch", "exact cycle-1 predecessor"),
+        ("digest", "exact cycle-1 predecessor"),
+        ("cutoff-low", "same evidence cutoff"),
+        ("cutoff-high", "same evidence cutoff"),
+        ("actors-reversed", "actor cohort"),
+        ("actors-duplicate", "actor cohort"),
+        ("ids-reversed", "canonical observation"),
+        ("ids-duplicate", "canonical observation"),
+        ("malformed-id", "lowercase hexadecimal"),
+        ("ready-at-selection", "strictly precede Epoch2 selection"),
+        ("ready-after-selection", "strictly precede Epoch2 selection"),
+    ),
+)
+def test_v40_retention_ready_rejects_event_cutoff_and_membership_drift(
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments = _v40_retention_ready_fixture()
+    events = list(arguments["manager_events"])
+    assert len(events) == 1
+    event = events[0]
+    payload = dict(event.payload)
+    if mutation == "missing":
+        events = []
+    elif mutation == "duplicate":
+        events.append(replace(event, source_sequence=101, line_number=101))
+    elif mutation == "extra-field":
+        payload["unexpected"] = True
+    elif mutation == "cycle":
+        payload["cycle_ordinal"] = 0
+    elif mutation == "epoch":
+        payload["predecessor_epoch_number"] = 0
+    elif mutation == "digest":
+        payload["predecessor_epoch_digest"] = "43" * 32
+    elif mutation == "cutoff-low":
+        payload["evidence_cutoff"] -= 1
+    elif mutation == "cutoff-high":
+        payload["evidence_cutoff"] += 1
+    elif mutation == "actors-reversed":
+        payload["responsive_degraded_actor_ids"] = list(
+            reversed(_V40_RETENTION_ACTORS)
+        )
+    elif mutation == "actors-duplicate":
+        payload["responsive_degraded_actor_ids"][-1] = (
+            payload["responsive_degraded_actor_ids"][-2]
+        )
+    elif mutation == "ids-reversed":
+        payload["admitted_observation_ids"] = list(
+            reversed(payload["admitted_observation_ids"])
+        )
+    elif mutation == "ids-duplicate":
+        payload["admitted_observation_ids"][-1] = (
+            payload["admitted_observation_ids"][-2]
+        )
+    elif mutation == "malformed-id":
+        payload["admitted_observation_ids"][0] = "not-a-digest"
+    elif mutation == "ready-at-selection":
+        event = replace(event, monotonic_ns=arguments["epoch2_selection_ns"])
+    else:
+        event = replace(
+            event,
+            monotonic_ns=arguments["epoch2_selection_ns"] + 1,
+        )
+    if mutation not in {"missing", "duplicate"}:
+        events = [replace(event, payload=payload)]
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v40_cross_commit_retention_ready(
+            **{**arguments, "manager_events": tuple(events)}
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("schema-v1", "schema-v2"),
+        ("on-time", "schema-v2 timeout"),
+        ("actor-mismatch", "canonical observation"),
+        ("post-cutoff", "canonical observation"),
+        ("post-selection", "strictly precede Epoch2 selection"),
+        ("post-ready", "accepted before readiness"),
+        ("source-sequence-at-ready", "accepted before readiness"),
+        ("all-direct", "aggregate_relay"),
+        ("noncanonical-type", "canonical observation"),
+        ("noncanonical-sequence", "canonical observation"),
+    ),
+)
+def test_v40_retention_ready_rejects_nonqualifying_or_noncanonical_facts(
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments = _v40_retention_ready_fixture()
+    records = list(arguments["accepted_epoch1"])
+    ready = arguments["manager_events"][0]
+    payload = dict(ready.payload)
+    first = records[0]
+    if mutation == "schema-v1":
+        records[0] = SimpleNamespace(**{**vars(first), "schema_version": 1})
+    elif mutation == "on-time":
+        records[0] = SimpleNamespace(**{**vars(first), "outcome": "on_time"})
+    elif mutation == "actor-mismatch":
+        records[0] = SimpleNamespace(**{**vars(first), "target_id": 2})
+    elif mutation == "post-cutoff":
+        records[0] = SimpleNamespace(
+            **{
+                **vars(first),
+                "ingestion_sequence": arguments["selection_current_cutoff"] + 1,
+            }
+        )
+    elif mutation == "post-selection":
+        records[0] = SimpleNamespace(
+            **{
+                **vars(first),
+                "acceptance_monotonic_ns": arguments["epoch2_selection_ns"],
+            }
+        )
+    elif mutation == "post-ready":
+        records[0] = SimpleNamespace(
+            **{
+                **vars(first),
+                "acceptance_monotonic_ns": ready.monotonic_ns + 1,
+            }
+        )
+    elif mutation == "source-sequence-at-ready":
+        records[0] = SimpleNamespace(
+            **{
+                **vars(first),
+                "acceptance_source_sequence": ready.source_sequence,
+            }
+        )
+    elif mutation == "all-direct":
+        records[0] = SimpleNamespace(
+            **{**vars(first), "message_type": "direct_vote"}
+        )
+        payload["admitted_observation_ids"][0] = records[0].observation_id
+    elif mutation == "noncanonical-type":
+        direct = _v40_retention_record(
+            actor=first.target_id,
+            reporter=first.reporter_id,
+            sequence=1,
+            height=2_001,
+            message_type="direct_vote",
+        )
+        records[0] = SimpleNamespace(
+            **{**vars(first), "ingestion_sequence": len(records) + 1}
+        )
+        records.append(direct)
+        payload["evidence_cutoff"] = len(records)
+        arguments["selection_current_cutoff"] = len(records)
+        payload["admitted_observation_ids"][0] = direct.observation_id
+    else:
+        later = _v40_retention_record(
+            actor=first.target_id,
+            reporter=first.reporter_id,
+            sequence=len(records) + 1,
+            height=2_002,
+            message_type="aggregate_relay",
+        )
+        records.append(later)
+        payload["evidence_cutoff"] = len(records)
+        arguments["selection_current_cutoff"] = len(records)
+        payload["admitted_observation_ids"][0] = later.observation_id
+    arguments["manager_events"] = (replace(ready, payload=payload),)
+    arguments["accepted_epoch1"] = tuple(records)
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v40_cross_commit_retention_ready(**arguments)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing-arm", "response-attempt arm"),
+        ("duplicate-arm", "response-attempt arm"),
+        ("arm-source", "authenticated reporter"),
+        ("arm-start", "attempt start"),
+        ("arm-duration", "deadline duration"),
+        ("missing-commit", "reporter-local rich commit"),
+        ("duplicate-commit", "reporter-local rich commit"),
+        ("missing-commit-sample", "reporter-local commit sample"),
+        ("commit-time", "reporter-local commit timestamp"),
+    ),
+)
+def test_v40_retention_ready_rejects_raw_arm_or_commit_substitution(
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments = _v40_retention_ready_fixture()
+    records = arguments["accepted_epoch1"]
+    assert isinstance(records, tuple)
+    first = records[0]
+    arms = list(arguments["arm_markers"])
+    replica_events = {
+        reporter: list(events)
+        for reporter, events in arguments["replica_events"].items()
+    }
+    if mutation == "missing-arm":
+        arms.pop(0)
+    elif mutation == "duplicate-arm":
+        arms.append(replace(arms[0], line_number=99))
+    elif mutation == "arm-source":
+        arms[0] = replace(arms[0], source_replica=first.reporter_id + 1)
+    elif mutation == "arm-start":
+        arms[0] = replace(
+            arms[0],
+            start_monotonic_ns=arms[0].start_monotonic_ns + 1,
+            absolute_deadline_ns=arms[0].absolute_deadline_ns + 1,
+        )
+    elif mutation == "arm-duration":
+        arms[0] = replace(
+            arms[0],
+            deadline_duration_us=arms[0].deadline_duration_us + 1,
+            absolute_deadline_ns=arms[0].absolute_deadline_ns + 1_000,
+        )
+    elif mutation == "missing-commit":
+        replica_events[first.reporter_id] = []
+    elif mutation == "duplicate-commit":
+        replica_events[first.reporter_id].append(
+            replace(
+                replica_events[first.reporter_id][0],
+                line_number=2,
+                source_sequence=2,
+            )
+        )
+    elif mutation == "missing-commit-sample":
+        event = replica_events[first.reporter_id][0]
+        payload = dict(event.payload)
+        payload.pop("reporter_local_commit_monotonic_ns")
+        replica_events[first.reporter_id][0] = replace(event, payload=payload)
+    else:
+        event = replica_events[first.reporter_id][0]
+        payload = dict(event.payload)
+        payload["reporter_local_commit_monotonic_ns"] = (
+            first.reporter_local_commit_monotonic_ns + 1
+        )
+        replica_events[first.reporter_id][0] = replace(event, payload=payload)
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v40_cross_commit_retention_ready(
+            **{
+                **arguments,
+                "arm_markers": tuple(arms),
+                "replica_events": {
+                    reporter: tuple(events)
+                    for reporter, events in replica_events.items()
+                },
+            }
+        )
+
+
+def test_v40_commit_sample_is_optional_only_in_exact_repair_compat_projection() -> None:
+    event = _commit_event(
+        1,
+        30_000,
+        1_001,
+        reporter_local_commit_monotonic_ns=29_000,
+    )
+    streams = {0: (event,)}
+
+    with pytest.raises(FactorialValidationError, match="escaped exact v40 S037"):
+        validation._v40_commit_retention_compat_events(
+            streams,
+            enabled=False,
+        )
+    projected = validation._v40_commit_retention_compat_events(
+        streams,
+        enabled=True,
+    )
+    assert "reporter_local_commit_monotonic_ns" not in projected[0][0].payload
+    assert event.payload["reporter_local_commit_monotonic_ns"] == 29_000
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("non-commit", "escaped exact v40 block.committed"),
+        ("zero", "integer >= 1"),
+        ("future", "after its structured commit event"),
+        ("overflow", "unsigned 64-bit"),
+    ),
+)
+def test_v40_commit_sample_scope_is_exact_and_overflow_safe(
+    mutation: str,
+    reason: str,
+) -> None:
+    event = _commit_event(
+        1,
+        30_000,
+        1_001,
+        reporter_local_commit_monotonic_ns=29_000,
+    )
+    if mutation == "non-commit":
+        event = replace(event, event_type="block.commit_observed")
+    else:
+        payload = dict(event.payload)
+        payload["reporter_local_commit_monotonic_ns"] = {
+            "zero": 0,
+            "future": 30_001,
+            "overflow": validation._UINT64_MAX + 1,
+        }[mutation]
+        event = replace(event, payload=payload)
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._v40_commit_retention_compat_events(
+            {0: (event,)},
+            enabled=True,
+        )
+
+
+def test_v40_main_config_receipt_binds_actual_bytes_and_sealed_input_row(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    payload = (
+        b"epoch-protocol-mode = adaptive_v2\n"
+        b"experiment-responsive-cross-commit-retention-v2 = true\n"
+    )
+    (runtime / "main.conf").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt = {"main_config_sha256": digest}
+
+    validation._validate_v40_main_config_receipt_binding(
+        receipt,
+        slot_root=tmp_path,
+        required=True,
+    )
+    validation._validate_main_config_receipt_provenance(
+        receipt,
+        (
+            {
+                "kind": "main_config",
+                "relative_path": "runtime/main.conf",
+                "sha256": digest,
+            },
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing", "is required"),
+        ("digest", "actual main.conf bytes"),
+        ("bytes", "actual main.conf bytes"),
+        ("line", "retention-v2 config line"),
+        ("historical-extra", "escaped exact v40 S037"),
+        ("provenance", "sealed input-artifact"),
+    ),
+)
+def test_v40_main_config_receipt_is_fail_closed(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    payload = (
+        b"epoch-protocol-mode = adaptive_v2\n"
+        b"experiment-responsive-cross-commit-retention-v2 = true\n"
+    )
+    path = runtime / "main.conf"
+    path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt: dict[str, object] = {"main_config_sha256": digest}
+    if mutation == "missing":
+        receipt.clear()
+    elif mutation == "digest":
+        receipt["main_config_sha256"] = "ff" * 32
+    elif mutation == "bytes":
+        path.write_bytes(payload + b"drift = true\n")
+    elif mutation == "line":
+        payload = b"epoch-protocol-mode = adaptive_v2\n"
+        path.write_bytes(payload)
+        receipt["main_config_sha256"] = hashlib.sha256(payload).hexdigest()
+    elif mutation == "historical-extra":
+        pass
+    elif mutation == "provenance":
+        validation._validate_v40_main_config_receipt_binding(
+            receipt,
+            slot_root=tmp_path,
+            required=True,
+        )
+        with pytest.raises(FactorialValidationError, match=reason):
+            validation._validate_main_config_receipt_provenance(
+                receipt,
+                (
+                    {
+                        "kind": "main_config",
+                        "relative_path": "runtime/main.conf",
+                        "sha256": "ee" * 32,
+                    },
+                ),
+            )
+        return
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v40_main_config_receipt_binding(
+            receipt,
+            slot_root=tmp_path,
+            required=mutation != "historical-extra",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing-marker", "actor-origin fault marker"),
+        ("duplicate-marker", "actor-origin fault marker"),
+        ("marker-source", "actor-origin fault marker"),
+        ("marker-key", "actor-origin fault marker"),
+        ("marker-action", "actor-origin fault marker"),
+        ("marker-mode", "actor-origin fault marker"),
+        ("marker-window", "actor-origin fault marker"),
+        ("marker-cohort", "actor-origin fault marker"),
+        ("marker-at-commit", "strict admitted-fact chronology"),
+        ("missing-observer", "observer-0 rich commit"),
+        ("duplicate-observer", "observer-0 rich commit"),
+        ("observer-key", "observer-0 rich commit"),
+        ("observer-at-selection", "observer-0 rich commit"),
+    ),
+)
+def test_v40_retention_ready_rejects_marker_or_authoritative_substitution(
+    mutation: str,
+    reason: str,
+) -> None:
+    arguments = _v40_retention_ready_fixture()
+    records = arguments["accepted_epoch1"]
+    assert isinstance(records, tuple)
+    first = records[0]
+    markers = list(arguments["markers"])
+    replica_events = {
+        replica_id: list(events)
+        for replica_id, events in arguments["replica_events"].items()
+    }
+    if mutation == "missing-marker":
+        markers.pop(0)
+    elif mutation == "duplicate-marker":
+        markers.append(replace(markers[0], line_number=99))
+    elif mutation == "marker-source":
+        markers[0] = replace(markers[0], source_replica=2)
+    elif mutation == "marker-key":
+        markers[0] = replace(markers[0], block_hash="ff" * 32)
+    elif mutation == "marker-action":
+        markers[0] = replace(markers[0], action="omit_direct_vote")
+    elif mutation == "marker-mode":
+        markers[0] = replace(markers[0], fault_mode="wrong_mode")
+    elif mutation == "marker-window":
+        markers[0] = replace(markers[0], window="wrong-window")
+    elif mutation == "marker-cohort":
+        markers[0] = replace(markers[0], cohort="hard")
+    elif mutation == "marker-at-commit":
+        markers[0] = replace(
+            markers[0],
+            monotonic_ns=first.reporter_local_commit_monotonic_ns,
+        )
+    elif mutation == "missing-observer":
+        replica_events[0].pop(0)
+    elif mutation == "duplicate-observer":
+        replica_events[0].append(
+            replace(
+                replica_events[0][0],
+                line_number=99,
+                source_sequence=99,
+            )
+        )
+    elif mutation == "observer-key":
+        event = replica_events[0][0]
+        payload = copy.deepcopy(event.payload)
+        payload["block_hash"] = "ff" * 32
+        payload["decision_proof"]["block_hash"] = "ff" * 32
+        replica_events[0][0] = replace(event, payload=payload)
+    else:
+        replica_events[0][0] = replace(
+            replica_events[0][0],
+            monotonic_ns=arguments["epoch2_selection_ns"],
+        )
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v40_cross_commit_retention_ready(
+            **{
+                **arguments,
+                "markers": tuple(markers),
+                "replica_events": {
+                    replica_id: tuple(events)
+                    for replica_id, events in replica_events.items()
+                },
+            }
+        )
+
+
+def _v40_schema2_accepted_event() -> validation._NativeEvent:
+    reporter = 4
+    target = 1
+    epoch = 1
+    tree_id = 0
+    block_hash = f"{1_001:064x}"
+    observation_id = hashlib.sha256(
+        validation._OBSERVATION_DOMAIN
+        + validation._u(reporter, 2)
+        + validation._u(target, 2)
+        + validation._u(epoch, 4)
+        + validation._u(tree_id, 4)
+        + bytes.fromhex(_V40_RETENTION_DIGEST)
+        + bytes.fromhex(block_hash)
+        + validation._u(validation._MESSAGE_TYPE_CODE["aggregate_relay"], 1)
+    ).hexdigest()
+    return replace(
+        _native_event(
+            source_id="adaptive-manager",
+            sequence=1,
+            monotonic_ns=22_100,
+            event_type="evidence.observation_accepted",
+            payload={
+                "ingestion_sequence": 1,
+                "observation": {
+                    "schema_version": 2,
+                    "observation_id": observation_id,
+                    "reporter_id": reporter,
+                    "observed_replica_id": target,
+                    "configuration": {
+                        "epoch_number": epoch,
+                        "tree_id": tree_id,
+                        "epoch_digest": _V40_RETENTION_DIGEST,
+                    },
+                    "block_hash": block_hash,
+                    "expected_message_type": "aggregate_relay",
+                    "outcome": "timeout",
+                    "response_duration_us": 0,
+                    "deadline_duration_us": 2,
+                    "reporter_monotonic_ns": 22_000,
+                    "reporter_sequence": 1,
+                    "attempt_start_monotonic_ns": 20_000,
+                    "reporter_local_commit_monotonic_ns": 21_000,
+                    "signer_set": [],
+                },
+            },
+        ),
+        source_kind="adaptation_manager",
+        source_instance="slot-adaptive-manager",
+    )
+
+
+def test_v40_schema2_accepted_timeout_parses_exact_retention_fact() -> None:
+    record = validation._evidence_record(
+        _v40_schema2_accepted_event(),
+        set(range(31)),
+        allowed_schema_versions=frozenset({2}),
+    )
+    assert (
+        record.schema_version,
+        record.attempt_start_monotonic_ns,
+        record.reporter_local_commit_monotonic_ns,
+    ) == (2, 20_000, 21_000)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing-start", "invalid field set"),
+        ("extra", "invalid field set"),
+        ("v1", "schema version"),
+        ("on-time", "schema-v2 timeout"),
+        ("start-zero", "integer >= 1"),
+        ("commit-zero", "integer >= 1"),
+        ("commit-at-deadline", "strict retention chronology"),
+        ("timeout-before-deadline", "strict retention chronology"),
+        ("overflow", "deadline overflows"),
+    ),
+)
+def test_v40_schema2_accepted_timeout_is_exact_and_overflow_safe(
+    mutation: str,
+    reason: str,
+) -> None:
+    event = _v40_schema2_accepted_event()
+    payload = copy.deepcopy(event.payload)
+    observation = payload["observation"]
+    if mutation == "missing-start":
+        observation.pop("attempt_start_monotonic_ns")
+    elif mutation == "extra":
+        observation["tls_authenticated"] = True
+    elif mutation == "v1":
+        observation["schema_version"] = 1
+    elif mutation == "on-time":
+        observation["outcome"] = "on_time"
+    elif mutation == "start-zero":
+        observation["attempt_start_monotonic_ns"] = 0
+    elif mutation == "commit-zero":
+        observation["reporter_local_commit_monotonic_ns"] = 0
+    elif mutation == "commit-at-deadline":
+        observation["reporter_local_commit_monotonic_ns"] = 22_000
+    elif mutation == "timeout-before-deadline":
+        observation["reporter_monotonic_ns"] = 21_999
+    else:
+        observation["attempt_start_monotonic_ns"] = validation._UINT64_MAX
+        observation["reporter_local_commit_monotonic_ns"] = (
+            validation._UINT64_MAX
+        )
+        observation["reporter_monotonic_ns"] = validation._UINT64_MAX
+        event = replace(event, monotonic_ns=validation._UINT64_MAX)
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._evidence_record(
+            replace(event, payload=payload),
+            set(range(31)),
+            allowed_schema_versions=frozenset({2}),
+        )
+
+
+def test_v40_mixed_v1_v2_accepted_ledger_preserves_v1_bytes() -> None:
+    v2 = _v40_schema2_accepted_event()
+    v1_payload = copy.deepcopy(v2.payload)
+    v1_observation = v1_payload["observation"]
+    v1_observation["schema_version"] = 1
+    v1_observation.pop("attempt_start_monotonic_ns")
+    v1_observation.pop("reporter_local_commit_monotonic_ns")
+    v1_observation["block_hash"] = f"{2_001:064x}"
+    v1_observation["observation_id"] = hashlib.sha256(
+        validation._OBSERVATION_DOMAIN
+        + validation._u(v1_observation["reporter_id"], 2)
+        + validation._u(v1_observation["observed_replica_id"], 2)
+        + validation._u(1, 4)
+        + validation._u(0, 4)
+        + bytes.fromhex(_V40_RETENTION_DIGEST)
+        + bytes.fromhex(v1_observation["block_hash"])
+        + validation._u(validation._MESSAGE_TYPE_CODE["aggregate_relay"], 1)
+    ).hexdigest()
+    v1 = replace(v2, monotonic_ns=22_100, payload=v1_payload)
+    v2_payload = copy.deepcopy(v2.payload)
+    v2_payload["ingestion_sequence"] = 2
+    v2_payload["observation"]["reporter_sequence"] = 2
+    v2 = replace(
+        v2,
+        line_number=2,
+        source_sequence=2,
+        monotonic_ns=22_200,
+        payload=v2_payload,
+    )
+
+    grouped = validation._accepted_evidence(
+        (v1, v2),
+        31,
+        allowed_schema_versions=frozenset({1, 2}),
+    )
+    assert tuple(
+        record.schema_version
+        for record in grouped[(1, _V40_RETENTION_DIGEST)]
+    ) == (1, 2)
+    with pytest.raises(FactorialValidationError, match="schema version"):
+        validation._accepted_evidence((v2,), 31)
 
 
 def test_epoch_command_signature_is_independently_verified() -> None:
@@ -8362,6 +9494,26 @@ def test_v36_sealed_s037_cross_commit_failure_reason_remains_exact() -> None:
         )
 
 
+def test_v39_sealed_s037_masked_actor1_failure_reason_remains_exact() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+
+    with pytest.raises(
+        FactorialValidationError,
+        match=(
+            r"responsive-degraded actors lack a v9 Epoch1 cross-commit "
+            r"retention witness ordered marker < reporter-local commit < "
+            r"original deadline <= timeout reporter <= timeout acceptance < "
+            r"Epoch2 selection: \[1\]"
+        ),
+    ):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "responsive_degraded_actor_ids": (1,),
+            }
+        )
+
+
 def test_v9_cross_commit_race_does_not_erase_strict_actor_witnesses() -> None:
     arguments = _v9_cross_commit_witness_fixture()
     valid_marker = arguments["markers"][0]
@@ -12327,6 +13479,8 @@ def _relocated_receipt_fixture(
 def _v39_repair_receipt_fixture(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    *,
+    version: int = 39,
 ) -> tuple[
     object,
     Path,
@@ -12335,7 +13489,13 @@ def _v39_repair_receipt_fixture(
     dict[str, object],
     bytes,
 ]:
-    manifest = _v39_candidate_manifest(monkeypatch)
+    if version not in {39, 40}:
+        raise AssertionError("repair receipt fixture supports only v39/v40")
+    manifest = (
+        _v40_candidate_manifest(monkeypatch)
+        if version == 40
+        else _v39_candidate_manifest(monkeypatch)
+    )
     plan = build_factorial_plan(manifest)
     primary = next(
         slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
@@ -12361,9 +13521,9 @@ def _v39_repair_receipt_fixture(
         for item in runtime_document["slots"]
         if item["slot_id"] == spec.slot_id
     )
-    original_repository = tmp_path / "removed-v39-original" / "Kauri"
+    original_repository = tmp_path / f"removed-v{version}-original" / "Kauri"
     original_slot = original_repository / spec.result_path
-    recovered_slot = tmp_path / "recovered-v39-archive" / spec.slot_id
+    recovered_slot = tmp_path / f"recovered-v{version}-archive" / spec.slot_id
     (recovered_slot / "runtime").mkdir(parents=True)
     tls = tuple(
         {
@@ -12385,7 +13545,11 @@ def _v39_repair_receipt_fixture(
         encoding="ascii",
     )
     authorization_bytes = _canonical(
-        {"authorization_id": "test-v39-repair-receipt-authorization"}
+        {
+            "authorization_id": (
+                f"test-v{version}-repair-receipt-authorization"
+            )
+        }
     )
     redaction_key = execution._derive_redaction_key(
         authorization_bytes,
@@ -12414,13 +13578,14 @@ def _v39_repair_receipt_fixture(
     replicas = materialize_replica_argv(spec, original_slot, anchor)
     start = anchor + spec.fault_window.start_after_prelaunch_anchor_s * 1_000_000_000
     end = start + spec.fault_window.duration_s * 1_000_000_000
+    identity = validation._frozen_artifact_identity(manifest.manifest_id)
     receipt: dict[str, object] = {
         "schema_version": 1,
         "slot_id": spec.slot_id,
         "runtime_artifact_id": spec.artifact_id,
-        "manifest_sha256": validation.FROZEN_MANIFEST_SHA256,
-        "plan_sha256": validation.FROZEN_PLAN_SHA256,
-        "runtime_sha256": validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        "manifest_sha256": identity.manifest_sha256,
+        "plan_sha256": identity.plan_sha256,
+        "runtime_sha256": identity.coverage_smoke_runtime_sha256,
         "execution_ordinal": spec.execution_ordinal,
         "attempt_ordinal": 1,
         "retry_of": None,
@@ -12435,6 +13600,13 @@ def _v39_repair_receipt_fixture(
             for process in replicas
         ],
     }
+    if version == 40:
+        main_config = (
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+            + "\n"
+        ).encode("ascii")
+        (recovered_slot / "runtime/main.conf").write_bytes(main_config)
+        receipt["main_config_sha256"] = hashlib.sha256(main_config).hexdigest()
     return (
         manifest,
         recovered_slot,
@@ -12443,6 +13615,127 @@ def _v39_repair_receipt_fixture(
         spec_document,
         authorization_bytes,
     )
+
+
+def test_v40_repair_receipt_production_dispatch_binds_main_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        manifest,
+        slot_root,
+        receipt,
+        expected,
+        runtime,
+        authorization_bytes,
+    ) = _v39_repair_receipt_fixture(monkeypatch, tmp_path, version=40)
+
+    validation._validate_slot_receipt(
+        receipt,
+        slot_root=slot_root,
+        manifest=manifest,
+        expected=expected,
+        runtime=runtime,
+        runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        authorization_bytes=authorization_bytes,
+    )
+
+    payload = (slot_root / "runtime/main.conf").read_bytes()
+    assert receipt["main_config_sha256"] == hashlib.sha256(payload).hexdigest()
+    manager_argv = receipt["manager_argv"]
+    assert manager_argv.count(
+        runtime_module.CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION
+    ) == 1
+    assert all(
+        runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_KEY
+        not in value
+        for row in receipt["replica_argv"]
+        for value in row["argv"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "digest", "bytes", "replica-argv", "historical-extra"),
+)
+def test_v40_repair_receipt_production_dispatch_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    version = 39 if mutation == "historical-extra" else 40
+    (
+        manifest,
+        slot_root,
+        receipt,
+        expected,
+        runtime,
+        authorization_bytes,
+    ) = _v39_repair_receipt_fixture(
+        monkeypatch,
+        tmp_path,
+        version=version,
+    )
+    runtime_sha256 = (
+        validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256
+        if version == 39
+        else validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    drifted = copy.deepcopy(receipt)
+    if mutation == "missing":
+        drifted.pop("main_config_sha256")
+    elif mutation == "digest":
+        drifted["main_config_sha256"] = "ff" * 32
+    elif mutation == "bytes":
+        path = slot_root / "runtime/main.conf"
+        path.write_bytes(path.read_bytes() + b"drift = true\n")
+    elif mutation == "replica-argv":
+        drifted["replica_argv"][0]["argv"].append(
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+        )
+    else:
+        (slot_root / "runtime/main.conf").write_text(
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+            + "\n",
+            encoding="ascii",
+        )
+        drifted["main_config_sha256"] = hashlib.sha256(
+            (slot_root / "runtime/main.conf").read_bytes()
+        ).hexdigest()
+
+    with pytest.raises(FactorialValidationError):
+        validation._validate_slot_receipt(
+            drifted,
+            slot_root=slot_root,
+            manifest=manifest,
+            expected=expected,
+            runtime=runtime,
+            runtime_sha256=runtime_sha256,
+            authorization_bytes=authorization_bytes,
+        )
+
+
+def test_validate_slot_v40_production_dispatch_precedes_strict_v9_guard() -> None:
+    source = inspect.getsource(validation.validate_slot)
+
+    receipt_index = source.index("_validate_slot_receipt(")
+    runner_index = source.index("_validate_runner_state(")
+    projection_index = source.index("_v40_commit_retention_compat_events(")
+    accepted_index = source.index("accepted = _accepted_evidence(")
+    readiness_index = source.index(
+        "_validate_v40_cross_commit_retention_ready("
+    )
+    strict_v9_index = source.index(
+        "internal_cross_commit_witness_count = validate_fault_causality("
+    )
+
+    assert receipt_index < runner_index < projection_index < accepted_index
+    assert accepted_index < readiness_index < strict_v9_index
+    assert "frozenset({1, 2})" in source
+    assert "if exact_v40_repair" in source
+    assert "else frozenset({1})" in source
+    assert "runner_hard_deadline_ns if exact_v40_repair else None" in source
+    assert "replica_events=raw_replica_events" in source
 
 
 @pytest.mark.parametrize(
@@ -12475,7 +13768,7 @@ def test_v39_repair_receipt_requires_exact_materialized_cycle1_gate(
         manifest=manifest,
         expected=expected,
         runtime=runtime,
-        runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        runtime_sha256=validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256,
         authorization_bytes=authorization_bytes,
     )
 
@@ -12509,7 +13802,7 @@ def test_v39_repair_receipt_requires_exact_materialized_cycle1_gate(
             manifest=manifest,
             expected=expected,
             runtime=runtime,
-            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            runtime_sha256=validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256,
             authorization_bytes=authorization_bytes,
         )
 
@@ -12539,7 +13832,7 @@ def test_v39_repair_receipt_rejects_fault_end_uint64_overflow(
             manifest=manifest,
             expected=expected,
             runtime=runtime,
-            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            runtime_sha256=validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256,
             authorization_bytes=authorization_bytes,
         )
 
@@ -12569,7 +13862,7 @@ def test_v39_repair_receipt_rejects_gate_target_uint64_overflow(
             manifest=manifest,
             expected=expected,
             runtime=runtime,
-            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            runtime_sha256=validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256,
             authorization_bytes=authorization_bytes,
         )
 
@@ -12600,7 +13893,7 @@ def test_v39_repair_receipt_requires_gate_strictly_before_hard_deadline(
             manifest=manifest,
             expected=expected,
             runtime=equal_hard,
-            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            runtime_sha256=validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256,
             authorization_bytes=authorization_bytes,
         )
 
@@ -12633,7 +13926,7 @@ def _v39_receipt_bound_live_chronology_fixture(
         manifest=manifest,
         expected=expected,
         runtime=runtime,
-        runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        runtime_sha256=validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256,
         authorization_bytes=authorization_bytes,
     )
     fault_end_ns = int(receipt["fault_window_end_ns"])
@@ -13199,6 +14492,7 @@ def _v25_coverage_runtime_fixture(
         37: _v37_candidate_manifest,
         38: _v38_candidate_manifest,
         39: _v39_candidate_manifest,
+        40: _v40_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -13372,6 +14666,230 @@ def test_v38_v39_repair_runtime_gate_and_contracts_are_cross_version_closed(
         ] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
     else:
         probe["semantic_delta"] = EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V2
+
+    with pytest.raises(FactorialValidationError):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+def test_v40_repair_runtime_binds_v5_readiness_and_source_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=40,
+    )
+    validated = validation._validate_v25_coverage_runtime_document(
+        runtime,
+        manifest=manifest,
+        expected_by_id=expected_by_id,
+    )
+    primary_id, repair_id = validation._coverage_smoke_slot_ids(
+        manifest.manifest_id
+    )
+    primary = validated[primary_id]
+    repair = validated[repair_id]
+    probe = repair["excluded_repair_smoke_probe"]
+    manager_argv = repair["manager_argv_template"]["argv"]
+    config_lines = repair["main_config"]["lines"]
+    v40_options = (
+        runtime_module.CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION,
+        runtime_module.CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION,
+        runtime_module.CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION,
+    )
+
+    assert primary["fault_window"]["duration_s"] == 450
+    assert "excluded_repair_smoke_probe" not in primary
+    assert repair["fault_window"]["duration_s"] == 360
+    assert repair["fault_window"]["hard_timeout_s"] == 650
+    assert probe["semantic_delta"] == (
+        runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
+    )
+    assert probe["observation_contract"] == (
+        manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
+    )
+    assert probe["post_fault_observation_grace_s"] == 5
+    assert probe["cycle1_inherited_wait_exempt_eligibility_gate"] is True
+    assert (
+        probe["cycle1_responsive_cross_commit_retention_readiness_gate"]
+        is True
+    )
+    assert tuple(probe["canonical_responsive_degraded_actor_ids"]) == (
+        1,
+        7,
+        8,
+        12,
+        16,
+        19,
+        20,
+    )
+    assert probe["response_evidence_timeout_retention_schema_version"] == 2
+    assert probe["runner_terminal_strictly_before_hard_deadline"] is True
+    assert all(manager_argv.count(option) == 1 for option in v40_options)
+    actors_index = manager_argv.index(
+        runtime_module.CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION
+    )
+    assert manager_argv[actors_index + 1] == "1,7,8,12,16,19,20"
+    assert config_lines.count(
+        runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+    ) == 1
+    assert all(
+        runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_KEY
+        not in value
+        for row in repair["replica_argv_templates"]
+        for value in row["argv"]
+    )
+
+    plan = build_factorial_plan(manifest)
+    campaign = json.loads(canonical_runtime_bytes(build_factorial_runtime(plan)))
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0]).runtime.as_document()
+    for slots in (campaign["slots"], (smoke,)):
+        for slot in slots:
+            argv = slot["manager_argv_template"]["argv"]
+            lines = slot["main_config"]["lines"]
+            assert all(option not in argv for option in v40_options)
+            assert CYCLE1_SELECTION_NOT_BEFORE_OPTION not in argv
+            assert (
+                runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+                not in lines
+            )
+            assert "excluded_repair_smoke_probe" not in slot
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "duration-359",
+        "duration-361",
+        "contract-v4",
+        "delta-v3",
+        "grace-4",
+        "grace-6",
+        "eligibility-false",
+        "readiness-false",
+        "cohort-drift",
+        "schema-v1",
+        "runner-terminal-false",
+        "missing-eligibility-option",
+        "duplicate-readiness-option",
+        "actor-csv-drift",
+        "missing-config",
+        "duplicate-config",
+        "config-key-in-replica-argv",
+        "config-key-in-manager-argv",
+    ),
+)
+def test_v40_repair_runtime_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=40,
+    )
+    repair_id = validation._coverage_smoke_slot_ids(manifest.manifest_id)[1]
+    repair = next(slot for slot in runtime["slots"] if slot["slot_id"] == repair_id)
+    probe = repair["excluded_repair_smoke_probe"]
+    argv = repair["manager_argv_template"]["argv"]
+    config_lines = repair["main_config"]["lines"]
+    if mutation == "duration-359":
+        repair["fault_window"]["duration_s"] = 359
+    elif mutation == "duration-361":
+        repair["fault_window"]["duration_s"] = 361
+    elif mutation == "contract-v4":
+        probe["observation_contract"] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        repair["causal_acceptance"][
+            "excluded_repair_smoke_observation_contract"
+        ] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+    elif mutation == "delta-v3":
+        probe["semantic_delta"] = EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
+    elif mutation == "grace-4":
+        probe["post_fault_observation_grace_s"] = 4
+    elif mutation == "grace-6":
+        probe["post_fault_observation_grace_s"] = 6
+    elif mutation == "eligibility-false":
+        probe["cycle1_inherited_wait_exempt_eligibility_gate"] = False
+    elif mutation == "readiness-false":
+        probe["cycle1_responsive_cross_commit_retention_readiness_gate"] = False
+    elif mutation == "cohort-drift":
+        probe["canonical_responsive_degraded_actor_ids"][-1] = 21
+    elif mutation == "schema-v1":
+        probe["response_evidence_timeout_retention_schema_version"] = 1
+    elif mutation == "runner-terminal-false":
+        probe["runner_terminal_strictly_before_hard_deadline"] = False
+    elif mutation == "missing-eligibility-option":
+        argv.remove(
+            runtime_module.CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION
+        )
+    elif mutation == "duplicate-readiness-option":
+        option = (
+            runtime_module.CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION
+        )
+        argv.insert(argv.index(option), option)
+    elif mutation == "actor-csv-drift":
+        option = runtime_module.CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION
+        argv[argv.index(option) + 1] = "1,7,8,12,16,19,21"
+    elif mutation == "missing-config":
+        config_lines.remove(
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+        )
+    elif mutation == "duplicate-config":
+        config_lines.append(
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+        )
+    elif mutation == "config-key-in-replica-argv":
+        repair["replica_argv_templates"][0]["argv"].append(
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+        )
+    else:
+        argv.append(
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+        )
+
+    with pytest.raises(FactorialValidationError):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("contract-v5", "v40-probe-field", "v40-manager-gate", "v40-config"),
+)
+def test_v39_runtime_rejects_every_v40_only_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=39,
+    )
+    repair_id = validation._coverage_smoke_slot_ids(manifest.manifest_id)[1]
+    repair = next(slot for slot in runtime["slots"] if slot["slot_id"] == repair_id)
+    if mutation == "contract-v5":
+        repair["excluded_repair_smoke_probe"]["observation_contract"] = (
+            manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
+        )
+        repair["causal_acceptance"][
+            "excluded_repair_smoke_observation_contract"
+        ] = manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
+    elif mutation == "v40-probe-field":
+        repair["excluded_repair_smoke_probe"][
+            "response_evidence_timeout_retention_schema_version"
+        ] = 2
+    elif mutation == "v40-manager-gate":
+        repair["manager_argv_template"]["argv"].append(
+            runtime_module.CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION
+        )
+    else:
+        repair["main_config"]["lines"].append(
+            runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
+        )
 
     with pytest.raises(FactorialValidationError):
         validation._validate_v25_coverage_runtime_document(
@@ -13927,7 +15445,7 @@ def test_v33_runtime_slot_rejects_any_deadline_or_schedule_drift(
         ),
         (
             39,
-            validation.FROZEN_MANIFEST_ID,
+            validation.V39_MANIFEST_ID,
             "results/shape-placement-factorial-v39/slot-037-n31-f2-b04-00",
         ),
     ),
@@ -15760,6 +17278,97 @@ def _write_static_slot(
         runtime_payload = canonical_runtime_bytes(runtime)
     (root / validation.RUNTIME_FILENAME).write_bytes(runtime_payload)
     return root
+
+
+def _write_runner_state_fixture(
+    tmp_path: Path,
+    *,
+    expected: validation._ExpectedSlot,
+    anchor_ns: int,
+    terminal_ns: int,
+) -> None:
+    phases = (
+        "identity_generation",
+        "launch",
+        "observing",
+        "qualified_pending_cleanup",
+        "terminal",
+    )
+    timestamps = (anchor_ns - 4, anchor_ns, anchor_ns + 1, anchor_ns + 2, terminal_ns)
+    rows: list[dict[str, object]] = []
+    for phase, timestamp in zip(phases, timestamps):
+        row: dict[str, object] = {
+            "schema_version": 1,
+            "slot_id": expected.slot_id,
+            "phase": phase,
+            "recorded_utc": "2026-08-11T00:00:00+00:00",
+            "recorded_monotonic_ns": timestamp,
+        }
+        if phase == "launch":
+            row["shared_raw_clock_anchor_ns"] = anchor_ns
+        elif phase == "observing":
+            row["launch_count"] = expected.replica_count + 1
+        elif phase == "terminal":
+            row.update({"outcome": "PASS", "reason": None})
+        rows.append(row)
+    (tmp_path / validation.RUNNER_STATE_FILENAME).write_bytes(
+        b"".join(_canonical(row) for row in rows)
+    )
+
+
+@pytest.mark.parametrize(
+    ("terminal_delta", "accepted"),
+    ((-1, True), (0, False), (1, False)),
+)
+def test_v40_runner_terminal_is_strictly_before_shared_hard_deadline(
+    tmp_path: Path,
+    terminal_delta: int,
+    accepted: bool,
+) -> None:
+    expected = _v25_inherited_placement_expected_slot()
+    anchor_ns = 100
+    hard_deadline_ns = 1_000
+    _write_runner_state_fixture(
+        tmp_path,
+        expected=expected,
+        anchor_ns=anchor_ns,
+        terminal_ns=hard_deadline_ns + terminal_delta,
+    )
+    arguments = {
+        "expected": expected,
+        "anchor_ns": anchor_ns,
+        "manifest_id": "shape-placement-factorial-v40",
+        "hard_deadline_ns": hard_deadline_ns,
+    }
+    if accepted:
+        validation._validate_runner_state(tmp_path, **arguments)
+    else:
+        with pytest.raises(
+            FactorialValidationError,
+            match="v40 runner terminal.*shared hard deadline",
+        ):
+            validation._validate_runner_state(tmp_path, **arguments)
+
+
+def test_v39_runner_terminal_preserves_historical_no_hard_bound(
+    tmp_path: Path,
+) -> None:
+    expected = _v25_inherited_placement_expected_slot()
+    anchor_ns = 100
+    hard_deadline_ns = 1_000
+    _write_runner_state_fixture(
+        tmp_path,
+        expected=expected,
+        anchor_ns=anchor_ns,
+        terminal_ns=hard_deadline_ns,
+    )
+    validation._validate_runner_state(
+        tmp_path,
+        expected=expected,
+        anchor_ns=anchor_ns,
+        manifest_id="shape-placement-factorial-v39",
+        hard_deadline_ns=hard_deadline_ns,
+    )
 
 
 def test_interrupted_slot_is_incomplete_not_pass(tmp_path: Path) -> None:

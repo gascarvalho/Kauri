@@ -318,7 +318,11 @@ bool same_fact(
            left.response_duration_us == right.response_duration_us &&
            left.deadline_duration_us == right.deadline_duration_us &&
            left.fact_monotonic_ns == right.fact_monotonic_ns &&
-           left.signer_set == right.signer_set;
+           left.signer_set == right.signer_set &&
+           left.attempt_start_monotonic_ns ==
+               right.attempt_start_monotonic_ns &&
+           left.reporter_local_commit_monotonic_ns ==
+               right.reporter_local_commit_monotonic_ns;
 }
 
 bool same_observation(
@@ -338,7 +342,11 @@ bool same_observation(
            left.reporter_monotonic_ns ==
                right.reporter_monotonic_ns &&
            left.reporter_sequence == right.reporter_sequence &&
-           left.signer_set == right.signer_set;
+           left.signer_set == right.signer_set &&
+           left.attempt_start_monotonic_ns ==
+               right.attempt_start_monotonic_ns &&
+           left.reporter_local_commit_monotonic_ns ==
+               right.reporter_local_commit_monotonic_ns;
 }
 
 bool same_envelope(
@@ -508,6 +516,94 @@ TEST_CASE("a fact becomes one complete trusted versioned envelope",
     CHECK(diagnostics.last_reporter_monotonic_ns == 1'500'000);
     CHECK(diagnostics.healthy);
     CHECK(reporter.healthy());
+}
+
+TEST_CASE(
+    "retained timeout fact becomes one schema-v2 observation",
+    "[adaptive-v2][evidence-reporter][v2][retention][intentional-red]")
+{
+    EvidenceReporter reporter(config(9));
+    auto input = fact(
+        "retained-timeout",
+        4,
+        ExpectedMessageType::aggregate_relay,
+        ResponseOutcome::timeout,
+        1'100'000,
+        {});
+    input.attempt_start_monotonic_ns = 1'000'000;
+    input.reporter_local_commit_monotonic_ns = 1'050'000;
+
+    REQUIRE(reporter.enqueue(input));
+    const auto *pending = reporter.front();
+    REQUIRE(pending != nullptr);
+    const auto &observation = pending->envelope.observation;
+    CHECK(observation.schema_version ==
+          hotstuff::kResponseObservationSchemaVersionV2);
+    CHECK(observation.attempt_start_monotonic_ns == 1'000'000);
+    CHECK(observation.reporter_local_commit_monotonic_ns == 1'050'000);
+    CHECK(observation.observation_id ==
+          hotstuff::compute_response_observation_id(
+              observation.attempt_identity()));
+}
+
+TEST_CASE(
+    "partial or unordered retention chronology is rejected fail closed",
+    "[adaptive-v2][evidence-reporter][v2][retention][invalid]"
+    "[intentional-red]")
+{
+    EvidenceReporter reporter(config(9));
+    auto input = fact(
+        "invalid-retained-timeout",
+        4,
+        ExpectedMessageType::aggregate_relay,
+        ResponseOutcome::timeout,
+        1'100'000,
+        {});
+    input.attempt_start_monotonic_ns = 1'000'000;
+    CHECK_FALSE(reporter.enqueue(input));
+    CHECK_FALSE(reporter.healthy());
+
+    EvidenceReporter reordered(config(9));
+    input.reporter_local_commit_monotonic_ns = 1'100'001;
+    CHECK_FALSE(reordered.enqueue(input));
+    CHECK_FALSE(reordered.healthy());
+}
+
+TEST_CASE(
+    "temporary retry preserves exact schema-v2 canonical payload bytes",
+    "[adaptive-v2][evidence-reporter][v2][retry][canonical]"
+    "[intentional-red]")
+{
+    EvidenceReporter reporter(config(9));
+    auto input = fact(
+        "retained-timeout-retry",
+        4,
+        ExpectedMessageType::aggregate_relay,
+        ResponseOutcome::timeout,
+        1'100'000,
+        {});
+    input.attempt_start_monotonic_ns = 1'000'000;
+    input.reporter_local_commit_monotonic_ns = 1'050'000;
+    REQUIRE(reporter.enqueue(input));
+    REQUIRE(reporter.front() != nullptr);
+    const auto canonical =
+        reporter.front()->envelope.canonical_payload;
+
+    std::vector<bytearray_t> seen;
+    const auto transport =
+        [&seen](const EvidenceReportEnvelope &envelope) {
+            seen.push_back(envelope.canonical_payload);
+            return seen.size() == 1
+                       ? EvidenceTransportResult::temporary_failure
+                       : EvidenceTransportResult::accepted;
+        };
+    REQUIRE(reporter.dispatch_one(transport).has_value());
+    REQUIRE(reporter.front() != nullptr);
+    CHECK(reporter.front()->envelope.canonical_payload == canonical);
+    REQUIRE(reporter.dispatch_one(transport).has_value());
+    REQUIRE(seen.size() == 2);
+    CHECK(seen[0] == canonical);
+    CHECK(seen[1] == canonical);
 }
 
 TEST_CASE("temporary transport failure retries the exact FIFO head",

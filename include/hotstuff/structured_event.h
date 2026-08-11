@@ -81,6 +81,10 @@ struct CommitStructuredEvent
     ProposalKey decision_proof;
     std::optional<std::uint64_t> view_generation;
     std::uint64_t commit_batch_index{0};
+    // Present only for the experiment-only schema-v2 retention path. The
+    // value is the exact reporter-local commit sample shared with evidence.
+    std::optional<std::uint64_t>
+        reporter_local_commit_monotonic_ns;
 };
 
 /**
@@ -284,6 +288,20 @@ struct AdaptiveV2FaultContainmentCoverageReadyStructuredEvent
     std::vector<std::uint32_t> observed_tree_ids;
 };
 
+/**
+ * Manager-owned proof that the exact cycle-one evaluation cutoff admitted
+ * one retained cross-commit witness for every responsive degraded actor.
+ */
+struct AdaptiveV2CrossCommitRetentionReadyStructuredEvent
+{
+    std::uint64_t cycle_ordinal{0};
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::uint64_t evidence_cutoff{0};
+    std::vector<ReplicaID> responsive_degraded_actor_ids;
+    std::vector<uint256_t> admitted_observation_ids;
+};
+
 /** Canonical JSON object containing every independently scored candidate. */
 std::string serialize_adaptive_v2_shape_decision_payload(
     const AdaptiveV2ShapeDecisionStructuredEvent &event,
@@ -333,7 +351,8 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV2ShapeDecisionStructuredEvent,
     FaultContributionOpportunityStructuredEvent,
     RootQcQueueBlockedStructuredEvent,
-    AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>;
+    AdaptiveV2FaultContainmentCoverageReadyStructuredEvent,
+    AdaptiveV2CrossCommitRetentionReadyStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -436,6 +455,7 @@ enum class StructuredEventType : std::uint8_t
     pipeline_root_qc_queue_blocked,
     adaptive_v2_fault_containment_coverage_ready,
     block_commit_identity_unavailable,
+    adaptive_v2_cross_commit_retention_ready,
 };
 
 StructuredEventType structured_event_type(

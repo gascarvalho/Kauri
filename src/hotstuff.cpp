@@ -5827,7 +5827,9 @@ namespace hotstuff
         const block_t &blk,
         const std::optional<ProposalKey> &committed_key,
         const std::optional<std::uint64_t> &view_generation,
-        std::uint64_t commit_batch_index) noexcept
+        std::uint64_t commit_batch_index,
+        const std::optional<std::uint64_t> &
+            reporter_local_commit_monotonic_ns) noexcept
     {
         if (structured_event_emitter == nullptr || blk == nullptr ||
             !committed_key.has_value() || !view_generation.has_value())
@@ -5850,7 +5852,8 @@ namespace hotstuff
                     static_cast<std::uint64_t>(blk->get_cmds().size()),
                     key,
                     view_generation,
-                    commit_batch_index}});
+                    commit_batch_index,
+                    reporter_local_commit_monotonic_ns}});
         }
         catch (...)
         {
@@ -9493,6 +9496,24 @@ namespace hotstuff
         {
             if (adaptive_v2_lifecycle_reporting_suppressed)
                 return;
+            if (experiment_responsive_cross_commit_retention_v2)
+            {
+                const auto local_commit_monotonic_ns =
+                    adaptive_evidence_monotonic_now_ns();
+                if (local_commit_monotonic_ns == 0 ||
+                    adaptive_v2_response_evidence == nullptr ||
+                    !adaptive_v2_response_evidence
+                         ->record_reporter_local_commit(
+                             *key, local_commit_monotonic_ns))
+                {
+                    mark_adaptive_v2_convergence_evidence_unhealthy(
+                        "cross_commit_retention_clock_or_state_failed");
+                    return;
+                }
+                pending_adaptive_v2_commit
+                    ->reporter_local_commit_monotonic_ns =
+                    local_commit_monotonic_ns;
+            }
             const auto pending =
                 experiment_false_timeout_states.find(*key);
             if (pending != experiment_false_timeout_states.end())
@@ -10486,6 +10507,17 @@ namespace hotstuff
             options.rotating_omission->local_replica != get_id())
             throw std::invalid_argument(
                 "scheduled omission local replica does not match runtime");
+        if (experiment_responsive_cross_commit_retention_v2 &&
+            (!options.rotating_omission.has_value() ||
+             options.rotating_omission->mode !=
+                 "tiered_persistent_responsive_omission_v2" ||
+             options.rotating_omission
+                 ->responsive_degraded_actor_ids.empty()))
+        {
+            throw std::invalid_argument(
+                "cross-commit retention v2 requires tiered responsive "
+                "omission v2 actors");
+        }
         if (!options.response_evidence_duplicate_probe.empty() &&
             (options.response_evidence_duplicate_probe !=
                  kExperimentResponseEvidenceDuplicateProbeMode ||
@@ -10557,6 +10589,25 @@ namespace hotstuff
             response_evidence_duplicate_probe_window_end_ns;
         experiment_response_evidence_duplicate_probe_consumed.store(false);
         experiment_byzantine_adapter = std::move(adapter);
+    }
+
+    void HotStuffBase::
+    enable_experiment_responsive_cross_commit_retention_v2()
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            throw std::logic_error(
+                "cross-commit retention v2 requires adaptive-v2");
+        if (proposal_contexts->active_configuration().has_value())
+            throw std::logic_error(
+                "cross-commit retention v2 must be enabled before startup");
+        if (adaptive_v2_response_evidence == nullptr ||
+            !adaptive_v2_response_evidence
+                 ->enable_cross_commit_retention_v2())
+        {
+            throw std::logic_error(
+                "cross-commit retention v2 bridge is unavailable");
+        }
+        experiment_responsive_cross_commit_retention_v2 = true;
     }
 
     void HotStuffBase::configure_experiment_post_qc_audit(
@@ -12454,7 +12505,11 @@ namespace hotstuff
             exact_key.reset();
         pending_adaptive_v2_commit.emplace(
             PendingAdaptiveV2Commit{
-                blk->get_hash(), exact_key, generation, disposition});
+                blk->get_hash(),
+                exact_key,
+                generation,
+                disposition,
+                std::nullopt});
     }
 
     std::optional<uint256_t>
@@ -12610,6 +12665,8 @@ namespace hotstuff
 
         std::optional<ProposalKey> committed_key;
         std::optional<std::uint64_t> view_generation;
+        std::optional<std::uint64_t>
+            reporter_local_commit_monotonic_ns;
         auto identity_disposition =
             CommittedProposalIdentityDisposition::conflicting;
         if (pending_adaptive_v2_commit &&
@@ -12618,6 +12675,9 @@ namespace hotstuff
             committed_key = pending_adaptive_v2_commit->committed_key;
             view_generation =
                 pending_adaptive_v2_commit->view_generation;
+            reporter_local_commit_monotonic_ns =
+                pending_adaptive_v2_commit
+                    ->reporter_local_commit_monotonic_ns;
             identity_disposition =
                 pending_adaptive_v2_commit->identity_disposition;
         }
@@ -12629,7 +12689,11 @@ namespace hotstuff
         else if (identity_disposition ==
                  CommittedProposalIdentityDisposition::exact)
             emit_committed_block_event(
-                blk, committed_key, view_generation, commit_batch_index);
+                blk,
+                committed_key,
+                view_generation,
+                commit_batch_index,
+                reporter_local_commit_monotonic_ns);
 
         const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
             pending_committed_epoch_change.reset();

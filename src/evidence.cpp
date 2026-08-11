@@ -19,7 +19,9 @@ constexpr char kObservationDomain[] =
     "kauri-response-observation-v1";
 constexpr std::size_t kDigestSize = 32;
 constexpr std::size_t kBatchFixedSize = 8;
-constexpr std::size_t kObservationFixedSize = 150;
+constexpr std::size_t kObservationV1FixedSize = 150;
+constexpr std::size_t kObservationV2FixedSize =
+    kObservationV1FixedSize + 2 * sizeof(std::uint64_t);
 
 template <typename UInt>
 void append_big_endian(bytearray_t &output, UInt value)
@@ -75,6 +77,50 @@ bool canonical_signers(const std::vector<ReplicaID> &signers) noexcept
                [](ReplicaID left, ReplicaID right) {
                    return left >= right;
                }) == signers.end();
+}
+
+bool valid_retention_witness_impl(
+    const ResponseObservation &observation) noexcept
+{
+    if (observation.schema_version ==
+        kResponseObservationSchemaVersionV1)
+    {
+        return observation.attempt_start_monotonic_ns == 0 &&
+               observation.reporter_local_commit_monotonic_ns == 0;
+    }
+    if (observation.schema_version !=
+        kResponseObservationSchemaVersionV2)
+    {
+        return false;
+    }
+    if (observation.outcome != ResponseOutcome::timeout ||
+        observation.response_duration_us != 0 ||
+        !observation.signer_set.empty() ||
+        observation.attempt_start_monotonic_ns == 0 ||
+        observation.reporter_local_commit_monotonic_ns == 0 ||
+        observation.deadline_duration_us == 0 ||
+        observation.deadline_duration_us >
+            std::numeric_limits<std::uint64_t>::max() / 1'000)
+    {
+        return false;
+    }
+    const auto deadline_duration_ns =
+        observation.deadline_duration_us * 1'000;
+    if (observation.attempt_start_monotonic_ns >
+        std::numeric_limits<std::uint64_t>::max() -
+            deadline_duration_ns)
+    {
+        return false;
+    }
+    const auto absolute_deadline_ns =
+        observation.attempt_start_monotonic_ns +
+        deadline_duration_ns;
+    return observation.attempt_start_monotonic_ns <=
+               observation.reporter_local_commit_monotonic_ns &&
+           observation.reporter_local_commit_monotonic_ns <
+               absolute_deadline_ns &&
+           absolute_deadline_ns <=
+               observation.reporter_monotonic_ns;
 }
 
 void add_encoded_size(std::size_t &size,
@@ -156,7 +202,8 @@ EvidenceDecodeResult decode_evidence_batch_impl(
     if (observation_count > limits.maximum_observations)
         return decode_failure(EvidenceWireError::batch_count_exceeded);
 
-    if (observation_count > reader.remaining() / kObservationFixedSize)
+    if (observation_count >
+        reader.remaining() / kObservationV1FixedSize)
         return decode_failure(EvidenceWireError::truncated);
 
     ResponseObservationBatch batch;
@@ -165,14 +212,14 @@ EvidenceDecodeResult decode_evidence_batch_impl(
 
     for (std::uint32_t index = 0; index < observation_count; ++index)
     {
-        if (reader.remaining() < kObservationFixedSize)
+        if (reader.remaining() < kObservationV1FixedSize)
             return decode_failure(EvidenceWireError::truncated);
 
         ResponseObservation observation;
         if (!reader.read(observation.schema_version))
             return decode_failure(EvidenceWireError::truncated);
-        if (observation.schema_version !=
-            kResponseObservationSchemaVersion)
+        if (!is_supported_response_observation_schema(
+                observation.schema_version))
         {
             return decode_failure(
                 EvidenceWireError::unsupported_observation_schema);
@@ -215,6 +262,18 @@ EvidenceDecodeResult decode_evidence_batch_impl(
             return decode_failure(EvidenceWireError::truncated);
         }
 
+        if (observation.schema_version ==
+            kResponseObservationSchemaVersionV2)
+        {
+            if (!reader.read(
+                    observation.attempt_start_monotonic_ns) ||
+                !reader.read(
+                    observation.reporter_local_commit_monotonic_ns))
+            {
+                return decode_failure(EvidenceWireError::truncated);
+            }
+        }
+
         std::uint32_t signer_count = 0;
         if (!reader.read(signer_count))
             return decode_failure(EvidenceWireError::truncated);
@@ -241,6 +300,12 @@ EvidenceDecodeResult decode_evidence_batch_impl(
                     EvidenceWireError::noncanonical_signer_set);
             }
             observation.signer_set.push_back(signer);
+        }
+        if (!valid_response_observation_retention_witness(
+                observation))
+        {
+            return decode_failure(
+                EvidenceWireError::invalid_retention_witness);
         }
         batch.observations.push_back(std::move(observation));
     }
@@ -335,7 +400,8 @@ bool position_is_in_subtree(std::size_t position,
 
 bool valid_timing(const ResponseObservation &observation) noexcept
 {
-    if (observation.deadline_duration_us == 0)
+    if (observation.deadline_duration_us == 0 ||
+        !valid_response_observation_retention_witness(observation))
         return false;
     switch (observation.outcome)
     {
@@ -455,6 +521,12 @@ std::optional<EvidenceRejectionReason> transition_rejection(
 
 } // namespace
 
+bool valid_response_observation_retention_witness(
+    const ResponseObservation &observation) noexcept
+{
+    return valid_retention_witness_impl(observation);
+}
+
 struct EvidenceLedger::State
 {
     using AttemptMap = std::map<uint256_t, AttemptProgress>;
@@ -478,8 +550,8 @@ struct EvidenceLedger::State
         const AuthenticatedReporter &authenticated_reporter,
         const ResponseObservation &observation) const
     {
-        if (observation.schema_version !=
-            kResponseObservationSchemaVersion)
+        if (!is_supported_response_observation_schema(
+                observation.schema_version))
         {
             return EvidenceRejectionReason::unsupported_schema;
         }
@@ -704,8 +776,8 @@ bytearray_t encode_evidence_batch(
         encoded_size, kBatchFixedSize, limits.maximum_payload_bytes);
     for (const auto &observation : batch.observations)
     {
-        if (observation.schema_version !=
-            kResponseObservationSchemaVersion)
+        if (!is_supported_response_observation_schema(
+                observation.schema_version))
         {
             throw std::invalid_argument(
                 "unsupported response observation schema");
@@ -728,9 +800,18 @@ bytearray_t encode_evidence_batch(
         {
             throw std::length_error("evidence signer bytes overflow");
         }
+        if (!valid_response_observation_retention_witness(
+                observation))
+        {
+            throw std::invalid_argument(
+                "invalid response retention witness");
+        }
         add_encoded_size(
             encoded_size,
-            kObservationFixedSize,
+            observation.schema_version ==
+                    kResponseObservationSchemaVersionV2
+                ? kObservationV2FixedSize
+                : kObservationV1FixedSize,
             limits.maximum_payload_bytes);
         add_encoded_size(
             encoded_size,
@@ -767,6 +848,15 @@ bytearray_t encode_evidence_batch(
         append_big_endian(payload, observation.deadline_duration_us);
         append_big_endian(payload, observation.reporter_monotonic_ns);
         append_big_endian(payload, observation.reporter_sequence);
+        if (observation.schema_version ==
+            kResponseObservationSchemaVersionV2)
+        {
+            append_big_endian(
+                payload, observation.attempt_start_monotonic_ns);
+            append_big_endian(
+                payload,
+                observation.reporter_local_commit_monotonic_ns);
+        }
         append_big_endian(
             payload,
             static_cast<std::uint32_t>(observation.signer_set.size()));
@@ -823,8 +913,8 @@ void EvidenceLedger::ingest(
                 std::nullopt);
         };
 
-        if (observation.schema_version !=
-            kResponseObservationSchemaVersion)
+        if (!is_supported_response_observation_schema(
+                observation.schema_version))
         {
             reject(EvidenceRejectionReason::unsupported_schema);
             return;

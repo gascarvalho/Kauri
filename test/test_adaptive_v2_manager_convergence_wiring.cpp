@@ -1691,3 +1691,86 @@ TEST_CASE(
     CHECK(manager.find("session_.observe_activation(") !=
           std::string::npos);
 }
+
+TEST_CASE(
+    "cycle-one repair admission gates live evaluation on retained and eligible actors",
+    "[adaptive-v2][manager][v40][retention][eligibility][wiring]"
+    "[intentional-red]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+    const auto admission = code_without_comments_or_literals(
+        source("src/adaptive_v2_response_evidence.cpp"));
+    REQUIRE(owns_manager_session(manager));
+    CHECK(raw_manager.find(
+              "--cycle-1-inherited-wait-exempt-eligibility-gate") !=
+          std::string::npos);
+    CHECK(raw_manager.find(
+              "--cycle-1-responsive-cross-commit-retention-readiness-gate") !=
+          std::string::npos);
+    CHECK(raw_manager.find("--cycle-1-responsive-degraded-actors") !=
+          std::string::npos);
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(evaluate.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"cycle_1_selection_gate_ready()",
+         "cycle_1_retention_readiness_gate_ready(evidence_cutoff)",
+         "cycle_1_inherited_eligibility_gate_ready(evidence_cutoff)",
+         "session_.evaluate()"}));
+
+    const auto retention = function_body(
+        manager,
+        "bool cycle_1_retention_readiness_gate_ready(");
+    REQUIRE_FALSE(retention.empty());
+    CHECK(retention.find(
+              "select_adaptive_v2_cross_commit_retention_admission") !=
+          std::string::npos);
+    CHECK(retention.find("cycle_1_retention_admission_") !=
+          std::string::npos);
+
+    const auto selector = function_body(
+        admission,
+        "AdaptiveV2CrossCommitRetentionAdmission ");
+    REQUIRE_FALSE(selector.empty());
+    CHECK(selector.find("kResponseObservationSchemaVersionV2") !=
+          std::string::npos);
+    CHECK(selector.find("ResponseOutcome::timeout") !=
+          std::string::npos);
+    CHECK(selector.find("ExpectedMessageType::aggregate_relay") !=
+          std::string::npos);
+    CHECK(selector.find("ingestion_sequence") != std::string::npos);
+    CHECK(selector.find("observed_replica_id") != std::string::npos);
+    CHECK(selector.find("outstanding.erase") != std::string::npos);
+    CHECK(selector.find("admitted_observation_ids") !=
+          std::string::npos);
+
+    const auto eligibility = function_body(
+        manager,
+        "bool cycle_1_inherited_eligibility_gate_ready(");
+    REQUIRE_FALSE(eligibility.empty());
+    CHECK(eligibility.find("AdaptiveV2ByzantineSelection") !=
+          std::string::npos);
+    CHECK(eligibility.find("freeze_baseline") != std::string::npos);
+    CHECK(eligibility.find("rank_inheriting_constraints_through") !=
+          std::string::npos);
+    CHECK(eligibility.find("responsive") != std::string::npos);
+    CHECK(eligibility.find("eligible") != std::string::npos);
+
+    const auto emit = function_body(
+        manager,
+        "bool emit_cycle_1_cross_commit_retention_ready(");
+    REQUIRE_FALSE(emit.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"session_.evaluate()",
+         "AdaptiveV2ManagerControllerStatus::successor_ready",
+         "emit_cycle_1_cross_commit_retention_ready(evidence_cutoff)"}));
+    CHECK(emit.find("AdaptiveV2CrossCommitRetentionReadyStructuredEvent") !=
+          std::string::npos);
+    CHECK(emit.find("controller->current_cutoff != evidence_cutoff") !=
+          std::string::npos);
+    CHECK(emit.find("admission.evidence_cutoff != evidence_cutoff") !=
+          std::string::npos);
+}

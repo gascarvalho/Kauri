@@ -24,6 +24,9 @@ namespace
 
 using hotstuff::AdaptiveV2ResponseEvidenceBridge;
 using hotstuff::AdaptiveV2ResponseEvidenceLimits;
+using hotstuff::AdaptiveV2CrossCommitRetentionAdmissionStatus;
+using hotstuff::AcceptedEvidenceRecord;
+using hotstuff::AdaptationEpochId;
 using hotstuff::AdaptiveV2ReportingAttemptStatus;
 using hotstuff::AdaptiveV2ReportingDeliveryResult;
 using hotstuff::AdaptiveV2ReportingEnqueueStatus;
@@ -44,6 +47,7 @@ using hotstuff::ProposalCommitted;
 using hotstuff::ProposalKey;
 using hotstuff::ProposalLifecycleFact;
 using hotstuff::ProposalTreeSnapshot;
+using hotstuff::ReplicaID;
 using hotstuff::ResponseOutcome;
 using hotstuff::uint256_t;
 
@@ -153,6 +157,62 @@ void deliver_and_release(
 std::uint64_t after_us(std::uint64_t microseconds)
 {
     return kStartNs + microseconds * kNanosecondsPerMicrosecond;
+}
+
+AcceptedEvidenceRecord retained_timeout_record(
+    std::uint64_t ingestion_sequence,
+    ReplicaID reporter,
+    ReplicaID target,
+    ExpectedMessageType message_type,
+    const AdaptationEpochId &epoch,
+    const std::string &label)
+{
+    hotstuff::ResponseObservation observation;
+    observation.schema_version =
+        hotstuff::kResponseObservationSchemaVersionV2;
+    observation.reporter_id = reporter;
+    observation.observed_replica_id = target;
+    observation.configuration = hotstuff::ConfigurationId{
+        epoch.epoch_number,
+        static_cast<std::uint32_t>(target % 5),
+        epoch.epoch_digest};
+    observation.block_hash = digest(label + "-block");
+    observation.expected_message_type = message_type;
+    observation.outcome = ResponseOutcome::timeout;
+    observation.response_duration_us = 0;
+    observation.deadline_duration_us = 100;
+    observation.attempt_start_monotonic_ns =
+        1'000'000 + ingestion_sequence * 1'000'000;
+    observation.reporter_local_commit_monotonic_ns =
+        observation.attempt_start_monotonic_ns + 40'000;
+    observation.reporter_monotonic_ns =
+        observation.attempt_start_monotonic_ns + 100'000;
+    observation.reporter_sequence = ingestion_sequence;
+    observation.observation_id =
+        hotstuff::compute_response_observation_id(
+            observation.attempt_identity());
+    REQUIRE(reporter != target);
+    REQUIRE(hotstuff::valid_response_observation_retention_witness(
+        observation));
+    return {ingestion_sequence, std::move(observation)};
+}
+
+AcceptedEvidenceRecord retained_late_record(
+    std::uint64_t ingestion_sequence,
+    const AcceptedEvidenceRecord &timeout)
+{
+    auto observation = timeout.observation;
+    observation.schema_version =
+        hotstuff::kResponseObservationSchemaVersionV1;
+    observation.outcome = ResponseOutcome::late;
+    observation.response_duration_us =
+        observation.deadline_duration_us + 1;
+    observation.reporter_monotonic_ns += 1'000'000;
+    observation.reporter_sequence = ingestion_sequence;
+    observation.signer_set = {observation.observed_replica_id};
+    observation.attempt_start_monotonic_ns = 0;
+    observation.reporter_local_commit_monotonic_ns = 0;
+    return {ingestion_sequence, std::move(observation)};
 }
 
 std::string source(const std::string &relative_path)
@@ -405,6 +465,244 @@ TEST_CASE(
     CHECK(diagnostics.closed_contexts_retained == 1);
     CHECK_FALSE(bridge.should_defer_commit_report(key));
     CHECK(diagnostics.healthy);
+}
+
+TEST_CASE(
+    "repair-only retention mode emits schema-v2 timeout facts after local commit",
+    "[adaptive-v2][response-evidence][v2][retention][intentional-red]")
+{
+    ManualEvidenceDeadlineScheduler scheduler;
+    AdaptiveV2ResponseEvidenceBridge bridge(0, limits());
+    REQUIRE(bridge.enable_cross_commit_retention_v2());
+    scheduler.bind(bridge);
+    std::vector<EvidenceReportEnvelope> delivered;
+    bridge.bind_transport(
+        [&delivered](const EvidenceReportEnvelope &envelope) {
+            delivered.push_back(envelope);
+            return EvidenceTransportResult::accepted;
+        });
+
+    const auto key = proposal("retained-v2-timeout");
+    REQUIRE(bridge.arm_with_deadline(
+        key, response_tree(), kStartNs, kDeadlineUs));
+    REQUIRE(bridge.record_reporter_local_commit(key, after_us(40)));
+    REQUIRE(bridge.record_reporter_local_commit(key, after_us(40)));
+    REQUIRE(bridge.close_consensus_context(key));
+    REQUIRE(scheduler.fire(0, after_us(kDeadlineUs)));
+
+    REQUIRE(delivered.size() == 2);
+    for (const auto &envelope : delivered)
+    {
+        const auto &observation = envelope.observation;
+        CHECK(observation.schema_version ==
+              hotstuff::kResponseObservationSchemaVersionV2);
+        CHECK(observation.outcome == ResponseOutcome::timeout);
+        CHECK(observation.attempt_start_monotonic_ns == kStartNs);
+        CHECK(observation.reporter_local_commit_monotonic_ns ==
+              after_us(40));
+        CHECK(observation.reporter_local_commit_monotonic_ns <
+              observation.attempt_start_monotonic_ns +
+                  observation.deadline_duration_us * 1'000);
+    }
+}
+
+TEST_CASE(
+    "conflicting reporter-local commit timestamp fails retention closed",
+    "[adaptive-v2][response-evidence][v2][retention][conflict]"
+    "[intentional-red]")
+{
+    ManualEvidenceDeadlineScheduler scheduler;
+    AdaptiveV2ResponseEvidenceBridge bridge(0, limits());
+    REQUIRE(bridge.enable_cross_commit_retention_v2());
+    scheduler.bind(bridge);
+    const auto key = proposal("conflicting-retained-commit");
+    REQUIRE(bridge.arm_with_deadline(
+        key, response_tree(), kStartNs, kDeadlineUs));
+    REQUIRE(bridge.record_reporter_local_commit(key, after_us(40)));
+    CHECK_FALSE(
+        bridge.record_reporter_local_commit(key, after_us(41)));
+    CHECK_FALSE(bridge.diagnostics().healthy);
+    CHECK(bridge.diagnostics().rejected_operations == 1);
+}
+
+TEST_CASE(
+    "retention mode keeps ordinary timeout schema-v1 without a local commit",
+    "[adaptive-v2][response-evidence][v2][retention][negative]"
+    "[intentional-red]")
+{
+    AdaptiveV2ResponseEvidenceBridge bridge(0, limits());
+    REQUIRE(bridge.enable_cross_commit_retention_v2());
+    const auto key = proposal("ordinary-v1-timeout");
+    REQUIRE(bridge.arm(key, response_tree(), kStartNs, kDeadlineUs));
+    CHECK(bridge.record_timeouts(key, {1}, after_us(kDeadlineUs)) == 1);
+    REQUIRE(bridge.front() != nullptr);
+    const auto &observation = bridge.front()->envelope.observation;
+    CHECK(observation.schema_version ==
+          hotstuff::kResponseObservationSchemaVersionV1);
+    CHECK(observation.attempt_start_monotonic_ns == 0);
+    CHECK(observation.reporter_local_commit_monotonic_ns == 0);
+}
+
+TEST_CASE(
+    "cycle-one retention admission selects outstanding target facts canonically",
+    "[adaptive-v2][response-evidence][retention][admission][v40]"
+    "[intentional-red]")
+{
+    const AdaptationEpochId epoch{
+        1, digest("retention-admission-epoch-one")};
+    const std::vector<ReplicaID> actors{1, 7, 8, 12, 16, 19, 20};
+    std::vector<AcceptedEvidenceRecord> accepted;
+    accepted.push_back(retained_timeout_record(
+        1, 2, 1, ExpectedMessageType::direct_vote,
+        epoch, "actor-1-direct"));
+    accepted.push_back(retained_timeout_record(
+        2, 3, 1, ExpectedMessageType::aggregate_relay,
+        epoch, "actor-1-aggregate-earliest"));
+    accepted.push_back(retained_timeout_record(
+        3, 4, 1, ExpectedMessageType::aggregate_relay,
+        epoch, "actor-1-aggregate-later"));
+    accepted.push_back(retained_timeout_record(
+        4, 9, 7, ExpectedMessageType::direct_vote,
+        epoch, "actor-7"));
+    accepted.push_back(retained_timeout_record(
+        5, 10, 8, ExpectedMessageType::direct_vote,
+        epoch, "actor-8"));
+    accepted.push_back(retained_timeout_record(
+        6, 14, 12, ExpectedMessageType::direct_vote,
+        epoch, "actor-12"));
+    accepted.push_back(retained_timeout_record(
+        7, 18, 16, ExpectedMessageType::direct_vote,
+        epoch, "actor-16"));
+    accepted.push_back(retained_timeout_record(
+        8, 21, 19, ExpectedMessageType::direct_vote,
+        epoch, "actor-19"));
+    accepted.push_back(retained_timeout_record(
+        9, 22, 20, ExpectedMessageType::direct_vote,
+        epoch, "actor-20"));
+    for (const auto &record : accepted)
+        CHECK(record.observation.reporter_id !=
+              record.observation.observed_replica_id);
+
+    SECTION("six of seven and a post-cutoff seventh fact still wait")
+    {
+        const auto incomplete = hotstuff::
+            select_adaptive_v2_cross_commit_retention_admission(
+                accepted, epoch, 8, actors);
+        CHECK(incomplete.status ==
+              AdaptiveV2CrossCommitRetentionAdmissionStatus::incomplete);
+        CHECK(incomplete.admitted_observation_ids.empty());
+    }
+
+    SECTION("older epoch rows do not hide a complete epoch-one prefix")
+    {
+        const AdaptationEpochId epoch_zero{
+            0, digest("retention-admission-epoch-zero")};
+        std::vector<AcceptedEvidenceRecord> mixed;
+        mixed.push_back(retained_timeout_record(
+            1, 30, 29, ExpectedMessageType::aggregate_relay,
+            epoch_zero, "old-epoch-row"));
+        std::uint64_t sequence = 2;
+        for (const auto actor : actors)
+        {
+            mixed.push_back(retained_timeout_record(
+                sequence,
+                static_cast<ReplicaID>(actor + 2),
+                actor,
+                actor == actors.front()
+                    ? ExpectedMessageType::aggregate_relay
+                    : ExpectedMessageType::direct_vote,
+                epoch,
+                "mixed-current-" + std::to_string(actor)));
+            ++sequence;
+        }
+        const auto mixed_ready = hotstuff::
+            select_adaptive_v2_cross_commit_retention_admission(
+                mixed, epoch, 8, actors);
+        CHECK(mixed_ready.status ==
+              AdaptiveV2CrossCommitRetentionAdmissionStatus::ready);
+    }
+
+    SECTION("accepted gaps and a trailing rejected high-watermark stay ready")
+    {
+        std::vector<AcceptedEvidenceRecord> gapped;
+        std::uint64_t sequence = 1;
+        for (const auto actor : actors)
+        {
+            gapped.push_back(retained_timeout_record(
+                sequence,
+                static_cast<ReplicaID>(actor + 2),
+                actor,
+                actor == actors.front()
+                    ? ExpectedMessageType::aggregate_relay
+                    : ExpectedMessageType::direct_vote,
+                epoch,
+                "gapped-current-" + std::to_string(actor)));
+            sequence += 2;
+        }
+
+        // EvidenceLedger::high_watermark() also counts rejected ingests, so
+        // the manager cutoff may exceed the final accepted sequence.
+        const auto gapped_ready = hotstuff::
+            select_adaptive_v2_cross_commit_retention_admission(
+                gapped, epoch, sequence, actors);
+        CHECK(gapped_ready.status ==
+              AdaptiveV2CrossCommitRetentionAdmissionStatus::ready);
+        CHECK(gapped_ready.evidence_cutoff == sequence);
+    }
+
+    const auto ready = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            accepted, epoch, 9, actors);
+    REQUIRE(ready.status ==
+            AdaptiveV2CrossCommitRetentionAdmissionStatus::ready);
+    CHECK(ready.evidence_cutoff == 9);
+    CHECK(ready.responsive_degraded_actor_ids == actors);
+    REQUIRE(ready.admitted_observation_ids.size() == actors.size());
+    CHECK(ready.admitted_observation_ids.front() ==
+          accepted[1].observation.observation_id);
+    CHECK(ready.admitted_observation_ids.front() !=
+          accepted[0].observation.observation_id);
+    CHECK(ready.admitted_observation_ids.front() !=
+          accepted[2].observation.observation_id);
+
+    SECTION("facts retained before the cycle-one baseline remain admissible")
+    {
+        // A manager baseline frozen at cutoff 9 must not erase the Epoch1
+        // retention prefix. The replay API deliberately has no lower bound.
+        CHECK(ready.status ==
+              AdaptiveV2CrossCommitRetentionAdmissionStatus::ready);
+    }
+
+    SECTION("timeout to late before cutoff removes the target witness")
+    {
+        accepted.push_back(retained_late_record(10, accepted[4]));
+        const auto after_late = hotstuff::
+            select_adaptive_v2_cross_commit_retention_admission(
+                accepted, epoch, 10, actors);
+        CHECK(after_late.status ==
+              AdaptiveV2CrossCommitRetentionAdmissionStatus::incomplete);
+
+        const auto held_cutoff = hotstuff::
+            select_adaptive_v2_cross_commit_retention_admission(
+                accepted, epoch, 9, actors);
+        REQUIRE(held_cutoff.status ==
+                AdaptiveV2CrossCommitRetentionAdmissionStatus::ready);
+        CHECK(held_cutoff.admitted_observation_ids ==
+              ready.admitted_observation_ids);
+    }
+
+    SECTION("a malformed schema-v2 late transition fails replay closed")
+    {
+        auto malformed_late = retained_late_record(10, accepted[4]);
+        malformed_late.observation.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV2;
+        accepted.push_back(std::move(malformed_late));
+        const auto invalid = hotstuff::
+            select_adaptive_v2_cross_commit_retention_admission(
+                accepted, epoch, 10, actors);
+        CHECK(invalid.status ==
+              AdaptiveV2CrossCommitRetentionAdmissionStatus::invalid);
+    }
 }
 
 TEST_CASE(

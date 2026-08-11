@@ -38,6 +38,42 @@ bool valid_fact(
     const ResponseAttemptFact &fact,
     const EvidenceWireLimits &limits) noexcept
 {
+    const bool has_attempt_start =
+        fact.attempt_start_monotonic_ns != 0;
+    const bool has_local_commit =
+        fact.reporter_local_commit_monotonic_ns != 0;
+    if (has_attempt_start != has_local_commit)
+        return false;
+    if (has_attempt_start)
+    {
+        if (fact.outcome != ResponseOutcome::timeout ||
+            fact.response_duration_us != 0 ||
+            !fact.signer_set.empty() ||
+            fact.deadline_duration_us == 0 ||
+            fact.deadline_duration_us >
+                std::numeric_limits<std::uint64_t>::max() / 1'000)
+        {
+            return false;
+        }
+        const auto deadline_duration_ns =
+            fact.deadline_duration_us * 1'000;
+        if (fact.attempt_start_monotonic_ns >
+            std::numeric_limits<std::uint64_t>::max() -
+                deadline_duration_ns)
+        {
+            return false;
+        }
+        const auto absolute_deadline_ns =
+            fact.attempt_start_monotonic_ns + deadline_duration_ns;
+        if (fact.reporter_local_commit_monotonic_ns <
+                fact.attempt_start_monotonic_ns ||
+            fact.reporter_local_commit_monotonic_ns >=
+                absolute_deadline_ns ||
+            absolute_deadline_ns > fact.fact_monotonic_ns)
+        {
+            return false;
+        }
+    }
     if (!valid_message_type(fact.key.expected_message_type) ||
         !valid_outcome(fact.outcome) ||
         fact.deadline_duration_us == 0 ||
@@ -150,6 +186,11 @@ bool EvidenceReporter::enqueue(const ResponseAttemptFact &fact)
     try
     {
         ResponseObservation observation;
+        if (fact.attempt_start_monotonic_ns != 0)
+        {
+            observation.schema_version =
+                kResponseObservationSchemaVersionV2;
+        }
         observation.reporter_id =
             state_->config.trusted_reporter_id;
         observation.observed_replica_id =
@@ -166,6 +207,10 @@ bool EvidenceReporter::enqueue(const ResponseAttemptFact &fact)
         observation.reporter_monotonic_ns =
             fact.fact_monotonic_ns;
         observation.reporter_sequence = next_sequence;
+        observation.attempt_start_monotonic_ns =
+            fact.attempt_start_monotonic_ns;
+        observation.reporter_local_commit_monotonic_ns =
+            fact.reporter_local_commit_monotonic_ns;
         observation.signer_set = fact.signer_set;
         observation.observation_id =
             compute_response_observation_id(

@@ -325,6 +325,13 @@ bool payload_type(const StructuredEventPayload &payload,
             }
             return false;
         case 2:
+            if (const auto &event =
+                    std::get<CommitStructuredEvent>(payload);
+                event.reporter_local_commit_monotonic_ns.has_value() &&
+                *event.reporter_local_commit_monotonic_ns == 0)
+            {
+                return false;
+            }
             type = StructuredEventType::block_committed;
             return true;
         case 3:
@@ -410,6 +417,10 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 9:
             type = StructuredEventType::
                 adaptive_v2_fault_containment_coverage_ready;
+            return true;
+        case 10:
+            type = StructuredEventType::
+                adaptive_v2_cross_commit_retention_ready;
             return true;
         default:
             return false;
@@ -785,8 +796,8 @@ bool valid_observation_accepted_payload(
     const auto &observation = record.observation;
     if (source_kind != StructuredEventSourceKind::adaptation_manager ||
         record.ingestion_sequence == 0 ||
-        observation.schema_version !=
-            kResponseObservationSchemaVersion ||
+        !is_supported_response_observation_schema(
+            observation.schema_version) ||
         observation.observation_id == uint256_t{} ||
         observation.reporter_id ==
             observation.observed_replica_id ||
@@ -806,6 +817,9 @@ bool valid_observation_accepted_payload(
     {
         return false;
     }
+
+    if (!valid_response_observation_retention_witness(observation))
+        return false;
 
     if (observation.outcome == ResponseOutcome::timeout)
     {
@@ -1146,6 +1160,50 @@ bool valid_fault_containment_coverage_ready_payload(
                }) == event.required_tree_ids.end();
 }
 
+bool valid_cross_commit_retention_ready_payload(
+    const AdaptiveV2CrossCommitRetentionReadyStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    if (config.source.kind !=
+            StructuredEventSourceKind::adaptation_manager ||
+        event.cycle_ordinal != 1 ||
+        event.predecessor_epoch_number != 1 ||
+        event.predecessor_epoch_digest == uint256_t{} ||
+        event.evidence_cutoff == 0 ||
+        event.responsive_degraded_actor_ids.empty() ||
+        event.responsive_degraded_actor_ids.size() !=
+            event.admitted_observation_ids.size() ||
+        event.responsive_degraded_actor_ids.size() >
+            kMaximumAdaptationEvidenceRecords)
+    {
+        return false;
+    }
+    if (std::adjacent_find(
+            event.responsive_degraded_actor_ids.begin(),
+            event.responsive_degraded_actor_ids.end(),
+            [](ReplicaID left, ReplicaID right) {
+                return left >= right;
+            }) != event.responsive_degraded_actor_ids.end())
+    {
+        return false;
+    }
+    for (std::size_t index = 0;
+         index < event.admitted_observation_ids.size();
+         ++index)
+    {
+        const auto &observation_id =
+            event.admitted_observation_ids[index];
+        if (observation_id == uint256_t{} ||
+            std::find(
+                event.admitted_observation_ids.begin(),
+                event.admitted_observation_ids.begin() + index,
+                observation_id) !=
+                event.admitted_observation_ids.begin() + index)
+            return false;
+    }
+    return true;
+}
+
 bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                          const StructuredEventConfig &config) noexcept
 {
@@ -1204,6 +1262,12 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
             return valid_fault_containment_coverage_ready_payload(
                 std::get<
                     AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>(
+                        payload),
+                config);
+        case 10:
+            return valid_cross_commit_retention_ready_payload(
+                std::get<
+                    AdaptiveV2CrossCommitRetentionReadyStructuredEvent>(
                         payload),
                 config);
         default:
@@ -1440,6 +1504,13 @@ void append_commit_payload(JsonLineBuilder &builder,
         builder.append("null");
     builder.append(",\"commit_batch_index\":");
     builder.append_integer(event.commit_batch_index);
+    if (event.reporter_local_commit_monotonic_ns.has_value())
+    {
+        builder.append(
+            ",\"reporter_local_commit_monotonic_ns\":");
+        builder.append_integer(
+            *event.reporter_local_commit_monotonic_ns);
+    }
     builder.append('}');
 }
 
@@ -1662,6 +1733,17 @@ void append_observation_accepted_payload(
     builder.append_integer(observation.reporter_monotonic_ns);
     builder.append(",\"reporter_sequence\":");
     builder.append_integer(observation.reporter_sequence);
+    if (observation.schema_version ==
+        kResponseObservationSchemaVersionV2)
+    {
+        builder.append(",\"attempt_start_monotonic_ns\":");
+        builder.append_integer(
+            observation.attempt_start_monotonic_ns);
+        builder.append(
+            ",\"reporter_local_commit_monotonic_ns\":");
+        builder.append_integer(
+            observation.reporter_local_commit_monotonic_ns);
+    }
     builder.append(",\"signer_set\":[");
     bool first = true;
     for (const auto signer : observation.signer_set)
@@ -1712,6 +1794,39 @@ void append_fault_containment_coverage_ready_payload(
     builder.append(",\"observed_tree_ids\":");
     append_u32_ids(builder, event.observed_tree_ids);
     builder.append('}');
+}
+
+void append_cross_commit_retention_ready_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2CrossCommitRetentionReadyStructuredEvent &event)
+{
+    builder.append("{\"cycle_ordinal\":");
+    builder.append_integer(event.cycle_ordinal);
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(event.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(event.predecessor_epoch_digest.to_hex());
+    builder.append(",\"evidence_cutoff\":");
+    builder.append_integer(event.evidence_cutoff);
+    builder.append(",\"responsive_degraded_actor_ids\":[");
+    bool first = true;
+    for (const auto actor : event.responsive_degraded_actor_ids)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append_integer(actor);
+        first = false;
+    }
+    builder.append("],\"admitted_observation_ids\":[");
+    first = true;
+    for (const auto &observation_id : event.admitted_observation_ids)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append_escaped(observation_id.to_hex());
+        first = false;
+    }
+    builder.append("]}");
 }
 
 void append_evidence_snapshot_payload(
@@ -2177,6 +2292,13 @@ std::string serialize_audit_event(
                 builder,
                 std::get<
                     AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>(
+                        event));
+            break;
+        case 10:
+            append_cross_commit_retention_ready_payload(
+                builder,
+                std::get<
+                    AdaptiveV2CrossCommitRetentionReadyStructuredEvent>(
                         event));
             break;
         default:
@@ -2684,6 +2806,9 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
         case StructuredEventType::
             adaptive_v2_fault_containment_coverage_ready:
             return "adaptive_v2.fault_containment_coverage_ready";
+        case StructuredEventType::
+            adaptive_v2_cross_commit_retention_ready:
+            return "adaptive_v2.cross_commit_retention_ready";
         default:
             break;
     }

@@ -16,8 +16,20 @@
 namespace hotstuff
 {
 
-constexpr std::uint32_t kResponseObservationSchemaVersion = 1;
+constexpr std::uint32_t kResponseObservationSchemaVersionV1 = 1;
+constexpr std::uint32_t kResponseObservationSchemaVersionV2 = 2;
+// The default remains v1. Schema v2 is an explicitly enabled experiment
+// extension and must never leak into ordinary reporters.
+constexpr std::uint32_t kResponseObservationSchemaVersion =
+    kResponseObservationSchemaVersionV1;
 constexpr std::uint32_t kEvidenceBatchSchemaVersion = 1;
+
+constexpr bool is_supported_response_observation_schema(
+    std::uint32_t schema_version) noexcept
+{
+    return schema_version == kResponseObservationSchemaVersionV1 ||
+           schema_version == kResponseObservationSchemaVersionV2;
+}
 
 enum class ExpectedMessageType : std::uint8_t
 {
@@ -71,6 +83,10 @@ struct ResponseObservation
     std::uint64_t reporter_monotonic_ns{0};
     std::uint64_t reporter_sequence{0};
     std::vector<ReplicaID> signer_set;
+    // Schema-v2-only reporter-local retention chronology. Both values are
+    // CLOCK_MONOTONIC_RAW nanoseconds; schema v1 requires both to remain zero.
+    std::uint64_t attempt_start_monotonic_ns{0};
+    std::uint64_t reporter_local_commit_monotonic_ns{0};
 
     ProposalKey proposal_key() const
     {
@@ -85,6 +101,9 @@ struct ResponseObservation
                 expected_message_type};
     }
 };
+
+bool valid_response_observation_retention_witness(
+    const ResponseObservation &observation) noexcept;
 
 uint256_t compute_response_observation_id(
     const ResponseAttemptIdentity &identity);
@@ -117,6 +136,7 @@ enum class EvidenceWireError : std::uint8_t
     noncanonical_signer_set,
     allocation_failure,
     internal_failure,
+    invalid_retention_witness,
 };
 
 struct EvidenceDecodeResult

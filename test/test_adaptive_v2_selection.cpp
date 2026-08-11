@@ -268,11 +268,32 @@ struct Fixture
         return value;
     }
 
+    ResponseObservation timeout_v2(
+        ReplicaID reporter, ReplicaID target)
+    {
+        auto value = observation(
+            reporter, target, ResponseOutcome::timeout);
+        value.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV2;
+        value.deadline_duration_us = 1;
+        REQUIRE(value.reporter_monotonic_ns > 1'000);
+        value.attempt_start_monotonic_ns =
+            value.reporter_monotonic_ns - 1'000;
+        value.reporter_local_commit_monotonic_ns =
+            value.attempt_start_monotonic_ns + 500;
+        ingest(value);
+        return value;
+    }
+
     void late(
         const ResponseObservation &timeout_observation,
         std::uint64_t response_duration_us = 150)
     {
         auto value = timeout_observation;
+        value.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV1;
+        value.attempt_start_monotonic_ns = 0;
+        value.reporter_local_commit_monotonic_ns = 0;
         value.outcome = ResponseOutcome::late;
         value.response_duration_us = response_duration_us;
         value.signer_set = {value.observed_replica_id};
@@ -1382,7 +1403,8 @@ TEST_CASE(
     "[adaptive-v2][selection][inheritance][optimization][late][n7]")
 {
     Fixture fixture;
-    const auto boundary_timeout = fixture.timeout(2, 0);
+    fixture.baseline_all();
+    const auto boundary_timeout = fixture.timeout_v2(2, 0);
     fixture.baseline_live_survivors();
     auto config = selection_config(1, 1);
     config.responsiveness_policy.minimum_attempts = 2;
@@ -1439,6 +1461,160 @@ TEST_CASE(
           baseline_trajectory_size +
               (suffix_cutoff - baseline_cutoff));
     CHECK(selector.healthy());
+}
+
+TEST_CASE(
+    "inherited eligibility waits at forty-nine and fifty-nine then admits sixty",
+    "[adaptive-v2][selection][inheritance][eligibility][threshold]"
+    "[v40][intentional-red]")
+{
+    Fixture fixture(1'024);
+    fixture.baseline_all();
+    auto config = selection_config(1, 1, 1'024);
+    config.required_nonresponsive = 1;
+    config.responsiveness_policy.minimum_attempts = 60;
+    config.responsiveness_policy.attempt_window = 64;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    const auto baseline = selector.current_cutoff();
+    const auto add_rounds = [&](std::size_t count) {
+        for (std::size_t round = 0; round < count; ++round)
+        {
+            for (const auto target : fixture.members)
+            {
+                fixture.on_time(
+                    target == 0 ? ReplicaID{1} : ReplicaID{0},
+                    target,
+                    50);
+            }
+        }
+    };
+
+    add_rounds(49);
+    const auto at_forty_nine =
+        selector.rank_inheriting_constraints_through(
+            fixture.ledger->high_watermark(), {ReplicaID{6}});
+    REQUIRE(at_forty_nine.snapshot != nullptr);
+    CHECK(at_forty_nine.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    const auto inherited_at_forty_nine = std::find_if(
+        at_forty_nine.snapshot->ranking().begin(),
+        at_forty_nine.snapshot->ranking().end(),
+        [](const auto &entry) { return entry.replica_id == 6; });
+    REQUIRE(inherited_at_forty_nine !=
+            at_forty_nine.snapshot->ranking().end());
+    CHECK(inherited_at_forty_nine->classification ==
+          ResponsivenessClass::insufficient_evidence);
+    CHECK_FALSE(inherited_at_forty_nine->eligible);
+    CHECK(selector.current_cutoff() == baseline);
+
+    add_rounds(10);
+    const auto at_fifty_nine =
+        selector.rank_inheriting_constraints_through(
+            fixture.ledger->high_watermark(), {ReplicaID{6}});
+    REQUIRE(at_fifty_nine.snapshot != nullptr);
+    CHECK(at_fifty_nine.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    const auto inherited_at_fifty_nine = std::find_if(
+        at_fifty_nine.snapshot->ranking().begin(),
+        at_fifty_nine.snapshot->ranking().end(),
+        [](const auto &entry) { return entry.replica_id == 6; });
+    REQUIRE(inherited_at_fifty_nine !=
+            at_fifty_nine.snapshot->ranking().end());
+    CHECK(inherited_at_fifty_nine->classification ==
+          ResponsivenessClass::insufficient_evidence);
+    CHECK_FALSE(inherited_at_fifty_nine->eligible);
+    CHECK(selector.current_cutoff() == baseline);
+
+    add_rounds(1);
+    const auto at_sixty =
+        selector.rank_inheriting_constraints_through(
+            fixture.ledger->high_watermark(), {ReplicaID{6}});
+    REQUIRE(at_sixty.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(at_sixty.selected_replicas ==
+          std::vector<ReplicaID>{6});
+    CHECK(at_sixty.eligible_roots.size() == 5);
+    const auto inherited_at_sixty = std::find_if(
+        at_sixty.snapshot->ranking().begin(),
+        at_sixty.snapshot->ranking().end(),
+        [](const auto &entry) { return entry.replica_id == 6; });
+    REQUIRE(inherited_at_sixty != at_sixty.snapshot->ranking().end());
+    CHECK(inherited_at_sixty->classification ==
+          ResponsivenessClass::responsive);
+    CHECK(inherited_at_sixty->eligible);
+    CHECK(selector.current_cutoff() == fixture.ledger->high_watermark());
+}
+
+TEST_CASE(
+    "schema-v2 retained timeouts are selection-equivalent to schema-v1",
+    "[adaptive-v2][selection][schema][v1][v2][equivalence]"
+    "[v40][intentional-red]")
+{
+    Fixture v1;
+    Fixture v2;
+    v1.baseline_all();
+    v2.baseline_all();
+    auto config = selection_config(1, 1);
+    config.required_nonresponsive = 1;
+    AdaptiveV2ByzantineSelection v1_selector(
+        *v1.ledger, v1.members, v1.epoch, config);
+    AdaptiveV2ByzantineSelection v2_selector(
+        *v2.ledger, v2.members, v2.epoch, config);
+    REQUIRE(v1_selector.freeze_baseline(v1.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    REQUIRE(v2_selector.freeze_baseline(v2.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    for (const auto reporter : std::vector<ReplicaID>{0, 1, 2})
+    {
+        v1.timeout(reporter, 6);
+        v2.timeout_v2(reporter, 6);
+    }
+
+    const auto first =
+        v1_selector.select_through(v1.ledger->high_watermark());
+    const auto second =
+        v2_selector.select_through(v2.ledger->high_watermark());
+    REQUIRE(first.status == AdaptiveV2SelectionStatus::selected);
+    REQUIRE(second.status == first.status);
+    CHECK(second.selected_replicas == first.selected_replicas);
+    CHECK(second.eligible_roots == first.eligible_roots);
+    REQUIRE(first.snapshot != nullptr);
+    REQUIRE(second.snapshot != nullptr);
+    CHECK(second.snapshot->ranking().size() ==
+          first.snapshot->ranking().size());
+}
+
+TEST_CASE(
+    "unsupported schema-v3 evidence is rejected before selection",
+    "[adaptive-v2][selection][schema][unsupported][fail-closed]"
+    "[v40][intentional-red]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        selection_config());
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    auto unsupported = fixture.observation(
+        2, 0, ResponseOutcome::timeout);
+    unsupported.schema_version = 3;
+    const auto accepted_before = fixture.ledger->accepted().size();
+    fixture.ledger->ingest(
+        AuthenticatedReporter{2}, unsupported);
+    CHECK(fixture.ledger->accepted().size() == accepted_before);
+    REQUIRE_FALSE(fixture.ledger->rejected().empty());
+    CHECK(fixture.ledger->rejected().back().reason ==
+          hotstuff::EvidenceRejectionReason::unsupported_schema);
+    CHECK(fixture.ledger->healthy());
+    CHECK(selector.current_cutoff() < fixture.ledger->high_watermark());
 }
 
 TEST_CASE(

@@ -131,7 +131,7 @@ def test_v38_profile_is_one_lf_and_exact_three_path_delta() -> None:
     assert v38 == v37
 
 
-def test_v37_v38_identities_are_historical_and_v39_is_frozen() -> None:
+def test_v37_v38_v39_identities_are_historical() -> None:
     assert (
         getattr(manifest_module, "V37_MANIFEST_ID", None),
         getattr(manifest_module, "V37_MANIFEST_SHA256", None),
@@ -166,14 +166,14 @@ def test_v37_v38_identities_are_historical_and_v39_is_frozen() -> None:
         "f1ae1fcffdaf4b209a595f3dd034ec935ad88ada5821930c105694b525e2817a",
         "3cf676755478f686af64f12fd3fcb5993f4887a8f5165fbf540d289463544950",
     )
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v39"
+    assert manifest_module.V39_MANIFEST_ID == "shape-placement-factorial-v39"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V39_MANIFEST_SHA256,
+        manifest_module.V39_SEMANTIC_SHA256,
+        manifest_module.V39_PLAN_SHA256,
+        runtime_module.V39_RUNTIME_SHA256,
+        runtime_module.V39_SMOKE_RUNTIME_SHA256,
+        runtime_module.V39_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         "ce6fb4c999275b575f1cf522524a5f3b41d109a6dcb3a1b77e789946b67b042f",
         "14a3c3b910c89368481780d176e031e3bffeb15731b3448359fd73b10aee0a5a",
@@ -431,7 +431,7 @@ def test_v37_and_v38_exact_static_bindings_reject_cross_version_mix(
 def test_v39_is_default_and_v38_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v39.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v40.json"
     assert cli.main(["--manifest", str(V38_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v38 are validation-only" in refusal["reason"]
+    assert "v1 through v39 are validation-only" in refusal["reason"]

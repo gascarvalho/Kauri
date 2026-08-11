@@ -544,6 +544,7 @@ using hotstuff::AdaptiveV2ConvergenceStructuredEvent;
 using hotstuff::AdaptiveV2ConvergenceTransition;
 using hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent;
 using hotstuff::AdaptiveV2FaultContainmentCoverageReadyStructuredEvent;
+using hotstuff::AdaptiveV2CrossCommitRetentionReadyStructuredEvent;
 using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ManagerCycleOutcome;
 using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
@@ -814,6 +815,26 @@ EvidenceObservationAcceptedStructuredEvent observation_accepted_event()
         AcceptedEvidenceRecord{42, std::move(observation)}};
 }
 
+EvidenceObservationAcceptedStructuredEvent
+retention_observation_accepted_event()
+{
+    auto event = observation_accepted_event();
+    auto &observation = event.record.observation;
+    observation.schema_version =
+        hotstuff::kResponseObservationSchemaVersionV2;
+    observation.outcome = ResponseOutcome::timeout;
+    observation.response_duration_us = 0;
+    observation.deadline_duration_us = 100;
+    observation.reporter_monotonic_ns = 200'000;
+    observation.signer_set.clear();
+    observation.attempt_start_monotonic_ns = 100'000;
+    observation.reporter_local_commit_monotonic_ns = 150'000;
+    observation.observation_id =
+        compute_response_observation_id(
+            observation.attempt_identity());
+    return event;
+}
+
 StructuredEventConfig manager_event_config()
 {
     auto config = event_config();
@@ -873,6 +894,23 @@ fault_containment_coverage_ready_event()
     event.evidence_cutoff = 313;
     event.required_tree_ids = {3, 7, 12, 29, 30};
     event.observed_tree_ids = {3, 7, 12, 29, 30};
+    return event;
+}
+
+AdaptiveV2CrossCommitRetentionReadyStructuredEvent
+cross_commit_retention_ready_event()
+{
+    AdaptiveV2CrossCommitRetentionReadyStructuredEvent event;
+    event.cycle_ordinal = 1;
+    event.predecessor_epoch_number = 1;
+    event.predecessor_epoch_digest =
+        digest("cross-commit-retention-ready-epoch");
+    event.evidence_cutoff = 419;
+    event.responsive_degraded_actor_ids = {1, 7, 8};
+    event.admitted_observation_ids = {
+        digest("actor-1-retention-observation"),
+        digest("actor-7-retention-observation"),
+        digest("actor-8-retention-observation")};
     return event;
 }
 
@@ -1483,7 +1521,7 @@ std::string expected_commit_line(const CommitStructuredEvent &event,
                                  bool designated_observer = true)
 {
     const auto &proof = event.decision_proof;
-    return
+    auto line =
         "{\"event_schema_version\":1,"
         "\"run_id\":\"run-\\\"\\\\\\n\\t\\u0001\","
         "\"source_kind\":\"replica\","
@@ -1511,7 +1549,14 @@ std::string expected_commit_line(const CommitStructuredEvent &event,
         "\"view_generation\":" +
             std::to_string(*event.view_generation) + ","
         "\"commit_batch_index\":" +
-            std::to_string(event.commit_batch_index) + "}}\n";
+            std::to_string(event.commit_batch_index);
+    if (event.reporter_local_commit_monotonic_ns.has_value())
+    {
+        line += ",\"reporter_local_commit_monotonic_ns\":" +
+            std::to_string(
+                *event.reporter_local_commit_monotonic_ns);
+    }
+    return line + "}}\n";
 }
 
 std::string expected_commit_observed_line(
@@ -1964,8 +2009,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 10,
-        "the audit capability appends containment coverage evidence");
+        std::variant_size<AuditStructuredEventPayload>::value == 11,
+        "the audit capability appends cross-commit readiness evidence");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -2006,6 +2051,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<9, AuditStructuredEventPayload>,
             AdaptiveV2FaultContainmentCoverageReadyStructuredEvent>::value,
         "the tenth audit payload is exact containment tree coverage");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<10, AuditStructuredEventPayload>,
+            AdaptiveV2CrossCommitRetentionReadyStructuredEvent>::value,
+        "the eleventh audit payload is exact cross-commit readiness");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -2066,6 +2116,15 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
     CHECK(std::string(
               hotstuff::structured_event_type_name(coverage_type)) ==
           "adaptive_v2.fault_containment_coverage_ready");
+
+    const auto retention_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{
+            cross_commit_retention_ready_event()});
+    CHECK(retention_type == StructuredEventType::
+          adaptive_v2_cross_commit_retention_ready);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(retention_type)) ==
+          "adaptive_v2.cross_commit_retention_ready");
 }
 
 TEST_CASE("AE01 serializes exact command and accepted reputation identities",
@@ -2256,6 +2315,52 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
         CHECK(rendered(output) == expected);
     }
 
+    SECTION("schema v2 accepted observation preserves retained chronology")
+    {
+        const auto event = retention_observation_accepted_event();
+        const auto &observation = event.record.observation;
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7004,"
+            "\"event_type\":\"evidence.observation_accepted\","
+            "\"payload\":{\"ingestion_sequence\":42,"
+            "\"observation\":{\"schema_version\":2,"
+            "\"observation_id\":\"" +
+            observation.observation_id.to_hex() + "\","
+            "\"reporter_id\":2,"
+            "\"observed_replica_id\":0,"
+            "\"configuration\":{\"epoch_number\":7,"
+            "\"tree_id\":3,"
+            "\"epoch_digest\":\"" +
+            observation.configuration.epoch_digest.to_hex() + "\"},"
+            "\"block_hash\":\"" +
+            observation.block_hash.to_hex() + "\","
+            "\"expected_message_type\":\"aggregate_relay\","
+            "\"outcome\":\"timeout\","
+            "\"response_duration_us\":0,"
+            "\"deadline_duration_us\":100,"
+            "\"reporter_monotonic_ns\":200000,"
+            "\"reporter_sequence\":9,"
+            "\"attempt_start_monotonic_ns\":100000,"
+            "\"reporter_local_commit_monotonic_ns\":150000,"
+            "\"signer_set\":[]}}}\n";
+
+        FakeClock clock({7004});
+        MemoryOutput output;
+        StructuredEventSink sink(
+            manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(rendered(output) == expected);
+    }
+
     SECTION("fault containment coverage readiness has exact source-bound JSON")
     {
         const auto event = fault_containment_coverage_ready_event();
@@ -2288,6 +2393,41 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
 
         CHECK(sink.health().healthy);
         CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+    }
+
+    SECTION("cross commit retention readiness binds actor-sorted witnesses")
+    {
+        const auto event = cross_commit_retention_ready_event();
+        const auto expected =
+            "{\"event_schema_version\":1,"
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7005,"
+            "\"event_type\":"
+            "\"adaptive_v2.cross_commit_retention_ready\","
+            "\"payload\":{\"cycle_ordinal\":1,"
+            "\"predecessor_epoch_number\":1,"
+            "\"predecessor_epoch_digest\":\"" +
+            event.predecessor_epoch_digest.to_hex() + "\","
+            "\"evidence_cutoff\":419,"
+            "\"responsive_degraded_actor_ids\":[1,7,8],"
+            "\"admitted_observation_ids\":[\"" +
+            event.admitted_observation_ids[0].to_hex() + "\",\"" +
+            event.admitted_observation_ids[1].to_hex() + "\",\"" +
+            event.admitted_observation_ids[2].to_hex() + "\"]}}\n";
+
+        FakeClock clock({7005});
+        MemoryOutput output;
+        StructuredEventSink sink(
+            manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
         CHECK(rendered(output) == expected);
     }
 
@@ -2688,6 +2828,37 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         invalid = fault_containment_coverage_ready_event();
         invalid.required_tree_ids = {3, 3, 12};
         invalid.observed_tree_ids = invalid.required_tree_ids;
+        CHECK(rejects(manager_event_config(), invalid));
+    }
+
+    SECTION("cross commit retention readiness is exact and manager-owned")
+    {
+        CHECK(rejects(
+            event_config(), cross_commit_retention_ready_event()));
+
+        auto invalid = cross_commit_retention_ready_event();
+        invalid.cycle_ordinal = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = cross_commit_retention_ready_event();
+        invalid.predecessor_epoch_number = 2;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = cross_commit_retention_ready_event();
+        invalid.evidence_cutoff = 0;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = cross_commit_retention_ready_event();
+        invalid.responsive_degraded_actor_ids = {1, 8, 7};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = cross_commit_retention_ready_event();
+        invalid.admitted_observation_ids.pop_back();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = cross_commit_retention_ready_event();
+        invalid.admitted_observation_ids[2] =
+            invalid.admitted_observation_ids[1];
         CHECK(rejects(manager_event_config(), invalid));
     }
 
@@ -3560,6 +3731,68 @@ TEST_CASE("V13 emits deterministic escaped integer-only commit NDJSON",
     CHECK(drained.complete_records == 1);
     CHECK(drained.queued_events == 0);
     CHECK(drained.queued_bytes == 0);
+}
+
+TEST_CASE(
+    "schema v2 commit payload carries the exact shared reporter local sample",
+    "[adaptive-v2][structured-event][commit][retention-v2][v40]"
+    "[intentional-red]")
+{
+    auto config = event_config();
+    config.run_id = "run-\"\\\n\t";
+    config.run_id.push_back('\x01');
+    config.source.logical_id = "replica-\"\\\r\b\f";
+    config.source.instance_id = "spawn-\n\t";
+    config.source.instance_id.push_back('\x02');
+    config.designated_commit_observer = config.source;
+    auto event = commit_event();
+    event.reporter_local_commit_monotonic_ns = 9'001'002'003;
+    const auto expected = expected_commit_line(event, 1, 9'001'002'100);
+    FakeClock clock({9'001'002'100});
+    MemoryOutput output;
+    StructuredEventSink sink(config, clock, output);
+
+    sink.emit(StructuredEventPayload{event});
+    sink.shutdown();
+
+    CHECK(sink.health().healthy);
+    CHECK(rendered(output) == expected);
+    CHECK(rendered(output).find(
+              "\"reporter_local_commit_monotonic_ns\":9001002003") !=
+          std::string::npos);
+    CHECK(rendered(output).find(
+              "\"source_monotonic_ns\":9001002100") !=
+          std::string::npos);
+
+    SECTION("historical commit payload remains byte-for-byte unchanged")
+    {
+        auto historical = commit_event();
+        FakeClock historical_clock({9'001'002'101});
+        MemoryOutput historical_output;
+        StructuredEventSink historical_sink(
+            config, historical_clock, historical_output);
+        historical_sink.emit(StructuredEventPayload{historical});
+        historical_sink.shutdown();
+        CHECK(rendered(historical_output) ==
+              expected_commit_line(historical, 1, 9'001'002'101));
+        CHECK(rendered(historical_output).find(
+                  "reporter_local_commit_monotonic_ns") ==
+              std::string::npos);
+    }
+
+    SECTION("a present zero sample fails closed")
+    {
+        event.reporter_local_commit_monotonic_ns = 0;
+        FakeClock invalid_clock({9'001'002'102});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            config, invalid_clock, invalid_output);
+        invalid_sink.emit(StructuredEventPayload{event});
+        CHECK_FALSE(invalid_sink.health().healthy);
+        CHECK(invalid_sink.health().first_failure ==
+              StructuredEventFailure::invalid_payload);
+        CHECK(invalid_output.bytes().empty());
+    }
 }
 
 TEST_CASE("V13 derives designated commit observer from exact source config",

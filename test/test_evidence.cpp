@@ -503,6 +503,15 @@ bytearray_t canonical_wire(const ResponseObservationBatch &batch)
         append_big_endian(bytes, observation.deadline_duration_us);
         append_big_endian(bytes, observation.reporter_monotonic_ns);
         append_big_endian(bytes, observation.reporter_sequence);
+        if (observation.schema_version ==
+            hotstuff::kResponseObservationSchemaVersionV2)
+        {
+            append_big_endian(
+                bytes, observation.attempt_start_monotonic_ns);
+            append_big_endian(
+                bytes,
+                observation.reporter_local_commit_monotonic_ns);
+        }
         append_big_endian(
             bytes,
             static_cast<std::uint32_t>(observation.signer_set.size()));
@@ -680,6 +689,12 @@ TEST_CASE("E08 evidence API is available with pinned protocol values",
     CHECK(static_cast<std::uint8_t>(ResponseOutcome::on_time) == 1);
     CHECK(static_cast<std::uint8_t>(ResponseOutcome::timeout) == 2);
     CHECK(static_cast<std::uint8_t>(ResponseOutcome::late) == 3);
+    CHECK(static_cast<std::uint8_t>(EvidenceWireError::allocation_failure) ==
+          11);
+    CHECK(static_cast<std::uint8_t>(EvidenceWireError::internal_failure) ==
+          12);
+    CHECK(static_cast<std::uint8_t>(
+              EvidenceWireError::invalid_retention_witness) == 13);
 }
 
 TEST_CASE("E08 fixture preserves exact breadth-first topology and window keys",
@@ -817,6 +832,101 @@ TEST_CASE("evidence batch wire is canonical bounded and round trips",
     CHECK(actual.signer_set == wanted.signer_set);
 }
 
+TEST_CASE(
+    "response observation v2 round trips strict retained commit chronology",
+    "[adaptive-v2][evidence][wire][v2][retention][intentional-red]")
+{
+    EvidenceFixture fixture;
+    auto retained = observation(
+        fixture.configuration,
+        fixture.block_a,
+        0,
+        1,
+        ExpectedMessageType::aggregate_relay,
+        ResponseOutcome::timeout,
+        {},
+        10,
+        1'100'000);
+    retained.schema_version =
+        hotstuff::kResponseObservationSchemaVersionV2;
+    retained.attempt_start_monotonic_ns = 1'000'000;
+    retained.reporter_local_commit_monotonic_ns = 1'050'000;
+
+    const ResponseObservationBatch batch{
+        hotstuff::kEvidenceBatchSchemaVersion, {retained}};
+    const EvidenceWireLimits limits{4096, 4, 7};
+    const auto expected = canonical_wire(batch);
+    const auto encoded = hotstuff::encode_evidence_batch(batch, limits);
+    CHECK(encoded == expected);
+
+    const auto decoded = hotstuff::decode_evidence_batch(encoded, limits);
+    REQUIRE(static_cast<bool>(decoded));
+    REQUIRE(decoded.batch->observations.size() == 1);
+    const auto &actual = decoded.batch->observations.front();
+    CHECK(actual.schema_version ==
+          hotstuff::kResponseObservationSchemaVersionV2);
+    CHECK(actual.attempt_start_monotonic_ns == 1'000'000);
+    CHECK(actual.reporter_local_commit_monotonic_ns == 1'050'000);
+    CHECK(actual.observation_id == retained.observation_id);
+    CHECK(actual.observation_id ==
+          hotstuff::compute_response_observation_id(
+              retained.attempt_identity()));
+
+    EvidenceLedger ledger(
+        fixture.epochs, fixture.window, generous_store_limits());
+    ledger.ingest(AuthenticatedReporter{0}, actual);
+    REQUIRE(ledger.accepted().size() == 1);
+    CHECK(ledger.accepted().front().observation.schema_version ==
+          hotstuff::kResponseObservationSchemaVersionV2);
+}
+
+TEST_CASE(
+    "response observation v2 rejects partial overflow and unordered retention",
+    "[adaptive-v2][evidence][wire][v2][retention][invalid]"
+    "[intentional-red]")
+{
+    EvidenceFixture fixture;
+    auto retained = observation(
+        fixture.configuration,
+        fixture.block_a,
+        0,
+        1,
+        ExpectedMessageType::aggregate_relay,
+        ResponseOutcome::timeout,
+        {},
+        10,
+        1'100'000);
+    retained.schema_version =
+        hotstuff::kResponseObservationSchemaVersionV2;
+    retained.attempt_start_monotonic_ns = 1'000'000;
+    retained.reporter_local_commit_monotonic_ns = 0;
+    const EvidenceWireLimits limits{4096, 4, 7};
+    CHECK_THROWS_AS(
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {retained}},
+            limits),
+        std::invalid_argument);
+
+    retained.reporter_local_commit_monotonic_ns = 1'100'001;
+    CHECK_THROWS_AS(
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {retained}},
+            limits),
+        std::invalid_argument);
+
+    retained.reporter_local_commit_monotonic_ns = 1'050'000;
+    retained.deadline_duration_us =
+        std::numeric_limits<std::uint64_t>::max();
+    CHECK_THROWS_AS(
+        hotstuff::encode_evidence_batch(
+            ResponseObservationBatch{
+                hotstuff::kEvidenceBatchSchemaVersion, {retained}},
+            limits),
+        std::invalid_argument);
+}
+
 TEST_CASE("evidence wire accepts every version-one message and outcome enum",
           "[e08][evidence][wire][enum][intentional-red]")
 {
@@ -888,7 +998,9 @@ TEST_CASE("evidence decoder rejects unsupported schemas and enum values",
     {
         auto wire = canonical_wire(batch);
         overwrite_u32(
-            wire, 8, hotstuff::kResponseObservationSchemaVersion + 1);
+            wire,
+            8,
+            hotstuff::kResponseObservationSchemaVersionV2 + 1);
         CHECK(hotstuff::decode_evidence_batch(wire, limits).error ==
               EvidenceWireError::unsupported_observation_schema);
     }
@@ -1136,7 +1248,8 @@ TEST_CASE("ledger applies deterministic trust and correlation rejection order",
         EvidenceLedger ledger(
             fixture.epochs, fixture.window, generous_store_limits());
         auto value = aggregate_on_time(fixture, fixture.block_a);
-        ++value.schema_version;
+        value.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV2 + 1;
         value.observation_id = fixture_digest("forged-id");
         value.reporter_id = 6;
         ++value.configuration.epoch_number;

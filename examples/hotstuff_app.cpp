@@ -979,6 +979,8 @@ int main(int argc, char **argv)
         Config::OptValInt::create(0);
     auto opt_experiment_response_evidence_duplicate_probe =
         Config::OptValStr::create("");
+    auto opt_experiment_responsive_cross_commit_retention_v2 =
+        Config::OptValFlag::create(false);
     auto opt_experiment_post_qc_audit_configuration =
         Config::OptValStr::create("");
     auto opt_experiment_post_qc_audit_window =
@@ -1227,6 +1229,12 @@ int main(int argc, char **argv)
         -1,
         "exact experiment-only response-evidence duplicate probe mode");
     config.add_opt(
+        "experiment-responsive-cross-commit-retention-v2",
+        opt_experiment_responsive_cross_commit_retention_v2,
+        Config::SWITCH_ON,
+        -1,
+        "emit schema-v2 reporter-local cross-commit retention evidence");
+    config.add_opt(
         "experiment-post-qc-audit-configuration",
         opt_experiment_post_qc_audit_configuration,
         Config::SET_VAL,
@@ -1373,6 +1381,20 @@ int main(int argc, char **argv)
             opt_experiment_post_qc_audit_deadline_ms->get(),
             opt_experiment_post_qc_audit_retention_ms->get(),
             opt_experiment_post_qc_audit_context_limit->get());
+    const bool experiment_responsive_cross_commit_retention_v2 =
+        opt_experiment_responsive_cross_commit_retention_v2->get();
+    if (experiment_responsive_cross_commit_retention_v2 &&
+        (!experiment_byzantine_options.has_value() ||
+         !experiment_byzantine_options->rotating_omission.has_value() ||
+         experiment_byzantine_options->rotating_omission->mode !=
+             "tiered_persistent_responsive_omission_v2" ||
+         experiment_byzantine_options->rotating_omission
+             ->responsive_degraded_actor_ids.empty()))
+    {
+        throw HotStuffError(
+            "experiment responsive cross-commit retention v2 requires "
+            "tiered responsive omission v2 actors");
+    }
     const auto adaptive_v2_manager_pin = parse_adaptive_v2_manager_pin(
         opt_epoch_protocol_mode->get(),
         opt_epoch_manager_address->get(),
@@ -1521,6 +1543,10 @@ int main(int argc, char **argv)
         static_cast<std::uint64_t>(
             opt_adaptive_activation_height->get()));
     papp->set_aggregation_timeout(opt_aggregation_timeout->get());
+    if (experiment_responsive_cross_commit_retention_v2)
+    {
+        papp->enable_experiment_responsive_cross_commit_retention_v2();
+    }
     if (experiment_byzantine_options.has_value())
         papp->configure_experiment_byzantine_faults(
             *experiment_byzantine_options);

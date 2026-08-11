@@ -10,7 +10,9 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <vector>
 
+#include "hotstuff/adaptation.h"
 #include "hotstuff/evidence_reporter.h"
 #include "hotstuff/proposal_context.h"
 
@@ -97,6 +99,35 @@ using EvidenceDeadlineResultCallback = std::function<void(
     const ProposalKey &,
     EvidenceDeadlineResult)>;
 
+enum class AdaptiveV2CrossCommitRetentionAdmissionStatus : std::uint8_t
+{
+    ready = 1,
+    incomplete,
+    invalid,
+};
+
+struct AdaptiveV2CrossCommitRetentionAdmission
+{
+    AdaptiveV2CrossCommitRetentionAdmissionStatus status{
+        AdaptiveV2CrossCommitRetentionAdmissionStatus::invalid};
+    std::uint64_t evidence_cutoff{0};
+    std::vector<ReplicaID> responsive_degraded_actor_ids;
+    std::vector<uint256_t> admitted_observation_ids;
+};
+
+/**
+ * Pure same-cutoff replay of the repair-only schema-v2 readiness predicate.
+ * One actor-sorted witness is selected per expected observed child/target.
+ * Reporter authenticity remains an EvidenceLedger admission invariant.
+ * Aggregate relay is preferred, then lower ingestion sequence, then ID.
+ */
+AdaptiveV2CrossCommitRetentionAdmission
+select_adaptive_v2_cross_commit_retention_admission(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    const std::vector<ReplicaID> &responsive_degraded_actor_ids) noexcept;
+
 /**
  * Event-loop-confined adapter from exact proposal callbacks to immutable
  * response evidence. An injected scheduler may retain only the immutable
@@ -127,6 +158,9 @@ public:
     AdaptiveV2ResponseEvidenceBridge &operator=(
         AdaptiveV2ResponseEvidenceBridge &&) = delete;
 
+    /** Enable schema-v2 retained-commit observations before any arm. */
+    bool enable_cross_commit_retention_v2() noexcept;
+
     bool arm(
         const ProposalKey &proposal,
         const ProposalTreeSnapshot &tree,
@@ -155,6 +189,11 @@ public:
         const ProposalKey &proposal,
         const std::set<ReplicaID> &exact_missing_direct_children,
         std::uint64_t timeout_monotonic_ns) noexcept;
+
+    /** Retain the first reporter-local authoritative commit timestamp. */
+    bool record_reporter_local_commit(
+        const ProposalKey &proposal,
+        std::uint64_t commit_monotonic_ns) noexcept;
 
     /**
      * Mark an authoritative-commit cleanup without discarding its already

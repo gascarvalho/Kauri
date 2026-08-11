@@ -1105,7 +1105,7 @@ TEST_CASE("proposal-independent malformed facts bypass an unknown FIFO head",
     auto unsupported_schema = observation(
         fixture.key("malformed-schema-unknown"), 1, 3, 2);
     unsupported_schema.schema_version =
-        hotstuff::kResponseObservationSchemaVersion + 1;
+        hotstuff::kResponseObservationSchemaVersionV2 + 1;
     malformed.emplace_back(
         unsupported_schema,
         EvidenceRejectionReason::unsupported_schema);

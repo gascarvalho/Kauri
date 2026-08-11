@@ -39,6 +39,7 @@ struct ChildAttemptKeyLess
 struct BoundAttempt
 {
     ResponseAttemptHandle handle;
+    std::uint64_t attempt_start_monotonic_ns{0};
     bool timeout_eligible{false};
     bool timeout_recorded{false};
     bool response_recorded{false};
@@ -48,6 +49,7 @@ struct BoundAttempt
 struct BoundDeadline
 {
     std::uint64_t generation{0};
+    std::uint64_t reporter_local_commit_monotonic_ns{0};
     bool consensus_context_closed{false};
     bool fired{false};
     bool dispatching{false};
@@ -196,6 +198,199 @@ const char *response_message_type_name(
 
 } // namespace
 
+AdaptiveV2CrossCommitRetentionAdmission
+select_adaptive_v2_cross_commit_retention_admission(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    const std::vector<ReplicaID> &responsive_degraded_actor_ids) noexcept
+{
+    AdaptiveV2CrossCommitRetentionAdmission output;
+    output.evidence_cutoff = evidence_cutoff;
+    try
+    {
+        if (current_epoch.epoch_digest == uint256_t{} ||
+            evidence_cutoff == 0 ||
+            responsive_degraded_actor_ids.empty() ||
+            !std::is_sorted(
+                responsive_degraded_actor_ids.begin(),
+                responsive_degraded_actor_ids.end()) ||
+            std::adjacent_find(
+                responsive_degraded_actor_ids.begin(),
+                responsive_degraded_actor_ids.end()) !=
+                responsive_degraded_actor_ids.end())
+        {
+            return output;
+        }
+
+        struct Candidate
+        {
+            ExpectedMessageType message_type{
+                ExpectedMessageType::direct_vote};
+            std::uint64_t ingestion_sequence{0};
+            uint256_t observation_id;
+        };
+        const auto preferred = [](const Candidate &left,
+                                  const Candidate &right) {
+            const auto left_type =
+                left.message_type == ExpectedMessageType::aggregate_relay
+                    ? 0
+                    : 1;
+            const auto right_type =
+                right.message_type == ExpectedMessageType::aggregate_relay
+                    ? 0
+                    : 1;
+            if (left_type != right_type)
+                return left_type < right_type;
+            if (left.ingestion_sequence != right.ingestion_sequence)
+                return left.ingestion_sequence < right.ingestion_sequence;
+            return left.observation_id.to_hex() <
+                right.observation_id.to_hex();
+        };
+        std::map<uint256_t, const AcceptedEvidenceRecord *> outstanding;
+        std::uint64_t previous_sequence = 0;
+        for (const auto &record : accepted)
+        {
+            if (record.ingestion_sequence == 0 ||
+                record.ingestion_sequence <= previous_sequence)
+            {
+                return output;
+            }
+            if (record.ingestion_sequence > evidence_cutoff)
+                break;
+            previous_sequence = record.ingestion_sequence;
+
+            const auto &observation = record.observation;
+            if (observation.configuration.epoch_number !=
+                    current_epoch.epoch_number ||
+                observation.configuration.epoch_digest !=
+                    current_epoch.epoch_digest)
+            {
+                continue;
+            }
+            const auto retained = outstanding.find(
+                observation.observation_id);
+            if (observation.outcome == ResponseOutcome::late &&
+                retained != outstanding.end())
+            {
+                constexpr std::size_t kMaximumRetentionSigners = 4'096;
+                const auto &timeout = retained->second->observation;
+                if (timeout.outcome != ResponseOutcome::timeout ||
+                    timeout.observation_id != observation.observation_id ||
+                    timeout.attempt_identity() !=
+                        observation.attempt_identity() ||
+                    timeout.deadline_duration_us !=
+                        observation.deadline_duration_us ||
+                    observation.schema_version !=
+                        kResponseObservationSchemaVersionV1 ||
+                    !valid_response_observation_retention_witness(
+                        observation) ||
+                    observation.deadline_duration_us == 0 ||
+                    observation.response_duration_us <
+                        observation.deadline_duration_us ||
+                    observation.signer_set.empty() ||
+                    observation.signer_set.size() >
+                        kMaximumRetentionSigners ||
+                    std::adjacent_find(
+                        observation.signer_set.begin(),
+                        observation.signer_set.end(),
+                        [](ReplicaID left, ReplicaID right) {
+                            return left >= right;
+                        }) != observation.signer_set.end())
+                {
+                    return output;
+                }
+                outstanding.erase(retained);
+                continue;
+            }
+            if (retained != outstanding.end())
+                return output;
+            if (!std::binary_search(
+                    responsive_degraded_actor_ids.begin(),
+                    responsive_degraded_actor_ids.end(),
+                    observation.observed_replica_id) ||
+                observation.schema_version !=
+                    kResponseObservationSchemaVersionV2)
+            {
+                continue;
+            }
+            if (observation.outcome != ResponseOutcome::timeout ||
+                (observation.expected_message_type !=
+                     ExpectedMessageType::direct_vote &&
+                 observation.expected_message_type !=
+                     ExpectedMessageType::aggregate_relay) ||
+                !valid_response_observation_retention_witness(
+                    observation))
+            {
+                return output;
+            }
+            if (!outstanding.emplace(
+                    observation.observation_id, &record).second)
+            {
+                return output;
+            }
+        }
+        std::map<ReplicaID, Candidate> selected;
+        for (const auto &entry : outstanding)
+        {
+            const auto &record = *entry.second;
+            const auto &observation = record.observation;
+            const Candidate candidate{
+                observation.expected_message_type,
+                record.ingestion_sequence,
+                observation.observation_id};
+            const auto found = selected.find(
+                observation.observed_replica_id);
+            if (found == selected.end() ||
+                preferred(candidate, found->second))
+            {
+                selected[observation.observed_replica_id] = candidate;
+            }
+        }
+
+        bool contains_aggregate_relay = false;
+        output.responsive_degraded_actor_ids =
+            responsive_degraded_actor_ids;
+        output.admitted_observation_ids.reserve(
+            responsive_degraded_actor_ids.size());
+        for (const auto actor : responsive_degraded_actor_ids)
+        {
+            const auto candidate = selected.find(actor);
+            if (candidate == selected.end())
+            {
+                output.status =
+                    AdaptiveV2CrossCommitRetentionAdmissionStatus::
+                        incomplete;
+                output.admitted_observation_ids.clear();
+                return output;
+            }
+            contains_aggregate_relay = contains_aggregate_relay ||
+                candidate->second.message_type ==
+                    ExpectedMessageType::aggregate_relay;
+            output.admitted_observation_ids.push_back(
+                candidate->second.observation_id);
+        }
+        if (!contains_aggregate_relay)
+        {
+            output.status =
+                AdaptiveV2CrossCommitRetentionAdmissionStatus::incomplete;
+            output.admitted_observation_ids.clear();
+            return output;
+        }
+        output.status =
+            AdaptiveV2CrossCommitRetentionAdmissionStatus::ready;
+        return output;
+    }
+    catch (...)
+    {
+        output.status =
+            AdaptiveV2CrossCommitRetentionAdmissionStatus::invalid;
+        output.responsive_degraded_actor_ids.clear();
+        output.admitted_observation_ids.clear();
+        return output;
+    }
+}
+
 struct AdaptiveV2ResponseEvidenceBridge::State
 {
     State(ReplicaID reporter_id,
@@ -264,6 +459,7 @@ struct AdaptiveV2ResponseEvidenceBridge::State
     std::uint64_t retry_schedule_failures{0};
     std::uint64_t last_deadline_generation{0};
     bool retry_scheduled{false};
+    bool cross_commit_retention_v2_enabled{false};
     bool terminal_delivery_failure{false};
     bool healthy{true};
     bool stopped{false};
@@ -278,6 +474,20 @@ AdaptiveV2ResponseEvidenceBridge::AdaptiveV2ResponseEvidenceBridge(
 AdaptiveV2ResponseEvidenceBridge::~AdaptiveV2ResponseEvidenceBridge()
 {
     shutdown();
+}
+
+bool AdaptiveV2ResponseEvidenceBridge::
+enable_cross_commit_retention_v2() noexcept
+{
+    if (state_->stopped || !state_->handles.empty() ||
+        !state_->deadlines.empty())
+    {
+        increment(state_->rejected_operations);
+        state_->healthy = false;
+        return false;
+    }
+    state_->cross_commit_retention_v2_enabled = true;
+    return true;
 }
 
 bool AdaptiveV2ResponseEvidenceBridge::arm(
@@ -414,6 +624,7 @@ bool AdaptiveV2ResponseEvidenceBridge::arm(
                 attempt.key,
                 BoundAttempt{
                     *handle,
+                    start_monotonic_ns,
                     attempt.timeout_eligible,
                     false,
                     false,
@@ -916,6 +1127,36 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts(
         false);
 }
 
+bool AdaptiveV2ResponseEvidenceBridge::record_reporter_local_commit(
+    const ProposalKey &proposal,
+    std::uint64_t commit_monotonic_ns) noexcept
+{
+    if (!state_->cross_commit_retention_v2_enabled)
+        return false;
+    if (state_->stopped || commit_monotonic_ns == 0)
+    {
+        increment(state_->rejected_operations);
+        state_->healthy = false;
+        return false;
+    }
+    const auto deadline = state_->deadlines.find(proposal);
+    if (deadline == state_->deadlines.end())
+        return true;
+    if (deadline->second.reporter_local_commit_monotonic_ns == 0)
+    {
+        deadline->second.reporter_local_commit_monotonic_ns =
+            commit_monotonic_ns;
+    }
+    else if (deadline->second.reporter_local_commit_monotonic_ns !=
+             commit_monotonic_ns)
+    {
+        increment(state_->rejected_operations);
+        state_->healthy = false;
+        return false;
+    }
+    return true;
+}
+
 std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts_impl(
     const ProposalKey &proposal,
     const std::set<ReplicaID> &exact_missing_direct_children,
@@ -985,6 +1226,40 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts_impl(
                 mark_deadline_delivery_failed(proposal);
                 finalize_ready_deadlines();
                 continue;
+            }
+            const auto retained_deadline =
+                state_->deadlines.find(proposal);
+            if (state_->cross_commit_retention_v2_enabled &&
+                retained_deadline != state_->deadlines.end() &&
+                retained_deadline->second
+                        .reporter_local_commit_monotonic_ns != 0 &&
+                found->second.attempt_start_monotonic_ns != 0 &&
+                fact->deadline_duration_us <=
+                    std::numeric_limits<std::uint64_t>::max() / 1'000)
+            {
+                const auto deadline_duration_ns =
+                    fact->deadline_duration_us * 1'000;
+                const auto attempt_start =
+                    found->second.attempt_start_monotonic_ns;
+                const auto commit =
+                    retained_deadline->second
+                        .reporter_local_commit_monotonic_ns;
+                if (attempt_start <=
+                        std::numeric_limits<std::uint64_t>::max() -
+                            deadline_duration_ns)
+                {
+                    const auto absolute_deadline =
+                        attempt_start + deadline_duration_ns;
+                    if (attempt_start <= commit &&
+                        commit < absolute_deadline &&
+                        absolute_deadline <= timeout_monotonic_ns)
+                    {
+                        fact->attempt_start_monotonic_ns =
+                            attempt_start;
+                        fact->reporter_local_commit_monotonic_ns =
+                            commit;
+                    }
+                }
             }
             if (!state_->retained_facts.push(std::move(*fact)))
             {

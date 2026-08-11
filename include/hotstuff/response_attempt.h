@@ -68,6 +68,10 @@ struct ResponseAttemptFact
     std::uint64_t deadline_duration_us{0};
     std::uint64_t fact_monotonic_ns{0};
     std::vector<ReplicaID> signer_set;
+    // Optional schema-v2 retention chronology. Existing aggregate
+    // initializers intentionally leave both fields at zero (schema v1).
+    std::uint64_t attempt_start_monotonic_ns{0};
+    std::uint64_t reporter_local_commit_monotonic_ns{0};
 };
 
 struct ResponseAttemptLimits

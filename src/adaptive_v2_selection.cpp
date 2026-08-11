@@ -296,7 +296,8 @@ bool exact_timeout_to_late_transition(
            timeout.observation_id == late.observation_id &&
            timeout.attempt_identity() == late.attempt_identity() &&
            timeout.deadline_duration_us == late.deadline_duration_us &&
-           late.schema_version == kResponseObservationSchemaVersion &&
+           is_supported_response_observation_schema(
+               late.schema_version) &&
            late.deadline_duration_us != 0 &&
            late.response_duration_us >= late.deadline_duration_us &&
            !late.signer_set.empty() &&

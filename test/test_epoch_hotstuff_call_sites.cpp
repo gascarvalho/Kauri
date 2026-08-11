@@ -2227,7 +2227,11 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
         cache,
         {"identity.key",
          "generation",
-         "blk->get_hash(), exact_key, generation, disposition"}));
+         "blk->get_hash(),",
+         "exact_key,",
+         "generation,",
+         "disposition,",
+         "std::nullopt"}));
 
     REQUIRE_FALSE(post_commit.empty());
     CHECK(contains_in_order(
@@ -2598,6 +2602,72 @@ TEST_CASE("adaptive v2 executable validates exact pre-vote configuration",
               std::string::npos);
         CHECK(missing.output.find("adaptive-v2") != std::string::npos);
     }
+}
+
+TEST_CASE(
+    "adaptive v2 executable loads retention schema v2 from main config syntax",
+    "[adaptive-v2][evidence][retention-v2][cli][config][subprocess]"
+    "[v40][intentional-red]")
+{
+    auto arguments = valid_adaptive_v2_arguments();
+    const auto config_path =
+        arguments.temporary_directory + "/main.conf";
+    {
+        std::ofstream config(config_path, std::ios::binary);
+        REQUIRE(config.good());
+        config <<
+            "experiment-responsive-cross-commit-retention-v2 = true\n";
+        REQUIRE(config.good());
+    }
+    arguments.values.insert(
+        arguments.values.end(),
+        {"--conf", config_path,
+         "--replica", "127.0.0.1:19000,unused,unused"});
+
+    const auto result = run_hotstuff_app(arguments.values);
+    ::unlink(config_path.c_str());
+
+    CHECK(result.status != 0);
+    CHECK(result.output.find(
+              "experiment responsive cross-commit retention v2 requires "
+              "tiered responsive omission v2 actors") !=
+          std::string::npos);
+    CHECK(result.output.find("replica idx out of range") ==
+          std::string::npos);
+}
+
+TEST_CASE(
+    "retention v2 shares one reporter-local commit sample with rich audit",
+    "[adaptive-v2][evidence][retention-v2][commit][wiring][v40]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto report = function_body(
+        implementation, "void HotStuffBase::report_adaptive_v2_committed(");
+    const auto post = function_body(
+        implementation, "void HotStuffBase::do_post_block_commit(");
+    const auto emit = function_body(
+        implementation, "void HotStuffBase::emit_committed_block_event(");
+    REQUIRE_FALSE(report.empty());
+    REQUIRE_FALSE(post.empty());
+    REQUIRE_FALSE(emit.empty());
+
+    CHECK(count_occurrences(
+              report, "adaptive_evidence_monotonic_now_ns()") == 1);
+    CHECK(contains_in_order(
+        report,
+        {"const auto local_commit_monotonic_ns =",
+         "record_reporter_local_commit(",
+         "*key, local_commit_monotonic_ns",
+         "reporter_local_commit_monotonic_ns =",
+         "local_commit_monotonic_ns"}));
+    CHECK(contains_in_order(
+        post,
+        {"pending_adaptive_v2_commit",
+         "reporter_local_commit_monotonic_ns",
+         "emit_committed_block_event(",
+         "reporter_local_commit_monotonic_ns"}));
+    CHECK(emit.find("reporter_local_commit_monotonic_ns") !=
+          std::string::npos);
 }
 
 TEST_CASE("adaptive v2 numeric options reject noncanonical and overflowing input",

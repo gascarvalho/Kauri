@@ -47,6 +47,8 @@
 #include "hotstuff/adaptation_manager_profile.h"
 #include "hotstuff/adaptive_v2_convergence_ack_wire.h"
 #include "hotstuff/adaptive_v2_manager_session.h"
+#include "hotstuff/adaptive_v2_response_evidence.h"
+#include "hotstuff/adaptive_v2_selection.h"
 #include "hotstuff/structured_event.h"
 #include "hotstuff/util.h"
 
@@ -153,6 +155,7 @@ struct CycleAuditContext
     bool shape_decision_emitted{false};
     bool evidence_snapshot_emitted{false};
     bool fault_containment_coverage_ready_emitted{false};
+    bool cross_commit_retention_ready_emitted{false};
 };
 
 struct ManagerOptions
@@ -185,6 +188,9 @@ struct ManagerOptions
     std::uint64_t fault_containment_evidence_start_monotonic_ns{0};
     std::uint32_t fault_containment_required_tree_coverage{0};
     std::uint64_t cycle_1_selection_not_before_monotonic_ns{0};
+    bool cycle_1_inherited_wait_exempt_eligibility_gate{false};
+    bool cycle_1_responsive_cross_commit_retention_readiness_gate{false};
+    std::vector<ReplicaID> cycle_1_responsive_degraded_actors;
     std::vector<TransitionRequest> transition_requests;
     std::string structured_event_run_id;
     std::string structured_event_source_instance;
@@ -748,6 +754,40 @@ std::vector<std::uint32_t> parse_shape_candidate_fanouts(
     return fanouts;
 }
 
+std::vector<ReplicaID> parse_canonical_replica_ids(
+    const std::string &text,
+    const char *field)
+{
+    if (text.empty() || text.back() == ',')
+        throw std::invalid_argument(
+            std::string(field) + " must use nonempty canonical CSV");
+    std::vector<ReplicaID> actors;
+    std::size_t begin = 0;
+    while (begin < text.size())
+    {
+        const auto separator = text.find(',', begin);
+        const auto end = separator == std::string::npos
+            ? text.size()
+            : separator;
+        const auto actor = parse_unsigned<std::uint32_t>(
+            text.substr(begin, end - begin), field, false);
+        if (actor > std::numeric_limits<ReplicaID>::max())
+            throw std::invalid_argument(
+                std::string(field) + " contains an out-of-range actor");
+        actors.push_back(static_cast<ReplicaID>(actor));
+        if (separator == std::string::npos)
+            break;
+        begin = separator + 1;
+    }
+    if (!std::is_sorted(actors.begin(), actors.end()) ||
+        std::adjacent_find(actors.begin(), actors.end()) != actors.end())
+    {
+        throw std::invalid_argument(
+            std::string(field) + " must be actor-sorted and unique");
+    }
+    return actors;
+}
+
 bytearray_t parse_hex(
     const std::string &text,
     const char *field,
@@ -1182,6 +1222,12 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValStr::create("0");
     auto opt_cycle_1_selection_not_before_monotonic_ns =
         Config::OptValStr::create("0");
+    auto opt_cycle_1_inherited_wait_exempt_eligibility_gate =
+        Config::OptValFlag::create(false);
+    auto opt_cycle_1_responsive_cross_commit_retention_readiness_gate =
+        Config::OptValFlag::create(false);
+    auto opt_cycle_1_responsive_degraded_actors =
+        Config::OptValStr::create("");
     auto opt_transition_requests = Config::OptValStrVec::create();
     auto opt_bundle_outputs = Config::OptValStrVec::create();
     auto opt_structured_event_run_id = Config::OptValStr::create();
@@ -1267,6 +1313,18 @@ ManagerOptions parse_options(int argc, char **argv)
     config.add_opt(
         "cycle-1-selection-not-before-monotonic-ns",
         opt_cycle_1_selection_not_before_monotonic_ns,
+        Config::SET_VAL);
+    config.add_opt(
+        "cycle-1-inherited-wait-exempt-eligibility-gate",
+        opt_cycle_1_inherited_wait_exempt_eligibility_gate,
+        Config::SWITCH_ON);
+    config.add_opt(
+        "cycle-1-responsive-cross-commit-retention-readiness-gate",
+        opt_cycle_1_responsive_cross_commit_retention_readiness_gate,
+        Config::SWITCH_ON);
+    config.add_opt(
+        "cycle-1-responsive-degraded-actors",
+        opt_cycle_1_responsive_degraded_actors,
         Config::SET_VAL);
     config.add_opt(
         "transition-request", opt_transition_requests, Config::APPEND);
@@ -1480,6 +1538,17 @@ ManagerOptions parse_options(int argc, char **argv)
             opt_cycle_1_selection_not_before_monotonic_ns->get(),
             "cycle 1 selection not before monotonic ns",
             false);
+    options.cycle_1_inherited_wait_exempt_eligibility_gate =
+        opt_cycle_1_inherited_wait_exempt_eligibility_gate->get();
+    options.cycle_1_responsive_cross_commit_retention_readiness_gate =
+        opt_cycle_1_responsive_cross_commit_retention_readiness_gate->get();
+    if (!opt_cycle_1_responsive_degraded_actors->get().empty())
+    {
+        options.cycle_1_responsive_degraded_actors =
+            parse_canonical_replica_ids(
+                opt_cycle_1_responsive_degraded_actors->get(),
+                "cycle 1 responsive degraded actors");
+    }
     const bool fault_coverage_enabled =
         options.fault_containment_evidence_start_monotonic_ns != 0;
     if (fault_coverage_enabled !=
@@ -1604,6 +1673,44 @@ ManagerOptions parse_options(int argc, char **argv)
     {
         throw std::invalid_argument(
             "cycle 1 selection gate requires the exact two-transition repair path");
+    }
+    const bool cycle_1_repair_admission_enabled =
+        options.cycle_1_inherited_wait_exempt_eligibility_gate;
+    if (cycle_1_repair_admission_enabled !=
+            options
+                .cycle_1_responsive_cross_commit_retention_readiness_gate ||
+        cycle_1_repair_admission_enabled !=
+            !options.cycle_1_responsive_degraded_actors.empty())
+    {
+        throw std::invalid_argument(
+            "--cycle-1-inherited-wait-exempt-eligibility-gate, "
+            "--cycle-1-responsive-cross-commit-retention-readiness-gate, "
+            "and --cycle-1-responsive-degraded-actors must be supplied together");
+    }
+    if (cycle_1_repair_admission_enabled &&
+        (options.cycle_1_selection_not_before_monotonic_ns == 0 ||
+         options.transition_requests.size() != 2 ||
+         options.transition_requests[1].predecessor_epoch_number != 1 ||
+         options.transition_requests[1].successor_epoch_number != 2 ||
+         options.transition_requests[1].minimum_predecessor_residency_ms !=
+             60'000 ||
+         options.transition_requests[1]
+                 .minimum_post_baseline_observation_ms != 0 ||
+         options.transition_requests[1].policy.intent !=
+             TreePolicyKind::fault_containment ||
+         options.transition_requests[1].policy.apply_shape_selection ||
+         !std::all_of(
+             options.cycle_1_responsive_degraded_actors.begin(),
+             options.cycle_1_responsive_degraded_actors.end(),
+             [&options](ReplicaID actor) {
+                 return std::binary_search(
+                     options.membership.begin(),
+                     options.membership.end(),
+                     actor);
+             })))
+    {
+        throw std::invalid_argument(
+            "cycle 1 repair admission requires the exact gated fault-containment 1-to-2 path and member actors");
     }
     options.structured_event_run_id =
         opt_structured_event_run_id->get();
@@ -2236,6 +2343,190 @@ private:
         if (!cycle_1_selection_gate_ready())
             return;
         evaluate();
+    }
+
+    bool cycle_1_retention_readiness_gate_ready(
+        std::uint64_t evidence_cutoff) noexcept
+    {
+        if (!options_
+                 .cycle_1_responsive_cross_commit_retention_readiness_gate ||
+            request_sequence_.cursor() != 1)
+        {
+            cycle_1_retention_admission_.reset();
+            return true;
+        }
+
+        try
+        {
+            const auto *request = current_transition_request();
+            const auto controller = session_.controller_audit();
+            const auto &ingress = session_.ingress();
+            const auto &epoch = ingress.current_epoch();
+            const auto &ledger = ingress.ledger();
+            if (request == nullptr ||
+                request->predecessor_epoch_number != 1 ||
+                request->successor_epoch_number != 2 ||
+                !controller.has_value() ||
+                !controller->baseline_frozen ||
+                epoch.epoch_number() != 1 ||
+                evidence_cutoff == 0 ||
+                evidence_cutoff != ledger.high_watermark() ||
+                !ledger.healthy())
+            {
+                fail("cycle_1_retention_readiness_context_invalid");
+                return false;
+            }
+
+            auto admission = hotstuff::
+                select_adaptive_v2_cross_commit_retention_admission(
+                    ledger.accepted(),
+                    hotstuff::AdaptationEpochId{
+                        epoch.epoch_number(), epoch.epoch_digest()},
+                    evidence_cutoff,
+                    options_.cycle_1_responsive_degraded_actors);
+            if (admission.status == hotstuff::
+                    AdaptiveV2CrossCommitRetentionAdmissionStatus::
+                        incomplete)
+            {
+                cycle_1_retention_admission_.reset();
+                return false;
+            }
+            if (admission.status != hotstuff::
+                    AdaptiveV2CrossCommitRetentionAdmissionStatus::ready)
+            {
+                fail("cycle_1_retention_readiness_fact_invalid");
+                return false;
+            }
+            cycle_1_retention_admission_ = std::move(admission);
+            return true;
+        }
+        catch (...)
+        {
+            cycle_1_retention_admission_.reset();
+            fail("cycle_1_retention_readiness_internal_failure");
+            return false;
+        }
+    }
+
+    bool cycle_1_inherited_eligibility_gate_ready(
+        std::uint64_t evidence_cutoff) noexcept
+    {
+        if (!options_.cycle_1_inherited_wait_exempt_eligibility_gate ||
+            request_sequence_.cursor() != 1)
+        {
+            return true;
+        }
+
+        try
+        {
+            const auto controller = session_.controller_audit();
+            const auto &ingress = session_.ingress();
+            const auto &epoch = ingress.current_epoch();
+            const auto &trees = epoch.trees();
+            if (!controller.has_value() ||
+                !controller->baseline_frozen ||
+                epoch.epoch_number() != 1 || trees.empty() ||
+                evidence_cutoff != ingress.ledger().high_watermark())
+            {
+                fail("cycle_1_inherited_eligibility_context_invalid");
+                return false;
+            }
+            if (evidence_cutoff <= controller->baseline_cutoff)
+                return false;
+
+            const auto inherited =
+                trees.front().wait_exempt_leaves;
+            if (inherited.size() != options_.required_nonresponsive ||
+                !std::is_sorted(inherited.begin(), inherited.end()) ||
+                std::adjacent_find(
+                    inherited.begin(), inherited.end()) !=
+                    inherited.end() ||
+                !std::all_of(
+                    trees.begin(), trees.end(),
+                    [&inherited](const auto &tree) {
+                        return tree.wait_exempt_leaves == inherited;
+                    }) ||
+                std::any_of(
+                    inherited.begin(), inherited.end(),
+                    [this](ReplicaID actor) {
+                        return std::binary_search(
+                            options_.cycle_1_responsive_degraded_actors
+                                .begin(),
+                            options_.cycle_1_responsive_degraded_actors
+                                .end(),
+                            actor);
+                    }))
+            {
+                fail("cycle_1_inherited_eligibility_constraints_invalid");
+                return false;
+            }
+
+            auto config = manager_controller_config(options_);
+            config.selection
+                .fault_containment_evidence_start_monotonic_ns = 0;
+            config.selection
+                .fault_containment_required_tree_coverage = 0;
+            hotstuff::AdaptiveV2ByzantineSelection selector(
+                ingress.ledger(),
+                options_.membership,
+                hotstuff::AdaptationEpochId{
+                    epoch.epoch_number(), epoch.epoch_digest()},
+                config.selection,
+                config.reputation_limits);
+            if (selector.freeze_baseline(controller->baseline_cutoff) !=
+                hotstuff::AdaptiveV2SelectionStatus::baseline_frozen)
+            {
+                fail("cycle_1_inherited_eligibility_baseline_failed");
+                return false;
+            }
+            const auto result =
+                selector.rank_inheriting_constraints_through(
+                    evidence_cutoff, inherited);
+            if (!selector.healthy() || result.snapshot == nullptr)
+            {
+                fail("cycle_1_inherited_eligibility_replay_failed");
+                return false;
+            }
+
+            for (const auto actor : inherited)
+            {
+                const auto entry = std::find_if(
+                    result.snapshot->ranking().begin(),
+                    result.snapshot->ranking().end(),
+                    [actor](const auto &candidate) {
+                        return candidate.replica_id == actor;
+                    });
+                if (entry == result.snapshot->ranking().end())
+                {
+                    fail("cycle_1_inherited_eligibility_actor_missing");
+                    return false;
+                }
+                if (entry->classification !=
+                        hotstuff::ResponsivenessClass::responsive ||
+                    !entry->eligible)
+                {
+                    return false;
+                }
+            }
+
+            if (result.status ==
+                hotstuff::AdaptiveV2SelectionStatus::selected)
+            {
+                return true;
+            }
+            if (result.status == hotstuff::AdaptiveV2SelectionStatus::
+                                     insufficient_eligible_roots)
+            {
+                return false;
+            }
+            fail("cycle_1_inherited_eligibility_status_invalid");
+            return false;
+        }
+        catch (...)
+        {
+            fail("cycle_1_inherited_eligibility_internal_failure");
+            return false;
+        }
     }
 
     bool schedule_current_predecessor_residency() noexcept
@@ -2971,6 +3262,77 @@ private:
         }
     }
 
+    bool emit_cycle_1_cross_commit_retention_ready(
+        std::uint64_t evidence_cutoff) noexcept
+    {
+        if (!options_
+                 .cycle_1_responsive_cross_commit_retention_readiness_gate ||
+            request_sequence_.cursor() != 1)
+        {
+            return true;
+        }
+        if (cycle_audits_.empty() ||
+            request_sequence_.cursor() != cycle_audits_.size() - 1 ||
+            !cycle_1_retention_admission_.has_value())
+        {
+            fail("cycle_1_retention_ready_has_no_exact_admission");
+            return false;
+        }
+
+        auto &cycle = cycle_audits_.back();
+        if (cycle.cross_commit_retention_ready_emitted)
+            return true;
+        try
+        {
+            const auto controller = session_.controller_audit();
+            const auto &epoch = session_.ingress().current_epoch();
+            const auto &admission = *cycle_1_retention_admission_;
+            if (!controller.has_value() ||
+                controller->current_cutoff != evidence_cutoff ||
+                admission.evidence_cutoff != evidence_cutoff ||
+                epoch.epoch_number() != 1 ||
+                admission.responsive_degraded_actor_ids !=
+                    options_.cycle_1_responsive_degraded_actors ||
+                admission.responsive_degraded_actor_ids.size() !=
+                    admission.admitted_observation_ids.size())
+            {
+                fail("cycle_1_retention_ready_cutoff_or_context_mismatch");
+                return false;
+            }
+
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("cycle_1_retention_ready_drain_failed");
+                return false;
+            }
+            structured_event_sink_.emit_audit(
+                hotstuff::AuditStructuredEventPayload{
+                    hotstuff::
+                        AdaptiveV2CrossCommitRetentionReadyStructuredEvent{
+                            static_cast<std::uint64_t>(
+                                request_sequence_.cursor()),
+                            epoch.epoch_number(),
+                            epoch.epoch_digest(),
+                            admission.evidence_cutoff,
+                            admission.responsive_degraded_actor_ids,
+                            admission.admitted_observation_ids}});
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+            {
+                fail("cycle_1_retention_ready_emit_failed");
+                return false;
+            }
+            cycle.cross_commit_retention_ready_emitted = true;
+            return true;
+        }
+        catch (...)
+        {
+            fail("cycle_1_retention_ready_internal_failure");
+            return false;
+        }
+    }
+
     void evaluate()
     {
         if (failed_ || request_sequence_.shutdown_eligible() ||
@@ -3007,6 +3369,16 @@ private:
         {
             return;
         }
+        if (controller.has_value() && controller->baseline_frozen &&
+            !cycle_1_retention_readiness_gate_ready(evidence_cutoff))
+        {
+            return;
+        }
+        if (controller.has_value() && controller->baseline_frozen &&
+            !cycle_1_inherited_eligibility_gate_ready(evidence_cutoff))
+        {
+            return;
+        }
         const auto status = session_.evaluate();
         refresh_cycle_audit();
         if ((status ==
@@ -3015,6 +3387,14 @@ private:
                  AdaptiveV2ManagerControllerStatus::already_ready) &&
             !fault_containment_coverage_ready(
                 *request, evidence_cutoff, true))
+        {
+            return;
+        }
+        if ((status ==
+                 AdaptiveV2ManagerControllerStatus::successor_ready ||
+             status ==
+                 AdaptiveV2ManagerControllerStatus::already_ready) &&
+            !emit_cycle_1_cross_commit_retention_ready(evidence_cutoff))
         {
             return;
         }
@@ -3826,6 +4206,8 @@ private:
     std::uint64_t convergence_tick_{0};
     std::optional<std::size_t> last_evaluated_ready_members_;
     std::optional<std::uint64_t> last_evaluated_evidence_cutoff_;
+    std::optional<hotstuff::AdaptiveV2CrossCommitRetentionAdmission>
+        cycle_1_retention_admission_;
     std::size_t emitted_score_trajectory_{0};
     std::size_t emitted_accepted_observations_{0};
     std::size_t emitted_session_terminals_{0};

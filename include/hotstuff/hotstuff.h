@@ -1137,6 +1137,7 @@ namespace hotstuff
             aggregation_timeout_coordinator;
         std::unique_ptr<AdaptiveV2ResponseEvidenceBridge>
             adaptive_v2_response_evidence;
+        bool experiment_responsive_cross_commit_retention_v2{false};
         std::unique_ptr<ExperimentByzantineAdapter>
             experiment_byzantine_adapter;
         std::unique_ptr<ExperimentPostQcAudit>
@@ -1345,6 +1346,8 @@ namespace hotstuff
             std::optional<std::uint64_t> view_generation;
             CommittedProposalIdentityDisposition identity_disposition{
                 CommittedProposalIdentityDisposition::conflicting};
+            std::optional<std::uint64_t>
+                reporter_local_commit_monotonic_ns;
         };
         std::optional<PendingAdaptiveV2Commit>
             pending_adaptive_v2_commit;
@@ -1746,7 +1749,9 @@ namespace hotstuff
             const block_t &blk,
             const std::optional<ProposalKey> &committed_key,
             const std::optional<std::uint64_t> &view_generation,
-            std::uint64_t commit_batch_index) noexcept;
+            std::uint64_t commit_batch_index,
+            const std::optional<std::uint64_t> &
+                reporter_local_commit_monotonic_ns) noexcept;
         void emit_commit_observed_event(
             const block_t &blk,
             std::uint64_t commit_batch_index) noexcept;
@@ -1864,6 +1869,7 @@ namespace hotstuff
         void set_aggregation_timeout(double timeout_seconds);
         void configure_experiment_byzantine_faults(
             ExperimentByzantineOptions options);
+        void enable_experiment_responsive_cross_commit_retention_v2();
         void configure_experiment_post_qc_audit(
             ExperimentPostQcAuditOptions options);
         /**
