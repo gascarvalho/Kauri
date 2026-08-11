@@ -1774,3 +1774,102 @@ TEST_CASE(
     CHECK(emit.find("admission.evidence_cutoff != evidence_cutoff") !=
           std::string::npos);
 }
+
+TEST_CASE(
+    "cycle-one aggregate retention policy is generic and repair compatible",
+    "[adaptive-v2][manager][v42][retention][policy][wiring]"
+    "[intentional-red]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+    REQUIRE(owns_manager_session(manager));
+
+    CHECK(raw_manager.find(
+              "--cycle-1-responsive-cross-commit-retention-admission-policy") !=
+          std::string::npos);
+    CHECK(raw_manager.find(
+              "one_per_actor_with_global_aggregate_v1") !=
+          std::string::npos);
+    CHECK(raw_manager.find("aggregate_relay_per_actor_v1") !=
+          std::string::npos);
+    const auto compact_raw_manager = without_whitespace(raw_manager);
+    CHECK(compact_raw_manager.find(
+              "opt_cycle_1_responsive_cross_commit_retention_admission_policy="
+              "Config::OptValStr::create") != std::string::npos);
+    CHECK(compact_raw_manager.find(
+              "config.add_opt("
+              "\"cycle-1-responsive-cross-commit-retention-admission-policy\","
+              "opt_cycle_1_responsive_cross_commit_retention_admission_policy,"
+              "Config::SET_VAL)") != std::string::npos);
+
+    const auto policy_parser = function_body(
+        manager,
+        "parse_cross_commit_retention_admission_policy(");
+    REQUIRE_FALSE(policy_parser.empty());
+    CHECK(policy_parser.find(
+              "one_per_actor_with_global_aggregate_v1") !=
+          std::string::npos);
+    CHECK(policy_parser.find("aggregate_relay_per_actor_v1") !=
+          std::string::npos);
+    CHECK(policy_parser.find("throw std::invalid_argument") !=
+          std::string::npos);
+
+    const auto parse_options = function_body(
+        manager, "ManagerOptions parse_options(");
+    REQUIRE_FALSE(parse_options.empty());
+    CHECK(parse_options.find(
+              "cycle_1_responsive_cross_commit_retention_admission_policy") !=
+          std::string::npos);
+    CHECK(parse_options.find("cycle_1_retention_admission_enabled") !=
+          std::string::npos);
+    CHECK(parse_options.find("cycle_1_repair_admission_enabled") !=
+          std::string::npos);
+    CHECK(parse_options.find("aggregate_relay_per_actor_v1") !=
+          std::string::npos);
+    CHECK(parse_options.find(
+              "one_per_actor_with_global_aggregate_v1") !=
+          std::string::npos);
+
+    const auto generic_validation = parse_options.find(
+        "cycle_1_retention_admission_enabled");
+    const auto repair_validation = parse_options.find(
+        "cycle_1_repair_admission_enabled", generic_validation);
+    REQUIRE(generic_validation != std::string::npos);
+    REQUIRE(repair_validation != std::string::npos);
+    CHECK(generic_validation < repair_validation);
+    const auto generic_block = parse_options.substr(
+        generic_validation,
+        repair_validation - generic_validation);
+    CHECK(generic_block.find("predecessor_epoch_number") !=
+          std::string::npos);
+    CHECK(generic_block.find("successor_epoch_number") !=
+          std::string::npos);
+    CHECK(generic_block.find("TreePolicyKind") == std::string::npos);
+    CHECK(generic_block.find("apply_shape_selection") ==
+          std::string::npos);
+    CHECK(generic_block.find("selection_not_before") ==
+          std::string::npos);
+    CHECK(generic_block.find("minimum_predecessor_residency_ms") ==
+          std::string::npos);
+
+    const auto compact_options = without_whitespace(parse_options);
+    CHECK(compact_options.find(
+              "cycle_1_repair_admission_enabled&&!options."
+              "cycle_1_responsive_cross_commit_retention_admission_policy."
+              "has_value()") != std::string::npos);
+    CHECK(compact_options.find(
+              "cycle_1_repair_admission_enabled&&"
+              "(options.cycle_1_selection_not_before_monotonic_ns==0") !=
+          std::string::npos);
+
+    const auto retention = function_body(
+        manager,
+        "bool cycle_1_retention_readiness_gate_ready(");
+    REQUIRE_FALSE(retention.empty());
+    CHECK(retention.find(
+              "cycle_1_responsive_cross_commit_retention_admission_policy") !=
+          std::string::npos);
+    CHECK(retention.find(
+              "select_adaptive_v2_cross_commit_retention_admission") !=
+          std::string::npos);
+}

@@ -1,4 +1,4 @@
-"""Fail-closed local execution for one SHAPE41 factorial slot.
+"""Fail-closed local execution for one SHAPE42 factorial slot.
 
 The frozen factorial modules describe *what* may be run.  This module owns the
 small, deliberately local execution boundary: it proves an exact pushed
@@ -54,6 +54,7 @@ from .factorial_manifest import (
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V1,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V2,
     RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+    RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V1,
     SOURCE_BOUND_PROPOSAL_WITNESS_CONTRACT_V1,
     V25_MANIFEST_ID,
     V26_MANIFEST_ID,
@@ -71,6 +72,7 @@ from .factorial_manifest import (
     V38_MANIFEST_ID,
     V39_MANIFEST_ID,
     V40_MANIFEST_ID,
+    V41_MANIFEST_ID,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     PortAllocation,
@@ -81,8 +83,10 @@ from .factorial_manifest import (
     load_frozen_manifest_bytes,
 )
 from .factorial_runtime import (
+    AGGREGATE_RELAY_PER_ACTOR_ADMISSION_POLICY_V1,
     CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION,
     CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION,
+    CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_ADMISSION_POLICY_OPTION,
     CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION,
     CYCLE1_SELECTION_NOT_BEFORE_OPTION,
     CYCLE1_SELECTION_NOT_BEFORE_TOKEN,
@@ -96,9 +100,14 @@ from .factorial_runtime import (
     EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3,
     EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4,
     EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5,
+    EXCLUDED_REPAIR_S037_RETENTION_SCOPE_V1,
+    FACTORIAL_CAMPAIGN_RETENTION_SCOPE_V1,
+    ONE_PER_ACTOR_WITH_GLOBAL_AGGREGATE_ADMISSION_POLICY_V1,
+    ORDERED_S066_COVERAGE_RETENTION_SCOPE_V1,
     RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_KEY,
     RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE,
     ExcludedRepairSmokeProbeContract,
+    Cycle1ResponsiveCrossCommitRetentionContract,
     FactorialRuntimePlan,
     ManagerSecretMaterial,
     ReplicaProcessSpec,
@@ -1392,6 +1401,7 @@ def build_coverage_smoke_execution_contract(
             V38_MANIFEST_ID,
             V39_MANIFEST_ID,
             V40_MANIFEST_ID,
+            V41_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.execution_mode != "fixed_sequential"
@@ -1666,6 +1676,7 @@ def _bind_execution_authorization(
         V38_MANIFEST_ID,
         V39_MANIFEST_ID,
         V40_MANIFEST_ID,
+        V41_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_slots = [
@@ -2930,6 +2941,7 @@ def _bind_static_artifacts(
                 V38_MANIFEST_ID,
                 V39_MANIFEST_ID,
                 V40_MANIFEST_ID,
+                V41_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else None
@@ -4557,7 +4569,8 @@ def _uses_exact_excluded_repair_smoke_bound(
         V38_MANIFEST_ID: "v38",
         V39_MANIFEST_ID: "v39",
         V40_MANIFEST_ID: "v40",
-        FROZEN_MANIFEST_ID: "v41",
+        V41_MANIFEST_ID: "v41",
+        FROZEN_MANIFEST_ID: "v42",
     }.get(manifest_id)
     if manifest_version is None:
         return False
@@ -4589,7 +4602,7 @@ def _uses_exact_excluded_repair_smoke_bound(
     )
     expected_observation_contract = (
         EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
-        if manifest_version == "v41"
+        if manifest_version in {"v41", "v42"}
         else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
         if manifest_version == "v40"
         else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
@@ -4602,7 +4615,7 @@ def _uses_exact_excluded_repair_smoke_bound(
     )
     expected_post_final_convergence_unmatched_commit_evidence_contract = (
         POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V2
-        if manifest_version in {"v38", "v39", "v40", "v41"}
+        if manifest_version in {"v38", "v39", "v40", "v41", "v42"}
         else (
             POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1
             if manifest_version in {"v36", "v37"}
@@ -4611,7 +4624,7 @@ def _uses_exact_excluded_repair_smoke_bound(
     )
     expected_semantic_delta = (
         EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
-        if manifest_version == "v41"
+        if manifest_version in {"v41", "v42"}
         else EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
         if manifest_version == "v40"
         else EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
@@ -4622,7 +4635,7 @@ def _uses_exact_excluded_repair_smoke_bound(
     )
     expected_effective_fault_window_duration_s = (
         360
-        if manifest_version in {"v40", "v41"}
+        if manifest_version in {"v40", "v41", "v42"}
         else 330
         if manifest_version in {"v37", "v38", "v39"}
         else 300
@@ -4650,23 +4663,23 @@ def _uses_exact_excluded_repair_smoke_bound(
         and probe.post_fault_observation_grace_s
         == (
             EXCLUDED_REPAIR_SMOKE_POST_FAULT_OBSERVATION_GRACE_S
-            if manifest_version in {"v40", "v41"}
+            if manifest_version in {"v40", "v41", "v42"}
             else None
         )
         and probe.cycle1_inherited_wait_exempt_eligibility_gate
-        == (True if manifest_version in {"v40", "v41"} else None)
+        == (True if manifest_version in {"v40", "v41", "v42"} else None)
         and probe.cycle1_responsive_cross_commit_retention_readiness_gate
-        == (True if manifest_version in {"v40", "v41"} else None)
+        == (True if manifest_version in {"v40", "v41", "v42"} else None)
         and probe.canonical_responsive_degraded_actor_ids
         == (
             EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
-            if manifest_version in {"v40", "v41"}
+            if manifest_version in {"v40", "v41", "v42"}
             else None
         )
         and probe.response_evidence_timeout_retention_schema_version
-        == (2 if manifest_version in {"v40", "v41"} else None)
+        == (2 if manifest_version in {"v40", "v41", "v42"} else None)
         and probe.runner_terminal_strictly_before_hard_deadline
-        == (True if manifest_version in {"v40", "v41"} else None)
+        == (True if manifest_version in {"v40", "v41", "v42"} else None)
     )
     exact_replica_argv = (
         len(spec.replica_argv_templates) == 31
@@ -4686,9 +4699,9 @@ def _uses_exact_excluded_repair_smoke_bound(
         spec.manager_argv_template.argv.count(
             CYCLE1_SELECTION_NOT_BEFORE_OPTION
         )
-        == (1 if manifest_version in {"v39", "v40", "v41"} else 0)
+        == (1 if manifest_version in {"v39", "v40", "v41", "v42"} else 0)
         and (
-            manifest_version not in {"v39", "v40", "v41"}
+            manifest_version not in {"v39", "v40", "v41", "v42"}
             or spec.manager_argv_template.argv[
                 spec.manager_argv_template.argv.index(
                     CYCLE1_SELECTION_NOT_BEFORE_OPTION
@@ -4702,17 +4715,17 @@ def _uses_exact_excluded_repair_smoke_bound(
         spec.manager_argv_template.argv.count(
             CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION
         )
-        == (1 if manifest_version in {"v40", "v41"} else 0)
+        == (1 if manifest_version in {"v40", "v41", "v42"} else 0)
         and spec.manager_argv_template.argv.count(
             CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION
         )
-        == (1 if manifest_version in {"v40", "v41"} else 0)
+        == (1 if manifest_version in {"v40", "v41", "v42"} else 0)
         and spec.manager_argv_template.argv.count(
             CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION
         )
-        == (1 if manifest_version in {"v40", "v41"} else 0)
+        == (1 if manifest_version in {"v40", "v41", "v42"} else 0)
         and (
-            manifest_version not in {"v40", "v41"}
+            manifest_version not in {"v40", "v41", "v42"}
             or spec.manager_argv_template.argv[
                 spec.manager_argv_template.argv.index(
                     CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION
@@ -4724,13 +4737,40 @@ def _uses_exact_excluded_repair_smoke_bound(
         and spec.main_config.lines.count(
             RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
         )
-        == (1 if manifest_version in {"v40", "v41"} else 0)
+        == (1 if manifest_version in {"v40", "v41", "v42"} else 0)
         and sum(
             line.split("=", 1)[0].strip()
             == RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_KEY
             for line in spec.main_config.lines
         )
-        == (1 if manifest_version in {"v40", "v41"} else 0)
+        == (1 if manifest_version in {"v40", "v41", "v42"} else 0)
+        and spec.manager_argv_template.argv.count(
+            CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_ADMISSION_POLICY_OPTION
+        )
+        == (1 if manifest_version == "v42" else 0)
+        and (
+            manifest_version != "v42"
+            or spec.manager_argv_template.argv[
+                spec.manager_argv_template.argv.index(
+                    CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_ADMISSION_POLICY_OPTION
+                )
+                + 1
+            ]
+            == ONE_PER_ACTOR_WITH_GLOBAL_AGGREGATE_ADMISSION_POLICY_V1
+        )
+        and (
+            spec.cycle1_responsive_cross_commit_retention is None
+            if manifest_version != "v42"
+            else spec.cycle1_responsive_cross_commit_retention
+            == Cycle1ResponsiveCrossCommitRetentionContract(
+                scope=EXCLUDED_REPAIR_S037_RETENTION_SCOPE_V1,
+                observation_schema_version=2,
+                responsive_degraded_actor_ids=(1, 7, 8, 12, 16, 19, 20),
+                admission_policy=(
+                    ONE_PER_ACTOR_WITH_GLOBAL_AGGREGATE_ADMISSION_POLICY_V1
+                ),
+            )
+        )
     )
     if not (
         contract.get("coverage_smoke_id")
@@ -4763,7 +4803,7 @@ def _uses_exact_excluded_repair_smoke_bound(
         and exact_readiness_argv_and_config
     ):
         raise FactorialExecutionError(
-            "v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39/v40/v41 excluded repair smoke runtime binding drifted"
+            "v28/v29/v30/v31/v32/v33/v34/v35/v36/v37/v38/v39/v40/v41/v42 excluded repair smoke runtime binding drifted"
         )
     return True
 
@@ -4982,26 +5022,44 @@ def _assert_v40_repair_runner_terminal_before_hard_deadline(
     """Bind an exact v40+ repair terminal row to the shared hard deadline."""
 
     probe = spec.excluded_repair_smoke_probe
-    expected_result_path = (
-        {
-            (
-                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5,
-                EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4,
-            ): (
-                "results/shape-placement-factorial-v40-coverage-smoke/"
-                "slot-037-n31-f2-b04-00"
-            ),
-            (
-                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6,
-                EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5,
-            ): (
-                "results/shape-placement-factorial-v41-coverage-smoke/"
-                "slot-037-n31-f2-b04-00"
-            ),
-        }.get((probe.observation_contract, probe.semantic_delta))
+    retention = spec.cycle1_responsive_cross_commit_retention
+    probe_contract = (
+        (probe.observation_contract, probe.semantic_delta)
         if probe is not None
         else None
     )
+    expected_result_path: str | None = None
+    if probe_contract == (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5,
+        EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4,
+    ) and retention is None:
+        expected_result_path = (
+            "results/shape-placement-factorial-v40-coverage-smoke/"
+            "slot-037-n31-f2-b04-00"
+        )
+    elif probe_contract == (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6,
+        EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5,
+    ):
+        if retention is None:
+            expected_result_path = (
+                "results/shape-placement-factorial-v41-coverage-smoke/"
+                "slot-037-n31-f2-b04-00"
+            )
+        elif retention == Cycle1ResponsiveCrossCommitRetentionContract(
+            scope=EXCLUDED_REPAIR_S037_RETENTION_SCOPE_V1,
+            observation_schema_version=2,
+            responsive_degraded_actor_ids=(
+                EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
+            ),
+            admission_policy=(
+                ONE_PER_ACTOR_WITH_GLOBAL_AGGREGATE_ADMISSION_POLICY_V1
+            ),
+        ):
+            expected_result_path = (
+                "results/shape-placement-factorial-v42-coverage-smoke/"
+                "slot-037-n31-f2-b04-00"
+            )
     if (
         probe is None
         or expected_result_path is None
@@ -5012,7 +5070,7 @@ def _assert_v40_repair_runner_terminal_before_hard_deadline(
         or spec.fault_window.hard_timeout_s != 650
     ):
         raise FactorialExecutionError(
-            "runner terminal hard bound requires the exact v40/v41 repair runtime"
+            "runner terminal hard bound requires the exact v40/v41/v42 repair runtime"
         )
     if (
         type(shared_raw_clock_anchor_ns) is not int
@@ -5064,11 +5122,11 @@ def _finalize_runner_terminal(
         try:
             if shared_raw_clock_anchor_ns is None:
                 raise FactorialExecutionError(
-                    "v40/v41 runner terminal hard bound lacks shared anchor"
+                    "v40/v41/v42 runner terminal hard bound lacks shared anchor"
                 )
             if not _uses_exact_excluded_repair_smoke_bound(spec, coverage_binding):
                 raise FactorialExecutionError(
-                    "v40/v41 runner terminal hard bound lacks exact coverage binding"
+                    "v40/v41/v42 runner terminal hard bound lacks exact coverage binding"
                 )
             _assert_v40_repair_runner_terminal_before_hard_deadline(
                 spec,
@@ -5273,19 +5331,22 @@ def _launch_receipt(
                 and probe.observation_contract
                 == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
                 and spec.result_path
-                == (
+                in {
                     "results/shape-placement-factorial-v41-coverage-smoke/"
-                    "slot-037-n31-f2-b04-00"
-                )
+                    "slot-037-n31-f2-b04-00",
+                    "results/shape-placement-factorial-v42-coverage-smoke/"
+                    "slot-037-n31-f2-b04-00",
+                }
             )
         )
         and spec.slot_id == "slot-037-n31-f2-b04-00"
     )
-    repair_readiness_enabled = (
-        cycle1_gate_enabled
+    retention = spec.cycle1_responsive_cross_commit_retention
+    historical_repair_readiness_enabled = (
+        retention is None
+        and cycle1_gate_enabled
         and probe is not None
-        and (probe.observation_contract, probe.semantic_delta)
-        in {
+        and (probe.observation_contract, probe.semantic_delta) in {
             (
                 EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5,
                 EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4,
@@ -5319,6 +5380,7 @@ def _launch_receipt(
         CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION,
         CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION,
         CYCLE1_RESPONSIVE_DEGRADED_ACTORS_OPTION,
+        CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_ADMISSION_POLICY_OPTION,
     )
     main_config_rows = tuple(
         row
@@ -5327,7 +5389,18 @@ def _launch_receipt(
         or row.get("relative_path") == spec.main_config.path
     )
     main_config_sha256: str | None = None
-    if repair_readiness_enabled:
+    readiness_enabled = historical_repair_readiness_enabled or retention is not None
+    if readiness_enabled:
+        expected_actors = (
+            retention.responsive_degraded_actor_ids
+            if retention is not None
+            else EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
+        )
+        expected_policy = retention.admission_policy if retention is not None else None
+        inherited_required = historical_repair_readiness_enabled or (
+            retention is not None
+            and retention.scope == EXCLUDED_REPAIR_S037_RETENTION_SCOPE_V1
+        )
         replica_config_values = tuple(
             tuple(
                 process.argv[index + 1]
@@ -5366,11 +5439,19 @@ def _launch_receipt(
             == RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_KEY
         )
         if (
-            manager_argv.count(readiness_options[0]) != 1
+            (manager_argv.count(readiness_options[0]) == 1)
+            is not inherited_required
             or manager_argv.count(readiness_options[1]) != 1
             or manager_argv.count(readiness_options[2]) != 1
             or manager_argv[manager_argv.index(readiness_options[2]) + 1]
-            != EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTORS_CSV_V1
+            != ",".join(map(str, expected_actors))
+            or (manager_argv.count(readiness_options[3]) == 1)
+            is not (expected_policy is not None)
+            or (
+                expected_policy is not None
+                and manager_argv[manager_argv.index(readiness_options[3]) + 1]
+                != expected_policy
+            )
             or spec.main_config.lines.count(
                 RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
             )
@@ -5421,7 +5502,7 @@ def _launch_receipt(
             != main_config_rows[0].get("sha256")
         ):
             raise FactorialExecutionError(
-                "launch receipt cannot seal drifted v40/v41 readiness or main config"
+                "launch receipt cannot seal drifted reporter readiness or main config"
             )
         main_config_sha256 = str(main_config_rows[0]["sha256"])
     elif (
@@ -5430,7 +5511,7 @@ def _launch_receipt(
         in spec.main_config.lines
     ):
         raise FactorialExecutionError(
-            "non-v40/v41-repair launch receipt must not seal readiness gates"
+            "ungated launch receipt must not seal readiness options"
         )
     receipt = {
         "schema_version": 1,
@@ -5458,6 +5539,10 @@ def _launch_receipt(
     }
     if main_config_sha256 is not None:
         receipt["main_config_sha256"] = main_config_sha256
+    if retention is not None:
+        receipt["cycle1_responsive_cross_commit_retention"] = (
+            retention.as_document()
+        )
     return receipt
 
 
@@ -6445,18 +6530,19 @@ def build_n31_coverage_smoke_slot(
         "results/shape-placement-factorial-v39/slot-066-n31-f5-b05-P": "v39",
         "results/shape-placement-factorial-v40/slot-066-n31-f5-b05-P": "v40",
         "results/shape-placement-factorial-v41/slot-066-n31-f5-b05-P": "v41",
+        "results/shape-placement-factorial-v42/slot-066-n31-f5-b05-P": "v42",
     }
     manifest_version = frozen_campaign_paths.get(template.result_path)
     expected_fault_duration_s = (
         450
         if manifest_version
-        in {"v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+        in {"v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
         else 300
     )
     expected_hard_timeout_s = (
         650
         if manifest_version
-        in {"v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+        in {"v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
         else 500
     )
     expected_timeout_eligibility = {
@@ -6487,6 +6573,7 @@ def build_n31_coverage_smoke_slot(
         "v39": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v40": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
         "v41": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
+        "v42": RESPONSIVE_CAUSAL_TIMEOUT_ELIGIBILITY_V3,
     }.get(manifest_version)
     expected_shape_evaluation_contract = (
         PRECONTAINMENT_SHAPE_EVALUATION_CONTRACT_V1
@@ -6517,6 +6604,7 @@ def build_n31_coverage_smoke_slot(
             "v39",
             "v40",
             "v41",
+            "v42",
         }
         else None
     )
@@ -6548,13 +6636,14 @@ def build_n31_coverage_smoke_slot(
             "v39",
             "v40",
             "v41",
+            "v42",
         }
         else None
     )
     expected_future_tree_proposal_delivery_contract = (
         FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2
         if manifest_version
-        in {"v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+        in {"v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
         else (
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
             if manifest_version in {"v19", "v20", "v21", "v22"}
@@ -6587,23 +6676,24 @@ def build_n31_coverage_smoke_slot(
             "v39",
             "v40",
             "v41",
+            "v42",
         }
         else None
     )
     expected_evidence_snapshot_selection_contract = (
         EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1
         if manifest_version
-        in {"v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+        in {"v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
         else None
     )
     expected_inherited_wait_exempt_placement_contract = (
         INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
-        if manifest_version in {"v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+        if manifest_version in {"v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
         else None
     )
     expected_verified_response_duplicate_delivery_contract = (
         VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2
-        if manifest_version in {"v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+        if manifest_version in {"v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
         else (
             VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1
             if manifest_version == "v26"
@@ -6612,7 +6702,7 @@ def build_n31_coverage_smoke_slot(
     )
     expected_excluded_repair_observation_contract = (
         EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
-        if manifest_version == "v41"
+        if manifest_version in {"v41", "v42"}
         else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
         if manifest_version == "v40"
         else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
@@ -6629,12 +6719,12 @@ def build_n31_coverage_smoke_slot(
     )
     expected_excluded_repair_duplicate_probe_contract = (
         EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
-        if manifest_version in {"v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+        if manifest_version in {"v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
         else None
     )
     expected_post_final_convergence_unmatched_commit_evidence_contract = (
         POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V2
-        if manifest_version in {"v38", "v39", "v40", "v41"}
+        if manifest_version in {"v38", "v39", "v40", "v41", "v42"}
         else (
             POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1
             if manifest_version in {"v36", "v37"}
@@ -6716,6 +6806,12 @@ def build_n31_coverage_smoke_slot(
         != expected_inherited_wait_exempt_placement_contract
         or responsive.verified_response_duplicate_delivery_contract
         != expected_verified_response_duplicate_delivery_contract
+        or responsive.causal_selection_reporter_retention_readiness_gate
+        != (
+            RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V1
+            if manifest_version == "v42"
+            else None
+        )
         or responsive.excluded_repair_smoke_observation_contract
         != expected_excluded_repair_observation_contract
         or responsive.excluded_repair_smoke_verified_response_duplicate_probe_contract
@@ -6726,14 +6822,14 @@ def build_n31_coverage_smoke_slot(
         != (
             60_000
             if manifest_version
-            in {"v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+            in {"v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
             else None
         )
         or responsive.minimum_primary_n31_f5_epoch1_internal_role_opportunities_per_actor_before_selection
         != (
             82
             if manifest_version
-            in {"v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}
+            in {"v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}
             else None
         )
     ):
@@ -6752,8 +6848,24 @@ def build_n31_coverage_smoke_slot(
             "N=31 coverage smoke result path must be the exact canonical root"
         )
     smoke = replace(template, result_path=result_path)
-    primary_runtime = build_slot_runtime(smoke)
-    if manifest_version not in {"v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}:
+    primary_runtime = build_slot_runtime(
+        smoke,
+        cycle1_responsive_cross_commit_retention=(
+            Cycle1ResponsiveCrossCommitRetentionContract(
+                scope=ORDERED_S066_COVERAGE_RETENTION_SCOPE_V1,
+                observation_schema_version=2,
+                responsive_degraded_actor_ids=(
+                    smoke.responsive_degraded_actor_ids
+                ),
+                admission_policy=(
+                    AGGREGATE_RELAY_PER_ACTOR_ADMISSION_POLICY_V1
+                ),
+            )
+            if manifest_version == "v42"
+            else None
+        ),
+    )
+    if manifest_version not in {"v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}:
         if repair_template is not None or repair_result_path is not None:
             raise FactorialExecutionError(
                 "historical N=31 coverage smoke must remain single-slot"
@@ -6846,6 +6958,12 @@ def build_n31_coverage_smoke_slot(
         != INHERITED_CONSENSUS_WAIT_EXEMPT_PLACEMENT_CONTRACT_V1
         or repair_responsive.verified_response_duplicate_delivery_contract
         != expected_verified_response_duplicate_delivery_contract
+        or repair_responsive.causal_selection_reporter_retention_readiness_gate
+        != (
+            RESPONSIVE_CAUSAL_SELECTION_REPORTER_RETENTION_READINESS_GATE_V1
+            if manifest_version == "v42"
+            else None
+        )
         or repair_responsive.excluded_repair_smoke_observation_contract
         != expected_excluded_repair_observation_contract
         or repair_responsive.excluded_repair_smoke_verified_response_duplicate_probe_contract
@@ -6870,11 +6988,27 @@ def build_n31_coverage_smoke_slot(
             "v25+ N=31 repair coverage result path must be the exact canonical root"
         )
     excluded_repair_probe: ExcludedRepairSmokeProbeContract | None = None
-    if manifest_version in {"v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41"}:
-        source_repair_runtime = build_slot_runtime(repair_template)
+    if manifest_version in {"v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"}:
+        source_repair_runtime = build_slot_runtime(
+            repair_template,
+            cycle1_responsive_cross_commit_retention=(
+                Cycle1ResponsiveCrossCommitRetentionContract(
+                    scope=FACTORIAL_CAMPAIGN_RETENTION_SCOPE_V1,
+                    observation_schema_version=2,
+                    responsive_degraded_actor_ids=(
+                        repair_template.responsive_degraded_actor_ids
+                    ),
+                    admission_policy=(
+                        AGGREGATE_RELAY_PER_ACTOR_ADMISSION_POLICY_V1
+                    ),
+                )
+                if manifest_version == "v42"
+                else None
+            ),
+        )
         effective_fault_window_duration_s = (
             360
-            if manifest_version in {"v40", "v41"}
+            if manifest_version in {"v40", "v41", "v42"}
             else 330
             if manifest_version in {"v37", "v38", "v39"}
             else 300
@@ -6893,7 +7027,7 @@ def build_n31_coverage_smoke_slot(
             source_campaign_artifact_id=source_repair_runtime.artifact_id,
             semantic_delta=(
                 EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
-                if manifest_version == "v41"
+                if manifest_version in {"v41", "v42"}
                 else EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
                 if manifest_version == "v40"
                 else EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
@@ -6914,30 +7048,44 @@ def build_n31_coverage_smoke_slot(
             ),
             post_fault_observation_grace_s=(
                 EXCLUDED_REPAIR_SMOKE_POST_FAULT_OBSERVATION_GRACE_S
-                if manifest_version in {"v40", "v41"}
+                if manifest_version in {"v40", "v41", "v42"}
                 else None
             ),
             cycle1_inherited_wait_exempt_eligibility_gate=(
-                True if manifest_version in {"v40", "v41"} else None
+                True if manifest_version in {"v40", "v41", "v42"} else None
             ),
             cycle1_responsive_cross_commit_retention_readiness_gate=(
-                True if manifest_version in {"v40", "v41"} else None
+                True if manifest_version in {"v40", "v41", "v42"} else None
             ),
             canonical_responsive_degraded_actor_ids=(
                 EXCLUDED_REPAIR_SMOKE_CANONICAL_RESPONSIVE_DEGRADED_ACTOR_IDS_V1
-                if manifest_version in {"v40", "v41"}
+                if manifest_version in {"v40", "v41", "v42"}
                 else None
             ),
             response_evidence_timeout_retention_schema_version=(
-                2 if manifest_version in {"v40", "v41"} else None
+                2 if manifest_version in {"v40", "v41", "v42"} else None
             ),
             runner_terminal_strictly_before_hard_deadline=(
-                True if manifest_version in {"v40", "v41"} else None
+                True if manifest_version in {"v40", "v41", "v42"} else None
             ),
         )
         repair_runtime = build_slot_runtime(
             repair_smoke,
             excluded_repair_smoke_probe=excluded_repair_probe,
+            cycle1_responsive_cross_commit_retention=(
+                Cycle1ResponsiveCrossCommitRetentionContract(
+                    scope=EXCLUDED_REPAIR_S037_RETENTION_SCOPE_V1,
+                    observation_schema_version=2,
+                    responsive_degraded_actor_ids=(
+                        repair_smoke.responsive_degraded_actor_ids
+                    ),
+                    admission_policy=(
+                        ONE_PER_ACTOR_WITH_GLOBAL_AGGREGATE_ADMISSION_POLICY_V1
+                    ),
+                )
+                if manifest_version == "v42"
+                else None
+            ),
         )
     else:
         repair_smoke = replace(repair_template, result_path=repair_result_path)

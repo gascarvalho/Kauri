@@ -106,6 +106,12 @@ enum class AdaptiveV2CrossCommitRetentionAdmissionStatus : std::uint8_t
     invalid,
 };
 
+enum class AdaptiveV2CrossCommitRetentionAdmissionPolicy : std::uint8_t
+{
+    one_per_actor_with_global_aggregate_v1 = 1,
+    aggregate_relay_per_actor_v1,
+};
+
 struct AdaptiveV2CrossCommitRetentionAdmission
 {
     AdaptiveV2CrossCommitRetentionAdmissionStatus status{
@@ -116,17 +122,21 @@ struct AdaptiveV2CrossCommitRetentionAdmission
 };
 
 /**
- * Pure same-cutoff replay of the repair-only schema-v2 readiness predicate.
+ * Pure same-cutoff replay of a schema-v2 retention-readiness predicate.
  * One actor-sorted witness is selected per expected observed child/target.
  * Reporter authenticity remains an EvidenceLedger admission invariant.
  * Aggregate relay is preferred, then lower ingestion sequence, then ID.
+ * The default preserves the historical repair-only admission contract.
  */
 AdaptiveV2CrossCommitRetentionAdmission
 select_adaptive_v2_cross_commit_retention_admission(
     const std::vector<AcceptedEvidenceRecord> &accepted,
     const AdaptationEpochId &current_epoch,
     std::uint64_t evidence_cutoff,
-    const std::vector<ReplicaID> &responsive_degraded_actor_ids) noexcept;
+    const std::vector<ReplicaID> &responsive_degraded_actor_ids,
+    AdaptiveV2CrossCommitRetentionAdmissionPolicy admission_policy =
+        AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+            one_per_actor_with_global_aggregate_v1) noexcept;
 
 /**
  * Event-loop-confined adapter from exact proposal callbacks to immutable

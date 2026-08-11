@@ -203,7 +203,8 @@ select_adaptive_v2_cross_commit_retention_admission(
     const std::vector<AcceptedEvidenceRecord> &accepted,
     const AdaptationEpochId &current_epoch,
     std::uint64_t evidence_cutoff,
-    const std::vector<ReplicaID> &responsive_degraded_actor_ids) noexcept
+    const std::vector<ReplicaID> &responsive_degraded_actor_ids,
+    AdaptiveV2CrossCommitRetentionAdmissionPolicy admission_policy) noexcept
 {
     AdaptiveV2CrossCommitRetentionAdmission output;
     output.evidence_cutoff = evidence_cutoff;
@@ -212,6 +213,12 @@ select_adaptive_v2_cross_commit_retention_admission(
         if (current_epoch.epoch_digest == uint256_t{} ||
             evidence_cutoff == 0 ||
             responsive_degraded_actor_ids.empty() ||
+            (admission_policy !=
+                 AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                     one_per_actor_with_global_aggregate_v1 &&
+             admission_policy !=
+                 AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                     aggregate_relay_per_actor_v1) ||
             !std::is_sorted(
                 responsive_degraded_actor_ids.begin(),
                 responsive_degraded_actor_ids.end()) ||
@@ -364,13 +371,28 @@ select_adaptive_v2_cross_commit_retention_admission(
                 output.admitted_observation_ids.clear();
                 return output;
             }
+            if (admission_policy ==
+                    AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                        aggregate_relay_per_actor_v1 &&
+                candidate->second.message_type !=
+                    ExpectedMessageType::aggregate_relay)
+            {
+                output.status =
+                    AdaptiveV2CrossCommitRetentionAdmissionStatus::
+                        incomplete;
+                output.admitted_observation_ids.clear();
+                return output;
+            }
             contains_aggregate_relay = contains_aggregate_relay ||
                 candidate->second.message_type ==
                     ExpectedMessageType::aggregate_relay;
             output.admitted_observation_ids.push_back(
                 candidate->second.observation_id);
         }
-        if (!contains_aggregate_relay)
+        if (admission_policy ==
+                AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                    one_per_actor_with_global_aggregate_v1 &&
+            !contains_aggregate_relay)
         {
             output.status =
                 AdaptiveV2CrossCommitRetentionAdmissionStatus::incomplete;

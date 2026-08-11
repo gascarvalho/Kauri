@@ -24,6 +24,7 @@ namespace
 
 using hotstuff::AdaptiveV2ResponseEvidenceBridge;
 using hotstuff::AdaptiveV2ResponseEvidenceLimits;
+using hotstuff::AdaptiveV2CrossCommitRetentionAdmissionPolicy;
 using hotstuff::AdaptiveV2CrossCommitRetentionAdmissionStatus;
 using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AdaptationEpochId;
@@ -703,6 +704,115 @@ TEST_CASE(
         CHECK(invalid.status ==
               AdaptiveV2CrossCommitRetentionAdmissionStatus::invalid);
     }
+}
+
+TEST_CASE(
+    "cycle-one aggregate retention admission waits for every actor",
+    "[adaptive-v2][response-evidence][retention][admission][v42]"
+    "[intentional-red]")
+{
+    const AdaptationEpochId epoch{
+        1, digest("aggregate-retention-admission-epoch-one")};
+    const std::vector<ReplicaID> actors{7, 8};
+    std::vector<AcceptedEvidenceRecord> accepted;
+    accepted.push_back(retained_timeout_record(
+        1, 3, 7, ExpectedMessageType::direct_vote,
+        epoch, "actor-7-direct"));
+    accepted.push_back(retained_timeout_record(
+        2, 4, 8, ExpectedMessageType::aggregate_relay,
+        epoch, "actor-8-aggregate"));
+
+    const auto legacy_ready = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            accepted,
+            epoch,
+            2,
+            actors,
+            AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                one_per_actor_with_global_aggregate_v1);
+    REQUIRE(legacy_ready.status ==
+            AdaptiveV2CrossCommitRetentionAdmissionStatus::ready);
+    REQUIRE(legacy_ready.admitted_observation_ids.size() == 2);
+    CHECK(legacy_ready.admitted_observation_ids.front() ==
+          accepted.front().observation.observation_id);
+    const auto default_legacy_ready = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            accepted, epoch, 2, actors);
+    CHECK(default_legacy_ready.status == legacy_ready.status);
+    CHECK(default_legacy_ready.admitted_observation_ids ==
+          legacy_ready.admitted_observation_ids);
+
+    const auto aggregate_incomplete = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            accepted,
+            epoch,
+            2,
+            actors,
+            AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                aggregate_relay_per_actor_v1);
+    CHECK(aggregate_incomplete.status ==
+          AdaptiveV2CrossCommitRetentionAdmissionStatus::incomplete);
+    CHECK(aggregate_incomplete.admitted_observation_ids.empty());
+
+    accepted.push_back(retained_timeout_record(
+        3, 5, 7, ExpectedMessageType::aggregate_relay,
+        epoch, "actor-7-aggregate"));
+    const auto aggregate_ready = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            accepted,
+            epoch,
+            3,
+            actors,
+            AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                aggregate_relay_per_actor_v1);
+    REQUIRE(aggregate_ready.status ==
+            AdaptiveV2CrossCommitRetentionAdmissionStatus::ready);
+    REQUIRE(aggregate_ready.admitted_observation_ids.size() == 2);
+    CHECK(aggregate_ready.admitted_observation_ids.front() ==
+          accepted.back().observation.observation_id);
+    CHECK(aggregate_ready.admitted_observation_ids.back() ==
+          accepted[1].observation.observation_id);
+
+    accepted.push_back(retained_late_record(4, accepted.back()));
+    const auto aggregate_cancelled = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            accepted,
+            epoch,
+            4,
+            actors,
+            AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                aggregate_relay_per_actor_v1);
+    CHECK(aggregate_cancelled.status ==
+          AdaptiveV2CrossCommitRetentionAdmissionStatus::incomplete);
+    CHECK(aggregate_cancelled.admitted_observation_ids.empty());
+
+    std::vector<AcceptedEvidenceRecord> malformed;
+    malformed.push_back(retained_timeout_record(
+        2, 5, 7, ExpectedMessageType::aggregate_relay,
+        epoch, "malformed-later"));
+    malformed.push_back(retained_timeout_record(
+        1, 4, 8, ExpectedMessageType::aggregate_relay,
+        epoch, "malformed-earlier"));
+    const auto invalid = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            malformed,
+            epoch,
+            2,
+            actors,
+            AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                aggregate_relay_per_actor_v1);
+    CHECK(invalid.status ==
+          AdaptiveV2CrossCommitRetentionAdmissionStatus::invalid);
+
+    const auto unknown_policy = hotstuff::
+        select_adaptive_v2_cross_commit_retention_admission(
+            malformed,
+            epoch,
+            2,
+            actors,
+            static_cast<AdaptiveV2CrossCommitRetentionAdmissionPolicy>(0));
+    CHECK(unknown_policy.status ==
+          AdaptiveV2CrossCommitRetentionAdmissionStatus::invalid);
 }
 
 TEST_CASE(

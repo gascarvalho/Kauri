@@ -837,7 +837,7 @@ def test_v40_terminal_production_path_samples_once_and_persists_same_timestamp(
 def test_v41_is_default_and_v39_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v41.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v42.json"
     assert cli.main(["--manifest", str(V39_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v40 are validation-only" in refusal["reason"]
+    assert "v1 through v41 are validation-only" in refusal["reason"]

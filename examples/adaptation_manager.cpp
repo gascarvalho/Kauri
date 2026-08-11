@@ -57,6 +57,7 @@ namespace
 
 using hotstuff::AdaptiveV2ManagerControllerConfig;
 using hotstuff::AdaptiveV2ManagerControllerStatus;
+using hotstuff::AdaptiveV2CrossCommitRetentionAdmissionPolicy;
 using hotstuff::AdaptiveV2ManagerCycleOutcome;
 using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
 using hotstuff::AdaptiveV2ManagerConvergenceDisposition;
@@ -190,6 +191,8 @@ struct ManagerOptions
     std::uint64_t cycle_1_selection_not_before_monotonic_ns{0};
     bool cycle_1_inherited_wait_exempt_eligibility_gate{false};
     bool cycle_1_responsive_cross_commit_retention_readiness_gate{false};
+    std::optional<AdaptiveV2CrossCommitRetentionAdmissionPolicy>
+        cycle_1_responsive_cross_commit_retention_admission_policy;
     std::vector<ReplicaID> cycle_1_responsive_degraded_actors;
     std::vector<TransitionRequest> transition_requests;
     std::string structured_event_run_id;
@@ -788,6 +791,24 @@ std::vector<ReplicaID> parse_canonical_replica_ids(
     return actors;
 }
 
+AdaptiveV2CrossCommitRetentionAdmissionPolicy
+parse_cross_commit_retention_admission_policy(
+    const std::string &raw)
+{
+    if (raw == "one_per_actor_with_global_aggregate_v1")
+    {
+        return AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+            one_per_actor_with_global_aggregate_v1;
+    }
+    if (raw == "aggregate_relay_per_actor_v1")
+    {
+        return AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+            aggregate_relay_per_actor_v1;
+    }
+    throw std::invalid_argument(
+        "cycle 1 responsive cross-commit retention admission policy is invalid");
+}
+
 bytearray_t parse_hex(
     const std::string &text,
     const char *field,
@@ -1226,6 +1247,8 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValFlag::create(false);
     auto opt_cycle_1_responsive_cross_commit_retention_readiness_gate =
         Config::OptValFlag::create(false);
+    auto opt_cycle_1_responsive_cross_commit_retention_admission_policy =
+        Config::OptValStr::create("");
     auto opt_cycle_1_responsive_degraded_actors =
         Config::OptValStr::create("");
     auto opt_transition_requests = Config::OptValStrVec::create();
@@ -1322,6 +1345,10 @@ ManagerOptions parse_options(int argc, char **argv)
         "cycle-1-responsive-cross-commit-retention-readiness-gate",
         opt_cycle_1_responsive_cross_commit_retention_readiness_gate,
         Config::SWITCH_ON);
+    config.add_opt(
+        "cycle-1-responsive-cross-commit-retention-admission-policy",
+        opt_cycle_1_responsive_cross_commit_retention_admission_policy,
+        Config::SET_VAL);
     config.add_opt(
         "cycle-1-responsive-degraded-actors",
         opt_cycle_1_responsive_degraded_actors,
@@ -1542,6 +1569,16 @@ ManagerOptions parse_options(int argc, char **argv)
         opt_cycle_1_inherited_wait_exempt_eligibility_gate->get();
     options.cycle_1_responsive_cross_commit_retention_readiness_gate =
         opt_cycle_1_responsive_cross_commit_retention_readiness_gate->get();
+    if (!opt_cycle_1_responsive_cross_commit_retention_admission_policy
+             ->get()
+             .empty())
+    {
+        options
+            .cycle_1_responsive_cross_commit_retention_admission_policy =
+            parse_cross_commit_retention_admission_policy(
+                opt_cycle_1_responsive_cross_commit_retention_admission_policy
+                    ->get());
+    }
     if (!opt_cycle_1_responsive_degraded_actors->get().empty())
     {
         options.cycle_1_responsive_degraded_actors =
@@ -1674,18 +1711,76 @@ ManagerOptions parse_options(int argc, char **argv)
         throw std::invalid_argument(
             "cycle 1 selection gate requires the exact two-transition repair path");
     }
-    const bool cycle_1_repair_admission_enabled =
-        options.cycle_1_inherited_wait_exempt_eligibility_gate;
-    if (cycle_1_repair_admission_enabled !=
-            options
-                .cycle_1_responsive_cross_commit_retention_readiness_gate ||
-        cycle_1_repair_admission_enabled !=
-            !options.cycle_1_responsive_degraded_actors.empty())
+    const bool cycle_1_retention_admission_enabled =
+        options
+            .cycle_1_responsive_cross_commit_retention_readiness_gate;
+    const bool cycle_1_retention_actors_supplied =
+        !options.cycle_1_responsive_degraded_actors.empty();
+    const bool cycle_1_retention_policy_supplied =
+        options
+            .cycle_1_responsive_cross_commit_retention_admission_policy
+            .has_value();
+    if (cycle_1_retention_admission_enabled !=
+            cycle_1_retention_actors_supplied ||
+        (!cycle_1_retention_admission_enabled &&
+         cycle_1_retention_policy_supplied))
     {
         throw std::invalid_argument(
-            "--cycle-1-inherited-wait-exempt-eligibility-gate, "
             "--cycle-1-responsive-cross-commit-retention-readiness-gate, "
-            "and --cycle-1-responsive-degraded-actors must be supplied together");
+            "--cycle-1-responsive-degraded-actors, and "
+            "--cycle-1-responsive-cross-commit-retention-admission-policy "
+            "form one bounded retention admission");
+    }
+    if (cycle_1_retention_admission_enabled &&
+        (options.transition_requests.size() != 2 ||
+         options.transition_requests[1].predecessor_epoch_number != 1 ||
+         options.transition_requests[1].successor_epoch_number != 2 ||
+         !std::all_of(
+             options.cycle_1_responsive_degraded_actors.begin(),
+             options.cycle_1_responsive_degraded_actors.end(),
+             [&options](ReplicaID actor) {
+                 return std::binary_search(
+                     options.membership.begin(),
+                     options.membership.end(),
+                     actor);
+             })))
+    {
+        throw std::invalid_argument(
+            "cycle 1 retention admission requires the exact 1-to-2 "
+            "transition and member actors");
+    }
+    const bool cycle_1_repair_admission_enabled =
+        options.cycle_1_inherited_wait_exempt_eligibility_gate;
+    if (cycle_1_repair_admission_enabled &&
+        !cycle_1_retention_admission_enabled)
+    {
+        throw std::invalid_argument(
+            "--cycle-1-inherited-wait-exempt-eligibility-gate requires "
+            "retention admission");
+    }
+    if (cycle_1_repair_admission_enabled &&
+        !options
+             .cycle_1_responsive_cross_commit_retention_admission_policy
+             .has_value())
+    {
+        options
+            .cycle_1_responsive_cross_commit_retention_admission_policy =
+            AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                one_per_actor_with_global_aggregate_v1;
+    }
+    if (!cycle_1_repair_admission_enabled &&
+        cycle_1_retention_admission_enabled &&
+        (!options
+              .cycle_1_responsive_cross_commit_retention_admission_policy
+              .has_value() ||
+         *options
+              .cycle_1_responsive_cross_commit_retention_admission_policy !=
+             AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                 aggregate_relay_per_actor_v1))
+    {
+        throw std::invalid_argument(
+            "generic cycle 1 retention admission requires explicit "
+            "aggregate_relay_per_actor_v1 policy");
     }
     if (cycle_1_repair_admission_enabled &&
         (options.cycle_1_selection_not_before_monotonic_ns == 0 ||
@@ -1699,18 +1794,14 @@ ManagerOptions parse_options(int argc, char **argv)
          options.transition_requests[1].policy.intent !=
              TreePolicyKind::fault_containment ||
          options.transition_requests[1].policy.apply_shape_selection ||
-         !std::all_of(
-             options.cycle_1_responsive_degraded_actors.begin(),
-             options.cycle_1_responsive_degraded_actors.end(),
-             [&options](ReplicaID actor) {
-                 return std::binary_search(
-                     options.membership.begin(),
-                     options.membership.end(),
-                     actor);
-             })))
+         *options
+              .cycle_1_responsive_cross_commit_retention_admission_policy !=
+             AdaptiveV2CrossCommitRetentionAdmissionPolicy::
+                 one_per_actor_with_global_aggregate_v1))
     {
         throw std::invalid_argument(
-            "cycle 1 repair admission requires the exact gated fault-containment 1-to-2 path and member actors");
+            "cycle 1 repair admission requires the exact gated "
+            "fault-containment 1-to-2 path and legacy retention policy");
     }
     options.structured_event_run_id =
         opt_structured_event_run_id->get();
@@ -2383,7 +2474,10 @@ private:
                     hotstuff::AdaptationEpochId{
                         epoch.epoch_number(), epoch.epoch_digest()},
                     evidence_cutoff,
-                    options_.cycle_1_responsive_degraded_actors);
+                    options_.cycle_1_responsive_degraded_actors,
+                    options_
+                        .cycle_1_responsive_cross_commit_retention_admission_policy
+                        .value());
             if (admission.status == hotstuff::
                     AdaptiveV2CrossCommitRetentionAdmissionStatus::
                         incomplete)

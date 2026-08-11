@@ -300,7 +300,7 @@ def test_v35_and_v36_exact_static_bindings_pass_but_cross_binding_fails(
 def test_v36_is_validation_only_after_the_v37_roll(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v41.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v42.json"
     assert cli.main(["--manifest", str(V36_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v40 are validation-only" in refusal["reason"]
+    assert "v1 through v41 are validation-only" in refusal["reason"]
