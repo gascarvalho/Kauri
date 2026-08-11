@@ -502,4 +502,4 @@ def test_v28_is_validation_only(
     assert cli.DEFAULT_MANIFEST != V28_MANIFEST
     assert cli.main(["--manifest", str(V28_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v36 are validation-only" in refusal["reason"]
+    assert "v1 through v37 are validation-only" in refusal["reason"]

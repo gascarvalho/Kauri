@@ -84,8 +84,11 @@ V35_MANIFEST_PATH = (
 V36_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v36.json"
 )
-FROZEN_MANIFEST_PATH = (
+V37_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v37.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v38.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -272,6 +275,12 @@ def test_v26_and_v27_duplicate_delivery_dispatch_is_version_and_field_exact() ->
     )
     assert validation._uses_verified_response_duplicate_delivery_contract(
         manifest(
+            validation.V37_MANIFEST_ID,
+            VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_verified_response_duplicate_delivery_contract(
+        manifest(
             validation.FROZEN_MANIFEST_ID,
             VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         )
@@ -336,6 +345,12 @@ def test_v23_future_tree_delivery_dispatch_is_version_and_field_exact() -> None:
     assert validation._uses_future_tree_proposal_delivery_contract(
         manifest(
             validation.V32_MANIFEST_ID,
+            FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        )
+    )
+    assert validation._uses_future_tree_proposal_delivery_contract(
+        manifest(
+            validation.V37_MANIFEST_ID,
             FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         )
     )
@@ -457,7 +472,7 @@ def test_v36_post_final_unmatched_commit_contract_dispatch_is_exact() -> None:
         manifest(validation.V36_MANIFEST_ID, contract)
     )
     assert validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
-        manifest(validation.FROZEN_MANIFEST_ID, contract)
+        manifest(validation.V37_MANIFEST_ID, contract)
     )
     assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
         manifest(validation.V35_MANIFEST_ID, contract)
@@ -466,8 +481,55 @@ def test_v36_post_final_unmatched_commit_contract_dispatch_is_exact() -> None:
         manifest(validation.V36_MANIFEST_ID, None)
     )
     assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
-        manifest(validation.FROZEN_MANIFEST_ID, contract + "-forged")
+        manifest(validation.V37_MANIFEST_ID, contract + "-forged")
     )
+
+
+def test_v38_post_final_unmatched_commit_contract_dispatch_is_exact() -> None:
+    v1 = validation.POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V1
+    v2 = validation.POST_FINAL_CONVERGENCE_UNMATCHED_COMMIT_EVIDENCE_CONTRACT_V2
+    assert v2 == (
+        "exact_v38_legal_qc_skipped_ancestor_without_authenticated_exact_identity_"
+        "source_authoritative_commit_identity_absence_strictly_after_final_cycle_"
+        "successor_converged_terminal_is_scoped_only_when_each_gap_has_one_same_"
+        "source_native_marker_every_replica_has_exactly_one_matching_commit_"
+        "observed_and_at_least_derived_q_distinct_source_bound_rich_block_"
+        "committed_proofs_match_height_hash_parent_transaction_count_commit_batch_"
+        "index_epoch_tree_digest_and_view_generation_non_designated_gaps_require_"
+        "the_designated_observer_rich_proof_while_at_most_one_designated_observer_"
+        "gap_is_permitted_only_for_zero_transactions_with_exact_height_adjacent_"
+        "designated_observer_rich_predecessor_and_successor_parent_chain_and_"
+        "configuration_generation_closure_every_positive_transaction_designated_"
+        "observer_observation_remains_complete_without_synthesizing_commit_"
+        "evidence_or_changing_consensus_or_transaction_throughput_authority_v2"
+    )
+
+    def manifest(manifest_id: str, value: str | None) -> SimpleNamespace:
+        responsive = SimpleNamespace(
+            post_final_convergence_unmatched_commit_evidence_contract=value,
+        )
+        return SimpleNamespace(
+            manifest_id=manifest_id,
+            byzantine=SimpleNamespace(responsive_degradation=responsive),
+        )
+
+    assert validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.V37_MANIFEST_ID, v1)
+    )
+    assert validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, v2)
+    )
+    assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.V37_MANIFEST_ID, v2)
+    )
+    assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, v1)
+    )
+    assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.FROZEN_MANIFEST_ID, v2 + "-forged")
+    )
+
+
 def _canonical(value: object) -> bytes:
     return (
         json.dumps(
@@ -586,11 +648,11 @@ def _v36_candidate_manifest(
 def _v37_candidate_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    payload = FROZEN_MANIFEST_PATH.read_bytes()
+    payload = V37_MANIFEST_PATH.read_bytes()
     semantic = _canonical(json.loads(payload))
     monkeypatch.setattr(
         manifest_module,
-        "FROZEN_SEMANTIC_SHA256",
+        "V37_SEMANTIC_SHA256",
         hashlib.sha256(semantic).hexdigest(),
     )
     return manifest_module.parse_manifest_bytes(payload)
@@ -876,7 +938,7 @@ def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
         validation.V36_MANIFEST_ID
     )
     identities[37] = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V37_MANIFEST_ID
     )
 
     assert identities[1].manifest_sha256 == validation.LEGACY_MANIFEST_SHA256
@@ -1172,16 +1234,16 @@ def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
         identities[36].coverage_smoke_runtime_sha256
         == validation.V36_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[37].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[37].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[37].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[37].manifest_sha256 == validation.V37_MANIFEST_SHA256
+    assert identities[37].plan_sha256 == validation.V37_PLAN_SHA256
+    assert identities[37].runtime_sha256 == validation.V37_RUNTIME_SHA256
     assert (
         identities[37].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V37_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[37].coverage_smoke_runtime_sha256
-        == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
+        == validation.V37_COVERAGE_SMOKE_RUNTIME_SHA256
     )
     assert validation._coverage_smoke_result_root(
         validation.V23_MANIFEST_ID
@@ -1226,8 +1288,11 @@ def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
         validation.V36_MANIFEST_ID
     ) == "results/shape-placement-factorial-v36-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V37_MANIFEST_ID
     ) == "results/shape-placement-factorial-v37-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v38-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -1642,13 +1707,13 @@ def test_validator_v36_identities_are_exactly_frozen() -> None:
 
 def test_validator_v37_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V37_MANIFEST_ID
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v37"
+    assert validation.V37_MANIFEST_ID == "shape-placement-factorial-v37"
     assert (
         identity.manifest_sha256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.V37_SEMANTIC_SHA256,
         identity.plan_sha256,
         identity.runtime_sha256,
         identity.smoke_runtime_sha256,
@@ -1660,6 +1725,29 @@ def test_validator_v37_identities_are_exactly_frozen() -> None:
         "a05f26983a34f626f95d326847db7a049a05c2258fdadf3bbaddd4ec3850c5d7",
         "1eda50b8e2887ab4d0f1763816f82344136dabf480d752f5a4d82f48272e8f63",
         "7aa68f246e06bee0a666734113e5a5bda7a747c912b3cc51db6f81d03b2a6d81",
+    )
+
+
+def test_validator_v38_identities_are_exactly_frozen() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v38"
+    assert (
+        identity.manifest_sha256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    ) == (
+        "aec2c4f2a9cb53e7b3d8d212bc0b56c008679aa97ebba140db7bac9404415698",
+        "9af592b436d934d13b1243439b84f78e1a78c19b035b37dbfe73bc168926b277",
+        "7e731a7f36a49a5e49aa62601165bd1fe8c846e3eff20001d0fccfe37b6050e0",
+        "2f080f10550c6eaac914435b436724a43f38615097063d3a70437a4459f69c3c",
+        "f1ae1fcffdaf4b209a595f3dd034ec935ad88ada5821930c105694b525e2817a",
+        "3cf676755478f686af64f12fd3fcb5993f4887a8f5165fbf540d289463544950",
     )
 
 
@@ -4067,6 +4155,9 @@ def test_v35_authoritative_completeness_dispatch_is_exact_and_historical_v34_is_
         validation.V35_MANIFEST_ID
     )
     assert validation._uses_authoritative_observer_commit_completeness(
+        validation.V37_MANIFEST_ID
+    )
+    assert validation._uses_authoritative_observer_commit_completeness(
         validation.FROZEN_MANIFEST_ID
     )
     assert not validation._uses_authoritative_observer_commit_completeness(
@@ -4207,7 +4298,11 @@ def _validate_v36_commit_identity_streams(
 
 @pytest.mark.parametrize(
     "manifest_id",
-    (validation.V36_MANIFEST_ID, validation.FROZEN_MANIFEST_ID),
+    (
+        validation.V36_MANIFEST_ID,
+        validation.V37_MANIFEST_ID,
+        validation.FROZEN_MANIFEST_ID,
+    ),
 )
 def test_v36_plus_commit_identity_unavailable_accepts_exact_post_terminal_q_proof(
     manifest_id: str,
@@ -4473,6 +4568,617 @@ def test_v36_gap_rejects_supporting_evidence_at_or_after_hard_deadline(
 
     with pytest.raises(FactorialValidationError, match=reason):
         _validate_v36_commit_identity_streams(streams)
+
+
+_V38_GAP_HEIGHT = 7
+_V38_GAP_HASH = f"{_V38_GAP_HEIGHT:064x}"
+_V38_GAP_PARENT = f"{_V38_GAP_HEIGHT - 1:064x}"
+_V38_GAP_DIGEST = "33" * 32
+_V38_GAP_GENERATION = (2 << 32) + 6
+_V38_GAP_REPORTERS = (0, 1, 15, 18, 26)
+
+
+def _v38_rich_commit(
+    replica_id: int,
+    *,
+    height: int,
+    sequence: int,
+    monotonic_ns: int,
+    transactions: int,
+) -> validation._NativeEvent:
+    event = _commit_event(
+        sequence,
+        monotonic_ns,
+        height,
+        epoch_number=2,
+        epoch_digest=_V38_GAP_DIGEST,
+        tree_id=5,
+        replica_id=replica_id,
+    )
+    return replace(
+        event,
+        payload={
+            **event.payload,
+            "transaction_count": transactions,
+            "view_generation": _V38_GAP_GENERATION,
+        },
+    )
+
+
+def _v38_observer_zero_gap_streams(
+    *,
+    gap_reporters: tuple[int, ...] = _V38_GAP_REPORTERS,
+) -> dict[int, tuple[validation._NativeEvent, ...]]:
+    streams: dict[int, tuple[validation._NativeEvent, ...]] = {}
+    for replica_id in range(31):
+        gap_commit = _v38_rich_commit(
+            replica_id,
+            height=_V38_GAP_HEIGHT,
+            sequence=4 if replica_id == 0 else 2,
+            monotonic_ns=111 + replica_id,
+            transactions=0,
+        )
+        gap_observed = _commit_observed_event(
+            gap_commit,
+            sequence=3 if replica_id == 0 else 1,
+            monotonic_ns=110 + replica_id,
+        )
+        disposition = (
+            _commit_identity_unavailable_event(
+                gap_observed,
+                sequence=gap_commit.source_sequence,
+                monotonic_ns=gap_commit.monotonic_ns,
+            )
+            if replica_id in gap_reporters
+            else gap_commit
+        )
+        if replica_id != 0:
+            streams[replica_id] = (gap_observed, disposition)
+            continue
+
+        predecessor = _v38_rich_commit(
+            0,
+            height=_V38_GAP_HEIGHT - 1,
+            sequence=2,
+            monotonic_ns=102,
+            transactions=1000,
+        )
+        successor = _v38_rich_commit(
+            0,
+            height=_V38_GAP_HEIGHT + 1,
+            sequence=6,
+            monotonic_ns=121,
+            transactions=1000,
+        )
+        streams[0] = (
+            _commit_observed_event(
+                predecessor,
+                sequence=1,
+                monotonic_ns=101,
+            ),
+            predecessor,
+            gap_observed,
+            disposition,
+            _commit_observed_event(
+                successor,
+                sequence=5,
+                monotonic_ns=120,
+            ),
+            successor,
+        )
+    return streams
+
+
+def _v38_gap_key() -> tuple[int, str, str, int, int]:
+    return (
+        _V38_GAP_HEIGHT,
+        _V38_GAP_HASH,
+        _V38_GAP_PARENT,
+        0,
+        0,
+    )
+
+
+def _validate_v38_commit_identity_streams(
+    streams: dict[int, tuple[validation._NativeEvent, ...]],
+    *,
+    manifest_id: str | None = None,
+    protected_block_identities: frozenset[tuple[int, str]] = frozenset(),
+) -> tuple[int, str, str | None, int, int] | None:
+    selected_manifest_id = (
+        validation.FROZEN_MANIFEST_ID if manifest_id is None else manifest_id
+    )
+    return validation._validate_manifest_commit_identity_evidence(
+        selected_manifest_id,
+        streams,
+        replica_count=31,
+        observer_id="replica-0",
+        observer_instance="slot-replica-0",
+        tree_ids_by_configuration={
+            (2, _V38_GAP_DIGEST): tuple(range(21)),
+        },
+        final_cycle_terminal_ns=100,
+        hard_deadline_ns=1_000,
+        protected_block_identities=protected_block_identities,
+    )
+
+
+def _replace_payload_field(
+    event: validation._NativeEvent,
+    field: str,
+    value: object,
+) -> validation._NativeEvent:
+    payload = {**event.payload, field: value}
+    if event.event_type == "block.committed" and field == "block_hash":
+        payload["decision_proof"] = {
+            **event.payload["decision_proof"],
+            "block_hash": value,
+        }
+    return replace(event, payload=payload)
+
+
+def test_v38_accepts_exact_post_terminal_zero_transaction_observer_gap() -> None:
+    streams = _v38_observer_zero_gap_streams()
+
+    assert _validate_v38_commit_identity_streams(streams) == _v38_gap_key()
+
+
+def test_v38_production_commit_identity_orchestration_is_gap_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    allowed_key = _v38_gap_key()
+    protected = frozenset({(_V38_GAP_HEIGHT, _V38_GAP_HASH)})
+
+    def validate_gaps(*_args: object, **kwargs: object):
+        calls.append("gaps")
+        assert kwargs["protected_block_identities"] == protected
+        return allowed_key
+
+    def validate_observer(*_args: object, **kwargs: object) -> None:
+        calls.append("observer")
+        assert kwargs["allowed_unavailable_key"] == allowed_key
+
+    monkeypatch.setattr(
+        validation,
+        "_validate_manifest_commit_identity_unavailable",
+        validate_gaps,
+    )
+    monkeypatch.setattr(
+        validation,
+        "_validate_manifest_authoritative_observer_commit_completeness",
+        validate_observer,
+    )
+
+    assert validation._validate_manifest_commit_identity_evidence(
+        validation.FROZEN_MANIFEST_ID,
+        {0: ()},
+        replica_count=1,
+        observer_id="replica-0",
+        observer_instance="slot-replica-0",
+        tree_ids_by_configuration={},
+        final_cycle_terminal_ns=100,
+        hard_deadline_ns=1_000,
+        protected_block_identities=protected,
+    ) == allowed_key
+    assert calls == ["gaps", "observer"]
+
+
+@pytest.mark.parametrize(
+    "manifest_name",
+    ("V35_MANIFEST_ID", "V36_MANIFEST_ID", "V37_MANIFEST_ID"),
+)
+def test_v35_through_v37_reject_v38_observer_gap(manifest_name: str) -> None:
+    with pytest.raises(FactorialValidationError):
+        _validate_v38_commit_identity_streams(
+            _v38_observer_zero_gap_streams(),
+            manifest_id=getattr(validation, manifest_name),
+        )
+
+
+def test_v37_official_observer_gap_failure_reason_is_preserved() -> None:
+    with pytest.raises(
+        FactorialValidationError,
+        match="authoritative observer commit observation lacks exactly one committed proof",
+    ):
+        validation._validate_manifest_commit_identity_evidence(
+            validation.V37_MANIFEST_ID,
+            _v38_observer_zero_gap_streams(),
+            replica_count=31,
+            observer_id="replica-0",
+            observer_instance="slot-replica-0",
+            tree_ids_by_configuration={
+                (2, _V38_GAP_DIGEST): tuple(range(21)),
+            },
+            final_cycle_terminal_ns=100,
+            hard_deadline_ns=1_000,
+        )
+
+
+def test_v38_observer_gap_rejects_positive_transactions() -> None:
+    streams = _v38_observer_zero_gap_streams()
+    for replica_id, events in streams.items():
+        streams[replica_id] = tuple(
+            _replace_payload_field(event, "transaction_count", 1)
+            if event.payload.get("block_height") == _V38_GAP_HEIGHT
+            else event
+            for event in events
+        )
+
+    with pytest.raises(FactorialValidationError, match="zero transactions"):
+        _validate_v38_commit_identity_streams(streams)
+
+
+def test_v38_rejects_a_second_designated_observer_zero_gap() -> None:
+    streams = _v38_observer_zero_gap_streams()
+    second_commit = _v38_rich_commit(
+        0,
+        height=10,
+        sequence=8,
+        monotonic_ns=131,
+        transactions=0,
+    )
+    second_observed = _commit_observed_event(
+        second_commit,
+        sequence=7,
+        monotonic_ns=130,
+    )
+    streams[0] = (
+        *streams[0],
+        second_observed,
+        _commit_identity_unavailable_event(
+            second_observed,
+            sequence=8,
+            monotonic_ns=131,
+        ),
+    )
+
+    with pytest.raises(FactorialValidationError, match="at most one"):
+        _validate_v38_commit_identity_streams(streams)
+
+
+@pytest.mark.parametrize(
+    ("monotonic_ns", "reason"),
+    ((100, "strictly follow"), (1_000, "strictly precede")),
+)
+def test_v38_observer_gap_rejects_terminal_and_hard_equalities(
+    monotonic_ns: int,
+    reason: str,
+) -> None:
+    streams = _v38_observer_zero_gap_streams()
+    observer = list(streams[0])
+    observer[3] = replace(observer[3], monotonic_ns=monotonic_ns)
+    streams[0] = tuple(observer)
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        _validate_v38_commit_identity_streams(streams)
+
+
+@pytest.mark.parametrize("duplicate_source", (False, True))
+def test_v38_observer_gap_requires_derived_distinct_source_quorum(
+    duplicate_source: bool,
+) -> None:
+    streams = _v38_observer_zero_gap_streams(
+        gap_reporters=tuple(range(11)),
+    )
+    if duplicate_source:
+        duplicate = streams[11][1]
+        streams[11] = (
+            *streams[11],
+            replace(
+                duplicate,
+                source_sequence=3,
+                line_number=3,
+                monotonic_ns=duplicate.monotonic_ns + 1,
+            ),
+        )
+
+    with pytest.raises(FactorialValidationError, match="rich commit quorum"):
+        _validate_v38_commit_identity_streams(streams)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing", "every configured replica"),
+        ("duplicate", "exactly one.*observation"),
+        ("conflicting", "same observed commit tuple"),
+    ),
+)
+def test_v38_observer_gap_requires_one_matching_observation_per_replica(
+    mutation: str,
+    reason: str,
+) -> None:
+    streams = _v38_observer_zero_gap_streams()
+    if mutation == "missing":
+        streams[30] = ()
+    elif mutation == "duplicate":
+        observed, committed = streams[2]
+        streams[2] = (
+            observed,
+            replace(
+                observed,
+                source_sequence=2,
+                line_number=2,
+                monotonic_ns=observed.monotonic_ns + 1,
+            ),
+            replace(committed, source_sequence=3, line_number=3),
+        )
+    else:
+        observed, committed = streams[2]
+        streams[2] = (
+            _replace_payload_field(observed, "block_hash", "99" * 32),
+            committed,
+        )
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        _validate_v38_commit_identity_streams(streams)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("block_height", 9),
+        ("block_hash", "99" * 32),
+        ("parent_hash", "88" * 32),
+        ("transaction_count", 1),
+        ("commit_batch_index", 1),
+    ),
+)
+def test_v38_observer_gap_rejects_rich_commit_tuple_drift(
+    field: str,
+    value: object,
+) -> None:
+    streams = _v38_observer_zero_gap_streams()
+    observed, committed = streams[2]
+    streams[2] = (observed, _replace_payload_field(committed, field, value))
+
+    with pytest.raises(FactorialValidationError):
+        _validate_v38_commit_identity_streams(streams)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("epoch_number", "tree_id", "epoch_digest", "view_generation"),
+)
+def test_v38_observer_gap_rejects_rich_configuration_generation_drift(
+    field: str,
+) -> None:
+    streams = _v38_observer_zero_gap_streams()
+    observed, committed = streams[2]
+    payload = dict(committed.payload)
+    if field == "view_generation":
+        payload[field] = _V38_GAP_GENERATION + 1
+    else:
+        payload["decision_proof"] = {
+            **payload["decision_proof"],
+            field: {
+                "epoch_number": 3,
+                "tree_id": 6,
+                "epoch_digest": "44" * 32,
+            }[field],
+        }
+    streams[2] = (observed, replace(committed, payload=payload))
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="configuration/generation identity drift",
+    ):
+        _validate_v38_commit_identity_streams(streams)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("malformed", "invalid field set"),
+        ("nonadjacent", "immediate same-source successor"),
+        ("reason", "unavailable reason"),
+        ("pending", "pending disposition"),
+        ("rich-marker", "both rich and unavailable"),
+    ),
+)
+def test_v38_observer_marker_remains_fail_closed(
+    mutation: str,
+    reason: str,
+) -> None:
+    streams = _v38_observer_zero_gap_streams()
+    observer = list(streams[0])
+    marker = observer[3]
+    if mutation == "malformed":
+        observer[3] = replace(marker, payload={**marker.payload, "extra": 1})
+    elif mutation == "nonadjacent":
+        intervening = _native_event(
+            source_id="replica-0",
+            sequence=4,
+            monotonic_ns=marker.monotonic_ns - 1,
+            event_type="test.intervening",
+            payload={},
+        )
+        observer = (
+            *observer[:3],
+            intervening,
+            replace(marker, source_sequence=5, line_number=5),
+            *(
+                replace(
+                    event,
+                    source_sequence=event.source_sequence + 1,
+                    line_number=event.line_number + 1,
+                )
+                for event in observer[4:]
+            ),
+        )
+    elif mutation == "reason":
+        observer[3] = replace(
+            marker,
+            payload={**marker.payload, "reason": "legal_qc_skip"},
+        )
+    elif mutation == "pending":
+        observer[3] = replace(
+            marker,
+            payload={**marker.payload, "convergence_identity_pending": True},
+        )
+    else:
+        observer.append(
+            _v38_rich_commit(
+                0,
+                height=_V38_GAP_HEIGHT,
+                sequence=7,
+                monotonic_ns=130,
+                transactions=0,
+            )
+        )
+    streams[0] = tuple(observer)
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        _validate_v38_commit_identity_streams(streams)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing-predecessor", "predecessor"),
+        ("missing-successor", "successor"),
+        ("parent", "parent chain"),
+        ("successor-parent", "parent chain"),
+        ("configuration", "configuration/generation closure"),
+        ("generation", "configuration/generation closure"),
+    ),
+)
+def test_v38_observer_gap_requires_exact_rich_bridge(
+    mutation: str,
+    reason: str,
+) -> None:
+    streams = _v38_observer_zero_gap_streams()
+    observer = list(streams[0])
+    if mutation == "missing-predecessor":
+        observer = observer[2:]
+    elif mutation == "missing-successor":
+        observer = observer[:-2]
+    elif mutation == "parent":
+        for replica_id, events in streams.items():
+            streams[replica_id] = tuple(
+                _replace_payload_field(event, "parent_hash", "99" * 32)
+                if event.payload.get("block_height") == _V38_GAP_HEIGHT
+                else event
+                for event in events
+            )
+        observer = list(streams[0])
+    elif mutation == "successor-parent":
+        observer[-2:] = [
+            _replace_payload_field(event, "parent_hash", "99" * 32)
+            for event in observer[-2:]
+        ]
+    else:
+        predecessor = observer[1]
+        proof = dict(predecessor.payload["decision_proof"])
+        payload = dict(predecessor.payload)
+        if mutation == "configuration":
+            proof["epoch_number"] = 1
+            proof["epoch_digest"] = "22" * 32
+            payload["view_generation"] = (1 << 32) + 6
+        else:
+            payload["view_generation"] = _V38_GAP_GENERATION + 1
+        payload["decision_proof"] = proof
+        observer[1] = replace(predecessor, payload=payload)
+    streams[0] = tuple(observer)
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        _validate_v38_commit_identity_streams(streams)
+
+
+def test_v38_observer_gap_cannot_be_transition_or_cutoff_evidence() -> None:
+    with pytest.raises(FactorialValidationError, match="transition or cutoff"):
+        _validate_v38_commit_identity_streams(
+            _v38_observer_zero_gap_streams(),
+            protected_block_identities=frozenset(
+                {(_V38_GAP_HEIGHT, _V38_GAP_HASH)}
+            ),
+        )
+
+
+def test_v38_production_protection_collects_transition_and_cutoff_blocks() -> None:
+    cutoff = _v38_rich_commit(
+        0,
+        height=_V38_GAP_HEIGHT,
+        sequence=1,
+        monotonic_ns=110,
+        transactions=0,
+    )
+    transition = _native_event(
+        source_id="replica-1",
+        sequence=1,
+        monotonic_ns=120,
+        event_type="epoch.command_committed",
+        payload={
+            "command_block_height": 8,
+            "command_block_hash": "88" * 32,
+        },
+    )
+    command_cutoff = _native_event(
+        source_id="replica-2",
+        sequence=1,
+        monotonic_ns=125,
+        event_type="epoch.command_committed",
+        payload={
+            "command_block_height": 10,
+            "command_block_hash": "aa" * 32,
+        },
+    )
+    terminal = _native_event(
+        source_id="adaptive-manager",
+        sequence=1,
+        monotonic_ns=130,
+        event_type="adaptive_v2_session_terminal",
+        payload={
+            "winning_activation": {
+                "command_block_height": 9,
+                "command_block_hash": "99" * 32,
+            },
+        },
+    )
+
+    protected = validation._transition_and_cutoff_block_identities(
+        cutoff_document={
+            "cutoffs": [
+                {
+                    "source_path": cutoff.relative_path,
+                    "source_sequence": cutoff.source_sequence,
+                },
+                {
+                    "source_path": command_cutoff.relative_path,
+                    "source_sequence": command_cutoff.source_sequence,
+                },
+            ],
+        },
+        events_by_ref={
+            (cutoff.relative_path, cutoff.source_sequence): cutoff,
+            (
+                command_cutoff.relative_path,
+                command_cutoff.source_sequence,
+            ): command_cutoff,
+        },
+        manager_events=(terminal,),
+        replica_events={0: (cutoff,), 1: (transition,)},
+    )
+
+    assert protected == frozenset(
+        {
+            (_V38_GAP_HEIGHT, _V38_GAP_HASH),
+            (8, "88" * 32),
+            (9, "99" * 32),
+            (10, "aa" * 32),
+        }
+    )
+
+
+def test_v38_observer_gap_does_not_synthesize_throughput_authority() -> None:
+    streams = _v38_observer_zero_gap_streams()
+    assert _validate_v38_commit_identity_streams(streams) == _v38_gap_key()
+
+    authoritative = validation._authoritative_commits(streams)
+    assert [commit["height"] for commit in authoritative] == [6, 8]
+    assert sum(commit["transactions"] for commit in authoritative) == 2_000
+    assert all(commit["hash"] != _V38_GAP_HASH for commit in authoritative)
 
 
 @pytest.mark.parametrize("field", ("block_height", "commit_batch_index"))
@@ -11446,6 +12152,10 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
         Path(validation.V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     )
+    v37_coverage = (
+        Path(validation.V37_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
     v29_coverage = (
         Path(validation.V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
@@ -11491,6 +12201,14 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
     )
     assert not validation._is_excluded_coverage_smoke_slot(
         v36_coverage,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert validation._is_excluded_coverage_smoke_slot(
+        v37_coverage,
+        manifest_id=validation.V37_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v37_coverage,
         manifest_id=validation.FROZEN_MANIFEST_ID,
     )
     assert validation._is_excluded_coverage_smoke_slot(
@@ -11572,6 +12290,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-037-n31-f2-b04-00",
     )
     assert validation._coverage_smoke_slot_ids(validation.V36_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
+    assert validation._coverage_smoke_slot_ids(validation.V37_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
@@ -12163,7 +12885,7 @@ def test_v33_runtime_slot_rejects_any_deadline_or_schedule_drift(
         ),
         (
             37,
-            validation.FROZEN_MANIFEST_ID,
+            validation.V37_MANIFEST_ID,
             "results/shape-placement-factorial-v37/slot-037-n31-f2-b04-00",
         ),
     ),
