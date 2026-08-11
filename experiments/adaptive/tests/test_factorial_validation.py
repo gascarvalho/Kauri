@@ -81,8 +81,11 @@ V34_MANIFEST_PATH = (
 V35_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v35.json"
 )
-FROZEN_MANIFEST_PATH = (
+V36_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v36.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v37.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -190,6 +193,15 @@ EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2 = (
     "epoch2_terminal_all_replica_command_activation_stable_end_and_drain_before_"
     "shared_hard_deadline_v2"
 )
+EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3 = (
+    "exact_excluded_repair_smoke_source_fault_window_duration_450s_effective_"
+    "fault_window_duration_330s_hard_deadline_650s_with_fault_evidence_and_"
+    "epoch1_stable_as_the_only_fault_active_causal_phases_with_epoch1_selection_"
+    "terminal_all_replica_command_activation_and_stable_end_before_fault_end_"
+    "then_epoch2_as_post_fault_recovery_and_stability_with_fault_end_before_"
+    "cycle1_selection_then_epoch2_terminal_all_replica_command_activation_"
+    "stable_end_and_drain_before_shared_hard_deadline_v3"
+)
 EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT = (
     "exact_excluded_repair_smoke_at_least_one_post_fault_epoch1_internal_"
     "responsive_child_response_is_replayed_only_into_response_evidence_bridge_"
@@ -212,6 +224,9 @@ def test_v28_repair_contract_literals_are_exact() -> None:
     assert validation.RESPONSE_DUPLICATE_PROBE_MODE_V1 == RESPONSE_DUPLICATE_PROBE_MODE
     assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2 == (
         EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+    )
+    assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3 == (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
     )
 
 
@@ -439,13 +454,16 @@ def test_v36_post_final_unmatched_commit_contract_dispatch_is_exact() -> None:
         )
 
     assert validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.V36_MANIFEST_ID, contract)
+    )
+    assert validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
         manifest(validation.FROZEN_MANIFEST_ID, contract)
     )
     assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
         manifest(validation.V35_MANIFEST_ID, contract)
     )
     assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
-        manifest(validation.FROZEN_MANIFEST_ID, None)
+        manifest(validation.V36_MANIFEST_ID, None)
     )
     assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
         manifest(validation.FROZEN_MANIFEST_ID, contract + "-forged")
@@ -553,6 +571,19 @@ def _v35_candidate_manifest(
 
 
 def _v36_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = V36_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "V36_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v37_candidate_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ):
     payload = FROZEN_MANIFEST_PATH.read_bytes()
@@ -782,7 +813,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v35_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -842,6 +873,9 @@ def test_validator_retains_exact_v1_through_v35_artifact_identities() -> None:
         validation.V35_MANIFEST_ID
     )
     identities[36] = validation._frozen_artifact_identity(
+        validation.V36_MANIFEST_ID
+    )
+    identities[37] = validation._frozen_artifact_identity(
         validation.FROZEN_MANIFEST_ID
     )
 
@@ -1127,15 +1161,26 @@ def test_validator_retains_exact_v1_through_v35_artifact_identities() -> None:
         identities[35].coverage_smoke_runtime_sha256
         == validation.V35_COVERAGE_SMOKE_RUNTIME_SHA256
     )
-    assert identities[36].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
-    assert identities[36].plan_sha256 == validation.FROZEN_PLAN_SHA256
-    assert identities[36].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert identities[36].manifest_sha256 == validation.V36_MANIFEST_SHA256
+    assert identities[36].plan_sha256 == validation.V36_PLAN_SHA256
+    assert identities[36].runtime_sha256 == validation.V36_RUNTIME_SHA256
     assert (
         identities[36].smoke_runtime_sha256
-        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+        == validation.V36_SMOKE_RUNTIME_SHA256
     )
     assert (
         identities[36].coverage_smoke_runtime_sha256
+        == validation.V36_COVERAGE_SMOKE_RUNTIME_SHA256
+    )
+    assert identities[37].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[37].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[37].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
+    assert (
+        identities[37].smoke_runtime_sha256
+        == validation.FROZEN_SMOKE_RUNTIME_SHA256
+    )
+    assert (
+        identities[37].coverage_smoke_runtime_sha256
         == validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
     )
     assert validation._coverage_smoke_result_root(
@@ -1178,8 +1223,11 @@ def test_validator_retains_exact_v1_through_v35_artifact_identities() -> None:
         validation.V35_MANIFEST_ID
     ) == "results/shape-placement-factorial-v35-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V36_MANIFEST_ID
     ) == "results/shape-placement-factorial-v36-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v37-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -1571,13 +1619,13 @@ def test_validator_v35_identities_are_exactly_frozen() -> None:
 
 def test_validator_v36_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V36_MANIFEST_ID
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v36"
+    assert validation.V36_MANIFEST_ID == "shape-placement-factorial-v36"
     assert (
         identity.manifest_sha256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.V36_SEMANTIC_SHA256,
         identity.plan_sha256,
         identity.runtime_sha256,
         identity.smoke_runtime_sha256,
@@ -1589,6 +1637,29 @@ def test_validator_v36_identities_are_exactly_frozen() -> None:
         "5b088b4d3e2a0a484f2829664b94db6d51e32fb0e8a0bc904fdf342098a85c89",
         "3ad3f26401c190827591351b21578e2b3ec088f0222e8262f2cfa6f29a402c7a",
         "34df26b4aaff8c3f417d1634aa1e52e7f40551b8265c2830720456dc068acc81",
+    )
+
+
+def test_validator_v37_identities_are_exactly_frozen() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v37"
+    assert (
+        identity.manifest_sha256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    ) == (
+        "a926192d3c6a5129ea8304504317f921a8a1a681b489e1503e715dcbd3e8be11",
+        "63efea700bd3a0fa3d59b7876602e3a5f99a3d71edb4e57ed218a8e6ea4bec8c",
+        "e413ff98733b5e462b058018ce25ca4c77013a760fffe730dcbfd50150379e36",
+        "a05f26983a34f626f95d326847db7a049a05c2258fdadf3bbaddd4ec3850c5d7",
+        "1eda50b8e2887ab4d0f1763816f82344136dabf480d752f5a4d82f48272e8f63",
+        "7aa68f246e06bee0a666734113e5a5bda7a747c912b3cc51db6f81d03b2a6d81",
     )
 
 
@@ -4121,7 +4192,7 @@ def _v36_commit_identity_streams(
 def _validate_v36_commit_identity_streams(
     streams: dict[int, tuple[validation._NativeEvent, ...]],
     *,
-    manifest_id: str = validation.FROZEN_MANIFEST_ID,
+    manifest_id: str = validation.V36_MANIFEST_ID,
 ) -> None:
     validation._validate_manifest_commit_identity_unavailable(
         manifest_id,
@@ -4134,9 +4205,17 @@ def _validate_v36_commit_identity_streams(
     )
 
 
-def test_v36_commit_identity_unavailable_accepts_exact_post_terminal_q_proof(
+@pytest.mark.parametrize(
+    "manifest_id",
+    (validation.V36_MANIFEST_ID, validation.FROZEN_MANIFEST_ID),
+)
+def test_v36_plus_commit_identity_unavailable_accepts_exact_post_terminal_q_proof(
+    manifest_id: str,
 ) -> None:
-    _validate_v36_commit_identity_streams(_v36_commit_identity_streams())
+    _validate_v36_commit_identity_streams(
+        _v36_commit_identity_streams(),
+        manifest_id=manifest_id,
+    )
 
 
 def test_v36_commit_identity_unavailable_accepts_zero_gap_markers() -> None:
@@ -4346,7 +4425,7 @@ def test_v36_commit_identity_unavailable_is_fail_closed(
 def test_v35_rejects_v36_commit_identity_unavailable_marker() -> None:
     with pytest.raises(
         FactorialValidationError,
-        match="only permitted by exact frozen v36",
+        match=r"only permitted by exact v36\+ evidence contracts",
     ):
         _validate_v36_commit_identity_streams(
             _v36_commit_identity_streams(),
@@ -7401,6 +7480,24 @@ def test_v9_cross_commit_retention_witness_requires_every_degraded_actor() -> No
     with pytest.raises(FactorialValidationError, match=r"cross-commit.*\[5\]"):
         validation._validate_v9_cross_commit_retention_witnesses(
             **{**arguments, "authoritative_commit_ns": commit_times}
+        )
+
+
+def test_v36_sealed_s037_cross_commit_failure_reason_remains_exact() -> None:
+    arguments = _v9_cross_commit_witness_fixture()
+
+    with pytest.raises(
+        FactorialValidationError,
+        match=(
+            r"responsive-degraded actors lack a v9 Epoch1 cross-commit "
+            r"retention witness.*\[7, 8\]"
+        ),
+    ):
+        validation._validate_v9_cross_commit_retention_witnesses(
+            **{
+                **arguments,
+                "responsive_degraded_actor_ids": (7, 8),
+            }
         )
 
 
@@ -10784,6 +10881,7 @@ def _v28_repair_observation_fixture(
         34: _v34_candidate_manifest,
         35: _v35_candidate_manifest,
         36: _v36_candidate_manifest,
+        37: _v37_candidate_manifest,
     }[version](monkeypatch)
     expected = _v25_inherited_placement_expected_slot()
     digests = ("10" * 32, "11" * 32, "22" * 32)
@@ -10920,9 +11018,13 @@ def _v28_repair_observation_fixture(
         }
 
     observation_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-        if version in {34, 35, 36}
-        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        if version == 37
+        else (
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            if version in {34, 35, 36}
+            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        )
     )
     observation = {
         "schema_version": 1,
@@ -10996,8 +11098,8 @@ def _v28_repair_observation_fixture(
     return document, arguments
 
 
-@pytest.mark.parametrize("version", (28, 29, 30, 31, 32, 33, 34, 35, 36))
-def test_v28_through_v36_excluded_repair_observation_bind_exact_grouped_chronology(
+@pytest.mark.parametrize("version", (28, 29, 30, 31, 32, 33, 34, 35, 36, 37))
+def test_v28_through_v37_excluded_repair_observation_bind_exact_grouped_chronology(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
 ) -> None:
@@ -11024,8 +11126,8 @@ def test_v28_through_v36_excluded_repair_observation_bind_exact_grouped_chronolo
         ("missing-replica-command", "all-replica"),
     ),
 )
-@pytest.mark.parametrize("version", (28, 34, 35, 36))
-def test_v28_v34_through_v36_excluded_repair_observation_are_fail_closed(
+@pytest.mark.parametrize("version", (28, 34, 35, 36, 37))
+def test_v28_v34_through_v37_excluded_repair_observation_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
     reason: str,
@@ -11340,6 +11442,10 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
         Path(validation.V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     )
+    v36_coverage = (
+        Path(validation.V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
     v29_coverage = (
         Path(validation.V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
@@ -11377,6 +11483,14 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
     )
     assert not validation._is_excluded_coverage_smoke_slot(
         v35_coverage,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert validation._is_excluded_coverage_smoke_slot(
+        v36_coverage,
+        manifest_id=validation.V36_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v36_coverage,
         manifest_id=validation.FROZEN_MANIFEST_ID,
     )
     assert validation._is_excluded_coverage_smoke_slot(
@@ -11457,6 +11571,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
+    assert validation._coverage_smoke_slot_ids(validation.V36_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
     assert validation._coverage_smoke_slot_ids(validation.FROZEN_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
@@ -11486,6 +11604,7 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         validation.V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V32_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        validation.V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
     ),
 )
@@ -11528,6 +11647,7 @@ def _v25_coverage_runtime_fixture(
         34: _v34_candidate_manifest,
         35: _v35_candidate_manifest,
         36: _v36_candidate_manifest,
+        37: _v37_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -11548,8 +11668,8 @@ def _v25_coverage_runtime_fixture(
     return manifest, runtime, expected_by_id
 
 
-@pytest.mark.parametrize("version", (28, 29, 30, 31, 32, 33, 34, 35, 36))
-def test_v28_through_v36_repair_observation_dispatch_preserves_version_parity(
+@pytest.mark.parametrize("version", (28, 29, 30, 31, 32, 33, 34, 35, 36, 37))
+def test_v28_through_v37_repair_observation_dispatch_preserves_version_parity(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
 ) -> None:
@@ -11577,9 +11697,13 @@ def test_v28_through_v36_repair_observation_dispatch_preserves_version_parity(
         slot_id=primary_id,
     )
     expected_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-        if version in {34, 35, 36}
-        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        if version == 37
+        else (
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            if version in {34, 35, 36}
+            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        )
     )
     assert validation._expected_excluded_repair_observation_contract(
         manifest.manifest_id
@@ -11587,7 +11711,7 @@ def test_v28_through_v36_repair_observation_dispatch_preserves_version_parity(
     assert expected_by_id[repair_id].slot_id == repair_id
 
 
-def test_v33_through_v36_preserve_all_inherited_semantic_dispatches(
+def test_v33_through_v37_preserve_all_inherited_semantic_dispatches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifests = (
@@ -11595,6 +11719,7 @@ def test_v33_through_v36_preserve_all_inherited_semantic_dispatches(
         _v34_candidate_manifest(monkeypatch),
         _v35_candidate_manifest(monkeypatch),
         _v36_candidate_manifest(monkeypatch),
+        _v37_candidate_manifest(monkeypatch),
     )
     predicates = (
         validation._uses_selection_visible_hard_timeout_witnesses,
@@ -11639,7 +11764,7 @@ def test_v36_runtime_rejects_missing_post_final_unmatched_commit_contract(
         )
 
 
-@pytest.mark.parametrize("version", (34, 35, 36))
+@pytest.mark.parametrize("version", (34, 35, 36, 37))
 def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runtime(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
@@ -11656,20 +11781,24 @@ def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runti
     primary_id, repair_id = validation._coverage_smoke_slot_ids(
         manifest.manifest_id
     )
+    expected_contract = (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        if version == 37
+        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+    )
     assert validation._v34_excluded_repair_fault_active_phase_contract(
         manifest=manifest,
         expected=expected_by_id[repair_id],
         runtime=validated[repair_id],
         coverage_smoke=True,
-        validated_observation_contract=(
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-        ),
-    ) == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        validated_observation_contract=expected_contract,
+    ) == expected_contract
 
     plan = build_factorial_plan(manifest)
     campaign_runtime = json.loads(
         canonical_runtime_bytes(build_factorial_runtime(plan))
     )
+    assert manifest.common_timers.aggregation_timeout_ms_per_depth == 125
     campaign_repair = next(
         slot for slot in campaign_runtime["slots"] if slot["slot_id"] == repair_id
     )
@@ -11728,7 +11857,7 @@ def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runti
         "result-path",
     ),
 )
-@pytest.mark.parametrize("version", (34, 35, 36))
+@pytest.mark.parametrize("version", (34, 35, 36, 37))
 def test_v34_plus_fault_active_phase_contract_rejects_any_repair_binding_drift(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
@@ -11746,19 +11875,29 @@ def test_v34_plus_fault_active_phase_contract_rejects_any_repair_binding_drift(
             if slot["slot_id"] == repair_id
         )
     )
-    validated_contract = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+    expected_contract = (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        if version == 37
+        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+    )
+    drift_contract = (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        if version == 37
+        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+    )
+    validated_contract = expected_contract
     if mutation == "missing-validated-observation":
         validated_contract = None
     elif mutation == "probe-observation":
         repair["excluded_repair_smoke_probe"]["observation_contract"] = (
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+            drift_contract
         )
     elif mutation == "runtime-observation":
         repair["causal_acceptance"][
             "excluded_repair_smoke_observation_contract"
-        ] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        ] = drift_contract
     elif mutation == "duration":
-        repair["fault_window"]["duration_s"] = 450
+        repair["fault_window"]["duration_s"] = 300 if version == 37 else 450
     else:
         repair["result_path"] = (
             f"results/shape-placement-factorial-v{version}/"
@@ -11913,6 +12052,24 @@ def test_v33_profile_timing_contract_is_fail_closed(
         )
 
 
+def test_v37_static_timing_preserves_125ms_aggregation_per_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _v37_candidate_manifest(monkeypatch)
+    validation._validate_v33_static_timing_contract(manifest)
+
+    with pytest.raises(FactorialValidationError, match="v37 exact 125ms"):
+        validation._validate_v33_static_timing_contract(
+            replace(
+                manifest,
+                common_timers=replace(
+                    manifest.common_timers,
+                    aggregation_timeout_ms_per_depth=126,
+                ),
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     (
@@ -12001,12 +12158,17 @@ def test_v33_runtime_slot_rejects_any_deadline_or_schedule_drift(
         ),
         (
             36,
-            validation.FROZEN_MANIFEST_ID,
+            validation.V36_MANIFEST_ID,
             "results/shape-placement-factorial-v36/slot-037-n31-f2-b04-00",
+        ),
+        (
+            37,
+            validation.FROZEN_MANIFEST_ID,
+            "results/shape-placement-factorial-v37/slot-037-n31-f2-b04-00",
         ),
     ),
 )
-def test_v28_through_v36_campaign_and_exact_repair_runtime_are_independently_bound(
+def test_v28_through_v37_campaign_and_exact_repair_runtime_are_independently_bound(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     manifest_id: str,
@@ -12035,6 +12197,11 @@ def test_v28_through_v36_campaign_and_exact_repair_runtime_are_independently_bou
             "--experiment-response-evidence-duplicate-probe" not in row["argv"]
             for row in campaign_slot["replica_argv_templates"]
         )
+    n7_runtime = execution.build_n7_ps_smoke_slot(
+        plan.slots[0]
+    ).runtime.as_document()
+    assert n7_runtime["fault_window"]["duration_s"] == 450
+    assert "excluded_repair_smoke_probe" not in n7_runtime
 
     validated = validation._validate_v25_coverage_runtime_document(
         coverage_runtime,
@@ -12042,21 +12209,35 @@ def test_v28_through_v36_campaign_and_exact_repair_runtime_are_independently_bou
         expected_by_id=expected_by_id,
     )
     primary_id, repair_id = validation._coverage_smoke_slot_ids(manifest_id)
+    assert primary_id == "slot-066-n31-f5-b05-P"
+    assert repair_id == "slot-037-n31-f2-b04-00"
     primary = validated[primary_id]
     repair = validated[repair_id]
     probe = repair["excluded_repair_smoke_probe"]
+    expected_repair_duration_s = 330 if version == 37 else 300
     assert primary["fault_window"]["duration_s"] == 450
     assert "excluded_repair_smoke_probe" not in primary
-    assert repair["fault_window"]["duration_s"] == 300
+    assert repair["fault_window"]["duration_s"] == expected_repair_duration_s
     assert repair["fault_window"]["hard_timeout_s"] == 650
     assert probe == coverage_runtime["excluded_repair_smoke_probe"]
     assert probe["source_campaign_slot_id"] == repair["slot_id"]
     assert probe["source_campaign_result_path"] == source_result_path
-    assert probe["semantic_delta"] == "byzantine.window.duration_s:450->300"
+    assert probe["semantic_delta"] == (
+        f"byzantine.window.duration_s:450->{expected_repair_duration_s}"
+    )
+    assert probe["source_fault_window_duration_s"] == 450
+    assert probe["effective_fault_window_duration_s"] == (
+        expected_repair_duration_s
+    )
+    assert probe["hard_timeout_s"] == 650
     assert probe["observation_contract"] == (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-        if version in {34, 35, 36}
-        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        if version == 37
+        else (
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            if version in {34, 35, 36}
+            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        )
     )
     assert probe["verified_response_duplicate_probe_contract"] == (
         EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT
@@ -12070,7 +12251,7 @@ def test_v28_through_v36_campaign_and_exact_repair_runtime_are_independently_bou
 
 @pytest.mark.parametrize(
     "version",
-    (28, 29, 30, 31, 32, 33, 34, 35, 36),
+    (28, 29, 30, 31, 32, 33, 34, 35, 36, 37),
 )
 @pytest.mark.parametrize(
     "mutation,reason",
@@ -12085,7 +12266,7 @@ def test_v28_through_v36_campaign_and_exact_repair_runtime_are_independently_bou
         ("missing-causal-contract", "causal acceptance contract"),
     ),
 )
-def test_v28_through_v36_exact_repair_runtime_are_fail_closed(
+def test_v28_through_v37_exact_repair_runtime_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     mutation: str,
@@ -12107,7 +12288,7 @@ def test_v28_through_v36_exact_repair_runtime_are_fail_closed(
     elif mutation == "wrong-duration":
         repair["excluded_repair_smoke_probe"][
             "effective_fault_window_duration_s"
-        ] = 301
+        ] = 331 if version == 37 else 301
     elif mutation == "missing-repair-probe":
         repair.pop("excluded_repair_smoke_probe")
     elif mutation == "missing-probe-argv":
@@ -12130,6 +12311,132 @@ def test_v28_through_v36_exact_repair_runtime_are_fail_closed(
             runtime,
             manifest=manifest,
             expected_by_id=expected_by_id,
+        )
+
+
+@pytest.mark.parametrize("duration_s", (300, 329, 331, 360))
+def test_v37_s037_runtime_rejects_every_non_b330_duration(
+    monkeypatch: pytest.MonkeyPatch,
+    duration_s: int,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=37,
+    )
+    repair = runtime["slots"][1]
+    repair["fault_window"]["duration_s"] = duration_s
+
+    with pytest.raises(FactorialValidationError, match="fault-window"):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+@pytest.mark.parametrize("duration_s", (300, 329, 331, 360))
+def test_v37_s037_probe_rejects_every_non_b330_duration(
+    monkeypatch: pytest.MonkeyPatch,
+    duration_s: int,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=37,
+    )
+    probe = runtime["slots"][1]["excluded_repair_smoke_probe"]
+    probe["effective_fault_window_duration_s"] = duration_s
+    runtime["excluded_repair_smoke_probe"] = copy.deepcopy(probe)
+
+    with pytest.raises(FactorialValidationError, match="probe runtime contract"):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_fault_window_duration_s", 449),
+        ("semantic_delta", "byzantine.window.duration_s:450->300"),
+        ("hard_timeout_s", 649),
+        ("observation_contract", EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2),
+    ),
+)
+def test_v37_s037_probe_rejects_source_delta_hard_or_v3_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=37,
+    )
+    probe = runtime["slots"][1]["excluded_repair_smoke_probe"]
+    probe[field] = value
+    runtime["excluded_repair_smoke_probe"] = copy.deepcopy(probe)
+
+    with pytest.raises(FactorialValidationError, match="probe runtime contract"):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+def test_v37_s037_rejects_v2_causal_observation_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=37,
+    )
+    runtime["slots"][1]["causal_acceptance"][
+        "excluded_repair_smoke_observation_contract"
+    ] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+
+    with pytest.raises(FactorialValidationError, match="causal acceptance contract"):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+def test_v36_and_v37_repair_runtimes_reject_cross_version_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    v36_manifest, v36_runtime, v36_expected = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=36,
+    )
+    v37_manifest, v37_runtime, v37_expected = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=37,
+    )
+    validation._validate_v25_coverage_runtime_document(
+        v36_runtime,
+        manifest=v36_manifest,
+        expected_by_id=v36_expected,
+    )
+    validation._validate_v25_coverage_runtime_document(
+        v37_runtime,
+        manifest=v37_manifest,
+        expected_by_id=v37_expected,
+    )
+
+    with pytest.raises(FactorialValidationError):
+        validation._validate_v25_coverage_runtime_document(
+            v37_runtime,
+            manifest=v36_manifest,
+            expected_by_id=v36_expected,
+        )
+    with pytest.raises(FactorialValidationError):
+        validation._validate_v25_coverage_runtime_document(
+            v36_runtime,
+            manifest=v37_manifest,
+            expected_by_id=v37_expected,
         )
 
 

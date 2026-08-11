@@ -53,6 +53,7 @@ from .factorial_manifest import (
     EVIDENCE_SNAPSHOT_SELECTION_CONTRACT_V1,
     EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V1,
     EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2,
+    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3,
     EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1,
     EXECUTION_CLEANUP_CONTRACT_V1,
     EXPECTED_ARM_CODES,
@@ -184,6 +185,9 @@ from .factorial_manifest import (
     V35_MANIFEST_ID,
     V35_MANIFEST_SHA256,
     V35_PLAN_SHA256,
+    V36_MANIFEST_ID,
+    V36_MANIFEST_SHA256,
+    V36_PLAN_SHA256,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V1,
     VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     FrozenFactorialManifest,
@@ -269,6 +273,10 @@ V35_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
 )
+V36_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
+    EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
+    "slot-037-n31-f2-b04-00",
+)
 FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS = (
     EXCLUDED_COVERAGE_SMOKE_SLOT_ID,
     "slot-037-n31-f2-b04-00",
@@ -340,8 +348,11 @@ V34_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
 V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v35-coverage-smoke"
 )
-EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
     "results/shape-placement-factorial-v36-coverage-smoke"
+)
+EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT = (
+    "results/shape-placement-factorial-v37-coverage-smoke"
 )
 V2_RUNTIME_SHA256 = (
     "2265155d61756385175baa6b5dd5e8a4fe03eef0a3b29a1cefda4c8a4c2a454a"
@@ -610,14 +621,23 @@ V35_SMOKE_RUNTIME_SHA256 = (
 V35_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "4fa44f57128bc096c7fd40bbf9c054c184a273d07ca8f2bdc43fdda7c5e93ad2"
 )
-FROZEN_RUNTIME_SHA256 = (
+V36_RUNTIME_SHA256 = (
     "5b088b4d3e2a0a484f2829664b94db6d51e32fb0e8a0bc904fdf342098a85c89"
 )
-FROZEN_SMOKE_RUNTIME_SHA256 = (
+V36_SMOKE_RUNTIME_SHA256 = (
     "3ad3f26401c190827591351b21578e2b3ec088f0222e8262f2cfa6f29a402c7a"
 )
-FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+V36_COVERAGE_SMOKE_RUNTIME_SHA256 = (
     "34df26b4aaff8c3f417d1634aa1e52e7f40551b8265c2830720456dc068acc81"
+)
+FROZEN_RUNTIME_SHA256 = (
+    "a05f26983a34f626f95d326847db7a049a05c2258fdadf3bbaddd4ec3850c5d7"
+)
+FROZEN_SMOKE_RUNTIME_SHA256 = (
+    "1eda50b8e2887ab4d0f1763816f82344136dabf480d752f5a4d82f48272e8f63"
+)
+FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256 = (
+    "7aa68f246e06bee0a666734113e5a5bda7a747c912b3cc51db6f81d03b2a6d81"
 )
 LEGACY_RUNTIME_SHA256 = (
     "326927b131cdc50f5aa9d542a21a12de5c26f4ac81726f75eafd389c945af681"
@@ -714,9 +734,13 @@ _V24_PRIMARY_INTERNAL_ROLE_OPPORTUNITIES = 82
 _V27_FAULT_WINDOW_DURATION_S = 450
 _V27_HARD_TIMEOUT_S = 650
 _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S = 300
+_V37_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S = 330
+_V37_AGGREGATION_TIMEOUT_MS_PER_DEPTH = 125
 _V33_TRANSITION_CONVERGENCE_DEADLINE_S = 30
 _V33_LEADER_PROGRESS_TIMEOUT_MS = 20_000
-_V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID = FROZEN_MANIFEST_ID
+_V36_PLUS_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS = frozenset(
+    {V36_MANIFEST_ID, FROZEN_MANIFEST_ID}
+)
 _FAULT_CONTAINMENT_EVIDENCE_START_TOKEN = (
     "{{fault_containment_evidence_start_monotonic_ns}}"
 )
@@ -753,6 +777,7 @@ _CAUSAL_MEASUREMENT_MANIFEST_IDS = frozenset(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }
 )
@@ -776,6 +801,7 @@ def _v24_preselection_contract(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return None
@@ -904,6 +930,7 @@ def _uses_selection_visible_hard_timeout_witnesses(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive.causal_timeout_eligibility
@@ -933,6 +960,7 @@ def _uses_selection_visible_responsive_timeout_nonwitnesses(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -970,6 +998,7 @@ def _uses_source_bound_contribution_opportunities(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1004,6 +1033,7 @@ def _uses_strict_sigint_cleanup(manifest: FrozenFactorialManifest) -> bool:
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and manifest.cleanup_contract == EXECUTION_CLEANUP_CONTRACT_V1
@@ -1038,6 +1068,7 @@ def _uses_precontainment_fault_coverage(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1072,6 +1103,7 @@ def _uses_precontainment_shape_preservation(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1109,6 +1141,7 @@ def _uses_precontainment_guarded_selection_contract(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1145,6 +1178,7 @@ def _uses_future_tree_proposal_delivery_contract(
         V33_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V34_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         V35_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
+        V36_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V2,
     }
     expected = expected_by_manifest.get(manifest.manifest_id)
@@ -1180,6 +1214,7 @@ def _uses_source_bound_proposal_witness_contract(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1213,6 +1248,7 @@ def _uses_evidence_snapshot_selection_contract(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1243,6 +1279,7 @@ def _uses_inherited_consensus_wait_exempt_placement_contract(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and responsive is not None
@@ -1270,6 +1307,7 @@ def _uses_verified_response_duplicate_delivery_contract(
         V33_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V34_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         V35_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
+        V36_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
         FROZEN_MANIFEST_ID: VERIFIED_RESPONSE_DUPLICATE_DELIVERY_CONTRACT_V2,
     }
     return (
@@ -1289,7 +1327,8 @@ def _uses_post_final_convergence_unmatched_commit_evidence_contract(
 ) -> bool:
     responsive = manifest.byzantine.responsive_degradation
     return (
-        manifest.manifest_id == FROZEN_MANIFEST_ID
+        manifest.manifest_id
+        in _V36_PLUS_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS
         and responsive is not None
         and getattr(
             responsive,
@@ -1730,6 +1769,16 @@ def _frozen_artifact_identity(manifest_id: str) -> _FrozenArtifactIdentity:
             smoke_runtime_sha256=V35_SMOKE_RUNTIME_SHA256,
             coverage_smoke_runtime_sha256=(
                 V35_COVERAGE_SMOKE_RUNTIME_SHA256
+            ),
+        ),
+        V36_MANIFEST_ID: _FrozenArtifactIdentity(
+            manifest_id=V36_MANIFEST_ID,
+            manifest_sha256=V36_MANIFEST_SHA256,
+            plan_sha256=V36_PLAN_SHA256,
+            runtime_sha256=V36_RUNTIME_SHA256,
+            smoke_runtime_sha256=V36_SMOKE_RUNTIME_SHA256,
+            coverage_smoke_runtime_sha256=(
+                V36_COVERAGE_SMOKE_RUNTIME_SHA256
             ),
         ),
         FROZEN_MANIFEST_ID: _FrozenArtifactIdentity(
@@ -3460,6 +3509,8 @@ def validate_schedule_document(plan: Mapping[str, Any], manifest: FrozenFactoria
 def _coverage_smoke_slot_ids(manifest_id: str) -> tuple[str, ...]:
     if manifest_id == FROZEN_MANIFEST_ID:
         return FROZEN_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
+    if manifest_id == V36_MANIFEST_ID:
+        return V36_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V35_MANIFEST_ID:
         return V35_EXCLUDED_COVERAGE_SMOKE_SLOT_IDS
     if manifest_id == V34_MANIFEST_ID:
@@ -3609,6 +3660,11 @@ def _is_excluded_coverage_smoke_slot(
             V35_COVERAGE_SMOKE_RUNTIME_SHA256,
             V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         ),
+        V36_MANIFEST_ID: (
+            V36_RUNTIME_SHA256,
+            V36_COVERAGE_SMOKE_RUNTIME_SHA256,
+            V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        ),
         FROZEN_MANIFEST_ID: (
             FROZEN_RUNTIME_SHA256,
             FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
@@ -3685,6 +3741,8 @@ def _coverage_smoke_result_root(manifest_id: str) -> str:
         return V34_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == V35_MANIFEST_ID:
         return V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
+    if manifest_id == V36_MANIFEST_ID:
+        return V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     if manifest_id == FROZEN_MANIFEST_ID:
         return EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT
     _fail("manifest does not define an excluded N=31 coverage smoke")
@@ -3718,6 +3776,7 @@ def _validate_v25_coverage_runtime_document(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fields.add("excluded_repair_smoke_probe")
@@ -3740,6 +3799,7 @@ def _validate_v25_coverage_runtime_document(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or runtime.get("schema_version") != 1
@@ -3788,6 +3848,7 @@ def _validate_v25_coverage_runtime_document(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         repair = validated[_coverage_smoke_slot_ids(manifest_id)[1]]
@@ -3933,6 +3994,7 @@ def _load_static_contracts(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             constituents = _validate_v25_coverage_runtime_document(
@@ -4071,6 +4133,7 @@ def _validate_v33_static_timing_contract(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         return
@@ -4087,6 +4150,12 @@ def _validate_v33_static_timing_contract(
             "v33 exact 30s convergence/20s leader/450s fault/650s hard "
             "timing contract drifted"
         )
+    if (
+        manifest.manifest_id == FROZEN_MANIFEST_ID
+        and timers.aggregation_timeout_ms_per_depth
+        != _V37_AGGREGATION_TIMEOUT_MS_PER_DEPTH
+    ):
+        _fail("v37 exact 125ms aggregation-per-depth timing contract drifted")
 
 
 def _expected_excluded_repair_observation_contract(
@@ -4104,9 +4173,29 @@ def _expected_excluded_repair_observation_contract(
     if manifest_id in {
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
-        FROZEN_MANIFEST_ID,
+        V36_MANIFEST_ID,
     }:
         return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+    if manifest_id == FROZEN_MANIFEST_ID:
+        return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+    return None
+
+
+def _excluded_repair_fault_window_duration_s(manifest_id: str) -> int | None:
+    if manifest_id == FROZEN_MANIFEST_ID:
+        return _V37_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+    if manifest_id in {
+        V28_MANIFEST_ID,
+        V29_MANIFEST_ID,
+        V30_MANIFEST_ID,
+        V31_MANIFEST_ID,
+        V32_MANIFEST_ID,
+        V33_MANIFEST_ID,
+        V34_MANIFEST_ID,
+        V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
+    }:
+        return _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
     return None
 
 
@@ -4129,6 +4218,7 @@ def _uses_excluded_repair_observation(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -4148,7 +4238,12 @@ def _v34_excluded_repair_fault_active_phase_contract(
 
     if (
         manifest.manifest_id
-        not in {V34_MANIFEST_ID, V35_MANIFEST_ID, FROZEN_MANIFEST_ID}
+        not in {
+            V34_MANIFEST_ID,
+            V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
+            FROZEN_MANIFEST_ID,
+        }
         or not coverage_smoke
         or expected.slot_id != "slot-037-n31-f2-b04-00"
     ):
@@ -4188,6 +4283,15 @@ def _v34_excluded_repair_fault_active_phase_contract(
         "verified_response_duplicate_probe_mode",
     }
     source_artifact_id = probe.get("source_campaign_artifact_id")
+    expected_contract = _expected_excluded_repair_observation_contract(
+        manifest.manifest_id
+    )
+    expected_duration_s = _excluded_repair_fault_window_duration_s(
+        manifest.manifest_id
+    )
+    expected_semantic_delta = (
+        f"byzantine.window.duration_s:450->{expected_duration_s}"
+    )
     if not (
         expected.execution_ordinal == 5
         and expected.replica_count == 31
@@ -4197,15 +4301,13 @@ def _v34_excluded_repair_fault_active_phase_contract(
         and expected.arm_code == "00"
         and runtime.get("result_path")
         == f"{_coverage_smoke_result_root(manifest.manifest_id)}/{expected.slot_id}"
-        and manifest_contract == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-        and validated_observation_contract
-        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        and manifest_contract == expected_contract
+        and validated_observation_contract == expected_contract
         and causal_acceptance.get(
             "excluded_repair_smoke_observation_contract"
         )
-        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-        and fault_window.get("duration_s")
-        == _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+        == expected_contract
+        and fault_window.get("duration_s") == expected_duration_s
         and fault_window.get("hard_timeout_s") == _V27_HARD_TIMEOUT_S
         and set(probe) == expected_probe_fields
         and probe.get("source_campaign_slot_id") == expected.slot_id
@@ -4214,22 +4316,20 @@ def _v34_excluded_repair_fault_active_phase_contract(
         and isinstance(source_artifact_id, str)
         and re.fullmatch(r"slot-runtime-[0-9a-f]{24}", source_artifact_id)
         is not None
-        and probe.get("semantic_delta")
-        == "byzantine.window.duration_s:450->300"
+        and probe.get("semantic_delta") == expected_semantic_delta
         and probe.get("source_fault_window_duration_s")
         == _V27_FAULT_WINDOW_DURATION_S
         and probe.get("effective_fault_window_duration_s")
-        == _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+        == expected_duration_s
         and probe.get("hard_timeout_s") == _V27_HARD_TIMEOUT_S
-        and probe.get("observation_contract")
-        == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        and probe.get("observation_contract") == expected_contract
         and probe.get("verified_response_duplicate_probe_contract")
         == EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT_V1
         and probe.get("verified_response_duplicate_probe_mode")
         == RESPONSE_DUPLICATE_PROBE_MODE_V1
     ):
         _fail("v34+ excluded repair fault-active phase scope binding drifted")
-    return EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+    return expected_contract
 
 
 def _validate_runtime_slot(
@@ -4276,14 +4376,18 @@ def _validate_runtime_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected.slot_id == _coverage_smoke_slot_ids(manifest.manifest_id)[1]
         and runtime.get("result_path")
         == f"{_coverage_smoke_result_root(manifest.manifest_id)}/{expected.slot_id}"
     )
+    excluded_repair_duration_s = _excluded_repair_fault_window_duration_s(
+        manifest.manifest_id
+    )
     effective_fault_window_duration_s = (
-        _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+        excluded_repair_duration_s
         if v28_repair_runtime
         else manifest.byzantine.duration_s
     )
@@ -4350,6 +4454,7 @@ def _validate_runtime_slot(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and (
         manifest.byzantine.duration_s != _V27_FAULT_WINDOW_DURATION_S
@@ -4376,6 +4481,7 @@ def _validate_runtime_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not future_tree_proposal_delivery
@@ -4400,6 +4506,7 @@ def _validate_runtime_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not source_bound_proposal_witnesses
@@ -4423,6 +4530,7 @@ def _validate_runtime_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not _uses_selection_visible_responsive_timeout_nonwitnesses(
@@ -4445,6 +4553,7 @@ def _validate_runtime_slot(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     } and not (
         evidence_snapshot_selection
@@ -4464,6 +4573,7 @@ def _validate_runtime_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and not inherited_wait_exempt_placement
@@ -4480,22 +4590,26 @@ def _validate_runtime_slot(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         if not verified_response_duplicate_delivery:
             _fail("verified response duplicate delivery contract drifted")
     elif duplicate_contract_value is not None:
         _fail("verified response duplicate delivery contract is v26-only or v27-only")
-    if manifest.manifest_id == FROZEN_MANIFEST_ID:
+    if (
+        manifest.manifest_id
+        in _V36_PLUS_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS
+    ):
         if not post_final_unmatched_commit_evidence:
             _fail(
-                "v36 post-final-convergence unmatched commit evidence "
+                "v36+ post-final-convergence unmatched commit evidence "
                 "contract drifted"
             )
     elif post_final_unmatched_commit_contract_value is not None:
         _fail(
             "post-final-convergence unmatched commit evidence contract "
-            "escaped exact frozen v36"
+            "escaped exact v36+ scope"
         )
     expected_responsive_period = _expected_responsive_omission_period(
         manifest.manifest_id
@@ -4590,6 +4704,7 @@ def _validate_runtime_slot(
                     V33_MANIFEST_ID,
                     V34_MANIFEST_ID,
                     V35_MANIFEST_ID,
+                    V36_MANIFEST_ID,
                     FROZEN_MANIFEST_ID,
                 }
                 else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4624,6 +4739,7 @@ def _validate_runtime_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity.update(
@@ -4653,6 +4769,7 @@ def _validate_runtime_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             artifact_identity["fault_window_duration_s"] = (
@@ -4674,16 +4791,20 @@ def _validate_runtime_slot(
     )
     expected_repair_probe: dict[str, object] | None = None
     if v28_repair_runtime:
+        assert excluded_repair_duration_s is not None
         expected_repair_probe = {
             "source_campaign_slot_id": expected.slot_id,
             "source_campaign_result_path": (
                 f"results/{manifest.manifest_id}/{expected.slot_id}"
             ),
             "source_campaign_artifact_id": source_campaign_artifact_id,
-            "semantic_delta": "byzantine.window.duration_s:450->300",
+            "semantic_delta": (
+                "byzantine.window.duration_s:"
+                f"450->{excluded_repair_duration_s}"
+            ),
             "source_fault_window_duration_s": _V27_FAULT_WINDOW_DURATION_S,
             "effective_fault_window_duration_s": (
-                _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+                excluded_repair_duration_s
             ),
             "hard_timeout_s": _V27_HARD_TIMEOUT_S,
             "observation_contract": (
@@ -4699,7 +4820,7 @@ def _validate_runtime_slot(
         if runtime.get("excluded_repair_smoke_probe") != expected_repair_probe:
             _fail("v28+ excluded repair smoke probe runtime contract drifted")
         artifact_identity["fault_window_duration_s"] = (
-            _V28_EXCLUDED_REPAIR_FAULT_WINDOW_DURATION_S
+            excluded_repair_duration_s
         )
         artifact_identity["excluded_repair_smoke_probe"] = expected_repair_probe
     elif "excluded_repair_smoke_probe" in runtime:
@@ -4849,6 +4970,7 @@ def _validate_runtime_slot(
                 V33_MANIFEST_ID,
                 V34_MANIFEST_ID,
                 V35_MANIFEST_ID,
+                V36_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
             else FUTURE_TREE_PROPOSAL_DELIVERY_CONTRACT_V1
@@ -4980,6 +5102,7 @@ def _validate_runtime_slot(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         expected_fault_window["transition_observation_bound_rule"] = (
@@ -5150,6 +5273,7 @@ def _validate_runtime_slot(
         V33_MANIFEST_ID,
         V34_MANIFEST_ID,
         V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
         FROZEN_MANIFEST_ID,
     }:
         deadline_option = "--convergence-deadline-seconds"
@@ -6487,11 +6611,11 @@ def _validate_manifest_commit_identity_unavailable(
         for events in replica_events.values()
         for event in events
     )
-    if manifest_id != _V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID:
+    if manifest_id not in _V36_PLUS_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS:
         if has_marker:
             _fail(
                 "commit identity unavailable markers are only permitted by "
-                "exact frozen v36"
+                "exact v36+ evidence contracts"
             )
         return
 
@@ -6863,7 +6987,11 @@ def _validate_authoritative_observer_commit_completeness(
 def _uses_authoritative_observer_commit_completeness(manifest_id: str) -> bool:
     """Keep the observer completeness gate across exact frozen v35+."""
 
-    return manifest_id in {V35_MANIFEST_ID, FROZEN_MANIFEST_ID}
+    return manifest_id in {
+        V35_MANIFEST_ID,
+        V36_MANIFEST_ID,
+        FROZEN_MANIFEST_ID,
+    }
 
 
 def _validate_manifest_authoritative_observer_commit_completeness(
@@ -9296,7 +9424,10 @@ def validate_fault_causality(
     if repair_fault_active_scope:
         if (
             fault_active_phase_contract
-            != EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            not in {
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2,
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3,
+            }
         ):
             _fail("fault causality received an unknown fault-active phase contract")
         if any(marker.epoch_number == 2 for marker in markers):
@@ -11310,6 +11441,7 @@ def _validate_v28_excluded_repair_observation(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id
@@ -11816,6 +11948,7 @@ def _validate_v25_inherited_wait_exempt_placement_live_exercise(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or not coverage_smoke
@@ -12764,6 +12897,7 @@ def _validate_v28_verified_response_duplicate_probe(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and coverage_smoke
@@ -13297,6 +13431,7 @@ def _validate_native_transitions(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         and expected.replica_count == 31
@@ -13840,6 +13975,7 @@ def _validate_v25_coverage_execution_lifecycle(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }
         or expected.slot_id not in coverage_slot_ids
@@ -14251,6 +14387,7 @@ def validate_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         )
     )
@@ -14587,13 +14724,13 @@ def validate_slot(
             final_cycle_terminal_ns=(
                 _final_adaptation_cycle_terminal_ns(manager_events)
                 if manifest.manifest_id
-                == _V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID
+                in _V36_PLUS_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS
                 else None
             ),
             hard_deadline_ns=(
                 hard_deadline_ns
                 if manifest.manifest_id
-                == _V36_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_ID
+                in _V36_PLUS_COMMIT_IDENTITY_UNAVAILABLE_MANIFEST_IDS
                 else None
             ),
         )
@@ -14644,6 +14781,7 @@ def validate_slot(
             V33_MANIFEST_ID,
             V34_MANIFEST_ID,
             V35_MANIFEST_ID,
+            V36_MANIFEST_ID,
             FROZEN_MANIFEST_ID,
         }:
             _validate_v28_verified_response_duplicate_probe(
@@ -14925,6 +15063,7 @@ def validate_slot(
                 V33_MANIFEST_ID,
                 V34_MANIFEST_ID,
                 V35_MANIFEST_ID,
+                V36_MANIFEST_ID,
                 FROZEN_MANIFEST_ID,
             }
         ):

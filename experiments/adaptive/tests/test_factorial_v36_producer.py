@@ -130,15 +130,15 @@ def test_v35_identities_are_explicit_historical_aliases() -> None:
     )
 
 
-def test_v36_six_identities_are_frozen_after_semantic_ack() -> None:
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v36"
+def test_v36_six_identities_are_explicit_historical_aliases() -> None:
+    assert manifest_module.V36_MANIFEST_ID == "shape-placement-factorial-v36"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V36_MANIFEST_SHA256,
+        manifest_module.V36_SEMANTIC_SHA256,
+        manifest_module.V36_PLAN_SHA256,
+        runtime_module.V36_RUNTIME_SHA256,
+        runtime_module.V36_SMOKE_RUNTIME_SHA256,
+        runtime_module.V36_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
         "50761ebcd8693c33ca30257b3abee6f44f992481b6f10e57732d098b029073d1",
         "87cd28e7df12aeb9f54386623b207526ea71d096d3699d687dc07784219d63ed",
@@ -297,10 +297,10 @@ def test_v35_and_v36_exact_static_bindings_pass_but_cross_binding_fails(
         )
 
 
-def test_v36_is_default_and_v35_is_validation_only(
+def test_v36_is_validation_only_after_the_v37_roll(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V36_MANIFEST
-    assert cli.main(["--manifest", str(V35_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v37.json"
+    assert cli.main(["--manifest", str(V36_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v35 are validation-only" in refusal["reason"]
+    assert "v1 through v36 are validation-only" in refusal["reason"]
