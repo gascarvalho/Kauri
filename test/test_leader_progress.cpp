@@ -1933,7 +1933,7 @@ TEST_CASE("proposal tail diagnostics bracket relay and callback completion",
         hotstuff,
         "bool HotStuffBase::broadcast_exact_proposal_fallback(");
     const auto active_processing = function_body(
-        hotstuff, "void HotStuffBase::process_active(");
+        hotstuff, "bool HotStuffBase::process_active(");
 
     REQUIRE_FALSE(record.empty());
     CHECK(contains_in_order(

@@ -3207,13 +3207,6 @@ namespace hotstuff
                                 "response_deadline_arm_failed_before_"
                                 "proposal_exposure");
                         }
-                        else
-                        {
-                            owner.create_expected_vote_state(metadata.key);
-                            static_cast<void>(
-                                owner.start_latency_deadline(metadata.key));
-                            owner.start_aggregation_timer(metadata.key);
-                        }
                         if (owner.epoch_protocol_mode ==
                             EpochProtocolMode::adaptive_v2)
                         {
@@ -3245,6 +3238,14 @@ namespace hotstuff
                                 ProposalProcessingOutcome::
                                     completed_exposed);
                             return;
+                        }
+                        if (owner.epoch_protocol_mode !=
+                            EpochProtocolMode::adaptive_v2)
+                        {
+                            owner.create_expected_vote_state(metadata.key);
+                            static_cast<void>(
+                                owner.start_latency_deadline(metadata.key));
+                            owner.start_aggregation_timer(metadata.key);
                         }
                         owner.drain_pending_exact_contributions(metadata.key);
                         log_callback("callback_end", "complete");

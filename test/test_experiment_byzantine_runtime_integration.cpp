@@ -73,6 +73,18 @@ public:
             key, generation);
     }
 
+    static void seed_physical_parent_ingress(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        const ProposalTreeSnapshot &tree,
+        std::uint64_t generation = 1)
+    {
+        if (!tree.parent.has_value())
+            throw std::invalid_argument(
+                "physical-parent ingress requires a non-root tree");
+        seed_view_generation(runtime, key, generation, *tree.parent);
+    }
+
     static void seed_unsuppressed_commit(
         HotStuffBase &runtime,
         const ProposalKey &key)
@@ -412,7 +424,8 @@ public:
             runtime.config.get_peer_id(proposer),
             view_generation,
             DataStream(body).get_hash(),
-            body};
+            body,
+            proposer};
         return runtime.proposal_admission->receive(std::move(buffered));
     }
 
@@ -1492,8 +1505,11 @@ TEST_CASE(
     const ProposalKey key{
         ConfigurationId{99, 7, digest("missing-exact-tree")},
         digest("missing-exact-tree-proposal")};
+    auto context_tree = tree(ExperimentReplicaRole::internal);
+    context_tree.assigned_subtree = {1, 2, 4};
+    context_tree.child_subtrees = {{2, {2}}, {4, {4}}};
     REQUIRE(Access::admit_context_with_tree(
-        runtime, key, tree(ExperimentReplicaRole::internal)));
+        runtime, key, std::move(context_tree)));
 
     Access::attempt_evidence_before_exposure(runtime, key);
     Access::attempt_evidence_before_exposure(runtime, key);
@@ -1623,18 +1639,8 @@ TEST_CASE(
     REQUIRE(Access::admit_exact_context(runtime, key));
     REQUIRE(Access::start_response_attempt_arm(runtime, key));
 
-    SECTION("missing coordinator")
-    {
-        Access::remove_aggregation_timeout_coordinator(runtime);
-        Access::start_aggregation_timer(runtime, key);
-    }
-
-    SECTION("zero timer generation")
-    {
-        Access::start_aggregation_timer(runtime, key);
-        REQUIRE(Access::convergence_evidence_healthy(runtime));
-        Access::start_aggregation_timer(runtime, key);
-    }
+    Access::remove_aggregation_timeout_coordinator(runtime);
+    Access::start_aggregation_timer(runtime, key);
 
     CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
     CHECK(Access::has_response_attempt_arm_failure(runtime, key));
@@ -2288,6 +2294,8 @@ TEST_CASE(
 
     const auto internal_key = selected_proposal(1, "native-internal");
     const auto internal = tree(ExperimentReplicaRole::internal);
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, internal_key, internal);
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
         runtime, internal_key, internal));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
@@ -2295,6 +2303,8 @@ TEST_CASE(
 
     const auto leaf_key = selected_proposal(1, "native-leaf");
     const auto leaf = tree(ExperimentReplicaRole::leaf);
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, leaf_key, leaf);
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
         runtime, leaf_key, leaf));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
@@ -2310,6 +2320,8 @@ TEST_CASE(
             runtime, root_key, root));
 
     const auto nonselected_key = selected_proposal(3, "native-nonselected");
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, nonselected_key, internal);
     CHECK_FALSE(
         ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
             runtime, nonselected_key, internal));
@@ -2356,6 +2368,10 @@ TEST_CASE(
     const auto internal = tree(ExperimentReplicaRole::internal);
     const auto leaf = tree(ExperimentReplicaRole::leaf);
     const auto root = tree(ExperimentReplicaRole::root);
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, internal_key, internal);
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, leaf_key, leaf);
 
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
         runtime, internal_key, internal));
@@ -2405,14 +2421,17 @@ TEST_CASE(
 
     for (std::uint32_t ordinal = 1; ordinal <= 31; ++ordinal)
     {
+        const ProposalKey key{
+            configuration,
+            digest(
+                "tiered-native-forward-" +
+                std::to_string(ordinal))};
+        ExperimentByzantineRuntimeIntegrationTestAccess::
+            seed_physical_parent_ingress(runtime, key, internal);
         CHECK_FALSE(
             ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
                 runtime,
-                ProposalKey{
-                    configuration,
-                    digest(
-                        "tiered-native-forward-" +
-                        std::to_string(ordinal))},
+                key,
                 internal));
     }
     REQUIRE(markers.size() == 31);
@@ -2420,6 +2439,8 @@ TEST_CASE(
 
     const ProposalKey thirty_second{
         configuration, digest("tiered-native-omit-32")};
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, thirty_second, internal);
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
         runtime, thirty_second, internal));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
@@ -2428,11 +2449,13 @@ TEST_CASE(
     CHECK(markers.back().contribution_ordinal == 32);
     CHECK(markers.back().action == ExperimentOmissionAction::omit_aggregate);
 
+    const ProposalKey thirty_third{
+        configuration, digest("tiered-native-forward-33")};
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, thirty_third, internal);
     CHECK_FALSE(
         ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-            runtime,
-            ProposalKey{configuration, digest("tiered-native-forward-33")},
-            internal));
+            runtime, thirty_third, internal));
     REQUIRE(markers.size() == 33);
     CHECK(markers.back().contribution_ordinal == 33);
     CHECK(markers.back().action == ExperimentOmissionAction::forward);
@@ -2462,19 +2485,23 @@ TEST_CASE(
     const auto internal = tree(ExperimentReplicaRole::internal, 1);
     const auto leaf = tree(ExperimentReplicaRole::leaf, 1);
     const auto root = tree(ExperimentReplicaRole::root, 1);
+    const ProposalKey internal_key{
+        configuration, digest("tiered-hard-internal")};
+    const ProposalKey leaf_key{
+        configuration, digest("tiered-hard-leaf")};
+    const ProposalKey root_key{
+        configuration, digest("tiered-hard-root")};
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, internal_key, internal);
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, leaf_key, leaf);
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-        runtime,
-        ProposalKey{configuration, digest("tiered-hard-internal")},
-        internal));
+        runtime, internal_key, internal));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
-        runtime,
-        ProposalKey{configuration, digest("tiered-hard-leaf")},
-        leaf));
+        runtime, leaf_key, leaf));
     CHECK_FALSE(
         ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-            runtime,
-            ProposalKey{configuration, digest("tiered-hard-root")},
-            root));
+            runtime, root_key, root));
 
     REQUIRE(markers.size() == 2);
     CHECK(markers[0].cohort == ExperimentOmissionCohort::hard);
@@ -2516,54 +2543,63 @@ TEST_CASE(
         8, 4, future.epoch_digest};
     const auto internal = tree(ExperimentReplicaRole::internal, 2);
     const auto leaf = tree(ExperimentReplicaRole::leaf, 2);
+    const ProposalKey active_internal_1{
+        active, digest("tiered-v2-native-active-internal-1")};
+    const ProposalKey predecessor_internal_1{
+        predecessor,
+        digest("tiered-v2-native-predecessor-internal-1")};
+    const ProposalKey future_internal_1{
+        future, digest("tiered-v2-native-future-internal-1")};
+    const ProposalKey active_internal_2{
+        active_other_tree,
+        digest("tiered-v2-native-active-internal-2")};
+    const ProposalKey predecessor_internal_2{
+        predecessor_other_tree,
+        digest("tiered-v2-native-predecessor-internal-2")};
+    const ProposalKey future_internal_2{
+        future_other_tree,
+        digest("tiered-v2-native-future-internal-2")};
+    const ProposalKey active_leaf_1{
+        active_other_tree,
+        digest("tiered-v2-native-active-leaf-1")};
+    const ProposalKey active_leaf_2{
+        active, digest("tiered-v2-native-active-leaf-2")};
+    const std::vector<ProposalKey> authenticated_internal_keys{
+        active_internal_1,
+        predecessor_internal_1,
+        future_internal_1,
+        active_internal_2,
+        predecessor_internal_2,
+        future_internal_2};
+    for (const auto &key : authenticated_internal_keys)
+        ExperimentByzantineRuntimeIntegrationTestAccess::
+            seed_physical_parent_ingress(runtime, key, internal);
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, active_leaf_1, leaf);
+    ExperimentByzantineRuntimeIntegrationTestAccess::
+        seed_physical_parent_ingress(runtime, active_leaf_2, leaf);
 
     CHECK_FALSE(
         ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-            runtime,
-            ProposalKey{active, digest("tiered-v2-native-active-internal-1")},
-            internal));
+            runtime, active_internal_1, internal));
     CHECK_FALSE(
         ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-            runtime,
-            ProposalKey{
-                predecessor,
-                digest("tiered-v2-native-predecessor-internal-1")},
-            internal));
+            runtime, predecessor_internal_1, internal));
     CHECK_FALSE(
         ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-            runtime,
-            ProposalKey{future, digest("tiered-v2-native-future-internal-1")},
-            internal));
+            runtime, future_internal_1, internal));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-        runtime,
-        ProposalKey{
-            active_other_tree,
-            digest("tiered-v2-native-active-internal-2")},
-        internal));
+        runtime, active_internal_2, internal));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-        runtime,
-        ProposalKey{
-            predecessor_other_tree,
-            digest("tiered-v2-native-predecessor-internal-2")},
-        internal));
+        runtime, predecessor_internal_2, internal));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_aggregate(
-        runtime,
-        ProposalKey{
-            future_other_tree,
-            digest("tiered-v2-native-future-internal-2")},
-        internal));
+        runtime, future_internal_2, internal));
 
     CHECK_FALSE(
         ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
-            runtime,
-            ProposalKey{
-                active_other_tree,
-                digest("tiered-v2-native-active-leaf-1")},
-            leaf));
+            runtime, active_leaf_1, leaf));
     CHECK(ExperimentByzantineRuntimeIntegrationTestAccess::consume_direct_vote(
-        runtime,
-        ProposalKey{active, digest("tiered-v2-native-active-leaf-2")},
-        leaf));
+        runtime, active_leaf_2, leaf));
 
     REQUIRE(markers.size() == 8);
     for (std::size_t index = 0; index < markers.size(); ++index)

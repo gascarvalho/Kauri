@@ -257,10 +257,17 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     const auto acceptance_body = active.find('{', acceptance_if);
     const auto still_open = active.find(
         "acquire_open_context(metadata.key)", normal);
+    const auto non_v2_timing_block = active.find(
+        "if(owner.epoch_protocol_mode!="
+        "EpochProtocolMode::adaptive_v2)"
+        "{owner.create_expected_vote_state(metadata.key);"
+        "static_cast<void>(owner.start_latency_deadline(metadata.key));"
+        "owner.start_aggregation_timer(metadata.key);}",
+        still_open);
     const auto expected = active.find(
         "create_expected_vote_state(metadata.key);");
     const auto latency = active.find(
-        "start_latency_deadline(metadata.key);");
+        "start_latency_deadline(metadata.key)");
     const auto timer = active.find(
         "start_aggregation_timer(metadata.key);");
     const auto drain = active.find(
@@ -280,6 +287,7 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     CHECK(active.find("on_receive_proposal(parsed);") ==
           std::string::npos);
     REQUIRE(still_open != std::string::npos);
+    REQUIRE(non_v2_timing_block != std::string::npos);
     REQUIRE(expected != std::string::npos);
     REQUIRE(latency != std::string::npos);
     REQUIRE(timer != std::string::npos);
@@ -288,6 +296,8 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     CHECK(admit < remote_origin);
     CHECK(remote_origin < normal);
     CHECK(normal < still_open);
+    CHECK(still_open < non_v2_timing_block);
+    CHECK(non_v2_timing_block < expected);
     CHECK(still_open < expected);
     CHECK(expected < latency);
     CHECK(latency < timer);

@@ -934,7 +934,7 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
     const auto local = function_body(
         implementation, "bool HotStuffBase::admit_local(");
     const auto remote = function_body(
-        implementation, "void HotStuffBase::process_active(");
+        implementation, "bool HotStuffBase::process_active(");
     const auto ingress = function_body(
         implementation, "void HotStuffBase::propose_handler(");
 
@@ -944,13 +944,18 @@ TEST_CASE("active proposals pass the semantic gate before protocol mutation",
         {"pre_vote_epoch_change_gate(", "admit_exact_context("}));
 
     REQUIRE_FALSE(remote.empty());
+    const auto compact_remote = without_whitespace(remote);
+    CHECK(contains_in_order(
+        compact_remote,
+        {"abort(\"proposal_retired\",", "return;"}));
     CHECK(contains_in_order(
         remote,
         {"delivered->get_hash() != metadata.key.block_hash",
          "owner.proposal_admission == nullptr",
          "!owner.proposal_admission->contains_admitted(",
          "metadata.key",
-         "abort(\"proposal_retired\")",
+         "abort(",
+         "\"proposal_retired\"",
          "return;",
          "pre_vote_epoch_change_gate(",
          "EpochChangeProposalDisposition::defer",
@@ -1002,10 +1007,13 @@ TEST_CASE(
     const auto admission_implementation =
         source("src/proposal_admission.cpp");
     const auto remote = function_body(
-        implementation, "void HotStuffBase::process_active(");
+        implementation, "bool HotStuffBase::process_active(");
     const auto receive = function_body(
         admission_implementation,
         "ProposalAdmissionResult ProposalAdmissionCoordinator::receive(");
+    const auto activation = function_body(
+        implementation,
+        "void HotStuffBase::activate_proposal_configuration(");
     const auto consensus = hotstuff_consensus_body(implementation);
     const auto retire_absent = function_body(
         implementation,
@@ -1017,22 +1025,41 @@ TEST_CASE(
         "bool HotStuffBase::try_enqueue_adaptive_v2_commit_report(");
 
     REQUIRE_FALSE(remote.empty());
+    const auto compact_remote = without_whitespace(remote);
+    CHECK(contains_in_order(
+        compact_remote,
+        {"abort(\"proposal_retired\",", "return;"}));
     CHECK(contains_in_order(
         remote,
         {"delivered == nullptr",
          "owner.proposal_admission == nullptr",
          "contains_admitted(",
          "metadata.key",
-         "abort(\"proposal_retired\")",
+         "abort(",
+         "\"proposal_retired\"",
          "return;",
          "pre_vote_epoch_change_gate(",
          "admit_exact_context(",
+         "attempt_proposal_evidence_before_exposure(",
+         "relay_once(deferred)",
+         "on_receive_proposal(parsed)",
+         "acquire_open_context(metadata.key)",
          "start_latency_deadline(metadata.key)",
          "start_aggregation_timer(metadata.key)",
-         "relay_once(deferred)",
          "drain_pending_exact_contributions(metadata.key)"}));
     REQUIRE_FALSE(receive.empty());
-    CHECK(receive.find("effects_.relay_once(") == std::string::npos);
+    CHECK(contains_in_order(
+        receive,
+        {"relay_policy_ ==",
+         "ProposalRelayPolicy::eager_before_processing",
+         "effects_.relay_once("}));
+    REQUIRE_FALSE(activation.empty());
+    CHECK(contains_in_order(
+        activation,
+        {"epoch_protocol_mode == EpochProtocolMode::adaptive_v2",
+         "ProposalRelayPolicy::",
+         "adaptive_v2_deferred_until_arm_attempt",
+         "ProposalRelayPolicy::eager_before_processing"}));
 
     REQUIRE_FALSE(consensus.empty());
     CHECK(contains_in_order(
@@ -1551,7 +1578,7 @@ TEST_CASE("deferred recovery is cleared only on deterministic terminal paths",
 {
     const auto implementation = source("src/hotstuff.cpp");
     const auto remote = function_body(
-        implementation, "void HotStuffBase::process_active(");
+        implementation, "bool HotStuffBase::process_active(");
     const auto activate = function_body(
         implementation,
         "void HotStuffBase::activate_proposal_configuration(");
@@ -1977,7 +2004,7 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     const auto local_proposal = function_body(
         implementation, "void HotStuffBase::do_broadcast_proposal(");
     const auto remote_proposal = function_body(
-        implementation, "void HotStuffBase::process_active(");
+        implementation, "bool HotStuffBase::process_active(");
     const auto do_consensus = hotstuff_consensus_body(implementation);
     const auto retire_before_epoch = function_body(
         implementation,

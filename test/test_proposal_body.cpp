@@ -72,6 +72,7 @@ using hotstuff::ProposalAdmissionEffects;
 using hotstuff::ProposalDisposition;
 using hotstuff::ProposalKey;
 using hotstuff::ProposalMetadata;
+using hotstuff::ProposalRelayPolicy;
 using hotstuff::ReplicaID;
 using hotstuff::admit_proposal_payload;
 using hotstuff::block_t;
@@ -258,7 +259,12 @@ struct PayloadHarness
 
     PayloadHarness()
         : active(configuration(*epochs.epoch0, 7)),
-          coordinator(epochs.store, active, buffer, effects)
+          coordinator(
+              epochs.store,
+              active,
+              buffer,
+              effects,
+              ProposalRelayPolicy::adaptive_v2_deferred_until_arm_attempt)
     {
         expected_block = source.add_block(
             source.get_genesis(), source.get_genesis());

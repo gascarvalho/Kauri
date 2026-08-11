@@ -493,7 +493,8 @@ std::map<std::string, std::string> parse_tiered_v2_marker_fields(
         "responsive_omission_period",
         "contribution_ordinal",
         "contribution_role",
-        "role_contribution_ordinal"};
+        "role_contribution_ordinal",
+        "authenticated_proposal_source_replica"};
     std::istringstream input(encoded);
     std::map<std::string, std::string> fields;
     std::string token;
@@ -2446,7 +2447,7 @@ TEST_CASE(
 
     const auto deadline_arm = source_slice(
         implementation,
-        "void HotStuffBase::start_latency_deadline",
+        "bool HotStuffBase::start_latency_deadline",
         "void HotStuffBase::start_aggregation_timer");
     const auto expected_targets =
         deadline_arm.find("lease->tree().direct_children");

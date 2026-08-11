@@ -2340,7 +2340,7 @@ TEST_CASE(
 
     const auto start_deadline = function_slice(
         implementation,
-        "void HotStuffBase::start_latency_deadline",
+        "bool HotStuffBase::start_latency_deadline",
         "void HotStuffBase::start_aggregation_timer");
     CHECK(start_deadline.find("aggregation_timeout_policy.timeout_for") !=
           std::string::npos);
