@@ -184,6 +184,7 @@ struct ManagerOptions
     bool shape_adaptation_enabled{false};
     std::uint64_t fault_containment_evidence_start_monotonic_ns{0};
     std::uint32_t fault_containment_required_tree_coverage{0};
+    std::uint64_t cycle_1_selection_not_before_monotonic_ns{0};
     std::vector<TransitionRequest> transition_requests;
     std::string structured_event_run_id;
     std::string structured_event_source_instance;
@@ -1179,6 +1180,8 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValStr::create("0");
     auto opt_fault_containment_required_tree_coverage =
         Config::OptValStr::create("0");
+    auto opt_cycle_1_selection_not_before_monotonic_ns =
+        Config::OptValStr::create("0");
     auto opt_transition_requests = Config::OptValStrVec::create();
     auto opt_bundle_outputs = Config::OptValStrVec::create();
     auto opt_structured_event_run_id = Config::OptValStr::create();
@@ -1260,6 +1263,10 @@ ManagerOptions parse_options(int argc, char **argv)
     config.add_opt(
         "fault-containment-required-tree-coverage",
         opt_fault_containment_required_tree_coverage,
+        Config::SET_VAL);
+    config.add_opt(
+        "cycle-1-selection-not-before-monotonic-ns",
+        opt_cycle_1_selection_not_before_monotonic_ns,
         Config::SET_VAL);
     config.add_opt(
         "transition-request", opt_transition_requests, Config::APPEND);
@@ -1468,6 +1475,11 @@ ManagerOptions parse_options(int argc, char **argv)
             opt_fault_containment_required_tree_coverage->get(),
             "fault containment required tree coverage",
             false);
+    options.cycle_1_selection_not_before_monotonic_ns =
+        parse_unsigned<std::uint64_t>(
+            opt_cycle_1_selection_not_before_monotonic_ns->get(),
+            "cycle 1 selection not before monotonic ns",
+            false);
     const bool fault_coverage_enabled =
         options.fault_containment_evidence_start_monotonic_ns != 0;
     if (fault_coverage_enabled !=
@@ -1578,6 +1590,21 @@ ManagerOptions parse_options(int argc, char **argv)
         }
         options.transition_requests.push_back(std::move(request));
     }
+    if (options.cycle_1_selection_not_before_monotonic_ns != 0 &&
+        (options.transition_requests.size() != 2 ||
+         options.fault_containment_evidence_start_monotonic_ns == 0 ||
+         options.cycle_1_selection_not_before_monotonic_ns <=
+             options.fault_containment_evidence_start_monotonic_ns ||
+         options.transition_requests[1].predecessor_epoch_number != 1 ||
+         options.transition_requests[1].successor_epoch_number != 2 ||
+         options.transition_requests[1].minimum_predecessor_residency_ms !=
+             60'000 ||
+         options.transition_requests[1]
+                 .minimum_post_baseline_observation_ms != 0))
+    {
+        throw std::invalid_argument(
+            "cycle 1 selection gate requires the exact two-transition repair path");
+    }
     options.structured_event_run_id =
         opt_structured_event_run_id->get();
     if (options.structured_event_run_id.empty())
@@ -1645,8 +1672,10 @@ public:
         EventContext &event_context,
         ManagerOptions options,
         const ManagerNetwork::Config &net_config,
+        hotstuff::StructuredEventClock &monotonic_raw_clock,
         hotstuff::StructuredEventSink &structured_event_sink)
         : event_context_(event_context),
+          monotonic_raw_clock_(monotonic_raw_clock),
           options_(std::move(options)),
           network_(event_context_, net_config),
           session_(
@@ -1682,6 +1711,11 @@ public:
             event_context_,
             [this](salticidae::TimerEvent &) {
                 handle_post_baseline_observation_timer();
+            });
+        cycle_1_selection_gate_timer = salticidae::TimerEvent(
+            event_context_,
+            [this](salticidae::TimerEvent &) {
+                handle_cycle_1_selection_gate_timer();
             });
         evaluation_timer = salticidae::TimerEvent(
             event_context_,
@@ -2124,6 +2158,86 @@ private:
         }
     }
 
+    void cancel_cycle_1_selection_gate() noexcept
+    {
+        cycle_1_selection_gate_timer.del();
+        cycle_1_selection_gate_pending_ = false;
+    }
+
+    bool arm_cycle_1_selection_gate(std::uint64_t now_ns) noexcept
+    {
+        const auto selection_not_before_ns =
+            options_.cycle_1_selection_not_before_monotonic_ns;
+        if (selection_not_before_ns == 0 ||
+            now_ns > selection_not_before_ns)
+        {
+            return false;
+        }
+        if (cycle_1_selection_gate_pending_)
+            return true;
+
+        try
+        {
+            const auto remaining_ns = selection_not_before_ns - now_ns;
+            const auto delay_seconds =
+                static_cast<double>(remaining_ns) / 1'000'000'000.0 +
+                kEvaluationCoalescingSeconds;
+            cycle_1_selection_gate_pending_ = true;
+            cycle_1_selection_gate_timer.add(delay_seconds);
+            return true;
+        }
+        catch (...)
+        {
+            cancel_cycle_1_selection_gate();
+            return false;
+        }
+    }
+
+    bool cycle_1_selection_gate_ready() noexcept
+    {
+        const auto selection_not_before_ns =
+            options_.cycle_1_selection_not_before_monotonic_ns;
+        if (selection_not_before_ns == 0 ||
+            request_sequence_.cursor() != 1)
+        {
+            return true;
+        }
+
+        const auto *request = current_transition_request();
+        if (request == nullptr ||
+            request->predecessor_epoch_number != 1 ||
+            request->successor_epoch_number != 2)
+        {
+            fail("cycle_1_selection_gate_context_invalid");
+            return false;
+        }
+
+        const auto now_ns = monotonic_raw_clock_.now_ns();
+        if (now_ns == 0 || !monotonic_raw_clock_.healthy())
+        {
+            fail("cycle_1_selection_gate_clock_unhealthy");
+            return false;
+        }
+        if (now_ns > selection_not_before_ns)
+        {
+            cancel_cycle_1_selection_gate();
+            return true;
+        }
+        if (!arm_cycle_1_selection_gate(now_ns))
+            fail("cycle_1_selection_gate_timer_failed");
+        return false;
+    }
+
+    void handle_cycle_1_selection_gate_timer() noexcept
+    {
+        if (!cycle_1_selection_gate_pending_ || failed_)
+            return;
+        cycle_1_selection_gate_pending_ = false;
+        if (!cycle_1_selection_gate_ready())
+            return;
+        evaluate();
+    }
+
     bool schedule_current_predecessor_residency() noexcept
     {
         const auto *request = current_transition_request();
@@ -2553,6 +2667,7 @@ private:
     {
         cancel_pending_evaluation();
         cancel_post_baseline_observation();
+        cancel_cycle_1_selection_gate();
         const auto convergence = session_.convergence_status();
         if (convergence.has_value() && !convergence_failure_emitted_)
         {
@@ -2584,6 +2699,7 @@ private:
         predecessor_residency_timer.del();
         predecessor_residency_pending_ = false;
         cancel_post_baseline_observation();
+        cancel_cycle_1_selection_gate();
         if (network_stop_required_ && !network_stopped_)
         {
             network_stopped_ = true;
@@ -2704,6 +2820,7 @@ private:
         if (failed_ || request_sequence_.shutdown_eligible() ||
             predecessor_residency_pending_ ||
             post_baseline_observation_pending_ ||
+            cycle_1_selection_gate_pending_ ||
             session_.convergence_status().has_value() ||
             evaluation_timer_pending_)
         {
@@ -2882,6 +2999,11 @@ private:
         if (controller.has_value() && controller->baseline_frozen &&
             !fault_containment_coverage_ready(
                 *request, evidence_cutoff, false))
+        {
+            return;
+        }
+        if (controller.has_value() && controller->baseline_frozen &&
+            !cycle_1_selection_gate_ready())
         {
             return;
         }
@@ -3682,6 +3804,7 @@ private:
     }
 
     EventContext &event_context_;
+    hotstuff::StructuredEventClock &monotonic_raw_clock_;
     ManagerOptions options_;
     ManagerNetwork network_;
     std::unordered_map<PeerId, ReplicaID> peer_to_replica_;
@@ -3694,6 +3817,7 @@ private:
     salticidae::TimerEvent convergence_ack_drain_timer;
     salticidae::TimerEvent predecessor_residency_timer;
     salticidae::TimerEvent post_baseline_observation_timer;
+    salticidae::TimerEvent cycle_1_selection_gate_timer;
     salticidae::TimerEvent evaluation_timer;
     std::chrono::steady_clock::time_point
         predecessor_residency_deadline_{};
@@ -3713,6 +3837,7 @@ private:
     bool convergence_failure_emitted_{false};
     bool predecessor_residency_pending_{false};
     bool post_baseline_observation_pending_{false};
+    bool cycle_1_selection_gate_pending_{false};
     bool evaluation_timer_pending_{false};
     bool experiment_bundle_drop_consumed_{false};
     bool experiment_activation_ack_drop_consumed_{false};
@@ -3746,6 +3871,7 @@ int main(int argc, char **argv)
             event_context,
             std::move(options),
             net_config,
+            structured_event_clock,
             structured_event_sink);
         int run_status = 1;
         std::exception_ptr run_failure;

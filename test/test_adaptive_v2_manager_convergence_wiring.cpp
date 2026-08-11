@@ -1506,6 +1506,148 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "cycle-one selection waits for the exclusive shared raw-clock bound",
+    "[adaptive-v2][manager][session][selection-gate][clock][wiring]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+    REQUIRE(owns_manager_session(manager));
+
+    CHECK(raw_manager.find(
+              "\"cycle-1-selection-not-before-monotonic-ns\"") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "cycle_1_selection_not_before_monotonic_ns") !=
+          std::string::npos);
+
+    const auto parse_options = function_body(
+        manager, "ManagerOptions parse_options(");
+    REQUIRE_FALSE(parse_options.empty());
+    const auto gate_parse = parse_options.find(
+        "cycle_1_selection_not_before_monotonic_ns =");
+    const auto append_requests = parse_options.find(
+        "options.transition_requests.push_back");
+    const auto gate_validation = parse_options.find(
+        "options.transition_requests.size() != 2", append_requests);
+    REQUIRE(gate_parse != std::string::npos);
+    REQUIRE(append_requests != std::string::npos);
+    REQUIRE(gate_validation != std::string::npos);
+    CHECK(gate_parse < append_requests);
+    CHECK(append_requests < gate_validation);
+    const auto validation = parse_options.substr(gate_validation);
+    CHECK(validation.find(
+              "fault_containment_evidence_start_monotonic_ns == 0") !=
+          std::string::npos);
+    CHECK(validation.find(
+              "cycle_1_selection_not_before_monotonic_ns <=") !=
+          std::string::npos);
+    CHECK(validation.find("predecessor_epoch_number != 1") !=
+          std::string::npos);
+    CHECK(validation.find("successor_epoch_number != 2") !=
+          std::string::npos);
+    CHECK(validation.find("minimum_predecessor_residency_ms") !=
+          std::string::npos);
+    CHECK(validation.find("60'000") != std::string::npos);
+    CHECK(validation.find("minimum_post_baseline_observation_ms") !=
+          std::string::npos);
+
+    const auto main_body = function_body(manager, "int main(");
+    REQUIRE_FALSE(main_body.empty());
+    CHECK(contains_in_order(
+        main_body,
+        {"MonotonicRawStructuredEventClock",
+         "StructuredEventSink",
+         "AdaptationManager"}));
+    CHECK(count_occurrences(
+              main_body, "structured_event_clock") >= 3);
+    CHECK(manager.find(
+              "hotstuff::StructuredEventClock &monotonic_raw_clock_") !=
+          std::string::npos);
+
+    const auto gate = function_body(
+        manager, "bool cycle_1_selection_gate_ready() noexcept");
+    REQUIRE_FALSE(gate.empty());
+    CHECK(gate.find("request_sequence_.cursor() != 1") !=
+          std::string::npos);
+    CHECK(gate.find("monotonic_raw_clock_.now_ns()") !=
+          std::string::npos);
+    CHECK(gate.find("monotonic_raw_clock_.healthy()") !=
+          std::string::npos);
+    CHECK(gate.find("steady_clock") == std::string::npos);
+    CHECK(contains_in_order(
+        gate,
+        {"selection_not_before_ns == 0",
+         "request_sequence_.cursor() != 1",
+         "return true",
+         "monotonic_raw_clock_.now_ns()"}));
+    CHECK(contains_in_order(
+        gate,
+        {"now_ns == 0",
+         "fail(",
+         "now_ns > selection_not_before_ns",
+         "arm_cycle_1_selection_gate(now_ns)"}));
+
+    const auto arm = function_body(
+        manager,
+        "bool arm_cycle_1_selection_gate(std::uint64_t now_ns) noexcept");
+    REQUIRE_FALSE(arm.empty());
+    CHECK(contains_in_order(
+        arm,
+        {"selection_not_before_ns - now_ns",
+         "kEvaluationCoalescingSeconds",
+         "cycle_1_selection_gate_pending_ = true",
+         "cycle_1_selection_gate_timer.add("}));
+
+    const auto fire = function_body(
+        manager,
+        "void handle_cycle_1_selection_gate_timer() noexcept");
+    REQUIRE_FALSE(fire.empty());
+    CHECK(contains_in_order(
+        fire,
+        {"cycle_1_selection_gate_pending_ = false",
+         "cycle_1_selection_gate_ready()",
+         "evaluate()"}));
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    const auto begin = function_body(
+        manager, "bool begin_current_cycle() noexcept");
+    const auto coalesce = function_body(
+        manager, "void schedule_evaluation() noexcept");
+    const auto residency = function_body(
+        manager,
+        "void handle_predecessor_residency_timer() noexcept");
+    REQUIRE_FALSE(evaluate.empty());
+    REQUIRE_FALSE(begin.empty());
+    REQUIRE_FALSE(coalesce.empty());
+    REQUIRE_FALSE(residency.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"controller->baseline_frozen",
+         "cycle_1_selection_gate_ready()",
+         "session_.evaluate()"}));
+    CHECK(begin.find("cycle_1_selection_gate_ready()") ==
+          std::string::npos);
+    CHECK(coalesce.find("cycle_1_selection_gate_pending_") !=
+          std::string::npos);
+    CHECK(contains_in_order(
+        residency,
+        {"steady_clock::now()",
+         "now < predecessor_residency_deadline_",
+         "begin_current_cycle()",
+         "evaluate()"}));
+
+    const auto fail = function_body(
+        manager, "void fail(const char *reason) noexcept");
+    const auto stop = function_body(manager, "void stop_runtime() noexcept");
+    REQUIRE_FALSE(fail.empty());
+    REQUIRE_FALSE(stop.empty());
+    CHECK(fail.find("cancel_cycle_1_selection_gate()") !=
+          std::string::npos);
+    CHECK(stop.find("cancel_cycle_1_selection_gate()") !=
+          std::string::npos);
+}
+
+TEST_CASE(
     "final recurring ACK drain ignores ordinary ingress without disabling duplicates",
     "[adaptive-v2][manager][session][recurring][final-drain][wiring]")
 {

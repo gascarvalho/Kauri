@@ -131,7 +131,7 @@ def test_v38_profile_is_one_lf_and_exact_three_path_delta() -> None:
     assert v38 == v37
 
 
-def test_v37_identities_are_explicit_historical_aliases_and_v38_is_frozen() -> None:
+def test_v37_v38_identities_are_historical_and_v39_is_frozen() -> None:
     assert (
         getattr(manifest_module, "V37_MANIFEST_ID", None),
         getattr(manifest_module, "V37_MANIFEST_SHA256", None),
@@ -149,7 +149,24 @@ def test_v37_identities_are_explicit_historical_aliases_and_v38_is_frozen() -> N
         "1eda50b8e2887ab4d0f1763816f82344136dabf480d752f5a4d82f48272e8f63",
         "7aa68f246e06bee0a666734113e5a5bda7a747c912b3cc51db6f81d03b2a6d81",
     )
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v38"
+    assert (
+        manifest_module.V38_MANIFEST_ID,
+        manifest_module.V38_MANIFEST_SHA256,
+        manifest_module.V38_SEMANTIC_SHA256,
+        manifest_module.V38_PLAN_SHA256,
+        runtime_module.V38_RUNTIME_SHA256,
+        runtime_module.V38_SMOKE_RUNTIME_SHA256,
+        runtime_module.V38_COVERAGE_SMOKE_RUNTIME_SHA256,
+    ) == (
+        "shape-placement-factorial-v38",
+        "aec2c4f2a9cb53e7b3d8d212bc0b56c008679aa97ebba140db7bac9404415698",
+        "9af592b436d934d13b1243439b84f78e1a78c19b035b37dbfe73bc168926b277",
+        "7e731a7f36a49a5e49aa62601165bd1fe8c846e3eff20001d0fccfe37b6050e0",
+        "2f080f10550c6eaac914435b436724a43f38615097063d3a70437a4459f69c3c",
+        "f1ae1fcffdaf4b209a595f3dd034ec935ad88ada5821930c105694b525e2817a",
+        "3cf676755478f686af64f12fd3fcb5993f4887a8f5165fbf540d289463544950",
+    )
+    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v39"
     assert (
         manifest_module.FROZEN_MANIFEST_SHA256,
         manifest_module.FROZEN_SEMANTIC_SHA256,
@@ -158,12 +175,12 @@ def test_v37_identities_are_explicit_historical_aliases_and_v38_is_frozen() -> N
         runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
         runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == (
-        "aec2c4f2a9cb53e7b3d8d212bc0b56c008679aa97ebba140db7bac9404415698",
-        "9af592b436d934d13b1243439b84f78e1a78c19b035b37dbfe73bc168926b277",
-        "7e731a7f36a49a5e49aa62601165bd1fe8c846e3eff20001d0fccfe37b6050e0",
-        "2f080f10550c6eaac914435b436724a43f38615097063d3a70437a4459f69c3c",
-        "f1ae1fcffdaf4b209a595f3dd034ec935ad88ada5821930c105694b525e2817a",
-        "3cf676755478f686af64f12fd3fcb5993f4887a8f5165fbf540d289463544950",
+        "ce6fb4c999275b575f1cf522524a5f3b41d109a6dcb3a1b77e789946b67b042f",
+        "14a3c3b910c89368481780d176e031e3bffeb15731b3448359fd73b10aee0a5a",
+        "481b9df491a68355eade98bf241e9b2805430276681c148cf2178ad5e3c794a0",
+        "8c46107ccea00424961501d31e9c85534d129353d8ed7fabba65e52c1049b17d",
+        "ad75abbf4592661aee236625a18c61a476f730d2825378e6598b42a63882fe65",
+        "aba47a1d783aa21769f153236e9f37c755cc7ef2ce6248c17cd21e84b505e856",
     )
 
 
@@ -411,10 +428,10 @@ def test_v37_and_v38_exact_static_bindings_reject_cross_version_mix(
             )
 
 
-def test_v38_is_default_and_v37_is_validation_only(
+def test_v39_is_default_and_v38_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V38_MANIFEST
-    assert cli.main(["--manifest", str(V37_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v39.json"
+    assert cli.main(["--manifest", str(V38_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v37 are validation-only" in refusal["reason"]
+    assert "v1 through v38 are validation-only" in refusal["reason"]

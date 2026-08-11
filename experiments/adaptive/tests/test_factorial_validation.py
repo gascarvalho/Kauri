@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import copy
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path
@@ -87,8 +88,11 @@ V36_MANIFEST_PATH = (
 V37_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v37.json"
 )
-FROZEN_MANIFEST_PATH = (
+V38_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v38.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v39.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -205,6 +209,32 @@ EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3 = (
     "cycle1_selection_then_epoch2_terminal_all_replica_command_activation_"
     "stable_end_and_drain_before_shared_hard_deadline_v3"
 )
+EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4 = (
+    "exact_excluded_repair_smoke_source_fault_window_duration_450s_effective_"
+    "fault_window_duration_330s_hard_deadline_650s_post_fault_cycle1_selection_"
+    "observation_grace_5s_with_exact_cycle1_manager_selection_gate_bound_to_the_"
+    "materialized_shared_clock_fault_end_plus_the_frozen_observation_grace_as_"
+    "an_exclusive_lower_bound_with_fault_evidence_and_epoch1_stable_as_the_only_"
+    "fault_active_causal_phases_with_epoch1_selection_terminal_all_replica_"
+    "command_activation_and_stable_end_before_fault_end_then_epoch2_as_post_"
+    "fault_recovery_and_stability_with_fault_end_before_cycle1_selection_and_"
+    "all_replica_commands_then_epoch2_terminal_all_replica_activation_stable_"
+    "end_and_drain_before_shared_hard_deadline_v4"
+)
+EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V2 = (
+    "byzantine.window.duration_s:450->330"
+)
+EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3 = (
+    "byzantine.window.duration_s:450->330;"
+    "cycle1.selection.exclusive_lower_bound:unset->"
+    "effective_fault_window_end_plus_5s"
+)
+CYCLE1_SELECTION_NOT_BEFORE_OPTION = (
+    "--cycle-1-selection-not-before-monotonic-ns"
+)
+CYCLE1_SELECTION_NOT_BEFORE_TOKEN = (
+    "{{cycle_1_selection_not_before_monotonic_ns}}"
+)
 EXCLUDED_REPAIR_SMOKE_VERIFIED_RESPONSE_DUPLICATE_PROBE_CONTRACT = (
     "exact_excluded_repair_smoke_at_least_one_post_fault_epoch1_internal_"
     "responsive_child_response_is_replayed_only_into_response_evidence_bridge_"
@@ -230,6 +260,73 @@ def test_v28_repair_contract_literals_are_exact() -> None:
     )
     assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3 == (
         EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+    )
+    assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4 == (
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+    )
+    assert runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3 == (
+        EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
+    )
+    assert runtime_module.EXCLUDED_REPAIR_SMOKE_POST_FAULT_OBSERVATION_GRACE_S == 5
+    assert runtime_module.CYCLE1_SELECTION_NOT_BEFORE_OPTION == (
+        CYCLE1_SELECTION_NOT_BEFORE_OPTION
+    )
+    assert runtime_module.CYCLE1_SELECTION_NOT_BEFORE_TOKEN == (
+        CYCLE1_SELECTION_NOT_BEFORE_TOKEN
+    )
+    assert validation._EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3 == (
+        EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
+    )
+    assert validation._V39_POST_FAULT_SELECTION_OBSERVATION_GRACE_S == 5
+
+
+def test_v39_preserves_strict_v9_and_v2_identity_validator_source() -> None:
+    expected_hashes = {
+        "_validate_v9_cross_commit_retention_witnesses": (
+            "80be9290ca1dd7347c8964c807c6397b2fac4658b1f3de0777e2e9439b73cc4e"
+        ),
+        "_validate_manifest_commit_identity_unavailable": (
+            "021f9c3c782f6d099dc515669729af3498b20acf451cafe161f0fa7e196ef0cb"
+        ),
+        "_validate_manifest_commit_identity_evidence": (
+            "efc31b5f2b2b665f90d6aa7187c6753f9908ab974746ed1c42480d6f582b4050"
+        ),
+    }
+
+    for name, expected_hash in expected_hashes.items():
+        source = inspect.getsource(getattr(validation, name)).encode("utf-8")
+        assert hashlib.sha256(source).hexdigest() == expected_hash
+
+
+def test_v38_history_and_v39_cycle1_gate_dispatch_are_exact() -> None:
+    repair_slot = "slot-037-n31-f2-b04-00"
+    primary_slot = "slot-066-n31-f5-b05-P"
+
+    assert validation._expected_excluded_repair_observation_contract(
+        validation.V38_MANIFEST_ID
+    ) == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+    assert validation._expected_excluded_repair_observation_contract(
+        validation.FROZEN_MANIFEST_ID
+    ) == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+    assert not validation._uses_excluded_repair_cycle1_selection_gate(
+        manifest_id=validation.V38_MANIFEST_ID,
+        coverage_smoke=True,
+        slot_id=repair_slot,
+    )
+    assert validation._uses_excluded_repair_cycle1_selection_gate(
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+        coverage_smoke=True,
+        slot_id=repair_slot,
+    )
+    assert not validation._uses_excluded_repair_cycle1_selection_gate(
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+        coverage_smoke=False,
+        slot_id=repair_slot,
+    )
+    assert not validation._uses_excluded_repair_cycle1_selection_gate(
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+        coverage_smoke=True,
+        slot_id=primary_slot,
     )
 
 
@@ -517,10 +614,16 @@ def test_v38_post_final_unmatched_commit_contract_dispatch_is_exact() -> None:
         manifest(validation.V37_MANIFEST_ID, v1)
     )
     assert validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.V38_MANIFEST_ID, v2)
+    )
+    assert validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
         manifest(validation.FROZEN_MANIFEST_ID, v2)
     )
     assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
         manifest(validation.V37_MANIFEST_ID, v2)
+    )
+    assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
+        manifest(validation.V38_MANIFEST_ID, v1)
     )
     assert not validation._uses_post_final_convergence_unmatched_commit_evidence_contract(
         manifest(validation.FROZEN_MANIFEST_ID, v1)
@@ -653,6 +756,32 @@ def _v37_candidate_manifest(
     monkeypatch.setattr(
         manifest_module,
         "V37_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v38_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = V38_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "V38_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v39_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = FROZEN_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_SEMANTIC_SHA256",
         hashlib.sha256(semantic).hexdigest(),
     )
     return manifest_module.parse_manifest_bytes(payload)
@@ -1291,8 +1420,11 @@ def test_validator_retains_exact_v1_through_v37_artifact_identities() -> None:
         validation.V37_MANIFEST_ID
     ) == "results/shape-placement-factorial-v37-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V38_MANIFEST_ID
     ) == "results/shape-placement-factorial-v38-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v39-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -1730,13 +1862,13 @@ def test_validator_v37_identities_are_exactly_frozen() -> None:
 
 def test_validator_v38_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V38_MANIFEST_ID
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v38"
+    assert validation.V38_MANIFEST_ID == "shape-placement-factorial-v38"
     assert (
         identity.manifest_sha256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.V38_SEMANTIC_SHA256,
         identity.plan_sha256,
         identity.runtime_sha256,
         identity.smoke_runtime_sha256,
@@ -1748,6 +1880,29 @@ def test_validator_v38_identities_are_exactly_frozen() -> None:
         "2f080f10550c6eaac914435b436724a43f38615097063d3a70437a4459f69c3c",
         "f1ae1fcffdaf4b209a595f3dd034ec935ad88ada5821930c105694b525e2817a",
         "3cf676755478f686af64f12fd3fcb5993f4887a8f5165fbf540d289463544950",
+    )
+
+
+def test_validator_v39_identities_are_exactly_frozen() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v39"
+    assert (
+        identity.manifest_sha256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    ) == (
+        "ce6fb4c999275b575f1cf522524a5f3b41d109a6dcb3a1b77e789946b67b042f",
+        "14a3c3b910c89368481780d176e031e3bffeb15731b3448359fd73b10aee0a5a",
+        "481b9df491a68355eade98bf241e9b2805430276681c148cf2178ad5e3c794a0",
+        "8c46107ccea00424961501d31e9c85534d129353d8ed7fabba65e52c1049b17d",
+        "ad75abbf4592661aee236625a18c61a476f730d2825378e6598b42a63882fe65",
+        "aba47a1d783aa21769f153236e9f37c755cc7ef2ce6248c17cd21e84b505e856",
     )
 
 
@@ -4686,7 +4841,7 @@ def _validate_v38_commit_identity_streams(
     protected_block_identities: frozenset[tuple[int, str]] = frozenset(),
 ) -> tuple[int, str, str | None, int, int] | None:
     selected_manifest_id = (
-        validation.FROZEN_MANIFEST_ID if manifest_id is None else manifest_id
+        validation.V38_MANIFEST_ID if manifest_id is None else manifest_id
     )
     return validation._validate_manifest_commit_identity_evidence(
         selected_manifest_id,
@@ -4751,7 +4906,7 @@ def test_v38_production_commit_identity_orchestration_is_gap_first(
     )
 
     assert validation._validate_manifest_commit_identity_evidence(
-        validation.FROZEN_MANIFEST_ID,
+        validation.V38_MANIFEST_ID,
         {0: ()},
         replica_count=1,
         observer_id="replica-0",
@@ -11575,7 +11730,9 @@ def _v28_repair_observation_fixture(
     *,
     version: int = 28,
     fault_end_ns: int = 500,
-    hard_deadline_ns: int = 1_000,
+    hard_deadline_ns: int | None = None,
+    epoch2_selection_ns: int | None = None,
+    epoch2_command_ns_by_replica: dict[int, int] | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     manifest = {
         28: _v28_candidate_manifest,
@@ -11588,9 +11745,43 @@ def _v28_repair_observation_fixture(
         35: _v35_candidate_manifest,
         36: _v36_candidate_manifest,
         37: _v37_candidate_manifest,
+        38: _v38_candidate_manifest,
+        39: _v39_candidate_manifest,
     }[version](monkeypatch)
     expected = _v25_inherited_placement_expected_slot()
     digests = ("10" * 32, "11" * 32, "22" * 32)
+    v39_gate_target_ns = fault_end_ns + 5_000_000_000
+    resolved_epoch2_selection_ns = (
+        epoch2_selection_ns
+        if epoch2_selection_ns is not None
+        else v39_gate_target_ns + 1
+        if version == 39
+        else 600
+    )
+    resolved_epoch2_command_ns = {
+        replica_id: (
+            epoch2_command_ns_by_replica[replica_id]
+            if epoch2_command_ns_by_replica is not None
+            else v39_gate_target_ns + 20 + replica_id
+            if version == 39
+            else 620 + replica_id
+        )
+        for replica_id in range(expected.replica_count)
+    }
+    epoch2_tail_base_ns = (
+        max(
+            resolved_epoch2_selection_ns,
+            max(resolved_epoch2_command_ns.values()),
+        )
+        + (50 if version == 39 else 20)
+    )
+    resolved_hard_deadline_ns = (
+        hard_deadline_ns
+        if hard_deadline_ns is not None
+        else epoch2_tail_base_ns + 330
+        if version == 39
+        else 1_000
+    )
     manager_events = (
         _native_event(
             source_id="adaptive-manager",
@@ -11609,21 +11800,21 @@ def _v28_repair_observation_fixture(
         _native_event(
             source_id="adaptive-manager",
             sequence=3,
-            monotonic_ns=550,
+            monotonic_ns=resolved_epoch2_selection_ns - 50,
             event_type="adaptive_v2_evidence_snapshot",
             payload={"cycle_ordinal": 1},
         ),
         _native_event(
             source_id="adaptive-manager",
             sequence=4,
-            monotonic_ns=600,
+            monotonic_ns=resolved_epoch2_selection_ns,
             event_type="adaptive_v2_shape_decision",
             payload={"cycle_ordinal": 1},
         ),
         _native_event(
             source_id="adaptive-manager",
             sequence=5,
-            monotonic_ns=750,
+            monotonic_ns=epoch2_tail_base_ns + 80,
             event_type="adaptive_v2_session_terminal",
             payload={"cycle_ordinal": 1},
         ),
@@ -11633,7 +11824,11 @@ def _v28_repair_observation_fixture(
         stream: list[validation._NativeEvent] = []
         for epoch, command_ns, activation_ns in (
             (1, 120 + replica_id, 151 + replica_id),
-            (2, 620 + replica_id, 670 + replica_id),
+            (
+                2,
+                resolved_epoch2_command_ns[replica_id],
+                epoch2_tail_base_ns + replica_id,
+            ),
         ):
             command_height = 100 + epoch * 10
             stream.extend(
@@ -11673,7 +11868,7 @@ def _v28_repair_observation_fixture(
     drain = _native_event(
         source_id="replica-0",
         sequence=5,
-        monotonic_ns=900,
+        monotonic_ns=epoch2_tail_base_ns + 230,
         event_type="block.committed",
         payload={},
     )
@@ -11724,19 +11919,23 @@ def _v28_repair_observation_fixture(
         }
 
     observation_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
-        if version == 37
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        if version == 39
         else (
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-            if version in {34, 35, 36}
-            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+            if version in {37, 38}
+            else (
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+                if version in {34, 35, 36}
+                else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+            )
         )
     )
     observation = {
         "schema_version": 1,
         "observation_contract": observation_contract,
         "fault_window_end_monotonic_ns": fault_end_ns,
-        "hard_deadline_monotonic_ns": hard_deadline_ns,
+        "hard_deadline_monotonic_ns": resolved_hard_deadline_ns,
         "rows": [
             native_row("epoch1_selection", manager_events[0]),
             native_row("epoch1_command", commands[1]),
@@ -11758,7 +11957,7 @@ def _v28_repair_observation_fixture(
             native_row("epoch2_terminal", manager_events[4]),
             {
                 "name": "epoch2_stable_end",
-                "monotonic_ns": 800,
+                "monotonic_ns": epoch2_tail_base_ns + 130,
                 "derivation": "phase.epoch2_stable.end_monotonic_ns",
             },
             native_row("epoch2_drain_complete", drain),
@@ -11796,16 +11995,22 @@ def _v28_repair_observation_fixture(
         },
         "phase_windows": {
             "epoch1_stable": (150, 200, 1),
-            "epoch2_stable": (720, 800, 1),
+            "epoch2_stable": (
+                epoch2_tail_base_ns + 100,
+                epoch2_tail_base_ns + 130,
+                1,
+            ),
         },
         "fault_window_end_ns": fault_end_ns,
-        "hard_deadline_ns": hard_deadline_ns,
+        "hard_deadline_ns": resolved_hard_deadline_ns,
     }
     return document, arguments
 
 
-@pytest.mark.parametrize("version", (28, 29, 30, 31, 32, 33, 34, 35, 36, 37))
-def test_v28_through_v37_excluded_repair_observation_bind_exact_grouped_chronology(
+@pytest.mark.parametrize(
+    "version", (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
+)
+def test_v28_through_v39_excluded_repair_observation_bind_exact_grouped_chronology(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
 ) -> None:
@@ -11816,24 +12021,28 @@ def test_v28_through_v37_excluded_repair_observation_bind_exact_grouped_chronolo
     validation._validate_v28_excluded_repair_observation(document, **arguments)
 
 
+_EXCLUDED_REPAIR_FAIL_CLOSED_MUTATIONS = (
+    ("wrong-contract", "document drifted"),
+    ("extra-row", "document drifted"),
+    ("wrong-reference", "document drifted"),
+    ("wrong-derivation", "document drifted"),
+    ("epoch1-at-fault-end", "Epoch1 proof"),
+    ("epoch1-stable-at-fault-end", "Epoch1 proof"),
+    ("epoch2-selection-at-fault-end", "selection/all-replica"),
+    ("one-epoch2-command-before-fault", "all-replica commands"),
+    ("one-epoch2-command-at-fault-end", "all-replica commands"),
+    ("epoch2-stable-at-hard-deadline", "Epoch2 proof"),
+    ("epoch2-at-hard-deadline", "Epoch2 proof"),
+    ("missing-replica-command", "all-replica"),
+)
+
+
 @pytest.mark.parametrize(
     "mutation,reason",
-    (
-        ("wrong-contract", "document drifted"),
-        ("extra-row", "document drifted"),
-        ("wrong-reference", "document drifted"),
-        ("wrong-derivation", "document drifted"),
-        ("epoch1-at-fault-end", "Epoch1 proof"),
-        ("epoch1-stable-at-fault-end", "Epoch1 proof"),
-        ("epoch2-selection-at-fault-end", "selection/all-replica"),
-        ("one-epoch2-command-before-fault", "all-replica commands"),
-        ("epoch2-stable-at-hard-deadline", "Epoch2 proof"),
-        ("epoch2-at-hard-deadline", "Epoch2 proof"),
-        ("missing-replica-command", "all-replica"),
-    ),
+    _EXCLUDED_REPAIR_FAIL_CLOSED_MUTATIONS,
 )
-@pytest.mark.parametrize("version", (28, 34, 35, 36, 37))
-def test_v28_v34_through_v37_excluded_repair_observation_are_fail_closed(
+@pytest.mark.parametrize("version", (28, 34, 35, 36, 37, 38))
+def test_v28_v34_through_v38_excluded_repair_observation_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
     reason: str,
@@ -11866,6 +12075,7 @@ def test_v28_v34_through_v37_excluded_repair_observation_are_fail_closed(
     elif mutation in {
         "missing-replica-command",
         "one-epoch2-command-before-fault",
+        "one-epoch2-command-at-fault-end",
     }:
         replica_events = dict(arguments["replica_events"])
         if mutation == "missing-replica-command":
@@ -11879,7 +12089,14 @@ def test_v28_v34_through_v37_excluded_repair_observation_are_fail_closed(
             )
         else:
             replica_events[0] = tuple(
-                replace(event, monotonic_ns=499)
+                replace(
+                    event,
+                    monotonic_ns=(
+                        500
+                        if mutation == "one-epoch2-command-at-fault-end"
+                        else 499
+                    ),
+                )
                 if event.event_type == "epoch.command_committed"
                 and event.payload["successor_epoch_number"] == 2
                 else event
@@ -11888,6 +12105,38 @@ def test_v28_v34_through_v37_excluded_repair_observation_are_fail_closed(
         arguments["replica_events"] = replica_events
     with pytest.raises(FactorialValidationError, match=reason):
         validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+
+def test_v38_live_chronology_retains_bare_fault_end_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document, arguments = _v28_repair_observation_fixture(
+        monkeypatch,
+        version=38,
+        fault_end_ns=500,
+        epoch2_selection_ns=501,
+        epoch2_command_ns_by_replica={replica_id: 501 for replica_id in range(31)},
+    )
+
+    validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+
+def test_v38_live_chronology_retains_official_fault_end_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document, arguments = _v28_repair_observation_fixture(
+        monkeypatch,
+        version=38,
+        fault_end_ns=600,
+    )
+
+    with pytest.raises(FactorialValidationError) as excinfo:
+        validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+    assert str(excinfo.value) == (
+        "v28 excluded repair Epoch2 selection/all-replica commands did not "
+        "follow fault end"
+    )
 
 
 def test_independent_config_reconstruction_accepts_only_exact_launcher_bytes(
@@ -12075,6 +12324,567 @@ def _relocated_receipt_fixture(
     )
 
 
+def _v39_repair_receipt_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[
+    object,
+    Path,
+    dict[str, object],
+    validation._ExpectedSlot,
+    dict[str, object],
+    bytes,
+]:
+    manifest = _v39_candidate_manifest(monkeypatch)
+    plan = build_factorial_plan(manifest)
+    primary = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-037-n31-f2-b04-00"
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    spec = next(
+        slot for slot in coverage.runtime.slots if slot.slot_id == repair.slot_id
+    )
+    expected = next(
+        item
+        for item in validation._expected_slots(manifest)
+        if item.slot_id == spec.slot_id
+    )
+    runtime_document = json.loads(json.dumps(coverage.runtime.as_document()))
+    spec_document = next(
+        item
+        for item in runtime_document["slots"]
+        if item["slot_id"] == spec.slot_id
+    )
+    original_repository = tmp_path / "removed-v39-original" / "Kauri"
+    original_slot = original_repository / spec.result_path
+    recovered_slot = tmp_path / "recovered-v39-archive" / spec.slot_id
+    (recovered_slot / "runtime").mkdir(parents=True)
+    tls = tuple(
+        {
+            "crt": f"{replica + 1201:064x}",
+            "sec": f"{replica + 1301:064x}",
+            "cid": f"{replica + 1401:064x}",
+        }
+        for replica in range(spec.replica_count + 1)
+    )
+    issuer = {"pub": f"{1901:064x}", "sec": f"{1902:064x}"}
+    (recovered_slot / "runtime/tls-identities.txt").write_text(
+        "".join(
+            f"crt:{row['crt']} sec:{row['sec']} cid:{row['cid']}\n" for row in tls
+        ),
+        encoding="ascii",
+    )
+    (recovered_slot / "runtime/issuer-identities.txt").write_text(
+        f"pub:{issuer['pub']} sec:{issuer['sec']}\n",
+        encoding="ascii",
+    )
+    authorization_bytes = _canonical(
+        {"authorization_id": "test-v39-repair-receipt-authorization"}
+    )
+    redaction_key = execution._derive_redaction_key(
+        authorization_bytes,
+        spec.slot_id,
+    )
+    key_id = hashlib.sha256(redaction_key).hexdigest()[:16]
+    secrets = ManagerSecretMaterial(
+        manager_tls_private_key_der_hex=tls[spec.replica_count]["sec"],
+        manager_tls_certificate_der_hex=tls[spec.replica_count]["crt"],
+        issuer_private_key_hex=issuer["sec"],
+        replica_tls_certificate_der_hex=tuple(
+            row["crt"] for row in tls[: spec.replica_count]
+        ),
+    )
+    anchor = 1_000_000_000
+    manager = execution._redact_manager_argv(
+        materialize_manager_argv(
+            spec,
+            original_slot,
+            secrets,
+            shared_raw_clock_anchor_ns=anchor,
+        ),
+        key=redaction_key,
+        key_id=key_id,
+    )
+    replicas = materialize_replica_argv(spec, original_slot, anchor)
+    start = anchor + spec.fault_window.start_after_prelaunch_anchor_s * 1_000_000_000
+    end = start + spec.fault_window.duration_s * 1_000_000_000
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "slot_id": spec.slot_id,
+        "runtime_artifact_id": spec.artifact_id,
+        "manifest_sha256": validation.FROZEN_MANIFEST_SHA256,
+        "plan_sha256": validation.FROZEN_PLAN_SHA256,
+        "runtime_sha256": validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        "execution_ordinal": spec.execution_ordinal,
+        "attempt_ordinal": 1,
+        "retry_of": None,
+        "replacement_for": None,
+        "shared_raw_clock_anchor_ns": anchor,
+        "fault_window_start_ns": start,
+        "fault_window_end_ns": end,
+        "redaction_key_id": key_id,
+        "manager_argv": list(manager),
+        "replica_argv": [
+            {"replica_id": process.replica_id, "argv": list(process.argv)}
+            for process in replicas
+        ],
+    }
+    return (
+        manifest,
+        recovered_slot,
+        receipt,
+        expected,
+        spec_document,
+        authorization_bytes,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "duplicate",
+        "four-seconds",
+        "six-seconds",
+        "minus-one-nanosecond",
+        "plus-one-nanosecond",
+    ),
+)
+def test_v39_repair_receipt_requires_exact_materialized_cycle1_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    (
+        manifest,
+        slot_root,
+        receipt,
+        expected,
+        runtime,
+        authorization_bytes,
+    ) = _v39_repair_receipt_fixture(monkeypatch, tmp_path)
+    validation._validate_slot_receipt(
+        receipt,
+        slot_root=slot_root,
+        manifest=manifest,
+        expected=expected,
+        runtime=runtime,
+        runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        authorization_bytes=authorization_bytes,
+    )
+
+    drifted = copy.deepcopy(receipt)
+    argv = drifted["manager_argv"]
+    option_index = argv.index(CYCLE1_SELECTION_NOT_BEFORE_OPTION)
+    if mutation == "missing":
+        del argv[option_index : option_index + 2]
+    elif mutation == "duplicate":
+        argv[option_index:option_index] = argv[option_index : option_index + 2]
+    elif mutation == "four-seconds":
+        argv[option_index + 1] = str(
+            int(drifted["fault_window_end_ns"]) + 4_000_000_000
+        )
+    elif mutation == "six-seconds":
+        argv[option_index + 1] = str(
+            int(drifted["fault_window_end_ns"]) + 6_000_000_000
+        )
+    elif mutation == "minus-one-nanosecond":
+        argv[option_index + 1] = str(int(argv[option_index + 1]) - 1)
+    else:
+        argv[option_index + 1] = str(int(argv[option_index + 1]) + 1)
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="manager argv|cycle-1 selection",
+    ):
+        validation._validate_slot_receipt(
+            drifted,
+            slot_root=slot_root,
+            manifest=manifest,
+            expected=expected,
+            runtime=runtime,
+            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            authorization_bytes=authorization_bytes,
+        )
+
+
+def test_v39_repair_receipt_rejects_fault_end_uint64_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        manifest,
+        slot_root,
+        receipt,
+        expected,
+        runtime,
+        authorization_bytes,
+    ) = _v39_repair_receipt_fixture(monkeypatch, tmp_path)
+    overflowed = copy.deepcopy(receipt)
+    anchor = validation._UINT64_MAX - 100
+    overflowed["shared_raw_clock_anchor_ns"] = anchor
+    overflowed["fault_window_start_ns"] = anchor + 150 * 1_000_000_000
+    overflowed["fault_window_end_ns"] = anchor + 480 * 1_000_000_000
+
+    with pytest.raises(FactorialValidationError, match="raw-clock window"):
+        validation._validate_slot_receipt(
+            overflowed,
+            slot_root=slot_root,
+            manifest=manifest,
+            expected=expected,
+            runtime=runtime,
+            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            authorization_bytes=authorization_bytes,
+        )
+
+
+def test_v39_repair_receipt_rejects_gate_target_uint64_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        manifest,
+        slot_root,
+        receipt,
+        expected,
+        runtime,
+        authorization_bytes,
+    ) = _v39_repair_receipt_fixture(monkeypatch, tmp_path)
+    overflowed = copy.deepcopy(receipt)
+    anchor = validation._UINT64_MAX - 480 * 1_000_000_000
+    overflowed["shared_raw_clock_anchor_ns"] = anchor
+    overflowed["fault_window_start_ns"] = anchor + 150 * 1_000_000_000
+    overflowed["fault_window_end_ns"] = validation._UINT64_MAX
+
+    with pytest.raises(FactorialValidationError, match="does not fit"):
+        validation._validate_slot_receipt(
+            overflowed,
+            slot_root=slot_root,
+            manifest=manifest,
+            expected=expected,
+            runtime=runtime,
+            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            authorization_bytes=authorization_bytes,
+        )
+
+
+def test_v39_repair_receipt_requires_gate_strictly_before_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        manifest,
+        slot_root,
+        receipt,
+        expected,
+        runtime,
+        authorization_bytes,
+    ) = _v39_repair_receipt_fixture(monkeypatch, tmp_path)
+    equal_hard = copy.deepcopy(runtime)
+    equal_hard["fault_window"]["hard_timeout_s"] = (
+        equal_hard["fault_window"]["start_after_prelaunch_anchor_s"]
+        + equal_hard["fault_window"]["duration_s"]
+        + 5
+    )
+
+    with pytest.raises(FactorialValidationError, match="shared hard deadline"):
+        validation._validate_slot_receipt(
+            receipt,
+            slot_root=slot_root,
+            manifest=manifest,
+            expected=expected,
+            runtime=equal_hard,
+            runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+            authorization_bytes=authorization_bytes,
+        )
+
+
+def _v39_receipt_bound_live_chronology_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_fixture: tuple[
+        object,
+        Path,
+        dict[str, object],
+        validation._ExpectedSlot,
+        dict[str, object],
+        bytes,
+    ],
+    *,
+    epoch2_selection_ns: int,
+    epoch2_command_ns_by_replica: dict[int, int],
+) -> tuple[dict[str, object], dict[str, object]]:
+    (
+        manifest,
+        slot_root,
+        receipt,
+        expected,
+        runtime,
+        authorization_bytes,
+    ) = receipt_fixture
+    validation._validate_slot_receipt(
+        receipt,
+        slot_root=slot_root,
+        manifest=manifest,
+        expected=expected,
+        runtime=runtime,
+        runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        authorization_bytes=authorization_bytes,
+    )
+    fault_end_ns = int(receipt["fault_window_end_ns"])
+    manager_argv = receipt["manager_argv"]
+    option_index = manager_argv.index(CYCLE1_SELECTION_NOT_BEFORE_OPTION)
+    gate_target_ns = int(manager_argv[option_index + 1])
+    assert gate_target_ns == fault_end_ns + 5_000_000_000
+    hard_deadline_ns = int(receipt["shared_raw_clock_anchor_ns"]) + (
+        int(runtime["fault_window"]["hard_timeout_s"]) * 1_000_000_000
+    )
+    document, arguments = _v28_repair_observation_fixture(
+        monkeypatch,
+        version=39,
+        fault_end_ns=fault_end_ns,
+        hard_deadline_ns=hard_deadline_ns,
+        epoch2_selection_ns=epoch2_selection_ns,
+        epoch2_command_ns_by_replica=epoch2_command_ns_by_replica,
+    )
+    arguments["manifest"] = manifest
+    arguments["expected"] = expected
+    return document, arguments
+
+
+def _validate_v39_receipt_bound_live_chronology(
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_fixture: tuple[
+        object,
+        Path,
+        dict[str, object],
+        validation._ExpectedSlot,
+        dict[str, object],
+        bytes,
+    ],
+    *,
+    epoch2_selection_ns: int,
+    epoch2_command_ns_by_replica: dict[int, int],
+) -> None:
+    document, arguments = _v39_receipt_bound_live_chronology_fixture(
+        monkeypatch,
+        receipt_fixture,
+        epoch2_selection_ns=epoch2_selection_ns,
+        epoch2_command_ns_by_replica=epoch2_command_ns_by_replica,
+    )
+    validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+
+@pytest.mark.parametrize("offset_ns", (0, -1))
+@pytest.mark.parametrize(
+    "boundary",
+    ("selection", "command-barrier", "one-replica-command"),
+)
+def test_v39_live_chronology_rejects_gate_target_equality_and_target_minus_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    boundary: str,
+    offset_ns: int,
+) -> None:
+    receipt_fixture = _v39_repair_receipt_fixture(monkeypatch, tmp_path)
+    receipt = receipt_fixture[2]
+    fault_end_ns = int(receipt["fault_window_end_ns"])
+    gate_target_ns = fault_end_ns + 5_000_000_000
+    selection_ns = gate_target_ns + 1
+    command_times = {
+        replica_id: gate_target_ns + 20 + replica_id
+        for replica_id in range(31)
+    }
+    if boundary == "selection":
+        selection_ns = gate_target_ns + offset_ns
+    elif boundary == "command-barrier":
+        command_times = {
+            replica_id: gate_target_ns + offset_ns
+            for replica_id in range(31)
+        }
+    else:
+        command_times[0] = gate_target_ns + offset_ns
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="selection/all-replica commands",
+    ):
+        _validate_v39_receipt_bound_live_chronology(
+            monkeypatch,
+            receipt_fixture,
+            epoch2_selection_ns=selection_ns,
+            epoch2_command_ns_by_replica=command_times,
+        )
+
+
+def test_v39_live_chronology_accepts_all_gate_boundaries_at_target_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    receipt_fixture = _v39_repair_receipt_fixture(monkeypatch, tmp_path)
+    receipt = receipt_fixture[2]
+    gate_target_ns = int(receipt["fault_window_end_ns"]) + 5_000_000_000
+
+    _validate_v39_receipt_bound_live_chronology(
+        monkeypatch,
+        receipt_fixture,
+        epoch2_selection_ns=gate_target_ns + 1,
+        epoch2_command_ns_by_replica={
+            replica_id: gate_target_ns + 1 for replica_id in range(31)
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    _EXCLUDED_REPAIR_FAIL_CLOSED_MUTATIONS,
+)
+def test_v39_receipt_bound_live_chronology_preserves_full_fail_closed_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    receipt_fixture = _v39_repair_receipt_fixture(monkeypatch, tmp_path)
+    receipt = receipt_fixture[2]
+    fault_end_ns = int(receipt["fault_window_end_ns"])
+    manager_argv = receipt["manager_argv"]
+    option_index = manager_argv.index(CYCLE1_SELECTION_NOT_BEFORE_OPTION)
+    gate_target_ns = int(manager_argv[option_index + 1])
+    document, arguments = _v39_receipt_bound_live_chronology_fixture(
+        monkeypatch,
+        receipt_fixture,
+        epoch2_selection_ns=gate_target_ns + 1,
+        epoch2_command_ns_by_replica={
+            replica_id: gate_target_ns + 20 + replica_id
+            for replica_id in range(31)
+        },
+    )
+    validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+    observation = document["excluded_repair_observation"]
+    rows = {row["name"]: row for row in observation["rows"]}
+
+    def replace_manager_event(
+        index: int,
+        monotonic_ns: int,
+    ) -> validation._NativeEvent:
+        manager_events = list(arguments["manager_events"])
+        updated = replace(manager_events[index], monotonic_ns=monotonic_ns)
+        manager_events[index] = updated
+        arguments["manager_events"] = tuple(manager_events)
+        events_by_ref = dict(arguments["events_by_ref"])
+        events_by_ref[(updated.relative_path, updated.source_sequence)] = updated
+        arguments["events_by_ref"] = events_by_ref
+        return updated
+
+    def replace_replica_event(
+        replica_id: int,
+        *,
+        event_type: str,
+        successor_epoch_number: int | None,
+        monotonic_ns: int,
+    ) -> validation._NativeEvent:
+        replica_events = dict(arguments["replica_events"])
+        stream = list(replica_events[replica_id])
+        index = next(
+            index
+            for index, event in enumerate(stream)
+            if event.event_type == event_type
+            and (
+                successor_epoch_number is None
+                or event.payload.get("successor_epoch_number")
+                == successor_epoch_number
+            )
+        )
+        updated = replace(stream[index], monotonic_ns=monotonic_ns)
+        stream[index] = updated
+        replica_events[replica_id] = tuple(stream)
+        arguments["replica_events"] = replica_events
+        events_by_ref = dict(arguments["events_by_ref"])
+        events_by_ref[(updated.relative_path, updated.source_sequence)] = updated
+        arguments["events_by_ref"] = events_by_ref
+        return updated
+
+    def update_native_row(name: str, event: validation._NativeEvent) -> None:
+        rows[name]["monotonic_ns"] = event.monotonic_ns
+        rows[name]["event"] = validation._native_event_reference(event)
+
+    if mutation == "wrong-contract":
+        observation["observation_contract"] += "-drift"
+    elif mutation == "extra-row":
+        observation["rows"].append(copy.deepcopy(observation["rows"][-1]))
+    elif mutation == "wrong-reference":
+        rows["epoch1_selection"]["event"]["line_sha256"] = "ff" * 32
+    elif mutation == "wrong-derivation":
+        rows["epoch1_stable_end"]["derivation"] = "phase.drift"
+    elif mutation == "epoch1-at-fault-end":
+        terminal = replace_manager_event(1, fault_end_ns)
+        update_native_row("epoch1_terminal", terminal)
+    elif mutation == "epoch1-stable-at-fault-end":
+        phase_windows = dict(arguments["phase_windows"])
+        start, _, count = phase_windows["epoch1_stable"]
+        phase_windows["epoch1_stable"] = (start, fault_end_ns, count)
+        arguments["phase_windows"] = phase_windows
+        rows["epoch1_stable_end"]["monotonic_ns"] = fault_end_ns
+    elif mutation == "epoch2-selection-at-fault-end":
+        replace_manager_event(2, fault_end_ns - 1)
+        selection = replace_manager_event(3, fault_end_ns)
+        update_native_row("epoch2_selection", selection)
+    elif mutation in {
+        "one-epoch2-command-before-fault",
+        "one-epoch2-command-at-fault-end",
+    }:
+        replace_replica_event(
+            0,
+            event_type="epoch.command_committed",
+            successor_epoch_number=2,
+            monotonic_ns=(
+                fault_end_ns
+                if mutation == "one-epoch2-command-at-fault-end"
+                else fault_end_ns - 1
+            ),
+        )
+    elif mutation == "epoch2-stable-at-hard-deadline":
+        hard_deadline_ns = int(arguments["hard_deadline_ns"])
+        phase_windows = dict(arguments["phase_windows"])
+        start, _, count = phase_windows["epoch2_stable"]
+        phase_windows["epoch2_stable"] = (start, hard_deadline_ns, count)
+        arguments["phase_windows"] = phase_windows
+        rows["epoch2_stable_end"]["monotonic_ns"] = hard_deadline_ns
+    elif mutation == "epoch2-at-hard-deadline":
+        hard_deadline_ns = int(arguments["hard_deadline_ns"])
+        drain = replace_replica_event(
+            0,
+            event_type="block.committed",
+            successor_epoch_number=None,
+            monotonic_ns=hard_deadline_ns,
+        )
+        update_native_row("epoch2_drain_complete", drain)
+        cutoff_times = dict(arguments["cutoff_times"])
+        cutoff_times["epoch2_drain_complete"] = hard_deadline_ns
+        arguments["cutoff_times"] = cutoff_times
+    else:
+        replica_events = dict(arguments["replica_events"])
+        replica_events[30] = tuple(
+            event
+            for event in replica_events[30]
+            if not (
+                event.event_type == "epoch.command_committed"
+                and event.payload.get("successor_epoch_number") == 1
+            )
+        )
+        arguments["replica_events"] = replica_events
+
+    with pytest.raises(FactorialValidationError, match=reason):
+        validation._validate_v28_excluded_repair_observation(document, **arguments)
+
+
 def test_smoke_slot_authorization_must_match_the_claimed_root_envelope(
     tmp_path: Path,
 ) -> None:
@@ -12156,6 +12966,10 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
         Path(validation.V37_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
     )
+    v38_coverage = (
+        Path(validation.V38_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
+        / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    )
     v29_coverage = (
         Path(validation.V29_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT)
         / validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
@@ -12179,6 +12993,14 @@ def test_n31_coverage_smoke_exclusion_depends_on_the_exact_parent_root() -> None
 
     assert not validation._is_excluded_coverage_smoke_slot(campaign)
     assert validation._is_excluded_coverage_smoke_slot(coverage)
+    assert validation._is_excluded_coverage_smoke_slot(
+        v38_coverage,
+        manifest_id=validation.V38_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v38_coverage,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
     assert validation._is_excluded_coverage_smoke_slot(
         v34_coverage,
         manifest_id=validation.V34_MANIFEST_ID,
@@ -12297,6 +13119,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
+    assert validation._coverage_smoke_slot_ids(validation.V38_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
     assert validation._coverage_smoke_slot_ids(validation.FROZEN_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
@@ -12327,6 +13153,7 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         validation.V32_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        validation.V38_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
     ),
 )
@@ -12370,6 +13197,8 @@ def _v25_coverage_runtime_fixture(
         35: _v35_candidate_manifest,
         36: _v36_candidate_manifest,
         37: _v37_candidate_manifest,
+        38: _v38_candidate_manifest,
+        39: _v39_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -12390,8 +13219,10 @@ def _v25_coverage_runtime_fixture(
     return manifest, runtime, expected_by_id
 
 
-@pytest.mark.parametrize("version", (28, 29, 30, 31, 32, 33, 34, 35, 36, 37))
-def test_v28_through_v37_repair_observation_dispatch_preserves_version_parity(
+@pytest.mark.parametrize(
+    "version", (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39)
+)
+def test_v28_through_v39_repair_observation_dispatch_preserves_version_parity(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
 ) -> None:
@@ -12419,12 +13250,16 @@ def test_v28_through_v37_repair_observation_dispatch_preserves_version_parity(
         slot_id=primary_id,
     )
     expected_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
-        if version == 37
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        if version == 39
         else (
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-            if version in {34, 35, 36}
-            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+            if version in {37, 38}
+            else (
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+                if version in {34, 35, 36}
+                else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+            )
         )
     )
     assert validation._expected_excluded_repair_observation_contract(
@@ -12433,7 +13268,184 @@ def test_v28_through_v37_repair_observation_dispatch_preserves_version_parity(
     assert expected_by_id[repair_id].slot_id == repair_id
 
 
-def test_v33_through_v37_preserve_all_inherited_semantic_dispatches(
+@pytest.mark.parametrize("version", (38, 39))
+def test_v38_history_and_v39_repair_runtime_gate_scope_are_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+) -> None:
+    manifest, coverage_runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=version,
+    )
+    validated = validation._validate_v25_coverage_runtime_document(
+        coverage_runtime,
+        manifest=manifest,
+        expected_by_id=expected_by_id,
+    )
+    primary_id, repair_id = validation._coverage_smoke_slot_ids(
+        manifest.manifest_id
+    )
+    primary = validated[primary_id]
+    repair = validated[repair_id]
+    primary_argv = primary["manager_argv_template"]["argv"]
+    repair_argv = repair["manager_argv_template"]["argv"]
+    probe = repair["excluded_repair_smoke_probe"]
+
+    assert CYCLE1_SELECTION_NOT_BEFORE_OPTION not in primary_argv
+    if version == 38:
+        assert CYCLE1_SELECTION_NOT_BEFORE_OPTION not in repair_argv
+        assert probe["semantic_delta"] == EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V2
+        assert (
+            probe["observation_contract"]
+            == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        )
+    else:
+        assert repair_argv.count(CYCLE1_SELECTION_NOT_BEFORE_OPTION) == 1
+        option_index = repair_argv.index(CYCLE1_SELECTION_NOT_BEFORE_OPTION)
+        assert repair_argv[option_index + 1] == CYCLE1_SELECTION_NOT_BEFORE_TOKEN
+        assert repair_argv.count(CYCLE1_SELECTION_NOT_BEFORE_TOKEN) == 1
+        assert probe["semantic_delta"] == EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
+        assert (
+            probe["observation_contract"]
+            == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        )
+
+    plan = build_factorial_plan(manifest)
+    campaign = json.loads(canonical_runtime_bytes(build_factorial_runtime(plan)))
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0]).runtime.as_document()
+    assert all(
+        CYCLE1_SELECTION_NOT_BEFORE_OPTION
+        not in slot["manager_argv_template"]["argv"]
+        for slot in campaign["slots"]
+    )
+    assert (
+        CYCLE1_SELECTION_NOT_BEFORE_OPTION
+        not in smoke["manager_argv_template"]["argv"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "mutation"),
+    (
+        (38, "gate"),
+        (38, "v4"),
+        (38, "delta-v3"),
+        (39, "missing-gate"),
+        (39, "v3"),
+        (39, "delta-v2"),
+    ),
+)
+def test_v38_v39_repair_runtime_gate_and_contracts_are_cross_version_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+    mutation: str,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=version,
+    )
+    repair_id = validation._coverage_smoke_slot_ids(manifest.manifest_id)[1]
+    repair = next(slot for slot in runtime["slots"] if slot["slot_id"] == repair_id)
+    argv = repair["manager_argv_template"]["argv"]
+    probe = repair["excluded_repair_smoke_probe"]
+    if mutation == "gate":
+        argv.extend(
+            (
+                CYCLE1_SELECTION_NOT_BEFORE_OPTION,
+                CYCLE1_SELECTION_NOT_BEFORE_TOKEN,
+            )
+        )
+    elif mutation == "v4":
+        probe["observation_contract"] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        repair["causal_acceptance"][
+            "excluded_repair_smoke_observation_contract"
+        ] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+    elif mutation == "delta-v3":
+        probe["semantic_delta"] = EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
+    elif mutation == "missing-gate":
+        index = argv.index(CYCLE1_SELECTION_NOT_BEFORE_OPTION)
+        del argv[index : index + 2]
+    elif mutation == "v3":
+        probe["observation_contract"] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        repair["causal_acceptance"][
+            "excluded_repair_smoke_observation_contract"
+        ] = EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+    else:
+        probe["semantic_delta"] = EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V2
+
+    with pytest.raises(FactorialValidationError):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+def test_v39_repair_manager_materialization_binds_exact_fault_end_plus_grace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _v39_candidate_manifest(monkeypatch)
+    plan = build_factorial_plan(manifest)
+    primary = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-066-n31-f5-b05-P"
+    )
+    repair = next(
+        slot for slot in plan.slots if slot.slot_id == "slot-037-n31-f2-b04-00"
+    )
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    spec = next(
+        slot for slot in coverage.runtime.slots if slot.slot_id == repair.slot_id
+    )
+    secrets = ManagerSecretMaterial(
+        manager_tls_private_key_der_hex="11" * 32,
+        manager_tls_certificate_der_hex="22" * 32,
+        issuer_private_key_hex="33" * 32,
+        replica_tls_certificate_der_hex=tuple(
+            f"{replica_id + 1:064x}" for replica_id in range(spec.replica_count)
+        ),
+    )
+    anchor_ns = 1_000_000_000
+    slot_root = tmp_path / "Kauri" / spec.result_path
+    argv = materialize_manager_argv(
+        spec,
+        slot_root,
+        secrets,
+        shared_raw_clock_anchor_ns=anchor_ns,
+    )
+    expected_fault_end_ns = anchor_ns + (
+        spec.fault_window.start_after_prelaunch_anchor_s
+        + spec.fault_window.duration_s
+    ) * 1_000_000_000
+    expected_gate_ns = expected_fault_end_ns + 5_000_000_000
+    hard_deadline_ns = anchor_ns + spec.fault_window.hard_timeout_s * 1_000_000_000
+
+    assert argv.count(CYCLE1_SELECTION_NOT_BEFORE_OPTION) == 1
+    option_index = argv.index(CYCLE1_SELECTION_NOT_BEFORE_OPTION)
+    assert argv[option_index + 1] == str(expected_gate_ns)
+    assert hard_deadline_ns - expected_gate_ns == 165_000_000_000
+    assert all(CYCLE1_SELECTION_NOT_BEFORE_TOKEN not in value for value in argv)
+
+    with pytest.raises(
+        manifest_module.FactorialManifestError,
+        match="cycle-1 selection|uint64|monotonic",
+    ):
+        materialize_manager_argv(
+            spec,
+            slot_root,
+            secrets,
+            shared_raw_clock_anchor_ns=(
+                validation._UINT64_MAX
+                - spec.fault_window.start_after_prelaunch_anchor_s
+                * 1_000_000_000
+            ),
+        )
+
+
+def test_v33_through_v39_preserve_all_inherited_semantic_dispatches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifests = (
@@ -12442,6 +13454,8 @@ def test_v33_through_v37_preserve_all_inherited_semantic_dispatches(
         _v35_candidate_manifest(monkeypatch),
         _v36_candidate_manifest(monkeypatch),
         _v37_candidate_manifest(monkeypatch),
+        _v38_candidate_manifest(monkeypatch),
+        _v39_candidate_manifest(monkeypatch),
     )
     predicates = (
         validation._uses_selection_visible_hard_timeout_witnesses,
@@ -12486,7 +13500,7 @@ def test_v36_runtime_rejects_missing_post_final_unmatched_commit_contract(
         )
 
 
-@pytest.mark.parametrize("version", (34, 35, 36, 37))
+@pytest.mark.parametrize("version", (34, 35, 36, 37, 38, 39))
 def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runtime(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
@@ -12504,9 +13518,13 @@ def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runti
         manifest.manifest_id
     )
     expected_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
-        if version == 37
-        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        if version == 39
+        else (
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+            if version in {37, 38}
+            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        )
     )
     assert validation._v34_excluded_repair_fault_active_phase_contract(
         manifest=manifest,
@@ -12579,7 +13597,7 @@ def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runti
         "result-path",
     ),
 )
-@pytest.mark.parametrize("version", (34, 35, 36, 37))
+@pytest.mark.parametrize("version", (34, 35, 36, 37, 38, 39))
 def test_v34_plus_fault_active_phase_contract_rejects_any_repair_binding_drift(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
@@ -12598,14 +13616,22 @@ def test_v34_plus_fault_active_phase_contract_rejects_any_repair_binding_drift(
         )
     )
     expected_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
-        if version == 37
-        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        if version == 39
+        else (
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+            if version in {37, 38}
+            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+        )
     )
     drift_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-        if version == 37
-        else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+        if version == 39
+        else (
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            if version in {37, 38}
+            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+        )
     )
     validated_contract = expected_contract
     if mutation == "missing-validated-observation":
@@ -12774,10 +13800,16 @@ def test_v33_profile_timing_contract_is_fail_closed(
         )
 
 
-def test_v37_static_timing_preserves_125ms_aggregation_per_depth(
+@pytest.mark.parametrize("version", (37, 38, 39))
+def test_v37_through_v39_static_timing_preserves_125ms_aggregation_per_depth(
     monkeypatch: pytest.MonkeyPatch,
+    version: int,
 ) -> None:
-    manifest = _v37_candidate_manifest(monkeypatch)
+    manifest = {
+        37: _v37_candidate_manifest,
+        38: _v38_candidate_manifest,
+        39: _v39_candidate_manifest,
+    }[version](monkeypatch)
     validation._validate_v33_static_timing_contract(manifest)
 
     with pytest.raises(FactorialValidationError, match="v37 exact 125ms"):
@@ -12888,9 +13920,19 @@ def test_v33_runtime_slot_rejects_any_deadline_or_schedule_drift(
             validation.V37_MANIFEST_ID,
             "results/shape-placement-factorial-v37/slot-037-n31-f2-b04-00",
         ),
+        (
+            38,
+            validation.V38_MANIFEST_ID,
+            "results/shape-placement-factorial-v38/slot-037-n31-f2-b04-00",
+        ),
+        (
+            39,
+            validation.FROZEN_MANIFEST_ID,
+            "results/shape-placement-factorial-v39/slot-037-n31-f2-b04-00",
+        ),
     ),
 )
-def test_v28_through_v37_campaign_and_exact_repair_runtime_are_independently_bound(
+def test_v28_through_v39_campaign_and_exact_repair_runtime_are_independently_bound(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     manifest_id: str,
@@ -12936,7 +13978,7 @@ def test_v28_through_v37_campaign_and_exact_repair_runtime_are_independently_bou
     primary = validated[primary_id]
     repair = validated[repair_id]
     probe = repair["excluded_repair_smoke_probe"]
-    expected_repair_duration_s = 330 if version == 37 else 300
+    expected_repair_duration_s = 330 if version in {37, 38, 39} else 300
     assert primary["fault_window"]["duration_s"] == 450
     assert "excluded_repair_smoke_probe" not in primary
     assert repair["fault_window"]["duration_s"] == expected_repair_duration_s
@@ -12945,7 +13987,13 @@ def test_v28_through_v37_campaign_and_exact_repair_runtime_are_independently_bou
     assert probe["source_campaign_slot_id"] == repair["slot_id"]
     assert probe["source_campaign_result_path"] == source_result_path
     assert probe["semantic_delta"] == (
-        f"byzantine.window.duration_s:450->{expected_repair_duration_s}"
+        EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
+        if version == 39
+        else (
+            EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V2
+            if version in {37, 38}
+            else f"byzantine.window.duration_s:450->{expected_repair_duration_s}"
+        )
     )
     assert probe["source_fault_window_duration_s"] == 450
     assert probe["effective_fault_window_duration_s"] == (
@@ -12953,12 +14001,16 @@ def test_v28_through_v37_campaign_and_exact_repair_runtime_are_independently_bou
     )
     assert probe["hard_timeout_s"] == 650
     assert probe["observation_contract"] == (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
-        if version == 37
+        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+        if version == 39
         else (
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
-            if version in {34, 35, 36}
-            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+            if version in {37, 38}
+            else (
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+                if version in {34, 35, 36}
+                else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT
+            )
         )
     )
     assert probe["verified_response_duplicate_probe_contract"] == (
@@ -12973,7 +14025,7 @@ def test_v28_through_v37_campaign_and_exact_repair_runtime_are_independently_bou
 
 @pytest.mark.parametrize(
     "version",
-    (28, 29, 30, 31, 32, 33, 34, 35, 36, 37),
+    (28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39),
 )
 @pytest.mark.parametrize(
     "mutation,reason",
@@ -12988,7 +14040,7 @@ def test_v28_through_v37_campaign_and_exact_repair_runtime_are_independently_bou
         ("missing-causal-contract", "causal acceptance contract"),
     ),
 )
-def test_v28_through_v37_exact_repair_runtime_are_fail_closed(
+def test_v28_through_v39_exact_repair_runtime_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
     mutation: str,
@@ -13010,7 +14062,7 @@ def test_v28_through_v37_exact_repair_runtime_are_fail_closed(
     elif mutation == "wrong-duration":
         repair["excluded_repair_smoke_probe"][
             "effective_fault_window_duration_s"
-        ] = 331 if version == 37 else 301
+        ] = 331 if version in {37, 38, 39} else 301
     elif mutation == "missing-repair-probe":
         repair.pop("excluded_repair_smoke_probe")
     elif mutation == "missing-probe-argv":
@@ -13037,13 +14089,15 @@ def test_v28_through_v37_exact_repair_runtime_are_fail_closed(
 
 
 @pytest.mark.parametrize("duration_s", (300, 329, 331, 360))
-def test_v37_s037_runtime_rejects_every_non_b330_duration(
+@pytest.mark.parametrize("version", (37, 38, 39))
+def test_v37_through_v39_s037_runtime_reject_every_non_b330_duration(
     monkeypatch: pytest.MonkeyPatch,
+    version: int,
     duration_s: int,
 ) -> None:
     manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
         monkeypatch,
-        version=37,
+        version=version,
     )
     repair = runtime["slots"][1]
     repair["fault_window"]["duration_s"] = duration_s
@@ -13057,13 +14111,15 @@ def test_v37_s037_runtime_rejects_every_non_b330_duration(
 
 
 @pytest.mark.parametrize("duration_s", (300, 329, 331, 360))
-def test_v37_s037_probe_rejects_every_non_b330_duration(
+@pytest.mark.parametrize("version", (37, 38, 39))
+def test_v37_through_v39_s037_probe_reject_every_non_b330_duration(
     monkeypatch: pytest.MonkeyPatch,
+    version: int,
     duration_s: int,
 ) -> None:
     manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
         monkeypatch,
-        version=37,
+        version=version,
     )
     probe = runtime["slots"][1]["excluded_repair_smoke_probe"]
     probe["effective_fault_window_duration_s"] = duration_s
@@ -13086,14 +14142,16 @@ def test_v37_s037_probe_rejects_every_non_b330_duration(
         ("observation_contract", EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2),
     ),
 )
-def test_v37_s037_probe_rejects_source_delta_hard_or_v3_drift(
+@pytest.mark.parametrize("version", (37, 38))
+def test_v37_v38_s037_probe_rejects_source_delta_hard_or_v3_drift(
     monkeypatch: pytest.MonkeyPatch,
+    version: int,
     field: str,
     value: object,
 ) -> None:
     manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
         monkeypatch,
-        version=37,
+        version=version,
     )
     probe = runtime["slots"][1]["excluded_repair_smoke_probe"]
     probe[field] = value
@@ -13107,12 +14165,44 @@ def test_v37_s037_probe_rejects_source_delta_hard_or_v3_drift(
         )
 
 
-def test_v37_s037_rejects_v2_causal_observation_contract(
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_fault_window_duration_s", 449),
+        ("semantic_delta", EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V2),
+        ("hard_timeout_s", 649),
+        ("observation_contract", EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3),
+    ),
+)
+def test_v39_s037_probe_rejects_source_delta_hard_or_v4_drift(
     monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
 ) -> None:
     manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
         monkeypatch,
-        version=37,
+        version=39,
+    )
+    probe = runtime["slots"][1]["excluded_repair_smoke_probe"]
+    probe[field] = value
+    runtime["excluded_repair_smoke_probe"] = copy.deepcopy(probe)
+
+    with pytest.raises(FactorialValidationError, match="probe runtime contract"):
+        validation._validate_v25_coverage_runtime_document(
+            runtime,
+            manifest=manifest,
+            expected_by_id=expected_by_id,
+        )
+
+
+@pytest.mark.parametrize("version", (37, 38))
+def test_v37_v38_s037_reject_v2_causal_observation_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+) -> None:
+    manifest, runtime, expected_by_id = _v25_coverage_runtime_fixture(
+        monkeypatch,
+        version=version,
     )
     runtime["slots"][1]["causal_acceptance"][
         "excluded_repair_smoke_observation_contract"
@@ -13126,39 +14216,45 @@ def test_v37_s037_rejects_v2_causal_observation_contract(
         )
 
 
-def test_v36_and_v37_repair_runtimes_reject_cross_version_validation(
+@pytest.mark.parametrize(
+    ("older_version", "newer_version"),
+    ((36, 37), (37, 38), (38, 39)),
+)
+def test_repair_runtimes_reject_cross_version_validation(
     monkeypatch: pytest.MonkeyPatch,
+    older_version: int,
+    newer_version: int,
 ) -> None:
-    v36_manifest, v36_runtime, v36_expected = _v25_coverage_runtime_fixture(
+    older_manifest, older_runtime, older_expected = _v25_coverage_runtime_fixture(
         monkeypatch,
-        version=36,
+        version=older_version,
     )
-    v37_manifest, v37_runtime, v37_expected = _v25_coverage_runtime_fixture(
+    newer_manifest, newer_runtime, newer_expected = _v25_coverage_runtime_fixture(
         monkeypatch,
-        version=37,
+        version=newer_version,
     )
     validation._validate_v25_coverage_runtime_document(
-        v36_runtime,
-        manifest=v36_manifest,
-        expected_by_id=v36_expected,
+        older_runtime,
+        manifest=older_manifest,
+        expected_by_id=older_expected,
     )
     validation._validate_v25_coverage_runtime_document(
-        v37_runtime,
-        manifest=v37_manifest,
-        expected_by_id=v37_expected,
+        newer_runtime,
+        manifest=newer_manifest,
+        expected_by_id=newer_expected,
     )
 
     with pytest.raises(FactorialValidationError):
         validation._validate_v25_coverage_runtime_document(
-            v37_runtime,
-            manifest=v36_manifest,
-            expected_by_id=v36_expected,
+            newer_runtime,
+            manifest=older_manifest,
+            expected_by_id=older_expected,
         )
     with pytest.raises(FactorialValidationError):
         validation._validate_v25_coverage_runtime_document(
-            v36_runtime,
-            manifest=v37_manifest,
-            expected_by_id=v37_expected,
+            older_runtime,
+            manifest=newer_manifest,
+            expected_by_id=newer_expected,
         )
 
 
