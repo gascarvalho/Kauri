@@ -431,7 +431,7 @@ def test_v42_repair_terminal_rejects_v41_path_alias_and_missing_contract(
     for candidate in mutations:
         with pytest.raises(
             execution.FactorialExecutionError,
-            match="exact v40/v41/v42/v43/v44 repair runtime",
+            match="exact v40/v41/v42/v43/v44/v45 repair runtime",
         ):
             execution._assert_v40_repair_runner_terminal_before_hard_deadline(
                 candidate,
@@ -525,4 +525,4 @@ def test_v42_is_validation_only_after_v43_rollover(
     assert cli.DEFAULT_MANIFEST != V42_MANIFEST
     assert cli.main(["--manifest", str(V42_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v43 are validation-only" in refusal["reason"]
+    assert "v1 through v44 are validation-only" in refusal["reason"]

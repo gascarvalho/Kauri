@@ -420,7 +420,7 @@ def test_v34_repair_runtime_and_execution_reject_self_consistent_v1_drift(
 def test_v35_is_default_and_v34_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v44.json"
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v45.json"
     assert cli.main(["--manifest", str(V34_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v43 are validation-only" in refusal["reason"]
+    assert "v1 through v44 are validation-only" in refusal["reason"]

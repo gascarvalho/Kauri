@@ -120,7 +120,7 @@ def test_v44_profile_is_exact_three_field_delta_from_v43() -> None:
     assert v44 == v43
 
 
-def test_v43_is_historical_and_v44_is_exactly_frozen() -> None:
+def test_v43_and_v44_are_exactly_historical() -> None:
     assert getattr(manifest_module, "V43_MANIFEST_ID", None) == (
         "shape-placement-factorial-v43"
     )
@@ -132,14 +132,13 @@ def test_v43_is_historical_and_v44_is_exactly_frozen() -> None:
         getattr(runtime_module, "V43_SMOKE_RUNTIME_SHA256", None),
         getattr(runtime_module, "V43_COVERAGE_SMOKE_RUNTIME_SHA256", None),
     ) == V43_SIX
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v44"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V44_MANIFEST_SHA256,
+        manifest_module.V44_SEMANTIC_SHA256,
+        manifest_module.V44_PLAN_SHA256,
+        runtime_module.V44_RUNTIME_SHA256,
+        runtime_module.V44_SMOKE_RUNTIME_SHA256,
+        runtime_module.V44_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == V44_SIX
 
 
@@ -355,10 +354,10 @@ def test_v44_native_manager_policy_and_timing_match_v43(
         )
 
 
-def test_v44_is_default_and_v43_is_validation_only(
+def test_v45_is_default_and_v44_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V44_MANIFEST
-    assert cli.main(["--manifest", str(V43_MANIFEST), "plan"]) == 2
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v45.json"
+    assert cli.main(["--manifest", str(V44_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v43 are validation-only" in refusal["reason"]
+    assert "v1 through v44 are validation-only" in refusal["reason"]

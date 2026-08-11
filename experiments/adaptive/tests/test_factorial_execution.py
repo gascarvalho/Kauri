@@ -1330,6 +1330,272 @@ def test_transition_ready_joins_one_immutable_stream_snapshot(
     assert all(current is snapshot for current in join_snapshots)
 
 
+def test_final_drain_poll_reads_only_the_authoritative_observer(
+    tmp_path: Path,
+    template_slot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = execution.build_slot_runtime(template_slot)
+    anchor_ns = execution.NANOSECONDS_PER_SECOND
+    digest1 = "11" * 32
+    digest2 = "22" * 32
+
+    def replica_event(
+        event_type: str,
+        *,
+        sequence: int,
+        timestamp_s: int,
+        epoch_number: int = 0,
+        epoch_digest: str = "00" * 32,
+    ) -> execution._Event:
+        payload: dict[str, object] = {}
+        if event_type == "epoch.activated":
+            payload = {
+                "epoch_number": epoch_number,
+                "tree_id": 0,
+                "epoch_digest": epoch_digest,
+                "activation_height": sequence + 5,
+            }
+        elif event_type == "block.committed":
+            block_hash = f"{sequence:064x}"
+            payload = {
+                "block_height": sequence,
+                "block_hash": block_hash,
+                "parent_hash": "33" * 32,
+                "transaction_count": 1_000,
+                "decision_proof": {
+                    "epoch_number": epoch_number,
+                    "tree_id": 0,
+                    "epoch_digest": epoch_digest,
+                    "block_hash": block_hash,
+                },
+            }
+        return _event(
+            spec,
+            replica_id=0,
+            sequence=sequence,
+            timestamp_ns=anchor_ns
+            + timestamp_s * execution.NANOSECONDS_PER_SECOND,
+            event_type=event_type,
+            payload=payload,
+        )
+
+    def manager_event(
+        event_type: str,
+        *,
+        sequence: int,
+        timestamp_s: int,
+        cycle_ordinal: int,
+    ) -> execution._Event:
+        return execution._Event(
+            source="adaptive-manager",
+            relative_path=spec.structured_events.manager_output_relative_path,
+            line_number=sequence,
+            value={
+                "source_sequence": sequence,
+                "source_monotonic_ns": anchor_ns
+                + timestamp_s * execution.NANOSECONDS_PER_SECOND,
+                "event_type": event_type,
+                "payload": {"cycle_ordinal": cycle_ordinal},
+            },
+            line_sha256=f"{sequence:064x}",
+        )
+
+    baseline = replica_event("block.committed", sequence=1, timestamp_s=149)
+    selection1 = manager_event(
+        "adaptive_v2_evidence_snapshot",
+        sequence=2,
+        timestamp_s=200,
+        cycle_ordinal=0,
+    )
+    command1 = replica_event(
+        "epoch.command_committed", sequence=3, timestamp_s=201
+    )
+    activation1 = replica_event(
+        "epoch.activated",
+        sequence=4,
+        timestamp_s=202,
+        epoch_number=1,
+        epoch_digest=digest1,
+    )
+    terminal1 = manager_event(
+        "adaptive_v2_session_terminal",
+        sequence=5,
+        timestamp_s=203,
+        cycle_ordinal=0,
+    )
+    stable1 = replica_event(
+        "block.committed",
+        sequence=6,
+        timestamp_s=204,
+        epoch_number=1,
+        epoch_digest=digest1,
+    )
+    selection2 = manager_event(
+        "adaptive_v2_shape_decision",
+        sequence=7,
+        timestamp_s=300,
+        cycle_ordinal=1,
+    )
+    command2 = replica_event(
+        "epoch.command_committed", sequence=8, timestamp_s=301
+    )
+    activation2 = replica_event(
+        "epoch.activated",
+        sequence=9,
+        timestamp_s=302,
+        epoch_number=2,
+        epoch_digest=digest2,
+    )
+    terminal2 = manager_event(
+        "adaptive_v2_session_terminal",
+        sequence=10,
+        timestamp_s=303,
+        cycle_ordinal=1,
+    )
+    stable2 = replica_event(
+        "block.committed",
+        sequence=11,
+        timestamp_s=304,
+        epoch_number=2,
+        epoch_digest=digest2,
+    )
+    drain = replica_event(
+        "block.committed",
+        sequence=12,
+        timestamp_s=355,
+        epoch_number=2,
+        epoch_digest=digest2,
+    )
+    observer_reads = 0
+
+    def read_observer(*_args: object, **_kwargs: object):
+        nonlocal observer_reads
+        observer_reads += 1
+        return (drain,)
+
+    def forbidden_full_stream_read(*_args: object, **_kwargs: object):
+        raise AssertionError("final drain poll reparsed every structured stream")
+
+    def wait_until(description: str, predicate, **_kwargs: Any):
+        if description.startswith("all "):
+            return anchor_ns
+        if description.startswith("fixed pre-fault baseline"):
+            return baseline, {
+                "identity": {
+                    "decision_proof": {
+                        "epoch_number": 0,
+                        "epoch_digest": "00" * 32,
+                    }
+                }
+            }
+        if description.startswith("fixed fault-evidence window"):
+            return True
+        if description.startswith("manager selection anchor for epoch-1"):
+            return selection1
+        if description.startswith("exact epoch-1 command"):
+            return command1, activation1, selection1, terminal1
+        if description.startswith("first authoritative epoch-1"):
+            return stable1
+        if description.startswith("fixed epoch-1 stable"):
+            return {"identity": {"decision_proof": {}}}
+        if description.startswith("manager selection anchor for epoch-2"):
+            return selection2
+        if description.startswith("exact epoch-2 command"):
+            return command2, activation2, selection2, terminal2
+        if description.startswith("first authoritative epoch-2"):
+            return stable2
+        if description.startswith("fixed epoch-2 stable"):
+            return {"identity": {"decision_proof": {}}}
+        assert description == "post-epoch-2 drain and authoritative commit"
+        return predicate()
+
+    monkeypatch.setattr(execution, "_wait_until", wait_until)
+    monkeypatch.setattr(execution, "read_event_streams", forbidden_full_stream_read)
+    monkeypatch.setattr(
+        execution,
+        "_read_commit_observer_event_stream",
+        read_observer,
+        raising=False,
+    )
+    (tmp_path / "slot.json").write_bytes(b"slot-receipt")
+
+    observed = execution.observe_slot_phases(
+        spec,
+        tmp_path,
+        (),
+        shared_raw_clock_anchor_ns=anchor_ns,
+        hard_deadline_ns=anchor_ns
+        + spec.fault_window.hard_timeout_s
+        * execution.NANOSECONDS_PER_SECOND,
+        raw_now_ns=lambda: anchor_ns,
+        sleep=lambda _seconds: None,
+    )
+
+    assert observer_reads == 1
+    assert observed["cutoffs"][-1]["source_monotonic_ns"] == drain.timestamp_ns
+
+
+def test_commit_observer_reader_binds_exact_source_instance_and_path(
+    tmp_path: Path,
+    template_slot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = execution.build_slot_runtime(template_slot)
+    contract = spec.structured_events
+    observed: list[dict[str, object]] = []
+
+    def read_event_file(
+        passed_spec,
+        passed_directory,
+        **kwargs: object,
+    ) -> tuple[execution._Event, ...]:
+        assert passed_spec is spec
+        assert passed_directory == tmp_path
+        observed.append(kwargs)
+        return ()
+
+    monkeypatch.setattr(execution, "_read_event_file", read_event_file)
+
+    assert execution._read_commit_observer_event_stream(
+        spec,
+        tmp_path,
+        allow_partial=True,
+    ) == ()
+    assert observed == [
+        {
+            "source": contract.commit_observer_id,
+            "instance": contract.replica_source_instances[0],
+            "relative_path": contract.replica_output_relative_paths[0],
+            "allow_partial": True,
+        }
+    ]
+
+
+def test_commit_observer_reader_rejects_a_nonreplica_source(
+    tmp_path: Path,
+    template_slot,
+) -> None:
+    spec = execution.build_slot_runtime(template_slot)
+    malformed = replace(
+        spec,
+        structured_events=replace(
+            spec.structured_events,
+            commit_observer_id="adaptive-manager",
+        ),
+    )
+
+    with pytest.raises(
+        execution.FactorialExecutionError,
+        match="commit observer is not an exact replica source",
+    ):
+        execution._read_commit_observer_event_stream(
+            malformed,
+            tmp_path,
+            allow_partial=True,
+        )
+
+
 def test_v27_schedule_contains_observed_slow_poll_timeline_and_v26_does_not() -> None:
     v26 = json.loads(
         (

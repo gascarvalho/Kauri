@@ -109,6 +109,9 @@ V43_MANIFEST_PATH = (
 V44_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v44.json"
 )
+V45_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v45.json"
+)
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
 )
@@ -888,6 +891,29 @@ def _v44_candidate_plan(monkeypatch: pytest.MonkeyPatch):
     del monkeypatch
     manifest = load_frozen_manifest(V44_MANIFEST_PATH)
     return manifest, build_factorial_plan(manifest)
+
+
+def _v45_candidate_plan(monkeypatch: pytest.MonkeyPatch):
+    payload = V45_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    manifest = manifest_module.parse_manifest_bytes(payload)
+    plan = build_factorial_plan(manifest)
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_MANIFEST_SHA256",
+        manifest.manifest_sha256,
+    )
+    monkeypatch.setattr(
+        manifest_module,
+        "FROZEN_PLAN_SHA256",
+        plan.plan_sha256,
+    )
+    return manifest, plan
 
 
 def _native_event(
@@ -2211,7 +2237,7 @@ def test_validator_v43_identities_are_exactly_frozen() -> None:
 
 def test_validator_v44_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V44_MANIFEST_ID
     )
     manifest_payload = V44_MANIFEST_PATH.read_bytes()
     manifest = load_frozen_manifest(V44_MANIFEST_PATH)
@@ -2231,6 +2257,65 @@ def test_validator_v44_identities_are_exactly_frozen() -> None:
         "fa6cb7313c58aaa45a859d3193d499ebc0fd811253ae19350ac5af8bc21065a5",
         "17bb2b9be77edc679be895beabcd06e9714bf72ae39c4e41d2c3a38ac70fcee0",
         "5508460d3488e830e43c6898c5396dcffa0478c8f98d0035f61571cd708d66fa",
+    )
+    producer_six = (
+        manifest_module.V44_MANIFEST_SHA256,
+        manifest_module.V44_SEMANTIC_SHA256,
+        manifest_module.V44_PLAN_SHA256,
+        runtime_module.V44_RUNTIME_SHA256,
+        runtime_module.V44_SMOKE_RUNTIME_SHA256,
+        runtime_module.V44_COVERAGE_SMOKE_RUNTIME_SHA256,
+    )
+    validator_six = (
+        identity.manifest_sha256,
+        manifest_module.V44_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    )
+    disk_six = (
+        hashlib.sha256(manifest_payload).hexdigest(),
+        hashlib.sha256(_canonical(json.loads(manifest_payload))).hexdigest(),
+        plan.plan_sha256,
+        hashlib.sha256(canonical_runtime_bytes(campaign_runtime)).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(smoke.runtime.as_document())
+        ).hexdigest(),
+        hashlib.sha256(
+            execution._canonical_json_bytes(coverage.runtime.as_document())
+        ).hexdigest(),
+    )
+
+    assert validation.V44_MANIFEST_ID == "shape-placement-factorial-v44"
+    assert producer_six == validator_six == disk_six == expected_six
+    assert validation._coverage_smoke_result_root(
+        validation.V44_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v44-coverage-smoke"
+
+
+def test_validator_v45_identities_are_exactly_frozen_and_path_isolated() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+    manifest_payload = V45_MANIFEST_PATH.read_bytes()
+    manifest = load_frozen_manifest(V45_MANIFEST_PATH)
+    plan = build_factorial_plan(manifest)
+    campaign_runtime = build_factorial_runtime(plan)
+    smoke = execution.build_n7_ps_smoke_slot(plan.slots[0])
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    expected_six = (
+        "aab7a4f9155c3a0a25fb4254a1ace9561fd2e82e7b841e18d42fca78ae578b73",
+        "6d5308d42d3a84746bc7169156a9ef756a7d4acd282c2dab9c53e62a9070841e",
+        "785057ccebe1dbdd8185f2710374558ef41ffa5e1d60c1b4d6094df8909becdf",
+        "b60c39867611e29f0a71fc13de903baac03a99a0069cb6efda659d697b9c2636",
+        "1233efc18d8c10e04e0d6e82a5ab9fdd85b8f87023d68f3202aa9fa526bf9dad",
+        "6d757b20042bd14d915f05f4eea2bc998655778bcb6b20ba2e934b9649e4f4f3",
     )
     producer_six = (
         manifest_module.FROZEN_MANIFEST_SHA256,
@@ -2261,11 +2346,33 @@ def test_validator_v44_identities_are_exactly_frozen() -> None:
         ).hexdigest(),
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v44"
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v45"
     assert producer_six == validator_six == disk_six == expected_six
     assert validation._coverage_smoke_result_root(
         validation.FROZEN_MANIFEST_ID
-    ) == "results/shape-placement-factorial-v44-coverage-smoke"
+    ) == "results/shape-placement-factorial-v45-coverage-smoke"
+
+    slot_id = validation.EXCLUDED_COVERAGE_SMOKE_SLOT_ID
+    v44_slot = (
+        Path(validation.V44_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT) / slot_id
+    )
+    v45_slot = Path(validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT) / slot_id
+    assert validation._is_excluded_coverage_smoke_slot(
+        v44_slot,
+        manifest_id=validation.V44_MANIFEST_ID,
+    )
+    assert validation._is_excluded_coverage_smoke_slot(
+        v45_slot,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v44_slot,
+        manifest_id=validation.FROZEN_MANIFEST_ID,
+    )
+    assert not validation._is_excluded_coverage_smoke_slot(
+        v45_slot,
+        manifest_id=validation.V44_MANIFEST_ID,
+    )
 
 
 @pytest.mark.parametrize(
@@ -4958,12 +5065,13 @@ def test_v44_retention_ready_selects_later_exact_causal_facts_independently(
     )
 
 
-def test_validate_slot_dispatches_v44_only_to_independent_causal_selection(
+def test_validate_slot_dispatches_v44_v45_only_to_independent_causal_selection(
 ) -> None:
     source = inspect.getsource(validation.validate_slot)
     dispatch = """retention_validator = (
                 _validate_v44_cross_commit_retention_ready
-                if manifest.manifest_id == FROZEN_MANIFEST_ID
+                if manifest.manifest_id
+                in {V44_MANIFEST_ID, FROZEN_MANIFEST_ID}
                 else _validate_v42_cross_commit_retention_ready
             )"""
 
@@ -5443,7 +5551,8 @@ def _assert_v42_plus_runtime_retention_scope_partition(
             "admission_policy",
         }
         if (
-            manifest.manifest_id == validation.FROZEN_MANIFEST_ID
+            manifest.manifest_id
+            in {validation.V44_MANIFEST_ID, validation.FROZEN_MANIFEST_ID}
             and not repair_runtime
         ):
             expected_fields.update(
@@ -5510,6 +5619,111 @@ def test_v44_runtime_retention_scope_partition_is_exact(
     )
 
 
+def test_v45_runtime_retention_scope_partition_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_v42_plus_runtime_retention_scope_partition(
+        *_v45_candidate_plan(monkeypatch)
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_candidate", "other_candidate"),
+    (
+        (_v44_candidate_plan, _v45_candidate_plan),
+        (_v45_candidate_plan, _v44_candidate_plan),
+    ),
+)
+def test_v44_v45_runtime_paths_and_artifact_identities_are_cross_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    source_candidate,
+    other_candidate,
+) -> None:
+    source_manifest, source_plan = source_candidate(monkeypatch)
+    other_manifest, other_plan = other_candidate(monkeypatch)
+    source_runtime = build_factorial_runtime(source_plan)
+    other_runtime = build_factorial_runtime(other_plan)
+    source_spec = source_runtime.slots[0]
+    other_spec = other_runtime.slots[0]
+    source_document = json.loads(_canonical(source_spec.as_document()))
+    source_expected = next(
+        slot
+        for slot in validation._expected_slots(source_manifest)
+        if slot.slot_id == source_spec.slot_id
+    )
+
+    assert source_manifest.manifest_id != other_manifest.manifest_id
+    assert source_runtime.runtime_id != other_runtime.runtime_id
+    assert source_runtime.manifest_id != other_runtime.manifest_id
+    assert validation._frozen_artifact_identity(
+        source_manifest.manifest_id
+    ) != validation._frozen_artifact_identity(other_manifest.manifest_id)
+    assert source_spec.result_path != other_spec.result_path
+    validation._validate_runtime_slot(
+        source_document,
+        source_expected,
+        source_manifest,
+    )
+
+    source_document["result_path"] = other_spec.result_path
+    with pytest.raises(FactorialValidationError, match="exact slot scope"):
+        validation._validate_runtime_slot(
+            source_document,
+            source_expected,
+            source_manifest,
+        )
+
+
+@pytest.mark.parametrize(
+    "candidate_plan",
+    (_v44_candidate_plan, _v45_candidate_plan),
+)
+def test_v44_v45_s037_stays_legacy_v6_delta_v5_and_n7_stays_ungated(
+    monkeypatch: pytest.MonkeyPatch,
+    candidate_plan,
+) -> None:
+    manifest, plan = candidate_plan(monkeypatch)
+    primary = next(slot for slot in plan.slots if slot.execution_ordinal == 1)
+    repair = next(slot for slot in plan.slots if slot.execution_ordinal == 5)
+    coverage = execution.build_n31_coverage_smoke_slot(
+        primary,
+        repair_template=repair,
+    )
+    repair_runtime = json.loads(
+        _canonical(coverage.runtimes[1].as_document())
+    )
+    repair_contract = repair_runtime[
+        "cycle1_responsive_cross_commit_retention"
+    ]
+    smoke_runtime = json.loads(
+        _canonical(
+            execution.build_n7_ps_smoke_slot(plan.slots[0]).runtime.as_document()
+        )
+    )
+
+    assert set(repair_contract) == {
+        "scope",
+        "observation_schema_version",
+        "responsive_degraded_actor_ids",
+        "admission_policy",
+    }
+    assert repair_contract["scope"] == "excluded_repair_s037_v1"
+    assert repair_contract["admission_policy"] == (
+        "one_per_actor_with_global_aggregate_v1"
+    )
+    assert repair_runtime["excluded_repair_smoke_probe"][
+        "observation_contract"
+    ] == manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
+    assert repair_runtime["excluded_repair_smoke_probe"][
+        "semantic_delta"
+    ] == runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
+    assert "cycle1_responsive_cross_commit_retention" not in smoke_runtime
+    assert (
+        runtime_module.CYCLE1_RESPONSIVE_CROSS_COMMIT_RETENTION_READINESS_GATE_OPTION
+        not in smoke_runtime["manager_argv_template"]["argv"]
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     (
@@ -5521,7 +5735,7 @@ def test_v44_runtime_retention_scope_partition_is_exact(
         ("extra", "field set"),
     ),
 )
-@pytest.mark.parametrize("manifest_version", ("v42", "v43", "v44"))
+@pytest.mark.parametrize("manifest_version", ("v42", "v43", "v44", "v45"))
 def test_v42_plus_runtime_retention_contract_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     mutation: str,
@@ -5532,6 +5746,7 @@ def test_v42_plus_runtime_retention_contract_fails_closed(
         "v42": _v42_candidate_plan,
         "v43": _v43_candidate_plan,
         "v44": _v44_candidate_plan,
+        "v45": _v45_candidate_plan,
     }[manifest_version]
     manifest, plan = candidate_plan(monkeypatch)
     spec = build_factorial_runtime(plan).slots[0]
@@ -5578,12 +5793,17 @@ def test_v42_plus_runtime_retention_contract_fails_closed(
     ),
 )
 @pytest.mark.parametrize("mutation", ("missing", "wrong"))
-def test_v44_runtime_two_stage_retention_contract_fails_closed(
+@pytest.mark.parametrize(
+    "candidate_plan",
+    (_v44_candidate_plan, _v45_candidate_plan),
+)
+def test_v44_v45_runtime_two_stage_retention_contract_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
     mutation: str,
+    candidate_plan,
 ) -> None:
-    manifest, plan = _v44_candidate_plan(monkeypatch)
+    manifest, plan = candidate_plan(monkeypatch)
     spec = build_factorial_runtime(plan).slots[0]
     document = json.loads(_canonical(spec.as_document()))
     expected = next(
@@ -5612,6 +5832,7 @@ def test_v44_runtime_two_stage_retention_contract_fails_closed(
     (
         validation.V42_MANIFEST_ID,
         validation.V43_MANIFEST_ID,
+        validation.V44_MANIFEST_ID,
         validation.FROZEN_MANIFEST_ID,
     ),
 )
@@ -15860,6 +16081,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-037-n31-f2-b04-00",
     )
     assert validation._coverage_smoke_slot_ids(validation.V43_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
+    assert validation._coverage_smoke_slot_ids(validation.V44_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
