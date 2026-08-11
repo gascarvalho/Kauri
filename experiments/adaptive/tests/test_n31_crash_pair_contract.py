@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import importlib
 import json
@@ -28,9 +28,55 @@ COMMON_WITNESSES = SURVIVORS[:Q]
 E0_DIGEST = "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
 MEMBERSHIP_DIGEST = "107f6e39481091529f50db1c6e32a72518cf50a971b074506bed095cb09769d9"
 RUN_ID = "n31-pair-contract"
-EVIDENCE_CUTOFF = N
+BASELINE_EVIDENCE_CUTOFF = N
+EVIDENCE_CUTOFF = N + len(CRASHED) + 2 * N
 ISSUER_PRIVATE_KEY = 1
 ISSUER_PUBLIC_KEY = "02" + f"{factorial_validation._SECP256K1_GX:064x}"
+NATIVE_SNAPSHOT_SEED = 41_719
+NATIVE_PLACEMENT_POLICY = "adaptive-v2-performance-optimization-v1"
+NATIVE_RESPONSIVENESS_POLICY = {
+    "schema_version": 1,
+    "policy_version": "adaptive-v2-controller-responsiveness-v1",
+    "attempt_window": 32,
+    "minimum_attempts": 2,
+    "minimum_response_rate_ppm": 750_000,
+    "maximum_timeout_rate_ppm": 250_000,
+    "trailing_timeout_streak": 2,
+    "latency_percentile_basis_points": 5_000,
+}
+TLS_PRIVATE_KEY_DER_HEX = (
+    "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420"
+    "b82c0bdb45a4f35aa0d93cbe748f004569f21718d0defac048191504793df7aea1440342"
+    "00046e69536068e139a32004510031c7386f14317bd9ac12a2017097db665e8cc69754e2"
+    "23f8c4336a0969b342e41d2ca2a47d63e2086807492e27ef1bb3418b8d2b"
+)
+MISMATCHED_TLS_PRIVATE_KEY_DER_HEX = (
+    "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420"
+    "6e2465c805f69dce7b8a3fdc3e283a5e98ff8865359be05cb01c247eafb82a37a1440342"
+    "0004c52c0d8fc13377057c7ef874f0b4d62ec31aa537cd2f288cb40b742ddfc5a27224cd"
+    "5639da641a61ddb20688aefb66d626d92d21e42da5bef4fffc62dd10cf77"
+)
+TLS_CERTIFICATE_DER_HEX = (
+    "3082017e30820125a00302010202141c7bac9fe94894fbde767b2dd08d586589fe46fc300a"
+    "06082a8648ce3d04030230153113301106035504030c0a6b617572692d74657374301e170d"
+    "3236303831313232313231365a170d3336303830383232313231365a301531133011060355"
+    "04030c0a6b617572692d746573743059301306072a8648ce3d020106082a8648ce3d030107"
+    "034200046e69536068e139a32004510031c7386f14317bd9ac12a2017097db665e8cc69754"
+    "e223f8c4336a0969b342e41d2ca2a47d63e2086807492e27ef1bb3418b8d2ba353305130"
+    "1d0603551d0e04160414bf9792b0eefe85658a4118d62f1cca91f3cd9105301f0603551d"
+    "23041830168014bf9792b0eefe85658a4118d62f1cca91f3cd9105300f0603551d130101ff"
+    "040530030101ff300a06082a8648ce3d040302034700304402204bdf256a6a8e8564b7e3f"
+    "722fcf86f41d63c194c04418dcfc025f208d0d0650a02201f4aa3ba8b44147d116bf6ff1"
+    "40a83b85b0e21713888ca52e3a1a62ef523799b"
+)
+
+
+def _replica_certificate_der_hex(replica: int) -> str:
+    certificate = bytearray.fromhex(TLS_CERTIFICATE_DER_HEX)
+    serial = bytes.fromhex("1c7bac9fe94894fbde767b2dd08d586589fe46fc")
+    offset = certificate.index(serial)
+    certificate[offset + len(serial) - 1] ^= replica + 1
+    return certificate.hex()
 
 
 def _subject() -> Any:
@@ -570,29 +616,113 @@ def test_atomic_sigkill_validation_rejects_runtime_evidence_drift(mutation: str)
         )
 
 
+def _safe_manager_boundary() -> tuple[tuple[str, ...], dict[str, object]]:
+    transitions = (
+        {
+            "apply_shape_selection": False,
+            "bundle_path": "transitions/e0-to-e1-containment/successor.bundle",
+            "containment_baseline_root_source": "live_predecessor_roots",
+            "evidence_snapshot_path": "transitions/e0-to-e1-containment/evidence-snapshot.json",
+            "evidence_window_rule": "fresh_exact_predecessor_after_common_commit",
+            "minimum_post_baseline_observation_ms": 0,
+            "minimum_predecessor_residency_ms": 0,
+            "policy_intent": "fault_containment",
+            "policy_parameters": {},
+            "predecessor_epoch_number": 0,
+            "successor_epoch_number": 1,
+            "transition_artifact_id": "e0-to-e1-containment",
+        },
+        {
+            "apply_shape_selection": True,
+            "bundle_path": "transitions/e1-to-e2-optimization/successor.bundle",
+            "evidence_snapshot_path": "transitions/e1-to-e2-optimization/evidence-snapshot.json",
+            "evidence_window_rule": "fresh_exact_predecessor_after_common_commit",
+            "minimum_post_baseline_observation_ms": 0,
+            "minimum_predecessor_residency_ms": 40_000,
+            "policy_intent": "performance_optimization",
+            "policy_parameters": {},
+            "predecessor_epoch_number": 1,
+            "successor_epoch_number": 2,
+            "transition_artifact_id": "e1-to-e2-optimization",
+        },
+    )
+    transition_json = tuple(_canonical(item).decode("ascii").rstrip("\n") for item in transitions)
+    argv = (
+        "adaptation-manager",
+        "--listen", "127.0.0.1:19000",
+        "--tls-privkey", TLS_PRIVATE_KEY_DER_HEX,
+        "--tls-cert", TLS_CERTIFICATE_DER_HEX,
+        "--issuer-id", "1",
+        "--issuer-private-key", f"{ISSUER_PRIVATE_KEY:064x}",
+        "--activation-delay-blocks", "5",
+        "--convergence-deadline-seconds", "30",
+        "--tree-fanout", str(FANOUT),
+        "--pipeline-stretch", str(PIPELINE),
+        "--shape-candidate-fanouts", str(FANOUT),
+        "--shape-deterministic-seed", str(NATIVE_SNAPSHOT_SEED),
+        "--responsiveness-policy-version", str(NATIVE_RESPONSIVENESS_POLICY["policy_version"]),
+        "--required-nonresponsive", str(len(CRASHED)),
+        "--responsiveness-attempt-window", str(NATIVE_RESPONSIVENESS_POLICY["attempt_window"]),
+        "--responsiveness-minimum-attempts", str(NATIVE_RESPONSIVENESS_POLICY["minimum_attempts"]),
+        "--responsiveness-minimum-response-rate-ppm", str(NATIVE_RESPONSIVENESS_POLICY["minimum_response_rate_ppm"]),
+        "--responsiveness-maximum-timeout-rate-ppm", str(NATIVE_RESPONSIVENESS_POLICY["maximum_timeout_rate_ppm"]),
+        "--responsiveness-trailing-timeout-streak", str(NATIVE_RESPONSIVENESS_POLICY["trailing_timeout_streak"]),
+        "--responsiveness-latency-percentile-basis-points", str(NATIVE_RESPONSIVENESS_POLICY["latency_percentile_basis_points"]),
+        "--transition-request", transition_json[0],
+        "--bundle-output", "/tmp/kauri-n31/transitions/e0-to-e1-containment/successor.bundle",
+        "--transition-request", transition_json[1],
+        "--bundle-output", "/tmp/kauri-n31/transitions/e1-to-e2-optimization/successor.bundle",
+        "--structured-event-run-id", RUN_ID,
+        "--structured-event-source-instance", f"{RUN_ID}-adaptive-manager",
+        "--structured-event-output", "/tmp/kauri-n31/raw/manager-events.jsonl",
+        *tuple(
+            value
+            for replica in range(N)
+            for value in (
+                "--replica",
+                f"{replica},127.0.0.1:{20_000 + replica},{_replica_certificate_der_hex(replica)}",
+            )
+        ),
+    )
+    return argv, {
+        "input_source": "normalized_manager_launch_boundary_v1",
+        "requested_argv": list(argv),
+        "observed_argv": list(argv),
+        "stdin": "closed",
+    }
+
+
 @pytest.mark.parametrize(
-    "manager_argv,manager_input",
+    "mutation",
     (
-        (("manager", "--crash-targets", "22,23,24"), {"evidence_path": "runtime.jsonl"}),
-        (("manager",), {"target_pgids": [20_022, 20_023, 20_024]}),
+        "truth",
+        "input",
+        "unknown",
+        "experiment",
+        "mismatch",
+        "relative-output",
+        "duplicate-cert",
+        "manager-cert-collision",
+        "duplicate-address",
+        "odd-hex",
+        "non-der",
+        "outer-tlv",
+        "malformed-x509",
+        "malformed-pkcs8",
+        "key-cert-mismatch",
     ),
 )
-def test_manager_boundary_rejects_fault_truth(
-    manager_argv: Sequence[str], manager_input: Mapping[str, object]
-) -> None:
+def test_manager_boundary_rejects_fault_truth(mutation: str) -> None:
     plan, _, _, _ = _fault_evidence()
-    safe_argv = (
-        "manager",
-        "--runtime-evidence",
-        "raw/runtime-events.jsonl",
-        "--command-output",
-        "raw/manager-commands.jsonl",
-    )
-    safe_input = {
-        "input_source": "authenticated_runtime_evidence_only",
-        "runtime_evidence_path": "raw/runtime-events.jsonl",
-        "command_output_path": "raw/manager-commands.jsonl",
-    }
+    safe_argv, safe_input = _safe_manager_boundary()
+    replica_arguments = [
+        safe_argv[index + 1]
+        for index, value in enumerate(safe_argv)
+        if value == "--replica"
+    ]
+    replica_certificates = [value.rsplit(",", 1)[1] for value in replica_arguments]
+    assert len(set(replica_arguments)) == len(set(replica_certificates)) == N
+    assert TLS_CERTIFICATE_DER_HEX not in replica_certificates
     proof = _document(
         _subject().validate_manager_blinding(
             fault_plan=plan,
@@ -603,7 +733,66 @@ def test_manager_boundary_rejects_fault_truth(
     assert proof["blinded"] is True
     assert proof["manager_cli_args_fault_truth_free"] is True
     assert proof["manager_input_fault_truth_free"] is True
-    assert proof["input_source"] == "authenticated_runtime_evidence_only"
+    assert proof["requested_observed_argv_identical"] is True
+    assert proof["input_source"] == "normalized_manager_launch_boundary_v1"
+
+    manager_argv = list(safe_argv)
+    manager_input = deepcopy(safe_input)
+    if mutation == "truth":
+        manager_argv.extend(("--crash-targets", "22,23,24"))
+    elif mutation == "input":
+        manager_input["target_pgids"] = [20_022, 20_023, 20_024]
+    elif mutation == "unknown":
+        manager_argv.extend(("--unreviewed-option", "1"))
+    elif mutation == "experiment":
+        manager_argv.extend(("--experiment-drop-bundle-attempt", "1"))
+    elif mutation == "mismatch":
+        manager_input["observed_argv"] = list(safe_argv[:-2])
+    elif mutation == "relative-output":
+        index = manager_argv.index("--bundle-output") + 1
+        manager_argv[index] = manager_argv[index][1:]
+    elif mutation in {"duplicate-cert", "manager-cert-collision", "duplicate-address"}:
+        indices = [
+            index + 1
+            for index, value in enumerate(manager_argv)
+            if value == "--replica"
+        ]
+        if mutation == "duplicate-cert":
+            second = manager_argv[indices[1]].rsplit(",", 1)[0]
+            first_certificate = manager_argv[indices[0]].rsplit(",", 1)[1]
+            manager_argv[indices[1]] = f"{second},{first_certificate}"
+        elif mutation == "manager-cert-collision":
+            first = manager_argv[indices[0]].rsplit(",", 1)[0]
+            manager_argv[indices[0]] = f"{first},{TLS_CERTIFICATE_DER_HEX}"
+        else:
+            first_id, first_address, _first_certificate = manager_argv[
+                indices[0]
+            ].split(",")
+            second_id, _second_address, second_certificate = manager_argv[
+                indices[1]
+            ].split(",")
+            assert first_id != second_id
+            manager_argv[indices[1]] = (
+                f"{second_id},{first_address},{second_certificate}"
+            )
+    elif mutation == "odd-hex":
+        manager_argv[manager_argv.index("--tls-cert") + 1] = "abc"
+    elif mutation == "non-der":
+        manager_argv[manager_argv.index("--tls-cert") + 1] = "00"
+    elif mutation == "outer-tlv":
+        manager_argv[manager_argv.index("--tls-cert") + 1] = "3000"
+    elif mutation == "malformed-x509":
+        manager_argv[manager_argv.index("--tls-cert") + 1] = "3003010100"
+    elif mutation == "malformed-pkcs8":
+        manager_argv[manager_argv.index("--tls-privkey") + 1] = "3003010100"
+    else:
+        manager_argv[manager_argv.index("--tls-privkey") + 1] = (
+            MISMATCHED_TLS_PRIVATE_KEY_DER_HEX
+        )
+
+    if mutation not in {"input", "mismatch"}:
+        manager_input["requested_argv"] = list(manager_argv)
+        manager_input["observed_argv"] = list(manager_argv)
 
     with pytest.raises(_subject().N31CrashPairError):
         _subject().validate_manager_blinding(
@@ -617,16 +806,18 @@ def _observation_id(
     *,
     reporter_id: int,
     observed_replica_id: int,
+    epoch_number: int,
     block_hash: str,
+    epoch_digest: str,
 ) -> str:
     payload = b"".join(
         (
             b"kauri-response-observation-v1",
             reporter_id.to_bytes(2, "big"),
             observed_replica_id.to_bytes(2, "big"),
-            (1).to_bytes(4, "big"),
+            epoch_number.to_bytes(4, "big"),
             (0).to_bytes(4, "big"),
-            bytes.fromhex(E1_DIGEST),
+            bytes.fromhex(epoch_digest),
             bytes.fromhex(block_hash),
             (1).to_bytes(1, "big"),
         )
@@ -640,17 +831,55 @@ def _response_latency(replica: int) -> int:
 
 
 def _accepted_ranking_evidence() -> list[dict[str, object]]:
-    events: list[dict[str, object]] = []
-    for sequence, replica in enumerate(range(N), start=1):
-        eligible = replica not in CRASHED
-        outcome = "on_time" if eligible else "timeout"
-        latency = _response_latency(replica) if eligible else 0
-        block_hash = "9" * 64
-        events.append(
+    accepted_events: list[dict[str, object]] = []
+    records: list[Any] = []
+    attempts: list[tuple[int, str, str, int, int]] = []
+    for replica in range(N):
+        attempts.append(
+            (
+                replica,
+                "baseline",
+                "on_time" if replica in SURVIVORS else "timeout",
+                _response_latency(replica) if replica in SURVIVORS else 0,
+                replica + 1,
+            )
+        )
+    for replica in CRASHED:
+        attempts.append(
+            (replica, "baseline", "late", 2_000 + replica, replica + 1)
+        )
+    for attempt_number, attempt_name in enumerate(("fresh-a", "fresh-b"), start=1):
+        for replica in range(N):
+            attempts.append(
+                (
+                    replica,
+                    attempt_name,
+                    "on_time" if replica in SURVIVORS else "timeout",
+                    (
+                        _response_latency(replica) + attempt_number
+                        if replica in SURVIVORS
+                        else 0
+                    ),
+                    N * attempt_number + replica + 1,
+                )
+            )
+
+    block_hashes = {
+        (replica, attempt): hashlib.sha256(
+            f"ranking-{replica}-{attempt}".encode()
+        ).hexdigest()
+        for replica, attempt, _outcome, _latency, _reporter_sequence in attempts
+    }
+    for sequence, (replica, attempt, outcome, latency, _reporter_sequence) in enumerate(
+        attempts,
+        start=1,
+    ):
+        block_hash = block_hashes[(replica, attempt)]
+        accepted_events.append(
             _envelope(
                 "adaptive-manager",
                 sequence,
-                30_000 + sequence,
+                100_000 + sequence,
                 "evidence.observation_accepted",
                 {
                     "ingestion_sequence": sequence,
@@ -659,7 +888,9 @@ def _accepted_ranking_evidence() -> list[dict[str, object]]:
                         "observation_id": _observation_id(
                             reporter_id=30,
                             observed_replica_id=replica,
+                            epoch_number=1,
                             block_hash=block_hash,
+                            epoch_digest=E1_DIGEST,
                         ),
                         "reporter_id": 30,
                         "observed_replica_id": replica,
@@ -671,147 +902,160 @@ def _accepted_ranking_evidence() -> list[dict[str, object]]:
                         "block_hash": block_hash,
                         "expected_message_type": "direct_vote",
                         "outcome": outcome,
-                        "response_duration_us": latency if eligible else 0,
+                        "response_duration_us": latency,
                         "deadline_duration_us": 1_000,
-                        "reporter_monotonic_ns": 29_000 + sequence,
+                        "reporter_monotonic_ns": 90_000 + sequence,
                         "reporter_sequence": sequence,
-                        "signer_set": [replica] if eligible else [],
+                        "signer_set": [replica] if outcome != "timeout" else [],
                     },
                 },
             )
         )
+        observation = accepted_events[-1]["payload"]["observation"]  # type: ignore[index]
+        records.append(
+            factorial_validation._EvidenceRecord(
+                ingestion_sequence=sequence,
+                acceptance_monotonic_ns=100_000 + sequence,
+                observation_id=str(observation["observation_id"]),
+                reporter_id=30,
+                target_id=replica,
+                epoch_number=1,
+                tree_id=0,
+                epoch_digest=E1_DIGEST,
+                block_hash=block_hash,
+                message_type="direct_vote",
+                outcome=outcome,
+                response_duration_us=latency,
+                deadline_duration_us=1_000,
+                reporter_monotonic_ns=90_000 + sequence,
+                reporter_sequence=sequence,
+                signer_set=(replica,) if outcome != "timeout" else (),
+                acceptance_source_sequence=sequence + 1,
+            )
+        )
+    events = [
+        _envelope(
+            "adaptive-manager",
+            1,
+            99_999,
+            "process.started",
+            {"exit_status": None},
+        )
+    ]
+    for source_sequence, event in enumerate(accepted_events, start=2):
+        event["source_sequence"] = source_sequence
+        event["source_monotonic_ns"] = 100_000 + source_sequence
+        events.append(event)
+    full_snapshot_id = factorial_validation._snapshot_id(
+        records,
+        replica_count=N,
+        epoch_number=1,
+        epoch_digest=E1_DIGEST,
+        cutoff=EVIDENCE_CUTOFF,
+        policy=NATIVE_RESPONSIVENESS_POLICY,
+        seed=NATIVE_SNAPSHOT_SEED,
+    )
+    selected_records = factorial_validation._snapshot_records(
+        records,
+        baseline_cutoff=BASELINE_EVIDENCE_CUTOFF,
+        current_cutoff=EVIDENCE_CUTOFF,
+        suffix_only=True,
+    )
+    selected_snapshot_id = factorial_validation._snapshot_id(
+        selected_records,
+        replica_count=N,
+        epoch_number=1,
+        epoch_digest=E1_DIGEST,
+        cutoff=EVIDENCE_CUTOFF,
+        policy=NATIVE_RESPONSIVENESS_POLICY,
+        seed=NATIVE_SNAPSHOT_SEED,
+    )
+    events.append(
+        _envelope(
+            "adaptive-manager",
+            len(events) + 1,
+            100_000 + len(events) + 1,
+            "adaptive_v2_evidence_snapshot",
+            {
+                "schema_version": 2,
+                "cycle_ordinal": 1,
+                "policy_intent": "performance_optimization",
+                "transition_artifact_id": "e1-to-e2-optimization",
+                "predecessor_epoch_number": 1,
+                "predecessor_epoch_digest": E1_DIGEST,
+                "activation_generation": (1 << 32) + 1,
+                "baseline_cutoff": BASELINE_EVIDENCE_CUTOFF,
+                "current_cutoff": EVIDENCE_CUTOFF,
+                "full_prefix_snapshot_id": full_snapshot_id,
+                "evidence_snapshot_id": selected_snapshot_id,
+                "accepted_prefix_count": EVIDENCE_CUTOFF,
+                "eligible_ranking": list(RANKED_SURVIVORS[:Q]),
+            },
+        )
+    )
+    assert len(accepted_events) == EVIDENCE_CUTOFF
     return events
 
 
-def _expected_score_rows() -> list[dict[str, object]]:
-    return [
-        {
-            "replica_id": replica,
-            "eligible": replica in SURVIVORS,
-            "attempt_count": 1,
-            "response_rate_ppm": 1_000_000 if replica in SURVIVORS else 0,
-            "timeout_rate_ppm": 0 if replica in SURVIVORS else 1_000_000,
-            "latency_percentile_us": (
-                _response_latency(replica)
-            )
-            if replica in SURVIVORS
-            else None,
-            "score_ppm": (
-                1_000_000 - _response_latency(replica)
-                if replica in SURVIVORS
-                else -1
-            ),
-        }
-        for replica in range(N)
-    ]
-
-
-def test_ranking_is_rebuilt_from_fresh_accepted_evidence_with_id_tie_break() -> None:
-    ranking = _document(
-        _subject().rebuild_epoch2_ranking(
-            _accepted_ranking_evidence(),
-            source_epoch_digest=E1_DIGEST,
-            policy_version="responsive-rank-v1",
-            evidence_cutoff=EVIDENCE_CUTOFF,
-            window_start_ns=25_000,
-            window_end_ns=35_000,
-            membership_replica_ids=tuple(range(N)),
+def _native_ranking_snapshot(
+    evidence: Sequence[Mapping[str, object]] | None = None,
+    **overrides: object,
+) -> dict[str, object]:
+    arguments: dict[str, object] = {
+        "membership_replica_ids": tuple(range(N)),
+        "predecessor_epoch_number": 1,
+        "predecessor_epoch_digest": E1_DIGEST,
+        "baseline_evidence_cutoff": BASELINE_EVIDENCE_CUTOFF,
+        "current_evidence_cutoff": EVIDENCE_CUTOFF,
+        "policy": NATIVE_RESPONSIVENESS_POLICY,
+        "seed": NATIVE_SNAPSHOT_SEED,
+        "suffix_only": True,
+    }
+    arguments.update(overrides)
+    return _document(
+        factorial_validation.replay_native_adaptation_snapshot(
+            list(evidence or _accepted_ranking_evidence()),
+            **arguments,
         )
     )
-    expected = list(RANKED_SURVIVORS[:Q])
-    assert ranking["ranked_eligible_replica_ids"][:Q] == expected
-    assert ranking["tie_break"] == "score_desc_replica_id_asc_v1"
-    assert ranking["evidence_cutoff"] == EVIDENCE_CUTOFF
-    assert ranking["policy_version"] == "responsive-rank-v1"
-    assert ranking["score_rows"] == _expected_score_rows()
 
 
-def test_ranking_requires_one_monotonic_authenticated_manager_stream() -> None:
-    evidence = _accepted_ranking_evidence()
-    baseline = _document(
-        _subject().rebuild_epoch2_ranking(
-            evidence,
-            source_epoch_digest=E1_DIGEST,
-            policy_version="responsive-rank-v1",
-            evidence_cutoff=EVIDENCE_CUTOFF,
-            window_start_ns=25_000,
-            window_end_ns=35_000,
-            membership_replica_ids=tuple(range(N)),
-        )
+def test_ranking_replays_native_fresh_suffix_with_manager_default_policy() -> None:
+    ranking = _native_ranking_snapshot()
+    assert ranking["seed"] == NATIVE_SNAPSHOT_SEED
+    assert ranking["policy"] == NATIVE_RESPONSIVENESS_POLICY
+    assert ranking["baseline_evidence_cutoff"] == BASELINE_EVIDENCE_CUTOFF
+    assert ranking["current_evidence_cutoff"] == EVIDENCE_CUTOFF
+    assert ranking["accepted_record_count"] == 2 * N
+    assert [row["replica_id"] for row in ranking["ranking"][:Q]] == list(
+        RANKED_SURVIVORS[:Q]
     )
-    assert baseline["source_epoch_digest"] == E1_DIGEST
-    assert baseline["evidence_cutoff"] == EVIDENCE_CUTOFF
-
-    mutations: dict[str, list[dict[str, object]]] = {}
-    instance_drift = deepcopy(evidence)
-    instance_drift[1]["source_instance"] = f"{RUN_ID}-adaptive-manager-restarted"
-    mutations["source-instance-drift"] = instance_drift
-
-    envelope_regression = deepcopy(evidence)
-    envelope_regression[0]["source_monotonic_ns"] = 30_050
-    mutations["envelope-timestamp-regression"] = envelope_regression
-
-    reporter_before = deepcopy(evidence)
-    reporter_before[0]["payload"]["observation"][  # type: ignore[index]
-        "reporter_monotonic_ns"
-    ] = 24_999
-    mutations["reporter-before-window"] = reporter_before
-
-    reporter_after = deepcopy(evidence)
-    reporter_after[-1]["payload"]["observation"][  # type: ignore[index]
-        "reporter_monotonic_ns"
-    ] = 35_000
-    mutations["reporter-after-window"] = reporter_after
-
-    configuration_drift = deepcopy(evidence)
-    configuration_drift[0]["payload"]["observation"]["configuration"][  # type: ignore[index]
-        "epoch_number"
-    ] = 2
-    mutations["configuration-epoch-drift"] = configuration_drift
-
-    unexpectedly_accepted: list[str] = []
-    for name, changed in mutations.items():
-        try:
-            _subject().rebuild_epoch2_ranking(
-                changed,
-                source_epoch_digest=E1_DIGEST,
-                policy_version="responsive-rank-v1",
-                evidence_cutoff=EVIDENCE_CUTOFF,
-                window_start_ns=25_000,
-                window_end_ns=35_000,
-                membership_replica_ids=tuple(range(N)),
-            )
-        except _subject().N31CrashPairError:
-            continue
-        unexpectedly_accepted.append(name)
-    assert unexpectedly_accepted == []
+    by_replica = {row["replica_id"]: row for row in ranking["ranking"]}
+    assert all(by_replica[replica]["classification"] == "responsive" for replica in SURVIVORS)
+    assert all(by_replica[replica]["classification"] == "nonresponsive" for replica in CRASHED)
 
 
-@pytest.mark.parametrize("mutation", ("policy", "cutoff", "freshness", "tie"))
+@pytest.mark.parametrize(
+    "mutation",
+    ("instance", "timestamp", "reporter", "predecessor", "cutoff"),
+)
 def test_ranking_rejects_unbound_or_noncanonical_evidence(mutation: str) -> None:
     evidence = deepcopy(_accepted_ranking_evidence())
-    policy_version = "responsive-rank-v1"
-    evidence_cutoff = EVIDENCE_CUTOFF
-    if mutation == "policy":
-        policy_version = "unreviewed-policy"
-    elif mutation == "cutoff":
-        evidence_cutoff -= 1
-    elif mutation == "freshness":
-        evidence[0]["source_monotonic_ns"] = 24_999
+    overrides: dict[str, object] = {}
+    if mutation == "instance":
+        evidence[1]["source_instance"] = "restarted-manager"
+    elif mutation == "timestamp":
+        evidence[1]["source_monotonic_ns"] = 1
+    elif mutation == "reporter":
+        evidence[-2]["payload"]["observation"][  # type: ignore[index]
+            "reporter_monotonic_ns"
+        ] = int(evidence[-3]["payload"]["observation"]["reporter_monotonic_ns"]) - 1  # type: ignore[index]
+    elif mutation == "predecessor":
+        overrides["predecessor_epoch_digest"] = "de" * 32
     else:
-        evidence[1]["payload"]["observation"][  # type: ignore[index]
-            "observed_replica_id"
-        ] = 0
-    with pytest.raises(_subject().N31CrashPairError):
-        _subject().rebuild_epoch2_ranking(
-            evidence,
-            source_epoch_digest=E1_DIGEST,
-            policy_version=policy_version,
-            evidence_cutoff=evidence_cutoff,
-            window_start_ns=25_000,
-            window_end_ns=35_000,
-            membership_replica_ids=tuple(range(N)),
-        )
+        overrides["current_evidence_cutoff"] = EVIDENCE_CUTOFF + 1
+    with pytest.raises(factorial_validation.FactorialValidationError):
+        _native_ranking_snapshot(evidence, **overrides)
 
 
 def _canonical_trees(
@@ -978,6 +1222,152 @@ def _encode_native_epoch_bundle(
     return wire, decoded
 
 
+def _epoch1_replay_evidence(
+    attempts_per_replica: int,
+) -> tuple[list[dict[str, object]], tuple[Any, ...]]:
+    accepted_events: list[dict[str, object]] = []
+    records: list[Any] = []
+    sequence = 0
+    for attempt in range(attempts_per_replica):
+        for replica in range(N):
+            sequence += 1
+            reporter = (replica + 1) % N
+            outcome = "timeout" if replica in CRASHED else "on_time"
+            latency = 0 if outcome == "timeout" else 200 + replica + attempt
+            block_hash = hashlib.sha256(
+                f"epoch0-{attempt}-{replica}".encode("ascii")
+            ).hexdigest()
+            observation_id = _observation_id(
+                reporter_id=reporter,
+                observed_replica_id=replica,
+                epoch_number=0,
+                block_hash=block_hash,
+                epoch_digest=E0_DIGEST,
+            )
+            reporter_ns = 40_000 + sequence
+            accepted_ns = 50_000 + sequence
+            signers = (replica,) if outcome == "on_time" else ()
+            observation = {
+                "schema_version": 1,
+                "observation_id": observation_id,
+                "reporter_id": reporter,
+                "observed_replica_id": replica,
+                "configuration": {
+                    "epoch_number": 0,
+                    "tree_id": 0,
+                    "epoch_digest": E0_DIGEST,
+                },
+                "block_hash": block_hash,
+                "expected_message_type": "direct_vote",
+                "outcome": outcome,
+                "response_duration_us": latency,
+                "deadline_duration_us": 1_000,
+                "reporter_monotonic_ns": reporter_ns,
+                "reporter_sequence": sequence,
+                "signer_set": list(signers),
+            }
+            accepted_events.append(
+                _envelope(
+                    "adaptive-manager",
+                    sequence,
+                    accepted_ns,
+                    "evidence.observation_accepted",
+                    {
+                        "ingestion_sequence": sequence,
+                        "observation": observation,
+                    },
+                )
+            )
+            records.append(
+                factorial_validation._EvidenceRecord(
+                    ingestion_sequence=sequence,
+                    acceptance_monotonic_ns=accepted_ns,
+                    observation_id=observation_id,
+                    reporter_id=reporter,
+                    target_id=replica,
+                    epoch_number=0,
+                    tree_id=0,
+                    epoch_digest=E0_DIGEST,
+                    block_hash=block_hash,
+                    message_type="direct_vote",
+                    outcome=outcome,
+                    response_duration_us=latency,
+                    deadline_duration_us=1_000,
+                    reporter_monotonic_ns=reporter_ns,
+                    reporter_sequence=sequence,
+                    signer_set=signers,
+                    acceptance_source_sequence=sequence,
+                )
+            )
+    events = [
+        _envelope(
+            "adaptive-manager",
+            1,
+            49_999,
+            "process.started",
+            {"exit_status": None},
+        )
+    ]
+    rebound_records: list[Any] = []
+    for source_sequence, (event, record) in enumerate(
+        zip(accepted_events, records, strict=True),
+        start=2,
+    ):
+        timestamp = 50_000 + source_sequence
+        event["source_sequence"] = source_sequence
+        event["source_monotonic_ns"] = timestamp
+        events.append(event)
+        rebound_records.append(
+            replace(
+                record,
+                acceptance_monotonic_ns=timestamp,
+                acceptance_source_sequence=source_sequence,
+            )
+        )
+    full_snapshot_id = factorial_validation._snapshot_id(
+        rebound_records,
+        replica_count=N,
+        epoch_number=0,
+        epoch_digest=E0_DIGEST,
+        cutoff=len(records),
+        policy=NATIVE_RESPONSIVENESS_POLICY,
+        seed=NATIVE_SNAPSHOT_SEED,
+    )
+    selected_snapshot_id = factorial_validation._snapshot_id(
+        rebound_records,
+        replica_count=N,
+        epoch_number=0,
+        epoch_digest=E0_DIGEST,
+        cutoff=len(records),
+        policy=NATIVE_RESPONSIVENESS_POLICY,
+        seed=NATIVE_SNAPSHOT_SEED,
+    )
+    events.append(
+        _envelope(
+            "adaptive-manager",
+            len(events) + 1,
+            50_000 + len(events) + 1,
+            "adaptive_v2_evidence_snapshot",
+            {
+                "schema_version": 2,
+                "cycle_ordinal": 0,
+                "policy_intent": "fault_containment",
+                "transition_artifact_id": "e0-to-e1-containment",
+                "predecessor_epoch_number": 0,
+                "predecessor_epoch_digest": E0_DIGEST,
+                "activation_generation": 1,
+                "baseline_cutoff": 0,
+                "current_cutoff": len(records),
+                "full_prefix_snapshot_id": full_snapshot_id,
+                "evidence_snapshot_id": selected_snapshot_id,
+                "accepted_prefix_count": len(records),
+                "eligible_ranking": list(range(Q)),
+            },
+        )
+    )
+    return events, tuple(rebound_records)
+
+
 E1_ROOTS = tuple(range(Q))
 E2_ROOTS = (
     0,
@@ -1006,15 +1396,46 @@ RANKED_SURVIVORS = E2_ROOTS + tuple(
     replica for replica in SURVIVORS if replica not in E2_ROOTS
 )
 E1_TREES = _canonical_trees(E1_ROOTS, CRASHED)
+CONTROL_E1_CUTOFF = 3 * N
+ADAPTIVE_E1_CUTOFF = 4 * N
+_, _CONTROL_E1_RECORDS = _epoch1_replay_evidence(3)
+_, _ADAPTIVE_E1_RECORDS = _epoch1_replay_evidence(4)
+CONTROL_E1_SNAPSHOT_ID = factorial_validation._snapshot_id(
+    _CONTROL_E1_RECORDS,
+    replica_count=N,
+    epoch_number=0,
+    epoch_digest=E0_DIGEST,
+    cutoff=CONTROL_E1_CUTOFF,
+    policy=NATIVE_RESPONSIVENESS_POLICY,
+)
+ADAPTIVE_E1_SNAPSHOT_ID = factorial_validation._snapshot_id(
+    _ADAPTIVE_E1_RECORDS,
+    replica_count=N,
+    epoch_number=0,
+    epoch_digest=E0_DIGEST,
+    cutoff=ADAPTIVE_E1_CUTOFF,
+    policy=NATIVE_RESPONSIVENESS_POLICY,
+)
+CONTROL_E1_DIGEST = hashlib.sha256(
+    _epoch_canonical_bytes(
+        1,
+        E0_DIGEST,
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
+        E1_TREES,
+        evidence_snapshot_id=CONTROL_E1_SNAPSHOT_ID,
+        evidence_cutoff=CONTROL_E1_CUTOFF,
+    )
+).hexdigest()
 E1_DIGEST = hashlib.sha256(
     _epoch_canonical_bytes(
         1,
         E0_DIGEST,
-        1,
-        "focused-containment-v1",
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
         E1_TREES,
-        evidence_snapshot_id="pair-01-containment",
-        evidence_cutoff=100,
+        evidence_snapshot_id=ADAPTIVE_E1_SNAPSHOT_ID,
+        evidence_cutoff=ADAPTIVE_E1_CUTOFF,
     )
 ).hexdigest()
 E2_TREES = _canonical_trees(E2_ROOTS, CRASHED)
@@ -1022,16 +1443,14 @@ E2_DIGEST = hashlib.sha256(
     _epoch_canonical_bytes(
         2,
         E1_DIGEST,
-        2,
-        "responsive-rank-v1",
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
         E2_TREES,
-        evidence_snapshot_id="pair-01-ranking",
+        evidence_snapshot_id="pair-01-native-ranking",
         evidence_cutoff=EVIDENCE_CUTOFF,
     )
 ).hexdigest()
 ISSUER_KEY_SHA256 = hashlib.sha256(bytes.fromhex(ISSUER_PUBLIC_KEY)).hexdigest()
-E1_BUNDLE_SHA256 = "bda2376d586c20e8f0bec9c97e21d053432cac49a9c8e91128bc463d826fd791"
-E2_BUNDLE_SHA256 = "c1e0b47cd39765d9cba4a3380874ba708e854275603a7679b06f1d3dc1ccaf4d"
 
 
 def _assert_decoded_epoch(
@@ -1061,63 +1480,155 @@ def _assert_decoded_epoch(
         assert set(CRASHED).issubset(tree.members[1 + FANOUT :])
 
 
-def _native_epoch_chain() -> tuple[bytes, Any, bytes, Any]:
+def _independent_epoch1_bundles(
+    *, verify_replay: bool = False
+) -> tuple[bytes, Any, bytes, Any]:
     assert _native_membership_digest() == MEMBERSHIP_DIGEST
-    epoch1_wire, epoch1 = _encode_native_epoch_bundle(
+    control_snapshot_id = CONTROL_E1_SNAPSHOT_ID
+    control_cutoff = CONTROL_E1_CUTOFF
+    adaptive_snapshot_id = ADAPTIVE_E1_SNAPSHOT_ID
+    adaptive_cutoff = ADAPTIVE_E1_CUTOFF
+    if verify_replay:
+        control_events, _ = _epoch1_replay_evidence(3)
+        adaptive_events, _ = _epoch1_replay_evidence(4)
+        common = {
+            "membership_replica_ids": tuple(range(N)),
+            "predecessor_epoch_number": 0,
+            "predecessor_epoch_digest": E0_DIGEST,
+            "baseline_evidence_cutoff": 0,
+            "policy": NATIVE_RESPONSIVENESS_POLICY,
+            "seed": NATIVE_SNAPSHOT_SEED,
+            "suffix_only": False,
+        }
+        control_snapshot = _document(
+            factorial_validation.replay_native_adaptation_snapshot(
+                control_events,
+                current_evidence_cutoff=CONTROL_E1_CUTOFF,
+                **common,
+            )
+        )
+        adaptive_snapshot = _document(
+            factorial_validation.replay_native_adaptation_snapshot(
+                adaptive_events,
+                current_evidence_cutoff=ADAPTIVE_E1_CUTOFF,
+                **common,
+            )
+        )
+        control_snapshot_id = str(control_snapshot["snapshot_id"])
+        control_cutoff = int(control_snapshot["current_evidence_cutoff"])
+        adaptive_snapshot_id = str(adaptive_snapshot["snapshot_id"])
+        adaptive_cutoff = int(adaptive_snapshot["current_evidence_cutoff"])
+        assert control_snapshot_id == CONTROL_E1_SNAPSHOT_ID
+        assert adaptive_snapshot_id == ADAPTIVE_E1_SNAPSHOT_ID
+        assert all(
+            len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+            for value in (control_snapshot_id, adaptive_snapshot_id)
+        )
+    control_wire, control_epoch1 = _encode_native_epoch_bundle(
         1,
         E0_DIGEST,
-        1,
-        "focused-containment-v1",
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
         E1_TREES,
-        evidence_snapshot_id="pair-01-containment",
-        evidence_cutoff=100,
+        evidence_snapshot_id=control_snapshot_id,
+        evidence_cutoff=control_cutoff,
     )
+    adaptive_wire, adaptive_epoch1 = _encode_native_epoch_bundle(
+        1,
+        E0_DIGEST,
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
+        E1_TREES,
+        evidence_snapshot_id=adaptive_snapshot_id,
+        evidence_cutoff=adaptive_cutoff,
+    )
+    assert control_epoch1.epoch_digest == CONTROL_E1_DIGEST
+    assert adaptive_epoch1.epoch_digest == E1_DIGEST
+    assert control_wire != adaptive_wire
+    assert control_epoch1.command.signature != adaptive_epoch1.command.signature
+    return control_wire, control_epoch1, adaptive_wire, adaptive_epoch1
+
+
+def _native_epoch_chain(
+    *, evidence_snapshot_id: str = "pair-01-native-ranking"
+) -> tuple[bytes, Any, bytes, Any]:
+    _, _, epoch1_wire, epoch1 = _independent_epoch1_bundles()
     epoch2_wire, epoch2 = _encode_native_epoch_bundle(
         2,
         epoch1.epoch_digest,
-        2,
-        "responsive-rank-v1",
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
         E2_TREES,
-        evidence_snapshot_id="pair-01-ranking",
+        evidence_snapshot_id=evidence_snapshot_id,
         evidence_cutoff=EVIDENCE_CUTOFF,
     )
     _assert_decoded_epoch(
         epoch1,
         epoch_number=1,
         previous_digest=E0_DIGEST,
-        generation_seed=1,
+        generation_seed=NATIVE_SNAPSHOT_SEED,
         roots=E1_ROOTS,
     )
     _assert_decoded_epoch(
         epoch2,
         epoch_number=2,
         previous_digest=epoch1.epoch_digest,
-        generation_seed=2,
+        generation_seed=NATIVE_SNAPSHOT_SEED,
         roots=E2_ROOTS,
     )
     assert epoch1.epoch_digest == E1_DIGEST
-    assert epoch2.epoch_digest == E2_DIGEST
-    assert hashlib.sha256(epoch1_wire).hexdigest() == E1_BUNDLE_SHA256
-    assert hashlib.sha256(epoch2_wire).hexdigest() == E2_BUNDLE_SHA256
+    if evidence_snapshot_id == "pair-01-native-ranking":
+        assert epoch2.epoch_digest == E2_DIGEST
     return epoch1_wire, epoch1, epoch2_wire, epoch2
 
 
-def _matched_pair() -> tuple[dict[str, object], dict[str, object]]:
-    epoch1_wire, epoch1, epoch2_wire, epoch2 = _native_epoch_chain()
-    ranking_ids = list(RANKED_SURVIVORS)
-    evidence = _accepted_ranking_evidence()
-    ranking = {
-        "source_evidence_sha256": _sha(evidence),
-        "source_epoch_digest": E1_DIGEST,
-        "policy_version": "responsive-rank-v1",
-        "evidence_cutoff": EVIDENCE_CUTOFF,
-        "window_start_ns": 25_000,
-        "window_end_ns": 35_000,
-        "ranked_eligible_replica_ids": ranking_ids,
-        "selected_root_ids": ranking_ids[:Q],
-        "score_rows": _expected_score_rows(),
-        "tie_break": "score_desc_replica_id_asc_v1",
+def _epoch1_replay_binding(
+    attempts_per_replica: int,
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object]]:
+    events, _ = _epoch1_replay_evidence(attempts_per_replica)
+    replay_input: dict[str, object] = {
+        "membership_replica_ids": list(range(N)),
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": E0_DIGEST,
+        "baseline_evidence_cutoff": 0,
+        "current_evidence_cutoff": attempts_per_replica * N,
+        "policy": deepcopy(NATIVE_RESPONSIVENESS_POLICY),
+        "seed": NATIVE_SNAPSHOT_SEED,
+        "suffix_only": False,
     }
+    snapshot = _document(
+        factorial_validation.replay_native_adaptation_snapshot(
+            events,
+            **replay_input,
+        )
+    )
+    return events, replay_input, snapshot
+
+
+def _matched_pair() -> tuple[dict[str, object], dict[str, object]]:
+    control_epoch1_wire, control_epoch1, adaptive_epoch1_wire, adaptive_epoch1 = (
+        _independent_epoch1_bundles(verify_replay=True)
+    )
+    evidence = _accepted_ranking_evidence()
+    control_e1_events, control_e1_input, control_e1_snapshot = (
+        _epoch1_replay_binding(3)
+    )
+    adaptive_e1_events, adaptive_e1_input, adaptive_e1_snapshot = (
+        _epoch1_replay_binding(4)
+    )
+    ranking = _native_ranking_snapshot(evidence)
+    ranking["selected_root_ids"] = [
+        row["replica_id"] for row in ranking["ranking"][:Q]
+    ]
+    epoch2_wire, epoch2 = _encode_native_epoch_bundle(
+        2,
+        adaptive_epoch1.epoch_digest,
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
+        E2_TREES,
+        evidence_snapshot_id=str(ranking["snapshot_id"]),
+        evidence_cutoff=EVIDENCE_CUTOFF,
+    )
     common = {
         "pair_id": "pair-01",
         "revision": "b" * 40,
@@ -1129,14 +1640,17 @@ def _matched_pair() -> tuple[dict[str, object], dict[str, object]]:
         "impairment_sha256": "6" * 64,
         "containment_policy_sha256": "7" * 64,
         "stable_windows_sha256": "8" * 64,
-        "epoch1_bundle": epoch1_wire,
-        "epoch1_bundle_sha256": hashlib.sha256(epoch1_wire).hexdigest(),
-        "epoch1_issuer_public_key": ISSUER_PUBLIC_KEY,
-        "epoch1_decoded": _document(epoch1),
     }
     control = {
         **common,
         "arm": "control",
+        "epoch1_bundle": control_epoch1_wire,
+        "epoch1_bundle_sha256": hashlib.sha256(control_epoch1_wire).hexdigest(),
+        "epoch1_issuer_public_key": ISSUER_PUBLIC_KEY,
+        "epoch1_decoded": _document(control_epoch1),
+        "epoch1_replay_events": control_e1_events,
+        "epoch1_replay_input": control_e1_input,
+        "epoch1_replay_snapshot": control_e1_snapshot,
         "epoch2_bundle": None,
         "epoch2_bundle_sha256": None,
         "epoch2_issuer_public_key": None,
@@ -1145,6 +1659,13 @@ def _matched_pair() -> tuple[dict[str, object], dict[str, object]]:
     adaptive = {
         **common,
         "arm": "adaptive",
+        "epoch1_bundle": adaptive_epoch1_wire,
+        "epoch1_bundle_sha256": hashlib.sha256(adaptive_epoch1_wire).hexdigest(),
+        "epoch1_issuer_public_key": ISSUER_PUBLIC_KEY,
+        "epoch1_decoded": _document(adaptive_epoch1),
+        "epoch1_replay_events": adaptive_e1_events,
+        "epoch1_replay_input": adaptive_e1_input,
+        "epoch1_replay_snapshot": adaptive_e1_snapshot,
         "post_containment_accepted_evidence": evidence,
         "ranking_snapshot": ranking,
         "epoch2_bundle": epoch2_wire,
@@ -1161,6 +1682,10 @@ def test_matched_pair_binds_verified_decoded_epochs_evidence_and_ranking() -> No
         control["epoch1_bundle"],  # type: ignore[arg-type]
         issuer_public_key=str(control["epoch1_issuer_public_key"]),
     )
+    adaptive_epoch1 = factorial_validation.decode_epoch_change_bundle(
+        adaptive["epoch1_bundle"],  # type: ignore[arg-type]
+        issuer_public_key=str(adaptive["epoch1_issuer_public_key"]),
+    )
     adaptive_epoch2 = factorial_validation.decode_epoch_change_bundle(
         adaptive["epoch2_bundle"],  # type: ignore[arg-type]
         issuer_public_key=str(adaptive["epoch2_issuer_public_key"]),
@@ -1169,28 +1694,52 @@ def test_matched_pair_binds_verified_decoded_epochs_evidence_and_ranking() -> No
         control_epoch1,
         epoch_number=1,
         previous_digest=E0_DIGEST,
-        generation_seed=1,
+        generation_seed=NATIVE_SNAPSHOT_SEED,
+        roots=E1_ROOTS,
+    )
+    _assert_decoded_epoch(
+        adaptive_epoch1,
+        epoch_number=1,
+        previous_digest=E0_DIGEST,
+        generation_seed=NATIVE_SNAPSHOT_SEED,
         roots=E1_ROOTS,
     )
     _assert_decoded_epoch(
         adaptive_epoch2,
         epoch_number=2,
-        previous_digest=control_epoch1.epoch_digest,
-        generation_seed=2,
+        previous_digest=adaptive_epoch1.epoch_digest,
+        generation_seed=NATIVE_SNAPSHOT_SEED,
         roots=E2_ROOTS,
     )
     proof = _document(_subject().validate_matched_pair(control, adaptive))
     assert proof["matched"] is True
-    assert proof["epoch1_exactly_identical"] is True
+    assert proof["epoch1_structurally_identical"] is True
+    assert proof["epoch1_replays_bound"] is True
     assert proof["control_has_epoch2"] is False
     assert proof["adaptive_epoch2_bound_to_fresh_evidence"] is True
     assert proof["adaptive_epoch2_roots_are_top_q"] is True
     assert proof["verified_epoch_numbers"] == [1, 2]
     assert proof["epoch1_tree_count"] == Q
     assert proof["epoch2_tree_count"] == Q
-    assert control["epoch1_bundle"] == adaptive["epoch1_bundle"]
+    assert control["epoch1_bundle"] != adaptive["epoch1_bundle"]
+    assert control_epoch1.epoch_digest != adaptive_epoch1.epoch_digest
+    assert control_epoch1.command.signature != adaptive_epoch1.command.signature
+    assert control_epoch1.evidence_snapshot_id != adaptive_epoch1.evidence_snapshot_id
+    assert control_epoch1.evidence_cutoff != adaptive_epoch1.evidence_cutoff
+    assert control_epoch1.generation_seed == adaptive_epoch1.generation_seed == NATIVE_SNAPSHOT_SEED
+    assert control_epoch1.policy_version == adaptive_epoch1.policy_version == NATIVE_PLACEMENT_POLICY
+    assert control_epoch1.command.issuer_id == adaptive_epoch1.command.issuer_id
+    assert control_epoch1.command.activation_delay_blocks == adaptive_epoch1.command.activation_delay_blocks
+    for arm, decoded in ((control, control_epoch1), (adaptive, adaptive_epoch1)):
+        replay = arm["epoch1_replay_snapshot"]
+        assert decoded.evidence_snapshot_id == replay["snapshot_id"]  # type: ignore[index]
+        assert decoded.evidence_cutoff == replay["current_evidence_cutoff"]  # type: ignore[index]
+        assert replay["ranking"]  # type: ignore[index]
     assert [list(tree.members) for tree in control_epoch1.trees] == [
         tree["members"] for tree in E1_TREES
+    ]
+    assert [asdict(tree) for tree in control_epoch1.trees] == [
+        asdict(tree) for tree in adaptive_epoch1.trees
     ]
     assert [list(tree.members) for tree in adaptive_epoch2.trees] == [
         tree["members"] for tree in E2_TREES
@@ -1224,7 +1773,15 @@ def _flip_bundle_reply_digest(wire: bytes) -> bytes:
 
 @pytest.mark.parametrize(
     "mutation",
-    ("issuer", "signature", "digest", "predecessor", "epoch1", "ranking"),
+    (
+        "issuer",
+        "signature",
+        "digest",
+        "predecessor",
+        "epoch1",
+        "epoch1-snapshot",
+        "ranking",
+    ),
 )
 def test_matched_pair_rejects_decoded_epoch_or_ranking_drift(mutation: str) -> None:
     baseline_control, baseline_adaptive = _matched_pair()
@@ -1248,34 +1805,188 @@ def test_matched_pair_rejects_decoded_epoch_or_ranking_drift(mutation: str) -> N
         wrong_wire, wrong_decoded = _encode_native_epoch_bundle(
             2,
             E0_DIGEST,
-            2,
-            "responsive-rank-v1",
+            NATIVE_SNAPSHOT_SEED,
+            NATIVE_PLACEMENT_POLICY,
             E2_TREES,
-            evidence_snapshot_id="pair-01-ranking",
+            evidence_snapshot_id="pair-01-native-ranking",
             evidence_cutoff=EVIDENCE_CUTOFF,
         )
         adaptive["epoch2_bundle"] = wrong_wire
         adaptive["epoch2_bundle_sha256"] = hashlib.sha256(wrong_wire).hexdigest()
         adaptive["epoch2_decoded"] = _document(wrong_decoded)
     elif mutation == "epoch1":
+        changed_trees = deepcopy(E1_TREES)
+        changed_trees[0]["members"][1], changed_trees[0]["members"][2] = (  # type: ignore[index]
+            changed_trees[0]["members"][2],  # type: ignore[index]
+            changed_trees[0]["members"][1],  # type: ignore[index]
+        )
         changed_wire, changed_decoded = _encode_native_epoch_bundle(
             1,
             E0_DIGEST,
-            9,
-            "focused-containment-v1",
-            E1_TREES,
-            evidence_snapshot_id="pair-01-containment",
-            evidence_cutoff=100,
+            NATIVE_SNAPSHOT_SEED,
+            NATIVE_PLACEMENT_POLICY,
+            changed_trees,
+            evidence_snapshot_id=ADAPTIVE_E1_SNAPSHOT_ID,
+            evidence_cutoff=ADAPTIVE_E1_CUTOFF,
         )
         adaptive["epoch1_bundle"] = changed_wire
         adaptive["epoch1_bundle_sha256"] = hashlib.sha256(
             changed_wire
         ).hexdigest()
         adaptive["epoch1_decoded"] = _document(changed_decoded)
+    elif mutation == "epoch1-snapshot":
+        changed_wire, changed_decoded = _encode_native_epoch_bundle(
+            1,
+            E0_DIGEST,
+            NATIVE_SNAPSHOT_SEED,
+            NATIVE_PLACEMENT_POLICY,
+            E1_TREES,
+            evidence_snapshot_id="f" * 64,
+            evidence_cutoff=ADAPTIVE_E1_CUTOFF + 1,
+        )
+        adaptive["epoch1_bundle"] = changed_wire
+        adaptive["epoch1_bundle_sha256"] = hashlib.sha256(changed_wire).hexdigest()
+        adaptive["epoch1_decoded"] = _document(changed_decoded)
     else:
         adaptive["ranking_snapshot"]["selected_root_ids"] = list(  # type: ignore[index]
             reversed(E2_ROOTS)
         )
+    with pytest.raises(_subject().N31CrashPairError):
+        _subject().validate_matched_pair(control, adaptive)
+
+
+@pytest.mark.parametrize("arm_name", ("control", "adaptive"))
+@pytest.mark.parametrize(
+    "component",
+    ("events", "input-cutoff", "input-policy", "input-seed", "snapshot"),
+)
+def test_matched_pair_recomputes_each_arm_epoch1_replay_component(
+    arm_name: str,
+    component: str,
+) -> None:
+    baseline_control, baseline_adaptive = _matched_pair()
+    assert _document(
+        _subject().validate_matched_pair(baseline_control, baseline_adaptive)
+    )["epoch1_replays_bound"] is True
+
+    control, adaptive = _matched_pair()
+    arm = control if arm_name == "control" else adaptive
+    before = {
+        key: deepcopy(arm[key])
+        for key in (
+            "epoch1_replay_events",
+            "epoch1_replay_input",
+            "epoch1_replay_snapshot",
+        )
+    }
+    if component == "events":
+        accepted = next(
+            event
+            for event in arm["epoch1_replay_events"]  # type: ignore[union-attr]
+            if event["event_type"] == "evidence.observation_accepted"
+        )
+        observation = accepted["payload"]["observation"]
+        observation["response_duration_us"] = int(
+            observation["response_duration_us"]
+        ) + 1
+    elif component == "input-cutoff":
+        replay_input = arm["epoch1_replay_input"]
+        replay_input["current_evidence_cutoff"] = int(
+            replay_input["current_evidence_cutoff"]
+        ) - 1
+    elif component == "input-policy":
+        arm["epoch1_replay_input"]["policy"]["minimum_attempts"] = 3
+    elif component == "input-seed":
+        arm["epoch1_replay_input"]["seed"] = NATIVE_SNAPSHOT_SEED + 1
+    else:
+        arm["epoch1_replay_snapshot"]["snapshot_id"] = "e" * 64
+
+    changed_group = (
+        "epoch1_replay_events"
+        if component == "events"
+        else "epoch1_replay_snapshot"
+        if component == "snapshot"
+        else "epoch1_replay_input"
+    )
+    assert all(
+        arm[key] == value
+        for key, value in before.items()
+        if key != changed_group
+    )
+
+    with pytest.raises(_subject().N31CrashPairError):
+        _subject().validate_matched_pair(control, adaptive)
+
+
+def test_matched_pair_rejects_coherent_earlier_control_epoch1_replay() -> None:
+    baseline_control, baseline_adaptive = _matched_pair()
+    assert _document(
+        _subject().validate_matched_pair(baseline_control, baseline_adaptive)
+    )["epoch1_replays_bound"] is True
+
+    control, adaptive = _matched_pair()
+    events = control["epoch1_replay_events"]
+    removed = events.pop(-2)
+    assert removed["event_type"] == "evidence.observation_accepted"
+    audit = events[-1]
+    audit["source_sequence"] = int(audit["source_sequence"]) - 1
+    audit["source_monotonic_ns"] = int(events[-2]["source_monotonic_ns"]) + 1
+    earlier_cutoff = CONTROL_E1_CUTOFF - 1
+    _, complete_records = _epoch1_replay_evidence(3)
+    prefix = tuple(
+        record
+        for record in complete_records
+        if record.ingestion_sequence <= earlier_cutoff
+    )
+    selected = factorial_validation._snapshot_records(
+        complete_records,
+        baseline_cutoff=0,
+        current_cutoff=earlier_cutoff,
+        suffix_only=False,
+    )
+    audit_payload = audit["payload"]
+    audit_payload["current_cutoff"] = earlier_cutoff
+    audit_payload["accepted_prefix_count"] = len(prefix)
+    audit_payload["full_prefix_snapshot_id"] = factorial_validation._snapshot_id(
+        prefix,
+        replica_count=N,
+        epoch_number=0,
+        epoch_digest=E0_DIGEST,
+        cutoff=earlier_cutoff,
+        policy=NATIVE_RESPONSIVENESS_POLICY,
+        seed=NATIVE_SNAPSHOT_SEED,
+    )
+    audit_payload["evidence_snapshot_id"] = factorial_validation._snapshot_id(
+        selected,
+        replica_count=N,
+        epoch_number=0,
+        epoch_digest=E0_DIGEST,
+        cutoff=earlier_cutoff,
+        policy=NATIVE_RESPONSIVENESS_POLICY,
+        seed=NATIVE_SNAPSHOT_SEED,
+    )
+    replay_input = control["epoch1_replay_input"]
+    replay_input["current_evidence_cutoff"] = earlier_cutoff
+    replay = _document(
+        factorial_validation.replay_native_adaptation_snapshot(
+            events,
+            **replay_input,
+        )
+    )
+    control["epoch1_replay_snapshot"] = replay
+    wire, decoded = _encode_native_epoch_bundle(
+        1,
+        E0_DIGEST,
+        NATIVE_SNAPSHOT_SEED,
+        NATIVE_PLACEMENT_POLICY,
+        E1_TREES,
+        evidence_snapshot_id=str(replay["snapshot_id"]),
+        evidence_cutoff=earlier_cutoff,
+    )
+    control["epoch1_bundle"] = wire
+    control["epoch1_bundle_sha256"] = hashlib.sha256(wire).hexdigest()
+    control["epoch1_decoded"] = _document(decoded)
+
     with pytest.raises(_subject().N31CrashPairError):
         _subject().validate_matched_pair(control, adaptive)
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, is_dataclass, replace
 import copy
 import hashlib
 import inspect
@@ -4516,6 +4516,7 @@ def _native_snapshot_id_reference(
     epoch_digest: str,
     cutoff: int,
     policy: dict[str, object],
+    seed: int = 41_719,
 ) -> str:
     """Reproduce native compute_snapshot_id byte order independently."""
 
@@ -4524,7 +4525,7 @@ def _native_snapshot_id_reference(
     result += validation._u(epoch_number, 4)
     result += bytes.fromhex(epoch_digest)
     result += validation._u(cutoff, 8)
-    result += validation._u(validation._SNAPSHOT_SEED, 8)
+    result += validation._u(seed, 8)
     result += validation._u(replica_count, 4)
     result += b"".join(
         validation._u(member, 2) for member in range(replica_count)
@@ -4636,6 +4637,517 @@ def test_snapshot_id_matches_native_mixed_v1_v2_bytes_and_binds_timestamps() -> 
         (v1, replace(v2, reporter_local_commit_monotonic_ns=11_001)),
         **common,
     ) != expected
+
+
+_NATIVE_REPLAY_POLICY = {
+    "schema_version": 1,
+    "policy_version": "adaptive-v2-controller-responsiveness-v1",
+    "attempt_window": 4,
+    "minimum_attempts": 1,
+    "minimum_response_rate_ppm": 500_000,
+    "maximum_timeout_rate_ppm": 500_000,
+    "trailing_timeout_streak": 2,
+    "latency_percentile_basis_points": 5_000,
+}
+_NATIVE_REPLAY_SEED = 41_719
+_NATIVE_REPLAY_EPOCH_DIGEST = "ab" * 32
+
+
+def _replay_document(value: object) -> dict[str, object]:
+    if is_dataclass(value) and not isinstance(value, type):
+        value = asdict(value)
+    assert isinstance(value, dict)
+    return value
+
+
+def _native_replay_evidence() -> tuple[
+    list[dict[str, object]],
+    tuple[validation._EvidenceRecord, ...],
+]:
+    attempts = (
+        (0, "a", "on_time", 10),
+        (1, "b", "timeout", 0),
+        (2, "c", "on_time", 30),
+        (1, "d", "timeout", 0),
+        (1, "d", "late", 150),
+        (0, "e", "on_time", 20),
+        (1, "f", "on_time", 40),
+        (2, "g", "timeout", 0),
+        (2, "g", "late", 300),
+        (0, "h", "timeout", 0),
+    )
+    attempt_hashes = {
+        attempt: hashlib.sha256(f"attempt-{attempt}".encode()).hexdigest()
+        for _target, attempt, _outcome, _latency in attempts
+    }
+    accepted_ingestion_sequences = (1, 2, 3, 4, 6, 7, 8, 10, 11, 13)
+    accepted_events: dict[int, dict[str, object]] = {}
+    records: list[validation._EvidenceRecord] = []
+    for reporter_sequence, (target, attempt, outcome, latency) in enumerate(
+        attempts,
+        start=1,
+    ):
+        ingestion_sequence = accepted_ingestion_sequences[reporter_sequence - 1]
+        block_hash = attempt_hashes[attempt]
+        observation_id = hashlib.sha256(
+            b"kauri-response-observation-v1"
+            + (2).to_bytes(2, "big")
+            + target.to_bytes(2, "big")
+            + (1).to_bytes(4, "big")
+            + (0).to_bytes(4, "big")
+            + bytes.fromhex(_NATIVE_REPLAY_EPOCH_DIGEST)
+            + bytes.fromhex(block_hash)
+            + (1).to_bytes(1, "big")
+        ).hexdigest()
+        reporter_ns = 10_000 + reporter_sequence
+        signers = [target] if outcome != "timeout" else []
+        observation = {
+            "schema_version": 1,
+            "observation_id": observation_id,
+            "reporter_id": 2,
+            "observed_replica_id": target,
+            "configuration": {
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": _NATIVE_REPLAY_EPOCH_DIGEST,
+            },
+            "block_hash": block_hash,
+            "expected_message_type": "direct_vote",
+            "outcome": outcome,
+            "response_duration_us": latency,
+            "deadline_duration_us": 100,
+            "reporter_monotonic_ns": reporter_ns,
+            "reporter_sequence": reporter_sequence,
+            "signer_set": signers,
+        }
+        accepted_events[ingestion_sequence] = {
+            "event_type": "evidence.observation_accepted",
+            "payload": {
+                "ingestion_sequence": ingestion_sequence,
+                "observation": observation,
+            },
+        }
+        records.append(
+            validation._EvidenceRecord(
+                ingestion_sequence=ingestion_sequence,
+                acceptance_monotonic_ns=0,
+                observation_id=observation_id,
+                reporter_id=2,
+                target_id=target,
+                epoch_number=1,
+                tree_id=0,
+                epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+                block_hash=block_hash,
+                message_type="direct_vote",
+                outcome=outcome,
+                response_duration_us=latency,
+                deadline_duration_us=100,
+                reporter_monotonic_ns=reporter_ns,
+                reporter_sequence=reporter_sequence,
+                signer_set=tuple(signers),
+                acceptance_source_sequence=0,
+            )
+        )
+
+    events: list[dict[str, object]] = []
+
+    def append_event(event_type: str, payload: Mapping[str, object]) -> int:
+        source_sequence = len(events) + 1
+        events.append(
+            {
+                "event_schema_version": 1,
+                "run_id": "native-replay-run",
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": "native-replay-manager-instance",
+                "source_sequence": source_sequence,
+                "source_monotonic_ns": 20_000 + source_sequence,
+                "event_type": event_type,
+                "payload": dict(payload),
+            }
+        )
+        return source_sequence
+
+    append_event("process.started", {"exit_status": None})
+    record_by_ingestion = {record.ingestion_sequence: record for record in records}
+    for accepted_index, ingestion_sequence in enumerate(
+        accepted_ingestion_sequences,
+        start=1,
+    ):
+        accepted = accepted_events[ingestion_sequence]
+        source_sequence = append_event(
+            str(accepted["event_type"]),
+            accepted["payload"],  # type: ignore[arg-type]
+        )
+        record = record_by_ingestion[ingestion_sequence]
+        record_by_ingestion[ingestion_sequence] = replace(
+            record,
+            acceptance_monotonic_ns=20_000 + source_sequence,
+            acceptance_source_sequence=source_sequence,
+        )
+        if accepted_index == 1:
+            append_event("process.ready", {"exit_status": None})
+    full_prefix_snapshot_id = _native_snapshot_id_reference(
+        tuple(record_by_ingestion[sequence] for sequence in accepted_ingestion_sequences),
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+    selected_snapshot_id = _native_snapshot_id_reference(
+        tuple(record_by_ingestion[sequence] for sequence in accepted_ingestion_sequences[5:]),
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+    append_event(
+        "adaptive_v2_evidence_snapshot",
+        {
+            "schema_version": 2,
+            "cycle_ordinal": 1,
+            "policy_intent": "performance_optimization",
+            "transition_artifact_id": "e1-to-e2-optimization",
+            "predecessor_epoch_number": 1,
+            "predecessor_epoch_digest": _NATIVE_REPLAY_EPOCH_DIGEST,
+            "activation_generation": (1 << 32) + 1,
+            "baseline_cutoff": 4,
+            "current_cutoff": 14,
+            "full_prefix_snapshot_id": full_prefix_snapshot_id,
+            "evidence_snapshot_id": selected_snapshot_id,
+            "accepted_prefix_count": len(records),
+            "eligible_ranking": [1, 0],
+        },
+    )
+    return events, tuple(
+        record_by_ingestion[sequence] for sequence in accepted_ingestion_sequences
+    )
+
+
+def _replay_snapshot(
+    events: list[dict[str, object]],
+    *,
+    suffix_only: bool,
+    seed: int = _NATIVE_REPLAY_SEED,
+    policy: dict[str, object] = _NATIVE_REPLAY_POLICY,
+    predecessor_digest: str = _NATIVE_REPLAY_EPOCH_DIGEST,
+    baseline_cutoff: int = 4,
+    current_cutoff: int = 14,
+) -> dict[str, object]:
+    return _replay_document(
+        validation.replay_native_adaptation_snapshot(
+            events,
+            membership_replica_ids=(0, 1, 2),
+            predecessor_epoch_number=1,
+            predecessor_epoch_digest=predecessor_digest,
+            baseline_evidence_cutoff=baseline_cutoff,
+            current_evidence_cutoff=current_cutoff,
+            policy=policy,
+            seed=seed,
+            suffix_only=suffix_only,
+        )
+    )
+
+
+def _rebind_native_replay_audit(
+    events: list[dict[str, object]],
+    records: tuple[validation._EvidenceRecord, ...],
+    *,
+    baseline_cutoff: int,
+    current_cutoff: int,
+    policy: dict[str, object] = _NATIVE_REPLAY_POLICY,
+    seed: int = _NATIVE_REPLAY_SEED,
+    suffix_only: bool = False,
+) -> None:
+    prefix = tuple(
+        record for record in records if record.ingestion_sequence <= current_cutoff
+    )
+    suffix = validation._snapshot_records(
+        records,
+        baseline_cutoff=baseline_cutoff,
+        current_cutoff=current_cutoff,
+        suffix_only=True,
+        allow_high_watermark_gaps=True,
+    )
+    selected = suffix if suffix_only else prefix
+    audit = events[-1]["payload"]
+    audit["baseline_cutoff"] = baseline_cutoff  # type: ignore[index]
+    audit["current_cutoff"] = current_cutoff  # type: ignore[index]
+    audit["full_prefix_snapshot_id"] = _native_snapshot_id_reference(  # type: ignore[index]
+        prefix,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=current_cutoff,
+        policy=policy,
+        seed=seed,
+    )
+    audit["evidence_snapshot_id"] = _native_snapshot_id_reference(  # type: ignore[index]
+        selected,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=current_cutoff,
+        policy=policy,
+        seed=seed,
+    )
+    audit["accepted_prefix_count"] = len(prefix)  # type: ignore[index]
+    audit["eligible_ranking"] = [  # type: ignore[index]
+        row.replica_id
+        for row in validation._score_snapshot(selected, 3, policy)
+        if row.eligible
+    ]
+
+
+def test_public_native_snapshot_replay_matches_cpp_full_prefix_and_suffix() -> None:
+    events, records = _native_replay_evidence()
+    assert [event["source_sequence"] for event in events] == list(
+        range(1, len(events) + 1)
+    )
+    assert [
+        event["payload"]["ingestion_sequence"]  # type: ignore[index]
+        for event in events
+        if event["event_type"] == "evidence.observation_accepted"
+    ] == [1, 2, 3, 4, 6, 7, 8, 10, 11, 13]
+    assert [events[0]["event_type"], events[2]["event_type"], events[-1]["event_type"]] == [
+        "process.started",
+        "process.ready",
+        "adaptive_v2_evidence_snapshot",
+    ]
+    full_events = copy.deepcopy(events)
+    full_events[-1]["payload"]["evidence_snapshot_id"] = full_events[-1][  # type: ignore[index]
+        "payload"
+    ]["full_prefix_snapshot_id"]  # type: ignore[index]
+    full = _replay_snapshot(full_events, suffix_only=False)
+    suffix = _replay_snapshot(events, suffix_only=True)
+    selected_suffix = records[5:]
+
+    full_expected_id = _native_snapshot_id_reference(
+        records,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+    suffix_expected_id = _native_snapshot_id_reference(
+        selected_suffix,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+    assert full["snapshot_id"] == full_expected_id
+    assert full_events[-1]["payload"]["evidence_snapshot_id"] == full_expected_id  # type: ignore[index]
+    assert suffix["snapshot_id"] == suffix_expected_id
+    assert full["seed"] == suffix["seed"] == _NATIVE_REPLAY_SEED
+    assert full["policy"] == suffix["policy"] == _NATIVE_REPLAY_POLICY
+    assert full["accepted_record_count"] == 10
+    assert suffix["accepted_record_count"] == 5
+    assert full["source_event_count"] == suffix["source_event_count"] == len(events)
+    assert full["accepted_ingestion_sequences"] == [1, 2, 3, 4, 6, 7, 8, 10, 11, 13]
+    assert suffix["accepted_ingestion_sequences"] == [7, 8, 10, 11, 13]
+    assert full["ledger_high_watermark"] == suffix["ledger_high_watermark"] == 14
+    assert [row["replica_id"] for row in full["ranking"]] == [2, 0, 1]
+    assert [row["replica_id"] for row in suffix["ranking"]] == [1, 0, 2]
+    assert [row["rank"] for row in full["ranking"]] == [0, 1, 2]
+    assert [row["rank"] for row in suffix["ranking"]] == [0, 1, 2]
+    assert full["ranking"][0] == {
+        "replica_id": 2,
+        "rank": 0,
+        "classification": "responsive",
+        "eligible": True,
+        "attempt_count": 2,
+        "on_time_count": 1,
+        "late_count": 1,
+        "timeout_only_count": 0,
+        "response_count": 2,
+        "timeout_count": 1,
+        "trailing_timeout_count": 0,
+        "response_rate_ppm": 1_000_000,
+        "timeout_rate_ppm": 500_000,
+        "latency_percentile_us": 30,
+        "reasons": [],
+    }
+
+
+def test_public_native_snapshot_replay_recomputes_for_valid_parameters() -> None:
+    events, records = _native_replay_evidence()
+    baseline_events = copy.deepcopy(events)
+    baseline_events[-1]["payload"]["evidence_snapshot_id"] = baseline_events[-1][  # type: ignore[index]
+        "payload"
+    ]["full_prefix_snapshot_id"]  # type: ignore[index]
+    baseline = _replay_snapshot(baseline_events, suffix_only=False)
+    alternate_seed_events = copy.deepcopy(events)
+    _rebind_native_replay_audit(
+        alternate_seed_events,
+        records,
+        baseline_cutoff=4,
+        current_cutoff=14,
+        seed=_NATIVE_REPLAY_SEED + 1,
+    )
+    alternate_seed = _replay_snapshot(
+        alternate_seed_events,
+        suffix_only=False,
+        seed=_NATIVE_REPLAY_SEED + 1,
+    )
+    alternate_policy_value = {
+        **_NATIVE_REPLAY_POLICY,
+        "policy_version": "bounded-test-responsiveness-v2",
+        "minimum_attempts": 2,
+    }
+    alternate_policy_events = copy.deepcopy(events)
+    _rebind_native_replay_audit(
+        alternate_policy_events,
+        records,
+        baseline_cutoff=4,
+        current_cutoff=14,
+        policy=alternate_policy_value,
+    )
+    alternate_policy = _replay_snapshot(
+        alternate_policy_events,
+        suffix_only=False,
+        policy=alternate_policy_value,
+    )
+    alternate_seed_audit = alternate_seed_events[-1]["payload"]
+    alternate_policy_audit = alternate_policy_events[-1]["payload"]
+    assert alternate_seed_audit["full_prefix_snapshot_id"] == alternate_seed[
+        "snapshot_id"
+    ]
+    assert alternate_seed_audit["evidence_snapshot_id"] == alternate_seed[
+        "snapshot_id"
+    ]
+    assert alternate_policy_audit["full_prefix_snapshot_id"] == alternate_policy[
+        "snapshot_id"
+    ]
+    assert alternate_policy_audit["evidence_snapshot_id"] == alternate_policy[
+        "snapshot_id"
+    ]
+    earlier_events = copy.deepcopy(events)
+    earlier_events = [
+        event
+        for event in earlier_events
+        if not (
+            event["event_type"] == "evidence.observation_accepted"
+            and int(event["payload"]["ingestion_sequence"]) > 11  # type: ignore[index]
+        )
+    ]
+    for source_sequence, event in enumerate(earlier_events, start=1):
+        event["source_sequence"] = source_sequence
+    _rebind_native_replay_audit(
+        earlier_events,
+        records,
+        baseline_cutoff=4,
+        current_cutoff=11,
+    )
+    alternate_cutoff = _replay_snapshot(
+        earlier_events,
+        suffix_only=False,
+        current_cutoff=11,
+    )
+
+    assert alternate_seed["snapshot_id"] == _native_snapshot_id_reference(
+        records,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+        seed=_NATIVE_REPLAY_SEED + 1,
+    )
+    assert alternate_policy["snapshot_id"] == _native_snapshot_id_reference(
+        records,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=alternate_policy_value,
+    )
+    assert alternate_cutoff["snapshot_id"] == _native_snapshot_id_reference(
+        records[:9],
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=11,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+    assert len(
+        {
+            baseline["snapshot_id"],
+            alternate_seed["snapshot_id"],
+            alternate_policy["snapshot_id"],
+            alternate_cutoff["snapshot_id"],
+        }
+    ) == 4
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "predecessor",
+        "gap",
+        "timestamp",
+        "partial",
+        "audit-provenance",
+        "caller-baseline",
+        "caller-current",
+        "caller-policy",
+        "caller-seed",
+        "audit-baseline",
+        "audit-current",
+        "audit-full-id",
+        "audit-selected-id",
+        "audit-selected-as-full",
+    ),
+)
+def test_public_native_snapshot_replay_rejects_unbound_input(mutation: str) -> None:
+    events, _ = _native_replay_evidence()
+    kwargs: dict[str, object] = {}
+    if mutation == "predecessor":
+        kwargs["predecessor_digest"] = "cd" * 32
+    elif mutation == "gap":
+        events.pop(1)
+    elif mutation == "timestamp":
+        events[1]["source_monotonic_ns"] = (
+            int(events[0]["source_monotonic_ns"]) - 1
+        )
+    elif mutation == "partial":
+        events = [
+            event
+            for event in events
+            if event["event_type"] == "evidence.observation_accepted"
+        ]
+    elif mutation == "audit-provenance":
+        events[-1]["source_instance"] = "restarted-manager"
+    elif mutation == "caller-baseline":
+        kwargs["baseline_cutoff"] = 3
+    elif mutation == "caller-current":
+        kwargs["current_cutoff"] = 12
+    elif mutation == "caller-policy":
+        kwargs["policy"] = {
+            **_NATIVE_REPLAY_POLICY,
+            "policy_version": "bounded-test-responsiveness-v2",
+            "minimum_attempts": 2,
+        }
+    elif mutation == "caller-seed":
+        kwargs["seed"] = _NATIVE_REPLAY_SEED + 1
+    elif mutation == "audit-baseline":
+        events[-1]["payload"]["baseline_cutoff"] = 3  # type: ignore[index]
+    elif mutation == "audit-current":
+        events[-1]["payload"]["current_cutoff"] = 13  # type: ignore[index]
+    elif mutation == "audit-full-id":
+        events[-1]["payload"]["full_prefix_snapshot_id"] = "f" * 64  # type: ignore[index]
+    elif mutation == "audit-selected-id":
+        events[-1]["payload"]["evidence_snapshot_id"] = "f" * 64  # type: ignore[index]
+    elif mutation == "audit-selected-as-full":
+        events[-1]["payload"]["evidence_snapshot_id"] = events[-1]["payload"][  # type: ignore[index]
+            "full_prefix_snapshot_id"
+        ]
+    with pytest.raises(FactorialValidationError):
+        _replay_snapshot(events, suffix_only=True, **kwargs)
 
 
 def test_compact_snapshot_preserves_sparse_accepted_ledger_integrity(

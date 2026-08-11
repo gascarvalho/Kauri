@@ -8544,10 +8544,11 @@ def _snapshot_id(
     epoch_digest: str,
     cutoff: int,
     policy: Mapping[str, Any],
+    seed: int = _SNAPSHOT_SEED,
 ) -> str:
     result = bytearray(_SNAPSHOT_DOMAIN)
     result += _u(1, 4) + _u(epoch_number, 4) + bytes.fromhex(epoch_digest)
-    result += _u(cutoff, 8) + _u(_SNAPSHOT_SEED, 8)
+    result += _u(cutoff, 8) + _u(seed, 8)
     result += _u(replica_count, 4)
     result += b"".join(_u(member, 2) for member in range(replica_count))
     result += _u(1, 4)
@@ -8584,6 +8585,462 @@ def _snapshot_id(
         result += _u(len(record.signer_set), 4)
         result += b"".join(_u(signer, 2) for signer in record.signer_set)
     return _sha256(bytes(result))
+
+
+def _native_snapshot_policy(policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the public replay policy against native fixed bounds."""
+
+    expected_fields = {
+        "schema_version",
+        "policy_version",
+        "attempt_window",
+        "minimum_attempts",
+        "minimum_response_rate_ppm",
+        "maximum_timeout_rate_ppm",
+        "trailing_timeout_streak",
+        "latency_percentile_basis_points",
+    }
+    _fields(policy, expected_fields, "adaptation replay policy")
+    schema_version = _integer(
+        policy.get("schema_version"), "adaptation replay policy schema", 1
+    )
+    policy_version = _string(
+        policy.get("policy_version"), "adaptation replay policy version"
+    )
+    try:
+        policy_version_bytes = policy_version.encode("utf-8")
+    except (
+        UnicodeEncodeError
+    ) as error:  # pragma: no cover - Python strings are Unicode.
+        raise _Reject("adaptation replay policy version is not UTF-8") from error
+    attempt_window = _integer(
+        policy.get("attempt_window"), "adaptation replay attempt window", 1
+    )
+    minimum_attempts = _integer(
+        policy.get("minimum_attempts"), "adaptation replay minimum attempts", 1
+    )
+    minimum_response_rate = _integer(
+        policy.get("minimum_response_rate_ppm"),
+        "adaptation replay minimum response rate",
+    )
+    maximum_timeout_rate = _integer(
+        policy.get("maximum_timeout_rate_ppm"),
+        "adaptation replay maximum timeout rate",
+    )
+    trailing_timeout_streak = _integer(
+        policy.get("trailing_timeout_streak"),
+        "adaptation replay trailing timeout streak",
+        2,
+    )
+    latency_percentile = _integer(
+        policy.get("latency_percentile_basis_points"),
+        "adaptation replay latency percentile",
+        1,
+    )
+    if (
+        schema_version != 1
+        or len(policy_version_bytes) > 64
+        or attempt_window > 4_096
+        or minimum_attempts > attempt_window
+        or minimum_response_rate > 1_000_000
+        or maximum_timeout_rate > 1_000_000
+        or trailing_timeout_streak > attempt_window
+        or latency_percentile > 10_000
+    ):
+        _fail("adaptation replay policy is outside native fixed bounds")
+    return {
+        "schema_version": schema_version,
+        "policy_version": policy_version,
+        "attempt_window": attempt_window,
+        "minimum_attempts": minimum_attempts,
+        "minimum_response_rate_ppm": minimum_response_rate,
+        "maximum_timeout_rate_ppm": maximum_timeout_rate,
+        "trailing_timeout_streak": trailing_timeout_streak,
+        "latency_percentile_basis_points": latency_percentile,
+    }
+
+
+def _native_snapshot_ranking_document(
+    records: Sequence[_EvidenceRecord],
+    *,
+    replica_count: int,
+    policy: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Project the existing native scorer into its complete audit shape."""
+
+    scores = _score_snapshot(records, replica_count, policy)
+    scored_records = (
+        tuple(record for record in records if record.message_type == "direct_vote")
+        if policy["policy_version"] == _DIRECT_VOTE_RESPONSIVENESS_POLICY_VERSION
+        else tuple(records)
+    )
+    attempts: dict[str, dict[str, Any]] = {}
+    for record in scored_records:
+        attempt = attempts.get(record.observation_id)
+        if attempt is None:
+            if record.outcome == "late":
+                _fail("snapshot evidence begins an attempt with late")
+            attempts[record.observation_id] = {
+                "target": record.target_id,
+                "first": record.ingestion_sequence,
+                "state": "timeout_only" if record.outcome == "timeout" else "on_time",
+            }
+            continue
+        if attempt["state"] != "timeout_only" or record.outcome != "late":
+            _fail("snapshot evidence has an invalid timeout-to-late transition")
+        attempt["state"] = "late"
+
+    attempt_window = int(policy["attempt_window"])
+    minimum_attempts = int(policy["minimum_attempts"])
+    minimum_response_rate = int(policy["minimum_response_rate_ppm"])
+    maximum_timeout_rate = int(policy["maximum_timeout_rate_ppm"])
+    trailing_timeout_streak = int(policy["trailing_timeout_streak"])
+    ranking: list[dict[str, Any]] = []
+    for rank, score in enumerate(scores):
+        selected = sorted(
+            (
+                attempt
+                for attempt in attempts.values()
+                if attempt["target"] == score.replica_id
+            ),
+            key=lambda attempt: attempt["first"],
+        )[-attempt_window:]
+        on_time_count = sum(attempt["state"] == "on_time" for attempt in selected)
+        late_count = sum(attempt["state"] == "late" for attempt in selected)
+        timeout_only_count = sum(
+            attempt["state"] == "timeout_only" for attempt in selected
+        )
+        trailing_timeout_count = 0
+        for attempt in reversed(selected):
+            if attempt["state"] != "timeout_only":
+                break
+            trailing_timeout_count += 1
+        reasons: list[str] = []
+        if score.attempt_count < minimum_attempts:
+            reasons.append("insufficient_attempts")
+        else:
+            if score.response_rate_ppm < minimum_response_rate:
+                reasons.append("response_rate_below_minimum")
+            if score.timeout_rate_ppm > maximum_timeout_rate:
+                reasons.append("timeout_rate_above_maximum")
+            if trailing_timeout_count >= trailing_timeout_streak:
+                reasons.append("persistent_timeout_streak")
+        ranking.append(
+            {
+                "replica_id": score.replica_id,
+                "rank": rank,
+                "classification": score.classification,
+                "eligible": score.eligible,
+                "attempt_count": score.attempt_count,
+                "on_time_count": on_time_count,
+                "late_count": late_count,
+                "timeout_only_count": timeout_only_count,
+                "response_count": on_time_count + late_count,
+                "timeout_count": timeout_only_count + late_count,
+                "trailing_timeout_count": trailing_timeout_count,
+                "response_rate_ppm": score.response_rate_ppm,
+                "timeout_rate_ppm": score.timeout_rate_ppm,
+                "latency_percentile_us": score.latency_percentile_us,
+                "reasons": reasons,
+            }
+        )
+    return ranking
+
+
+def replay_native_adaptation_snapshot(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    membership_replica_ids: Sequence[int],
+    predecessor_epoch_number: int,
+    predecessor_epoch_digest: str,
+    baseline_evidence_cutoff: int,
+    current_evidence_cutoff: int,
+    policy: Mapping[str, Any],
+    seed: int,
+    suffix_only: bool,
+) -> dict[str, Any]:
+    """Replay one native adaptation snapshot from authenticated envelopes.
+
+    The caller remains responsible for binding ``policy`` and ``seed`` to a
+    frozen experiment profile.  This function validates the native bounds and
+    reconstructs only the source-bound accepted predecessor prefix or suffix.
+    """
+
+    membership = tuple(
+        _integer(value, "adaptation replay membership replica")
+        for value in membership_replica_ids
+    )
+    if (
+        not membership
+        or len(membership) > 65_536
+        or tuple(sorted(set(membership))) != membership
+        or membership != tuple(range(len(membership)))
+        or membership[-1] >= 1 << 16
+    ):
+        _fail("adaptation replay membership is not canonical contiguous membership")
+    epoch_number = _integer(
+        predecessor_epoch_number, "adaptation replay predecessor epoch"
+    )
+    if epoch_number >= 1 << 32:
+        _fail("adaptation replay predecessor epoch exceeds uint32")
+    epoch_digest = _digest(
+        predecessor_epoch_digest, "adaptation replay predecessor digest"
+    )
+    baseline_cutoff = _integer(
+        baseline_evidence_cutoff, "adaptation replay baseline cutoff"
+    )
+    current_cutoff = _integer(
+        current_evidence_cutoff, "adaptation replay current cutoff", 1
+    )
+    snapshot_seed = _integer(seed, "adaptation replay seed")
+    if (
+        baseline_cutoff > current_cutoff
+        or current_cutoff > _UINT64_MAX
+        or snapshot_seed > _UINT64_MAX
+        or type(suffix_only) is not bool
+    ):
+        _fail("adaptation replay cutoff, seed, or suffix mode is invalid")
+    normalized_policy = _native_snapshot_policy(
+        _mapping(policy, "adaptation replay policy")
+    )
+
+    raw_events = tuple(events)
+    if not raw_events or len(raw_events) > 1_048_576:
+        _fail("adaptation replay event stream is empty or exceeds native bounds")
+    native_events: list[_NativeEvent] = []
+    run_id: str | None = None
+    source_instance: str | None = None
+    previous_monotonic_ns = 0
+    event_fields = {
+        "event_schema_version",
+        "run_id",
+        "source_kind",
+        "source_id",
+        "source_instance",
+        "source_sequence",
+        "source_monotonic_ns",
+        "event_type",
+        "payload",
+    }
+    for line_number, raw_event in enumerate(raw_events, start=1):
+        event = _mapping(raw_event, f"adaptation replay event {line_number}")
+        _fields(event, event_fields, f"adaptation replay event {line_number}")
+        current_run_id = _string(
+            event.get("run_id"), f"adaptation replay event {line_number} run ID"
+        )
+        current_source_instance = _string(
+            event.get("source_instance"),
+            f"adaptation replay event {line_number} source instance",
+        )
+        sequence = _integer(
+            event.get("source_sequence"),
+            f"adaptation replay event {line_number} source sequence",
+            1,
+        )
+        monotonic_ns = _integer(
+            event.get("source_monotonic_ns"),
+            f"adaptation replay event {line_number} source timestamp",
+            1,
+        )
+        if (
+            event.get("event_schema_version") != 1
+            or event.get("source_kind") != "adaptation_manager"
+            or event.get("source_id") != "adaptive-manager"
+            or sequence != line_number
+            or monotonic_ns < previous_monotonic_ns
+            or (run_id is not None and current_run_id != run_id)
+            or (
+                source_instance is not None
+                and current_source_instance != source_instance
+            )
+        ):
+            _fail("adaptation replay event stream has mixed or regressing provenance")
+        run_id = current_run_id
+        source_instance = current_source_instance
+        previous_monotonic_ns = monotonic_ns
+        native_events.append(
+            _NativeEvent(
+                relative_path="<adaptation-replay>",
+                line_number=line_number,
+                source_kind="adaptation_manager",
+                source_id="adaptive-manager",
+                source_instance=current_source_instance,
+                source_sequence=sequence,
+                monotonic_ns=monotonic_ns,
+                event_type=_string(
+                    event.get("event_type"),
+                    f"adaptation replay event {line_number} type",
+                ),
+                payload=_mapping(
+                    event.get("payload"),
+                    f"adaptation replay event {line_number} payload",
+                ),
+                line_sha256=_sha256(_canonical_json_bytes(event)),
+            )
+        )
+
+    snapshot_audits = tuple(
+        event
+        for event in native_events
+        if event.event_type == "adaptive_v2_evidence_snapshot"
+        and event.payload.get("predecessor_epoch_number") == epoch_number
+        and event.payload.get("predecessor_epoch_digest") == epoch_digest
+    )
+    if len(snapshot_audits) != 1:
+        _fail("adaptation replay lacks one source-bound predecessor snapshot audit")
+    snapshot_audit = snapshot_audits[0]
+    _fields(
+        snapshot_audit.payload,
+        {
+            "schema_version",
+            "cycle_ordinal",
+            "policy_intent",
+            "transition_artifact_id",
+            "predecessor_epoch_number",
+            "predecessor_epoch_digest",
+            "activation_generation",
+            "baseline_cutoff",
+            "current_cutoff",
+            "full_prefix_snapshot_id",
+            "evidence_snapshot_id",
+            "accepted_prefix_count",
+            "eligible_ranking",
+        },
+        "adaptation replay snapshot audit",
+    )
+    audited_baseline_cutoff = _integer(
+        snapshot_audit.payload.get("baseline_cutoff"),
+        "adaptation replay audited baseline cutoff",
+    )
+    ledger_high_watermark = _integer(
+        snapshot_audit.payload.get("current_cutoff"),
+        "adaptation replay ledger high watermark",
+        1,
+    )
+    _validated_activation_generation(
+        snapshot_audit.payload.get("activation_generation"),
+        predecessor_epoch_number=epoch_number,
+        label="adaptation replay audit activation generation",
+    )
+    if (
+        snapshot_audit.payload.get("schema_version") != 2
+        or audited_baseline_cutoff != baseline_cutoff
+        or ledger_high_watermark != current_cutoff
+        or ledger_high_watermark <= audited_baseline_cutoff
+        or _integer(
+            snapshot_audit.payload.get("predecessor_epoch_number"),
+            "adaptation replay audit predecessor epoch",
+        )
+        != epoch_number
+        or _digest(
+            snapshot_audit.payload.get("predecessor_epoch_digest"),
+            "adaptation replay audit predecessor digest",
+        )
+        != epoch_digest
+    ):
+        _fail("adaptation replay snapshot audit identity or cutoff drifted")
+
+    accepted_events = tuple(
+        event
+        for event in native_events
+        if event.event_type == "evidence.observation_accepted"
+    )
+    if not accepted_events:
+        _fail("adaptation replay contains no accepted predecessor evidence")
+    grouped = _accepted_evidence(
+        accepted_events,
+        len(membership),
+        allow_ingestion_sequence_gaps=True,
+        allowed_schema_versions=frozenset({1, 2}),
+    )
+    expected_epoch = (epoch_number, epoch_digest)
+    if expected_epoch not in grouped:
+        _fail("adaptation replay evidence is not the exact predecessor stream")
+    predecessor_records = grouped[expected_epoch]
+    audited_records = tuple(
+        record
+        for record in predecessor_records
+        if record.ingestion_sequence <= ledger_high_watermark
+    )
+    if _integer(
+        snapshot_audit.payload.get("accepted_prefix_count"),
+        "adaptation replay audit accepted prefix count",
+    ) != len(audited_records) or any(
+        record.ingestion_sequence > ledger_high_watermark
+        for record in predecessor_records
+    ):
+        _fail("adaptation replay accepted prefix differs from its audited ledger")
+    full_prefix_records = _snapshot_records(
+        predecessor_records,
+        baseline_cutoff=baseline_cutoff,
+        current_cutoff=current_cutoff,
+        suffix_only=False,
+        allow_high_watermark_gaps=True,
+    )
+    suffix_records = _snapshot_records(
+        predecessor_records,
+        baseline_cutoff=baseline_cutoff,
+        current_cutoff=current_cutoff,
+        suffix_only=True,
+        allow_high_watermark_gaps=True,
+    )
+    full_prefix_snapshot_id = _snapshot_id(
+        full_prefix_records,
+        replica_count=len(membership),
+        epoch_number=epoch_number,
+        epoch_digest=epoch_digest,
+        cutoff=current_cutoff,
+        policy=normalized_policy,
+        seed=snapshot_seed,
+    )
+    suffix_snapshot_id = _snapshot_id(
+        suffix_records,
+        replica_count=len(membership),
+        epoch_number=epoch_number,
+        epoch_digest=epoch_digest,
+        cutoff=current_cutoff,
+        policy=normalized_policy,
+        seed=snapshot_seed,
+    )
+    recorded_selected_snapshot_id = _digest(
+        snapshot_audit.payload.get("evidence_snapshot_id"),
+        "adaptation replay selected snapshot commitment",
+    )
+    expected_selected_snapshot_id = (
+        suffix_snapshot_id if suffix_only else full_prefix_snapshot_id
+    )
+    if recorded_selected_snapshot_id != expected_selected_snapshot_id:
+        _fail("adaptation replay selected snapshot commitment does not recompute")
+    _validate_compact_snapshot_commitments(
+        snapshot_audit.payload,
+        accepted_prefix_count=len(full_prefix_records),
+        current_cutoff=current_cutoff,
+        full_prefix_snapshot_id=full_prefix_snapshot_id,
+        evidence_snapshot_id=expected_selected_snapshot_id,
+    )
+    records = suffix_records if suffix_only else full_prefix_records
+    return {
+        "schema_version": 1,
+        "snapshot_id": suffix_snapshot_id if suffix_only else full_prefix_snapshot_id,
+        "predecessor_epoch_number": epoch_number,
+        "predecessor_epoch_digest": epoch_digest,
+        "baseline_evidence_cutoff": baseline_cutoff,
+        "current_evidence_cutoff": current_cutoff,
+        "suffix_only": suffix_only,
+        "source_event_count": len(native_events),
+        "accepted_ingestion_sequences": [
+            record.ingestion_sequence for record in records
+        ],
+        "ledger_high_watermark": ledger_high_watermark,
+        "accepted_record_count": len(records),
+        "policy": normalized_policy,
+        "seed": snapshot_seed,
+        "ranking": _native_snapshot_ranking_document(
+            records,
+            replica_count=len(membership),
+            policy=normalized_policy,
+        ),
+    }
 
 
 def _first_leaf_index(member_count: int, fanout: int) -> int:
@@ -20371,6 +20828,7 @@ __all__ = (
     "decode_epoch_change_bundle",
     "derive_actor_ids",
     "fnv1a_rotating_actor",
+    "replay_native_adaptation_snapshot",
     "validate_campaign",
     "validate_fault_causality",
     "validate_manager_blinding",

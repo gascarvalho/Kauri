@@ -27,9 +27,9 @@ EXPECTED_SCHEDULE_SHA256 = (
     "d6f67df39400f44575927a4660d73c4706f33157396ffdc86b202affc2e1c166"
 )
 EPOCH_DIGESTS = (
-    "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a",
-    "a8b25ca808229b2684156a3dfdb9e2e4735deb6a80cef2d899fa1599464d1bfd",
-    "4364a13a95ce3ab8541e5158c307fc42edc16689a38f26a0abbce7da3b1d3721",
+    pair_fixture.E0_DIGEST,
+    pair_fixture.E1_DIGEST,
+    pair_fixture.E2_DIGEST,
 )
 
 
