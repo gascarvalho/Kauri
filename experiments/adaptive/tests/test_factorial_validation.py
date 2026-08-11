@@ -94,8 +94,11 @@ V38_MANIFEST_PATH = (
 V39_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v39.json"
 )
-FROZEN_MANIFEST_PATH = (
+V40_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v40.json"
+)
+FROZEN_MANIFEST_PATH = (
+    REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v41.json"
 )
 V23_MANIFEST_PATH = (
     REPOSITORY / "experiments/adaptive/profiles/shape-placement-factorial-v23.json"
@@ -270,6 +273,9 @@ def test_v28_repair_contract_literals_are_exact() -> None:
     assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5 == (
         manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
     )
+    assert validation.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6 == (
+        manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
+    )
     assert runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3 == (
         EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V3
     )
@@ -285,6 +291,9 @@ def test_v28_repair_contract_literals_are_exact() -> None:
     )
     assert validation._EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4 == (
         runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V4
+    )
+    assert validation._EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5 == (
+        runtime_module.EXCLUDED_REPAIR_SMOKE_SEMANTIC_DELTA_V5
     )
     assert validation._V39_POST_FAULT_SELECTION_OBSERVATION_GRACE_S == 5
     assert validation._CYCLE1_INHERITED_WAIT_EXEMPT_ELIGIBILITY_GATE_OPTION == (
@@ -323,7 +332,7 @@ def test_v39_preserves_strict_v9_and_v2_identity_validator_source() -> None:
         assert hashlib.sha256(source).hexdigest() == expected_hash
 
 
-def test_v38_v39_history_and_v40_cycle1_gate_dispatch_are_exact() -> None:
+def test_v38_through_v41_cycle1_gate_dispatch_is_exact() -> None:
     repair_slot = "slot-037-n31-f2-b04-00"
     primary_slot = "slot-066-n31-f5-b05-P"
 
@@ -334,8 +343,11 @@ def test_v38_v39_history_and_v40_cycle1_gate_dispatch_are_exact() -> None:
         validation.V39_MANIFEST_ID
     ) == EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
     assert validation._expected_excluded_repair_observation_contract(
-        validation.FROZEN_MANIFEST_ID
+        validation.V40_MANIFEST_ID
     ) == manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
+    assert validation._expected_excluded_repair_observation_contract(
+        validation.FROZEN_MANIFEST_ID
+    ) == manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
     assert not validation._uses_excluded_repair_cycle1_selection_gate(
         manifest_id=validation.V38_MANIFEST_ID,
         coverage_smoke=True,
@@ -343,6 +355,11 @@ def test_v38_v39_history_and_v40_cycle1_gate_dispatch_are_exact() -> None:
     )
     assert validation._uses_excluded_repair_cycle1_selection_gate(
         manifest_id=validation.V39_MANIFEST_ID,
+        coverage_smoke=True,
+        slot_id=repair_slot,
+    )
+    assert validation._uses_excluded_repair_cycle1_selection_gate(
+        manifest_id=validation.V40_MANIFEST_ID,
         coverage_smoke=True,
         slot_id=repair_slot,
     )
@@ -823,6 +840,19 @@ def _v39_candidate_manifest(
 def _v40_candidate_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    payload = V40_MANIFEST_PATH.read_bytes()
+    semantic = _canonical(json.loads(payload))
+    monkeypatch.setattr(
+        manifest_module,
+        "V40_SEMANTIC_SHA256",
+        hashlib.sha256(semantic).hexdigest(),
+    )
+    return manifest_module.parse_manifest_bytes(payload)
+
+
+def _v41_candidate_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+):
     payload = FROZEN_MANIFEST_PATH.read_bytes()
     semantic = _canonical(json.loads(payload))
     monkeypatch.setattr(
@@ -1056,7 +1086,7 @@ def test_responsive_degraded_vectors_recompute_with_observer_zero_isolated() -> 
         assert len((*hard, *degraded)) == (vector.replica_count - 1) // 3
 
 
-def test_validator_retains_exact_v1_through_v39_artifact_identities() -> None:
+def test_validator_retains_exact_v1_through_v40_artifact_identities() -> None:
     identities = {
         version: validation._frozen_artifact_identity(
             load_frozen_manifest(path).manifest_id
@@ -1126,6 +1156,12 @@ def test_validator_retains_exact_v1_through_v39_artifact_identities() -> None:
     )
     identities[39] = validation._frozen_artifact_identity(
         validation.V39_MANIFEST_ID
+    )
+    identities[40] = validation._frozen_artifact_identity(
+        validation.V40_MANIFEST_ID
+    )
+    identities[41] = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
     )
 
     assert identities[1].manifest_sha256 == validation.LEGACY_MANIFEST_SHA256
@@ -1438,6 +1474,12 @@ def test_validator_retains_exact_v1_through_v39_artifact_identities() -> None:
     assert identities[39].manifest_sha256 == validation.V39_MANIFEST_SHA256
     assert identities[39].plan_sha256 == validation.V39_PLAN_SHA256
     assert identities[39].runtime_sha256 == validation.V39_RUNTIME_SHA256
+    assert identities[40].manifest_sha256 == validation.V40_MANIFEST_SHA256
+    assert identities[40].plan_sha256 == validation.V40_PLAN_SHA256
+    assert identities[40].runtime_sha256 == validation.V40_RUNTIME_SHA256
+    assert identities[41].manifest_sha256 == validation.FROZEN_MANIFEST_SHA256
+    assert identities[41].plan_sha256 == validation.FROZEN_PLAN_SHA256
+    assert identities[41].runtime_sha256 == validation.FROZEN_RUNTIME_SHA256
     assert validation._coverage_smoke_result_root(
         validation.V23_MANIFEST_ID
     ) == "results/shape-placement-factorial-v23-coverage-smoke"
@@ -1490,8 +1532,11 @@ def test_validator_retains_exact_v1_through_v39_artifact_identities() -> None:
         validation.V39_MANIFEST_ID
     ) == "results/shape-placement-factorial-v39-coverage-smoke"
     assert validation._coverage_smoke_result_root(
-        validation.FROZEN_MANIFEST_ID
+        validation.V40_MANIFEST_ID
     ) == "results/shape-placement-factorial-v40-coverage-smoke"
+    assert validation._coverage_smoke_result_root(
+        validation.FROZEN_MANIFEST_ID
+    ) == "results/shape-placement-factorial-v41-coverage-smoke"
 
 
 def test_validator_v27_identities_match_independent_artifact_recomputation() -> None:
@@ -1975,13 +2020,13 @@ def test_validator_v39_identities_are_exactly_frozen() -> None:
 
 def test_validator_v40_identities_are_exactly_frozen() -> None:
     identity = validation._frozen_artifact_identity(
-        validation.FROZEN_MANIFEST_ID
+        validation.V40_MANIFEST_ID
     )
 
-    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v40"
+    assert validation.V40_MANIFEST_ID == "shape-placement-factorial-v40"
     assert (
         identity.manifest_sha256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
+        manifest_module.V40_SEMANTIC_SHA256,
         identity.plan_sha256,
         identity.runtime_sha256,
         identity.smoke_runtime_sha256,
@@ -1993,6 +2038,29 @@ def test_validator_v40_identities_are_exactly_frozen() -> None:
         "5286f8815b1812afa13f39d84e872af8dbfe78d675f53e8a02ea1c56e5acccdc",
         "4522bf796e10f67d2394ceab3399b5755ee41914dc30375ce0f87a8e0e5459eb",
         "70847285deb39a40addbbd1cc118fff0e3ed97498cb300e1a45564cc13f7d79e",
+    )
+
+
+def test_validator_v41_identities_are_exactly_frozen() -> None:
+    identity = validation._frozen_artifact_identity(
+        validation.FROZEN_MANIFEST_ID
+    )
+
+    assert validation.FROZEN_MANIFEST_ID == "shape-placement-factorial-v41"
+    assert (
+        identity.manifest_sha256,
+        manifest_module.FROZEN_SEMANTIC_SHA256,
+        identity.plan_sha256,
+        identity.runtime_sha256,
+        identity.smoke_runtime_sha256,
+        identity.coverage_smoke_runtime_sha256,
+    ) == (
+        "6f9c5b53c465afd56d467421437dadd238928f7550c4e589a8a18988fd8441d5",
+        "23c8be6ccd4059868b0822cfb0dd6269d17b164ed37241ac2e5082312df5e2ed",
+        "f5e0cfcfe7e0e57b33358b4c0603acb9547dfc61900d3b47f5c0dbd033ffee08",
+        "e52d8641add32d484ffa829b6e7f740fd22388a93930a6f345c2bea9fa466d4c",
+        "0d74f500c32d9a210148a75ee8921b2a0d62737c17169bb3faa557848d69429d",
+        "e27e4848510b4c92440edebc2a658a38a5d69464adab795219f09482af3154e6",
     )
 
 
@@ -4137,7 +4205,10 @@ def _v40_retention_record(
     )
 
 
-def _v40_retention_ready_fixture() -> dict[str, object]:
+def _v40_retention_ready_fixture(
+    *,
+    marker_window: str = "tiered-responsive-omission-v2",
+) -> dict[str, object]:
     records = tuple(
         _v40_retention_record(
             actor=actor,
@@ -4209,7 +4280,7 @@ def _v40_retention_ready_fixture() -> dict[str, object]:
             tree_id=record.tree_id,
             epoch_digest=record.epoch_digest,
             block_hash=record.block_hash,
-            window="tiered-responsive-omission-v2",
+            window=marker_window,
             window_start_ns=1,
             window_end_ns=selection_ns,
             actor=record.target_id,
@@ -4266,6 +4337,8 @@ def _v40_retention_ready_fixture() -> dict[str, object]:
         "markers": markers,
         "arm_markers": arm_markers,
         "replica_events": replica_events,
+        "actor_origin_marker_window_id": "tiered-responsive-omission-v2",
+        "manifest_id": validation.V40_MANIFEST_ID,
     }
 
 
@@ -4281,6 +4354,110 @@ def test_v40_retention_ready_replays_canonical_v2_facts_and_raw_sources() -> Non
     assert tuple(record.observation_id for record in selected) == tuple(
         record.observation_id for record in records
     )
+
+
+def test_v41_retention_ready_binds_materialized_prefixed_omission_window() -> None:
+    materialized_window = "n31-f2-b04-tiered-responsive-omission-v2"
+    arguments = _v40_retention_ready_fixture(marker_window=materialized_window)
+    official_v40_reason = (
+        "v40 admitted fact lacks one exact actor-origin fault marker"
+    )
+
+    with pytest.raises(FactorialValidationError) as failure:
+        validation._validate_v40_cross_commit_retention_ready(**arguments)
+    assert str(failure.value) == official_v40_reason
+
+    selected = validation._validate_v40_cross_commit_retention_ready(
+        **{
+            **arguments,
+            "actor_origin_marker_window_id": materialized_window,
+            "manifest_id": validation.FROZEN_MANIFEST_ID,
+        }
+    )
+    assert tuple(record.target_id for record in selected) == (
+        _V40_RETENTION_ACTORS
+    )
+
+
+@pytest.mark.parametrize("actor_index", range(len(_V40_RETENTION_ACTORS)))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "duplicate",
+        "wrong-block",
+        "wrong-prefix",
+        "wrong-window",
+    ),
+)
+def test_v41_retention_ready_rejects_each_broken_actor_origin_marker_join(
+    actor_index: int,
+    mutation: str,
+) -> None:
+    materialized_window = "n31-f2-b04-tiered-responsive-omission-v2"
+    arguments = _v40_retention_ready_fixture(marker_window=materialized_window)
+    markers = list(arguments["markers"])
+    marker = markers[actor_index]
+    if mutation == "missing":
+        markers.pop(actor_index)
+    elif mutation == "duplicate":
+        markers.append(replace(marker, line_number=100 + actor_index))
+    elif mutation == "wrong-block":
+        markers[actor_index] = replace(marker, block_hash="ff" * 32)
+    elif mutation == "wrong-prefix":
+        markers[actor_index] = replace(
+            marker,
+            window="n31-f2-b05-tiered-responsive-omission-v2",
+        )
+    else:
+        markers[actor_index] = replace(
+            marker,
+            window="n31-f2-b04-wrong-window",
+        )
+
+    with pytest.raises(FactorialValidationError) as failure:
+        validation._validate_v40_cross_commit_retention_ready(
+            **{
+                **arguments,
+                "markers": tuple(markers),
+                "actor_origin_marker_window_id": materialized_window,
+                "manifest_id": validation.FROZEN_MANIFEST_ID,
+            }
+        )
+    assert str(failure.value) == (
+        "v41 admitted fact lacks one exact actor-origin fault marker"
+    )
+
+
+def test_v41_retention_ready_rejects_historical_suffix_only_window() -> None:
+    arguments = _v40_retention_ready_fixture()
+
+    with pytest.raises(FactorialValidationError) as failure:
+        validation._validate_v40_cross_commit_retention_ready(
+            **{
+                **arguments,
+                "actor_origin_marker_window_id": (
+                    "n31-f2-b04-tiered-responsive-omission-v2"
+                ),
+                "manifest_id": validation.FROZEN_MANIFEST_ID,
+            }
+        )
+    assert str(failure.value) == (
+        "v41 admitted fact lacks one exact actor-origin fault marker"
+    )
+
+
+def test_retention_ready_rejects_unsupported_manifest_dispatch() -> None:
+    arguments = {
+        **_v40_retention_ready_fixture(),
+        "manifest_id": validation.V39_MANIFEST_ID,
+    }
+
+    with pytest.raises(
+        FactorialValidationError,
+        match="cross-commit retention manifest ID is unsupported",
+    ):
+        validation._validate_v40_cross_commit_retention_ready(**arguments)
 
 
 def _v40_retention_late_transition(
@@ -8471,12 +8648,12 @@ def _v34_post_fault_epoch2_causality_fixture() -> dict[str, object]:
         "markers": markers,
         "window_end_ns": fault_end_ns,
         "fault_active_phase_contract": (
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            validation._EXCLUDED_REPAIR_FAULT_ACTIVE_PHASE_SCOPE_V1
         ),
     }
 
 
-def test_v34_slot037_accepts_post_fault_epoch2_stable_window_only_with_v2_scope(
+def test_repair_slot037_accepts_post_fault_epoch2_with_phase_family_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _skip_tiered_schedule_shape_checks(monkeypatch)
@@ -13489,12 +13666,16 @@ def _v39_repair_receipt_fixture(
     dict[str, object],
     bytes,
 ]:
-    if version not in {39, 40}:
-        raise AssertionError("repair receipt fixture supports only v39/v40")
+    if version not in {39, 40, 41}:
+        raise AssertionError("repair receipt fixture supports only v39/v40/v41")
     manifest = (
-        _v40_candidate_manifest(monkeypatch)
-        if version == 40
-        else _v39_candidate_manifest(monkeypatch)
+        _v41_candidate_manifest(monkeypatch)
+        if version == 41
+        else (
+            _v40_candidate_manifest(monkeypatch)
+            if version == 40
+            else _v39_candidate_manifest(monkeypatch)
+        )
     )
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -13600,7 +13781,7 @@ def _v39_repair_receipt_fixture(
             for process in replicas
         ],
     }
-    if version == 40:
+    if version in {40, 41}:
         main_config = (
             runtime_module.RESPONSIVE_CROSS_COMMIT_RETENTION_V2_CONFIG_LINE
             + "\n"
@@ -13617,9 +13798,11 @@ def _v39_repair_receipt_fixture(
     )
 
 
-def test_v40_repair_receipt_production_dispatch_binds_main_config(
+@pytest.mark.parametrize("version", (40, 41))
+def test_v40_v41_repair_receipt_production_dispatch_binds_main_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    version: int,
 ) -> None:
     (
         manifest,
@@ -13628,7 +13811,9 @@ def test_v40_repair_receipt_production_dispatch_binds_main_config(
         expected,
         runtime,
         authorization_bytes,
-    ) = _v39_repair_receipt_fixture(monkeypatch, tmp_path, version=40)
+    ) = _v39_repair_receipt_fixture(monkeypatch, tmp_path, version=version)
+
+    identity = validation._frozen_artifact_identity(manifest.manifest_id)
 
     validation._validate_slot_receipt(
         receipt,
@@ -13636,7 +13821,7 @@ def test_v40_repair_receipt_production_dispatch_binds_main_config(
         manifest=manifest,
         expected=expected,
         runtime=runtime,
-        runtime_sha256=validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        runtime_sha256=identity.coverage_smoke_runtime_sha256,
         authorization_bytes=authorization_bytes,
     )
 
@@ -13658,12 +13843,14 @@ def test_v40_repair_receipt_production_dispatch_binds_main_config(
     "mutation",
     ("missing", "digest", "bytes", "replica-argv", "historical-extra"),
 )
-def test_v40_repair_receipt_production_dispatch_is_fail_closed(
+@pytest.mark.parametrize("active_version", (40, 41))
+def test_v40_v41_repair_receipt_production_dispatch_is_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     mutation: str,
+    active_version: int,
 ) -> None:
-    version = 39 if mutation == "historical-extra" else 40
+    version = 39 if mutation == "historical-extra" else active_version
     (
         manifest,
         slot_root,
@@ -13676,11 +13863,9 @@ def test_v40_repair_receipt_production_dispatch_is_fail_closed(
         tmp_path,
         version=version,
     )
-    runtime_sha256 = (
-        validation.V39_COVERAGE_SMOKE_RUNTIME_SHA256
-        if version == 39
-        else validation.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256
-    )
+    runtime_sha256 = validation._frozen_artifact_identity(
+        manifest.manifest_id
+    ).coverage_smoke_runtime_sha256
     drifted = copy.deepcopy(receipt)
     if mutation == "missing":
         drifted.pop("main_config_sha256")
@@ -13715,8 +13900,11 @@ def test_v40_repair_receipt_production_dispatch_is_fail_closed(
         )
 
 
-def test_validate_slot_v40_production_dispatch_precedes_strict_v9_guard() -> None:
+def test_validate_slot_v40_v41_dispatch_precedes_strict_v9_guard() -> None:
     source = inspect.getsource(validation.validate_slot)
+    signature = inspect.signature(
+        validation._validate_v40_cross_commit_retention_ready
+    )
 
     receipt_index = source.index("_validate_slot_receipt(")
     runner_index = source.index("_validate_runner_state(")
@@ -13725,17 +13913,29 @@ def test_validate_slot_v40_production_dispatch_precedes_strict_v9_guard() -> Non
     readiness_index = source.index(
         "_validate_v40_cross_commit_retention_ready("
     )
+    omission_contract_index = source.index(
+        "expected_window, expected_max_omissions = _effective_omission_contract("
+    )
     strict_v9_index = source.index(
         "internal_cross_commit_witness_count = validate_fault_causality("
     )
 
     assert receipt_index < runner_index < projection_index < accepted_index
-    assert accepted_index < readiness_index < strict_v9_index
+    assert accepted_index < omission_contract_index < readiness_index
+    assert readiness_index < strict_v9_index
     assert "frozenset({1, 2})" in source
-    assert "if exact_v40_repair" in source
+    assert "if v40_plus_repair" in source
     assert "else frozenset({1})" in source
-    assert "runner_hard_deadline_ns if exact_v40_repair else None" in source
+    assert "runner_hard_deadline_ns if v40_plus_repair else None" in source
     assert "replica_events=raw_replica_events" in source
+    assert "actor_origin_marker_window_id=(" in source
+    assert "if exact_v41_repair" in source
+    assert "else _TIERED_OMISSION_WINDOW_V2" in source
+    assert "manifest_id=manifest.manifest_id" in source
+    assert signature.parameters[
+        "actor_origin_marker_window_id"
+    ].default is inspect.Parameter.empty
+    assert signature.parameters["manifest_id"].default is inspect.Parameter.empty
 
 
 @pytest.mark.parametrize(
@@ -14416,6 +14616,10 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
     )
+    assert validation._coverage_smoke_slot_ids(validation.V40_MANIFEST_ID) == (
+        "slot-066-n31-f5-b05-P",
+        "slot-037-n31-f2-b04-00",
+    )
     assert validation._coverage_smoke_slot_ids(validation.FROZEN_MANIFEST_ID) == (
         "slot-066-n31-f5-b05-P",
         "slot-037-n31-f2-b04-00",
@@ -14447,6 +14651,7 @@ def test_v25_coverage_smoke_slot_order_is_exact_and_v24_is_preserved() -> None:
         validation.V35_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V36_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.V38_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
+        validation.V40_EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
         validation.EXCLUDED_COVERAGE_SMOKE_RESULT_ROOT,
     ),
 )
@@ -14493,6 +14698,7 @@ def _v25_coverage_runtime_fixture(
         38: _v38_candidate_manifest,
         39: _v39_candidate_manifest,
         40: _v40_candidate_manifest,
+        41: _v41_candidate_manifest,
     }[version](monkeypatch)
     plan = build_factorial_plan(manifest)
     primary = next(
@@ -15018,7 +15224,7 @@ def test_v36_runtime_rejects_missing_post_final_unmatched_commit_contract(
         )
 
 
-@pytest.mark.parametrize("version", (34, 35, 36, 37, 38, 39))
+@pytest.mark.parametrize("version", (34, 35, 36, 37, 38, 39, 40, 41))
 def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runtime(
     monkeypatch: pytest.MonkeyPatch,
     version: int,
@@ -15036,12 +15242,20 @@ def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runti
         manifest.manifest_id
     )
     expected_contract = (
-        EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
-        if version == 39
+        manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V6
+        if version == 41
         else (
-            EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
-            if version in {37, 38}
-            else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+            manifest_module.EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V5
+            if version == 40
+            else (
+                EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V4
+                if version == 39
+                else (
+                    EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V3
+                    if version in {37, 38}
+                    else EXCLUDED_REPAIR_SMOKE_OBSERVATION_CONTRACT_V2
+                )
+            )
         )
     )
     assert validation._v34_excluded_repair_fault_active_phase_contract(
@@ -15050,7 +15264,7 @@ def test_v34_plus_fault_active_phase_contract_dispatches_only_exact_repair_runti
         runtime=validated[repair_id],
         coverage_smoke=True,
         validated_observation_contract=expected_contract,
-    ) == expected_contract
+    ) == validation._EXCLUDED_REPAIR_FAULT_ACTIVE_PHASE_SCOPE_V1
 
     plan = build_factorial_plan(manifest)
     campaign_runtime = json.loads(
@@ -17320,10 +17534,15 @@ def _write_runner_state_fixture(
     ("terminal_delta", "accepted"),
     ((-1, True), (0, False), (1, False)),
 )
-def test_v40_runner_terminal_is_strictly_before_shared_hard_deadline(
+@pytest.mark.parametrize(
+    "manifest_id",
+    (validation.V40_MANIFEST_ID, validation.FROZEN_MANIFEST_ID),
+)
+def test_v40_v41_runner_terminal_is_strictly_before_shared_hard_deadline(
     tmp_path: Path,
     terminal_delta: int,
     accepted: bool,
+    manifest_id: str,
 ) -> None:
     expected = _v25_inherited_placement_expected_slot()
     anchor_ns = 100
@@ -17337,7 +17556,7 @@ def test_v40_runner_terminal_is_strictly_before_shared_hard_deadline(
     arguments = {
         "expected": expected,
         "anchor_ns": anchor_ns,
-        "manifest_id": "shape-placement-factorial-v40",
+        "manifest_id": manifest_id,
         "hard_deadline_ns": hard_deadline_ns,
     }
     if accepted:

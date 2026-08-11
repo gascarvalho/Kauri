@@ -262,7 +262,7 @@ def test_v40_profile_is_one_lf_and_exact_three_path_delta() -> None:
     assert v40 == v39
 
 
-def test_v39_identities_are_historical_and_v40_is_exactly_frozen() -> None:
+def test_v39_and_v40_identities_are_exactly_historical() -> None:
     assert (
         getattr(manifest_module, "V39_MANIFEST_SHA256", None),
         getattr(manifest_module, "V39_SEMANTIC_SHA256", None),
@@ -274,14 +274,14 @@ def test_v39_identities_are_historical_and_v40_is_exactly_frozen() -> None:
     assert getattr(manifest_module, "V39_MANIFEST_ID", None) == (
         "shape-placement-factorial-v39"
     )
-    assert manifest_module.FROZEN_MANIFEST_ID == "shape-placement-factorial-v40"
+    assert manifest_module.V40_MANIFEST_ID == "shape-placement-factorial-v40"
     assert (
-        manifest_module.FROZEN_MANIFEST_SHA256,
-        manifest_module.FROZEN_SEMANTIC_SHA256,
-        manifest_module.FROZEN_PLAN_SHA256,
-        runtime_module.FROZEN_RUNTIME_SHA256,
-        runtime_module.FROZEN_SMOKE_RUNTIME_SHA256,
-        runtime_module.FROZEN_COVERAGE_SMOKE_RUNTIME_SHA256,
+        manifest_module.V40_MANIFEST_SHA256,
+        manifest_module.V40_SEMANTIC_SHA256,
+        manifest_module.V40_PLAN_SHA256,
+        runtime_module.V40_RUNTIME_SHA256,
+        runtime_module.V40_SMOKE_RUNTIME_SHA256,
+        runtime_module.V40_COVERAGE_SMOKE_RUNTIME_SHA256,
     ) == V40_SIX
 
 
@@ -834,10 +834,10 @@ def test_v40_terminal_production_path_samples_once_and_persists_same_timestamp(
         )
 
 
-def test_v40_is_default_and_v39_is_validation_only(
+def test_v41_is_default_and_v39_is_validation_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.DEFAULT_MANIFEST == V40_MANIFEST
+    assert cli.DEFAULT_MANIFEST.name == "shape-placement-factorial-v41.json"
     assert cli.main(["--manifest", str(V39_MANIFEST), "plan"]) == 2
     refusal = json.loads(capsys.readouterr().err)
-    assert "v1 through v39 are validation-only" in refusal["reason"]
+    assert "v1 through v40 are validation-only" in refusal["reason"]
