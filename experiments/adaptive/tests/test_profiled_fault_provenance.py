@@ -26,6 +26,7 @@ def _layout(tmp_path: Path) -> tuple[Path, Path, dict[str, Path]]:
     )
     binaries = {
         "app": examples / "hotstuff-app",
+        "client": examples / "hotstuff-client",
         "manager": examples / "adaptation-manager",
         "keygen": build / "hotstuff-keygen",
         "tls_keygen": build / "hotstuff-tls-keygen",
@@ -96,6 +97,12 @@ def test_verify_build_provenance_binds_exact_revision_and_binary_bytes(
 
     assert record["revision"] == "a" * 40
     assert set(record["binaries"]) == set(binaries)
+    assert record["binaries"]["client"] == {
+        "path": str(binaries["client"].resolve()),
+        "size_bytes": binaries["client"].stat().st_size,
+        "sha256": runtime.sha256_file(binaries["client"]),
+    }
+    assert "hotstuff-client" in record["build_command"]
 
 
 @pytest.mark.parametrize("drift", ("revision", "binary", "path"))

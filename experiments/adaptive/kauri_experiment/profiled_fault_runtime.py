@@ -185,6 +185,7 @@ REPLICA_NETWORK_WORKERS = 2
 BUILD_PROVENANCE_FILENAME = "n31-exact-build-provenance.json"
 EXACT_BUILD_TARGETS = (
     "hotstuff-app",
+    "hotstuff-client",
     "adaptation-manager",
     "hotstuff-keygen",
     "hotstuff-tls-keygen",
@@ -389,6 +390,7 @@ def exact_binary_paths(repository: Path, build_directory: Path) -> dict[str, Pat
         )
     return {
         "app": build_directory / "examples" / "hotstuff-app",
+        "client": build_directory / "examples" / "hotstuff-client",
         "manager": build_directory / "examples" / "adaptation-manager",
         "keygen": build_directory / "hotstuff-keygen",
         "tls_keygen": build_directory / "hotstuff-tls-keygen",

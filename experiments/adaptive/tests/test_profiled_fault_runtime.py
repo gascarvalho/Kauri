@@ -7,6 +7,7 @@ from dataclasses import replace
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -39,6 +40,50 @@ def _evaluation():
     return importlib.import_module(
         "experiments.adaptive.kauri_experiment.profiled_fault_evaluation"
     )
+
+
+def test_exact_build_provenance_includes_hotstuff_client_path_and_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    repository = tmp_path / "Kauri"
+    build_directory = repository / "build-adaptive"
+    build_directory.mkdir(parents=True)
+    paths = runtime.exact_binary_paths(repository, build_directory)
+    assert paths["client"] == build_directory / "examples" / "hotstuff-client"
+    for name, path in paths.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"{name}-binary".encode("ascii"))
+        path.chmod(0o755)
+    for path in runtime.exact_build_metadata_paths(build_directory).values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("metadata\n", encoding="utf-8")
+    (build_directory / "CMakeCache.txt").write_text(
+        f"CMAKE_HOME_DIRECTORY:INTERNAL={repository.resolve()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime, "verify_repository_state", lambda _root: "a" * 40)
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    provenance_path = runtime.prepare_exact_revision_build(
+        repository=repository,
+        build_directory=build_directory,
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    client = provenance["binaries"]["client"]
+    assert client == {
+        "path": str(paths["client"].resolve()),
+        "size_bytes": paths["client"].stat().st_size,
+        "sha256": runtime.sha256_file(paths["client"]),
+    }
 
 
 def _append_event(
