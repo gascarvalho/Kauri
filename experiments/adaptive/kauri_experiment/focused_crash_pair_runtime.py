@@ -2986,16 +2986,19 @@ class FocusedLaunchBackend:
         instances[profiled_fault_runtime.MANAGER_SOURCE_ID] = (
             f"{run_id}-manager-{uuid.uuid4().hex}"
         )
-        _legacy_manager, replicas, artifacts = profiled_fault_runtime.write_runtime_inputs(
-            adapter,
-            run_directory=run_directory,
-            app_binary=Path(binaries["app"]),
-            manager_binary=Path(binaries["manager"]),
-            bls=bls,
-            tls=tls,
-            issuer=issuer,
-            run_id=run_id,
-            source_instances=instances,
+        _legacy_manager, replicas, artifacts = (
+            profiled_fault_runtime.write_runtime_inputs(
+                adapter,
+                run_directory=run_directory,
+                app_binary=Path(binaries["app"]),
+                manager_binary=Path(binaries["manager"]),
+                bls=bls,
+                tls=tls,
+                issuer=issuer,
+                run_id=run_id,
+                source_instances=instances,
+                include_issuer_identity_artifact=False,
+            )
         )
         manager = _focused_manager_command(
             profile,
@@ -3073,7 +3076,9 @@ class FocusedLaunchBackend:
                 "profile_sha256": source_profile.profile_sha256,
                 "pair_seed": pair_seed,
             },
-            "runtime/launch-arguments.json": {"manager_argv": list(manager)},
+            "runtime/launch-arguments.json": {
+                "manager_argv": profiled_fault_runtime.normalized_manager_argv(manager)
+            },
             "derived/phase-windows.json": {"phases": []},
             "derived/throughput.json": {"rows": []},
         }
@@ -3184,14 +3189,23 @@ class FocusedLaunchBackend:
             forbidden_values=tuple(
                 f"crash-replica-{replica}"
                 for replica in configuration["profile"].target_replica_ids
-            ) + (str(configuration["pair_id"]), str(configuration["arm"])),
+            )
+            + (str(configuration["pair_id"]), str(configuration["arm"])),
         )
         root = Path(configuration["run_directory"])
+        normalized_requested = profiled_fault_runtime.normalized_manager_argv(requested)
+        normalized_observed = profiled_fault_runtime.normalized_manager_argv(observed)
         (root / "runtime" / "manager-observed-argv.json").write_bytes(
-            _canonical_json({"argv": list(observed)})
+            _canonical_json({"argv": normalized_observed})
         )
         (root / "runtime" / "manager-input.json").write_bytes(
-            _canonical_json(manager_input)
+            _canonical_json(
+                {
+                    **manager_input,
+                    "requested_argv": normalized_requested,
+                    "observed_argv": normalized_observed,
+                }
+            )
         )
         return _FocusedProcesses(registry, records, logs, evidence, lifecycle)
 

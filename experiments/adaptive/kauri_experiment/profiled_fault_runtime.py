@@ -1134,6 +1134,7 @@ def write_runtime_inputs(
     run_id: str,
     source_instances: Mapping[str, str],
     replica_overlays: Mapping[int, Sequence[str]] | None = None,
+    include_issuer_identity_artifact: bool = True,
 ) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...], list[dict[str, object]]]:
     config_directory = run_directory / "config"
     main_config = config_directory / "main.conf"
@@ -1192,24 +1193,28 @@ def write_runtime_inputs(
             "replicas": [list(command) for command in replica_commands],
         },
     )
-    artifact_paths = (
+    artifact_paths = [
         ("bls_identity_input", None, config_directory / "bls-identities.txt"),
         ("tls_identity_input", None, config_directory / "tls-identities.txt"),
-        (
-            "issuer_identity_input",
-            None,
-            config_directory / "issuer-identities.txt",
-        ),
         ("main_config", None, main_config),
-        *(
+        *[
             ("replica_config", replica, path)
             for replica, path in zip(profile.replica_ids, replica_configs)
-        ),
+        ],
         ("initial_epoch", None, epoch_path),
         ("effective_runtime", None, runtime_path),
         ("transition_request", None, request_path),
         ("launch_arguments", None, launch_path),
-    )
+    ]
+    if include_issuer_identity_artifact:
+        artifact_paths.insert(
+            2,
+            (
+                "issuer_identity_input",
+                None,
+                config_directory / "issuer-identities.txt",
+            ),
+        )
     artifacts = [
         {
             "kind": kind,

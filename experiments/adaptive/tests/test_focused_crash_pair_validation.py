@@ -612,6 +612,50 @@ def test_trusted_provenance_is_exact_and_bound_to_the_sealed_child(
             )
 
 
+def test_source_blind_validator_accepts_redacted_live_manager_boundary(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    launch_path = directory / "runtime/launch-arguments.json"
+    observed_path = directory / "runtime/manager-observed-argv.json"
+    input_path = directory / "runtime/manager-input.json"
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    original = launch["manager_argv"]
+    secrets = {
+        original[original.index(option) + 1]
+        for option in ("--tls-privkey", "--issuer-private-key")
+    }
+    profiled_runtime = runtime_fixture._runtime().profiled_fault_runtime
+    normalized = profiled_runtime.normalized_manager_argv(original)
+    _write_json(launch_path, {"manager_argv": normalized})
+    _write_json(observed_path, {"argv": normalized})
+    manager_input = json.loads(input_path.read_text(encoding="utf-8"))
+    manager_input["requested_argv"] = normalized
+    manager_input["observed_argv"] = normalized
+    _write_json(input_path, manager_input)
+    _reseal(directory)
+
+    sealed_text = "".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in (launch_path, observed_path, input_path)
+    )
+    assert all(secret not in sealed_text for secret in secrets)
+    assert (
+        validation.validate_sealed_arm(
+            directory,
+            trusted_provenance=_trusted_provenance(directory),
+        )["verdict"]
+        == "PASS"
+    )
+
+
 def test_validator_imports_no_runner_or_runtime_verdict_logic() -> None:
     module = _validation()
     tree = ast.parse(inspect.getsource(module))

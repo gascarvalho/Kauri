@@ -1357,6 +1357,58 @@ def test_write_runtime_inputs_default_and_explicit_clean_overlay_are_equivalent(
     )
 
 
+def test_write_runtime_inputs_can_use_external_issuer_without_sealing_secret(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _evaluation().load_frozen_profile(PROFILE_PATH)
+    bls = [
+        {"pub": f"bls-pub-{replica}", "sec": f"bls-sec-{replica}"}
+        for replica in profile.replica_ids
+    ]
+    tls = [
+        {
+            "crt": f"tls-crt-{identity}",
+            "sec": f"tls-sec-{identity}",
+            "cid": f"tls-cid-{identity}",
+        }
+        for identity in range(len(profile.replica_ids) + 1)
+    ]
+    issuer = {"pub": "issuer-pub", "sec": "issuer-secret-must-stay-external"}
+    instances = {
+        f"replica-{replica}": f"instance-{replica}" for replica in profile.replica_ids
+    }
+    instances[runtime.MANAGER_SOURCE_ID] = "manager-instance"
+    run_directory = tmp_path / "external-issuer"
+    for child in ("config", "runtime", "raw"):
+        (run_directory / child).mkdir(parents=True, exist_ok=True)
+    for identity_file in ("bls-identities.txt", "tls-identities.txt"):
+        (run_directory / "config" / identity_file).write_text(
+            f"synthetic {identity_file}\n",
+            encoding="utf-8",
+        )
+
+    manager, _replicas, artifacts = runtime.write_runtime_inputs(
+        profile,
+        run_directory=run_directory,
+        app_binary=Path("/build/hotstuff-app"),
+        manager_binary=Path("/build/adaptation-manager"),
+        bls=bls,
+        tls=tls,
+        issuer=issuer,
+        run_id="run-external-issuer",
+        source_instances=instances,
+        include_issuer_identity_artifact=False,
+    )
+
+    assert manager[manager.index("--issuer-private-key") + 1] == issuer["sec"]
+    assert not (run_directory / "config/issuer-identities.txt").exists()
+    assert all(item["kind"] != "issuer_identity_input" for item in artifacts)
+    assert issuer["sec"] not in (
+        run_directory / "runtime/launch-arguments.json"
+    ).read_text(encoding="utf-8")
+
+
 def test_configuration_boundary_poller_can_target_tree_zero_on_crash_profile(
     tmp_path: Path,
 ) -> None:

@@ -1201,6 +1201,96 @@ class _DelayedPollingSource:
         return None if count == 1 else self.snapshots[name]
 
 
+def test_default_backend_materializes_pair_issuer_without_secret_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE)
+    bls = [
+        {"pub": f"bls-pub-{replica}", "sec": f"bls-sec-{replica}"}
+        for replica in profile.replica_ids
+    ]
+    tls = [
+        {
+            "crt": f"tls-crt-{identity}",
+            "sec": f"tls-sec-{identity}",
+            "cid": f"tls-cid-{identity}",
+        }
+        for identity in range(len(profile.replica_ids) + 1)
+    ]
+
+    def generate_identities(
+        _profile: object,
+        *,
+        keygen_binary: Path,
+        tls_keygen_binary: Path,
+        config_directory: Path,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        assert keygen_binary.name == "hotstuff-keygen"
+        assert tls_keygen_binary.name == "hotstuff-tls-keygen"
+        (config_directory / "bls-identities.txt").write_text(
+            "synthetic BLS identities\n", encoding="utf-8"
+        )
+        (config_directory / "tls-identities.txt").write_text(
+            "synthetic TLS identities\n", encoding="utf-8"
+        )
+        return bls, tls
+
+    monkeypatch.setattr(runtime, "_generate_arm_identities", generate_identities)
+    build_directory = tmp_path / "build"
+    build_directory.mkdir()
+    (
+        build_directory / runtime.profiled_fault_runtime.BUILD_PROVENANCE_FILENAME
+    ).write_text(
+        json.dumps({"schema_version": 1, "revision": "a" * 40}),
+        encoding="utf-8",
+    )
+    public_key = native_fixture.ISSUER_PUBLIC_KEY
+    private_key = f"{1:064x}"
+    context = {
+        "profile": profile,
+        "pair_seed": 41_720,
+        "output_root": tmp_path / "results",
+        "build_directory": build_directory,
+        "binaries": {
+            "app": Path("/build/hotstuff-app"),
+            "manager": Path("/build/adaptation-manager"),
+            "client": Path("/build/hotstuff-client"),
+            "keygen": Path("/build/hotstuff-keygen"),
+            "tls_keygen": Path("/build/hotstuff-tls-keygen"),
+        },
+        "pair_issuer_allocations": {
+            "pair-01": {
+                "public_key": public_key,
+                "control": {"public_key": public_key, "private_key": private_key},
+                "adaptive": {"public_key": public_key, "private_key": private_key},
+            }
+        },
+        "preflight_receipt": {},
+        "authorization_receipt": {
+            "approval_reference": "test-only",
+            "approved_utc": "2026-08-17T00:00:00Z",
+        },
+    }
+
+    configuration = runtime.FocusedLaunchBackend().materialize_arm_configuration(
+        context,
+        pair_ordinal=1,
+        arm="control",
+    )
+
+    run_directory = Path(configuration["run_directory"])
+    assert not (run_directory / "config/issuer-identities.txt").exists()
+    assert all(
+        artifact["kind"] != "issuer_identity_input"
+        for artifact in configuration["runtime_artifacts"]
+    )
+    assert private_key not in (
+        run_directory / "runtime/launch-arguments.json"
+    ).read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("arm", ("C", "A"))
 def test_default_backend_run_arm_polls_and_faults_only_at_state_machine_boundary(
     arm: str,
