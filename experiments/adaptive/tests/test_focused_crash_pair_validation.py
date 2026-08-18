@@ -2159,6 +2159,323 @@ def test_target_process_record_exit_requires_exact_confirmed_sigkill_receipt(
     assert unconfirmed.unexpected_exit_ids() == (22,)
 
 
+def _append_successful_manager_shutdown(
+    directory: Path, *, epochs: tuple[int, ...] = (1,)
+) -> None:
+    """Append production-shaped successful manager terminals and orderly tail."""
+
+    events = _load_events(directory)
+    profile = json.loads((directory / "profile.json").read_text(encoding="utf-8"))
+    manager = next(
+        event for event in events if event["source_kind"] == "adaptation_manager"
+    )
+    manager_events = [
+        event for event in events if event["source_kind"] == "adaptation_manager"
+    ]
+    sequence = max(int(event["source_sequence"]) for event in manager_events)
+    timestamp = max(int(event["source_monotonic_ns"]) for event in manager_events)
+    source = _raw_source(directory)
+    for epoch_number in epochs:
+        command = next(
+            event
+            for event in events
+            if event["event_type"] == "epoch.command_committed"
+            and event["payload"]["successor_epoch_number"] == epoch_number
+        )["payload"]
+        activation = next(
+            event
+            for event in events
+            if event["event_type"] == "epoch.activated"
+            and event["payload"]["epoch_number"] == epoch_number
+        )["payload"]
+        epoch = source._bundle(epoch_number)[1]
+        ranking = source._ranking(events, predecessor_epoch=epoch_number - 1)
+        audit = next(
+            event
+            for event in events
+            if event["source_kind"] == "adaptation_manager"
+            and event["event_type"] == "adaptive_v2_evidence_snapshot"
+            and event["payload"]["predecessor_epoch_number"] == epoch_number - 1
+        )["payload"]
+        winning = {
+            "predecessor_epoch_number": command["predecessor_epoch_number"],
+            "predecessor_epoch_digest": command["predecessor_epoch_digest"],
+            "successor_epoch_number": command["successor_epoch_number"],
+            "successor_epoch_digest": command["successor_epoch_digest"],
+            "command_payload_digest": command["payload_digest"],
+            "command_block_height": command["command_block_height"],
+            "command_block_hash": command["command_block_hash"],
+            "activation_delay_blocks": command["activation_delay_blocks"],
+            "activation_height": activation["activation_height"],
+        }
+        terminal = {
+            "cycle_ordinal": epoch_number - 1,
+            "policy_intent": (
+                "fault_containment" if epoch_number == 1 else "performance_optimization"
+            ),
+            "outcome": "advanced",
+            "reason": "successor_converged",
+            "transition_artifact_id": (
+                "e0-to-e1-containment" if epoch_number == 1 else "e1-to-e2-optimization"
+            ),
+            "predecessor_epoch_number": epoch_number - 1,
+            "predecessor_epoch_digest": (
+                profile["topology"]["epoch_zero_digest"]
+                if epoch_number == 1
+                else source._bundle(epoch_number - 1)[1].epoch_digest
+            ),
+            "successor_epoch_number": epoch_number,
+            "successor_epoch_digest": epoch.epoch_digest,
+            "command_payload_digest": epoch.command.payload_digest,
+            "winning_activation": winning,
+            "evidence_window_activation_generation": audit["activation_generation"],
+            "baseline_evidence_cutoff": ranking["baseline_evidence_cutoff"],
+            "current_evidence_cutoff": ranking["current_evidence_cutoff"],
+        }
+        sequence += 1
+        timestamp += 1
+        events.append(
+            {
+                "event_schema_version": 1,
+                "run_id": manager["run_id"],
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": manager["source_instance"],
+                "source_sequence": sequence,
+                "source_monotonic_ns": timestamp,
+                "event_type": "adaptive_v2_session_terminal",
+                "payload": terminal,
+            }
+        )
+    for event_type, payload in (
+        ("process.stopping", {"exit_status": None}),
+        ("process.stopped", {"exit_status": None}),
+    ):
+        sequence += 1
+        timestamp += 1
+        events.append(
+            {
+                "event_schema_version": 1,
+                "run_id": manager["run_id"],
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": manager["source_instance"],
+                "source_sequence": sequence,
+                "source_monotonic_ns": timestamp,
+                "event_type": event_type,
+                "payload": payload,
+            }
+        )
+    _write_events(directory, events)
+
+
+def test_manager_clean_exit_requires_completed_native_transition_and_exact_tail(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    record = runtime_fixture.SimpleNamespace(
+        name="adaptive-manager", replica_id=-1, process=process
+    )
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(record,),
+    )
+    assert source.unexpected_exit_ids() == ()
+
+    bundle_path = directory / "raw" / "epoch1.bundle"
+    bundle = bundle_path.read_bytes()
+    bundle_path.write_bytes(bundle[:-1] + bytes((bundle[-1] ^ 1,)))
+    assert source.unexpected_exit_ids() == (-1,)
+    bundle_path.write_bytes(bundle)
+    assert source.unexpected_exit_ids() == ()
+
+    events = _load_events(directory)
+    terminal = next(
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v2_session_terminal"
+    )
+    terminal["payload"]["reason"] = "caller_failed"
+    _write_events(directory, events)
+    assert source.unexpected_exit_ids() == (-1,)
+
+
+def test_raw_poll_reuses_its_single_event_read_for_exit_health(tmp_path: Path) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    source = _raw_source(directory)
+    reads = 0
+    original_events = source._events
+
+    def counted_events() -> list[dict[str, object]]:
+        nonlocal reads
+        reads += 1
+        return original_events()
+
+    source._events = counted_events
+    source.poll("readiness")
+    assert reads == 1
+
+
+def test_adaptive_manager_clean_exit_requires_both_successful_cycles(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    record = runtime_fixture.SimpleNamespace(
+        name="adaptive-manager", replica_id=-1, process=process
+    )
+    _append_successful_manager_shutdown(directory, epochs=(1, 2))
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(record,),
+    )
+    assert source.unexpected_exit_ids() == ()
+    process.returncode = 1
+    assert source.unexpected_exit_ids() == (-1,)
+    process.returncode = 0
+    events = _load_events(directory)
+    epoch2_terminal = [
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v2_session_terminal"
+    ][1]
+    epoch2_terminal["event_type"] = "manager.note"
+    _write_events(directory, events)
+    assert source.unexpected_exit_ids() == (-1,)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    (
+        ("malformed-terminal", (-1,)),
+        ("missing-tail", (-1,)),
+        ("terminal-cycle-bool", (-1,)),
+        ("winning-predecessor-bool", (-1,)),
+        ("terminal-cutoff-drift", (-1,)),
+        ("client-exit", (-2,)),
+        ("survivor-record-exit", (20,)),
+    ),
+)
+def test_manager_clean_exit_preserves_fail_closed_exit_identity(
+    mutation: str, expected: tuple[int, ...], tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    manager_process = runtime_fixture._FakeProcess(20_001)
+    manager_process.returncode = 0
+    records: tuple[object, ...] = (
+        runtime_fixture.SimpleNamespace(
+            name="adaptive-manager", replica_id=-1, process=manager_process
+        ),
+    )
+    events = _load_events(directory)
+    if mutation == "malformed-terminal":
+        terminal = next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive_v2_session_terminal"
+        )
+        terminal["payload"]["unexpected"] = True
+    elif mutation == "terminal-cycle-bool":
+        terminal = next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive_v2_session_terminal"
+        )
+        terminal["payload"]["cycle_ordinal"] = False
+    elif mutation == "winning-predecessor-bool":
+        terminal = next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive_v2_session_terminal"
+        )
+        terminal["payload"]["winning_activation"]["predecessor_epoch_number"] = False
+    elif mutation == "terminal-cutoff-drift":
+        terminal = next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive_v2_session_terminal"
+        )
+        terminal["payload"]["baseline_evidence_cutoff"] = 0
+        terminal["payload"]["current_evidence_cutoff"] = 0
+    elif mutation == "missing-tail":
+        stopped = next(
+            event for event in events if event["event_type"] == "process.stopped"
+        )
+        stopped["event_type"] = "process.cleaned"
+    elif mutation == "client-exit":
+        client_events = [event for event in events if event["source_kind"] == "client"]
+        template = next(
+            event for event in events if event["source_kind"] == "adaptation_manager"
+        )
+        events.append(
+            {
+                **template,
+                "source_kind": "client",
+                "source_id": "client-0",
+                "source_instance": f"{template['run_id']}-client-0",
+                "source_sequence": len(client_events) + 1,
+                "source_monotonic_ns": (
+                    max(
+                        (int(event["source_monotonic_ns"]) for event in client_events),
+                        default=0,
+                    )
+                    + 1
+                ),
+                "event_type": "process.exited",
+                "payload": {"exit_status": 0},
+            }
+        )
+    else:
+        survivor_process = runtime_fixture._FakeProcess(20_020)
+        survivor_process.returncode = 0
+        records += (
+            runtime_fixture.SimpleNamespace(
+                name="replica-20", replica_id=20, process=survivor_process
+            ),
+        )
+    _write_events(directory, events)
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=records,
+    )
+    assert source.unexpected_exit_ids() == expected
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

@@ -3107,8 +3107,315 @@ class FocusedRawEvidenceSource:
             ),
         }
 
-    def unexpected_exit_ids(self) -> tuple[int, ...]:
-        events = self._events()
+    def _manager_clean_exit_is_expected(
+        self, events: Sequence[Mapping[str, Any]], record: object
+    ) -> bool:
+        """Accept only a fully witnessed, successful manager completion."""
+
+        if (
+            getattr(record, "name", None) != "adaptive-manager"
+            or getattr(record, "replica_id", None) != -1
+        ):
+            return False
+        process = getattr(record, "process", None)
+        if process is None or process.poll() != 0:
+            return False
+        try:
+            expected_epochs = (1, 2) if self._arm == "A" else (1,)
+            cache_key = _sha256(
+                _canonical_json(
+                    {
+                        "arm": self._arm,
+                        "returncode": 0,
+                        "bundles": {
+                            str(epoch): _sha256(self._bundle(epoch)[0])
+                            for epoch in expected_epochs
+                        },
+                        "events": [
+                            event
+                            for event in events
+                            if (
+                                event["source_kind"] == "adaptation_manager"
+                                and event["source_id"] == "adaptive-manager"
+                            )
+                            or event["event_type"]
+                            in {
+                                "adaptive_v2_evidence_snapshot",
+                                "adaptive_v2_session_terminal",
+                                "epoch.command_committed",
+                                "epoch.activated",
+                                "process.stopping",
+                                "process.stopped",
+                            }
+                        ],
+                    }
+                )
+            )
+            if getattr(self, "_manager_clean_exit_cache_key", None) == cache_key:
+                return True
+            terminal_keys = {
+                "cycle_ordinal",
+                "policy_intent",
+                "outcome",
+                "reason",
+                "transition_artifact_id",
+                "predecessor_epoch_number",
+                "predecessor_epoch_digest",
+                "successor_epoch_number",
+                "successor_epoch_digest",
+                "command_payload_digest",
+                "winning_activation",
+                "evidence_window_activation_generation",
+                "baseline_evidence_cutoff",
+                "current_evidence_cutoff",
+            }
+            winning_keys = {
+                "predecessor_epoch_number",
+                "predecessor_epoch_digest",
+                "successor_epoch_number",
+                "successor_epoch_digest",
+                "command_payload_digest",
+                "command_block_height",
+                "command_block_hash",
+                "activation_delay_blocks",
+                "activation_height",
+            }
+            manager_events = [
+                event
+                for event in events
+                if event["source_kind"] == "adaptation_manager"
+                and event["source_id"] == "adaptive-manager"
+            ]
+            terminals = [
+                event
+                for event in manager_events
+                if event["event_type"] == "adaptive_v2_session_terminal"
+            ]
+            if len(terminals) != len(expected_epochs):
+                return False
+            if [event["event_type"] for event in manager_events[-3:]] != [
+                "adaptive_v2_session_terminal",
+                "process.stopping",
+                "process.stopped",
+            ]:
+                return False
+            if any(
+                _document(event["payload"], "manager clean-exit tail")
+                != {"exit_status": None}
+                for event in manager_events[-2:]
+            ):
+                return False
+            if [int(event["source_sequence"]) for event in manager_events[-3:]] != list(
+                range(
+                    int(manager_events[-3]["source_sequence"]),
+                    int(manager_events[-3]["source_sequence"]) + 3,
+                )
+            ):
+                return False
+            for epoch, terminal in zip(expected_epochs, terminals, strict=True):
+                if epoch == expected_epochs[-1] and terminal != manager_events[-3]:
+                    return False
+                payload = _document(terminal["payload"], "manager terminal")
+                if set(payload) != terminal_keys:
+                    return False
+                command = self._transition(events, epoch, activation=False)
+                activation = self._transition(events, epoch, activation=True)
+                if command is None or activation is None:
+                    return False
+                ranking = self._ranking(events, predecessor_epoch=epoch - 1)
+                audits = [
+                    event
+                    for event in manager_events
+                    if event["event_type"] == "adaptive_v2_evidence_snapshot"
+                    and _integer(
+                        _document(event["payload"], "manager snapshot audit").get(
+                            "predecessor_epoch_number"
+                        ),
+                        "manager snapshot predecessor epoch",
+                        0,
+                    )
+                    == epoch - 1
+                ]
+                if len(audits) != 1:
+                    return False
+                audit = _document(audits[0]["payload"], "manager snapshot audit")
+                _wire, decoded = self._bundle(epoch)
+                predecessor_digest = (
+                    _document(self._profile.raw["topology"], "profile topology").get(
+                        "epoch_zero_digest"
+                    )
+                    if epoch == 1
+                    else self._bundle(epoch - 1)[1].epoch_digest
+                )
+                expected_artifact = (
+                    "e0-to-e1-containment" if epoch == 1 else "e1-to-e2-optimization"
+                )
+                winning = _document(
+                    payload.get("winning_activation"), "manager winning activation"
+                )
+                terminal_cycle = _integer(
+                    payload.get("cycle_ordinal"), "manager terminal cycle", 0
+                )
+                terminal_predecessor = _integer(
+                    payload.get("predecessor_epoch_number"),
+                    "manager terminal predecessor epoch",
+                    0,
+                )
+                terminal_successor = _integer(
+                    payload.get("successor_epoch_number"),
+                    "manager terminal successor epoch",
+                    1,
+                )
+                terminal_generation = _uint64(
+                    payload.get("evidence_window_activation_generation"),
+                    "manager terminal activation generation",
+                    1,
+                )
+                terminal_baseline = _integer(
+                    payload.get("baseline_evidence_cutoff"),
+                    "manager terminal baseline cutoff",
+                    0,
+                )
+                terminal_current = _integer(
+                    payload.get("current_evidence_cutoff"),
+                    "manager terminal current cutoff",
+                    0,
+                )
+                winning_numeric = {
+                    "predecessor_epoch_number": _integer(
+                        winning.get("predecessor_epoch_number"),
+                        "manager winning predecessor epoch",
+                        0,
+                    ),
+                    "successor_epoch_number": _integer(
+                        winning.get("successor_epoch_number"),
+                        "manager winning successor epoch",
+                        1,
+                    ),
+                    "command_block_height": _integer(
+                        winning.get("command_block_height"),
+                        "manager winning command height",
+                        1,
+                    ),
+                    "activation_delay_blocks": _integer(
+                        winning.get("activation_delay_blocks"),
+                        "manager winning activation delay",
+                        1,
+                    ),
+                    "activation_height": _integer(
+                        winning.get("activation_height"),
+                        "manager winning activation height",
+                        1,
+                    ),
+                }
+                if (
+                    set(winning) != winning_keys
+                    or terminal_cycle != epoch - 1
+                    or payload.get("policy_intent")
+                    != (
+                        "fault_containment"
+                        if epoch == 1
+                        else "performance_optimization"
+                    )
+                    or payload.get("outcome") != "advanced"
+                    or payload.get("reason") != "successor_converged"
+                    or payload.get("transition_artifact_id") != expected_artifact
+                    or terminal_predecessor != epoch - 1
+                    or payload.get("predecessor_epoch_digest") != predecessor_digest
+                    or terminal_successor != epoch
+                    or payload.get("successor_epoch_digest") != decoded.epoch_digest
+                    or payload.get("command_payload_digest")
+                    != decoded.command.payload_digest
+                    or terminal_generation
+                    != _uint64(
+                        audit.get("activation_generation"),
+                        "manager snapshot activation generation",
+                        1,
+                    )
+                    or terminal_baseline
+                    != _integer(
+                        ranking.get("baseline_evidence_cutoff"),
+                        "manager ranking baseline cutoff",
+                        0,
+                    )
+                    or terminal_current
+                    != _integer(
+                        ranking.get("current_evidence_cutoff"),
+                        "manager ranking current cutoff",
+                        0,
+                    )
+                ):
+                    return False
+                command_payload = {
+                    key: command[key]
+                    for key in (
+                        "command_block_height",
+                        "activation_height",
+                    )
+                }
+                command_event = next(
+                    event
+                    for event in events
+                    if event["event_type"] == "epoch.command_committed"
+                    and _document(event["payload"], "transition payload").get(
+                        "successor_epoch_number"
+                    )
+                    == epoch
+                )
+                full_command = _document(command_event["payload"], "transition payload")
+                if (
+                    {
+                        **{
+                            key: winning.get(key)
+                            for key in winning_keys
+                            if key
+                            not in {
+                                "predecessor_epoch_number",
+                                "successor_epoch_number",
+                                "command_block_height",
+                                "activation_delay_blocks",
+                                "activation_height",
+                            }
+                        },
+                        **winning_numeric,
+                    }
+                    != {
+                        **{
+                            key: (
+                                _integer(
+                                    full_command.get(key), "transition numeric field", 0
+                                )
+                                if key
+                                in {
+                                    "predecessor_epoch_number",
+                                    "successor_epoch_number",
+                                    "command_block_height",
+                                    "activation_delay_blocks",
+                                    "activation_height",
+                                }
+                                else full_command.get(key)
+                            )
+                            for key in winning_keys
+                            if key != "command_payload_digest"
+                        },
+                        "command_payload_digest": full_command.get("payload_digest"),
+                    }
+                    or winning_numeric["activation_height"]
+                    != command_payload["activation_height"]
+                    or winning_numeric["activation_height"]
+                    != activation["activation_height"]
+                ):
+                    return False
+            self._manager_clean_exit_cache_key = cache_key
+            return True
+        except (FocusedCrashPairRuntimeError, KeyError, StopIteration, TypeError):
+            return False
+
+    def unexpected_exit_ids(
+        self, events: Sequence[Mapping[str, Any]] | None = None
+    ) -> tuple[int, ...]:
+        if events is None:
+            events = self._events()
         unexpected: set[int] = set()
         for record in self._process_records:
             replica = getattr(record, "replica_id", None)
@@ -3117,6 +3424,10 @@ class FocusedRawEvidenceSource:
                 continue
             returncode = process.poll()
             if returncode is None:
+                continue
+            if replica == -1:
+                if not self._manager_clean_exit_is_expected(events, record):
+                    unexpected.add(replica)
                 continue
             if replica < 0 or replica not in self._profile.target_replica_ids:
                 unexpected.add(replica)
@@ -3166,7 +3477,11 @@ class FocusedRawEvidenceSource:
             if event["event_type"] != "process.exited":
                 continue
             source_id = str(event["source_id"])
-            if source_id.startswith("replica-"):
+            if event["source_kind"] == "adaptation_manager":
+                unexpected.add(-1)
+            elif event["source_kind"] == "client":
+                unexpected.add(-2)
+            elif source_id.startswith("replica-"):
                 replica = int(source_id.removeprefix("replica-"))
                 receipt_path = self._root / "raw" / "fault-receipt.json"
                 exempt = False
@@ -3249,9 +3564,9 @@ class FocusedRawEvidenceSource:
     def poll(self, name: str) -> Mapping[str, object] | None:
         events = self._events()
         self._reject_post_fault_target_events(events)
-        unexpected = self.unexpected_exit_ids()
+        unexpected = self.unexpected_exit_ids(events)
         if unexpected:
-            _error("raw process health contains an unexpected survivor exit")
+            _error("raw process health contains an unexpected process exit")
         expected_lifecycle = {
             **{
                 f"replica-{replica}": "replica" for replica in self._profile.replica_ids
