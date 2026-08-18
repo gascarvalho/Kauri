@@ -51,9 +51,9 @@ def _inputs(
         "trusted": tmp_path / "trusted.json",
     }
     source_profile = (
-        runtime_fixture.N7_PROFILE_V2
+        runtime_fixture.N7_PROFILE_V3
         if mode == "smoke"
-        else runtime_fixture.N31_PROFILE_V2
+        else runtime_fixture.N31_PROFILE_V3
     )
     profile = json.loads(source_profile.read_text(encoding="utf-8"))
     source_proof = runtime_fixture._topology_proof_path(source_profile, profile)
@@ -758,7 +758,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     runtime = importlib.import_module(
         "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
     )
-    profile = runtime.load_focused_profile(runtime_fixture.N7_PROFILE_V2)
+    profile = runtime.load_focused_profile(runtime_fixture.N7_PROFILE_V3)
     assert profile.issuer_public_key is None
     checks = _CliPreflightChecks()
     captured: list[dict[str, object]] = []
@@ -774,7 +774,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
                 "--mode",
                 "smoke",
                 "--profile",
-                str(runtime_fixture.N7_PROFILE_V2),
+                str(runtime_fixture.N7_PROFILE_V3),
                 "--pairs",
                 "1",
                 "--output",
@@ -824,18 +824,21 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     ("mode", "profile_path", "pairs"),
     (
         ("smoke", runtime_fixture.N7_PROFILE, 1),
+        ("smoke", runtime_fixture.N7_PROFILE_V2, 1),
         ("pair", runtime_fixture.N31_PROFILE, 1),
+        ("pair", runtime_fixture.N31_PROFILE_V2, 1),
         ("campaign", runtime_fixture.N31_PROFILE, 5),
+        ("campaign", runtime_fixture.N31_PROFILE_V2, 5),
     ),
 )
-def test_cli_rejects_archived_v1_profile_for_new_execution(
+def test_cli_rejects_archived_v1_and_v2_profiles_for_new_execution(
     mode: str,
     profile_path: Path,
     pairs: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """v1 remains loadable for archives but cannot authorize a new run."""
+    """Archived v1/v2 evidence remains readable but cannot authorize a new run."""
 
     runner = _runner()
     _execution_sentinels(runner, monkeypatch)
@@ -1036,7 +1039,7 @@ def test_default_preflight_persists_and_execution_reloads_pair_issuer_material(
                 "--mode",
                 "campaign",
                 "--profile",
-                str(runtime_fixture.N31_PROFILE_V2),
+                str(runtime_fixture.N31_PROFILE_V3),
                 "--pairs",
                 "5",
                 "--output",

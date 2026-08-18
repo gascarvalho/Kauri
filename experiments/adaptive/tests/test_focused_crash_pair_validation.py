@@ -298,7 +298,16 @@ def _complete_child(
                 "leader-activation-grace = 1.0",
                 "client-ip = 127.0.0.1",
                 "tree-generation = default",
-                f"tree-switch-period = {len(members)}",
+                "tree-switch-period = "
+                + (
+                    "2"
+                    if profile["profile_id"]
+                    in {
+                        "n7-f2-q5-two-crash-pair-smoke-v3",
+                        "n31-f5-q21-three-crash-pair-v3",
+                    }
+                    else str(len(members))
+                ),
                 "epoch-protocol-mode = adaptive_v2",
                 "epoch-change-issuer-id = 7",
                 f"epoch-change-issuer-public-key = {native_fixture.ISSUER_PUBLIC_KEY}",
@@ -729,6 +738,165 @@ def test_independent_validator_rechecks_fcrash_h_guard_and_deadline_caps(
             )
         with pytest.raises(validation.FocusedCrashPairValidationError):
             validation.validate_fcrash_h_evidence(contract, changed)
+
+
+def _v3_progress_contract(tmp_path: Path) -> dict[str, object]:
+    profile = json.loads(runtime_fixture.N7_PROFILE_V3.read_text(encoding="utf-8"))
+    proof_source = runtime_fixture._topology_proof_path(
+        runtime_fixture.N7_PROFILE_V3, profile
+    )
+    proof_path = tmp_path / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True, exist_ok=True)
+    proof_path.write_bytes(proof_source.read_bytes())
+    _write_json(tmp_path / "profile.json", profile)
+    return _document(_validation().validation_contract_from_profile(tmp_path))
+
+
+def _v3_progress_events(contract: Mapping[str, object]) -> list[dict[str, object]]:
+    run_id = "v3-progress-run"
+    source_id = str(contract["authoritative_source_id"])
+    instance = f"{run_id}-{source_id}-550e8400-e29b-41d4-a716-446655440000"
+    digest = str(contract["epoch_zero_digest"])
+    lifecycle = [
+        {
+            "event_schema_version": 1,
+            "run_id": run_id,
+            "source_kind": "replica",
+            "source_id": source_id,
+            "source_instance": instance,
+            "source_sequence": index + 1,
+            "source_monotonic_ns": 10 + index,
+            "event_type": event_type,
+            "payload": {},
+        }
+        for index, event_type in enumerate(("process.started", "process.ready"))
+    ]
+    starting_tree = int(contract["reporter_coverage_plan"]["active_tree_id"])
+    members = [int(member) for member in contract["members"]]
+    configurations = [
+        {
+            "event_schema_version": 1,
+            "run_id": run_id,
+            "source_kind": "replica",
+            "source_id": source_id,
+            "source_instance": instance,
+            "source_sequence": 3 + position,
+            "source_monotonic_ns": 90 if position == 0 else 100 + position,
+            "event_type": "adaptive.configuration_active",
+            "payload": {
+                "epoch_number": 0,
+                "tree_id": members[(members.index(starting_tree) + position) % len(members)],
+                "epoch_digest": digest,
+            },
+        }
+        for position in range(6)
+    ]
+    commits = [
+        {
+            "event_schema_version": 1,
+            "run_id": run_id,
+            "source_kind": "replica",
+            "source_id": source_id,
+            "source_instance": instance,
+            "source_sequence": index + 10,
+            "source_monotonic_ns": 120 + index,
+            "event_type": "block.committed",
+            "payload": {
+                "block_height": index + 1,
+                "block_hash": f"{index + 1:064x}",
+                "parent_hash": "00" * 32 if index == 0 else f"{index:064x}",
+                "transaction_count": 1000,
+                "commit_batch_index": 0,
+                "designated_observer": True,
+                "view_generation": 1,
+                "decision_proof": {
+                    "epoch_number": 0,
+                    "epoch_digest": digest,
+                    "block_hash": f"{index + 1:064x}",
+                    "tree_id": 4,
+                },
+            },
+        }
+        for index in range(12)
+    ]
+    return [*lifecycle, *configurations, *commits]
+
+
+def test_v3_progress_witness_is_recomputed_from_exact_authoritative_commits(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    contract = _v3_progress_contract(tmp_path)
+    progress = validation._fcrash_h_postfault_progress(
+        contract, _v3_progress_events(contract), fault_ns=100, audit_ns=200
+    )
+    assert progress == {
+        "required_tree_positions": 6,
+        "actual_tree_positions": 6,
+        "starting_tree_id": 6,
+        "observed_tree_ids": [6, 0, 1, 2, 3, 4],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong-epoch",
+        "wrong-digest",
+        "malformed-proof",
+        "missing-position",
+        "unbound-lifecycle",
+        "multiple-lifecycle-instances",
+        "wrong-proof-hash",
+        "wrong-proof-tree",
+        "out-of-order",
+    ),
+)
+def test_v3_progress_witness_rejects_non_authoritative_or_insufficient_raw_commits(
+    mutation: str, tmp_path: Path
+) -> None:
+    validation = _validation()
+    contract = _v3_progress_contract(tmp_path)
+    events = _v3_progress_events(contract)
+    target = events[-1]
+    if mutation == "wrong-epoch":
+        target["payload"]["decision_proof"]["epoch_number"] = 1  # type: ignore[index]
+    elif mutation == "wrong-digest":
+        target["payload"]["decision_proof"]["epoch_digest"] = "ff" * 32  # type: ignore[index]
+    elif mutation == "malformed-proof":
+        target["payload"]["decision_proof"] = {}  # type: ignore[index]
+    elif mutation == "missing-position":
+        events.pop(7)
+    elif mutation == "unbound-lifecycle":
+        events = [event for event in events if event["event_type"] != "process.ready"]
+    elif mutation == "multiple-lifecycle-instances":
+        events[1]["source_instance"] = "v3-progress-run-replica-2-other-uuid"
+    elif mutation == "wrong-proof-hash":
+        target["payload"]["decision_proof"]["block_hash"] = "ff" * 32  # type: ignore[index]
+    elif mutation == "wrong-proof-tree":
+        target["payload"]["decision_proof"]["tree_id"] = 1  # type: ignore[index]
+    elif mutation == "out-of-order":
+        target["source_sequence"] = 1
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._fcrash_h_postfault_progress(
+            contract, events, fault_ns=100, audit_ns=200
+        )
+
+
+def test_v3_progress_witness_rejects_duplicate_cyclic_configuration(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    contract = _v3_progress_contract(tmp_path)
+    events = _v3_progress_events(contract)
+    duplicate = deepcopy(events[7])
+    duplicate["source_sequence"] = 22
+    duplicate["source_monotonic_ns"] = 110
+    events.append(duplicate)
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="cyclic"):
+        validation._fcrash_h_postfault_progress(
+            contract, events, fault_ns=100, audit_ns=200
+        )
 
 
 def test_validator_uses_no_n31_specific_fault_or_blinding_helper() -> None:

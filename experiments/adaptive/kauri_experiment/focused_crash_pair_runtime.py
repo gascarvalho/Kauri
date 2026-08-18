@@ -65,6 +65,12 @@ _PROFILE_KEYS = {
     "blinding",
 }
 _PROFILE_KEYS_V2 = _PROFILE_KEYS | {"evidence_guard"}
+_FCRASH_H_V3_PROFILE_IDS = frozenset(
+    {
+        "n7-f2-q5-two-crash-pair-smoke-v3",
+        "n31-f5-q21-three-crash-pair-v3",
+    }
+)
 _AUTHORIZATION_KEYS = (
     "schema_version",
     "mode",
@@ -109,6 +115,29 @@ class FocusedCrashPairRuntimeError(RuntimeError):
 
 def _error(message: str) -> None:
     raise FocusedCrashPairRuntimeError(message)
+
+
+def _authoritative_lifecycle_instance(
+    events: Sequence[Mapping[str, Any]], expected_source: str
+) -> str:
+    """Bind an authoritative replica to its one native lifecycle instance."""
+
+    lifecycle = [
+        event
+        for event in events
+        if event.get("event_type") in {"process.started", "process.ready"}
+        and event.get("source_id") == expected_source
+    ]
+    if len(lifecycle) != 2 or {
+        event.get("event_type") for event in lifecycle
+    } != {"process.started", "process.ready"}:
+        _error("authoritative progress lacks an exact lifecycle binding")
+    if any(event.get("source_kind") != "replica" for event in lifecycle):
+        _error("authoritative progress lifecycle kind drifted")
+    instances = {event.get("source_instance") for event in lifecycle}
+    if len(instances) != 1 or not isinstance(next(iter(instances)), str):
+        _error("authoritative progress lifecycle instance is ambiguous")
+    return str(next(iter(instances)))
 
 
 def _canonical_json(value: object) -> bytes:
@@ -485,7 +514,7 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         _error("reporter coverage requires a focused profile")
     raw = profile.raw
     if raw.get("schema_version") != 2:
-        _error("reporter coverage requires an immutable v2 profile")
+        _error("reporter coverage requires an immutable FCRASH-H profile")
     protocol = _document(raw.get("protocol"), "profile protocol")
     topology = _document(raw.get("topology"), "profile topology")
     guard = _document(raw.get("evidence_guard"), "profile evidence guard")
@@ -498,6 +527,8 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         "minimum_timeouts_per_reporter",
         "minimum_score_drop",
     }
+    if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS:
+        expected_guard_keys.add("required_postfault_tree_positions")
     expected_timer_keys = {
         "adaptation_interval_seconds",
         "stable_phase_seconds",
@@ -558,14 +589,17 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
     ordered_common = sorted(common_reporters)
     for row in target_rows:
         row["authenticated_reporter_ids"] = ordered_common
+    expected_period = 2 if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS else replica_count
     expected_guard = {
         "schedule": "native_cyclic_epoch_zero",
-        "tree_switch_period_blocks": replica_count,
+        "tree_switch_period_blocks": expected_period,
         "horizon_tree_positions": horizon,
         "required_qualifying_reporters": required,
         "minimum_timeouts_per_reporter": minimum_timeouts,
         "minimum_score_drop": minimum_timeouts * required,
     }
+    if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS:
+        expected_guard["required_postfault_tree_positions"] = horizon
     if dict(guard) != expected_guard:
         _error("FCRASH-H frozen evidence guard differs from topology derivation")
     deadline_fields = {
@@ -601,6 +635,12 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         "required_qualifying_reporters": required,
         "minimum_timeouts_per_reporter": minimum_timeouts,
         "minimum_score_drop": minimum_timeouts * required,
+        **(
+            {"required_postfault_tree_positions": horizon,
+             "nominal_commit_horizon": horizon * expected_period}
+            if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+            else {}
+        ),
         "deadlines_seconds": deadlines,
         "stable_phase_seconds": stable,
         "readiness_timeout_seconds": readiness,
@@ -1464,6 +1504,30 @@ def _drive_arm_state_machine(
             for target in targets
         ):
             _error("runtime nonresponse lacks the frozen score drawdown")
+        required_progress = coverage.get("required_postfault_tree_positions")
+        if required_progress is not None:
+            progress = _document(
+                nonresponse.get("postfault_progress"), "runtime post-fault progress"
+            )
+            expected_progress_keys = {
+                "required_tree_positions",
+                "actual_tree_positions",
+                "starting_tree_id",
+                "observed_tree_ids",
+            }
+            required_count = _integer(
+                required_progress, "required post-fault commit horizon", 1
+            )
+            if set(progress) != expected_progress_keys or (
+                _integer(progress.get("required_tree_positions"), "progress required count", 1)
+                != required_count
+                or _integer(progress.get("actual_tree_positions"), "progress actual count", 1)
+                < required_count
+                or not isinstance(progress.get("observed_tree_ids"), list)
+                or len(progress["observed_tree_ids"])
+                != _integer(progress.get("actual_tree_positions"), "progress actual count", 1)
+            ):
+                _error("runtime nonresponse lacks the frozen post-fault progress")
 
     epoch1_snapshot = hooks.issue_epoch_request(1)
     epoch1_ns = _timestamp(epoch1_snapshot, "epoch 1 request")
@@ -2139,6 +2203,153 @@ class FocusedRawEvidenceSource:
             max(timestamps),
         )
 
+    def _postfault_authoritative_progress(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        fault_ns: int,
+        audit_ns: int,
+    ) -> dict[str, int] | None:
+        """Derive the v3 progress gate solely from authoritative raw commits."""
+
+        coverage = derive_reporter_coverage_plan(self._profile)
+        required = coverage.get("required_postfault_tree_positions")
+        if required is None:
+            return None
+        required_count = _integer(required, "required post-fault commit horizon", 1)
+        measurement = _document(
+            self._profile.raw.get("measurement"), "profile measurement"
+        )
+        observer = _integer(
+            measurement.get("authoritative_replica_id"), "authoritative observer", 0
+        )
+        expected_source = f"replica-{observer}"
+        expected_instance = _authoritative_lifecycle_instance(
+            events, expected_source
+        )
+        expected_digest = _document(
+            self._profile.raw.get("topology"), "profile topology"
+        ).get("epoch_zero_digest")
+        start_events = [
+            event for event in events
+            if event.get("source_kind") == "replica"
+            and event.get("source_id") == expected_source
+            and event.get("source_instance") == expected_instance
+            and event.get("event_type") == "adaptive.configuration_active"
+            and _integer(event.get("source_monotonic_ns"), "configuration timestamp") < fault_ns
+        ]
+        if not start_events:
+            _error("raw authoritative progress lacks a pre-fault configuration")
+        start = max(start_events, key=lambda event: _integer(event.get("source_monotonic_ns"), "configuration timestamp"))
+        start_payload = _document(start.get("payload"), "pre-fault configuration")
+        starting_tree = _integer(start_payload.get("tree_id"), "starting tree")
+        if (
+            start_payload.get("epoch_number") != 0
+            or start_payload.get("epoch_digest") != expected_digest
+            or starting_tree != _integer(
+                derive_reporter_coverage_plan(self._profile).get("active_tree_id"),
+                "active tree",
+            )
+        ):
+            _error("raw authoritative progress pre-fault configuration drifted")
+        members = tuple(self._profile.replica_ids)
+        activations = sorted(
+            [
+                event for event in events
+                if event.get("source_kind") == "replica"
+                and event.get("source_id") == expected_source
+                and event.get("source_instance") == expected_instance
+                and event.get("event_type") == "adaptive.configuration_active"
+                and fault_ns < _integer(event.get("source_monotonic_ns"), "configuration timestamp") < audit_ns
+            ],
+            key=lambda event: (
+                _integer(event.get("source_sequence"), "configuration sequence", 1),
+                _integer(event.get("source_monotonic_ns"), "configuration timestamp"),
+            ),
+        )
+        # The active pre-fault tree is position one of the frozen horizon.
+        observed_trees: list[int] = [starting_tree]
+        for position, event in enumerate(activations, start=1):
+            payload = _document(event.get("payload"), "post-fault configuration")
+            tree = _integer(payload.get("tree_id"), "activated tree")
+            if (
+                payload.get("epoch_number") != 0
+                or payload.get("epoch_digest") != expected_digest
+                or tree != members[(members.index(starting_tree) + position) % len(members)]
+            ):
+                _error("raw authoritative progress cyclic configuration drifted")
+            observed_trees.append(tree)
+        if len(observed_trees) < required_count:
+            return None
+        configurations = [(
+            _integer(start.get("source_sequence"), "configuration sequence", 1),
+            _integer(start.get("source_monotonic_ns"), "configuration timestamp"),
+            starting_tree,
+        )] + [
+            (
+                _integer(event.get("source_sequence"), "configuration sequence", 1),
+                _integer(event.get("source_monotonic_ns"), "configuration timestamp"),
+                tree,
+            ) for event, tree in zip(activations, observed_trees[1:], strict=True)
+        ]
+        for event in events:
+            if event.get("event_type") != "block.committed":
+                continue
+            if (
+                event.get("source_kind") != "replica"
+                or event.get("source_id") != expected_source
+                or event.get("source_instance") != expected_instance
+            ):
+                continue
+            timestamp = _integer(
+                event.get("source_monotonic_ns"), "authoritative progress timestamp"
+            )
+            if not fault_ns < timestamp < audit_ns:
+                continue
+            payload = _document(event.get("payload"), "authoritative progress commit")
+            proof = _document(payload.get("decision_proof"), "progress decision proof")
+            if set(payload) != {
+                "block_height",
+                "block_hash",
+                "parent_hash",
+                "transaction_count",
+                "commit_batch_index",
+                "designated_observer",
+                "decision_proof",
+                "view_generation",
+            }:
+                _error("raw authoritative progress commit schema drifted")
+            block_hash = _digest(payload.get("block_hash"), "progress commit hash")
+            proof_tree = _integer(proof.get("tree_id"), "progress proof tree")
+            if (
+                payload.get("designated_observer") is not True
+                or payload.get("commit_batch_index") != 0
+                or payload.get("view_generation") != 1
+                or _integer(payload.get("transaction_count"), "progress transactions", 1)
+                % 5
+                != 0
+                or proof.get("block_hash") != block_hash
+                or proof.get("epoch_number") != 0
+                or proof.get("epoch_digest") != expected_digest
+            ):
+                _error("raw authoritative progress commit invariants drifted")
+            commit_key = (_integer(event.get("source_sequence"), "progress source sequence", 1), timestamp)
+            active_index = max(
+                (index for index, row in enumerate(configurations) if row[:2] <= commit_key),
+                default=-1,
+            )
+            if active_index < 0 or proof_tree not in {
+                configurations[active_index][2],
+                *([configurations[active_index - 1][2]] if active_index else []),
+            }:
+                _error("raw authoritative progress commit is not causally activated")
+        return {
+            "required_tree_positions": required_count,
+            "actual_tree_positions": len(observed_trees),
+            "starting_tree_id": starting_tree,
+            "observed_tree_ids": observed_trees,
+        }
+
     def _transition(
         self,
         events: Sequence[Mapping[str, Any]],
@@ -2571,7 +2782,7 @@ class FocusedRawEvidenceSource:
                 if qualified is None:
                     return None
                 counts, drawdowns, timestamp = qualified
-                return {
+                result: dict[str, object] = {
                     "detected_target_ids": ranking["detected_target_ids"],
                     "qualifying_timeout_counts": counts,
                     "guard_drawdowns": drawdowns,
@@ -2581,6 +2792,24 @@ class FocusedRawEvidenceSource:
                         "ranking audit timestamp",
                     ),
                 }
+                progress = self._postfault_authoritative_progress(
+                    events,
+                    fault_ns=_integer(fault.get("source_monotonic_ns"), "fault timestamp"),
+                    audit_ns=_integer(
+                        ranking.get("audit_source_monotonic_ns"),
+                        "ranking audit timestamp",
+                    ),
+                )
+                if (
+                    derive_reporter_coverage_plan(self._profile).get(
+                        "required_postfault_tree_positions"
+                    )
+                    is not None
+                ):
+                    if progress is None:
+                        return None
+                    result["postfault_progress"] = progress
+                return result
             timeout_events = [
                 event
                 for event in events

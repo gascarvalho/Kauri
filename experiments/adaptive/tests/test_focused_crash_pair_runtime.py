@@ -27,6 +27,8 @@ N31_PROFILE = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v1.json"
 # constants above: archived fixtures and validation continue to bind them.
 N7_PROFILE_V2 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v2.json"
 N31_PROFILE_V2 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v2.json"
+N7_PROFILE_V3 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v3.json"
+N31_PROFILE_V3 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v3.json"
 PROFILE_KEYS = {
     "schema_version",
     "profile_id",
@@ -190,9 +192,9 @@ def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
     ("profile_path", "expected"),
     (
         (
-            N7_PROFILE_V2,
+            N7_PROFILE_V3,
             {
-                "profile_id": "n7-f2-q5-two-crash-pair-smoke-v2",
+                "profile_id": "n7-f2-q5-two-crash-pair-smoke-v3",
                 "active_tree_id": 6,
                 "horizon_tree_positions": 6,
                 "required_qualifying_reporters": 3,
@@ -207,17 +209,17 @@ def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
                     1: ((1, 6, 6), (4, 2, 4), (5, 3, 5)),
                 },
                 "deadlines": {
-                    "evidence_seconds": 75,
-                    "epoch1_activation_seconds": 90,
+                    "evidence_seconds": 120,
+                    "epoch1_activation_seconds": 180,
                     "optimization_activation_seconds": 90,
                     "arm_hard_seconds": 330,
                 },
             },
         ),
         (
-            N31_PROFILE_V2,
+            N31_PROFILE_V3,
             {
-                "profile_id": "n31-f5-q21-three-crash-pair-v2",
+                "profile_id": "n31-f5-q21-three-crash-pair-v3",
                 "active_tree_id": 20,
                 "horizon_tree_positions": 16,
                 "required_qualifying_reporters": 11,
@@ -269,8 +271,8 @@ def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
                     ),
                 },
                 "deadlines": {
-                    "evidence_seconds": 160,
-                    "epoch1_activation_seconds": 180,
+                    "evidence_seconds": 180,
+                    "epoch1_activation_seconds": 270,
                     "optimization_activation_seconds": 90,
                     "arm_hard_seconds": 420,
                 },
@@ -325,7 +327,7 @@ def test_fcrash_h_coverage_plan_is_common_honest_and_bounded(
     assert len(expected["reporter_ids"]) == expected["required_qualifying_reporters"]
 
 
-@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V3, N31_PROFILE_V3))
 def test_fcrash_h_deadlines_are_absolute_half_open_intervals(
     profile_path: Path,
 ) -> None:
@@ -356,7 +358,7 @@ def test_fcrash_h_deadlines_are_absolute_half_open_intervals(
         )
 
 
-@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V3, N31_PROFILE_V3))
 def test_fcrash_h_requires_all_member_exact_active_configuration_before_fault(
     profile_path: Path,
 ) -> None:
@@ -385,7 +387,7 @@ def test_fcrash_h_requires_all_member_exact_active_configuration_before_fault(
 
 
 def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, object]]:
-    """A v2 state-machine witness with the exact pre-fault evidence boundary."""
+    """A v3 state-machine witness with the exact pre-fault evidence boundary."""
 
     replicas = len(profile.replica_ids)
     snapshots = _arm_snapshots(replicas, arm)
@@ -438,6 +440,18 @@ def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, obj
             }
             for target in plan["targets"]
         },
+        **(
+            {
+                "postfault_progress": {
+                    "required_tree_positions": plan["required_postfault_tree_positions"],
+                    "actual_tree_positions": plan["required_postfault_tree_positions"],
+                    "starting_tree_id": plan["active_tree_id"],
+                    "observed_tree_ids": list(range(plan["required_postfault_tree_positions"])),
+                }
+            }
+            if "required_postfault_tree_positions" in plan
+            else {}
+        ),
     }
     snapshots["epoch1"] = {
         **snapshots["epoch1"],
@@ -486,11 +500,141 @@ def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, obj
     return snapshots
 
 
-@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+def _v3_raw_progress_events(profile: object) -> list[dict[str, object]]:
+    run_id = "v3-progress-run"
+    source_id = f"replica-{profile.raw['measurement']['authoritative_replica_id']}"
+    instance = f"{run_id}-{source_id}-550e8400-e29b-41d4-a716-446655440000"
+    digest = profile.raw["topology"]["epoch_zero_digest"]
+    lifecycle = [
+        {
+            "run_id": run_id,
+            "source_kind": "replica",
+            "source_id": source_id,
+            "source_instance": instance,
+            "event_type": event_type,
+            "source_monotonic_ns": 10 + index,
+            "payload": {},
+        }
+        for index, event_type in enumerate(("process.started", "process.ready"))
+    ]
+    starting_tree = int(profile.raw["topology"]["active_tree_id"])
+    members = list(profile.replica_ids)
+    configurations = [
+        {
+            "run_id": run_id,
+            "source_kind": "replica",
+            "source_id": source_id,
+            "source_instance": instance,
+            "source_sequence": 3 + position,
+            "source_monotonic_ns": 90 if position == 0 else 100 + position,
+            "event_type": "adaptive.configuration_active",
+            "payload": {
+                "epoch_number": 0,
+                "tree_id": members[(members.index(starting_tree) + position) % len(members)],
+                "epoch_digest": digest,
+            },
+        }
+        for position in range(6)
+    ]
+    commits = [
+        {
+            "run_id": run_id,
+            "source_kind": "replica",
+            "source_id": source_id,
+            "source_instance": instance,
+            "event_type": "block.committed",
+            "source_sequence": index + 10,
+            "source_monotonic_ns": 120 + index,
+            "payload": {
+                "block_height": index + 1,
+                "block_hash": f"{index + 1:064x}",
+                "parent_hash": "00" * 32 if index == 0 else f"{index:064x}",
+                "transaction_count": 1000,
+                "commit_batch_index": 0,
+                "designated_observer": True,
+                "view_generation": 1,
+                "decision_proof": {
+                    "epoch_number": 0,
+                    "epoch_digest": digest,
+                    "block_hash": f"{index + 1:064x}",
+                    "tree_id": 4,
+                },
+            },
+        }
+        for index in range(12)
+    ]
+    return [*lifecycle, *configurations, *commits]
+
+
+def test_v3_raw_progress_binds_native_uuid_lifecycle_instance() -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    assert source._postfault_authoritative_progress(
+        _v3_raw_progress_events(profile), fault_ns=100, audit_ns=200
+    ) == {
+        "required_tree_positions": 6,
+        "actual_tree_positions": 6,
+        "starting_tree_id": 6,
+        "observed_tree_ids": [6, 0, 1, 2, 3, 4],
+    }
+
+
+@pytest.mark.parametrize("mutation", ("unbound", "mixed", "multiple"))
+def test_v3_raw_progress_rejects_unbound_or_mixed_lifecycle_instances(
+    mutation: str,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    events = _v3_raw_progress_events(profile)
+    if mutation == "unbound":
+        events.pop(1)
+    elif mutation == "mixed":
+        events[-1]["source_instance"] = "foreign-uuid"
+    else:
+        events[1]["source_instance"] = "other-uuid"
+    if mutation == "mixed":
+        assert source._postfault_authoritative_progress(
+            events, fault_ns=100, audit_ns=200
+        ) is not None
+    else:
+        with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+            source._postfault_authoritative_progress(
+                events, fault_ns=100, audit_ns=200
+            )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("wrong-proof-hash", "wrong-proof-tree", "out-of-order"),
+)
+def test_v3_raw_progress_requires_one_consecutive_authoritative_commit_chain(
+    mutation: str,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    events = _v3_raw_progress_events(profile)
+    target = events[-1]
+    if mutation == "wrong-proof-hash":
+        target["payload"]["decision_proof"]["block_hash"] = "ff" * 32
+    elif mutation == "wrong-proof-tree":
+        target["payload"]["decision_proof"]["tree_id"] = 1
+    else:
+        target["source_sequence"] = 1
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        source._postfault_authoritative_progress(events, fault_ns=100, audit_ns=200)
+
+
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V3, N31_PROFILE_V3))
 def test_fcrash_h_state_machine_requires_exact_barrier_and_guarded_timeouts(
     profile_path: Path,
 ) -> None:
-    """v2 cannot fault until its exact barrier and native timeout guard exist."""
+    """v3 cannot fault until its exact barrier and native timeout guard exist."""
 
     runtime = _runtime()
     profile = replace(
@@ -511,6 +655,9 @@ def test_fcrash_h_state_machine_requires_exact_barrier_and_guarded_timeouts(
         "missing-reporter": lambda: snapshots["nonresponse"][
             "qualifying_timeout_counts"
         ][str(profile.target_replica_ids[0])].popitem(),
+        "missing-progress": lambda: snapshots["nonresponse"].pop(
+            "postfault_progress"
+        ),
         "healed-score": lambda: snapshots["nonresponse"]["guard_drawdowns"].update(
             {str(profile.target_replica_ids[0]): 0}
         ),
@@ -527,7 +674,7 @@ def test_fcrash_h_state_machine_requires_exact_barrier_and_guarded_timeouts(
             runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
 
 
-@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V3, N31_PROFILE_V3))
 @pytest.mark.parametrize("phase", ("nonresponse", "activations1", "activations2"))
 def test_fcrash_h_state_machine_rejects_exact_deadline_endpoint(
     profile_path: Path,

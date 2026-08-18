@@ -35,6 +35,12 @@ _PROFILE_KEYS = {
     "blinding",
 }
 _PROFILE_KEYS_V2 = _PROFILE_KEYS | {"evidence_guard"}
+_FCRASH_H_V3_PROFILE_IDS = frozenset(
+    {
+        "n7-f2-q5-two-crash-pair-smoke-v3",
+        "n31-f5-q21-three-crash-pair-v3",
+    }
+)
 _EVENT_KEYS = {
     "event_schema_version",
     "run_id",
@@ -101,6 +107,29 @@ class FocusedCrashPairValidationError(ValueError):
 
 def _error(message: str) -> None:
     raise FocusedCrashPairValidationError(message)
+
+
+def _authoritative_lifecycle_instance(
+    events: Sequence[Mapping[str, Any]], expected_source: str
+) -> str:
+    """Bind the authoritative commit source to one sealed lifecycle instance."""
+
+    lifecycle = [
+        event
+        for event in events
+        if event.get("event_type") in {"process.started", "process.ready"}
+        and event.get("source_id") == expected_source
+    ]
+    if len(lifecycle) != 2 or {
+        event.get("event_type") for event in lifecycle
+    } != {"process.started", "process.ready"}:
+        _error("sealed authoritative progress lacks an exact lifecycle binding")
+    if any(event.get("source_kind") != "replica" for event in lifecycle):
+        _error("sealed authoritative progress lifecycle kind drifted")
+    instances = {event.get("source_instance") for event in lifecycle}
+    if len(instances) != 1 or not isinstance(next(iter(instances)), str):
+        _error("sealed authoritative progress lifecycle instance is ambiguous")
+    return str(next(iter(instances)))
 
 
 def _canonical(value: object) -> bytes:
@@ -201,6 +230,8 @@ def _derive_reporter_coverage_plan(
         "minimum_timeouts_per_reporter",
         "minimum_score_drop",
     }
+    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS:
+        expected_guard_keys.add("required_postfault_tree_positions")
     expected_timer_keys = {
         "adaptation_interval_seconds",
         "stable_phase_seconds",
@@ -255,14 +286,17 @@ def _derive_reporter_coverage_plan(
     common_ids = sorted(common)
     for row in target_rows:
         row["authenticated_reporter_ids"] = common_ids
+    expected_period = 2 if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS else count
     expected_guard = {
         "schedule": "native_cyclic_epoch_zero",
-        "tree_switch_period_blocks": count,
+        "tree_switch_period_blocks": expected_period,
         "horizon_tree_positions": horizon,
         "required_qualifying_reporters": required,
         "minimum_timeouts_per_reporter": 2,
         "minimum_score_drop": 2 * required,
     }
+    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS:
+        expected_guard["required_postfault_tree_positions"] = horizon
     if dict(guard) != expected_guard:
         _error("FCRASH-H frozen evidence guard differs from topology derivation")
     deadlines = {
@@ -299,6 +333,12 @@ def _derive_reporter_coverage_plan(
         "required_qualifying_reporters": required,
         "minimum_timeouts_per_reporter": 2,
         "minimum_score_drop": 2 * required,
+        **(
+            {"required_postfault_tree_positions": horizon,
+             "nominal_commit_horizon": horizon * expected_period}
+            if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS
+            else {}
+        ),
         "deadlines_seconds": deadlines,
         "stable_phase_seconds": _integer(
             timers.get("stable_phase_seconds"), "stable phase", 1
@@ -336,6 +376,9 @@ def validate_fcrash_h_evidence(
         "timeout_observations",
         "guard_drawdowns",
     }
+    required_progress = coverage.get("required_postfault_tree_positions")
+    if required_progress is not None:
+        expected_keys.add("postfault_progress")
     if set(witness) != expected_keys:
         _error("FCRASH-H witness schema drifted")
     fault_ns = _integer(witness.get("fault_monotonic_ns"), "fault timestamp")
@@ -453,6 +496,168 @@ def validate_fcrash_h_evidence(
         for target in expected
     ):
         _error("FCRASH-H score drawdown is incomplete")
+    if required_progress is not None:
+        progress = _mapping(witness.get("postfault_progress"), "post-fault progress")
+        required_count = _integer(
+            required_progress, "required post-fault commit horizon", 1
+        )
+        if set(progress) != {
+            "required_tree_positions",
+            "actual_tree_positions",
+            "starting_tree_id",
+            "observed_tree_ids",
+        } or (
+            _integer(progress.get("required_tree_positions"), "progress required count", 1)
+            != required_count
+            or _integer(progress.get("actual_tree_positions"), "progress actual count", 1)
+            < required_count
+            or not isinstance(progress.get("observed_tree_ids"), list)
+            or len(progress["observed_tree_ids"]) != _integer(
+                progress.get("actual_tree_positions"), "progress actual count", 1
+            )
+        ):
+            _error("FCRASH-H post-fault authoritative progress is incomplete")
+
+
+def _fcrash_h_postfault_progress(
+    contract: Mapping[str, object],
+    events: Sequence[Mapping[str, Any]],
+    *,
+    fault_ns: int,
+    audit_ns: int,
+) -> dict[str, object]:
+    """Independently reconstruct the v3 progress witness from sealed raw events."""
+
+    coverage = _mapping(
+        contract.get("reporter_coverage_plan"), "reporter coverage plan"
+    )
+    required_positions = _integer(
+        coverage.get("required_postfault_tree_positions"),
+        "required post-fault tree positions",
+        1,
+    )
+    observer = _integer(
+        contract.get("authoritative_replica_id"), "authoritative observer", 0
+    )
+    expected_source = f"replica-{observer}"
+    expected_instance = _authoritative_lifecycle_instance(events, expected_source)
+    expected_digest = str(contract["epoch_zero_digest"])
+    members = tuple(int(member) for member in contract["members"])
+    start_events = [
+        event for event in events
+        if event["source_kind"] == "replica"
+        and event["source_id"] == expected_source
+        and event["source_instance"] == expected_instance
+        and event["event_type"] == "adaptive.configuration_active"
+        and _integer(event["source_monotonic_ns"], "configuration timestamp") < fault_ns
+    ]
+    if not start_events:
+        _error("sealed authoritative progress lacks a pre-fault configuration")
+    start = max(start_events, key=lambda event: int(event["source_monotonic_ns"]))
+    start_payload = _mapping(start["payload"], "pre-fault configuration")
+    starting_tree = _integer(start_payload.get("tree_id"), "starting tree")
+    if (
+        start_payload.get("epoch_number") != 0
+        or start_payload.get("epoch_digest") != expected_digest
+        or starting_tree != int(coverage["active_tree_id"])
+    ):
+        _error("sealed authoritative progress pre-fault configuration drifted")
+    activations = sorted(
+        [
+            event for event in events
+            if event["source_kind"] == "replica"
+            and event["source_id"] == expected_source
+            and event["source_instance"] == expected_instance
+            and event["event_type"] == "adaptive.configuration_active"
+            and fault_ns < _integer(event["source_monotonic_ns"], "configuration timestamp") < audit_ns
+        ],
+        key=lambda event: (_integer(event["source_sequence"], "configuration sequence", 1), _integer(event["source_monotonic_ns"], "configuration timestamp")),
+    )
+    # The frozen horizon starts with the configuration already active at the
+    # fault boundary; only H-1 later activations are required.
+    observed_trees: list[int] = [starting_tree]
+    for position, event in enumerate(activations, start=1):
+        payload = _mapping(event["payload"], "post-fault configuration")
+        tree = _integer(payload.get("tree_id"), "activated tree")
+        if (
+            payload.get("epoch_number") != 0
+            or payload.get("epoch_digest") != expected_digest
+            or tree != members[(members.index(starting_tree) + position) % len(members)]
+        ):
+            _error("sealed authoritative progress cyclic configuration drifted")
+        observed_trees.append(tree)
+    if len(observed_trees) < required_positions:
+        _error("FCRASH-H post-fault tree positions are incomplete")
+    # Commit proofs may lag the current configuration by one tree while the
+    # pipeline drains.  They must nevertheless be causally bound to either
+    # the configuration active at the commit or its immediately preceding one.
+    configurations = [(
+        _integer(start["source_sequence"], "configuration sequence", 1),
+        _integer(start["source_monotonic_ns"], "configuration timestamp"),
+        starting_tree,
+    )] + [
+        (
+            _integer(event["source_sequence"], "configuration sequence", 1),
+            _integer(event["source_monotonic_ns"], "configuration timestamp"),
+            tree,
+        )
+        for event, tree in zip(activations, observed_trees[1:], strict=True)
+    ]
+    for event in events:
+        if event["event_type"] != "block.committed":
+            continue
+        if (
+            event["source_kind"] != "replica"
+            or event["source_id"] != expected_source
+            or event["source_instance"] != expected_instance
+        ):
+            continue
+        timestamp = _integer(event["source_monotonic_ns"], "progress commit timestamp")
+        if not fault_ns < timestamp < audit_ns:
+            continue
+        payload = _mapping(event["payload"], "authoritative progress commit")
+        proof = _mapping(payload.get("decision_proof"), "progress decision proof")
+        if set(payload) != {
+            "block_height",
+            "block_hash",
+            "parent_hash",
+            "transaction_count",
+            "commit_batch_index",
+            "designated_observer",
+            "decision_proof",
+            "view_generation",
+        }:
+            _error("sealed authoritative progress commit schema drifted")
+        block_hash = _digest(payload.get("block_hash"), "progress commit hash")
+        proof_tree = _integer(proof.get("tree_id"), "progress proof tree")
+        if (
+            payload.get("designated_observer") is not True
+            or payload.get("commit_batch_index") != 0
+            or payload.get("view_generation") != 1
+            or _integer(payload.get("transaction_count"), "progress transactions", 1)
+            % 5
+            != 0
+            or proof.get("block_hash") != block_hash
+            or proof.get("epoch_number") != 0
+            or proof.get("epoch_digest") != expected_digest
+        ):
+            _error("sealed authoritative progress commit invariants drifted")
+        commit_key = (_integer(event["source_sequence"], "progress source sequence", 1), timestamp)
+        active_index = max(
+            (index for index, row in enumerate(configurations) if row[:2] <= commit_key),
+            default=-1,
+        )
+        if active_index < 0 or proof_tree not in {
+            configurations[active_index][2],
+            *( [configurations[active_index - 1][2]] if active_index else [] ),
+        }:
+            _error("sealed authoritative progress commit is not causally activated")
+    return {
+        "required_tree_positions": required_positions,
+        "actual_tree_positions": len(observed_trees),
+        "starting_tree_id": starting_tree,
+        "observed_tree_ids": observed_trees,
+    }
 
 
 def _fcrash_h_witness_from_events(
@@ -600,7 +805,7 @@ def _fcrash_h_witness_from_events(
         )
     if not rows:
         _error("FCRASH-H contains no qualifying timeout evidence")
-    return {
+    witness = {
         "fault_monotonic_ns": fault_ns,
         "nonresponse_monotonic_ns": max(
             int(row["source_monotonic_ns"]) for row in rows
@@ -625,6 +830,16 @@ def _fcrash_h_witness_from_events(
             str(target): drawdown for target, drawdown in sorted(drawdowns.items())
         },
     }
+    if coverage.get("required_postfault_tree_positions") is not None:
+        witness["postfault_progress"] = _fcrash_h_postfault_progress(
+            contract,
+            events,
+            fault_ns=fault_ns,
+            audit_ns=_integer(
+                audits[0]["source_monotonic_ns"], "snapshot audit timestamp"
+            ),
+        )
+    return witness
 
 
 def _validate_prefault_active_configuration(
@@ -683,6 +898,8 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "n31-f5-q21-three-crash-pair-v1",
         "n7-f2-q5-two-crash-pair-smoke-v2",
         "n31-f5-q21-three-crash-pair-v2",
+        "n7-f2-q5-two-crash-pair-smoke-v3",
+        "n31-f5-q21-three-crash-pair-v3",
     }:
         _error("focused profile identity is not reviewed")
     protocol = _mapping(profile.get("protocol"), "profile protocol")
@@ -945,7 +1162,12 @@ def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) 
         "leader-progress-timeout": "8.0",
         "leader-activation-grace": "1.0",
         "tree-generation": "default",
-        "tree-switch-period": str(len(tuple(contract["members"]))),
+        "tree-switch-period": str(
+            2
+            if _mapping(contract.get("profile"), "focused profile").get("profile_id")
+            in _FCRASH_H_V3_PROFILE_IDS
+            else len(tuple(contract["members"]))
+        ),
         "epoch-protocol-mode": "adaptive_v2",
         "epoch-change-minimum-activation-delay": "5",
         "epoch-change-maximum-activation-delay": "5",
@@ -1523,14 +1745,80 @@ def _commit_reconstruction(
     contract: Mapping[str, object],
 ) -> tuple[list[Mapping[str, Any]], dict[str, object]]:
     commits = [event for event in events if event["event_type"] == "block.committed"]
+    authoritative_source = str(contract["authoritative_source_id"])
     if len(commits) < 4 or any(
-        event["source_id"] != contract["authoritative_source_id"] for event in commits
+        event["source_kind"] != "replica"
+        or event["source_id"] != authoritative_source
+        for event in commits
     ):
         _error("raw evidence lacks the minimum authoritative commit chain")
-    commits.sort(key=lambda event: int(event["payload"]["block_height"]))
+    profile = _mapping(contract.get("profile"), "focused profile")
+    is_v3 = profile.get("profile_id") in _FCRASH_H_V3_PROFILE_IDS
+    configurations_by_epoch: dict[int, list[tuple[tuple[int, int], int]]] = {}
+    if is_v3:
+        instance = _authoritative_lifecycle_instance(events, authoritative_source)
+        if any(event.get("source_instance") != instance for event in commits):
+            _error("authoritative commit chain is not lifecycle-bound")
+        config_events = sorted(
+            [
+                event for event in events
+                if event["event_type"] == "adaptive.configuration_active"
+                and event["source_kind"] == "replica"
+                and event["source_id"] == contract["authoritative_source_id"]
+                and event.get("source_instance") == instance
+            ],
+            key=lambda event: (
+                _integer(event["source_sequence"], "configuration sequence", 1),
+                _integer(event["source_monotonic_ns"], "configuration timestamp"),
+            ),
+        )
+        epoch_trees = {
+            0: tuple(range(len(tuple(contract["members"])))),
+            1: tuple(tree.tree_id for tree in epoch1.trees),
+        }
+        if epoch2 is not None:
+            epoch_trees[2] = tuple(tree.tree_id for tree in epoch2.trees)
+        allowed_digests = {
+            0: str(contract["epoch_zero_digest"]),
+            1: epoch1.epoch_digest,
+        }
+        if epoch2 is not None:
+            allowed_digests[2] = epoch2.epoch_digest
+        expected_indexes = {epoch: 0 for epoch in allowed_digests}
+        for event in config_events:
+            payload = _mapping(event["payload"], "authoritative configuration")
+            epoch = _integer(payload.get("epoch_number"), "configuration epoch")
+            tree = _integer(payload.get("tree_id"), "configuration tree")
+            if (
+                epoch not in allowed_digests
+                or payload.get("epoch_digest") != allowed_digests[epoch]
+                or not epoch_trees[epoch]
+                or tree != epoch_trees[epoch][expected_indexes[epoch]]
+            ):
+                _error("authoritative cyclic configuration drifted")
+            configurations_by_epoch.setdefault(epoch, []).append((
+                (
+                    _integer(event["source_sequence"], "configuration sequence", 1),
+                    _integer(event["source_monotonic_ns"], "configuration timestamp"),
+                ),
+                tree,
+            ))
+            expected_indexes[epoch] = (expected_indexes[epoch] + 1) % len(
+                epoch_trees[epoch]
+            )
+        if set(configurations_by_epoch) != set(allowed_digests):
+            _error("v3 authoritative commit chain lacks active epoch configurations")
+    commits.sort(
+        key=(
+            (lambda event: _integer(event["source_sequence"], "commit source sequence", 1))
+            if is_v3
+            else (lambda event: _integer(event["payload"].get("block_height"), "commit height", 1))
+        )
+    )
     prior_hash: str | None = None
     prior_height: int | None = None
     prior_epoch = 0
+    prior_sequence: int | None = None
     for event in commits:
         payload = _mapping(event["payload"], "authoritative commit")
         if set(payload) != {
@@ -1546,11 +1834,18 @@ def _commit_reconstruction(
             _error("authoritative commit schema drifted")
         height = _integer(payload.get("block_height"), "commit height", 1)
         block_hash = _digest(payload.get("block_hash"), "commit hash")
+        if is_v3:
+            _digest(payload.get("parent_hash"), "commit parent hash")
         transactions = _integer(payload.get("transaction_count"), "transactions", 1)
         proof = _mapping(payload.get("decision_proof"), "decision proof")
+        sequence = _integer(event["source_sequence"], "commit source sequence", 1)
         if (
-            (prior_height is not None and height <= prior_height)
-            or payload.get("parent_hash") != prior_hash
+            (is_v3 and prior_sequence is not None and sequence <= prior_sequence)
+            or (
+                prior_height is not None
+                and (height != prior_height + 1 if is_v3 else height <= prior_height)
+            )
+            or (prior_hash is not None and payload.get("parent_hash") != prior_hash)
             or payload.get("commit_batch_index") != 0
             or payload.get("designated_observer") is not True
             or payload.get("view_generation") != 1
@@ -1568,13 +1863,31 @@ def _commit_reconstruction(
         if (
             expected_epoch not in allowed_digests
             or expected_epoch < prior_epoch
-            or proof.get("tree_id") != 0
             or proof.get("epoch_digest") != allowed_digests[expected_epoch]
         ):
             _error("authoritative commit decision proof drifted")
+        tree = _integer(proof.get("tree_id"), "commit tree")
+        if not is_v3 and tree != 0:
+            _error("authoritative commit decision proof drifted")
+        if is_v3:
+            commit_key = (
+                sequence,
+                _integer(event["source_monotonic_ns"], "commit timestamp"),
+            )
+            timeline = configurations_by_epoch[expected_epoch]
+            active_index = max(
+                (index for index, row in enumerate(timeline) if row[0] <= commit_key),
+                default=-1,
+            )
+            if active_index < 0 or tree not in {
+                timeline[active_index][1],
+                *([timeline[active_index - 1][1]] if active_index else []),
+            }:
+                _error("authoritative commit is not bound to an active or draining tree")
         prior_epoch = expected_epoch
         prior_hash = block_hash
         prior_height = height
+        prior_sequence = sequence
     observations = [
         event
         for event in events

@@ -1,0 +1,92 @@
+{
+  "active_tree_id": 6,
+  "bfs_member_order": [
+    6,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "epoch_zero_digest": "f550407e56cc54a8fd4e93d1997ebe658b75699f4f2a9e955f4cc829b52bec81",
+  "fanout": 2,
+  "internal_descendant_sets": {
+    "0": [
+      2,
+      3
+    ],
+    "1": [
+      4,
+      5
+    ],
+    "6": [
+      0,
+      2,
+      3,
+      1,
+      4,
+      5
+    ]
+  },
+  "members": [
+    {
+      "bfs_index": 0,
+      "depth": 0,
+      "replica_id": 6,
+      "role": "root"
+    },
+    {
+      "bfs_index": 1,
+      "depth": 1,
+      "replica_id": 0,
+      "role": "internal"
+    },
+    {
+      "bfs_index": 2,
+      "depth": 1,
+      "replica_id": 1,
+      "role": "internal"
+    },
+    {
+      "bfs_index": 3,
+      "depth": 2,
+      "replica_id": 2,
+      "role": "leaf"
+    },
+    {
+      "bfs_index": 4,
+      "depth": 2,
+      "replica_id": 3,
+      "role": "leaf"
+    },
+    {
+      "bfs_index": 5,
+      "depth": 2,
+      "replica_id": 4,
+      "role": "leaf"
+    },
+    {
+      "bfs_index": 6,
+      "depth": 2,
+      "replica_id": 5,
+      "role": "leaf"
+    }
+  ],
+  "profile_id": "n7-f2-q5-two-crash-pair-smoke-v3",
+  "profile_sha256": "2efc6e78e1821d91d2f4ac037cea2ef6416c1916d037a43c136507dd4d673527",
+  "root_replica_id": 6,
+  "schema_version": 1,
+  "source": "native_epoch_profile_digest",
+  "target_derivation": {
+    "deepest_member_ids": [
+      0,
+      1
+    ],
+    "pairwise_disjoint": true,
+    "selected_target_replica_ids": [
+      0,
+      1
+    ]
+  }
+}

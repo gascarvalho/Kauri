@@ -418,9 +418,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
     expected = (
-        "n7-f2-q5-two-crash-pair-smoke-v2"
+        "n7-f2-q5-two-crash-pair-smoke-v3"
         if mode == "smoke"
-        else "n31-f5-q21-three-crash-pair-v2"
+        else "n31-f5-q21-three-crash-pair-v3"
     )
     if profile.profile_id != expected:
         raise FocusedCrashPairCliError(
