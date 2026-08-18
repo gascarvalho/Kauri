@@ -246,6 +246,12 @@ def _document(value: object, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _sequence(value: object, label: str) -> Sequence[Any]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        _error(f"{label} must be a sequence")
+    return value
+
+
 def _validate_controller_failure_terminal(
     payload: Mapping[str, Any], *, require_for_unhealthy: bool
 ) -> bool:

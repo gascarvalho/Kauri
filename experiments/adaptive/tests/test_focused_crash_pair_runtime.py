@@ -2842,6 +2842,51 @@ def test_fault_window_arm_publication_is_one_shot_and_hides_its_temp_file(
         runtime._publish_fault_window_arm(target, arm)
 
 
+def test_fault_window_arm_document_binds_finalized_sigkill_outcomes(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(
+        N7_PROFILE_V3.with_name("n7-f2-q5-two-crash-pair-smoke-v4.json")
+    )
+    topology = profile.raw["topology"]
+    barrier = [
+        {
+            "replica_id": replica,
+            "configuration": {
+                "epoch_number": 0,
+                "tree_id": topology["active_tree_id"],
+                "epoch_digest": topology["epoch_zero_digest"],
+            },
+        }
+        for replica in profile.replica_ids
+    ]
+    receipt = {
+        "schema_version": 1,
+        "sigkill_outcomes": [
+            {"confirmed_monotonic_ns": 100},
+            {"confirmed_monotonic_ns": 101},
+        ],
+    }
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "fault-receipt.json").write_bytes(runtime._canonical_json(receipt))
+
+    arm = runtime._fault_window_arm_document(
+        {
+            "profile": profile,
+            "run_directory": tmp_path,
+            "run_id": "run-v4",
+            "parent_request_sha256": "a" * 64,
+        },
+        receipt,
+        barrier,
+    )
+
+    assert arm["evidence_start_monotonic_ns"] == 101
+    assert arm["required_tree_ids"] == [6, 0, 1, 2, 3, 4]
+
+
 def test_v4_manager_binds_the_profile_tree_horizon(tmp_path: Path) -> None:
     runtime = _runtime()
     profile = runtime.load_focused_profile(
