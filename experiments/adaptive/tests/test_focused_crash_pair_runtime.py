@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict, fields, is_dataclass, replace
 import hashlib
 import importlib
 import itertools
@@ -19,11 +19,14 @@ from experiments.adaptive.kauri_experiment import factorial_validation
 from experiments.adaptive.kauri_experiment import profiled_fault_archive
 from experiments.adaptive.tests import test_n31_crash_pair_contract as native_fixture
 
-
 RUNTIME = "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
 PROFILE_ROOT = Path(__file__).parents[1] / "profiles"
 N7_PROFILE = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v1.json"
 N31_PROFILE = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v1.json"
+# FCRASH-H supersedes these immutable v1 inputs prospectively.  Keep the v1
+# constants above: archived fixtures and validation continue to bind them.
+N7_PROFILE_V2 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v2.json"
+N31_PROFILE_V2 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v2.json"
 PROFILE_KEYS = {
     "schema_version",
     "profile_id",
@@ -59,8 +62,7 @@ def _document(value: object) -> dict[str, Any]:
 
 def _canonical_json(value: object) -> bytes:
     return (
-        json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True)
-        + "\n"
+        json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
 
 
@@ -78,6 +80,19 @@ def _topology_proof_path(profile_path: Path, raw: Mapping[str, object]) -> Path:
     relative = topology["proof_path"]
     assert isinstance(relative, str)
     return profile_path.parent / relative
+
+
+def _fcrash_h_profile(path: Path) -> object:
+    """Load a prospective immutable profile without falling back to v1."""
+
+    assert path.is_file(), f"FCRASH-H profile is absent: {path.name}"
+    return _runtime().load_focused_profile(path)
+
+
+def _coverage_plan_document(value: object) -> dict[str, Any]:
+    """Keep the public plan serializable for preflight sealing."""
+
+    return _document(value)
 
 
 def _assert_complete_topology_proof(
@@ -111,23 +126,25 @@ def _assert_complete_topology_proof(
     def subtree(index: int) -> tuple[int, ...]:
         children = children_by_index[index]
         return tuple(
-            member
-            for child in children
-            for member in (order[child], *subtree(child))
+            member for child in children for member in (order[child], *subtree(child))
         )
 
     depths = [0] * replica_count
     for index in range(1, replica_count):
         depths[index] = depths[(index - 1) // fanout] + 1
     for index, replica in enumerate(order):
-        role = "root" if index == 0 else "internal" if children_by_index[index] else "leaf"
+        role = (
+            "root" if index == 0 else "internal" if children_by_index[index] else "leaf"
+        )
         assert by_replica[replica] == {
             "replica_id": replica,
             "bfs_index": index,
             "depth": depths[index],
             "role": role,
         }
-    internal_indices = [index for index, children in children_by_index.items() if children]
+    internal_indices = [
+        index for index, children in children_by_index.items() if children
+    ]
     assert set(descendants) == {str(order[index]) for index in internal_indices}
     assert descendants == {
         str(order[index]): list(subtree(index)) for index in internal_indices
@@ -167,6 +184,385 @@ def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
     assert fallback_horizon < (
         adapter.leader_activation_grace_s + adapter.leader_progress_timeout_s
     )
+
+
+@pytest.mark.parametrize(
+    ("profile_path", "expected"),
+    (
+        (
+            N7_PROFILE_V2,
+            {
+                "profile_id": "n7-f2-q5-two-crash-pair-smoke-v2",
+                "active_tree_id": 6,
+                "horizon_tree_positions": 6,
+                "required_qualifying_reporters": 3,
+                "minimum_timeouts_per_reporter": 2,
+                "minimum_score_drop": 6,
+                # The intersection is intentional: all targets must have the
+                # same honest reporters, not merely individually possible ones.
+                "reporter_ids": (4, 5, 6),
+                "targets": (0, 1),
+                "coverage": {
+                    0: ((1, 6, 6), (4, 2, 4), (6, 4, 5)),
+                    1: ((1, 6, 6), (4, 2, 4), (5, 3, 5)),
+                },
+                "deadlines": {
+                    "evidence_seconds": 75,
+                    "epoch1_activation_seconds": 90,
+                    "optimization_activation_seconds": 90,
+                    "arm_hard_seconds": 330,
+                },
+            },
+        ),
+        (
+            N31_PROFILE_V2,
+            {
+                "profile_id": "n31-f5-q21-three-crash-pair-v2",
+                "active_tree_id": 20,
+                "horizon_tree_positions": 16,
+                "required_qualifying_reporters": 11,
+                "minimum_timeouts_per_reporter": 2,
+                "minimum_score_drop": 22,
+                # The 11 reporters are the common honest set accumulated by
+                # trees 20,21,...,4; crashed roots/parents 22,23,24 are absent.
+                "reporter_ids": (*range(8), 20, 21, 30),
+                "targets": (22, 23, 24),
+                "coverage": {
+                    22: (
+                        (1, 20, 20),
+                        (2, 21, 21),
+                        (6, 25, 30),
+                        (7, 26, 0),
+                        (8, 27, 1),
+                        (10, 29, 2),
+                        (11, 30, 3),
+                        (12, 0, 4),
+                        (13, 1, 5),
+                        (15, 3, 6),
+                        (16, 4, 7),
+                    ),
+                    23: (
+                        (1, 20, 20),
+                        (2, 21, 21),
+                        (6, 25, 30),
+                        (7, 26, 0),
+                        (8, 27, 1),
+                        (9, 28, 2),
+                        (11, 30, 3),
+                        (12, 0, 4),
+                        (13, 1, 5),
+                        (14, 2, 6),
+                        (16, 4, 7),
+                    ),
+                    24: (
+                        (1, 20, 20),
+                        (2, 21, 21),
+                        (6, 25, 30),
+                        (7, 26, 0),
+                        (8, 27, 1),
+                        (9, 28, 2),
+                        (10, 29, 3),
+                        (12, 0, 4),
+                        (13, 1, 5),
+                        (14, 2, 6),
+                        (15, 3, 7),
+                    ),
+                },
+                "deadlines": {
+                    "evidence_seconds": 160,
+                    "epoch1_activation_seconds": 180,
+                    "optimization_activation_seconds": 90,
+                    "arm_hard_seconds": 420,
+                },
+            },
+        ),
+    ),
+)
+def test_fcrash_h_coverage_plan_is_common_honest_and_bounded(
+    profile_path: Path,
+    expected: Mapping[str, object],
+) -> None:
+    """The profile is rejected unless every target has f+1 honest reporters."""
+
+    runtime = _runtime()
+    profile = _fcrash_h_profile(profile_path)
+    assert profile.profile_id == expected["profile_id"]
+    plan = _coverage_plan_document(runtime.derive_reporter_coverage_plan(profile))
+
+    assert plan["profile_id"] == expected["profile_id"]
+    assert plan["active_tree_id"] == expected["active_tree_id"]
+    assert plan["horizon_tree_positions"] == expected["horizon_tree_positions"]
+    assert (
+        plan["required_qualifying_reporters"]
+        == expected["required_qualifying_reporters"]
+    )
+    assert plan["minimum_timeouts_per_reporter"] == 2
+    assert plan["minimum_score_drop"] == expected["minimum_score_drop"]
+    assert plan["deadlines_seconds"] == expected["deadlines"]
+    assert plan["stable_phase_seconds"] == 30
+    assert plan["readiness_timeout_seconds"] == 60
+    assert plan["manager_convergence_timeout_seconds"] == 60
+
+    targets = plan["targets"]
+    assert isinstance(targets, list)
+    assert targets == [
+        {
+            "target_replica_id": target,
+            "authenticated_reporter_ids": list(expected["reporter_ids"]),
+            "first_qualifying_reporters": [
+                {
+                    "tree_position": position,
+                    "tree_id": tree_id,
+                    "reporter_id": reporter_id,
+                }
+                for position, tree_id, reporter_id in expected["coverage"][target]
+            ],
+        }
+        for target in expected["targets"]
+    ]
+    crashed = set(expected["targets"])
+    assert crashed.isdisjoint(expected["reporter_ids"])
+    assert len(expected["reporter_ids"]) == expected["required_qualifying_reporters"]
+
+
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+def test_fcrash_h_deadlines_are_absolute_half_open_intervals(
+    profile_path: Path,
+) -> None:
+    """A phase deadline accepts t < end and rejects the exact endpoint."""
+
+    runtime = _runtime()
+    profile = _fcrash_h_profile(profile_path)
+    plan = _coverage_plan_document(runtime.derive_reporter_coverage_plan(profile))
+    deadlines = plan["deadlines_seconds"]
+    assert isinstance(deadlines, Mapping)
+    fault_ns = 9_000_000_000
+    epoch1_ns = (
+        fault_ns + int(deadlines["epoch1_activation_seconds"]) * 1_000_000_000 - 1
+    )
+    for phase, deadline_seconds in deadlines.items():
+        origin_ns = (
+            epoch1_ns if phase == "optimization_activation_seconds" else fault_ns
+        )
+        end_ns = origin_ns + int(deadline_seconds) * 1_000_000_000
+        assert runtime.is_before_fcrash_h_deadline(
+            origin_ns, end_ns - 1, int(deadline_seconds)
+        )
+        assert not runtime.is_before_fcrash_h_deadline(
+            origin_ns, end_ns, int(deadline_seconds)
+        )
+        assert not runtime.is_before_fcrash_h_deadline(
+            origin_ns, end_ns + 1, int(deadline_seconds)
+        )
+
+
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+def test_fcrash_h_requires_all_member_exact_active_configuration_before_fault(
+    profile_path: Path,
+) -> None:
+    """Process readiness alone cannot authorize the SIGKILL causal hook."""
+
+    runtime = _runtime()
+    profile = _fcrash_h_profile(profile_path)
+    plan = _coverage_plan_document(runtime.derive_reporter_coverage_plan(profile))
+    members = tuple(profile.replica_ids)
+    active_tree = int(plan["active_tree_id"])
+    configuration = {
+        "epoch_number": 0,
+        "tree_id": active_tree,
+        "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+    }
+    barrier = [
+        {"replica_id": replica, "configuration": dict(configuration)}
+        for replica in members
+    ]
+    assert runtime.has_exact_active_configuration_barrier(profile, barrier)
+
+    assert not runtime.has_exact_active_configuration_barrier(profile, barrier[:-1])
+    wrong_tree = deepcopy(barrier)
+    wrong_tree[-1]["configuration"]["tree_id"] = (active_tree + 1) % len(members)
+    assert not runtime.has_exact_active_configuration_barrier(profile, wrong_tree)
+
+
+def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, object]]:
+    """A v2 state-machine witness with the exact pre-fault evidence boundary."""
+
+    replicas = len(profile.replica_ids)
+    snapshots = _arm_snapshots(replicas, arm)
+    plan = _coverage_plan_document(_runtime().derive_reporter_coverage_plan(profile))
+    fault_ns = 2_000_000_000
+    configuration = {
+        "epoch_number": 0,
+        "tree_id": plan["active_tree_id"],
+        "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+    }
+    snapshots["baseline"] = {
+        "stable": True,
+        "source_monotonic_ns": fault_ns - 1,
+        "active_configuration_barrier": [
+            {"replica_id": replica, "configuration": dict(configuration)}
+            for replica in profile.replica_ids
+        ],
+    }
+    snapshots["fault"] = {
+        **snapshots["fault"],
+        "source_monotonic_ns": fault_ns,
+    }
+    timeout_observations: list[dict[str, object]] = []
+    for target in plan["targets"]:
+        for reporter in target["authenticated_reporter_ids"]:
+            for ordinal in range(2):
+                timeout_observations.append(
+                    {
+                        "epoch_number": 0,
+                        "observed_replica_id": target["target_replica_id"],
+                        "reporter_id": reporter,
+                        "outcome": "timeout",
+                        "compensated": False,
+                        "source_monotonic_ns": fault_ns + 1 + ordinal,
+                    }
+                )
+    snapshots["nonresponse"] = {
+        **snapshots["nonresponse"],
+        "source_monotonic_ns": fault_ns + 2,
+        "snapshot_audit_monotonic_ns": fault_ns + 3,
+        "timeout_observations": timeout_observations,
+        "guard_drawdowns": {
+            str(target["target_replica_id"]): -int(plan["minimum_score_drop"])
+            for target in plan["targets"]
+        },
+        "qualifying_timeout_counts": {
+            str(target["target_replica_id"]): {
+                str(reporter): plan["minimum_timeouts_per_reporter"]
+                for reporter in target["authenticated_reporter_ids"]
+            }
+            for target in plan["targets"]
+        },
+    }
+    snapshots["epoch1"] = {
+        **snapshots["epoch1"],
+        "source_monotonic_ns": fault_ns + 3,
+    }
+    snapshots["commands1"] = {
+        **snapshots["commands1"],
+        "source_monotonic_ns": fault_ns + 4,
+    }
+    snapshots["activations1"] = {
+        **snapshots["activations1"],
+        "source_monotonic_ns": fault_ns + 5,
+    }
+    snapshots["commit1"] = {
+        **snapshots["commit1"],
+        "source_monotonic_ns": fault_ns + 6,
+    }
+    snapshots["containment"] = {
+        **snapshots["containment"],
+        "source_monotonic_ns": fault_ns + 7,
+    }
+    snapshots["ranking"] = {
+        **snapshots["ranking"],
+        "source_monotonic_ns": fault_ns + 8,
+    }
+    snapshots["epoch2"] = {
+        **snapshots["epoch2"],
+        "source_monotonic_ns": fault_ns + 9,
+    }
+    snapshots["commands2"] = {
+        **snapshots["commands2"],
+        "source_monotonic_ns": fault_ns + 10,
+    }
+    snapshots["activations2"] = {
+        **snapshots["activations2"],
+        "source_monotonic_ns": fault_ns + 11,
+    }
+    snapshots["commit2"] = {
+        **snapshots["commit2"],
+        "source_monotonic_ns": fault_ns + 12,
+    }
+    snapshots["late"] = {
+        **snapshots["late"],
+        "source_monotonic_ns": fault_ns + 13,
+    }
+    return snapshots
+
+
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+def test_fcrash_h_state_machine_requires_exact_barrier_and_guarded_timeouts(
+    profile_path: Path,
+) -> None:
+    """v2 cannot fault until its exact barrier and native timeout guard exist."""
+
+    runtime = _runtime()
+    profile = replace(
+        _fcrash_h_profile(profile_path),
+        issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
+    )
+    snapshots = _fcrash_h_snapshots(profile, "A")
+    hooks, _ = _arm_hooks(runtime, snapshots)
+    runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    mutations = {
+        "missing-member": lambda: snapshots["baseline"][
+            "active_configuration_barrier"
+        ].pop(),
+        "wrong-configuration": lambda: snapshots["baseline"][
+            "active_configuration_barrier"
+        ][-1]["configuration"].update(tree_id=0),
+        "missing-reporter": lambda: snapshots["nonresponse"][
+            "qualifying_timeout_counts"
+        ][str(profile.target_replica_ids[0])].popitem(),
+        "healed-score": lambda: snapshots["nonresponse"]["guard_drawdowns"].update(
+            {str(profile.target_replica_ids[0]): 0}
+        ),
+        "epoch2-command-before-audit": lambda: snapshots["epoch2"].update(
+            source_monotonic_ns=snapshots["commands2"]["source_monotonic_ns"]
+        ),
+    }
+    for _name, mutate in mutations.items():
+        rejected = _fcrash_h_snapshots(profile, "A")
+        snapshots = rejected
+        mutate()
+        hooks, _ = _arm_hooks(runtime, rejected)
+        with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+            runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V2, N31_PROFILE_V2))
+@pytest.mark.parametrize("phase", ("nonresponse", "activations1", "activations2"))
+def test_fcrash_h_state_machine_rejects_exact_deadline_endpoint(
+    profile_path: Path,
+    phase: str,
+) -> None:
+    """Evidence/E1 are fault-anchored; E2 is anchored to E1 activation."""
+
+    runtime = _runtime()
+    profile = replace(
+        _fcrash_h_profile(profile_path),
+        issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
+    )
+    snapshots = _fcrash_h_snapshots(profile, "A")
+    plan = _coverage_plan_document(runtime.derive_reporter_coverage_plan(profile))
+    deadlines = plan["deadlines_seconds"]
+    fault_ns = snapshots["fault"]["source_monotonic_ns"]
+    assert isinstance(fault_ns, int)
+    if phase == "nonresponse":
+        snapshots[phase]["snapshot_audit_monotonic_ns"] = (
+            fault_ns + int(deadlines["evidence_seconds"]) * 1_000_000_000
+        )
+    elif phase == "activations1":
+        snapshots[phase]["source_monotonic_ns"] = (
+            fault_ns + int(deadlines["epoch1_activation_seconds"]) * 1_000_000_000
+        )
+    else:
+        epoch1_ns = snapshots["activations1"]["source_monotonic_ns"]
+        assert isinstance(epoch1_ns, int)
+        snapshots[phase]["source_monotonic_ns"] = (
+            epoch1_ns
+            + int(deadlines["optimization_activation_seconds"]) * 1_000_000_000
+        )
+    hooks, _ = _arm_hooks(runtime, snapshots)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
 
 
 @pytest.mark.parametrize(
@@ -288,7 +684,9 @@ def test_topology_proof_rejects_isolated_semantic_drift(
     proof_path = tmp_path / raw["topology"]["proof_path"]
     proof_path.parent.mkdir(parents=True, exist_ok=True)
     proof_path.write_bytes(_canonical_json(proof))
-    raw["topology"]["proof_sha256"] = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    raw["topology"]["proof_sha256"] = hashlib.sha256(
+        proof_path.read_bytes()
+    ).hexdigest()
     profile_path = tmp_path / N31_PROFILE.name
     profile_path.write_bytes(_canonical_json(raw))
     with pytest.raises(_runtime().FocusedCrashPairRuntimeError):
@@ -350,27 +748,26 @@ def test_preflight_is_no_launch_and_receipt_binds_every_execution_input(
     topology = json.loads(topology_path.read_text(encoding="utf-8"))
     assert topology["source"] == "native_epoch_profile_digest"
     assert topology["profile_sha256"] == profile.profile_sha256
-    assert preflight["topology_proof_sha256"] == hashlib.sha256(
-        topology_path.read_bytes()
-    ).hexdigest()
+    assert (
+        preflight["topology_proof_sha256"]
+        == hashlib.sha256(topology_path.read_bytes()).hexdigest()
+    )
     assert preflight["topology_proof_sha256"] == profile.topology_proof_sha256
     assert preflight["profile_sha256"] == profile.profile_sha256
 
     request = runtime.build_focused_authorization_request(preflight)
     request_document = json.loads(request)
     assert request_document["profile_sha256"] == profile.profile_sha256
-    assert request_document["topology_proof_sha256"] == preflight[
-        "topology_proof_sha256"
-    ]
+    assert (
+        request_document["topology_proof_sha256"] == preflight["topology_proof_sha256"]
+    )
     receipt = {
         **request_document,
         "request_sha256": hashlib.sha256(request).hexdigest(),
         "approval_reference": "thesis-author-approved-run-22",
         "approved_utc": "2026-08-11T12:00:00+00:00",
     }
-    verified = _document(
-        runtime.verify_focused_authorization_receipt(request, receipt)
-    )
+    verified = _document(runtime.verify_focused_authorization_receipt(request, receipt))
     assert verified["execution_authorized"] is True
     assert verified["profile_sha256"] == profile.profile_sha256
     assert verified["automatic_retries"] == 0
@@ -394,7 +791,9 @@ def test_preflight_runs_real_checks_and_binds_issuer_before_execution(
         def __init__(self, failing: str | None = None) -> None:
             self.failing = failing
 
-        def _result(self, name: str, value: Mapping[str, object]) -> Mapping[str, object]:
+        def _result(
+            self, name: str, value: Mapping[str, object]
+        ) -> Mapping[str, object]:
             calls.append(name)
             if self.failing == name:
                 raise runtime.FocusedCrashPairRuntimeError(f"{name} check failed")
@@ -419,9 +818,7 @@ def test_preflight_runs_real_checks_and_binds_issuer_before_execution(
             return self._result(
                 "native_topology",
                 {
-                    "epoch_zero_digest": profile.raw["topology"][
-                        "epoch_zero_digest"
-                    ],
+                    "epoch_zero_digest": profile.raw["topology"]["epoch_zero_digest"],
                     "topology_proof_sha256": profile.topology_proof_sha256,
                 },
             )
@@ -499,9 +896,7 @@ def test_live_execution_context_binds_authorized_revision_build_and_binaries(
     monkeypatch.setattr(
         runtime.profiled_fault_runtime,
         "exact_binary_paths",
-        lambda *_args, **_kwargs: {
-            name: current_binary for name in binary_names
-        },
+        lambda *_args, **_kwargs: {name: current_binary for name in binary_names},
     )
     monkeypatch.setattr(
         runtime.profiled_fault_runtime,
@@ -518,9 +913,7 @@ def test_live_execution_context_binds_authorized_revision_build_and_binaries(
         "sha256_file",
         lambda _path: binary_sha256,
     )
-    current_binary_paths = {
-        name: current_binary for name in binary_names
-    }
+    current_binary_paths = {name: current_binary for name in binary_names}
     current_binary_paths["client"] = (
         Path(runtime.__file__).resolve().parents[3]
         / "build-adaptive"
@@ -623,8 +1016,7 @@ def test_atomic_fault_batch_is_one_call_and_terminalizes_partial_failure(
     runtime = _runtime()
     plan = _fault_plan()
     processes_by_pid = {
-        20_000 + replica: _FakeProcess(20_000 + replica)
-        for replica in (22, 23, 24)
+        20_000 + replica: _FakeProcess(20_000 + replica) for replica in (22, 23, 24)
     }
     calls: list[tuple[int, int]] = []
 
@@ -651,9 +1043,7 @@ def test_atomic_fault_batch_is_one_call_and_terminalizes_partial_failure(
         monotonic_ns=itertools.count(2_000).__next__,
     ) as journal:
         lifecycle = faults.FaultLifecycle(plan, journal)
-        result = runtime._execute_atomic_fault_batch(
-            registry, plan, lifecycle, 0.25
-        )
+        result = runtime._execute_atomic_fault_batch(registry, plan, lifecycle, 0.25)
     assert calls == [(20_022, 9), (20_023, 9), (20_024, 9)]
     assert max(item.requested_monotonic_ns for item in result) < min(
         item.confirmed_monotonic_ns for item in result
@@ -766,9 +1156,7 @@ def _native_trees(
     for tree_id, root in enumerate(roots):
         internal = tuple(replica for replica in survivors if replica != root)[:fanout]
         leaves = tuple(
-            replica
-            for replica in survivors
-            if replica not in (root, *internal)
+            replica for replica in survivors if replica not in (root, *internal)
         )
         trees.append(
             {
@@ -813,9 +1201,7 @@ def _encode_signed_bundle(
         canonical += native_fixture._u(len(members), 4)
         canonical += b"".join(native_fixture._u(member, 2) for member in members)
         canonical += native_fixture._u(len(wait_exempt), 4)
-        canonical += b"".join(
-            native_fixture._u(member, 2) for member in wait_exempt
-        )
+        canonical += b"".join(native_fixture._u(member, 2) for member in wait_exempt)
     successor_digest = hashlib.sha256(canonical).hexdigest()
     signing_bytes = b"".join(
         (
@@ -970,7 +1356,10 @@ def _arm_snapshots(replicas: int, arm: str) -> dict[str, Mapping[str, object]]:
         command_height=11,
     )
     epoch2_roots = [tree.members[0] for tree in epoch2_decoded.trees]
-    ranked_ids = [*epoch2_roots, *(replica for replica in survivors if replica not in epoch2_roots)]
+    ranked_ids = [
+        *epoch2_roots,
+        *(replica for replica in survivors if replica not in epoch2_roots),
+    ]
     return {
         "baseline": {"stable": True, "source_monotonic_ns": 1_000},
         "fault": {
@@ -1091,17 +1480,17 @@ def test_fake_process_control_and_adaptive_state_machines(
     adaptive = _document(
         runtime._drive_arm_state_machine(profile, "A", "pair-01", adaptive_hooks)
     )
-    assert control["survivor_replica_ids"] == adaptive["survivor_replica_ids"] == list(
-        survivors
+    assert (
+        control["survivor_replica_ids"]
+        == adaptive["survivor_replica_ids"]
+        == list(survivors)
     )
     assert control["quorum"] == adaptive["quorum"] == quorum
     assert control["epoch1_native_validated"] is True
     assert adaptive["epoch1_native_validated"] is True
     assert control["epoch2_present"] is False
     assert adaptive["epoch2_present"] is True
-    assert adaptive["epoch2_predecessor_digest"] == adaptive[
-        "epoch1_epoch_digest"
-    ]
+    assert adaptive["epoch2_predecessor_digest"] == adaptive["epoch1_epoch_digest"]
     assert not any(call == ("request", "epoch2") for call in control_calls)
     assert ("ranking", "ranking") in adaptive_calls
     assert control_calls == [
@@ -1136,9 +1525,10 @@ def test_fake_process_control_and_adaptive_state_machines(
         )
         assert control_decoded.epoch_digest != adaptive_decoded.epoch_digest
         assert control_decoded.command.signature != adaptive_decoded.command.signature
-        assert runtime.epoch1_structurally_identical(
-            control_decoded, adaptive_decoded
-        ) is True
+        assert (
+            runtime.epoch1_structurally_identical(control_decoded, adaptive_decoded)
+            is True
+        )
         changed_trees = [asdict(tree) for tree in adaptive_decoded.trees]
         changed_members = list(changed_trees[0]["members"])  # type: ignore[arg-type]
         changed_members[1:3] = reversed(changed_members[1:3])
@@ -1306,7 +1696,9 @@ def test_default_backend_materializes_pair_issuer_without_secret_artifact(
     assert private_key not in (
         run_directory / "runtime/launch-arguments.json"
     ).read_text(encoding="utf-8")
-    assert (run_directory / "treegen.conf").read_text(encoding="ascii").splitlines() == [
+    assert (run_directory / "treegen.conf").read_text(
+        encoding="ascii"
+    ).splitlines() == [
         "fan:2 pipe:2 "
         + " ".join(str(replica) for replica in (*range(offset, 7), *range(offset)))
         for offset in range(7)
@@ -1390,9 +1782,7 @@ def test_default_backend_run_arm_polls_and_faults_only_at_state_machine_boundary
         "containment",
     ]
     if arm == "A":
-        expected.extend(
-            ("ranking", "epoch2", "commands2", "activations2", "commit2")
-        )
+        expected.extend(("ranking", "epoch2", "commands2", "activations2", "commit2"))
     expected.append("late")
     for name in expected:
         assert source.polls[name] >= 2
@@ -1486,13 +1876,16 @@ def test_manager_actual_argv_and_input_are_blind(tmp_path: Path) -> None:
     cmdline = proc_root / "123" / "cmdline"
     cmdline.parent.mkdir(parents=True)
     requested, manager_input = native_fixture._safe_manager_boundary()
-    assert _document(
-        native_fixture._subject().validate_manager_blinding(
-            fault_plan=native_fixture._fault_evidence()[0],
-            manager_cli_args=requested,
-            manager_input=manager_input,
-        )
-    )["blinded"] is True
+    assert (
+        _document(
+            native_fixture._subject().validate_manager_blinding(
+                fault_plan=native_fixture._fault_evidence()[0],
+                manager_cli_args=requested,
+                manager_input=manager_input,
+            )
+        )["blinded"]
+        is True
+    )
     cmdline.write_bytes(b"\0".join(item.encode() for item in requested) + b"\0")
     record = SimpleNamespace(name="manager", replica_id=-1, pid=123, pgid=123)
     linux_observed = runtime._capture_process_argv(
@@ -1651,7 +2044,9 @@ def test_spawn_boundary_failure_cleans_up_every_owned_process(
         replica_id: int,
         **_kwargs: object,
     ) -> tuple[object, object]:
-        return SimpleNamespace(name=name, replica_id=replica_id, pid=10, pgid=10), Log(name)
+        return SimpleNamespace(name=name, replica_id=replica_id, pid=10, pgid=10), Log(
+            name
+        )
 
     backend = runtime.FocusedLaunchBackend(spawn=spawn)
     with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="argv differ"):

@@ -14,7 +14,6 @@ from experiments.adaptive import run_n31_crash_pair_campaign as campaign_contrac
 from . import factorial_validation
 from .profiled_fault_archive import EvidenceSealError, verify_evidence_seal
 
-
 _PROFILE_KEYS = {
     "schema_version",
     "profile_id",
@@ -35,6 +34,7 @@ _PROFILE_KEYS = {
     "campaign",
     "blinding",
 }
+_PROFILE_KEYS_V2 = _PROFILE_KEYS | {"evidence_guard"}
 _EVENT_KEYS = {
     "event_schema_version",
     "run_id",
@@ -52,9 +52,7 @@ _SURVIVORS = tuple(replica for replica in _MEMBERS if replica not in _TARGETS)
 _QUORUM = 21
 _FANOUT = 5
 _PIPELINE_STRETCH = 2
-_EPOCH_ZERO_DIGEST = (
-    "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
-)
+_EPOCH_ZERO_DIGEST = "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a"
 _NATIVE_RESPONSIVENESS_POLICY = {
     "schema_version": 1,
     "policy_version": "adaptive-v2-controller-responsiveness-v1",
@@ -175,13 +173,507 @@ def _profile_identity(profile: Mapping[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def _cyclic_parent(
+    replica_count: int, fanout: int, root: int, target: int
+) -> int | None:
+    position = (target - root) % replica_count
+    if position == 0:
+        return None
+    return (root + (position - 1) // fanout) % replica_count
+
+
+def _derive_reporter_coverage_plan(
+    profile: Mapping[str, Any],
+    *,
+    members: tuple[int, ...],
+    targets: tuple[int, ...],
+    fault_threshold: int,
+    fanout: int,
+    active_tree: int,
+) -> dict[str, object]:
+    guard = _mapping(profile.get("evidence_guard"), "profile evidence guard")
+    timers = _mapping(profile.get("timers"), "profile timers")
+    expected_guard_keys = {
+        "schedule",
+        "tree_switch_period_blocks",
+        "horizon_tree_positions",
+        "required_qualifying_reporters",
+        "minimum_timeouts_per_reporter",
+        "minimum_score_drop",
+    }
+    expected_timer_keys = {
+        "adaptation_interval_seconds",
+        "stable_phase_seconds",
+        "readiness_timeout_seconds",
+        "manager_convergence_timeout_seconds",
+        "nonresponse_evidence_deadline_seconds",
+        "containment_activation_deadline_seconds",
+        "optimization_activation_deadline_seconds",
+        "arm_hard_deadline_seconds",
+    }
+    if set(guard) != expected_guard_keys or set(timers) != expected_timer_keys:
+        _error("FCRASH-H guard or timer schema drifted")
+    required = fault_threshold + 1
+    target_rows: list[dict[str, object]] = []
+    reporter_sets: list[set[int]] = []
+    horizon = 0
+    count = len(members)
+    for target in targets:
+        seen: set[int] = set()
+        first: list[dict[str, int]] = []
+        for offset in range(count):
+            tree_id = (active_tree + offset) % count
+            if tree_id in targets:
+                continue
+            reporter = _cyclic_parent(count, fanout, tree_id, target)
+            if reporter is None or reporter in targets or reporter in seen:
+                continue
+            seen.add(reporter)
+            first.append(
+                {
+                    "tree_position": offset + 1,
+                    "tree_id": tree_id,
+                    "reporter_id": reporter,
+                }
+            )
+            if len(first) == required:
+                break
+        if len(first) != required:
+            _error("FCRASH-H has insufficient honest reporter coverage")
+        horizon = max(horizon, first[-1]["tree_position"])
+        reporter_sets.append({row["reporter_id"] for row in first})
+        target_rows.append(
+            {
+                "target_replica_id": target,
+                "authenticated_reporter_ids": [],
+                "first_qualifying_reporters": first,
+            }
+        )
+    common = set.intersection(*reporter_sets)
+    if len(common) != required:
+        _error("FCRASH-H targets lack one common honest reporter set")
+    common_ids = sorted(common)
+    for row in target_rows:
+        row["authenticated_reporter_ids"] = common_ids
+    expected_guard = {
+        "schedule": "native_cyclic_epoch_zero",
+        "tree_switch_period_blocks": count,
+        "horizon_tree_positions": horizon,
+        "required_qualifying_reporters": required,
+        "minimum_timeouts_per_reporter": 2,
+        "minimum_score_drop": 2 * required,
+    }
+    if dict(guard) != expected_guard:
+        _error("FCRASH-H frozen evidence guard differs from topology derivation")
+    deadlines = {
+        "evidence_seconds": _integer(
+            timers.get("nonresponse_evidence_deadline_seconds"),
+            "nonresponse evidence deadline",
+            1,
+        ),
+        "epoch1_activation_seconds": _integer(
+            timers.get("containment_activation_deadline_seconds"),
+            "containment activation deadline",
+            1,
+        ),
+        "optimization_activation_seconds": _integer(
+            timers.get("optimization_activation_deadline_seconds"),
+            "optimization activation deadline",
+            1,
+        ),
+        "arm_hard_seconds": _integer(
+            timers.get("arm_hard_deadline_seconds"), "arm hard deadline", 1
+        ),
+    }
+    if (
+        deadlines["evidence_seconds"] >= deadlines["epoch1_activation_seconds"]
+        or deadlines["epoch1_activation_seconds"] >= deadlines["arm_hard_seconds"]
+        or deadlines["optimization_activation_seconds"] >= deadlines["arm_hard_seconds"]
+    ):
+        _error("FCRASH-H phase deadlines are not strictly nested")
+    return {
+        "schema_version": 1,
+        "profile_id": profile["profile_id"],
+        "active_tree_id": active_tree,
+        "horizon_tree_positions": horizon,
+        "required_qualifying_reporters": required,
+        "minimum_timeouts_per_reporter": 2,
+        "minimum_score_drop": 2 * required,
+        "deadlines_seconds": deadlines,
+        "stable_phase_seconds": _integer(
+            timers.get("stable_phase_seconds"), "stable phase", 1
+        ),
+        "readiness_timeout_seconds": _integer(
+            timers.get("readiness_timeout_seconds"), "readiness timeout", 1
+        ),
+        "manager_convergence_timeout_seconds": _integer(
+            timers.get("manager_convergence_timeout_seconds"),
+            "manager convergence timeout",
+            1,
+        ),
+        "targets": target_rows,
+    }
+
+
+def _inside_deadline(origin_ns: int, candidate_ns: int, seconds: int) -> bool:
+    return origin_ns <= candidate_ns < origin_ns + seconds * 1_000_000_000
+
+
+def validate_fcrash_h_evidence(
+    contract: Mapping[str, object], witness: Mapping[str, object]
+) -> None:
+    """Validate one independently reconstructed FCRASH-H causal witness."""
+
+    coverage = _mapping(
+        contract.get("reporter_coverage_plan"), "reporter coverage plan"
+    )
+    expected_keys = {
+        "fault_monotonic_ns",
+        "nonresponse_monotonic_ns",
+        "snapshot_audit_monotonic_ns",
+        "epoch1_activation_monotonic_ns",
+        "epoch2_activation_monotonic_ns",
+        "timeout_observations",
+        "guard_drawdowns",
+    }
+    if set(witness) != expected_keys:
+        _error("FCRASH-H witness schema drifted")
+    fault_ns = _integer(witness.get("fault_monotonic_ns"), "fault timestamp")
+    nonresponse_ns = _integer(
+        witness.get("nonresponse_monotonic_ns"), "nonresponse timestamp"
+    )
+    snapshot_audit_ns = _integer(
+        witness.get("snapshot_audit_monotonic_ns"), "snapshot audit timestamp"
+    )
+    epoch1_ns = _integer(
+        witness.get("epoch1_activation_monotonic_ns"), "Epoch 1 activation"
+    )
+    epoch2_raw = witness.get("epoch2_activation_monotonic_ns")
+    epoch2_ns = (
+        None if epoch2_raw is None else _integer(epoch2_raw, "Epoch 2 activation")
+    )
+    deadlines = _mapping(coverage.get("deadlines_seconds"), "coverage deadlines")
+    if (
+        not _inside_deadline(
+            fault_ns,
+            snapshot_audit_ns,
+            _integer(deadlines.get("evidence_seconds"), "evidence deadline", 1),
+        )
+        or not _inside_deadline(
+            fault_ns,
+            epoch1_ns,
+            _integer(
+                deadlines.get("epoch1_activation_seconds"),
+                "Epoch 1 activation deadline",
+                1,
+            ),
+        )
+        or nonresponse_ns >= snapshot_audit_ns
+        or snapshot_audit_ns >= epoch1_ns
+        or (
+            epoch2_ns is not None
+            and (
+                epoch2_ns <= epoch1_ns
+                or not _inside_deadline(
+                    epoch1_ns,
+                    epoch2_ns,
+                    _integer(
+                        deadlines.get("optimization_activation_seconds"),
+                        "Epoch 2 activation deadline",
+                        1,
+                    ),
+                )
+            )
+        )
+    ):
+        _error("FCRASH-H causal timestamp or deadline drifted")
+    expected = {
+        int(row["target_replica_id"]): {
+            int(reporter) for reporter in row["authenticated_reporter_ids"]
+        }
+        for row in _sequence(coverage.get("targets"), "coverage targets")
+    }
+    expected_trees = {
+        (
+            int(row["target_replica_id"]),
+            int(first["reporter_id"]),
+        ): int(first["tree_id"])
+        for row in _sequence(coverage.get("targets"), "coverage targets")
+        for first in _sequence(
+            _mapping(row, "coverage target").get("first_qualifying_reporters"),
+            "first qualifying reporters",
+        )
+    }
+    counts = {
+        target: {reporter: 0 for reporter in reporters}
+        for target, reporters in expected.items()
+    }
+    for raw in _sequence(witness.get("timeout_observations"), "timeout observations"):
+        observation = _mapping(raw, "timeout observation")
+        if set(observation) != {
+            "epoch_number",
+            "tree_id",
+            "observed_replica_id",
+            "reporter_id",
+            "outcome",
+            "compensated",
+            "source_monotonic_ns",
+        }:
+            _error("timeout observation schema drifted")
+        target = _integer(observation.get("observed_replica_id"), "timeout target")
+        reporter = _integer(observation.get("reporter_id"), "timeout reporter")
+        timestamp = _integer(
+            observation.get("source_monotonic_ns"), "timeout timestamp"
+        )
+        if (
+            observation.get("epoch_number") != 0
+            or observation.get("tree_id") != expected_trees.get((target, reporter))
+            or observation.get("outcome") != "timeout"
+            or observation.get("compensated") is not False
+            or target not in counts
+            or reporter not in counts[target]
+            or not (fault_ns < timestamp <= nonresponse_ns)
+        ):
+            _error("timeout observation is not exact post-fault evidence")
+        counts[target][reporter] += 1
+    minimum = _integer(
+        coverage.get("minimum_timeouts_per_reporter"),
+        "minimum timeouts per reporter",
+        1,
+    )
+    if any(
+        count < minimum for reporters in counts.values() for count in reporters.values()
+    ):
+        _error("FCRASH-H reporter timeout coverage is incomplete")
+    drawdowns = _mapping(witness.get("guard_drawdowns"), "guard drawdowns")
+    minimum_drop = _integer(coverage.get("minimum_score_drop"), "minimum score drop", 1)
+    if set(drawdowns) != {str(target) for target in expected} or any(
+        type(drawdowns[str(target)]) is not int
+        or int(drawdowns[str(target)]) > -minimum_drop
+        for target in expected
+    ):
+        _error("FCRASH-H score drawdown is incomplete")
+
+
+def _fcrash_h_witness_from_events(
+    contract: Mapping[str, object],
+    events: Sequence[Mapping[str, Any]],
+    fault_receipt: Mapping[str, Any],
+    activations1: Sequence[Mapping[str, Any]],
+    activations2: Sequence[Mapping[str, Any]],
+) -> dict[str, object]:
+    coverage = _mapping(
+        contract.get("reporter_coverage_plan"), "reporter coverage plan"
+    )
+    confirmations = [
+        _integer(
+            _mapping(outcome, "SIGKILL outcome").get("confirmed_monotonic_ns"),
+            "fault confirmation",
+        )
+        for outcome in _sequence(
+            fault_receipt.get("sigkill_outcomes"), "SIGKILL outcomes"
+        )
+    ]
+    fault_ns = max(confirmations)
+    audits = [
+        event
+        for event in events
+        if event["source_kind"] == "adaptation_manager"
+        and event["source_id"] == "adaptive-manager"
+        and event["event_type"] == "adaptive_v2_evidence_snapshot"
+        and _mapping(event["payload"], "snapshot audit").get("predecessor_epoch_number")
+        == 0
+    ]
+    if len(audits) != 1:
+        _error("FCRASH-H lacks one predecessor-0 native snapshot audit")
+    cutoff = _integer(
+        _mapping(audits[0]["payload"], "snapshot audit").get("current_cutoff"),
+        "snapshot current cutoff",
+        1,
+    )
+    baseline_cutoff = _integer(
+        _mapping(audits[0]["payload"], "snapshot audit").get("baseline_cutoff"),
+        "snapshot baseline cutoff",
+    )
+    accepted: list[tuple[int, Mapping[str, Any]]] = []
+    latest: dict[str, tuple[int, Mapping[str, Any], int, int]] = {}
+    for event in events:
+        if (
+            event["source_kind"] != "adaptation_manager"
+            or event["source_id"] != "adaptive-manager"
+            or event["event_type"] != "evidence.observation_accepted"
+        ):
+            continue
+        payload = _mapping(event["payload"], "accepted evidence")
+        sequence = _integer(
+            payload.get("ingestion_sequence"), "evidence ingestion sequence", 1
+        )
+        if sequence <= baseline_cutoff or sequence > cutoff:
+            continue
+        observation = _mapping(payload.get("observation"), "accepted observation")
+        configuration = _mapping(
+            observation.get("configuration"), "observation configuration"
+        )
+        if (
+            configuration.get("epoch_number") != 0
+            or configuration.get("epoch_digest") != contract["epoch_zero_digest"]
+        ):
+            continue
+        observation_id = observation.get("observation_id")
+        if not isinstance(observation_id, str):
+            _error("accepted observation ID is malformed")
+        previous = latest.get(observation_id)
+        if previous is not None and sequence <= previous[0]:
+            _error("accepted observation transition regressed")
+        latest[observation_id] = (
+            sequence,
+            observation,
+            _integer(event["source_monotonic_ns"], "evidence acceptance time"),
+            _integer(
+                observation.get("reporter_monotonic_ns"),
+                "evidence reporter time",
+            ),
+        )
+        accepted.append((sequence, observation))
+    expected = {
+        int(row["target_replica_id"]): {
+            int(reporter) for reporter in row["authenticated_reporter_ids"]
+        }
+        for row in _sequence(coverage.get("targets"), "coverage targets")
+    }
+    rows: list[dict[str, object]] = []
+    drawdowns = {target: 0 for target in expected}
+    outstanding: dict[str, tuple[int, int]] = {}
+    for _sequence_number, observation in sorted(accepted, key=lambda row: row[0]):
+        observation_id = str(observation["observation_id"])
+        reporter = int(observation["reporter_id"])
+        target = int(observation["observed_replica_id"])
+        outcome = str(observation["outcome"])
+        if outcome == "timeout":
+            if observation_id in outstanding:
+                _error("accepted timeout attempt is duplicated")
+            outstanding[observation_id] = (reporter, target)
+            if target in drawdowns:
+                drawdowns[target] -= 1
+        elif outcome == "on_time":
+            if target in drawdowns and drawdowns[target] < 0:
+                drawdowns[target] += 1
+        elif outcome == "late":
+            previous = outstanding.pop(observation_id, None)
+            if previous is not None:
+                if previous != (reporter, target):
+                    _error("accepted late evidence changed its attempt identity")
+                if target in drawdowns and drawdowns[target] < 0:
+                    drawdowns[target] += 1
+    for (
+        _ingestion_sequence,
+        observation,
+        accepted_ns,
+        reporter_ns,
+    ) in latest.values():
+        target = observation.get("observed_replica_id")
+        reporter = observation.get("reporter_id")
+        if (
+            observation.get("outcome") != "timeout"
+            or type(target) is not int
+            or type(reporter) is not int
+            or target not in expected
+            or reporter not in expected[target]
+        ):
+            continue
+        rows.append(
+            {
+                "epoch_number": 0,
+                "tree_id": _integer(
+                    _mapping(
+                        observation.get("configuration"),
+                        "observation configuration",
+                    ).get("tree_id"),
+                    "observation tree",
+                ),
+                "observed_replica_id": target,
+                "reporter_id": reporter,
+                "outcome": "timeout",
+                "compensated": False,
+                "source_monotonic_ns": max(accepted_ns, reporter_ns),
+            }
+        )
+    if not rows:
+        _error("FCRASH-H contains no qualifying timeout evidence")
+    return {
+        "fault_monotonic_ns": fault_ns,
+        "nonresponse_monotonic_ns": max(
+            int(row["source_monotonic_ns"]) for row in rows
+        ),
+        "snapshot_audit_monotonic_ns": _integer(
+            audits[0]["source_monotonic_ns"], "snapshot audit timestamp"
+        ),
+        "epoch1_activation_monotonic_ns": max(
+            _integer(event["source_monotonic_ns"], "Epoch 1 activation time")
+            for event in activations1
+        ),
+        "epoch2_activation_monotonic_ns": (
+            None
+            if not activations2
+            else max(
+                _integer(event["source_monotonic_ns"], "Epoch 2 activation time")
+                for event in activations2
+            )
+        ),
+        "timeout_observations": rows,
+        "guard_drawdowns": {
+            str(target): drawdown for target, drawdown in sorted(drawdowns.items())
+        },
+    }
+
+
+def _validate_prefault_active_configuration(
+    contract: Mapping[str, object],
+    events: Sequence[Mapping[str, Any]],
+    fault_ns: int,
+) -> None:
+    latest: dict[int, Mapping[str, Any]] = {}
+    for event in events:
+        source_id = str(event["source_id"])
+        if (
+            event["source_kind"] != "replica"
+            or not source_id.startswith("replica-")
+            or event["event_type"] != "adaptive.configuration_active"
+            or int(event["source_monotonic_ns"]) >= fault_ns
+        ):
+            continue
+        replica = int(source_id.removeprefix("replica-"))
+        previous = latest.get(replica)
+        if previous is None or int(event["source_monotonic_ns"]) > int(
+            previous["source_monotonic_ns"]
+        ):
+            latest[replica] = event
+    members = tuple(int(member) for member in contract["members"])
+    if set(latest) != set(members):
+        _error("FCRASH-H pre-fault active configuration lacks every member")
+    for replica in members:
+        payload = _mapping(latest[replica]["payload"], "active configuration")
+        if {
+            key: payload.get(key) for key in ("epoch_number", "tree_id", "epoch_digest")
+        } != {
+            "epoch_number": 0,
+            "tree_id": _mapping(
+                contract["reporter_coverage_plan"], "reporter coverage plan"
+            )["active_tree_id"],
+            "epoch_digest": contract["epoch_zero_digest"],
+        }:
+            _error("FCRASH-H pre-fault active configuration drifted")
+
+
 def validation_contract_from_profile(root: Path) -> dict[str, object]:
     """Derive the independent N7/N31 contract from sealed frozen inputs."""
 
     profile = _read_json(root / "profile.json", "focused profile")
+    schema_version = profile.get("schema_version")
+    expected_keys = _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
     if (
-        set(profile) != _PROFILE_KEYS
-        or profile.get("schema_version") != 1
+        set(profile) != expected_keys
+        or schema_version not in {1, 2}
         or profile.get("frozen") is not True
     ):
         _error("focused profile schema or identity drifted")
@@ -189,6 +681,8 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     if profile_id not in {
         "n7-f2-q5-two-crash-pair-smoke-v1",
         "n31-f5-q21-three-crash-pair-v1",
+        "n7-f2-q5-two-crash-pair-smoke-v2",
+        "n31-f5-q21-three-crash-pair-v2",
     }:
         _error("focused profile identity is not reviewed")
     protocol = _mapping(profile.get("protocol"), "profile protocol")
@@ -196,9 +690,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     threshold = _integer(protocol.get("f"), "profile fault threshold")
     quorum = _integer(protocol.get("Q"), "profile quorum", 1)
     fanout = _integer(protocol.get("fanout"), "profile fanout", 1)
-    pipeline = _integer(
-        protocol.get("pipeline_stretch"), "profile pipeline stretch", 1
-    )
+    pipeline = _integer(protocol.get("pipeline_stretch"), "profile pipeline stretch", 1)
     if count != 3 * threshold + 1 or quorum != 2 * threshold + 1:
         _error("focused profile protocol identity drifted")
     members = tuple(range(count))
@@ -309,9 +801,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             "bfs_index": index,
             "depth": depths[index],
             "role": (
-                "root"
-                if index == 0
-                else "internal" if children[index] else "leaf"
+                "root" if index == 0 else "internal" if children[index] else "leaf"
             ),
         }
         for index, replica in enumerate(order)
@@ -321,7 +811,9 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         for index, child_ids in children.items()
         if child_ids
     }
-    nonroot_internal = [index for index, child_ids in children.items() if index and child_ids]
+    nonroot_internal = [
+        index for index, child_ids in children.items() if index and child_ids
+    ]
     deepest_depth = max(depths[index] for index in nonroot_internal)
     deepest = [
         order[index] for index in nonroot_internal if depths[index] == deepest_depth
@@ -345,7 +837,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     ):
         _error("topology proof roles, depths, or descendants drifted")
     survivors = tuple(member for member in members if member not in targets)
-    return {
+    result: dict[str, object] = {
         "profile": profile,
         "profile_sha256": profile_sha,
         "topology_proof_sha256": proof_sha,
@@ -379,6 +871,16 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         ),
         "figure_eligible": profile.get("figure_eligible") is True,
     }
+    if schema_version == 2:
+        result["reporter_coverage_plan"] = _derive_reporter_coverage_plan(
+            profile,
+            members=members,
+            targets=targets,
+            fault_threshold=threshold,
+            fanout=fanout,
+            active_tree=active_tree,
+        )
+    return result
 
 
 def _expected_treegen_payload(contract: Mapping[str, object]) -> bytes:
@@ -398,9 +900,7 @@ def _expected_treegen_payload(contract: Mapping[str, object]) -> bytes:
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
-def _validate_runtime_configuration(
-    root: Path, contract: Mapping[str, object]
-) -> None:
+def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) -> None:
     treegen_path = root / "treegen.conf"
     if treegen_path.is_symlink() or not treegen_path.is_file():
         _error("client tree configuration is absent")
@@ -477,7 +977,9 @@ def _read_jsonl(path: Path, source_kind: str) -> list[dict[str, Any]]:
         try:
             event = _mapping(json.loads(line), f"event line {line_number}")
         except (json.JSONDecodeError, UnicodeError) as exc:
-            raise FocusedCrashPairValidationError("event stream is invalid JSONL") from exc
+            raise FocusedCrashPairValidationError(
+                "event stream is invalid JSONL"
+            ) from exc
         if (
             set(event) != _EVENT_KEYS
             or event.get("event_schema_version") != 1
@@ -529,7 +1031,8 @@ def _validate_sources(
             _error("source monotonic time regressed")
     inventory = [list(source) for source in sorted(by_source)]
     recorded_sources = [
-        list(source) for source in sorted({(kind, source_id) for kind, source_id, _ in by_source})
+        list(source)
+        for source in sorted({(kind, source_id) for kind, source_id, _ in by_source})
     ]
     recorded_inventory = _read_json(
         root / "runtime" / "source-inventory.json", "source inventory"
@@ -568,11 +1071,7 @@ def _canonical_tree_members(
     targets = tuple(contract["targets"])
     fanout = int(contract["fanout"])
     internal = tuple(replica for replica in survivors if replica != root)[:fanout]
-    leaves = tuple(
-        replica
-        for replica in survivors
-        if replica not in (root, *internal)
-    )
+    leaves = tuple(replica for replica in survivors if replica not in (root, *internal))
     return (root, *internal, *leaves, *targets)
 
 
@@ -602,7 +1101,9 @@ def _command_payload(decoded: Any, payload: Mapping[str, Any]) -> dict[str, obje
     delay = decoded.command.activation_delay_blocks
     expected = {
         "command_block_height": height,
-        "command_block_hash": _digest(payload.get("command_block_hash"), "command hash"),
+        "command_block_hash": _digest(
+            payload.get("command_block_hash"), "command hash"
+        ),
         "payload_digest": decoded.command.payload_digest,
         "predecessor_epoch_number": decoded.epoch_number - 1,
         "predecessor_epoch_digest": decoded.previous_epoch_digest,
@@ -662,7 +1163,9 @@ def _validate_transition(
         if dict(activation["payload"]) != expected_activation:
             _error("survivor activation identity drifted")
         command = commands_by_source[str(activation["source_id"])]
-        if int(activation["source_monotonic_ns"]) <= int(command["source_monotonic_ns"]):
+        if int(activation["source_monotonic_ns"]) <= int(
+            command["source_monotonic_ns"]
+        ):
             _error("survivor activation precedes its command")
     return commands, activations
 
@@ -677,11 +1180,21 @@ def _observation_id(observation: Mapping[str, Any]) -> str:
         (
             b"kauri-response-observation-v1",
             _integer(observation.get("reporter_id"), "reporter").to_bytes(2, "big"),
-            _integer(observation.get("observed_replica_id"), "observed replica").to_bytes(2, "big"),
-            _integer(configuration.get("epoch_number"), "observation epoch").to_bytes(4, "big"),
-            _integer(configuration.get("tree_id"), "observation tree").to_bytes(4, "big"),
-            bytes.fromhex(_digest(configuration.get("epoch_digest"), "observation epoch digest")),
-            bytes.fromhex(_digest(observation.get("block_hash"), "observation block hash")),
+            _integer(
+                observation.get("observed_replica_id"), "observed replica"
+            ).to_bytes(2, "big"),
+            _integer(configuration.get("epoch_number"), "observation epoch").to_bytes(
+                4, "big"
+            ),
+            _integer(configuration.get("tree_id"), "observation tree").to_bytes(
+                4, "big"
+            ),
+            bytes.fromhex(
+                _digest(configuration.get("epoch_digest"), "observation epoch digest")
+            ),
+            bytes.fromhex(
+                _digest(observation.get("block_hash"), "observation block hash")
+            ),
             outcome_code.to_bytes(1, "big"),
         )
     )
@@ -726,8 +1239,7 @@ def reconstruct_focused_ranking(
         policy.get("minimum_attempts"), "ranking minimum attempts", 1
     )
     if any(
-        _integer(row.get("attempt_count"), "ranking attempt count")
-        < minimum_attempts
+        _integer(row.get("attempt_count"), "ranking attempt count") < minimum_attempts
         for row in ranking
     ):
         _error("ranking contains a replica below the minimum attempt count")
@@ -764,7 +1276,7 @@ def _ranking(
     contract: Mapping[str, object],
     *,
     predecessor_epoch: int,
-) -> tuple[list[int], list[str], tuple[int, ...]]:
+) -> tuple[list[int], list[str], tuple[int, ...], str | None, int | None, int | None]:
     manager_events = [
         event for event in events if event["source_kind"] == "adaptation_manager"
     ]
@@ -792,20 +1304,29 @@ def _ranking(
         event["event_type"] == "adaptive_v2_evidence_snapshot"
         for event in manager_events
     )
+    replay_snapshot_id: str | None = None
+    replay_cutoff: int | None = None
+    replay_audit_ns: int | None = None
     if has_snapshot_audit:
-        all_audits = [
-            _mapping(event["payload"], "native ranking audit")
+        all_audit_events = [
+            event
             for event in manager_events
             if event["event_type"] == "adaptive_v2_evidence_snapshot"
         ]
-        audits = [
-            audit
-            for audit in all_audits
-            if audit.get("predecessor_epoch_number") == predecessor_epoch
+        audit_events = [
+            event
+            for event in all_audit_events
+            if _mapping(event["payload"], "native ranking audit").get(
+                "predecessor_epoch_number"
+            )
+            == predecessor_epoch
         ]
-        if len(audits) != 1:
+        if len(audit_events) != 1:
             _error("ranking evidence lacks one audit for the selected predecessor")
-        audit = audits[0]
+        audit = _mapping(audit_events[0]["payload"], "native ranking audit")
+        replay_audit_ns = _integer(
+            audit_events[0]["source_monotonic_ns"], "native ranking audit timestamp"
+        )
         audited_epoch = _integer(
             audit.get("predecessor_epoch_number"), "ranking predecessor epoch"
         )
@@ -837,11 +1358,18 @@ def _ranking(
             seed=_integer(epoch1.generation_seed, "Epoch 1 generation seed"),
             suffix_only=suffix_only,
         )
+        replay_snapshot_id = _digest(
+            replay.get("snapshot_id"), "ranking replay snapshot ID"
+        )
+        replay_cutoff = current_cutoff
         for other_epoch in {0, 1} - {audited_epoch}:
             other_audits = [
-                candidate
-                for candidate in all_audits
-                if candidate.get("predecessor_epoch_number") == other_epoch
+                _mapping(candidate["payload"], "native ranking audit")
+                for candidate in all_audit_events
+                if _mapping(candidate["payload"], "native ranking audit").get(
+                    "predecessor_epoch_number"
+                )
+                == other_epoch
             ]
             if len(other_audits) > 1:
                 _error("ranking evidence duplicates a predecessor audit")
@@ -925,7 +1453,14 @@ def _ranking(
         )
         for event in accepted
     )
-    return ranked, observation_ids, timeout_targets
+    return (
+        ranked,
+        observation_ids,
+        timeout_targets,
+        replay_snapshot_id,
+        replay_cutoff,
+        replay_audit_ns,
+    )
 
 
 def _select_latest_common_commit(
@@ -933,9 +1468,7 @@ def _select_latest_common_commit(
     observations: Sequence[Mapping[str, Any]],
     contract: Mapping[str, object],
 ) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
-    survivor_sources = {
-        f"replica-{replica}" for replica in contract["survivors"]
-    }
+    survivor_sources = {f"replica-{replica}" for replica in contract["survivors"]}
     eligible: list[tuple[Mapping[str, Any], list[Mapping[str, Any]]]] = []
     for commit in commits:
         payload = _mapping(commit["payload"], "authoritative commit")
@@ -965,9 +1498,7 @@ def _select_latest_common_commit(
         _error("common commit does not contain matching survivor witnesses")
     latest_height = max(
         _integer(
-            _mapping(commit["payload"], "authoritative commit").get(
-                "block_height"
-            ),
+            _mapping(commit["payload"], "authoritative commit").get("block_height"),
             "commit height",
             1,
         )
@@ -976,9 +1507,7 @@ def _select_latest_common_commit(
     latest = [
         item
         for item in eligible
-        if _mapping(item[0]["payload"], "authoritative commit").get(
-            "block_height"
-        )
+        if _mapping(item[0]["payload"], "authoritative commit").get("block_height")
         == latest_height
     ]
     if len(latest) != 1:
@@ -1094,7 +1623,9 @@ def _commit_reconstruction(
                 "start_ns": start,
                 "end_ns": end,
                 "transactions": transaction_count,
-                "mean_milli_tps": transaction_count * 1_000_000_000_000 // (end - start),
+                "mean_milli_tps": transaction_count
+                * 1_000_000_000_000
+                // (end - start),
             }
         )
     return commits, {
@@ -1177,9 +1708,10 @@ def _aggregate_child_provenance(
     trusted_provenance: object, directory: Path
 ) -> Mapping[str, Any]:
     aggregate = _mapping(trusted_provenance, "aggregate trusted provenance")
-    if set(aggregate) != {"schema_version", "children"} or aggregate.get(
-        "schema_version"
-    ) != 1:
+    if (
+        set(aggregate) != {"schema_version", "children"}
+        or aggregate.get("schema_version") != 1
+    ):
         _error("aggregate trusted provenance schema drifted")
     children = _mapping(aggregate.get("children"), "trusted child provenance")
     seal = verify_evidence_seal(directory)
@@ -1209,7 +1741,9 @@ def _validate_receipts(
 ) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
     manifest = _read_json(root / "manifest.json", "arm manifest")
     build = _read_json(root / "runtime" / "build-provenance.json", "build provenance")
-    effective = _read_json(root / "runtime" / "effective-runtime.json", "runtime identity")
+    effective = _read_json(
+        root / "runtime" / "effective-runtime.json", "runtime identity"
+    )
     pair = _read_json(root / "pair-receipt.json", "pair receipt")
     if (
         set(manifest)
@@ -1231,8 +1765,7 @@ def _validate_receipts(
             "automatic_retries",
             "replacement_policy",
         }
-        or
-        manifest.get("schema_version") != 1
+        or manifest.get("schema_version") != 1
         or manifest.get("profile_sha256") != profile_sha
         or manifest.get("build_sha256") != build.get("build_sha256")
         or manifest.get("pair_seed") != effective.get("pair_seed")
@@ -1419,9 +1952,7 @@ def validate_sealed_arm(
     )
     if epoch1.previous_epoch_digest != contract["epoch_zero_digest"]:
         _error("Epoch 1 predecessor identity drifted")
-    _validate_trees(
-        epoch1, tuple(range(int(contract["quorum"]))), "Epoch 1", contract
-    )
+    _validate_trees(epoch1, tuple(range(int(contract["quorum"]))), "Epoch 1", contract)
     epoch2_path = root / "raw" / "epoch2.bundle"
     epoch2_wire: bytes | None = None
     epoch2: Any | None = None
@@ -1431,19 +1962,47 @@ def validate_sealed_arm(
             _error("Epoch 2 is not chained to Epoch 1")
 
     commands1, activations1 = _validate_transition(events, epoch1, contract)
+    (
+        containment_ranked_ids,
+        containment_observation_ids,
+        containment_timeout_targets,
+        epoch1_snapshot_id,
+        epoch1_cutoff,
+        epoch1_audit_ns,
+    ) = _ranking(events, epoch1, contract, predecessor_epoch=0)
+    if epoch1_snapshot_id is not None and (
+        epoch1.evidence_snapshot_id != epoch1_snapshot_id
+        or epoch1.evidence_cutoff != epoch1_cutoff
+    ):
+        _error("Epoch 1 bundle is not bound to its native snapshot audit")
     if epoch2 is None:
         if any(
             event["event_type"] in {"epoch.command_committed", "epoch.activated"}
-            and event["payload"].get("successor_epoch_number", event["payload"].get("epoch_number")) == 2
+            and event["payload"].get(
+                "successor_epoch_number", event["payload"].get("epoch_number")
+            )
+            == 2
             for event in events
         ):
             _error("control arm contains an Epoch 2 transition")
         commands2: list[Mapping[str, Any]] = []
         activations2: list[Mapping[str, Any]] = []
     else:
-        ranked_ids, observation_ids, timeout_targets = _ranking(
-            events, epoch1, contract, predecessor_epoch=1
-        )
+        (
+            ranked_ids,
+            observation_ids,
+            timeout_targets,
+            epoch2_snapshot_id,
+            epoch2_cutoff,
+            epoch2_audit_ns,
+        ) = _ranking(events, epoch1, contract, predecessor_epoch=1)
+        if epoch2_snapshot_id is None or (
+            epoch2.evidence_snapshot_id != epoch2_snapshot_id
+            or epoch2.evidence_cutoff != epoch2_cutoff
+        ):
+            _error("Epoch 2 bundle is not bound to its native snapshot audit")
+        if timeout_targets != containment_timeout_targets:
+            _error("containment and optimization evidence disagree on fault targets")
         _validate_trees(
             epoch2,
             tuple(ranked_ids[: int(contract["quorum"])]),
@@ -1451,14 +2010,21 @@ def validate_sealed_arm(
             contract,
         )
         commands2, activations2 = _validate_transition(events, epoch2, contract)
+        if (
+            epoch2_audit_ns is None
+            or min(
+                _integer(event["source_monotonic_ns"], "Epoch 2 command timestamp")
+                for event in commands2
+            )
+            <= epoch2_audit_ns
+        ):
+            _error("Epoch 2 command does not follow its native snapshot audit")
         predecessor_commits = [
             event
             for event in events
             if event["event_type"] == "block.committed"
             and _mapping(
-                _mapping(event["payload"], "predecessor commit").get(
-                    "decision_proof"
-                ),
+                _mapping(event["payload"], "predecessor commit").get("decision_proof"),
                 "predecessor decision proof",
             ).get("epoch_number")
             == 1
@@ -1473,14 +2039,13 @@ def validate_sealed_arm(
             contract,
         )
         if min(int(event["source_monotonic_ns"]) for event in commands2) <= max(
-            int(event["source_monotonic_ns"])
-            for event in predecessor_observations
+            int(event["source_monotonic_ns"]) for event in predecessor_observations
         ):
             _error("Epoch 2 command precedes the fresh common-commit window")
     if epoch2 is None:
-        ranked_ids, observation_ids, timeout_targets = _ranking(
-            events, epoch1, contract, predecessor_epoch=0
-        )
+        ranked_ids = containment_ranked_ids
+        observation_ids = containment_observation_ids
+        timeout_targets = containment_timeout_targets
 
     commits, measurements = _commit_reconstruction(
         root, events, epoch1, epoch2, contract
@@ -1498,28 +2063,59 @@ def validate_sealed_arm(
         _error("raw replica sources differ from the reconstructed membership")
 
     fault_receipt = _read_json(root / "raw" / "fault-receipt.json", "fault receipt")
-    if set(fault_receipt) != {
-        "schema_version",
-        "fault_plan",
-        "process_records",
-        "sigkill_outcomes",
-        "fault_journal",
-    } or fault_receipt.get("schema_version") != 1:
+    if (
+        set(fault_receipt)
+        != {
+            "schema_version",
+            "fault_plan",
+            "process_records",
+            "sigkill_outcomes",
+            "fault_journal",
+        }
+        or fault_receipt.get("schema_version") != 1
+    ):
         _error("fault receipt schema drifted")
     confirmations = {
-        _integer(outcome.get("replica_id"), "fault outcome replica"):
-        _integer(outcome.get("confirmed_monotonic_ns"), "fault confirmation")
-        for outcome in _sequence(
-            fault_receipt["sigkill_outcomes"], "SIGKILL outcomes"
+        _integer(outcome.get("replica_id"), "fault outcome replica"): _integer(
+            outcome.get("confirmed_monotonic_ns"), "fault confirmation"
         )
+        for outcome in _sequence(fault_receipt["sigkill_outcomes"], "SIGKILL outcomes")
     }
     for event in events:
         if event["source_kind"] != "replica":
             continue
         replica = int(str(event["source_id"]).removeprefix("replica-"))
-        if replica in confirmations and int(event["source_monotonic_ns"]) > confirmations[replica]:
+        if (
+            replica in confirmations
+            and int(event["source_monotonic_ns"]) > confirmations[replica]
+        ):
             _error("crashed replica emitted an event after confirmed SIGKILL")
     _validate_atomic_fault_receipt(contract, fault_receipt)
+    if "reporter_coverage_plan" in contract:
+        fault_ns = max(confirmations.values())
+        _validate_prefault_active_configuration(contract, events, fault_ns)
+        coverage_witness = _fcrash_h_witness_from_events(
+            contract,
+            events,
+            fault_receipt,
+            activations1,
+            activations2,
+        )
+        validate_fcrash_h_evidence(contract, coverage_witness)
+        audit_ns = _integer(
+            coverage_witness.get("snapshot_audit_monotonic_ns"),
+            "snapshot audit timestamp",
+        )
+        if epoch1_audit_ns != audit_ns:
+            _error("Epoch 1 replay audit timestamp drifted")
+        if (
+            min(
+                _integer(event["source_monotonic_ns"], "Epoch 1 command timestamp")
+                for event in commands1
+            )
+            <= audit_ns
+        ):
+            _error("Epoch 1 command does not follow its native snapshot audit")
 
     launch = _read_json(root / "runtime" / "launch-arguments.json", "launch arguments")
     observed = _read_json(
@@ -1585,9 +2181,7 @@ def validate_sealed_arm(
         "slot_id": manifest.get("slot_id"),
         "pair_seed": manifest.get("pair_seed"),
         "arm": "adaptive" if epoch2 is not None else "control",
-        "epoch1_structure_sha256": _hash(
-            epoch_structural_projection(epoch1)
-        ),
+        "epoch1_structure_sha256": _hash(epoch_structural_projection(epoch1)),
         "source_inventory_sha256": _hash(source_inventory),
         "authoritative_commit_identity_sha256": _hash(commit_identity),
         "epoch_identity_sha256": _hash(epoch_identity),
@@ -1660,13 +2254,16 @@ def validate_sealed_pair(
         control["build_sha256"] != adaptive["build_sha256"]
         or control["pair_seed"] != adaptive["pair_seed"]
         or control["profile_sha256"] != adaptive["profile_sha256"]
-        or control["issuer_public_key_sha256"]
-        != adaptive["issuer_public_key_sha256"]
+        or control["issuer_public_key_sha256"] != adaptive["issuer_public_key_sha256"]
         or control["epoch1_structure_sha256"] != adaptive["epoch1_structure_sha256"]
     ):
         _error("sealed pair matched inputs or Epoch 1 structure drifted")
-    control_tps = int(control["scientific_measurements"]["late_window_throughput_milli_tps"])
-    adaptive_tps = int(adaptive["scientific_measurements"]["late_window_throughput_milli_tps"])
+    control_tps = int(
+        control["scientific_measurements"]["late_window_throughput_milli_tps"]
+    )
+    adaptive_tps = int(
+        adaptive["scientific_measurements"]["late_window_throughput_milli_tps"]
+    )
     outcome = (
         "FAVORABLE"
         if adaptive_tps > control_tps
@@ -1695,7 +2292,9 @@ def validate_sealed_campaign(
     try:
         verify_evidence_seal(root)
     except (EvidenceSealError, OSError) as exc:
-        raise FocusedCrashPairValidationError("campaign evidence seal rejected") from exc
+        raise FocusedCrashPairValidationError(
+            "campaign evidence seal rejected"
+        ) from exc
     plan = _read_json(root / "plan.json", "campaign plan")
     ledger_path = root / "campaign-ledger.jsonl"
     if ledger_path.is_symlink() or not ledger_path.is_file():
@@ -1731,6 +2330,7 @@ def validate_sealed_campaign(
             }
         )
     try:
+
         def validate_isolated_child(
             directory: Path, *, trusted_provenance: object
         ) -> Mapping[str, Any]:

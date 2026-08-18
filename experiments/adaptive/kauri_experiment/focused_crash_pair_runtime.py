@@ -44,7 +44,6 @@ from . import profiled_fault_runtime
 from .profiled_fault_evaluation import FrozenProfile, ProfileFault
 from .profiled_fault_runtime import spawn_owned_process
 
-
 _PROFILE_KEYS = {
     "schema_version",
     "profile_id",
@@ -65,6 +64,7 @@ _PROFILE_KEYS = {
     "campaign",
     "blinding",
 }
+_PROFILE_KEYS_V2 = _PROFILE_KEYS | {"evidence_guard"}
 _AUTHORIZATION_KEYS = (
     "schema_version",
     "mode",
@@ -217,9 +217,7 @@ class FocusedPairIssuerAllocator:
             public_keys.add(public)
             private_path = pair_root / "issuer.sec"
             public_path = pair_root / "issuer.pub"
-            profiled_fault_runtime.write_exclusive(
-                private_path, private, mode=0o600
-            )
+            profiled_fault_runtime.write_exclusive(private_path, private, mode=0o600)
             profiled_fault_runtime.write_exclusive(
                 public_path, f"{public}\n".encode("ascii"), mode=0o600
             )
@@ -334,9 +332,7 @@ def _validate_topology_proof(
     nonroot_internal = [index for index in internal if index]
     deepest_depth = max(depths[index] for index in nonroot_internal)
     deepest = [
-        order[index]
-        for index in nonroot_internal
-        if depths[index] == deepest_depth
+        order[index] for index in nonroot_internal if depths[index] == deepest_depth
     ]
     target_descendants = [set(expected_descendants[str(target)]) for target in targets]
     pairwise_disjoint = all(
@@ -371,7 +367,9 @@ def load_focused_profile(path: Path) -> FocusedProfile:
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise FocusedCrashPairRuntimeError("focused profile is invalid JSON") from exc
     profile = _document(raw, "focused profile")
-    if set(profile) != _PROFILE_KEYS or profile.get("schema_version") != 1:
+    schema_version = profile.get("schema_version")
+    expected_keys = _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
+    if set(profile) != expected_keys or schema_version not in {1, 2}:
         _error("focused profile schema drifted")
     if profile.get("frozen") is not True:
         _error("focused profile is not frozen")
@@ -389,7 +387,10 @@ def load_focused_profile(path: Path) -> FocusedProfile:
     if (
         not targets
         or len(set(targets)) != len(targets)
-        or any(type(target) is not int or target not in range(replica_count) for target in targets)
+        or any(
+            type(target) is not int or target not in range(replica_count)
+            for target in targets
+        )
     ):
         _error("profile reviewed targets are invalid")
     fault = _document(profile.get("fault"), "profile fault")
@@ -429,7 +430,7 @@ def load_focused_profile(path: Path) -> FocusedProfile:
     )
     if issuer_key is not None and not isinstance(issuer_key, str):
         _error("issuer public key is malformed")
-    return FocusedProfile(
+    loaded = FocusedProfile(
         path=profile_path.resolve(),
         profile_id=profile_id,
         profile_sha256=profile_sha256,
@@ -441,6 +442,203 @@ def load_focused_profile(path: Path) -> FocusedProfile:
         issuer_public_key=issuer_key,
         raw=dict(profile),
     )
+    if schema_version == 2:
+        derive_reporter_coverage_plan(loaded)
+    return loaded
+
+
+def is_before_fcrash_h_deadline(
+    origin_ns: int,
+    candidate_ns: int,
+    deadline_seconds: int,
+) -> bool:
+    """Return whether a native timestamp is inside one absolute half-open cap."""
+
+    if (
+        type(origin_ns) is not int
+        or type(candidate_ns) is not int
+        or type(deadline_seconds) is not int
+        or origin_ns < 0
+        or candidate_ns < origin_ns
+        or deadline_seconds <= 0
+    ):
+        return False
+    return candidate_ns < origin_ns + deadline_seconds * 1_000_000_000
+
+
+def _cyclic_parent(
+    replica_count: int,
+    fanout: int,
+    tree_root: int,
+    target: int,
+) -> int | None:
+    position = (target - tree_root) % replica_count
+    if position == 0:
+        return None
+    return (tree_root + (position - 1) // fanout) % replica_count
+
+
+def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
+    """Derive and verify the frozen FCRASH-H reporter-coverage contract."""
+
+    if type(profile) is not FocusedProfile:
+        _error("reporter coverage requires a focused profile")
+    raw = profile.raw
+    if raw.get("schema_version") != 2:
+        _error("reporter coverage requires an immutable v2 profile")
+    protocol = _document(raw.get("protocol"), "profile protocol")
+    topology = _document(raw.get("topology"), "profile topology")
+    guard = _document(raw.get("evidence_guard"), "profile evidence guard")
+    timers = _document(raw.get("timers"), "profile timers")
+    expected_guard_keys = {
+        "schedule",
+        "tree_switch_period_blocks",
+        "horizon_tree_positions",
+        "required_qualifying_reporters",
+        "minimum_timeouts_per_reporter",
+        "minimum_score_drop",
+    }
+    expected_timer_keys = {
+        "adaptation_interval_seconds",
+        "stable_phase_seconds",
+        "readiness_timeout_seconds",
+        "manager_convergence_timeout_seconds",
+        "nonresponse_evidence_deadline_seconds",
+        "containment_activation_deadline_seconds",
+        "optimization_activation_deadline_seconds",
+        "arm_hard_deadline_seconds",
+    }
+    if set(guard) != expected_guard_keys or set(timers) != expected_timer_keys:
+        _error("FCRASH-H guard or timer schema drifted")
+    replica_count = len(profile.replica_ids)
+    fanout = _integer(protocol.get("fanout"), "profile fanout", 1)
+    active_tree = _integer(topology.get("active_tree_id"), "active tree")
+    fault_threshold = _integer(protocol.get("f"), "fault threshold")
+    required = fault_threshold + 1
+    minimum_timeouts = 2
+    targets = profile.target_replica_ids
+    target_rows: list[dict[str, object]] = []
+    first_sets: list[set[int]] = []
+    horizon = 0
+    for target in targets:
+        seen: set[int] = set()
+        first: list[dict[str, int]] = []
+        for offset in range(replica_count):
+            tree_id = (active_tree + offset) % replica_count
+            if tree_id in targets:
+                continue
+            reporter = _cyclic_parent(replica_count, fanout, tree_id, target)
+            if reporter is None or reporter in targets or reporter in seen:
+                continue
+            seen.add(reporter)
+            first.append(
+                {
+                    "tree_position": offset + 1,
+                    "tree_id": tree_id,
+                    "reporter_id": reporter,
+                }
+            )
+            if len(first) == required:
+                break
+        if len(first) != required:
+            _error("FCRASH-H has insufficient honest reporter coverage")
+        horizon = max(horizon, first[-1]["tree_position"])
+        reporter_set = {row["reporter_id"] for row in first}
+        first_sets.append(reporter_set)
+        target_rows.append(
+            {
+                "target_replica_id": target,
+                "authenticated_reporter_ids": [],
+                "first_qualifying_reporters": first,
+            }
+        )
+    common_reporters = set.intersection(*first_sets)
+    if len(common_reporters) != required:
+        _error("FCRASH-H targets lack one common honest reporter set")
+    ordered_common = sorted(common_reporters)
+    for row in target_rows:
+        row["authenticated_reporter_ids"] = ordered_common
+    expected_guard = {
+        "schedule": "native_cyclic_epoch_zero",
+        "tree_switch_period_blocks": replica_count,
+        "horizon_tree_positions": horizon,
+        "required_qualifying_reporters": required,
+        "minimum_timeouts_per_reporter": minimum_timeouts,
+        "minimum_score_drop": minimum_timeouts * required,
+    }
+    if dict(guard) != expected_guard:
+        _error("FCRASH-H frozen evidence guard differs from topology derivation")
+    deadline_fields = {
+        "evidence_seconds": "nonresponse_evidence_deadline_seconds",
+        "epoch1_activation_seconds": "containment_activation_deadline_seconds",
+        "optimization_activation_seconds": "optimization_activation_deadline_seconds",
+        "arm_hard_seconds": "arm_hard_deadline_seconds",
+    }
+    deadlines = {
+        output: _integer(timers.get(source), source, 1)
+        for output, source in deadline_fields.items()
+    }
+    readiness = _integer(
+        timers.get("readiness_timeout_seconds"), "readiness timeout", 1
+    )
+    convergence = _integer(
+        timers.get("manager_convergence_timeout_seconds"),
+        "manager convergence timeout",
+        1,
+    )
+    stable = _integer(timers.get("stable_phase_seconds"), "stable phase", 1)
+    if (
+        deadlines["evidence_seconds"] >= deadlines["epoch1_activation_seconds"]
+        or deadlines["epoch1_activation_seconds"] >= deadlines["arm_hard_seconds"]
+        or deadlines["optimization_activation_seconds"] >= deadlines["arm_hard_seconds"]
+    ):
+        _error("FCRASH-H phase deadlines are not strictly nested")
+    return {
+        "schema_version": 1,
+        "profile_id": profile.profile_id,
+        "active_tree_id": active_tree,
+        "horizon_tree_positions": horizon,
+        "required_qualifying_reporters": required,
+        "minimum_timeouts_per_reporter": minimum_timeouts,
+        "minimum_score_drop": minimum_timeouts * required,
+        "deadlines_seconds": deadlines,
+        "stable_phase_seconds": stable,
+        "readiness_timeout_seconds": readiness,
+        "manager_convergence_timeout_seconds": convergence,
+        "targets": target_rows,
+    }
+
+
+def has_exact_active_configuration_barrier(
+    profile: FocusedProfile,
+    rows: Sequence[Mapping[str, object]],
+) -> bool:
+    """Check the exact all-member Epoch-0 configuration immediately pre-fault."""
+
+    if type(profile) is not FocusedProfile or len(rows) != len(profile.replica_ids):
+        return False
+    topology = _document(profile.raw.get("topology"), "profile topology")
+    expected = {
+        "epoch_number": 0,
+        "tree_id": topology.get("active_tree_id"),
+        "epoch_digest": topology.get("epoch_zero_digest"),
+    }
+    seen: set[int] = set()
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            return False
+        replica = raw.get("replica_id")
+        configuration = raw.get("configuration")
+        if (
+            type(replica) is not int
+            or replica not in profile.replica_ids
+            or replica in seen
+            or not isinstance(configuration, Mapping)
+            or dict(configuration) != expected
+        ):
+            return False
+        seen.add(replica)
+    return seen == set(profile.replica_ids)
 
 
 def _authorization_request(
@@ -514,9 +712,7 @@ class FocusedLivePreflightChecks:
         )
 
     def repository(self, _profile: object) -> Mapping[str, object]:
-        revision = profiled_fault_runtime.verify_repository_state(
-            self.repository_path
-        )
+        revision = profiled_fault_runtime.verify_repository_state(self.repository_path)
         return {"revision": revision}
 
     def build(self, _profile: object) -> Mapping[str, object]:
@@ -612,14 +808,10 @@ class FocusedLivePreflightChecks:
             allocate = getattr(self.issuer_allocator, "allocate_pair_issuers", None)
             if not callable(allocate):
                 _error("pair issuer allocator is unavailable")
-            return dict(
-                _document(allocate(), "pair issuer allocation")
-            )
+            return dict(_document(allocate(), "pair issuer allocation"))
         configured = focused.issuer_public_key
         if not isinstance(configured, str) or len(configured) != 66:
-            _error(
-                "issuer_public_key check requires a pair-bound issuer context"
-            )
+            _error("issuer_public_key check requires a pair-bound issuer context")
         return {"issuer_public_key": configured}
 
 
@@ -687,8 +879,7 @@ def prepare_focused_preflight(
             != _document(profile.raw.get("topology"), "profile topology").get(
                 "epoch_zero_digest"
             )
-            or native.get("topology_proof_sha256")
-            != profile.topology_proof_sha256
+            or native.get("topology_proof_sha256") != profile.topology_proof_sha256
             or not isinstance(issuer.get("issuer_public_key"), str)
         ):
             _error("preflight execution context is not profile-bound")
@@ -733,11 +924,13 @@ def prepare_focused_preflight(
                 if any(value is None for value in normalized[pair_id].values()):
                     _error("pair issuer allocation schema drifted")
             execution_context["pair_issuers"] = normalized
+        if profile.raw.get("schema_version") == 2:
+            execution_context["reporter_coverage"] = derive_reporter_coverage_plan(
+                profile
+            )
         request = {
             **request,
-            "execution_context_sha256": _sha256(
-                _canonical_json(execution_context)
-            ),
+            "execution_context_sha256": _sha256(_canonical_json(execution_context)),
         }
     request_bytes = _canonical_json(request)
     request_path = preflight_root / "authorization-request.json"
@@ -773,17 +966,14 @@ def build_focused_authorization_request(preflight: object) -> bytes:
             _error("preflight execution context digest drifted")
         request_keys.append("execution_context_sha256")
     request = {key: document.get(key) for key in request_keys}
-    if any(
-        request[key] is None for key in request_keys
-    ):
+    if any(request[key] is None for key in request_keys):
         _error("preflight does not contain the complete authorization request")
     payload = _canonical_json(request)
     expected_sha = document.get("request_sha256")
     if expected_sha is not None and expected_sha != _sha256(payload):
         base_request = {key: document.get(key) for key in _AUTHORIZATION_KEYS}
-        if (
-            "execution_context_sha256" not in request
-            or expected_sha != _sha256(_canonical_json(base_request))
+        if "execution_context_sha256" not in request or expected_sha != _sha256(
+            _canonical_json(base_request)
         ):
             _error("preflight request digest drifted")
     if (
@@ -825,11 +1015,15 @@ def verify_focused_authorization_receipt(
         _error("authorization receipt is not bound to the request")
     if document.get("request_sha256") != _sha256(request):
         _error("authorization receipt request digest drifted")
-    if not isinstance(document.get("approval_reference"), str) or not document[
-        "approval_reference"
-    ]:
+    if (
+        not isinstance(document.get("approval_reference"), str)
+        or not document["approval_reference"]
+    ):
         _error("authorization approval reference is absent")
-    if not isinstance(document.get("approved_utc"), str) or not document["approved_utc"]:
+    if (
+        not isinstance(document.get("approved_utc"), str)
+        or not document["approved_utc"]
+    ):
         _error("authorization approval time is absent")
     return {**dict(document), "execution_authorized": True, "launch_permitted": True}
 
@@ -844,13 +1038,9 @@ def reload_pair_issuer_allocations(
     request = build_focused_authorization_request(preflight)
     verified = verify_focused_authorization_receipt(request, authorization)
     context = _document(preflight.get("execution_context"), "execution context")
-    if verified.get("execution_context_sha256") != _sha256(
-        _canonical_json(context)
-    ):
+    if verified.get("execution_context_sha256") != _sha256(_canonical_json(context)):
         _error("authorization does not bind the issuer execution context")
-    allocations = _document(
-        context.get("pair_issuers"), "pair issuer allocations"
-    )
+    allocations = _document(context.get("pair_issuers"), "pair issuer allocations")
     pair_count = _integer(verified.get("pair_count"), "authorized pair count", 1)
     expected = {f"pair-{ordinal:02d}" for ordinal in range(1, pair_count + 1)}
     if set(allocations) != expected:
@@ -858,9 +1048,7 @@ def reload_pair_issuer_allocations(
     loaded: dict[str, dict[str, object]] = {}
     public_keys: set[str] = set()
     for pair_id in sorted(expected):
-        allocation = _document(
-            allocations[pair_id], f"{pair_id} issuer allocation"
-        )
+        allocation = _document(allocations[pair_id], f"{pair_id} issuer allocation")
         if set(allocation) != {
             "private_key_path",
             "private_key_sha256",
@@ -906,7 +1094,9 @@ def reload_pair_issuer_allocations(
         if (
             len(private_text) != 65
             or private_text[-1] != "\n"
-            or any(character not in "0123456789abcdef" for character in private_text[:-1])
+            or any(
+                character not in "0123456789abcdef" for character in private_text[:-1]
+            )
         ):
             _error("pair issuer private scalar encoding drifted")
         scalar = int(private_text[:-1], 16)
@@ -1038,7 +1228,9 @@ def _execute_atomic_fault_batch(
     """Execute one precommitted batch and terminalize every reserved action."""
 
     actions = tuple(plan.actions)
-    if not actions or any(type(action) is not ReplicaGroupSigkill for action in actions):
+    if not actions or any(
+        type(action) is not ReplicaGroupSigkill for action in actions
+    ):
         _error("focused fault plan must contain only replica SIGKILL actions")
     for action in actions:
         lifecycle.start(action.fault_id)
@@ -1062,7 +1254,10 @@ def _execute_atomic_fault_batch(
         lifecycle.finalize(started_status="failed")
         raise
     for action, outcome in zip(actions, outcomes, strict=True):
-        if outcome.fault_id != action.fault_id or outcome.replica_id != action.replica_id:
+        if (
+            outcome.fault_id != action.fault_id
+            or outcome.replica_id != action.replica_id
+        ):
             lifecycle.finalize(started_status="failed")
             _error("atomic SIGKILL result order or identity drifted")
         lifecycle.terminal(action.fault_id, "succeeded", _outcome_document(outcome))
@@ -1130,7 +1325,9 @@ def _transition_barrier(
     if activation:
         _integer(snapshot.get("activation_height"), f"{label} activation height")
     else:
-        height = _integer(snapshot.get("command_block_height"), f"{label} command height")
+        height = _integer(
+            snapshot.get("command_block_height"), f"{label} command height"
+        )
         activation_height = _integer(
             snapshot.get("activation_height"), f"{label} activation height"
         )
@@ -1174,9 +1371,11 @@ def epoch1_structurally_identical(left: Any, right: Any) -> bool:
         "generation_seed",
         "policy_version",
     )
-    return all(getattr(left, field) == getattr(right, field) for field in fields) and tuple(
-        asdict(tree) for tree in left.trees
-    ) == tuple(asdict(tree) for tree in right.trees)
+    return all(
+        getattr(left, field) == getattr(right, field) for field in fields
+    ) and tuple(asdict(tree) for tree in left.trees) == tuple(
+        asdict(tree) for tree in right.trees
+    )
 
 
 def _drive_arm_state_machine(
@@ -1196,12 +1395,26 @@ def _drive_arm_state_machine(
     if not replicas or not isinstance(issuer, str):
         _error("arm profile membership or issuer identity is absent")
     survivors = tuple(replica for replica in replicas if replica not in targets)
+    coverage = (
+        derive_reporter_coverage_plan(profile)
+        if isinstance(profile, FocusedProfile)
+        and profile.raw.get("schema_version") == 2
+        else None
+    )
     if len(survivors) < quorum or hooks.unexpected_exit_ids():
         _error("arm has an unexplained exit or insufficient survivors")
 
     baseline = hooks.wait_for_stable_phase("baseline")
     if baseline.get("stable") is not True:
         _error("baseline did not stabilize")
+    if coverage is not None:
+        raw_barrier = baseline.get("active_configuration_barrier")
+        if (
+            not isinstance(raw_barrier, Sequence)
+            or isinstance(raw_barrier, (str, bytes))
+            or not has_exact_active_configuration_barrier(profile, raw_barrier)
+        ):
+            _error("baseline lacks the exact all-member active configuration")
     baseline_ns = _timestamp(baseline, "baseline")
     fault = hooks.inject_atomic_fault_batch()
     fault_ns = _timestamp(fault, "fault")
@@ -1213,13 +1426,51 @@ def _drive_arm_state_machine(
         _error("fault receipt or survivor projection drifted")
     nonresponse = hooks.wait_for_nonresponse()
     nonresponse_ns = _timestamp(nonresponse, "nonresponse")
-    if nonresponse_ns <= fault_ns or tuple(nonresponse.get("detected_target_ids", ())) != targets:
+    if (
+        nonresponse_ns <= fault_ns
+        or tuple(nonresponse.get("detected_target_ids", ())) != targets
+    ):
         _error("runtime nonresponse does not match the confirmed fault set")
+    if coverage is not None:
+        deadline = _document(coverage["deadlines_seconds"], "coverage deadlines")
+        snapshot_audit_ns = _integer(
+            nonresponse.get("snapshot_audit_monotonic_ns"),
+            "nonresponse snapshot audit timestamp",
+        )
+        if snapshot_audit_ns <= nonresponse_ns:
+            _error("nonresponse snapshot audit is not causally after its evidence")
+        if not is_before_fcrash_h_deadline(
+            fault_ns,
+            snapshot_audit_ns,
+            _integer(deadline.get("evidence_seconds"), "evidence deadline", 1),
+        ):
+            _error("runtime nonresponse exceeded the crash-anchored evidence cap")
+        expected_counts = {
+            str(row["target_replica_id"]): {
+                str(reporter): coverage["minimum_timeouts_per_reporter"]
+                for reporter in row["authenticated_reporter_ids"]
+            }
+            for row in coverage["targets"]
+        }
+        if nonresponse.get("qualifying_timeout_counts") != expected_counts:
+            _error("runtime nonresponse lacks the frozen reporter coverage")
+        minimum_drop = _integer(
+            coverage.get("minimum_score_drop"), "minimum score drop", 1
+        )
+        drawdowns = nonresponse.get("guard_drawdowns")
+        if not isinstance(drawdowns, Mapping) or any(
+            type(drawdowns.get(str(target))) is not int
+            or int(drawdowns[str(target)]) > -minimum_drop
+            for target in targets
+        ):
+            _error("runtime nonresponse lacks the frozen score drawdown")
 
     epoch1_snapshot = hooks.issue_epoch_request(1)
     epoch1_ns = _timestamp(epoch1_snapshot, "epoch 1 request")
     if epoch1_ns <= nonresponse_ns:
         _error("epoch 1 request is causally early")
+    if coverage is not None and epoch1_ns != snapshot_audit_ns:
+        _error("Epoch 1 request is not bound to its native snapshot audit")
     epoch1_wire, epoch1 = _decoded_bundle(epoch1_snapshot, issuer, "epoch 1")
     if epoch1.epoch_number != 1:
         _error("epoch 1 bundle has the wrong epoch number")
@@ -1245,6 +1496,18 @@ def _drive_arm_state_machine(
     )
     if activation1.get("activation_height") != command1.get("activation_height"):
         _error("epoch 1 activation does not match its command")
+    if coverage is not None and not is_before_fcrash_h_deadline(
+        fault_ns,
+        activation1_ns,
+        _integer(
+            _document(coverage["deadlines_seconds"], "coverage deadlines").get(
+                "epoch1_activation_seconds"
+            ),
+            "Epoch 1 activation deadline",
+            1,
+        ),
+    ):
+        _error("Epoch 1 activation exceeded the crash-anchored containment cap")
     commit1 = hooks.wait_for_common_commit(1)
     commit1_ns = _common_commit(
         commit1,
@@ -1285,7 +1548,10 @@ def _drive_arm_state_machine(
         if epoch2_ns <= ranking_ns:
             _error("epoch 2 request precedes its ranking")
         epoch2_wire, epoch2 = _decoded_bundle(epoch2_snapshot, issuer, "epoch 2")
-        if epoch2.epoch_number != 2 or epoch2.previous_epoch_digest != epoch1.epoch_digest:
+        if (
+            epoch2.epoch_number != 2
+            or epoch2.previous_epoch_digest != epoch1.epoch_digest
+        ):
             _error("epoch 2 is not the exact successor of epoch 1")
         if selected_root_ids != tuple(tree.members[0] for tree in epoch2.trees):
             _error("epoch 2 roots differ from the frozen ranking")
@@ -1296,7 +1562,7 @@ def _drive_arm_state_machine(
             decoded=epoch2,
             wire=epoch2_wire,
             label="epoch 2 command",
-            after_ns=ranking_ns,
+            after_ns=epoch2_ns,
             activation=False,
         )
         activation2 = hooks.wait_for_epoch_activations(2)
@@ -1311,6 +1577,18 @@ def _drive_arm_state_machine(
         )
         if activation2.get("activation_height") != command2.get("activation_height"):
             _error("epoch 2 activation does not match its command")
+        if coverage is not None and not is_before_fcrash_h_deadline(
+            activation1_ns,
+            activation2_ns,
+            _integer(
+                _document(coverage["deadlines_seconds"], "coverage deadlines").get(
+                    "optimization_activation_seconds"
+                ),
+                "Epoch 2 activation deadline",
+                1,
+            ),
+        ):
+            _error("Epoch 2 activation exceeded the Epoch-1-anchored cap")
         commit2 = hooks.wait_for_common_commit(2)
         final_commit_ns = _common_commit(
             commit2,
@@ -1332,6 +1610,18 @@ def _drive_arm_state_machine(
         or hooks.unexpected_exit_ids()
     ):
         _error("late phase violates the arm contract")
+    if coverage is not None and not is_before_fcrash_h_deadline(
+        fault_ns,
+        _timestamp(late, "late"),
+        _integer(
+            _document(coverage["deadlines_seconds"], "coverage deadlines").get(
+                "arm_hard_seconds"
+            ),
+            "arm hard deadline",
+            1,
+        ),
+    ):
+        _error("arm exceeded the crash-anchored hard deadline")
     return {
         "schema_version": 1,
         "pair_id": pair_id,
@@ -1404,10 +1694,7 @@ class FocusedRawEvidenceSource:
             _error("raw manifest pair identity is absent")
         self._pair_id = pair_id
         adaptive_output = (
-            self._root
-            / "transitions"
-            / "e1-to-e2-optimization"
-            / "successor.bundle"
+            self._root / "transitions" / "e1-to-e2-optimization" / "successor.bundle"
         )
         self._arm = (
             "A"
@@ -1505,11 +1792,7 @@ class FocusedRawEvidenceSource:
     def _bundle(self, epoch: int) -> tuple[bytes, Any]:
         path = self._root / "raw" / f"epoch{epoch}.bundle"
         if not path.exists():
-            artifact = (
-                "e0-to-e1-containment"
-                if epoch == 1
-                else "e1-to-e2-optimization"
-            )
+            artifact = "e0-to-e1-containment" if epoch == 1 else "e1-to-e2-optimization"
             path = self._root / "transitions" / artifact / "successor.bundle"
         if path.is_symlink() or not path.is_file():
             _error(f"raw Epoch {epoch} bundle is absent")
@@ -1550,8 +1833,7 @@ class FocusedRawEvidenceSource:
             confirmed != targets
             or len(outcomes) != len(targets)
             or any(
-                outcome.get("signal_number") != 9
-                or outcome.get("returncode") != -9
+                outcome.get("signal_number") != 9 or outcome.get("returncode") != -9
                 for outcome in outcomes
             )
         ):
@@ -1561,9 +1843,7 @@ class FocusedRawEvidenceSource:
             for outcome in outcomes
         ]
         survivors = tuple(
-            replica
-            for replica in self._profile.replica_ids
-            if replica not in targets
+            replica for replica in self._profile.replica_ids if replica not in targets
         )
         return {
             "schema_version": 1,
@@ -1626,9 +1906,10 @@ class FocusedRawEvidenceSource:
             if predecessor == 0
             else epoch1.epoch_digest
         )
-        if predecessor not in {0, 1} or audit.get(
-            "predecessor_epoch_digest"
-        ) != expected_digest:
+        if (
+            predecessor not in {0, 1}
+            or audit.get("predecessor_epoch_digest") != expected_digest
+        ):
             _error("raw ranking audit predecessor drifted")
         try:
             replay = factorial_validation.replay_native_adaptation_snapshot(
@@ -1668,9 +1949,7 @@ class FocusedRawEvidenceSource:
             if event["event_type"] == "evidence.observation_accepted"
             and _document(
                 _document(
-                    _document(event["payload"], "accepted evidence").get(
-                        "observation"
-                    ),
+                    _document(event["payload"], "accepted evidence").get("observation"),
                     "accepted observation",
                 ).get("configuration"),
                 "observation configuration",
@@ -1700,7 +1979,165 @@ class FocusedRawEvidenceSource:
             "audit_source_monotonic_ns": _integer(
                 audits[0].get("source_monotonic_ns"), "ranking audit timestamp"
             ),
+            "baseline_evidence_cutoff": _integer(
+                audit.get("baseline_cutoff"), "ranking baseline cutoff"
+            ),
+            "current_evidence_cutoff": _integer(
+                audit.get("current_cutoff"), "ranking current cutoff", 1
+            ),
+            "replayed_snapshot_id": _digest(
+                replay.get("snapshot_id"), "ranking replay snapshot ID"
+            ),
         }
+
+    def _qualifying_timeout_counts(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        fault_ns: int,
+        baseline_cutoff: int,
+        current_cutoff: int,
+    ) -> tuple[dict[str, dict[str, int]], dict[str, int], int] | None:
+        coverage = derive_reporter_coverage_plan(self._profile)
+        topology = _document(self._profile.raw.get("topology"), "profile topology")
+        expected_digest = topology.get("epoch_zero_digest")
+        expected = {
+            int(row["target_replica_id"]): {
+                int(reporter) for reporter in row["authenticated_reporter_ids"]
+            }
+            for row in coverage["targets"]
+        }
+        expected_trees = {
+            (
+                int(row["target_replica_id"]),
+                int(first["reporter_id"]),
+            ): int(first["tree_id"])
+            for row in coverage["targets"]
+            for first in row["first_qualifying_reporters"]
+        }
+        accepted: list[tuple[int, Mapping[str, Any], int, int]] = []
+        latest: dict[str, tuple[int, Mapping[str, Any], int, int]] = {}
+        for event in events:
+            if (
+                event["source_kind"] != "adaptation_manager"
+                or event["source_id"] != "adaptive-manager"
+                or event["event_type"] != "evidence.observation_accepted"
+            ):
+                continue
+            payload = _document(event["payload"], "accepted evidence")
+            sequence = _integer(
+                payload.get("ingestion_sequence"), "evidence ingestion sequence", 1
+            )
+            if sequence <= baseline_cutoff or sequence > current_cutoff:
+                continue
+            observation = _document(payload.get("observation"), "accepted observation")
+            configuration = _document(
+                observation.get("configuration"), "observation configuration"
+            )
+            if (
+                configuration.get("epoch_number") != 0
+                or configuration.get("epoch_digest") != expected_digest
+            ):
+                continue
+            observation_id = observation.get("observation_id")
+            reporter = observation.get("reporter_id")
+            target = observation.get("observed_replica_id")
+            outcome = observation.get("outcome")
+            accepted_ns = _integer(
+                event.get("source_monotonic_ns"), "evidence acceptance timestamp"
+            )
+            reporter_ns = _integer(
+                observation.get("reporter_monotonic_ns"),
+                "evidence reporter timestamp",
+            )
+            if (
+                not isinstance(observation_id, str)
+                or type(reporter) is not int
+                or type(target) is not int
+                or outcome not in {"on_time", "timeout", "late"}
+            ):
+                _error("accepted evidence identity or outcome drifted")
+            previous = latest.get(observation_id)
+            if previous is not None and sequence <= previous[0]:
+                _error("accepted evidence attempt sequence regressed")
+            latest[observation_id] = (
+                sequence,
+                observation,
+                accepted_ns,
+                reporter_ns,
+            )
+            accepted.append((sequence, observation, accepted_ns, reporter_ns))
+        accepted.sort(key=lambda row: row[0])
+        drawdowns = {target: 0 for target in expected}
+        outstanding: dict[str, tuple[int, int]] = {}
+        for _sequence, observation, _accepted_ns, _reporter_ns in accepted:
+            observation_id = str(observation["observation_id"])
+            reporter = int(observation["reporter_id"])
+            target = int(observation["observed_replica_id"])
+            outcome = str(observation["outcome"])
+            if outcome == "timeout":
+                if observation_id in outstanding:
+                    _error("accepted timeout attempt is duplicated")
+                outstanding[observation_id] = (reporter, target)
+                if target in drawdowns:
+                    drawdowns[target] -= 1
+            elif outcome == "on_time":
+                if target in drawdowns and drawdowns[target] < 0:
+                    drawdowns[target] += 1
+            elif outcome == "late":
+                previous = outstanding.pop(observation_id, None)
+                if previous is not None:
+                    if previous != (reporter, target):
+                        _error("accepted late evidence changed its attempt identity")
+                    if target in drawdowns and drawdowns[target] < 0:
+                        drawdowns[target] += 1
+        counts = {
+            target: {reporter: 0 for reporter in reporters}
+            for target, reporters in expected.items()
+        }
+        timestamps: list[int] = []
+        for _sequence, observation, accepted_ns, reporter_ns in latest.values():
+            target = observation.get("observed_replica_id")
+            reporter = observation.get("reporter_id")
+            configuration = _document(
+                observation.get("configuration"), "observation configuration"
+            )
+            if (
+                observation.get("outcome") == "timeout"
+                and target in counts
+                and reporter in counts[target]
+                and configuration.get("tree_id")
+                == expected_trees.get((int(target), int(reporter)))
+                and accepted_ns >= fault_ns
+                and reporter_ns >= fault_ns
+            ):
+                counts[int(target)][int(reporter)] += 1
+                timestamps.extend((accepted_ns, reporter_ns))
+        minimum = _integer(
+            coverage.get("minimum_timeouts_per_reporter"),
+            "minimum timeouts per reporter",
+            1,
+        )
+        minimum_drop = _integer(
+            coverage.get("minimum_score_drop"), "minimum score drop", 1
+        )
+        if any(
+            count < minimum
+            for reporters in counts.values()
+            for count in reporters.values()
+        ) or any(drawdown > -minimum_drop for drawdown in drawdowns.values()):
+            return None
+        clipped = {
+            str(target): {str(reporter): minimum for reporter in sorted(reporters)}
+            for target, reporters in counts.items()
+        }
+        if not timestamps:
+            return None
+        return (
+            clipped,
+            {str(target): drawdown for target, drawdown in sorted(drawdowns.items())},
+            max(timestamps),
+        )
 
     def _transition(
         self,
@@ -1767,9 +2204,7 @@ class FocusedRawEvidenceSource:
             == epoch
         ]
         observers = [
-            event
-            for event in events
-            if event["event_type"] == "block.commit_observed"
+            event for event in events if event["event_type"] == "block.commit_observed"
         ]
         survivors = set(self._profile.replica_ids) - set(
             self._profile.target_replica_ids
@@ -1794,8 +2229,7 @@ class FocusedRawEvidenceSource:
                 == identity
                 and event["source_kind"] == "replica"
                 and str(event["source_id"]).startswith("replica-")
-                and int(str(event["source_id"]).removeprefix("replica-"))
-                in survivors
+                and int(str(event["source_id"]).removeprefix("replica-")) in survivors
             ]
             witness_ids = {
                 int(str(event["source_id"]).removeprefix("replica-"))
@@ -1874,8 +2308,7 @@ class FocusedRawEvidenceSource:
                 outcomes = [
                     _document(item, "fault outcome")
                     for item in receipt["sigkill_outcomes"]
-                    if _document(item, "fault outcome").get("replica_id")
-                    == replica
+                    if _document(item, "fault outcome").get("replica_id") == replica
                 ]
                 receipt_records = [
                     _document(item, "fault process record")
@@ -1917,13 +2350,15 @@ class FocusedRawEvidenceSource:
                 replica = int(source_id.removeprefix("replica-"))
                 receipt_path = self._root / "raw" / "fault-receipt.json"
                 exempt = False
-                if replica in self._profile.target_replica_ids and receipt_path.is_file():
+                if (
+                    replica in self._profile.target_replica_ids
+                    and receipt_path.is_file()
+                ):
                     receipt = self._fault_receipt()
                     matching = [
                         _document(item, "fault outcome")
                         for item in receipt["sigkill_outcomes"]
-                        if _document(item, "fault outcome").get("replica_id")
-                        == replica
+                        if _document(item, "fault outcome").get("replica_id") == replica
                     ]
                     exempt = (
                         len(matching) == 1
@@ -1946,11 +2381,11 @@ class FocusedRawEvidenceSource:
             return
         receipt = self._fault_receipt()
         confirmations = {
-            _integer(row.get("replica_id"), "fault replica"):
-            _integer(row.get("confirmed_monotonic_ns"), "fault confirmation")
+            _integer(row.get("replica_id"), "fault replica"): _integer(
+                row.get("confirmed_monotonic_ns"), "fault confirmation"
+            )
             for row in (
-                _document(item, "fault outcome")
-                for item in receipt["sigkill_outcomes"]
+                _document(item, "fault outcome") for item in receipt["sigkill_outcomes"]
             )
         }
         for event in events:
@@ -1960,7 +2395,10 @@ class FocusedRawEvidenceSource:
             ):
                 continue
             replica = int(source_id.removeprefix("replica-"))
-            if replica in confirmations and int(event["source_monotonic_ns"]) > confirmations[replica]:
+            if (
+                replica in confirmations
+                and int(event["source_monotonic_ns"]) > confirmations[replica]
+            ):
                 _error("crashed replica emitted raw evidence after confirmed SIGKILL")
 
     @staticmethod
@@ -1996,8 +2434,7 @@ class FocusedRawEvidenceSource:
             _error("raw process health contains an unexpected survivor exit")
         expected_lifecycle = {
             **{
-                f"replica-{replica}": "replica"
-                for replica in self._profile.replica_ids
+                f"replica-{replica}": "replica" for replica in self._profile.replica_ids
             },
             "adaptive-manager": "adaptation_manager",
         }
@@ -2009,9 +2446,10 @@ class FocusedRawEvidenceSource:
         if lifecycle:
             allowed_lifecycle = {**expected_lifecycle, "client-0": "client"}
             for event in lifecycle:
-                if allowed_lifecycle.get(str(event["source_id"])) != event[
-                    "source_kind"
-                ]:
+                if (
+                    allowed_lifecycle.get(str(event["source_id"]))
+                    != event["source_kind"]
+                ):
                     _error("raw readiness source identity or kind drifted")
         ready_sources = {
             str(event["source_id"])
@@ -2062,18 +2500,50 @@ class FocusedRawEvidenceSource:
             first_commit_ns = min(
                 int(event["source_monotonic_ns"]) for event in commits
             )
-            last_commit_ns = max(
-                int(event["source_monotonic_ns"]) for event in commits
-            )
-            if (
-                last_commit_ns - first_commit_ns < stable_duration_ns
-            ):
+            last_commit_ns = max(int(event["source_monotonic_ns"]) for event in commits)
+            if last_commit_ns - first_commit_ns < stable_duration_ns:
                 return None
-            return {
+            result: dict[str, object] = {
                 "stable": True,
                 "authoritative_commit_count": len(commits),
                 "source_monotonic_ns": last_commit_ns,
             }
+            if self._profile.raw.get("schema_version") == 2:
+                active: dict[int, Mapping[str, Any]] = {}
+                for event in events:
+                    source_id = str(event["source_id"])
+                    if (
+                        event["source_kind"] != "replica"
+                        or not source_id.startswith("replica-")
+                        or event["event_type"] != "adaptive.configuration_active"
+                    ):
+                        continue
+                    replica = int(source_id.removeprefix("replica-"))
+                    if replica not in self._profile.replica_ids:
+                        _error("active configuration source is outside membership")
+                    previous = active.get(replica)
+                    if previous is None or int(event["source_monotonic_ns"]) > int(
+                        previous["source_monotonic_ns"]
+                    ):
+                        active[replica] = event
+                barrier = [
+                    {
+                        "replica_id": replica,
+                        "configuration": {
+                            key: _document(
+                                active[replica]["payload"],
+                                "active configuration payload",
+                            ).get(key)
+                            for key in ("epoch_number", "tree_id", "epoch_digest")
+                        },
+                    }
+                    for replica in self._profile.replica_ids
+                    if replica in active
+                ]
+                if not has_exact_active_configuration_barrier(self._profile, barrier):
+                    return None
+                result["active_configuration_barrier"] = barrier
+            return result
         if name == "fault":
             return self.atomic_fault_outcome()
         if name == "nonresponse":
@@ -2082,14 +2552,41 @@ class FocusedRawEvidenceSource:
             if 0 not in snapshot_predecessors:
                 return None
             ranking = self._ranking(events, predecessor_epoch=0)
+            if self._profile.raw.get("schema_version") == 2:
+                qualified = self._qualifying_timeout_counts(
+                    events,
+                    fault_ns=_integer(
+                        fault.get("source_monotonic_ns"), "fault timestamp"
+                    ),
+                    baseline_cutoff=_integer(
+                        ranking.get("baseline_evidence_cutoff"),
+                        "ranking baseline cutoff",
+                    ),
+                    current_cutoff=_integer(
+                        ranking.get("current_evidence_cutoff"),
+                        "ranking current cutoff",
+                        1,
+                    ),
+                )
+                if qualified is None:
+                    return None
+                counts, drawdowns, timestamp = qualified
+                return {
+                    "detected_target_ids": ranking["detected_target_ids"],
+                    "qualifying_timeout_counts": counts,
+                    "guard_drawdowns": drawdowns,
+                    "source_monotonic_ns": timestamp,
+                    "snapshot_audit_monotonic_ns": _integer(
+                        ranking.get("audit_source_monotonic_ns"),
+                        "ranking audit timestamp",
+                    ),
+                }
             timeout_events = [
                 event
                 for event in events
                 if event["event_type"] == "evidence.observation_accepted"
                 and _document(
-                    _document(event["payload"], "accepted evidence").get(
-                        "observation"
-                    ),
+                    _document(event["payload"], "accepted evidence").get("observation"),
                     "accepted observation",
                 ).get("outcome")
                 == "timeout"
@@ -2104,30 +2601,23 @@ class FocusedRawEvidenceSource:
                 ).get("epoch_number")
                 == 0
             ]
-            if not timeout_events:
-                return None
             targets = set(ranking["detected_target_ids"])
             target_timeouts = [
                 event
                 for event in timeout_events
                 if _document(
-                    _document(event["payload"], "accepted evidence").get(
-                        "observation"
-                    ),
+                    _document(event["payload"], "accepted evidence").get("observation"),
                     "accepted observation",
                 ).get("observed_replica_id")
                 in targets
             ]
-            observed_timeout_targets = {
+            if {
                 _document(
-                    _document(event["payload"], "accepted evidence").get(
-                        "observation"
-                    ),
+                    _document(event["payload"], "accepted evidence").get("observation"),
                     "accepted observation",
                 ).get("observed_replica_id")
                 for event in target_timeouts
-            }
-            if observed_timeout_targets != targets:
+            } != targets:
                 return None
             timestamp = max(
                 int(event["source_monotonic_ns"]) for event in target_timeouts
@@ -2139,6 +2629,11 @@ class FocusedRawEvidenceSource:
         if name == "epoch1":
             epoch1_wire, epoch1 = self._bundle(1)
             request = self._ranking(events, predecessor_epoch=0)
+            if (
+                epoch1.evidence_snapshot_id != request["replayed_snapshot_id"]
+                or epoch1.evidence_cutoff != request["current_evidence_cutoff"]
+            ):
+                _error("Epoch 1 bundle is not bound to its native snapshot audit")
             return {
                 "native_bundle": epoch1_wire,
                 "decoded": asdict(epoch1),
@@ -2173,14 +2668,8 @@ class FocusedRawEvidenceSource:
             ]
             if (
                 not epoch1_commits
-                or max(
-                    int(event["source_monotonic_ns"])
-                    for event in epoch1_commits
-                )
-                - min(
-                    int(event["source_monotonic_ns"])
-                    for event in epoch1_commits
-                )
+                or max(int(event["source_monotonic_ns"]) for event in epoch1_commits)
+                - min(int(event["source_monotonic_ns"]) for event in epoch1_commits)
                 < stable_duration_ns
             ):
                 return None
@@ -2203,6 +2692,11 @@ class FocusedRawEvidenceSource:
                 return None
             wire, decoded = self._bundle(2)
             request = self._ranking(events, predecessor_epoch=1)
+            if (
+                decoded.evidence_snapshot_id != request["replayed_snapshot_id"]
+                or decoded.evidence_cutoff != request["current_evidence_cutoff"]
+            ):
+                _error("Epoch 2 bundle is not bound to its native snapshot audit")
             return {
                 "native_bundle": wire,
                 "decoded": asdict(decoded),
@@ -2244,14 +2738,8 @@ class FocusedRawEvidenceSource:
             ]
             if (
                 not final_commits
-                or max(
-                    int(event["source_monotonic_ns"])
-                    for event in final_commits
-                )
-                - min(
-                    int(event["source_monotonic_ns"])
-                    for event in final_commits
-                )
+                or max(int(event["source_monotonic_ns"]) for event in final_commits)
+                - min(int(event["source_monotonic_ns"]) for event in final_commits)
                 < stable_duration_ns
             ):
                 return None
@@ -2354,7 +2842,10 @@ def _darwin_procargs2(pid: int) -> bytes:
             raise FocusedCrashPairRuntimeError(
                 f"cannot size process {pid} argv: {os.strerror(error)}"
             )
-        if required.value <= ctypes.sizeof(ctypes.c_int) or required.value > _MAX_ARGV_BYTES:
+        if (
+            required.value <= ctypes.sizeof(ctypes.c_int)
+            or required.value > _MAX_ARGV_BYTES
+        ):
             _error("Darwin process argv payload size is invalid")
         buffer = ctypes.create_string_buffer(required.value)
         actual = ctypes.c_size_t(required.value)
@@ -2414,7 +2905,9 @@ def _capture_process_argv(
         observed = (_darwin_procargs2 if darwin_reader is None else darwin_reader)(pid)
         if isinstance(observed, bytes):
             return _parse_darwin_procargs2(observed)
-        if isinstance(observed, Sequence) and not isinstance(observed, (str, bytearray)):
+        if isinstance(observed, Sequence) and not isinstance(
+            observed, (str, bytearray)
+        ):
             if not observed or any(not isinstance(item, str) for item in observed):
                 _error("Darwin argv reader returned malformed arguments")
             return tuple(observed)
@@ -2529,9 +3022,7 @@ def _seal_arm_artifacts(
         _error("required arm artifact list is invalid")
     (root / "runner-outcome.json").write_bytes(_canonical_json(runner_outcome))
     (root / "cleanup.json").write_bytes(_canonical_json(cleanup))
-    actual = {
-        str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()
-    }
+    actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
     if actual != set(required):
         _error("arm artifact layout is incomplete or contains extra files")
     metadata = create_seal(root)
@@ -2553,6 +3044,32 @@ def _profiled_adapter(profile: FocusedProfile, pair_seed: int) -> FrozenProfile:
     base = _integer(ports.get("base"), "profile port base", 1)
     count = len(profile.replica_ids)
     target = profile.target_replica_ids[0]
+    if raw.get("schema_version") == 2:
+        coverage = derive_reporter_coverage_plan(profile)
+        deadline = _document(coverage.get("deadlines_seconds"), "coverage deadlines")
+        tree_switch_period = _integer(
+            _document(raw.get("evidence_guard"), "profile evidence guard").get(
+                "tree_switch_period_blocks"
+            ),
+            "tree switch period",
+            1,
+        )
+        startup_timeout = _integer(
+            timers.get("readiness_timeout_seconds"), "readiness timeout", 1
+        )
+        maximum_stall = _integer(
+            timers.get("manager_convergence_timeout_seconds"),
+            "manager convergence timeout",
+            1,
+        )
+        hard_timeout = _integer(
+            deadline.get("arm_hard_seconds"), "arm hard deadline", 1
+        )
+    else:
+        tree_switch_period = count
+        maximum_stall = float(timers.get("containment_deadline_seconds", 60))
+        startup_timeout = float(timers.get("containment_deadline_seconds", 60))
+        hard_timeout = float(timers.get("optimization_deadline_seconds", 90)) + 60.0
     return FrozenProfile(
         profile_id=profile.profile_id,
         profile_sha256=profile.profile_sha256,
@@ -2586,7 +3103,7 @@ def _profiled_adapter(profile: FocusedProfile, pair_seed: int) -> FrozenProfile:
         block_size=_integer(
             protocol.get("transactions_per_block"), "transactions per block", 1
         ),
-        tree_switch_period_blocks=count,
+        tree_switch_period_blocks=tree_switch_period,
         bucket_width_s=_integer(
             measurement.get("bucket_width_seconds"), "bucket width", 1
         ),
@@ -2602,9 +3119,9 @@ def _profiled_adapter(profile: FocusedProfile, pair_seed: int) -> FrozenProfile:
         leader_progress_timeout_s=8.0,
         leader_activation_grace_s=1.0,
         activation_delay_blocks=5,
-        maximum_stall_s=float(timers.get("containment_deadline_seconds", 60)),
-        startup_timeout_s=float(timers.get("containment_deadline_seconds", 60)),
-        hard_timeout_s=float(timers.get("optimization_deadline_seconds", 90)) + 60.0,
+        maximum_stall_s=float(maximum_stall),
+        startup_timeout_s=float(startup_timeout),
+        hard_timeout_s=float(hard_timeout),
         crash_confirm_timeout_s=5.0,
     )
 
@@ -2704,7 +3221,9 @@ def _focused_transition_requests(
     return tuple(requests)
 
 
-def _focused_client_default_epoch(profile: FocusedProfile, adapter: FrozenProfile) -> bytes:
+def _focused_client_default_epoch(
+    profile: FocusedProfile, adapter: FrozenProfile
+) -> bytes:
     """Mirror the replica default-tree schedule for the standalone client.
 
     The client does not read ``main.conf`` and defaults to ``treegen.conf`` in
@@ -2835,15 +3354,16 @@ class FocusedLaunchBackend:
         poll_snapshot: Callable[[str], Mapping[str, object] | None] | None = None,
         poll_interval_s: float = 0.05,
         readiness_timeout_s: float = 60.0,
-        execute_fault: Callable[
-            [Mapping[str, object], object], Mapping[str, object]
-        ]
-        | None = None,
+        execute_fault: (
+            Callable[[Mapping[str, object], object], Mapping[str, object]] | None
+        ) = None,
         cleanup_registry: Callable[[object], Sequence[object]] | None = None,
-        materialize_artifacts: Callable[
-            [Mapping[str, object], Mapping[str, object], Mapping[str, object]], None
-        ]
-        | None = None,
+        materialize_artifacts: (
+            Callable[
+                [Mapping[str, object], Mapping[str, object], Mapping[str, object]], None
+            ]
+            | None
+        ) = None,
     ) -> None:
         self._spawn = spawn
         self._seal_artifacts = seal_artifacts
@@ -2860,9 +3380,7 @@ class FocusedLaunchBackend:
         self, invocation: Mapping[str, object]
     ) -> Mapping[str, object]:
         profile = invocation.get("profile")
-        preflight = _document(
-            invocation.get("preflight_receipt"), "preflight receipt"
-        )
+        preflight = _document(invocation.get("preflight_receipt"), "preflight receipt")
         if not isinstance(profile, FocusedProfile):
             _error("live execution requires a loaded focused profile")
         execution = _document(
@@ -2870,11 +3388,14 @@ class FocusedLaunchBackend:
         )
         if (
             execution.get("profile_sha256") != profile.profile_sha256
-            or execution.get("topology_proof_sha256")
-            != profile.topology_proof_sha256
+            or execution.get("topology_proof_sha256") != profile.topology_proof_sha256
             or not isinstance(execution.get("issuer_public_key"), str)
         ):
             _error("live execution context is not preflight-bound")
+        if profile.raw.get("schema_version") == 2 and execution.get(
+            "reporter_coverage"
+        ) != derive_reporter_coverage_plan(profile):
+            _error("live reporter coverage differs from preflight")
         repository = Path(__file__).resolve().parents[3]
         build_directory = repository / "build-adaptive"
         authorized_repository = _document(
@@ -2900,11 +3421,9 @@ class FocusedLaunchBackend:
             binaries=binaries,
         )
         authorized_build = _document(execution.get("build"), "authorized build")
-        if (
-            authorized_build.get("revision") != current_revision
-            or authorized_build.get("build_sha256")
-            != _sha256(_canonical_json(build_record))
-        ):
+        if authorized_build.get("revision") != current_revision or authorized_build.get(
+            "build_sha256"
+        ) != _sha256(_canonical_json(build_record)):
             _error("authorized build provenance drifted")
         authorized_binaries = _document(
             execution.get("binaries"), "authorized binaries"
@@ -2921,19 +3440,15 @@ class FocusedLaunchBackend:
                 executable_records.get(name), f"authorized {name} binary"
             )
             resolved = path.resolve()
-            if (
-                authorized.get("path") != str(resolved)
-                or authorized.get("sha256")
-                != profiled_fault_runtime.sha256_file(resolved)
-            ):
+            if authorized.get("path") != str(resolved) or authorized.get(
+                "sha256"
+            ) != profiled_fault_runtime.sha256_file(resolved):
                 _error(f"authorized {name} binary identity drifted")
         loaded_allocations = invocation.get("pair_issuer_allocations")
         authorized_allocations = execution.get("pair_issuers")
         if loaded_allocations is not None or authorized_allocations is not None:
             loaded = _document(loaded_allocations, "loaded pair issuers")
-            authorized = _document(
-                authorized_allocations, "authorized pair issuers"
-            )
+            authorized = _document(authorized_allocations, "authorized pair issuers")
             if set(loaded) != set(authorized):
                 _error("authorized pair issuer cardinality drifted")
             for pair_id in authorized:
@@ -3004,9 +3519,7 @@ class FocusedLaunchBackend:
         pair_allocation = _document(
             allocations.get(pair_id), f"{pair_id} issuer allocation"
         )
-        arm_allocation = _document(
-            pair_allocation.get(arm), f"{pair_id} {arm} issuer"
-        )
+        arm_allocation = _document(pair_allocation.get(arm), f"{pair_id} {arm} issuer")
         if set(arm_allocation) != {"public_key", "private_key"}:
             _error("pair issuer arm allocation schema drifted")
         issuer = {
@@ -3189,9 +3702,7 @@ class FocusedLaunchBackend:
             "runtime_artifacts": artifacts,
         }
 
-    def spawn_processes(
-        self, configuration: Mapping[str, object]
-    ) -> _FocusedProcesses:
+    def spawn_processes(self, configuration: Mapping[str, object]) -> _FocusedProcesses:
         root = Path(configuration["run_directory"])
         registry = ProcessRegistry(monotonic_ns=profiled_fault_runtime.monotonic_raw_ns)
         evidence = FaultEvidence(
@@ -3245,8 +3756,12 @@ class FocusedLaunchBackend:
                 ),
             )
             root = Path(configuration["run_directory"])
-            normalized_requested = profiled_fault_runtime.normalized_manager_argv(requested)
-            normalized_observed = profiled_fault_runtime.normalized_manager_argv(observed)
+            normalized_requested = profiled_fault_runtime.normalized_manager_argv(
+                requested
+            )
+            normalized_observed = profiled_fault_runtime.normalized_manager_argv(
+                observed
+            )
             (root / "runtime" / "manager-observed-argv.json").write_bytes(
                 _canonical_json({"argv": normalized_observed})
             )
@@ -3327,8 +3842,14 @@ class FocusedLaunchBackend:
         self,
         name: str,
         poll: Callable[[str], Mapping[str, object] | None],
+        *,
+        deadline_monotonic: float | None = None,
     ) -> Mapping[str, object]:
-        deadline = time.monotonic() + self._readiness_timeout_s
+        deadline = (
+            time.monotonic() + self._readiness_timeout_s
+            if deadline_monotonic is None
+            else deadline_monotonic
+        )
         while True:
             snapshot = poll(name)
             if snapshot is not None:
@@ -3357,16 +3878,90 @@ class FocusedLaunchBackend:
         else:
             poll = self._poll_snapshot
             unexpected_exits = lambda: ()
+        profile = configuration.get("profile")
+        coverage = (
+            derive_reporter_coverage_plan(profile)
+            if isinstance(profile, FocusedProfile)
+            and profile.raw.get("schema_version") == 2
+            else None
+        )
+        started_wall = time.monotonic()
+        hard_deadline = (
+            None
+            if coverage is None
+            else started_wall
+            + _integer(
+                _document(coverage["deadlines_seconds"], "coverage deadlines").get(
+                    "arm_hard_seconds"
+                ),
+                "arm hard deadline",
+                1,
+            )
+        )
+        readiness_deadline = (
+            None
+            if coverage is None
+            else started_wall
+            + _integer(
+                coverage.get("readiness_timeout_seconds"),
+                "readiness timeout",
+                1,
+            )
+        )
+        fault_wall: float | None = None
+        epoch1_activation_wall: float | None = None
         try:
-            self._wait_for_snapshot("readiness", poll)
+            self._wait_for_snapshot(
+                "readiness", poll, deadline_monotonic=readiness_deadline
+            )
         except KeyError:
             if self._poll_snapshot is None:
                 raise
 
         def wait(name: str) -> Mapping[str, object]:
-            return self._wait_for_snapshot(name, poll)
+            nonlocal epoch1_activation_wall
+            deadline = hard_deadline
+            if coverage is not None and fault_wall is not None:
+                limits = _document(coverage["deadlines_seconds"], "coverage deadlines")
+                if name in {"nonresponse", "epoch1"}:
+                    deadline = min(
+                        float(hard_deadline),
+                        fault_wall
+                        + _integer(
+                            limits.get("evidence_seconds"),
+                            "evidence deadline",
+                            1,
+                        ),
+                    )
+                elif name in {"commands1", "activations1"}:
+                    deadline = min(
+                        float(hard_deadline),
+                        fault_wall
+                        + _integer(
+                            limits.get("epoch1_activation_seconds"),
+                            "Epoch 1 activation deadline",
+                            1,
+                        ),
+                    )
+                elif name in {"ranking", "epoch2", "commands2", "activations2"}:
+                    if epoch1_activation_wall is None:
+                        _error("optimization wait lacks its Epoch 1 activation anchor")
+                    deadline = min(
+                        float(hard_deadline),
+                        epoch1_activation_wall
+                        + _integer(
+                            limits.get("optimization_activation_seconds"),
+                            "optimization activation deadline",
+                            1,
+                        ),
+                    )
+            snapshot = self._wait_for_snapshot(name, poll, deadline_monotonic=deadline)
+            if name == "activations1" and coverage is not None:
+                epoch1_activation_wall = time.monotonic()
+            return snapshot
 
         def inject() -> Mapping[str, object]:
+            nonlocal fault_wall
             execute = self._execute_fault
             if execute is not None:
                 outcome = dict(execute(configuration, processes))
@@ -3376,6 +3971,7 @@ class FocusedLaunchBackend:
                         configuration, processes
                     )
                 )
+            fault_wall = time.monotonic()
             observed = wait("fault")
             if dict(observed) != outcome:
                 _error("observed fault receipt differs from the atomic outcome")
@@ -3531,9 +4127,7 @@ class FocusedLaunchBackend:
         required = {
             str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()
         } | {"runner-outcome.json", "cleanup.json"}
-        return self._seal_artifacts(
-            root, sorted(required), outcome, cleanup
-        )
+        return self._seal_artifacts(root, sorted(required), outcome, cleanup)
 
     def validate(
         self,

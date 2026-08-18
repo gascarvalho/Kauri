@@ -15,10 +15,13 @@ from typing import Any, Mapping
 
 import pytest
 
-from experiments.adaptive.tests import test_focused_crash_pair_runtime as runtime_fixture
+from experiments.adaptive.tests import (
+    test_focused_crash_pair_runtime as runtime_fixture,
+)
 from experiments.adaptive.tests import test_n31_crash_pair_contract as native_fixture
-from experiments.adaptive.tests import test_run_n31_crash_pair_campaign as campaign_fixture
-
+from experiments.adaptive.tests import (
+    test_run_n31_crash_pair_campaign as campaign_fixture,
+)
 
 RUNNER = "experiments.adaptive.run_focused_n31_crash_pair"
 
@@ -29,8 +32,7 @@ def _runner() -> Any:
 
 def _canonical(value: object) -> bytes:
     return (
-        json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True)
-        + "\n"
+        json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
 
 
@@ -49,7 +51,9 @@ def _inputs(
         "trusted": tmp_path / "trusted.json",
     }
     source_profile = (
-        runtime_fixture.N7_PROFILE if mode == "smoke" else runtime_fixture.N31_PROFILE
+        runtime_fixture.N7_PROFILE_V2
+        if mode == "smoke"
+        else runtime_fixture.N31_PROFILE_V2
     )
     profile = json.loads(source_profile.read_text(encoding="utf-8"))
     source_proof = runtime_fixture._topology_proof_path(source_profile, profile)
@@ -117,7 +121,9 @@ def _execution_sentinels(runner: Any, monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_aggregate_validators(
     runner: Any,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[list[tuple[Path, Mapping[str, object]]], list[tuple[Path, Mapping[str, object]]]]:
+) -> tuple[
+    list[tuple[Path, Mapping[str, object]]], list[tuple[Path, Mapping[str, object]]]
+]:
     pair_calls: list[tuple[Path, Mapping[str, object]]] = []
     campaign_calls: list[tuple[Path, Mapping[str, object]]] = []
 
@@ -283,21 +289,24 @@ def test_default_cli_executes_the_injectable_focused_launch_backend(
     pair_calls, campaign_calls = _stub_aggregate_validators(runner, monkeypatch)
     captured: list[Mapping[str, object]] = []
     monkeypatch.setattr(runner, "_write_cli_result", captured.append)
-    assert runner.main(
-        [
-            command,
-            "--profile",
-            str(paths["profile"]),
-            "--pairs",
-            str(pair_count),
-            "--preflight-receipt",
-            str(paths["preflight"]),
-            "--authorization-receipt",
-            str(paths["authorization"]),
-            "--output",
-            str(output),
-        ]
-    ) == 0
+    assert (
+        runner.main(
+            [
+                command,
+                "--profile",
+                str(paths["profile"]),
+                "--pairs",
+                str(pair_count),
+                "--preflight-receipt",
+                str(paths["preflight"]),
+                "--authorization-receipt",
+                str(paths["authorization"]),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
     expected = [("identity", None, None)]
     slots = (
         campaign_fixture._expected_slots()
@@ -395,12 +404,16 @@ def test_execution_never_invokes_or_self_promotes_aggregate_validation(
     monkeypatch.setattr(
         runner,
         "validate_sealed_pair",
-        lambda *_args, **_kwargs: pytest.fail("execution supplied aggregate provenance"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "execution supplied aggregate provenance"
+        ),
     )
     monkeypatch.setattr(
         runner,
         "validate_sealed_campaign",
-        lambda *_args, **_kwargs: pytest.fail("execution supplied aggregate provenance"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "execution supplied aggregate provenance"
+        ),
     )
 
     result = runner._execute_focused(invocation, backend=backend)
@@ -569,8 +582,7 @@ def test_campaign_executes_prederived_slots_without_self_validating(
         if action == "configuration"
     ]
     expected_slots = [
-        (slot["pair_id"], slot["arm"])
-        for slot in campaign_fixture._expected_slots()
+        (slot["pair_id"], slot["arm"]) for slot in campaign_fixture._expected_slots()
     ]
     children_root = output / "children"
     assert {
@@ -669,14 +681,17 @@ def test_campaign_child_authorization_derives_without_rewriting_parent(
             "pair_seed": 41_722,
         },
     }
-    assert runtime.verify_focused_child_authorization(
-        parent_authorization=parent,
-        child_authorization=child,
-        pair_id="pair-03",
-        slot_id="slot-06",
-        arm="adaptive",
-        pair_seed=41_722,
-    )["derivation"] == child["derivation"]
+    assert (
+        runtime.verify_focused_child_authorization(
+            parent_authorization=parent,
+            child_authorization=child,
+            pair_id="pair-03",
+            slot_id="slot-06",
+            arm="adaptive",
+            pair_seed=41_722,
+        )["derivation"]
+        == child["derivation"]
+    )
     for field in ("pair_id", "slot_id"):
         changed = json.loads(json.dumps(child))
         changed["derivation"][field] = "relabelled"
@@ -743,26 +758,31 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     runtime = importlib.import_module(
         "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
     )
-    profile = runtime.load_focused_profile(runtime_fixture.N7_PROFILE)
+    profile = runtime.load_focused_profile(runtime_fixture.N7_PROFILE_V2)
     assert profile.issuer_public_key is None
     checks = _CliPreflightChecks()
     captured: list[dict[str, object]] = []
     monkeypatch.setattr(runner, "FOCUSED_PREFLIGHT_CHECKS", checks, raising=False)
-    monkeypatch.setattr(runner, "_write_cli_result", lambda value: captured.append(value))
+    monkeypatch.setattr(
+        runner, "_write_cli_result", lambda value: captured.append(value)
+    )
     output = tmp_path / "results"
-    assert runner.main(
-        [
-            "preflight",
-            "--mode",
-            "smoke",
-            "--profile",
-            str(runtime_fixture.N7_PROFILE),
-            "--pairs",
-            "1",
-            "--output",
-            str(output),
-        ]
-    ) == 0
+    assert (
+        runner.main(
+            [
+                "preflight",
+                "--mode",
+                "smoke",
+                "--profile",
+                str(runtime_fixture.N7_PROFILE_V2),
+                "--pairs",
+                "1",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
     assert checks.calls == [
         "repository",
         "build",
@@ -777,26 +797,67 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     assert context["issuer_public_key"] == native_fixture.ISSUER_PUBLIC_KEY
     request = runtime.build_focused_authorization_request(preflight)
     request_document = json.loads(request)
-    assert request_document["execution_context_sha256"] == hashlib.sha256(
-        _canonical(context)
-    ).hexdigest()
+    assert (
+        request_document["execution_context_sha256"]
+        == hashlib.sha256(_canonical(context)).hexdigest()
+    )
     receipt = {
         **request_document,
         "request_sha256": hashlib.sha256(request).hexdigest(),
         "approval_reference": "thesis-author-approved-focused-run",
         "approved_utc": "2026-08-12T12:00:00+00:00",
     }
-    assert runtime.verify_focused_authorization_receipt(
-        request,
-        receipt,
-    )["execution_context_sha256"] == request_document["execution_context_sha256"]
+    assert (
+        runtime.verify_focused_authorization_receipt(
+            request,
+            receipt,
+        )["execution_context_sha256"]
+        == request_document["execution_context_sha256"]
+    )
     changed = json.loads(json.dumps(preflight))
     changed["execution_context"]["ports"]["available"] = False
     with pytest.raises(runtime.FocusedCrashPairRuntimeError):
         runtime.build_focused_authorization_request(changed)
 
 
-def _authorized_receipt(runtime: Any, preflight: Mapping[str, object]) -> dict[str, object]:
+@pytest.mark.parametrize(
+    ("mode", "profile_path", "pairs"),
+    (
+        ("smoke", runtime_fixture.N7_PROFILE, 1),
+        ("pair", runtime_fixture.N31_PROFILE, 1),
+        ("campaign", runtime_fixture.N31_PROFILE, 5),
+    ),
+)
+def test_cli_rejects_archived_v1_profile_for_new_execution(
+    mode: str,
+    profile_path: Path,
+    pairs: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v1 remains loadable for archives but cannot authorize a new run."""
+
+    runner = _runner()
+    _execution_sentinels(runner, monkeypatch)
+    with pytest.raises(SystemExit):
+        runner.main(
+            [
+                "preflight",
+                "--mode",
+                mode,
+                "--profile",
+                str(profile_path),
+                "--pairs",
+                str(pairs),
+                "--output",
+                str(tmp_path / mode),
+            ]
+        )
+
+
+def _authorized_receipt(
+    runtime: Any, preflight: Mapping[str, object]
+) -> dict[str, object]:
     request = runtime.build_focused_authorization_request(preflight)
     return {
         **json.loads(request),
@@ -910,9 +971,7 @@ def test_separate_cli_execution_reloads_pair_issuer_before_backend(
     runner = _runner()
     paths, preflight = _issuer_bound_campaign_inputs(tmp_path)
     private_path = Path(
-        preflight["execution_context"]["pair_issuers"]["pair-01"][
-            "private_key_path"
-        ]
+        preflight["execution_context"]["pair_issuers"]["pair-01"]["private_key_path"]
     )
     if mutation == "missing":
         private_path.unlink()
@@ -928,9 +987,9 @@ def test_separate_cli_execution_reloads_pair_issuer_before_backend(
             loaded = invocation["pair_issuer_allocations"]
             assert len(loaded) == 5
             for pair_id, issuer in loaded.items():
-                assert issuer["control"]["public_key"] == issuer["adaptive"][
-                    "public_key"
-                ]
+                assert (
+                    issuer["control"]["public_key"] == issuer["adaptive"]["public_key"]
+                )
             raise _ExecutionReached
 
     monkeypatch.setattr(runner, "FOCUSED_LAUNCH_BACKEND", Backend())
@@ -947,7 +1006,11 @@ def test_separate_cli_execution_reloads_pair_issuer_before_backend(
         "--output",
         str(tmp_path / "results"),
     ]
-    expected = pytest.raises(_ExecutionReached) if mutation is None else pytest.raises(SystemExit)
+    expected = (
+        pytest.raises(_ExecutionReached)
+        if mutation is None
+        else pytest.raises(SystemExit)
+    )
     with expected:
         runner.main(argv)
 
@@ -966,19 +1029,22 @@ def test_default_preflight_persists_and_execution_reloads_pair_issuer_material(
     captured: list[dict[str, object]] = []
     monkeypatch.setattr(runner, "_write_cli_result", captured.append)
     output = tmp_path / "results"
-    assert runner.main(
-        [
-            "preflight",
-            "--mode",
-            "campaign",
-            "--profile",
-            str(runtime_fixture.N31_PROFILE),
-            "--pairs",
-            "5",
-            "--output",
-            str(output),
-        ]
-    ) == 0
+    assert (
+        runner.main(
+            [
+                "preflight",
+                "--mode",
+                "campaign",
+                "--profile",
+                str(runtime_fixture.N31_PROFILE_V2),
+                "--pairs",
+                "5",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
     preflight = captured[0]
     issuer_allocations = preflight["execution_context"]["pair_issuers"]
     serialized = _canonical(preflight)
@@ -994,30 +1060,33 @@ def test_default_preflight_persists_and_execution_reloads_pair_issuer_material(
         assert private_path.parent.name == pair_id
         assert stat.S_IMODE(private_path.stat().st_mode) == 0o600
         private_bytes = private_path.read_bytes()
-        assert allocation["private_key_sha256"] == hashlib.sha256(private_bytes).hexdigest()
+        assert (
+            allocation["private_key_sha256"]
+            == hashlib.sha256(private_bytes).hexdigest()
+        )
         assert "private_key" not in allocation
         public_keys.add(allocation["public_key"])
     assert len(public_keys) == 5
     request = runtime.build_focused_authorization_request(preflight)
     request_document = json.loads(request)
-    assert request_document["execution_context_sha256"] == hashlib.sha256(
-        _canonical(preflight["execution_context"])
-    ).hexdigest()
+    assert (
+        request_document["execution_context_sha256"]
+        == hashlib.sha256(_canonical(preflight["execution_context"])).hexdigest()
+    )
     receipt = _authorized_receipt(runtime, preflight)
 
     reloaded = runtime.reload_pair_issuer_allocations(
         preflight=preflight,
         authorization=receipt,
     )
-    assert {
-        pair_id: value["public_key"] for pair_id, value in reloaded.items()
-    } == {
+    assert {pair_id: value["public_key"] for pair_id, value in reloaded.items()} == {
         pair_id: value["public_key"] for pair_id, value in issuer_allocations.items()
     }
     for pair_id in issuer_allocations:
-        assert reloaded[pair_id]["control"]["public_key"] == reloaded[pair_id][
-            "adaptive"
-        ]["public_key"]
+        assert (
+            reloaded[pair_id]["control"]["public_key"]
+            == reloaded[pair_id]["adaptive"]["public_key"]
+        )
 
     first_path = Path(issuer_allocations["pair-01"]["private_key_path"])
     mutations = (
@@ -1112,6 +1181,8 @@ def test_valid_cli_inputs_reach_exact_execution_route(
                 str(output),
             ]
         )
+
+
 @pytest.mark.parametrize("command", ("smoke", "pair", "campaign"))
 @pytest.mark.parametrize("missing", ("preflight", "authorization"))
 def test_execution_cli_refuses_missing_receipts(
@@ -1259,9 +1330,7 @@ def test_cli_routes_each_supported_mode_once(
     mode = (
         command
         if command in {"smoke", "pair", "campaign"}
-        else "smoke"
-        if command == "preflight"
-        else "pair"
+        else "smoke" if command == "preflight" else "pair"
     )
     output = tmp_path / "results"
     paths = _inputs(tmp_path, mode=mode, pairs=pair_count, output=output)
@@ -1370,9 +1439,10 @@ def test_cli_refuses_replayed_or_mismatched_authorization_receipt(
             "authorization_nonce",
         )
     }
-    assert authorization["request_sha256"] == hashlib.sha256(
-        _canonical(request)
-    ).hexdigest()
+    assert (
+        authorization["request_sha256"]
+        == hashlib.sha256(_canonical(request)).hexdigest()
+    )
     with pytest.raises(SystemExit):
         runner.main(
             [
@@ -1393,7 +1463,9 @@ def test_cli_refuses_replayed_or_mismatched_authorization_receipt(
 
 def test_runner_script_imports_when_invoked_directly_from_kauri_root() -> None:
     repository_root = Path(__file__).parents[3]
-    script = repository_root / "experiments" / "adaptive" / "run_focused_n31_crash_pair.py"
+    script = (
+        repository_root / "experiments" / "adaptive" / "run_focused_n31_crash_pair.py"
+    )
     completed = subprocess.run(
         [sys.executable, str(script), "--help"],
         cwd=repository_root,

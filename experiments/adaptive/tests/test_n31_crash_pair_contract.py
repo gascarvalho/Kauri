@@ -13,7 +13,6 @@ import pytest
 
 from experiments.adaptive.kauri_experiment import factorial_validation
 
-
 SUBJECT = "experiments.adaptive.kauri_experiment.n31_crash_pair"
 EXPERIMENT_ID = "n31-f5-q21-three-crash-pair-v1"
 N = 31
@@ -237,7 +236,9 @@ def _envelope(
     }
 
 
-def _commit_payload(height: int, block_hash: str, transactions: int) -> dict[str, object]:
+def _commit_payload(
+    height: int, block_hash: str, transactions: int
+) -> dict[str, object]:
     return {
         "block_height": height,
         "block_hash": block_hash,
@@ -341,9 +342,9 @@ def test_runtime_graph_binds_authoritative_q21_and_all_28_transition_evidence() 
     assert proof["source_sequence_contiguous"] is True
 
 
-def _runtime_streams_with_native_command() -> tuple[
-    dict[str, list[dict[str, object]]], bytes, Any
-]:
+def _runtime_streams_with_native_command() -> (
+    tuple[dict[str, list[dict[str, object]]], bytes, Any]
+):
     epoch1_wire, epoch1, _, _ = _native_epoch_chain()
     return _runtime_streams(), epoch1_wire, epoch1
 
@@ -487,7 +488,7 @@ def test_runtime_graph_rejects_source_or_survivor_binding_drift(mutation: str) -
     elif mutation == "commit":
         streams[f"replica-{COMMON_WITNESSES[-1]}"][0]["payload"][  # type: ignore[index]
             "block_hash"
-        ] = "b" * 64
+        ] = ("b" * 64)
     else:
         streams[f"replica-{SURVIVORS[-1]}"].pop()
     with pytest.raises(_subject().N31CrashPairError):
@@ -597,7 +598,9 @@ def test_atomic_sigkill_validation_joins_plan_registry_outcomes_and_journal() ->
 
 
 @pytest.mark.parametrize("mutation", ("pgid", "timing", "outcome", "journal"))
-def test_atomic_sigkill_validation_rejects_runtime_evidence_drift(mutation: str) -> None:
+def test_atomic_sigkill_validation_rejects_runtime_evidence_drift(
+    mutation: str,
+) -> None:
     plan, records, outcomes, journal = _fault_evidence()
     if mutation == "pgid":
         outcomes[0]["pgid"] = outcomes[1]["pgid"]
@@ -646,35 +649,63 @@ def _safe_manager_boundary() -> tuple[tuple[str, ...], dict[str, object]]:
             "transition_artifact_id": "e1-to-e2-optimization",
         },
     )
-    transition_json = tuple(_canonical(item).decode("ascii").rstrip("\n") for item in transitions)
+    transition_json = tuple(
+        _canonical(item).decode("ascii").rstrip("\n") for item in transitions
+    )
     argv = (
         "adaptation-manager",
-        "--listen", "127.0.0.1:19000",
-        "--tls-privkey", TLS_PRIVATE_KEY_DER_HEX,
-        "--tls-cert", TLS_CERTIFICATE_DER_HEX,
-        "--issuer-id", "1",
-        "--issuer-private-key", f"{ISSUER_PRIVATE_KEY:064x}",
-        "--activation-delay-blocks", "5",
-        "--convergence-deadline-seconds", "30",
-        "--tree-fanout", str(FANOUT),
-        "--pipeline-stretch", str(PIPELINE),
-        "--shape-candidate-fanouts", str(FANOUT),
-        "--shape-deterministic-seed", str(NATIVE_SNAPSHOT_SEED),
-        "--responsiveness-policy-version", str(NATIVE_RESPONSIVENESS_POLICY["policy_version"]),
-        "--required-nonresponsive", str(len(CRASHED)),
-        "--responsiveness-attempt-window", str(NATIVE_RESPONSIVENESS_POLICY["attempt_window"]),
-        "--responsiveness-minimum-attempts", str(NATIVE_RESPONSIVENESS_POLICY["minimum_attempts"]),
-        "--responsiveness-minimum-response-rate-ppm", str(NATIVE_RESPONSIVENESS_POLICY["minimum_response_rate_ppm"]),
-        "--responsiveness-maximum-timeout-rate-ppm", str(NATIVE_RESPONSIVENESS_POLICY["maximum_timeout_rate_ppm"]),
-        "--responsiveness-trailing-timeout-streak", str(NATIVE_RESPONSIVENESS_POLICY["trailing_timeout_streak"]),
-        "--responsiveness-latency-percentile-basis-points", str(NATIVE_RESPONSIVENESS_POLICY["latency_percentile_basis_points"]),
-        "--transition-request", transition_json[0],
-        "--bundle-output", "/tmp/kauri-n31/transitions/e0-to-e1-containment/successor.bundle",
-        "--transition-request", transition_json[1],
-        "--bundle-output", "/tmp/kauri-n31/transitions/e1-to-e2-optimization/successor.bundle",
-        "--structured-event-run-id", RUN_ID,
-        "--structured-event-source-instance", f"{RUN_ID}-adaptive-manager",
-        "--structured-event-output", "/tmp/kauri-n31/raw/manager-events.jsonl",
+        "--listen",
+        "127.0.0.1:19000",
+        "--tls-privkey",
+        TLS_PRIVATE_KEY_DER_HEX,
+        "--tls-cert",
+        TLS_CERTIFICATE_DER_HEX,
+        "--issuer-id",
+        "1",
+        "--issuer-private-key",
+        f"{ISSUER_PRIVATE_KEY:064x}",
+        "--activation-delay-blocks",
+        "5",
+        "--convergence-deadline-seconds",
+        "30",
+        "--tree-fanout",
+        str(FANOUT),
+        "--pipeline-stretch",
+        str(PIPELINE),
+        "--shape-candidate-fanouts",
+        str(FANOUT),
+        "--shape-deterministic-seed",
+        str(NATIVE_SNAPSHOT_SEED),
+        "--responsiveness-policy-version",
+        str(NATIVE_RESPONSIVENESS_POLICY["policy_version"]),
+        "--required-nonresponsive",
+        str(len(CRASHED)),
+        "--responsiveness-attempt-window",
+        str(NATIVE_RESPONSIVENESS_POLICY["attempt_window"]),
+        "--responsiveness-minimum-attempts",
+        str(NATIVE_RESPONSIVENESS_POLICY["minimum_attempts"]),
+        "--responsiveness-minimum-response-rate-ppm",
+        str(NATIVE_RESPONSIVENESS_POLICY["minimum_response_rate_ppm"]),
+        "--responsiveness-maximum-timeout-rate-ppm",
+        str(NATIVE_RESPONSIVENESS_POLICY["maximum_timeout_rate_ppm"]),
+        "--responsiveness-trailing-timeout-streak",
+        str(NATIVE_RESPONSIVENESS_POLICY["trailing_timeout_streak"]),
+        "--responsiveness-latency-percentile-basis-points",
+        str(NATIVE_RESPONSIVENESS_POLICY["latency_percentile_basis_points"]),
+        "--transition-request",
+        transition_json[0],
+        "--bundle-output",
+        "/tmp/kauri-n31/transitions/e0-to-e1-containment/successor.bundle",
+        "--transition-request",
+        transition_json[1],
+        "--bundle-output",
+        "/tmp/kauri-n31/transitions/e1-to-e2-optimization/successor.bundle",
+        "--structured-event-run-id",
+        RUN_ID,
+        "--structured-event-source-instance",
+        f"{RUN_ID}-adaptive-manager",
+        "--structured-event-output",
+        "/tmp/kauri-n31/raw/manager-events.jsonl",
         *tuple(
             value
             for replica in range(N)
@@ -809,6 +840,7 @@ def _observation_id(
     epoch_number: int,
     block_hash: str,
     epoch_digest: str,
+    tree_id: int = 0,
 ) -> str:
     payload = b"".join(
         (
@@ -816,7 +848,7 @@ def _observation_id(
             reporter_id.to_bytes(2, "big"),
             observed_replica_id.to_bytes(2, "big"),
             epoch_number.to_bytes(4, "big"),
-            (0).to_bytes(4, "big"),
+            tree_id.to_bytes(4, "big"),
             bytes.fromhex(epoch_digest),
             bytes.fromhex(block_hash),
             (1).to_bytes(1, "big"),
@@ -845,9 +877,7 @@ def _accepted_ranking_evidence() -> list[dict[str, object]]:
             )
         )
     for replica in CRASHED:
-        attempts.append(
-            (replica, "baseline", "late", 2_000 + replica, replica + 1)
-        )
+        attempts.append((replica, "baseline", "late", 2_000 + replica, replica + 1))
     for attempt_number, attempt_name in enumerate(("fresh-a", "fresh-b"), start=1):
         for replica in range(N):
             attempts.append(
@@ -1031,8 +1061,12 @@ def test_ranking_replays_native_fresh_suffix_with_manager_default_policy() -> No
         RANKED_SURVIVORS[:Q]
     )
     by_replica = {row["replica_id"]: row for row in ranking["ranking"]}
-    assert all(by_replica[replica]["classification"] == "responsive" for replica in SURVIVORS)
-    assert all(by_replica[replica]["classification"] == "nonresponsive" for replica in CRASHED)
+    assert all(
+        by_replica[replica]["classification"] == "responsive" for replica in SURVIVORS
+    )
+    assert all(
+        by_replica[replica]["classification"] == "nonresponsive" for replica in CRASHED
+    )
 
 
 @pytest.mark.parametrize(
@@ -1049,7 +1083,9 @@ def test_ranking_rejects_unbound_or_noncanonical_evidence(mutation: str) -> None
     elif mutation == "reporter":
         evidence[-2]["payload"]["observation"][  # type: ignore[index]
             "reporter_monotonic_ns"
-        ] = int(evidence[-3]["payload"]["observation"]["reporter_monotonic_ns"]) - 1  # type: ignore[index]
+        ] = (
+            int(evidence[-3]["payload"]["observation"]["reporter_monotonic_ns"]) - 1
+        )  # type: ignore[index]
     elif mutation == "predecessor":
         overrides["predecessor_epoch_digest"] = "de" * 32
     else:
@@ -1064,13 +1100,9 @@ def _canonical_trees(
     root_order = tuple(roots)
     trees: list[dict[str, object]] = []
     for tree_id, root in enumerate(root_order):
-        internal = tuple(replica for replica in SURVIVORS if replica != root)[
-            :FANOUT
-        ]
+        internal = tuple(replica for replica in SURVIVORS if replica != root)[:FANOUT]
         leaf_survivors = tuple(
-            replica
-            for replica in SURVIVORS
-            if replica not in (root, *internal)
+            replica for replica in SURVIVORS if replica not in (root, *internal)
         )
         trees.append(
             {
@@ -1521,7 +1553,8 @@ def _independent_epoch1_bundles(
         assert control_snapshot_id == CONTROL_E1_SNAPSHOT_ID
         assert adaptive_snapshot_id == ADAPTIVE_E1_SNAPSHOT_ID
         assert all(
-            len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+            len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
             for value in (control_snapshot_id, adaptive_snapshot_id)
         )
     control_wire, control_epoch1 = _encode_native_epoch_bundle(
@@ -1610,16 +1643,12 @@ def _matched_pair() -> tuple[dict[str, object], dict[str, object]]:
         _independent_epoch1_bundles(verify_replay=True)
     )
     evidence = _accepted_ranking_evidence()
-    control_e1_events, control_e1_input, control_e1_snapshot = (
-        _epoch1_replay_binding(3)
-    )
+    control_e1_events, control_e1_input, control_e1_snapshot = _epoch1_replay_binding(3)
     adaptive_e1_events, adaptive_e1_input, adaptive_e1_snapshot = (
         _epoch1_replay_binding(4)
     )
     ranking = _native_ranking_snapshot(evidence)
-    ranking["selected_root_ids"] = [
-        row["replica_id"] for row in ranking["ranking"][:Q]
-    ]
+    ranking["selected_root_ids"] = [row["replica_id"] for row in ranking["ranking"][:Q]]
     epoch2_wire, epoch2 = _encode_native_epoch_bundle(
         2,
         adaptive_epoch1.epoch_digest,
@@ -1726,10 +1755,21 @@ def test_matched_pair_binds_verified_decoded_epochs_evidence_and_ranking() -> No
     assert control_epoch1.command.signature != adaptive_epoch1.command.signature
     assert control_epoch1.evidence_snapshot_id != adaptive_epoch1.evidence_snapshot_id
     assert control_epoch1.evidence_cutoff != adaptive_epoch1.evidence_cutoff
-    assert control_epoch1.generation_seed == adaptive_epoch1.generation_seed == NATIVE_SNAPSHOT_SEED
-    assert control_epoch1.policy_version == adaptive_epoch1.policy_version == NATIVE_PLACEMENT_POLICY
+    assert (
+        control_epoch1.generation_seed
+        == adaptive_epoch1.generation_seed
+        == NATIVE_SNAPSHOT_SEED
+    )
+    assert (
+        control_epoch1.policy_version
+        == adaptive_epoch1.policy_version
+        == NATIVE_PLACEMENT_POLICY
+    )
     assert control_epoch1.command.issuer_id == adaptive_epoch1.command.issuer_id
-    assert control_epoch1.command.activation_delay_blocks == adaptive_epoch1.command.activation_delay_blocks
+    assert (
+        control_epoch1.command.activation_delay_blocks
+        == adaptive_epoch1.command.activation_delay_blocks
+    )
     for arm, decoded in ((control, control_epoch1), (adaptive, adaptive_epoch1)):
         replay = arm["epoch1_replay_snapshot"]
         assert decoded.evidence_snapshot_id == replay["snapshot_id"]  # type: ignore[index]
@@ -1830,9 +1870,7 @@ def test_matched_pair_rejects_decoded_epoch_or_ranking_drift(mutation: str) -> N
             evidence_cutoff=ADAPTIVE_E1_CUTOFF,
         )
         adaptive["epoch1_bundle"] = changed_wire
-        adaptive["epoch1_bundle_sha256"] = hashlib.sha256(
-            changed_wire
-        ).hexdigest()
+        adaptive["epoch1_bundle_sha256"] = hashlib.sha256(changed_wire).hexdigest()
         adaptive["epoch1_decoded"] = _document(changed_decoded)
     elif mutation == "epoch1-snapshot":
         changed_wire, changed_decoded = _encode_native_epoch_bundle(
@@ -1865,9 +1903,12 @@ def test_matched_pair_recomputes_each_arm_epoch1_replay_component(
     component: str,
 ) -> None:
     baseline_control, baseline_adaptive = _matched_pair()
-    assert _document(
-        _subject().validate_matched_pair(baseline_control, baseline_adaptive)
-    )["epoch1_replays_bound"] is True
+    assert (
+        _document(
+            _subject().validate_matched_pair(baseline_control, baseline_adaptive)
+        )["epoch1_replays_bound"]
+        is True
+    )
 
     control, adaptive = _matched_pair()
     arm = control if arm_name == "control" else adaptive
@@ -1886,14 +1927,14 @@ def test_matched_pair_recomputes_each_arm_epoch1_replay_component(
             if event["event_type"] == "evidence.observation_accepted"
         )
         observation = accepted["payload"]["observation"]
-        observation["response_duration_us"] = int(
-            observation["response_duration_us"]
-        ) + 1
+        observation["response_duration_us"] = (
+            int(observation["response_duration_us"]) + 1
+        )
     elif component == "input-cutoff":
         replay_input = arm["epoch1_replay_input"]
-        replay_input["current_evidence_cutoff"] = int(
-            replay_input["current_evidence_cutoff"]
-        ) - 1
+        replay_input["current_evidence_cutoff"] = (
+            int(replay_input["current_evidence_cutoff"]) - 1
+        )
     elif component == "input-policy":
         arm["epoch1_replay_input"]["policy"]["minimum_attempts"] = 3
     elif component == "input-seed":
@@ -1904,14 +1945,14 @@ def test_matched_pair_recomputes_each_arm_epoch1_replay_component(
     changed_group = (
         "epoch1_replay_events"
         if component == "events"
-        else "epoch1_replay_snapshot"
-        if component == "snapshot"
-        else "epoch1_replay_input"
+        else (
+            "epoch1_replay_snapshot"
+            if component == "snapshot"
+            else "epoch1_replay_input"
+        )
     )
     assert all(
-        arm[key] == value
-        for key, value in before.items()
-        if key != changed_group
+        arm[key] == value for key, value in before.items() if key != changed_group
     )
 
     with pytest.raises(_subject().N31CrashPairError):
@@ -1920,9 +1961,12 @@ def test_matched_pair_recomputes_each_arm_epoch1_replay_component(
 
 def test_matched_pair_rejects_coherent_earlier_control_epoch1_replay() -> None:
     baseline_control, baseline_adaptive = _matched_pair()
-    assert _document(
-        _subject().validate_matched_pair(baseline_control, baseline_adaptive)
-    )["epoch1_replays_bound"] is True
+    assert (
+        _document(
+            _subject().validate_matched_pair(baseline_control, baseline_adaptive)
+        )["epoch1_replays_bound"]
+        is True
+    )
 
     control, adaptive = _matched_pair()
     events = control["epoch1_replay_events"]
@@ -2026,16 +2070,34 @@ def test_throughput_uses_one_hash_per_height_and_event_transaction_counts() -> N
             phase_windows=(
                 {"phase": "baseline", "start_ns": 0, "end_ns": 5_000_000_000},
                 {"phase": "fault", "start_ns": 5_000_000_000, "end_ns": 10_000_000_000},
-                {"phase": "epoch1", "start_ns": 10_000_000_000, "end_ns": 15_000_000_000},
-                {"phase": "epoch2", "start_ns": 15_000_000_000, "end_ns": 20_000_000_000},
+                {
+                    "phase": "epoch1",
+                    "start_ns": 10_000_000_000,
+                    "end_ns": 15_000_000_000,
+                },
+                {
+                    "phase": "epoch2",
+                    "start_ns": 15_000_000_000,
+                    "end_ns": 20_000_000_000,
+                },
             ),
             authoritative_source_id="replica-0",
             bucket_width_ns=5_000_000_000,
         )
     )
     assert result["authority"]["unique_commit_rule"] == "one_hash_per_height_v1"
-    assert [phase["transactions"] for phase in result["phases"]] == [500, 750, 1_000, 1_250]
-    assert [phase["mean_tps"] for phase in result["phases"]] == [100.0, 150.0, 200.0, 250.0]
+    assert [phase["transactions"] for phase in result["phases"]] == [
+        500,
+        750,
+        1_000,
+        1_250,
+    ]
+    assert [phase["mean_tps"] for phase in result["phases"]] == [
+        100.0,
+        150.0,
+        200.0,
+        250.0,
+    ]
 
 
 def test_throughput_rejects_two_hashes_for_one_committed_height() -> None:
@@ -2053,8 +2115,16 @@ def test_throughput_rejects_two_hashes_for_one_committed_height() -> None:
             phase_windows=(
                 {"phase": "baseline", "start_ns": 0, "end_ns": 5_000_000_000},
                 {"phase": "fault", "start_ns": 5_000_000_000, "end_ns": 10_000_000_000},
-                {"phase": "epoch1", "start_ns": 10_000_000_000, "end_ns": 15_000_000_000},
-                {"phase": "epoch2", "start_ns": 15_000_000_000, "end_ns": 20_000_000_000},
+                {
+                    "phase": "epoch1",
+                    "start_ns": 10_000_000_000,
+                    "end_ns": 15_000_000_000,
+                },
+                {
+                    "phase": "epoch2",
+                    "start_ns": 15_000_000_000,
+                    "end_ns": 20_000_000_000,
+                },
             ),
             authoritative_source_id="replica-0",
             bucket_width_ns=5_000_000_000,

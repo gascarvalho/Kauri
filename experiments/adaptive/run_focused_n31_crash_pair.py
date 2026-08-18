@@ -168,10 +168,7 @@ def _execute_focused(
             pair_ordinal=int(slot["pair_ordinal"]),
             arm=arm,
         )
-        if (
-            configuration.get("pair_id") != pair_id
-            or configuration.get("arm") != arm
-        ):
+        if configuration.get("pair_id") != pair_id or configuration.get("arm") != arm:
             raise FocusedCrashPairCliError(
                 "backend relabelled the prederived pair or arm identity"
             )
@@ -325,9 +322,7 @@ def _execute_focused(
         campaign_summary = campaign_contracts.validate_campaign_ledger(
             plan, ledger_records
         )
-        _write_exclusive_json(
-            output_root / "campaign-summary.json", campaign_summary
-        )
+        _write_exclusive_json(output_root / "campaign-summary.json", campaign_summary)
         campaign_seal = create_evidence_seal(output_root)
         campaign_validation = _pending_external_provenance(
             output_root,
@@ -396,7 +391,9 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     preflight = subparsers.add_parser("preflight")
-    preflight.add_argument("--mode", choices=("smoke", "pair", "campaign"), required=True)
+    preflight.add_argument(
+        "--mode", choices=("smoke", "pair", "campaign"), required=True
+    )
     preflight.add_argument("--profile", type=Path, required=True)
     preflight.add_argument("--pairs", type=int, required=True)
     preflight.add_argument("--output", type=Path, required=True)
@@ -421,9 +418,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
     expected = (
-        "n7-f2-q5-two-crash-pair-smoke-v1"
+        "n7-f2-q5-two-crash-pair-smoke-v2"
         if mode == "smoke"
-        else "n31-f5-q21-three-crash-pair-v1"
+        else "n31-f5-q21-three-crash-pair-v2"
     )
     if profile.profile_id != expected:
         raise FocusedCrashPairCliError(
@@ -431,9 +428,9 @@ def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
         )
 
 
-def _authorized_execution(arguments: argparse.Namespace) -> tuple[
-    FocusedProfile, Mapping[str, Any], Mapping[str, Any]
-]:
+def _authorized_execution(
+    arguments: argparse.Namespace,
+) -> tuple[FocusedProfile, Mapping[str, Any], Mapping[str, Any]]:
     expected_pairs = 5 if arguments.command == "campaign" else 1
     if arguments.pairs != expected_pairs or arguments.retries != 0:
         raise FocusedCrashPairCliError(
@@ -445,9 +442,7 @@ def _authorized_execution(arguments: argparse.Namespace) -> tuple[
     profile = load_focused_profile(arguments.profile)
     _require_mode_profile(profile, arguments.command)
     preflight = _read_json(arguments.preflight_receipt, "preflight receipt")
-    authorization = _read_json(
-        arguments.authorization_receipt, "authorization receipt"
-    )
+    authorization = _read_json(arguments.authorization_receipt, "authorization receipt")
     request = build_focused_authorization_request(preflight)
     verify_focused_authorization_receipt(request, authorization)
     request_document = json.loads(request)

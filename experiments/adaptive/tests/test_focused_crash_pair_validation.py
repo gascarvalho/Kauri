@@ -17,8 +17,9 @@ import pytest
 
 from experiments.adaptive.tests import test_run_n31_crash_pair_campaign as fixture
 from experiments.adaptive.tests import test_n31_crash_pair_contract as native_fixture
-from experiments.adaptive.tests import test_focused_crash_pair_runtime as runtime_fixture
-
+from experiments.adaptive.tests import (
+    test_focused_crash_pair_runtime as runtime_fixture,
+)
 
 VALIDATION = "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
 
@@ -173,13 +174,15 @@ def _resign_child_with_independent_issuer(directory: Path) -> str:
     return public_key
 
 
-def _complete_child(child: dict[str, object]) -> None:
+def _complete_child(
+    child: dict[str, object], *, profile_path: Path = runtime_fixture.N31_PROFILE
+) -> None:
     directory = child["sealed_child_directory"]
     assert isinstance(directory, Path)
     (directory / "evidence-seal.json").unlink(missing_ok=True)
-    profile = json.loads(runtime_fixture.N31_PROFILE.read_text(encoding="utf-8"))
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
     proof_source = runtime_fixture._topology_proof_path(
-        runtime_fixture.N31_PROFILE,
+        profile_path,
         profile,
     )
     proof_relative = Path(profile["topology"]["proof_path"])
@@ -352,13 +355,15 @@ def _complete_child(child: dict[str, object]) -> None:
             payload = event["payload"]
             if not isinstance(payload, dict):
                 continue
-            if event["event_type"] == "epoch.command_committed" and payload.get(
-                "successor_epoch_number"
-            ) == 2:
+            if (
+                event["event_type"] == "epoch.command_committed"
+                and payload.get("successor_epoch_number") == 2
+            ):
                 event["payload"] = fixture._command_payload(epoch2, 11)
-            elif event["event_type"] == "epoch.activated" and payload.get(
-                "epoch_number"
-            ) == 2:
+            elif (
+                event["event_type"] == "epoch.activated"
+                and payload.get("epoch_number") == 2
+            ):
                 payload["epoch_digest"] = epoch2.epoch_digest
             elif event["event_type"] == "block.committed":
                 proof = payload.get("decision_proof")
@@ -376,13 +381,15 @@ def _complete_child(child: dict[str, object]) -> None:
             payload = event["payload"]
             if not isinstance(payload, dict):
                 continue
-            if event["event_type"] == "epoch.command_committed" and payload.get(
-                "successor_epoch_number"
-            ) == 1:
+            if (
+                event["event_type"] == "epoch.command_committed"
+                and payload.get("successor_epoch_number") == 1
+            ):
                 event["payload"] = fixture._command_payload(control_epoch1, 4)
-            elif event["event_type"] == "epoch.activated" and payload.get(
-                "epoch_number"
-            ) == 1:
+            elif (
+                event["event_type"] == "epoch.activated"
+                and payload.get("epoch_number") == 1
+            ):
                 payload["epoch_digest"] = control_epoch1.epoch_digest
             elif event["event_type"] == "block.committed":
                 proof = payload.get("decision_proof")
@@ -414,10 +421,7 @@ def _complete_child(child: dict[str, object]) -> None:
         directory / "runtime" / "source-inventory.json",
         {
             "sources": sorted(
-                {
-                    (event["source_kind"], event["source_id"])
-                    for event in events
-                }
+                {(event["source_kind"], event["source_id"]) for event in events}
             )
         },
     )
@@ -515,10 +519,13 @@ def test_sealed_arm_rejects_client_topology_or_timer_configuration_drift(
     _complete_child(child)
     directory = child["sealed_child_directory"]
     assert isinstance(directory, Path)
-    assert _validation().validate_sealed_arm(
-        directory,
-        trusted_provenance=_trusted_provenance(directory),
-    )["verdict"] == "PASS"
+    assert (
+        _validation().validate_sealed_arm(
+            directory,
+            trusted_provenance=_trusted_provenance(directory),
+        )["verdict"]
+        == "PASS"
+    )
     path = directory / relative_path
     path.write_text(
         path.read_text(encoding="ascii").replace(old, new, 1),
@@ -538,9 +545,7 @@ def test_sealed_arm_rejects_client_topology_or_timer_configuration_drift(
 def _trusted_provenance(directory: Path) -> dict[str, object]:
     profile = json.loads((directory / "profile.json").read_text(encoding="utf-8"))
     build = json.loads(
-        (directory / "runtime" / "build-provenance.json").read_text(
-            encoding="utf-8"
-        )
+        (directory / "runtime" / "build-provenance.json").read_text(encoding="utf-8")
     )
     seal = fixture._archive().verify_evidence_seal(directory)
     return {
@@ -621,19 +626,109 @@ def test_validator_contract_is_derived_from_each_focused_profile(
     assert contract["quorum"] == expected["quorum"]
     assert tuple(contract["targets"]) == expected["targets"]
     assert tuple(contract["survivors"]) == expected["survivors"]
-    assert contract["authoritative_source_id"] == expected[
-        "authoritative_source_id"
-    ]
+    assert contract["authoritative_source_id"] == expected["authoritative_source_id"]
     assert contract["fault_target_count"] == expected["fault_target_count"]
-    assert contract["manager_blinding_target_count"] == expected[
-        "fault_target_count"
+    assert contract["manager_blinding_target_count"] == expected["fault_target_count"]
+    assert contract["control_transition_count"] == expected["control_transition_count"]
+    assert (
+        contract["adaptive_transition_count"] == expected["adaptive_transition_count"]
+    )
+
+
+@pytest.mark.parametrize(
+    "profile_path", (runtime_fixture.N7_PROFILE_V2, runtime_fixture.N31_PROFILE_V2)
+)
+def test_independent_validator_rechecks_fcrash_h_guard_and_deadline_caps(
+    profile_path: Path,
+    tmp_path: Path,
+) -> None:
+    """The sealed-validator helper owns the guard; it cannot trust the runner."""
+
+    validation = _validation()
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    proof_source = runtime_fixture._topology_proof_path(profile_path, profile)
+    proof_path = tmp_path / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True, exist_ok=True)
+    proof_path.write_bytes(proof_source.read_bytes())
+    _write_json(tmp_path / "profile.json", profile)
+    contract = _document(validation.validation_contract_from_profile(tmp_path))
+    coverage = contract["reporter_coverage_plan"]
+    fault_ns = 2_000_000_000
+    observations = [
+        {
+            "epoch_number": 0,
+            "tree_id": next(
+                item["tree_id"]
+                for item in target["first_qualifying_reporters"]
+                if item["reporter_id"] == reporter
+            ),
+            "observed_replica_id": target["target_replica_id"],
+            "reporter_id": reporter,
+            "outcome": "timeout",
+            "compensated": False,
+            "source_monotonic_ns": fault_ns + 1 + ordinal,
+        }
+        for target in coverage["targets"]
+        for reporter in target["authenticated_reporter_ids"]
+        for ordinal in range(2)
     ]
-    assert contract["control_transition_count"] == expected[
-        "control_transition_count"
-    ]
-    assert contract["adaptive_transition_count"] == expected[
-        "adaptive_transition_count"
-    ]
+    witness = {
+        "fault_monotonic_ns": fault_ns,
+        "nonresponse_monotonic_ns": fault_ns + 2,
+        "snapshot_audit_monotonic_ns": fault_ns + 3,
+        "epoch1_activation_monotonic_ns": fault_ns + 4,
+        "epoch2_activation_monotonic_ns": fault_ns + 5,
+        "timeout_observations": observations,
+        "guard_drawdowns": {
+            str(target["target_replica_id"]): -int(coverage["minimum_score_drop"])
+            for target in coverage["targets"]
+        },
+    }
+    assert validation.validate_fcrash_h_evidence(contract, witness) is None
+
+    for mutation in (
+        "compensated",
+        "pre-fault",
+        "wrong-tree",
+        "healed-score",
+        "evidence-after-audit",
+        "evidence-cap",
+        "epoch1-cap",
+        "epoch2-cap",
+    ):
+        changed = deepcopy(witness)
+        if mutation == "compensated":
+            changed["timeout_observations"][0]["compensated"] = True
+        elif mutation == "pre-fault":
+            changed["timeout_observations"][0]["source_monotonic_ns"] = fault_ns
+        elif mutation == "wrong-tree":
+            changed["timeout_observations"][0]["tree_id"] = -1
+        elif mutation == "healed-score":
+            first_target = next(iter(changed["guard_drawdowns"]))
+            changed["guard_drawdowns"][first_target] = 0
+        elif mutation == "evidence-after-audit":
+            changed["timeout_observations"][0]["source_monotonic_ns"] = changed[
+                "snapshot_audit_monotonic_ns"
+            ]
+        elif mutation == "evidence-cap":
+            changed["snapshot_audit_monotonic_ns"] = (
+                fault_ns
+                + int(coverage["deadlines_seconds"]["evidence_seconds"]) * 1_000_000_000
+            )
+        elif mutation == "epoch1-cap":
+            changed["epoch1_activation_monotonic_ns"] = (
+                fault_ns
+                + int(coverage["deadlines_seconds"]["epoch1_activation_seconds"])
+                * 1_000_000_000
+            )
+        else:
+            changed["epoch2_activation_monotonic_ns"] = (
+                changed["epoch1_activation_monotonic_ns"]
+                + int(coverage["deadlines_seconds"]["optimization_activation_seconds"])
+                * 1_000_000_000
+            )
+        with pytest.raises(validation.FocusedCrashPairValidationError):
+            validation.validate_fcrash_h_evidence(contract, changed)
 
 
 def test_validator_uses_no_n31_specific_fault_or_blinding_helper() -> None:
@@ -708,10 +803,13 @@ def test_trusted_provenance_is_exact_and_bound_to_the_sealed_child(
     directory = child["sealed_child_directory"]
     assert isinstance(directory, Path)
     trusted = _trusted_provenance(directory)
-    assert validation.validate_sealed_arm(
-        directory,
-        trusted_provenance=trusted,
-    )["verdict"] == "PASS"
+    assert (
+        validation.validate_sealed_arm(
+            directory,
+            trusted_provenance=trusted,
+        )["verdict"]
+        == "PASS"
+    )
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation.validate_sealed_arm(
             directory,
@@ -954,10 +1052,13 @@ def test_fake_runtime_flow_reaches_valid_nonempty_sealed_arm_artifacts(
             if path.is_file():
                 assert path.stat().st_size > 0, path
         fixture._archive().verify_evidence_seal(directory)
-        assert validation.validate_sealed_arm(
-            directory,
-            trusted_provenance=_trusted_provenance(directory),
-        )["verdict"] == "PASS"
+        assert (
+            validation.validate_sealed_arm(
+                directory,
+                trusted_provenance=_trusted_provenance(directory),
+            )["verdict"]
+            == "PASS"
+        )
     assert set(issuer_by_arm.values()) == {native_fixture.ISSUER_PUBLIC_KEY}
 
 
@@ -1020,9 +1121,7 @@ def _add_epoch2_common_commit_witnesses(directory: Path) -> None:
     }
     for replica in native_fixture.SURVIVORS[: native_fixture.Q]:
         source_id = f"replica-{replica}"
-        source_events = [
-            event for event in events if event["source_id"] == source_id
-        ]
+        source_events = [event for event in events if event["source_id"] == source_id]
         events.append(
             {
                 "event_schema_version": 1,
@@ -1073,8 +1172,7 @@ def _add_complete_ready_barrier(
     events = _load_events(directory)
     run_id = str(events[0]["run_id"])
     by_source = {
-        str(event["source_id"]): str(event["source_instance"])
-        for event in events
+        str(event["source_id"]): str(event["source_instance"]) for event in events
     }
     expected = [*(f"replica-{replica}" for replica in range(31)), "adaptive-manager"]
     if include_client:
@@ -1087,7 +1185,9 @@ def _add_complete_ready_barrier(
             else "adaptation_manager" if source_id == "adaptive-manager" else "client"
         )
         instance = by_source.get(source_id, f"{run_id}-{source_id}")
-        for sequence, event_type in enumerate(("process.started", "process.ready"), start=1):
+        for sequence, event_type in enumerate(
+            ("process.started", "process.ready"), start=1
+        ):
             augmented.append(
                 {
                     "event_schema_version": 1,
@@ -1196,10 +1296,9 @@ def _add_complete_stable_phase_windows(directory: Path) -> None:
                 observation = payload["observation"]
                 predecessor = int(observation["configuration"]["epoch_number"])
                 base = 34 if predecessor == 0 else 81
-                event["source_monotonic_ns"] = (
-                    base * second
-                    + int(payload["ingestion_sequence"]) * (second // 10)
-                )
+                event["source_monotonic_ns"] = base * second + int(
+                    payload["ingestion_sequence"]
+                ) * (second // 10)
             elif event["event_type"] == "process.started":
                 sequence = int(event["source_sequence"])
                 if sequence == 1:
@@ -1301,10 +1400,7 @@ def test_raw_source_barriers_are_event_derived_and_span_configured_windows(
             )
         ]
         for event in partial_events:
-            if (
-                event["source_id"] == "replica-30"
-                and int(event["source_sequence"]) > 2
-            ):
+            if event["source_id"] == "replica-30" and int(event["source_sequence"]) > 2:
                 event["source_sequence"] = int(event["source_sequence"]) - 1
         _write_events(directory, partial_events)
         assert source.poll("readiness") is None
@@ -1575,10 +1671,13 @@ def test_common_commit_witness_requires_replica_source_kind_and_instance(
     assert isinstance(directory, Path)
     source = _raw_source(directory)
     assert source._common_commit(source._events(), 1)["block_height"] == 3
-    assert validation.validate_sealed_arm(
-        directory,
-        trusted_provenance=_trusted_provenance(directory),
-    )["verdict"] == "PASS"
+    assert (
+        validation.validate_sealed_arm(
+            directory,
+            trusted_provenance=_trusted_provenance(directory),
+        )["verdict"]
+        == "PASS"
+    )
 
     _reclassify_common_commit_witness_as_client(directory)
     if layer == "runtime":
@@ -1720,9 +1819,10 @@ def test_raw_envelope_evidence_source_rejects_runtime_graph_drift(
         receipt = json.loads(
             (directory / "raw" / "fault-receipt.json").read_text(encoding="utf-8")
         )
-        timestamp = max(
-            row["confirmed_monotonic_ns"] for row in receipt["sigkill_outcomes"]
-        ) + 1
+        timestamp = (
+            max(row["confirmed_monotonic_ns"] for row in receipt["sigkill_outcomes"])
+            + 1
+        )
         replica = 22 if mutation == "target-post-sigkill" else 27
         events.append(
             {
@@ -1824,13 +1924,564 @@ def _write_source_inventory(
         directory / "runtime" / "source-inventory.json",
         {
             "sources": sorted(
-                {
-                    (event["source_kind"], event["source_id"])
-                    for event in events
-                }
+                {(event["source_kind"], event["source_id"]) for event in events}
             )
         },
     )
+
+
+def _fcrash_h_record(event: Mapping[str, object]) -> object:
+    """Project one production-shaped manager acceptance into native replay input."""
+
+    payload = event["payload"]
+    assert isinstance(payload, dict)
+    observation = payload["observation"]
+    assert isinstance(observation, dict)
+    configuration = observation["configuration"]
+    assert isinstance(configuration, dict)
+    return native_fixture.factorial_validation._EvidenceRecord(
+        ingestion_sequence=int(payload["ingestion_sequence"]),
+        acceptance_monotonic_ns=int(event["source_monotonic_ns"]),
+        observation_id=str(observation["observation_id"]),
+        reporter_id=int(observation["reporter_id"]),
+        target_id=int(observation["observed_replica_id"]),
+        epoch_number=int(configuration["epoch_number"]),
+        tree_id=int(configuration["tree_id"]),
+        epoch_digest=str(configuration["epoch_digest"]),
+        block_hash=str(observation["block_hash"]),
+        message_type=str(observation["expected_message_type"]),
+        outcome=str(observation["outcome"]),
+        response_duration_us=int(observation["response_duration_us"]),
+        deadline_duration_us=int(observation["deadline_duration_us"]),
+        reporter_monotonic_ns=int(observation["reporter_monotonic_ns"]),
+        reporter_sequence=int(observation["reporter_sequence"]),
+        signer_set=tuple(observation["signer_set"]),
+        acceptance_source_sequence=int(event["source_sequence"]),
+        schema_version=int(observation["schema_version"]),
+    )
+
+
+def _fcrash_h_v2_child(child: dict[str, object]) -> Path:
+    """Seal an N31-v2 arm whose raw manager stream proves FCRASH-H itself.
+
+    This intentionally does not borrow a precomputed snapshot: all IDs below
+    are replayed from the manager observations written into the sealed child.
+    """
+
+    _complete_child(child, profile_path=runtime_fixture.N31_PROFILE_V2)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    validation = _validation()
+    contract = _document(validation.validation_contract_from_profile(directory))
+    coverage = contract["reporter_coverage_plan"]
+    assert isinstance(coverage, dict)
+    assert tuple(coverage["targets"][0]["authenticated_reporter_ids"]) == (
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        20,
+        21,
+        30,
+    )
+    receipt_path = directory / "raw" / "fault-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    fault_ns = max(
+        item["confirmed_monotonic_ns"] for item in receipt["sigkill_outcomes"]
+    )
+    prefault_ns = (
+        min(item["requested_monotonic_ns"] for item in receipt["sigkill_outcomes"]) - 1
+    )
+    active_tree_id = int(coverage["active_tree_id"])
+    epoch0_digest = str(contract["epoch_zero_digest"])
+
+    # Two on-time samples per survivor make the native responsiveness replay
+    # non-vacuous.  Each selected target gets exactly two timeout samples from
+    # every topology-derived common reporter.
+    attempts: list[tuple[int, int, str, int]] = []
+    timeout_tree_ids = {
+        (int(target["target_replica_id"]), int(first["reporter_id"])): int(
+            first["tree_id"]
+        )
+        for target in coverage["targets"]
+        for first in target["first_qualifying_reporters"]
+    }
+    for survivor in contract["survivors"]:
+        for attempt in range(2):
+            attempts.append((30, int(survivor), "on_time", attempt))
+    for target in coverage["targets"]:
+        assert isinstance(target, dict)
+        for reporter in target["authenticated_reporter_ids"]:
+            for attempt in range(2):
+                attempts.append(
+                    (
+                        int(reporter),
+                        int(target["target_replica_id"]),
+                        "timeout",
+                        attempt,
+                    )
+                )
+
+    manager_events: list[dict[str, object]] = [
+        {
+            "event_schema_version": 1,
+            "run_id": "",
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_instance": "",
+            "source_sequence": 1,
+            "source_monotonic_ns": fault_ns + 1,
+            "event_type": "process.started",
+            "payload": {"exit_status": None},
+        },
+        {
+            "event_schema_version": 1,
+            "run_id": "",
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_instance": "",
+            "source_sequence": 2,
+            "source_monotonic_ns": fault_ns + 2,
+            "event_type": "process.ready",
+            "payload": {"exit_status": None},
+        },
+    ]
+    reporter_sequences: dict[int, int] = {}
+    for ingestion, (reporter, target, outcome, attempt) in enumerate(attempts, start=1):
+        reporter_sequences[reporter] = reporter_sequences.get(reporter, 0) + 1
+        block_hash = hashlib.sha256(
+            f"fcrash-h-e0-{reporter}-{target}-{attempt}".encode("ascii")
+        ).hexdigest()
+        reporter_ns = fault_ns + 10 + ingestion
+        manager_events.append(
+            {
+                "event_schema_version": 1,
+                "run_id": "",
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": "",
+                "source_sequence": ingestion + 1,
+                "source_monotonic_ns": reporter_ns + 1,
+                "event_type": "evidence.observation_accepted",
+                "payload": {
+                    "ingestion_sequence": ingestion,
+                    "observation": {
+                        "schema_version": 1,
+                        "observation_id": native_fixture._observation_id(
+                            reporter_id=reporter,
+                            observed_replica_id=target,
+                            epoch_number=0,
+                            block_hash=block_hash,
+                            epoch_digest=epoch0_digest,
+                            tree_id=timeout_tree_ids.get((target, reporter), 0),
+                        ),
+                        "reporter_id": reporter,
+                        "observed_replica_id": target,
+                        "configuration": {
+                            "epoch_number": 0,
+                            "tree_id": timeout_tree_ids.get((target, reporter), 0),
+                            "epoch_digest": epoch0_digest,
+                        },
+                        "block_hash": block_hash,
+                        "expected_message_type": "direct_vote",
+                        "outcome": outcome,
+                        "response_duration_us": 100 if outcome == "on_time" else 0,
+                        "deadline_duration_us": 1_000,
+                        "reporter_monotonic_ns": reporter_ns,
+                        "reporter_sequence": reporter_sequences[reporter],
+                        "signer_set": [target] if outcome == "on_time" else [],
+                    },
+                },
+            }
+        )
+    events = _load_events(directory)
+    run_id = str(events[0]["run_id"])
+    instance = f"{run_id}-adaptive-manager"
+    for sequence, event in enumerate(manager_events, start=1):
+        event["run_id"] = run_id
+        event["source_instance"] = instance
+        event["source_sequence"] = sequence
+    records = [
+        _fcrash_h_record(event)
+        for event in manager_events
+        if event["event_type"] == "evidence.observation_accepted"
+    ]
+    cutoff = len(records)
+    full_snapshot_id = native_fixture.factorial_validation._snapshot_id(
+        records,
+        replica_count=native_fixture.N,
+        epoch_number=0,
+        epoch_digest=epoch0_digest,
+        cutoff=cutoff,
+        policy=native_fixture.NATIVE_RESPONSIVENESS_POLICY,
+        seed=native_fixture.NATIVE_SNAPSHOT_SEED,
+    )
+    selected_snapshot_id = native_fixture.factorial_validation._snapshot_id(
+        records,
+        replica_count=native_fixture.N,
+        epoch_number=0,
+        epoch_digest=epoch0_digest,
+        cutoff=cutoff,
+        policy=native_fixture.NATIVE_RESPONSIVENESS_POLICY,
+        seed=native_fixture.NATIVE_SNAPSHOT_SEED,
+    )
+    manager_events.append(
+        {
+            **manager_events[0],
+            "source_sequence": len(manager_events) + 1,
+            "source_monotonic_ns": max(
+                int(event["source_monotonic_ns"]) for event in manager_events
+            )
+            + 1,
+            "event_type": "adaptive_v2_evidence_snapshot",
+            "payload": {
+                "schema_version": 2,
+                "cycle_ordinal": 0,
+                "policy_intent": "fault_containment",
+                "transition_artifact_id": "e0-to-e1-containment",
+                "predecessor_epoch_number": 0,
+                "predecessor_epoch_digest": epoch0_digest,
+                "activation_generation": 1,
+                "baseline_cutoff": 0,
+                "current_cutoff": cutoff,
+                "full_prefix_snapshot_id": full_snapshot_id,
+                "evidence_snapshot_id": selected_snapshot_id,
+                "accepted_prefix_count": cutoff,
+                "eligible_ranking": list(range(native_fixture.Q)),
+            },
+        }
+    )
+    epoch1_wire, epoch1 = native_fixture._encode_native_epoch_bundle(
+        1,
+        epoch0_digest,
+        native_fixture.NATIVE_SNAPSHOT_SEED,
+        native_fixture.NATIVE_PLACEMENT_POLICY,
+        native_fixture.E1_TREES,
+        evidence_snapshot_id=selected_snapshot_id,
+        evidence_cutoff=cutoff,
+    )
+
+    ranking_events = deepcopy(native_fixture._accepted_ranking_evidence())
+    ranking_base_ns = 12_000_000_000
+    for offset, event in enumerate(ranking_events, start=1):
+        event["run_id"] = run_id
+        event["source_instance"] = instance
+        event["source_sequence"] = len(manager_events) + offset
+        event["source_monotonic_ns"] = ranking_base_ns + offset
+        payload = event["payload"]
+        if event["event_type"] != "evidence.observation_accepted":
+            continue
+        observation = payload["observation"]
+        configuration = observation["configuration"]
+        configuration["epoch_digest"] = epoch1.epoch_digest
+        observation["reporter_monotonic_ns"] = ranking_base_ns + offset - 1
+        observation["observation_id"] = native_fixture._observation_id(
+            reporter_id=int(observation["reporter_id"]),
+            observed_replica_id=int(observation["observed_replica_id"]),
+            epoch_number=1,
+            block_hash=str(observation["block_hash"]),
+            epoch_digest=epoch1.epoch_digest,
+        )
+    ranking_records = [
+        _fcrash_h_record(event)
+        for event in ranking_events
+        if event["event_type"] == "evidence.observation_accepted"
+    ]
+    ranking_full = native_fixture.factorial_validation._snapshot_id(
+        ranking_records,
+        replica_count=native_fixture.N,
+        epoch_number=1,
+        epoch_digest=epoch1.epoch_digest,
+        cutoff=native_fixture.EVIDENCE_CUTOFF,
+        policy=native_fixture.NATIVE_RESPONSIVENESS_POLICY,
+        seed=native_fixture.NATIVE_SNAPSHOT_SEED,
+    )
+    ranking_selected = native_fixture.factorial_validation._snapshot_id(
+        native_fixture.factorial_validation._snapshot_records(
+            ranking_records,
+            baseline_cutoff=native_fixture.BASELINE_EVIDENCE_CUTOFF,
+            current_cutoff=native_fixture.EVIDENCE_CUTOFF,
+            suffix_only=True,
+        ),
+        replica_count=native_fixture.N,
+        epoch_number=1,
+        epoch_digest=epoch1.epoch_digest,
+        cutoff=native_fixture.EVIDENCE_CUTOFF,
+        policy=native_fixture.NATIVE_RESPONSIVENESS_POLICY,
+        seed=native_fixture.NATIVE_SNAPSHOT_SEED,
+    )
+    audit = next(
+        event
+        for event in ranking_events
+        if event["event_type"] == "adaptive_v2_evidence_snapshot"
+    )
+    audit["payload"]["predecessor_epoch_digest"] = epoch1.epoch_digest
+    audit["payload"]["full_prefix_snapshot_id"] = ranking_full
+    audit["payload"]["evidence_snapshot_id"] = ranking_selected
+    epoch2_wire, epoch2 = native_fixture._encode_native_epoch_bundle(
+        2,
+        epoch1.epoch_digest,
+        native_fixture.NATIVE_SNAPSHOT_SEED,
+        native_fixture.NATIVE_PLACEMENT_POLICY,
+        native_fixture.E2_TREES,
+        evidence_snapshot_id=ranking_selected,
+        evidence_cutoff=native_fixture.EVIDENCE_CUTOFF,
+    )
+
+    # The audit must remain after all its accepted observations but before the
+    # containment/optimization events whose payloads bind the new digests.
+    events = (
+        [event for event in events if event["source_kind"] != "adaptation_manager"]
+        + manager_events
+        + ranking_events
+    )
+    for replica in range(native_fixture.N):
+        source = f"replica-{replica}"
+        source_events = [event for event in events if event["source_id"] == source]
+        source_instance = (
+            str(source_events[0]["source_instance"])
+            if source_events
+            else f"{run_id}-{source}"
+        )
+        for offset, event_type in enumerate(
+            ("process.started", "process.ready"), start=2
+        ):
+            events.append(
+                {
+                    "event_schema_version": 1,
+                    "run_id": run_id,
+                    "source_kind": "replica",
+                    "source_id": source,
+                    "source_instance": source_instance,
+                    "source_sequence": 0,
+                    "source_monotonic_ns": prefault_ns - offset,
+                    "event_type": event_type,
+                    "payload": {"exit_status": None},
+                }
+            )
+        events.append(
+            {
+                "event_schema_version": 1,
+                "run_id": run_id,
+                "source_kind": "replica",
+                "source_id": source,
+                "source_instance": source_instance,
+                "source_sequence": (
+                    1
+                    if not source_events
+                    else min(int(event["source_sequence"]) for event in source_events)
+                    - 1
+                ),
+                "source_monotonic_ns": prefault_ns,
+                "event_type": "adaptive.configuration_active",
+                "payload": {
+                    "epoch_number": 0,
+                    "tree_id": active_tree_id,
+                    "epoch_digest": epoch0_digest,
+                },
+            }
+        )
+    for event in events:
+        payload = event["payload"]
+        if event["event_type"] == "epoch.command_committed":
+            successor = int(payload["successor_epoch_number"])
+            event["payload"] = fixture._command_payload(
+                epoch1 if successor == 1 else epoch2,
+                int(payload["command_block_height"]),
+            )
+            event["source_monotonic_ns"] = (
+                8_000_000_000 if successor == 1 else 14_000_000_000
+            )
+        elif event["event_type"] == "epoch.activated":
+            epoch = int(payload["epoch_number"])
+            payload["epoch_digest"] = (epoch1 if epoch == 1 else epoch2).epoch_digest
+            event["source_monotonic_ns"] = (
+                9_000_000_000 if epoch == 1 else 15_000_000_000
+            )
+        elif event["event_type"] == "block.committed":
+            proof = payload.get("decision_proof")
+            if isinstance(proof, dict) and proof.get("epoch_number") == 1:
+                proof["epoch_digest"] = epoch1.epoch_digest
+            elif isinstance(proof, dict) and proof.get("epoch_number") == 2:
+                proof["epoch_digest"] = epoch2.epoch_digest
+    (directory / "raw" / "epoch1.bundle").write_bytes(epoch1_wire)
+    (directory / "raw" / "epoch2.bundle").write_bytes(epoch2_wire)
+    sources: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    for event in events:
+        sources.setdefault(
+            (
+                str(event["source_kind"]),
+                str(event["source_id"]),
+                str(event["source_instance"]),
+            ),
+            [],
+        ).append(event)
+    for source_events in sources.values():
+        source_events.sort(key=lambda event: int(event["source_monotonic_ns"]))
+        for sequence, event in enumerate(source_events, start=1):
+            event["source_sequence"] = sequence
+    events.sort(
+        key=lambda event: (
+            str(event["source_kind"]),
+            str(event["source_id"]),
+            str(event["source_instance"]),
+            int(event["source_sequence"]),
+        )
+    )
+    _write_events(directory, events)
+    _write_source_inventory(directory, events)
+    _reseal(directory)
+    return directory
+
+
+def test_sealed_n31_v2_fcrash_h_native_fixture_passes(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    assert (
+        _validation().validate_sealed_arm(
+            directory, trusted_provenance=_trusted_provenance(directory)
+        )["verdict"]
+        == "PASS"
+    )
+
+
+def test_raw_n31_v2_nonresponse_and_epoch1_share_the_native_audit(
+    tmp_path: Path,
+) -> None:
+    """The audit follows its evidence and atomically produces Epoch 1."""
+
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    source = _raw_source(directory)
+    nonresponse = source.poll("nonresponse")
+    epoch1 = source.poll("epoch1")
+    assert nonresponse is not None
+    assert epoch1 is not None
+    assert int(nonresponse["source_monotonic_ns"]) < int(
+        nonresponse["snapshot_audit_monotonic_ns"]
+    )
+    assert epoch1["source_monotonic_ns"] == nonresponse["snapshot_audit_monotonic_ns"]
+
+
+@pytest.mark.parametrize(("epoch", "phase"), ((1, "epoch1"), (2, "epoch2")))
+def test_raw_n31_v2_bundle_must_match_its_replayed_snapshot(
+    epoch: int,
+    phase: str,
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    bundle_path = directory / "raw" / f"epoch{epoch}.bundle"
+    decoded = native_fixture.factorial_validation.decode_epoch_change_bundle(
+        bundle_path.read_bytes(),
+        issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
+    )
+    wire, _changed = native_fixture._encode_native_epoch_bundle(
+        epoch,
+        decoded.previous_epoch_digest,
+        decoded.generation_seed,
+        decoded.policy_version,
+        [asdict(tree) for tree in decoded.trees],
+        evidence_snapshot_id="f" * 64,
+        evidence_cutoff=decoded.evidence_cutoff,
+    )
+    bundle_path.write_bytes(wire)
+    with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
+        _raw_source(directory).poll(phase)
+
+
+def test_sealed_n31_v2_epoch2_bundle_must_match_replayed_snapshot(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    bundle_path = directory / "raw" / "epoch2.bundle"
+    decoded = native_fixture.factorial_validation.decode_epoch_change_bundle(
+        bundle_path.read_bytes(),
+        issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
+    )
+    wire, changed = native_fixture._encode_native_epoch_bundle(
+        2,
+        decoded.previous_epoch_digest,
+        decoded.generation_seed,
+        decoded.policy_version,
+        [asdict(tree) for tree in decoded.trees],
+        evidence_snapshot_id="f" * 64,
+        evidence_cutoff=decoded.evidence_cutoff,
+    )
+    bundle_path.write_bytes(wire)
+    events = _load_events(directory)
+    for event in events:
+        payload = event["payload"]
+        if (
+            event["event_type"] == "epoch.command_committed"
+            and payload["successor_epoch_number"] == 2
+        ):
+            event["payload"] = fixture._command_payload(
+                changed, int(payload["command_block_height"])
+            )
+        elif event["event_type"] == "epoch.activated" and payload["epoch_number"] == 2:
+            payload["epoch_digest"] = changed.epoch_digest
+        elif event["event_type"] == "block.committed":
+            proof = payload.get("decision_proof")
+            if isinstance(proof, dict) and proof.get("epoch_number") == 2:
+                proof["epoch_digest"] = changed.epoch_digest
+    _write_events(directory, events)
+    _reseal(directory)
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation.validate_sealed_arm(
+            directory, trusted_provenance=_trusted_provenance(directory)
+        )
+
+
+def test_sealed_n31_v2_epoch2_command_must_follow_its_snapshot_audit(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    events = _load_events(directory)
+    command_ns = min(
+        int(event["source_monotonic_ns"])
+        for event in events
+        if event["event_type"] == "epoch.command_committed"
+        and event["payload"]["successor_epoch_number"] == 2
+    )
+    audit = next(
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v2_evidence_snapshot"
+        and event["payload"]["predecessor_epoch_number"] == 1
+    )
+    audit["source_monotonic_ns"] = command_ns + 1
+    _write_events(directory, events)
+    _reseal(directory)
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation.validate_sealed_arm(
+            directory, trusted_provenance=_trusted_provenance(directory)
+        )
 
 
 def _reclassify_common_commit_witness_as_client(directory: Path) -> None:
@@ -1934,8 +2585,7 @@ def test_commit_reconstruction_uses_profile_windows_and_fault_lifetime(
             for event in events
             if event["source_kind"] == "adaptation_manager"
             and event["event_type"] == "evidence.observation_accepted"
-            and event["payload"]["observation"]["configuration"]["epoch_number"]
-            == 1
+            and event["payload"]["observation"]["configuration"]["epoch_number"] == 1
         ]
         records = []
         for event in accepted:
@@ -2009,13 +2659,15 @@ def test_commit_reconstruction_uses_profile_windows_and_fault_lifetime(
         (directory / "raw" / "epoch2.bundle").write_bytes(epoch2_wire)
         for event in events:
             payload = event["payload"]
-            if event["event_type"] == "epoch.command_committed" and payload.get(
-                "successor_epoch_number"
-            ) == 2:
+            if (
+                event["event_type"] == "epoch.command_committed"
+                and payload.get("successor_epoch_number") == 2
+            ):
                 event["payload"] = fixture._command_payload(epoch2, 11)
-            elif event["event_type"] == "epoch.activated" and payload.get(
-                "epoch_number"
-            ) == 2:
+            elif (
+                event["event_type"] == "epoch.activated"
+                and payload.get("epoch_number") == 2
+            ):
                 payload["epoch_digest"] = epoch2.epoch_digest
             elif event["event_type"] == "block.committed":
                 proof = payload.get("decision_proof")
@@ -2044,7 +2696,9 @@ def test_commit_reconstruction_uses_profile_windows_and_fault_lifetime(
                 "source_id": "replica-22",
                 "source_instance": f"{events[0]['run_id']}-replica-22",
                 "source_kind": "replica",
-                "source_monotonic_ns": confirmation - 1 if accepted else confirmation + 1,
+                "source_monotonic_ns": (
+                    confirmation - 1 if accepted else confirmation + 1
+                ),
                 "source_sequence": 1,
             }
         )
@@ -2053,10 +2707,13 @@ def test_commit_reconstruction_uses_profile_windows_and_fault_lifetime(
     _reseal(directory)
     trusted = _trusted_provenance(directory)
     if accepted:
-        assert validation.validate_sealed_arm(
-            directory,
-            trusted_provenance=trusted,
-        )["verdict"] == "PASS"
+        assert (
+            validation.validate_sealed_arm(
+                directory,
+                trusted_provenance=trusted,
+            )["verdict"]
+            == "PASS"
+        )
     else:
         with pytest.raises(validation.FocusedCrashPairValidationError):
             validation.validate_sealed_arm(
@@ -2076,10 +2733,13 @@ def test_commit_reconstruction_accepts_all_unique_authoritative_commits(
     _complete_child(child)
     directory = child["sealed_child_directory"]
     assert isinstance(directory, Path)
-    assert validation.validate_sealed_arm(
-        directory,
-        trusted_provenance=_trusted_provenance(directory),
-    )["verdict"] == "PASS"
+    assert (
+        validation.validate_sealed_arm(
+            directory,
+            trusted_provenance=_trusted_provenance(directory),
+        )["verdict"]
+        == "PASS"
+    )
     events = _load_events(directory)
     commits = [event for event in events if event["event_type"] == "block.committed"]
     last = max(commits, key=lambda event: event["payload"]["block_height"])
@@ -2089,11 +2749,15 @@ def test_commit_reconstruction_accepts_all_unique_authoritative_commits(
     extra_payload["parent_hash"] = last["payload"]["block_hash"]
     extra_payload["block_hash"] = "f" * 64
     extra_payload["decision_proof"]["block_hash"] = extra_payload["block_hash"]
-    source_events = [event for event in events if event["source_id"] == extra["source_id"]]
-    extra["source_sequence"] = max(event["source_sequence"] for event in source_events) + 1
-    extra["source_monotonic_ns"] = max(
-        event["source_monotonic_ns"] for event in source_events
-    ) + 1
+    source_events = [
+        event for event in events if event["source_id"] == extra["source_id"]
+    ]
+    extra["source_sequence"] = (
+        max(event["source_sequence"] for event in source_events) + 1
+    )
+    extra["source_monotonic_ns"] = (
+        max(event["source_monotonic_ns"] for event in source_events) + 1
+    )
     events.append(extra)
     _write_events(directory, events)
     _write_source_inventory(directory, events)
@@ -2119,10 +2783,13 @@ def test_sealed_common_commit_uses_latest_eligible_q_witnessed_identity(
     _complete_child(child)
     directory = child["sealed_child_directory"]
     assert isinstance(directory, Path)
-    assert validation.validate_sealed_arm(
-        directory,
-        trusted_provenance=_trusted_provenance(directory),
-    )["verdict"] == "PASS"
+    assert (
+        validation.validate_sealed_arm(
+            directory,
+            trusted_provenance=_trusted_provenance(directory),
+        )["verdict"]
+        == "PASS"
+    )
 
     if mutation == "multiple":
         _add_epoch2_common_commit_witnesses(directory)
@@ -2137,9 +2804,7 @@ def test_sealed_common_commit_uses_latest_eligible_q_witnessed_identity(
 
     events = _load_events(directory)
     observations = [
-        event
-        for event in events
-        if event["event_type"] == "block.commit_observed"
+        event for event in events if event["event_type"] == "block.commit_observed"
     ]
     assert len(observations) == native_fixture.Q
     if mutation == "conflicting":
@@ -2183,19 +2848,20 @@ def test_sealed_arm_rejects_runtime_graph_or_identity_drift(
     validation = _validation()
     plan = fixture._plan(fixture._runner())
     child = next(
-        item
-        for item in fixture._children(plan, tmp_path)
-        if item["arm"] == "adaptive"
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
     )
     _complete_child(child)
     directory = child["sealed_child_directory"]
     assert isinstance(directory, Path)
-    assert _document(
-        validation.validate_sealed_arm(
-            directory,
-            trusted_provenance=_trusted_provenance(directory),
-        )
-    )["verdict"] == "PASS"
+    assert (
+        _document(
+            validation.validate_sealed_arm(
+                directory,
+                trusted_provenance=_trusted_provenance(directory),
+            )
+        )["verdict"]
+        == "PASS"
+    )
 
     events = _load_events(directory)
     if mutation == "source-order":
@@ -2382,12 +3048,15 @@ def test_pair_and_campaign_consume_full_ledger_without_retry_and_keep_unfavorabl
     pair_parent_seal = fixture._archive().create_evidence_seal(pair_root)
     assert fixture._archive().verify_evidence_seal(pair_root) == pair_parent_seal
     pair_trusted = _aggregate_trusted_provenance(pair_root, pair_children)
-    assert len(
-        {
-            (entry["tree_sha256"], entry["seal_sha256"])
-            for entry in pair_trusted["children"].values()
-        }
-    ) == 2
+    assert (
+        len(
+            {
+                (entry["tree_sha256"], entry["seal_sha256"])
+                for entry in pair_trusted["children"].values()
+            }
+        )
+        == 2
+    )
     pair = _document(
         validation.validate_sealed_pair(
             pair_root,
@@ -2408,8 +3077,7 @@ def test_pair_and_campaign_consume_full_ledger_without_retry_and_keep_unfavorabl
     ]
     ledger = fixture._ledger(plan)
     assert [
-        (slot["slot_id"], slot["pair_id"], slot["arm"])
-        for slot in plan["slots"]
+        (slot["slot_id"], slot["pair_id"], slot["arm"]) for slot in plan["slots"]
     ] == [
         (slot["slot_id"], slot["pair_id"], slot["arm"])
         for slot in fixture._expected_slots()
@@ -2427,19 +3095,21 @@ def test_pair_and_campaign_consume_full_ledger_without_retry_and_keep_unfavorabl
     )
     campaign_parent_seal = fixture._archive().create_evidence_seal(campaign_root)
     assert (
-        fixture._archive().verify_evidence_seal(campaign_root)
-        == campaign_parent_seal
+        fixture._archive().verify_evidence_seal(campaign_root) == campaign_parent_seal
     )
     campaign_trusted = _aggregate_trusted_provenance(
         campaign_root,
         copied_children,
     )
-    assert len(
-        {
-            (entry["tree_sha256"], entry["seal_sha256"])
-            for entry in campaign_trusted["children"].values()
-        }
-    ) == 10
+    assert (
+        len(
+            {
+                (entry["tree_sha256"], entry["seal_sha256"])
+                for entry in campaign_trusted["children"].values()
+            }
+        )
+        == 10
+    )
     campaign = _document(
         validation.validate_sealed_campaign(
             campaign_root,
@@ -2451,7 +3121,9 @@ def test_pair_and_campaign_consume_full_ledger_without_retry_and_keep_unfavorabl
     assert campaign["pair_count"] == 5
     assert campaign["automatic_retries"] == 0
     assert campaign["replacement_policy"] == "none"
-    assert any(pair["scientific_outcome"] == "UNFAVORABLE" for pair in campaign["pairs"])
+    assert any(
+        pair["scientific_outcome"] == "UNFAVORABLE" for pair in campaign["pairs"]
+    )
     assert campaign["figure_eligible"] is True
 
     truncated = ledger[:-1]
@@ -2510,17 +3182,18 @@ def test_sealed_pair_requires_one_exact_issuer_identity_across_arms(
         },
     )
     fixture._archive().create_evidence_seal(pair_root)
-    assert validation.validate_sealed_pair(
-        pair_root,
-        trusted_provenance=_aggregate_trusted_provenance(pair_root, children),
-    )["verdict"] == "PASS"
+    assert (
+        validation.validate_sealed_pair(
+            pair_root,
+            trusted_provenance=_aggregate_trusted_provenance(pair_root, children),
+        )["verdict"]
+        == "PASS"
+    )
 
     adaptive = next(child for child in children if child["arm"] == "adaptive")
     adaptive_directory = adaptive["sealed_child_directory"]
     assert isinstance(adaptive_directory, Path)
-    independent_public_key = _resign_child_with_independent_issuer(
-        adaptive_directory
-    )
+    independent_public_key = _resign_child_with_independent_issuer(adaptive_directory)
     assert independent_public_key != native_fixture.ISSUER_PUBLIC_KEY
     adaptive_seal = fixture._archive().verify_evidence_seal(adaptive_directory)
     receipt_path = pair_root / "pair-receipt.json"
@@ -2532,10 +3205,13 @@ def test_sealed_pair_requires_one_exact_issuer_identity_across_arms(
     adaptive_entry["seal_sha256"] = adaptive_seal.seal_sha256
     _write_json(receipt_path, receipt)
     _reseal(pair_root)
-    assert validation.validate_sealed_arm(
-        adaptive_directory,
-        trusted_provenance=_trusted_provenance(adaptive_directory),
-    )["verdict"] == "PASS"
+    assert (
+        validation.validate_sealed_arm(
+            adaptive_directory,
+            trusted_provenance=_trusted_provenance(adaptive_directory),
+        )["verdict"]
+        == "PASS"
+    )
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation.validate_sealed_pair(
             pair_root,
