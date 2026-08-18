@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 import hashlib
 import importlib
 import inspect
@@ -2514,7 +2514,44 @@ def test_manager_clean_exit_preserves_fail_closed_exit_identity(
         timeout_s=1,
         process_records=records,
     )
-    assert source.unexpected_exit_ids() == expected
+    if mutation == "malformed-terminal":
+        with pytest.raises(
+            runtime_fixture._runtime().FocusedCrashPairRuntimeError,
+            match="manager terminal schema drifted",
+        ):
+            source.unexpected_exit_ids()
+    else:
+        assert source.unexpected_exit_ids() == expected
+
+
+def test_raw_terminal_failure_detail_is_required_only_for_v4_profiles(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    events = _load_events(directory)
+    terminal = next(
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v2_session_terminal"
+    )
+    terminal["payload"]["reason"] = "controller_unhealthy"
+    _write_events(directory, events)
+    legacy = _raw_source(directory)
+    assert legacy._events()
+    v4 = _raw_source(directory)
+    v4._profile = replace(v4._profile, profile_id="n7-f2-q5-two-crash-pair-smoke-v4")
+    with pytest.raises(
+        runtime_fixture._runtime().FocusedCrashPairRuntimeError,
+        match="manager terminal controller failure drifted",
+    ):
+        v4._events()
 
 
 @pytest.mark.parametrize(

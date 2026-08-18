@@ -109,6 +109,74 @@ def _error(message: str) -> None:
     raise FocusedCrashPairValidationError(message)
 
 
+def _validate_controller_failure_terminal(
+    payload: Mapping[str, Any], *, require_for_unhealthy: bool
+) -> bool:
+    """Validate the sealed diagnostic controller-failure projection."""
+
+    unhealthy = payload.get("reason") == "controller_unhealthy"
+    present = "controller_failure" in payload
+    detail = payload.get("controller_failure")
+    if (
+        (require_for_unhealthy and unhealthy and not present)
+        or (unhealthy and present and detail is None)
+        or (not unhealthy and detail is not None)
+    ):
+        return False
+    if detail is None:
+        return True
+    if not isinstance(detail, Mapping) or set(detail) != {
+        "stage",
+        "selection_status",
+        "epoch_factory_status",
+    }:
+        return False
+    fatal_selection_statuses = {
+        "invalid_state",
+        "invalid_cutoff",
+        "ledger_unhealthy",
+        "mixed_epoch",
+        "nonmember_evidence",
+        "projection_failed",
+        "capacity_exceeded",
+        "snapshot_failed",
+        "internal_failure",
+    }
+    factory_statuses = {
+        "invalid_current_epoch",
+        "epoch_number_exhausted",
+        "invalid_selection",
+        "epoch_mismatch",
+        "membership_mismatch",
+        "root_mismatch",
+        "tree_count_mismatch",
+        "insufficient_leaf_capacity",
+        "invalid_activation_delay",
+        "capacity_exceeded",
+        "placement_failed",
+        "authorization_failed",
+        "bundle_failed",
+        "internal_failure",
+    }
+    stage = detail.get("stage")
+    selection = detail.get("selection_status")
+    factory = detail.get("epoch_factory_status")
+    if stage == "operational_precondition":
+        return selection is None and factory is None
+    if stage == "baseline_selection":
+        return (
+            selection in fatal_selection_statuses | {"baseline_frozen"}
+            and factory is None
+        )
+    if stage == "guarded_selection":
+        return selection in fatal_selection_statuses and factory is None
+    return (
+        stage == "successor_factory"
+        and selection == "selected"
+        and factory in factory_statuses
+    )
+
+
 def _authoritative_lifecycle_instance(
     events: Sequence[Mapping[str, Any]], expected_source: str
 ) -> str:
@@ -1327,6 +1395,8 @@ def _read_jsonl(path: Path, source_kind: str) -> list[dict[str, Any]]:
 
 def _validate_sources(
     root: Path,
+    *,
+    require_controller_failure: bool = False,
 ) -> tuple[list[dict[str, Any]], list[list[str]]]:
     events = [
         *_read_jsonl(root / "raw" / "replica-events.jsonl", "replica"),
@@ -1367,6 +1437,14 @@ def _validate_sources(
     )
     if recorded_inventory.get("sources") != recorded_sources:
         _error("recorded source inventory differs from raw envelopes")
+    for event in events:
+        if event[
+            "event_type"
+        ] == "adaptive_v2_session_terminal" and not _validate_controller_failure_terminal(
+            _mapping(event["payload"], "manager terminal"),
+            require_for_unhealthy=require_controller_failure,
+        ):
+            _error("manager terminal controller failure detail drifted")
     return events, inventory
 
 
@@ -2524,7 +2602,12 @@ def validate_sealed_arm(
     if dict(trusted_provenance) != expected_provenance:
         _error("trusted provenance is not exact or child-seal-bound")
     _validate_runtime_configuration(root, contract)
-    events, source_inventory = _validate_sources(root)
+    events, source_inventory = _validate_sources(
+        root,
+        require_controller_failure=str(
+            _mapping(contract["profile"], "focused profile").get("profile_id")
+        ).endswith("-v4"),
+    )
 
     issuer_path = root / "raw" / "issuer-public-key.txt"
     if issuer_path.is_symlink() or not issuer_path.is_file():

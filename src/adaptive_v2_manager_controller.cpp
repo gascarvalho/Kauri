@@ -290,10 +290,19 @@ struct AdaptiveV2ManagerController::State
         return locally_healthy && ingress.healthy() && selector.healthy();
     }
 
-    AdaptiveV2ManagerControllerStatus fail_closed() noexcept
+    AdaptiveV2ManagerControllerStatus fail_closed(
+        std::optional<AdaptiveV2ManagerControllerFailureDetail>
+            detail = std::nullopt) noexcept
     {
+        if (!failure && detail.has_value())
+            failure = std::move(detail);
         locally_healthy = false;
         return AdaptiveV2ManagerControllerStatus::unhealthy;
+    }
+
+    AdaptiveV2ManagerControllerStatus fail_operational() noexcept
+    {
+        return fail_closed(AdaptiveV2ManagerControllerFailureDetail{});
     }
 
     AdaptiveV2ManagerControllerStatus freeze_baseline(
@@ -335,7 +344,7 @@ struct AdaptiveV2ManagerController::State
             static_cast<std::size_t>(
                 ingress.quorum_metadata().quorum));
         if (baseline == BaselineSnapshotStatus::invalid)
-            return fail_closed();
+            return fail_operational();
         if (baseline == BaselineSnapshotStatus::incomplete)
         {
             return AdaptiveV2ManagerControllerStatus::
@@ -348,7 +357,10 @@ struct AdaptiveV2ManagerController::State
             selector.baseline_cutoff() != cutoff ||
             selector.current_cutoff() != cutoff)
         {
-            return fail_closed();
+            return fail_closed(AdaptiveV2ManagerControllerFailureDetail{
+                AdaptiveV2ManagerControllerFailureStage::baseline_selection,
+                frozen,
+                std::nullopt});
         }
         baseline_snapshot = std::move(candidate);
         return AdaptiveV2ManagerControllerStatus::baseline_frozen;
@@ -357,13 +369,13 @@ struct AdaptiveV2ManagerController::State
     AdaptiveV2ManagerControllerStatus build_successor()
     {
         if (factory_attempted)
-            return fail_closed();
+            return fail_operational();
         factory_attempted = true;
 
         if (latest_selection == nullptr ||
             latest_selection->snapshot == nullptr)
         {
-            return fail_closed();
+            return fail_operational();
         }
         const auto &snapshot = *latest_selection->snapshot;
         if (snapshot.epoch() != epoch ||
@@ -371,7 +383,7 @@ struct AdaptiveV2ManagerController::State
                 latest_selection->metadata.evidence_cutoff ||
             snapshot.evidence_cutoff() != selector.current_cutoff())
         {
-            return fail_closed();
+            return fail_operational();
         }
 
         auto placement = config.placement;
@@ -395,7 +407,7 @@ struct AdaptiveV2ManagerController::State
                                 placement.shape.pipeline_stretch;
                     }))
             {
-                return fail_closed();
+                return fail_operational();
             }
         }
         else
@@ -438,7 +450,7 @@ struct AdaptiveV2ManagerController::State
                 !finalize_shape_v1_application(
                     decision, config.shape_adaptation_enabled))
             {
-                return fail_closed();
+                return fail_operational();
             }
             placement.shape.fanout = decision.current_fanout;
             if (placement.shape.tree_count != decision.tree_count ||
@@ -463,7 +475,16 @@ struct AdaptiveV2ManagerController::State
             config.issuer_private_key,
             config.bundle_limits);
         if (!built || built.bundle == nullptr)
-            return fail_closed();
+        {
+            const auto factory_status =
+                built.status == AdaptiveV2EpochFactoryStatus::success
+                    ? AdaptiveV2EpochFactoryStatus::internal_failure
+                    : built.status;
+            return fail_closed(AdaptiveV2ManagerControllerFailureDetail{
+                AdaptiveV2ManagerControllerFailureStage::successor_factory,
+                AdaptiveV2SelectionStatus::selected,
+                factory_status});
+        }
         if (preserve_initial_containment_shape &&
             (built.bundle->definition().trees.empty() ||
              !std::all_of(
@@ -476,7 +497,7 @@ struct AdaptiveV2ManagerController::State
                              placement.shape.pipeline_stretch;
                  })))
         {
-            return fail_closed();
+            return fail_operational();
         }
         successor = std::move(built.bundle);
         return AdaptiveV2ManagerControllerStatus::successor_ready;
@@ -486,7 +507,7 @@ struct AdaptiveV2ManagerController::State
         std::uint64_t cutoff)
     {
         if (cutoff < selector.current_cutoff())
-            return fail_closed();
+            return fail_operational();
         if (cutoff == selector.current_cutoff())
         {
             return AdaptiveV2ManagerControllerStatus::
@@ -506,13 +527,16 @@ struct AdaptiveV2ManagerController::State
                            : selector.select_through(cutoff);
             break;
         default:
-            return fail_closed();
+            return fail_operational();
         }
         latest_selection =
             std::make_unique<AdaptiveV2SelectionResult>(
                 std::move(selected));
         if (!selector.healthy())
-            return fail_closed();
+            return fail_closed(AdaptiveV2ManagerControllerFailureDetail{
+                AdaptiveV2ManagerControllerFailureStage::guarded_selection,
+                latest_selection->status,
+                std::nullopt});
 
         switch (latest_selection->status)
         {
@@ -532,7 +556,10 @@ struct AdaptiveV2ManagerController::State
         case AdaptiveV2SelectionStatus::capacity_exceeded:
         case AdaptiveV2SelectionStatus::snapshot_failed:
         case AdaptiveV2SelectionStatus::internal_failure:
-            return fail_closed();
+            return fail_closed(AdaptiveV2ManagerControllerFailureDetail{
+                AdaptiveV2ManagerControllerFailureStage::guarded_selection,
+                latest_selection->status,
+                std::nullopt});
         }
         return build_successor();
     }
@@ -551,6 +578,7 @@ struct AdaptiveV2ManagerController::State
     bool baseline_examined{false};
     bool factory_attempted{false};
     bool locally_healthy{true};
+    std::optional<AdaptiveV2ManagerControllerFailureDetail> failure;
 };
 
 AdaptiveV2ManagerController::AdaptiveV2ManagerController(
@@ -568,7 +596,7 @@ AdaptiveV2ManagerController::evaluate() noexcept
     try
     {
         if (!state.operational())
-            return state.fail_closed();
+            return state.fail_operational();
         if (state.successor != nullptr)
             return AdaptiveV2ManagerControllerStatus::already_ready;
         if (!state.ingress.operationally_ready())
@@ -581,7 +609,7 @@ AdaptiveV2ManagerController::evaluate() noexcept
     }
     catch (...)
     {
-        return state.fail_closed();
+        return state.fail_operational();
     }
 }
 
@@ -613,6 +641,12 @@ const ShapeDecisionRecord *
 AdaptiveV2ManagerController::shape_decision() const noexcept
 {
     return state_->shape_decision.get();
+}
+
+const AdaptiveV2ManagerControllerFailureDetail *
+AdaptiveV2ManagerController::failure_detail() const noexcept
+{
+    return state_->failure ? &*state_->failure : nullptr;
 }
 
 std::uint64_t

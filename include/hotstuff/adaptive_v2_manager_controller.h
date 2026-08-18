@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "hotstuff/adaptive_v2_epoch_factory.h"
@@ -40,6 +41,22 @@ enum class AdaptiveV2ManagerControllerStatus : std::uint8_t
     successor_ready,
     already_ready,
     unhealthy,
+};
+
+enum class AdaptiveV2ManagerControllerFailureStage : std::uint8_t
+{
+    operational_precondition = 1,
+    baseline_selection,
+    guarded_selection,
+    successor_factory,
+};
+
+struct AdaptiveV2ManagerControllerFailureDetail
+{
+    AdaptiveV2ManagerControllerFailureStage stage{
+        AdaptiveV2ManagerControllerFailureStage::operational_precondition};
+    std::optional<AdaptiveV2SelectionStatus> selection_status;
+    std::optional<AdaptiveV2EpochFactoryStatus> epoch_factory_status;
 };
 
 /**
@@ -76,6 +93,8 @@ public:
     score_trajectory() const noexcept;
     const AdaptiveV2EpochChangeBundle *successor_bundle() const noexcept;
     const ShapeDecisionRecord *shape_decision() const noexcept;
+    const AdaptiveV2ManagerControllerFailureDetail *
+    failure_detail() const noexcept;
 
     std::uint64_t baseline_cutoff() const noexcept;
     std::uint64_t current_cutoff() const noexcept;

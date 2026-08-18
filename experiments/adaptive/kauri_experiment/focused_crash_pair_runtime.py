@@ -169,6 +169,74 @@ def _document(value: object, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _validate_controller_failure_terminal(
+    payload: Mapping[str, Any], *, require_for_unhealthy: bool
+) -> bool:
+    """Validate the diagnostic-only controller failure projection."""
+
+    unhealthy = payload.get("reason") == "controller_unhealthy"
+    present = "controller_failure" in payload
+    detail = payload.get("controller_failure")
+    if (
+        (require_for_unhealthy and unhealthy and not present)
+        or (unhealthy and present and detail is None)
+        or (not unhealthy and detail is not None)
+    ):
+        return False
+    if detail is None:
+        return True
+    if not isinstance(detail, Mapping) or set(detail) != {
+        "stage",
+        "selection_status",
+        "epoch_factory_status",
+    }:
+        return False
+    fatal_selection_statuses = {
+        "invalid_state",
+        "invalid_cutoff",
+        "ledger_unhealthy",
+        "mixed_epoch",
+        "nonmember_evidence",
+        "projection_failed",
+        "capacity_exceeded",
+        "snapshot_failed",
+        "internal_failure",
+    }
+    factory_statuses = {
+        "invalid_current_epoch",
+        "epoch_number_exhausted",
+        "invalid_selection",
+        "epoch_mismatch",
+        "membership_mismatch",
+        "root_mismatch",
+        "tree_count_mismatch",
+        "insufficient_leaf_capacity",
+        "invalid_activation_delay",
+        "capacity_exceeded",
+        "placement_failed",
+        "authorization_failed",
+        "bundle_failed",
+        "internal_failure",
+    }
+    stage = detail.get("stage")
+    selection = detail.get("selection_status")
+    factory = detail.get("epoch_factory_status")
+    if stage == "operational_precondition":
+        return selection is None and factory is None
+    if stage == "baseline_selection":
+        return (
+            selection in fatal_selection_statuses | {"baseline_frozen"}
+            and factory is None
+        )
+    if stage == "guarded_selection":
+        return selection in fatal_selection_statuses and factory is None
+    return (
+        stage == "successor_factory"
+        and selection == "selected"
+        and factory in factory_statuses
+    )
+
+
 def _integer(value: object, label: str, minimum: int = 0) -> int:
     if type(value) is not int or value < minimum:
         _error(f"{label} must be an integer >= {minimum}")
@@ -2031,6 +2099,37 @@ class FocusedRawEvidenceSource:
                 _error("raw source sequence is not contiguous")
             if timestamps != sorted(timestamps):
                 _error("raw source monotonic time regressed")
+        terminal_keys = {
+            "cycle_ordinal",
+            "policy_intent",
+            "outcome",
+            "reason",
+            "transition_artifact_id",
+            "predecessor_epoch_number",
+            "predecessor_epoch_digest",
+            "successor_epoch_number",
+            "successor_epoch_digest",
+            "command_payload_digest",
+            "winning_activation",
+            "evidence_window_activation_generation",
+            "baseline_evidence_cutoff",
+            "current_evidence_cutoff",
+        }
+        requires_controller_failure = self._profile.profile_id.endswith("-v4")
+        for event in events:
+            if event["event_type"] != "adaptive_v2_session_terminal":
+                continue
+            payload = _document(event["payload"], "manager terminal")
+            if set(payload) not in (
+                terminal_keys,
+                terminal_keys | {"controller_failure"},
+            ):
+                _error("manager terminal schema drifted")
+            if not _validate_controller_failure_terminal(
+                payload,
+                require_for_unhealthy=requires_controller_failure,
+            ):
+                _error("manager terminal controller failure drifted")
         return events
 
     def _bundle(self, epoch: int) -> tuple[bytes, Any]:
@@ -3216,7 +3315,14 @@ class FocusedRawEvidenceSource:
                 if epoch == expected_epochs[-1] and terminal != manager_events[-3]:
                     return False
                 payload = _document(terminal["payload"], "manager terminal")
-                if set(payload) != terminal_keys:
+                if (
+                    set(payload)
+                    not in (
+                        terminal_keys,
+                        terminal_keys | {"controller_failure"},
+                    )
+                    or payload.get("controller_failure") is not None
+                ):
                     return False
                 command = self._transition(events, epoch, activation=False)
                 activation = self._transition(events, epoch, activation=True)

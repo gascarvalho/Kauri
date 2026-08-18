@@ -218,6 +218,19 @@ struct AdaptiveV2ManagerSession::State
             ingress.current_epoch().epoch_number();
         record.predecessor_epoch_digest =
             ingress.current_epoch().epoch_digest();
+        if (reason ==
+                AdaptiveV2ManagerCycleTerminalReason::controller_unhealthy)
+        {
+            if (controller != nullptr &&
+                controller->failure_detail() != nullptr)
+            {
+                const auto *detail = controller->failure_detail();
+                record.controller_failure = *detail;
+            }
+            else
+                record.controller_failure =
+                    AdaptiveV2ManagerControllerFailureDetail{};
+        }
 
         if (outcome != AdaptiveV2ManagerCycleOutcome::no_op &&
             controller != nullptr)
@@ -778,6 +791,8 @@ AdaptiveV2ManagerSession::controller_audit() const noexcept
         {
             snapshot.shape_decision = *decision;
         }
+        if (const auto *const detail = state.controller->failure_detail())
+            snapshot.controller_failure = *detail;
         return snapshot;
     }
     catch (...)

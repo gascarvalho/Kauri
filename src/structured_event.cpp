@@ -483,6 +483,69 @@ const char *manager_cycle_reason_name(
     return nullptr;
 }
 
+const char *controller_failure_stage_name(
+    AdaptiveV2ManagerControllerFailureStage stage) noexcept
+{
+    switch (stage)
+    {
+        case AdaptiveV2ManagerControllerFailureStage::operational_precondition:
+            return "operational_precondition";
+        case AdaptiveV2ManagerControllerFailureStage::baseline_selection:
+            return "baseline_selection";
+        case AdaptiveV2ManagerControllerFailureStage::guarded_selection:
+            return "guarded_selection";
+        case AdaptiveV2ManagerControllerFailureStage::successor_factory:
+            return "successor_factory";
+    }
+    return nullptr;
+}
+
+const char *selection_status_name(
+    AdaptiveV2SelectionStatus status) noexcept
+{
+    switch (status)
+    {
+        case AdaptiveV2SelectionStatus::baseline_frozen: return "baseline_frozen";
+        case AdaptiveV2SelectionStatus::selected: return "selected";
+        case AdaptiveV2SelectionStatus::insufficient_guarded_candidates: return "insufficient_guarded_candidates";
+        case AdaptiveV2SelectionStatus::insufficient_eligible_roots: return "insufficient_eligible_roots";
+        case AdaptiveV2SelectionStatus::invalid_state: return "invalid_state";
+        case AdaptiveV2SelectionStatus::invalid_cutoff: return "invalid_cutoff";
+        case AdaptiveV2SelectionStatus::ledger_unhealthy: return "ledger_unhealthy";
+        case AdaptiveV2SelectionStatus::mixed_epoch: return "mixed_epoch";
+        case AdaptiveV2SelectionStatus::nonmember_evidence: return "nonmember_evidence";
+        case AdaptiveV2SelectionStatus::projection_failed: return "projection_failed";
+        case AdaptiveV2SelectionStatus::capacity_exceeded: return "capacity_exceeded";
+        case AdaptiveV2SelectionStatus::snapshot_failed: return "snapshot_failed";
+        case AdaptiveV2SelectionStatus::internal_failure: return "internal_failure";
+    }
+    return nullptr;
+}
+
+const char *epoch_factory_status_name(
+    AdaptiveV2EpochFactoryStatus status) noexcept
+{
+    switch (status)
+    {
+        case AdaptiveV2EpochFactoryStatus::success: return "success";
+        case AdaptiveV2EpochFactoryStatus::invalid_current_epoch: return "invalid_current_epoch";
+        case AdaptiveV2EpochFactoryStatus::epoch_number_exhausted: return "epoch_number_exhausted";
+        case AdaptiveV2EpochFactoryStatus::epoch_mismatch: return "epoch_mismatch";
+        case AdaptiveV2EpochFactoryStatus::membership_mismatch: return "membership_mismatch";
+        case AdaptiveV2EpochFactoryStatus::invalid_selection: return "invalid_selection";
+        case AdaptiveV2EpochFactoryStatus::root_mismatch: return "root_mismatch";
+        case AdaptiveV2EpochFactoryStatus::tree_count_mismatch: return "tree_count_mismatch";
+        case AdaptiveV2EpochFactoryStatus::invalid_activation_delay: return "invalid_activation_delay";
+        case AdaptiveV2EpochFactoryStatus::capacity_exceeded: return "capacity_exceeded";
+        case AdaptiveV2EpochFactoryStatus::placement_failed: return "placement_failed";
+        case AdaptiveV2EpochFactoryStatus::insufficient_leaf_capacity: return "insufficient_leaf_capacity";
+        case AdaptiveV2EpochFactoryStatus::authorization_failed: return "authorization_failed";
+        case AdaptiveV2EpochFactoryStatus::bundle_failed: return "bundle_failed";
+        case AdaptiveV2EpochFactoryStatus::internal_failure: return "internal_failure";
+    }
+    return nullptr;
+}
+
 const char *response_outcome_name(ResponseOutcome outcome) noexcept
 {
     switch (outcome)
@@ -1026,6 +1089,59 @@ bool valid_manager_session_terminal_payload(
     const AdaptiveV2ManagerSessionTerminalStructuredEvent &event,
     const StructuredEventConfig &config) noexcept
 {
+    const auto valid_failure = [&event]() noexcept {
+        const auto fatal_selection = [](AdaptiveV2SelectionStatus status) noexcept {
+            switch (status)
+            {
+                case AdaptiveV2SelectionStatus::invalid_state:
+                case AdaptiveV2SelectionStatus::invalid_cutoff:
+                case AdaptiveV2SelectionStatus::ledger_unhealthy:
+                case AdaptiveV2SelectionStatus::mixed_epoch:
+                case AdaptiveV2SelectionStatus::nonmember_evidence:
+                case AdaptiveV2SelectionStatus::projection_failed:
+                case AdaptiveV2SelectionStatus::capacity_exceeded:
+                case AdaptiveV2SelectionStatus::snapshot_failed:
+                case AdaptiveV2SelectionStatus::internal_failure:
+                    return true;
+                default: return false;
+            }
+        };
+        if (!event.controller_failure.has_value())
+            return event.reason !=
+                AdaptiveV2ManagerCycleTerminalReason::controller_unhealthy;
+        const auto &detail = *event.controller_failure;
+        if (event.reason !=
+                AdaptiveV2ManagerCycleTerminalReason::controller_unhealthy ||
+            controller_failure_stage_name(detail.stage) == nullptr)
+            return false;
+        switch (detail.stage)
+        {
+            case AdaptiveV2ManagerControllerFailureStage::operational_precondition:
+                return !detail.selection_status.has_value() &&
+                    !detail.epoch_factory_status.has_value();
+            case AdaptiveV2ManagerControllerFailureStage::baseline_selection:
+                return detail.selection_status.has_value() &&
+                    (fatal_selection(*detail.selection_status) ||
+                     *detail.selection_status ==
+                         AdaptiveV2SelectionStatus::baseline_frozen) &&
+                    !detail.epoch_factory_status.has_value();
+            case AdaptiveV2ManagerControllerFailureStage::guarded_selection:
+                return detail.selection_status.has_value() &&
+                    fatal_selection(*detail.selection_status) &&
+                    !detail.epoch_factory_status.has_value();
+            case AdaptiveV2ManagerControllerFailureStage::successor_factory:
+                return detail.selection_status ==
+                        AdaptiveV2SelectionStatus::selected &&
+                    detail.epoch_factory_status.has_value() &&
+                    *detail.epoch_factory_status !=
+                        AdaptiveV2EpochFactoryStatus::success &&
+                    epoch_factory_status_name(
+                        *detail.epoch_factory_status) != nullptr;
+        }
+        return false;
+    };
+    if (!valid_failure())
+        return false;
     if (event.evidence_window_activation_generation == 0)
         return false;
     const auto packed_generation =
@@ -2060,6 +2176,27 @@ void append_manager_session_terminal_payload(
     builder.append_integer(event.baseline_evidence_cutoff);
     builder.append(",\"current_evidence_cutoff\":");
     builder.append_integer(event.current_evidence_cutoff);
+    builder.append(",\"controller_failure\":");
+    if (!event.controller_failure.has_value())
+        builder.append("null");
+    else
+    {
+        const auto &detail = *event.controller_failure;
+        builder.append("{\"stage\":");
+        builder.append_escaped(controller_failure_stage_name(detail.stage));
+        builder.append(",\"selection_status\":");
+        if (detail.selection_status.has_value())
+            builder.append_escaped(selection_status_name(*detail.selection_status));
+        else
+            builder.append("null");
+        builder.append(",\"epoch_factory_status\":");
+        if (detail.epoch_factory_status.has_value())
+            builder.append_escaped(
+                epoch_factory_status_name(*detail.epoch_factory_status));
+        else
+            builder.append("null");
+        builder.append('}');
+    }
     builder.append('}');
 }
 

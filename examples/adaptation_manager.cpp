@@ -3023,6 +3023,7 @@ private:
                 event.command_payload_digest =
                     record.command_payload_digest;
                 event.winning_activation = record.winning_activation;
+                event.controller_failure = record.controller_failure;
                 event.evidence_window_activation_generation =
                     audit.activation_generation;
                 event.baseline_evidence_cutoff =

@@ -330,6 +330,8 @@ struct AdaptiveV2ManagerSessionTerminalStructuredEvent
     std::optional<uint256_t> successor_epoch_digest;
     std::optional<uint256_t> command_payload_digest;
     std::optional<AdaptiveV2EpochChangeIdentity> winning_activation;
+    std::optional<AdaptiveV2ManagerControllerFailureDetail>
+        controller_failure;
     std::uint64_t evidence_window_activation_generation{0};
     std::uint64_t baseline_evidence_cutoff{0};
     std::uint64_t current_evidence_cutoff{0};

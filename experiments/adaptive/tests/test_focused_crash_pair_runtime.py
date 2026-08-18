@@ -29,6 +29,237 @@ N7_PROFILE_V2 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v2.json"
 N31_PROFILE_V2 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v2.json"
 N7_PROFILE_V3 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v3.json"
 N31_PROFILE_V3 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v3.json"
+
+
+_CONTROLLER_FAILURE_MUTATIONS = (
+    ("v1-v3 absent", {"reason": "controller_unhealthy"}, False, True),
+    ("v4 missing", {"reason": "controller_unhealthy"}, True, False),
+    (
+        "unhealthy null",
+        {"reason": "controller_unhealthy", "controller_failure": None},
+        False,
+        False,
+    ),
+    (
+        "healthy detail",
+        {
+            "reason": "success",
+            "controller_failure": {
+                "stage": "operational_precondition",
+                "selection_status": None,
+                "epoch_factory_status": None,
+            },
+        },
+        False,
+        False,
+    ),
+    (
+        "operational",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "operational_precondition",
+                "selection_status": None,
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        True,
+    ),
+    (
+        "guarded recoverable",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "guarded_selection",
+                "selection_status": "insufficient_guarded_candidates",
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "guarded fatal",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "guarded_selection",
+                "selection_status": "internal_failure",
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        True,
+    ),
+    (
+        "guarded factory",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "guarded_selection",
+                "selection_status": "insufficient_guarded_candidates",
+                "epoch_factory_status": "bundle_failed",
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "successor",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "successor_factory",
+                "selection_status": "selected",
+                "epoch_factory_status": "bundle_failed",
+            },
+        },
+        True,
+        True,
+    ),
+    (
+        "unknown field",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "operational_precondition",
+                "selection_status": None,
+                "epoch_factory_status": None,
+                "extra": 1,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "unknown stage",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "unknown",
+                "selection_status": None,
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "unknown selection",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "guarded_selection",
+                "selection_status": "unknown",
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "bool selection",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "guarded_selection",
+                "selection_status": True,
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "bool factory",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "successor_factory",
+                "selection_status": "selected",
+                "epoch_factory_status": True,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "missing stage",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "selection_status": None,
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "missing selection",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "operational_precondition",
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "missing factory",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "operational_precondition",
+                "selection_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "factory success",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "successor_factory",
+                "selection_status": "selected",
+                "epoch_factory_status": "success",
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "successor wrong selection",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "successor_factory",
+                "selection_status": "internal_failure",
+                "epoch_factory_status": "bundle_failed",
+            },
+        },
+        True,
+        False,
+    ),
+    (
+        "successor null",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "successor_factory",
+                "selection_status": "selected",
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        False,
+    ),
+)
 PROFILE_KEYS = {
     "schema_version",
     "profile_id",
@@ -53,6 +284,32 @@ PROFILE_KEYS = {
 
 def _runtime() -> Any:
     return importlib.import_module(RUNTIME)
+
+
+@pytest.mark.parametrize(
+    "_name,payload,required,expected", _CONTROLLER_FAILURE_MUTATIONS
+)
+@pytest.mark.parametrize(
+    "module_name",
+    (
+        RUNTIME,
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_validation",
+    ),
+)
+def test_controller_failure_validator_mutation_matrix(
+    module_name: str,
+    _name: str,
+    payload: Mapping[str, object],
+    required: bool,
+    expected: bool,
+) -> None:
+    module = importlib.import_module(module_name)
+    assert (
+        module._validate_controller_failure_terminal(
+            deepcopy(payload), require_for_unhealthy=required
+        )
+        is expected
+    )
 
 
 def _document(value: object) -> dict[str, Any]:

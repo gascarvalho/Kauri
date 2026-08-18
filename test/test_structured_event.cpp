@@ -2536,7 +2536,8 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
             "\"activation_height\":2365},"
             "\"evidence_window_activation_generation\":30064771089,"
             "\"baseline_evidence_cutoff\":44,"
-            "\"current_evidence_cutoff\":52}}\n";
+            "\"current_evidence_cutoff\":52,"
+            "\"controller_failure\":null}}\n";
 
         FakeClock clock({7002});
         MemoryOutput output;
@@ -2957,6 +2958,21 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         invalid = manager_terminal_event();
         invalid.reason =
             AdaptiveV2ManagerCycleTerminalReason::caller_failed;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = manager_terminal_event();
+        invalid.outcome = AdaptiveV2ManagerCycleOutcome::failed;
+        invalid.reason =
+            AdaptiveV2ManagerCycleTerminalReason::controller_unhealthy;
+        invalid.successor_epoch_number.reset();
+        invalid.successor_epoch_digest.reset();
+        invalid.command_payload_digest.reset();
+        invalid.winning_activation.reset();
+        invalid.controller_failure =
+            hotstuff::AdaptiveV2ManagerControllerFailureDetail{
+                hotstuff::AdaptiveV2ManagerControllerFailureStage::guarded_selection,
+                hotstuff::AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
+                std::nullopt};
         CHECK(rejects(manager_event_config(), invalid));
 
         invalid = manager_terminal_event();

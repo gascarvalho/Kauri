@@ -1355,6 +1355,7 @@ TEST_CASE(
               insufficient_guarded_candidates);
     CHECK(fixture.controller->selection_audit()
               ->selected_replicas.empty());
+    CHECK(fixture.controller->failure_detail() == nullptr);
     CHECK(fixture.controller->successor_bundle() == nullptr);
 
     fixture.persistent_timeouts(0, 1, 2);
@@ -1641,6 +1642,13 @@ TEST_CASE(
     REQUIRE(fixture.controller->selection_audit() != nullptr);
     CHECK(fixture.controller->selection_audit()->status ==
           AdaptiveV2SelectionStatus::selected);
+    REQUIRE(fixture.controller->failure_detail() != nullptr);
+    CHECK(fixture.controller->failure_detail()->stage ==
+          hotstuff::AdaptiveV2ManagerControllerFailureStage::successor_factory);
+    CHECK(fixture.controller->failure_detail()->selection_status ==
+          AdaptiveV2SelectionStatus::selected);
+    CHECK(fixture.controller->failure_detail()->epoch_factory_status ==
+          hotstuff::AdaptiveV2EpochFactoryStatus::invalid_activation_delay);
     CHECK(fixture.controller->successor_bundle() == nullptr);
     CHECK_FALSE(fixture.controller->healthy());
 }
