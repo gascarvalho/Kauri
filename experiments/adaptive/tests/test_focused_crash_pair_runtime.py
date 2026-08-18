@@ -312,6 +312,198 @@ def test_controller_failure_validator_mutation_matrix(
     )
 
 
+def test_v4_manager_terminal_requires_exact_arm_failure_projection() -> None:
+    terminal = {
+        "cycle_ordinal": 0,
+        "policy_intent": "fault_containment",
+        "outcome": "failed",
+        "reason": "fault_window_arm_missing",
+        "transition_artifact_id": "e0-to-e1-containment",
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": "a" * 64,
+        "successor_epoch_number": None,
+        "successor_epoch_digest": None,
+        "command_payload_digest": None,
+        "winning_activation": None,
+        "evidence_window_activation_generation": 1,
+        "baseline_evidence_cutoff": 1,
+        "current_evidence_cutoff": 1,
+        "controller_failure": None,
+    }
+    modules = (
+        _runtime(),
+        importlib.import_module(
+            "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+        ),
+    )
+    assert all(
+        module._validate_v4_manager_terminal_payload(terminal) for module in modules
+    )
+
+    post_arm_invalid = deepcopy(terminal)
+    post_arm_invalid["reason"] = "fault_window_arm_invalid"
+    post_arm_invalid["current_evidence_cutoff"] = 2
+    assert all(
+        module._validate_v4_manager_terminal_payload(post_arm_invalid)
+        for module in modules
+    )
+
+    late_missing = deepcopy(terminal)
+    late_missing["current_evidence_cutoff"] = 2
+    assert not any(
+        module._validate_v4_manager_terminal_payload(late_missing) for module in modules
+    )
+
+    mutations = (
+        ("unknown_reason", "fault_window_arm_unknown"),
+        ("wrong_outcome", "advanced"),
+        ("wrong_cycle", 1),
+        ("wrong_policy", "performance_optimization"),
+        ("wrong_predecessor", 1),
+        ("successor", 1),
+        ("winning", {}),
+        ("controller_failure", {}),
+        ("cycle_bool", True),
+        ("digest_bool", True),
+    )
+    for field, value in mutations:
+        candidate = deepcopy(terminal)
+        if field == "unknown_reason":
+            candidate["reason"] = value
+        elif field == "wrong_outcome":
+            candidate["outcome"] = value
+        elif field == "wrong_cycle":
+            candidate["cycle_ordinal"] = value
+        elif field == "wrong_policy":
+            candidate["policy_intent"] = value
+        elif field == "wrong_predecessor":
+            candidate["predecessor_epoch_number"] = value
+        elif field == "successor":
+            candidate["successor_epoch_number"] = value
+        elif field == "winning":
+            candidate["winning_activation"] = value
+        elif field == "controller_failure":
+            candidate["controller_failure"] = value
+        elif field == "cycle_bool":
+            candidate["cycle_ordinal"] = value
+        else:
+            candidate["predecessor_epoch_digest"] = value
+        assert not any(
+            module._validate_v4_manager_terminal_payload(candidate)
+            for module in modules
+        ), field
+
+    missing = deepcopy(terminal)
+    del missing["controller_failure"]
+    extra = deepcopy(terminal)
+    extra["unexpected"] = None
+    assert not any(
+        module._validate_v4_manager_terminal_payload(candidate)
+        for candidate in (missing, extra)
+        for module in modules
+    )
+
+
+def test_v4_pass_terminal_chain_rejects_injected_arm_failure() -> None:
+    validation = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+    )
+    command = {
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": "a" * 64,
+        "successor_epoch_number": 1,
+        "successor_epoch_digest": "b" * 64,
+        "payload_digest": "c" * 64,
+        "command_block_height": 10,
+        "command_block_hash": "d" * 64,
+        "activation_delay_blocks": 5,
+    }
+    activation = {"activation_height": 15}
+    winning = {
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": "a" * 64,
+        "successor_epoch_number": 1,
+        "successor_epoch_digest": "b" * 64,
+        "command_payload_digest": "c" * 64,
+        "command_block_height": 10,
+        "command_block_hash": "d" * 64,
+        "activation_delay_blocks": 5,
+        "activation_height": 15,
+    }
+    terminal = {
+        "cycle_ordinal": 0,
+        "policy_intent": "fault_containment",
+        "outcome": "advanced",
+        "reason": "successor_converged",
+        "transition_artifact_id": "e0-to-e1-containment",
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": "a" * 64,
+        "successor_epoch_number": 1,
+        "successor_epoch_digest": "b" * 64,
+        "command_payload_digest": "c" * 64,
+        "winning_activation": winning,
+        "evidence_window_activation_generation": 1,
+        "baseline_evidence_cutoff": 7,
+        "current_evidence_cutoff": 9,
+        "controller_failure": None,
+    }
+    events = [
+        {
+            "source_kind": "adaptation_manager",
+            "event_type": "adaptive_v2_evidence_snapshot",
+            "source_sequence": 1,
+            "payload": {
+                "predecessor_epoch_number": 0,
+                "activation_generation": 1,
+                "baseline_evidence_cutoff": 7,
+                "current_evidence_cutoff": 9,
+            },
+        },
+        {
+            "source_kind": "adaptation_manager",
+            "event_type": "adaptive_v2_session_terminal",
+            "source_sequence": 2,
+            "payload": terminal,
+        },
+    ]
+    epoch = SimpleNamespace(
+        epoch_digest="b" * 64,
+        command=SimpleNamespace(payload_digest="c" * 64),
+    )
+    kwargs = {
+        "contract": {"epoch_zero_digest": "a" * 64},
+        "epoch1": epoch,
+        "epoch2": None,
+        "commands1": [{"payload": command}],
+        "commands2": [],
+        "activations1": [{"payload": activation}],
+        "activations2": [],
+    }
+    validation._validate_v4_pass_terminals(events, **kwargs)
+
+    injected = deepcopy(terminal)
+    injected.update(
+        outcome="failed",
+        reason="fault_window_arm_missing",
+        successor_epoch_number=None,
+        successor_epoch_digest=None,
+        command_payload_digest=None,
+        winning_activation=None,
+        baseline_evidence_cutoff=7,
+        current_evidence_cutoff=7,
+    )
+    events.append(
+        {
+            "source_kind": "adaptation_manager",
+            "event_type": "adaptive_v2_session_terminal",
+            "source_sequence": 3,
+            "payload": injected,
+        }
+    )
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="cardinality"):
+        validation._validate_v4_pass_terminals(events, **kwargs)
+
+
 def _document(value: object) -> dict[str, Any]:
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
@@ -2608,6 +2800,87 @@ def test_backend_atomic_fault_projection_preserves_pre_signal_boundary(
     )
     receipt = json.loads((raw / "fault-receipt.json").read_text(encoding="utf-8"))
     assert projected["sigkill_outcomes"] == receipt["sigkill_outcomes"]
+
+
+def test_fault_window_arm_publication_is_one_shot_and_hides_its_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime()
+    target = tmp_path / "runtime" / "fault-window-arm.json"
+    target.parent.mkdir()
+    arm = {
+        "schema_version": 1,
+        "kind": "kauri-focused-fault-window-arm-v1",
+        "run_id": "run-1",
+        "profile_id": "n7-f2-q5-two-crash-pair-smoke-v4",
+        "profile_sha256": "a" * 64,
+        "topology_proof_sha256": "b" * 64,
+        "request_sha256": "c" * 64,
+        "epoch_number": 0,
+        "epoch_digest": "d" * 64,
+        "fault_receipt_sha256": "e" * 64,
+        "evidence_start_monotonic_ns": 9,
+        "prefault_tree_id": 6,
+        "required_tree_positions": 2,
+        "required_tree_ids": [6, 0],
+    }
+    linked: list[Path] = []
+    original_link = runtime.os.link
+
+    def inspect_then_link(source: Path, destination: Path) -> None:
+        assert source.name.endswith(".tmp") and source.is_file()
+        assert not destination.exists()
+        linked.append(source)
+        original_link(source, destination)
+
+    monkeypatch.setattr(runtime.os, "link", inspect_then_link)
+    digest = runtime._publish_fault_window_arm(target, arm)
+    assert linked and target.is_file()
+    assert not list(target.parent.glob("*.tmp"))
+    assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="destination"):
+        runtime._publish_fault_window_arm(target, arm)
+
+
+def test_v4_manager_binds_the_profile_tree_horizon(tmp_path: Path) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(
+        N7_PROFILE_V3.with_name("n7-f2-q5-two-crash-pair-smoke-v4.json")
+    )
+    adapter = runtime._profiled_adapter(profile, 41_719)
+    tls = [{"sec": f"key-{index}", "crt": f"cert-{index}"} for index in range(8)]
+    arm_path = tmp_path / "runtime" / "fault-window-arm.json"
+    arm_path.parent.mkdir()
+    argv = runtime._focused_manager_command(
+        profile,
+        adapter,
+        arm="control",
+        manager_binary=Path("/build/adaptation-manager"),
+        tls=tls,
+        issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
+        run_directory=tmp_path,
+        run_id="run-v4",
+        source_instance="manager-v4",
+        fault_window_arm_path=arm_path.resolve(),
+        request_sha256="a" * 64,
+    )
+    pairs = dict(zip(argv[1::2], argv[2::2], strict=True))
+    assert pairs["--fault-window-arm-required-tree-positions"] == "6"
+    assert pairs["--fault-window-arm-path"] == str(arm_path.resolve())
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="requires"):
+        runtime._focused_manager_command(
+            profile,
+            adapter,
+            arm="control",
+            manager_binary=Path("/build/adaptation-manager"),
+            tls=tls,
+            issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
+            run_directory=tmp_path,
+            run_id="run-v4",
+            source_instance="manager-v4",
+            fault_window_arm_path=None,
+            request_sha256="a" * 64,
+        )
 
 
 def _membership_digest(replica_count: int) -> str:

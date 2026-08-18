@@ -42,6 +42,12 @@ class FocusedCrashPairCliError(RuntimeError):
 
 FOCUSED_LAUNCH_BACKEND = FocusedLaunchBackend()
 FOCUSED_PREFLIGHT_CHECKS: object = FocusedLivePreflightChecks
+_PROFILE_DIRECTORY = Path(__file__).resolve().parent / "profiles"
+_V4_PROFILES = {
+    "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v4.json",
+    "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v4.json",
+    "campaign": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v4.json",
+}
 
 
 def _read_json(path: Path, label: str) -> Mapping[str, Any]:
@@ -394,13 +400,13 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument(
         "--mode", choices=("smoke", "pair", "campaign"), required=True
     )
-    preflight.add_argument("--profile", type=Path, required=True)
+    preflight.add_argument("--profile", type=Path)
     preflight.add_argument("--pairs", type=int, required=True)
     preflight.add_argument("--output", type=Path, required=True)
 
     for command in ("smoke", "pair", "campaign"):
         execute = subparsers.add_parser(command)
-        execute.add_argument("--profile", type=Path, required=True)
+        execute.add_argument("--profile", type=Path)
         execute.add_argument("--pairs", type=int, required=True)
         execute.add_argument("--preflight-receipt", type=Path, required=True)
         execute.add_argument("--authorization-receipt", type=Path, required=True)
@@ -418,14 +424,22 @@ def _parser() -> argparse.ArgumentParser:
 
 def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
     expected = (
-        "n7-f2-q5-two-crash-pair-smoke-v3"
+        "n7-f2-q5-two-crash-pair-smoke-v4"
         if mode == "smoke"
-        else "n31-f5-q21-three-crash-pair-v3"
+        else "n31-f5-q21-three-crash-pair-v4"
     )
     if profile.profile_id != expected:
         raise FocusedCrashPairCliError(
             "execution mode is not bound to the required frozen profile"
         )
+
+
+def _profile_path(profile: Path | None, mode: str) -> Path:
+    """Use the immutable v4 profile unless an explicit path is supplied."""
+
+    if mode not in _V4_PROFILES:
+        raise FocusedCrashPairCliError("execution mode has no frozen v4 profile")
+    return _V4_PROFILES[mode] if profile is None else profile
 
 
 def _authorized_execution(
@@ -439,7 +453,7 @@ def _authorized_execution(
     output = arguments.output.resolve()
     if output.exists():
         raise FocusedCrashPairCliError("allocated result root already exists")
-    profile = load_focused_profile(arguments.profile)
+    profile = load_focused_profile(_profile_path(arguments.profile, arguments.command))
     _require_mode_profile(profile, arguments.command)
     preflight = _read_json(arguments.preflight_receipt, "preflight receipt")
     authorization = _read_json(arguments.authorization_receipt, "authorization receipt")
@@ -472,7 +486,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise FocusedCrashPairCliError(
                     "preflight pair cardinality or output allocation is invalid"
                 )
-            profile = load_focused_profile(arguments.profile)
+            profile = load_focused_profile(
+                _profile_path(arguments.profile, arguments.mode)
+            )
             _require_mode_profile(profile, arguments.mode)
             result = prepare_focused_preflight(
                 profile=profile,

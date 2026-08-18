@@ -24,6 +24,9 @@ from experiments.adaptive.tests import (
 )
 
 RUNNER = "experiments.adaptive.run_focused_n31_crash_pair"
+PROFILE_ROOT = Path(__file__).parents[1] / "profiles"
+N7_PROFILE_V4 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v4.json"
+N31_PROFILE_V4 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v4.json"
 
 
 def _runner() -> Any:
@@ -50,11 +53,7 @@ def _inputs(
         "authorization": tmp_path / "authorization.json",
         "trusted": tmp_path / "trusted.json",
     }
-    source_profile = (
-        runtime_fixture.N7_PROFILE_V3
-        if mode == "smoke"
-        else runtime_fixture.N31_PROFILE_V3
-    )
+    source_profile = N7_PROFILE_V4 if mode == "smoke" else N31_PROFILE_V4
     profile = json.loads(source_profile.read_text(encoding="utf-8"))
     source_proof = runtime_fixture._topology_proof_path(source_profile, profile)
     values["proof"] = tmp_path / profile["topology"]["proof_path"]
@@ -758,7 +757,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     runtime = importlib.import_module(
         "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
     )
-    profile = runtime.load_focused_profile(runtime_fixture.N7_PROFILE_V3)
+    profile = runtime.load_focused_profile(N7_PROFILE_V4)
     assert profile.issuer_public_key is None
     checks = _CliPreflightChecks()
     captured: list[dict[str, object]] = []
@@ -774,7 +773,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
                 "--mode",
                 "smoke",
                 "--profile",
-                str(runtime_fixture.N7_PROFILE_V3),
+                str(N7_PROFILE_V4),
                 "--pairs",
                 "1",
                 "--output",
@@ -795,8 +794,20 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     preflight = captured[0]
     context = preflight["execution_context"]
     assert context["issuer_public_key"] == native_fixture.ISSUER_PUBLIC_KEY
+    assert (
+        preflight["profile_sha256"]
+        == "65bebcdf98b675092ce6839b256bb6403243bd8ea59860765d0b8acafa0bf2bc"
+    )
+    assert (
+        preflight["topology_proof_sha256"]
+        == "b41d040b0233790b27ea5d66f5ebe870c444fcecc4aa5d4f3222585bdcbab900"
+    )
     request = runtime.build_focused_authorization_request(preflight)
     request_document = json.loads(request)
+    assert request_document["profile_sha256"] == preflight["profile_sha256"]
+    assert (
+        request_document["topology_proof_sha256"] == preflight["topology_proof_sha256"]
+    )
     assert (
         request_document["execution_context_sha256"]
         == hashlib.sha256(_canonical(context)).hexdigest()
@@ -821,24 +832,93 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
 
 
 @pytest.mark.parametrize(
+    ("mode", "pairs", "profile_id", "profile_sha256", "proof_sha256"),
+    (
+        (
+            "smoke",
+            1,
+            "n7-f2-q5-two-crash-pair-smoke-v4",
+            "65bebcdf98b675092ce6839b256bb6403243bd8ea59860765d0b8acafa0bf2bc",
+            "b41d040b0233790b27ea5d66f5ebe870c444fcecc4aa5d4f3222585bdcbab900",
+        ),
+        (
+            "pair",
+            1,
+            "n31-f5-q21-three-crash-pair-v4",
+            "a83ffc00c2ebd0293fc0aeabd1bafbf42eb0c52f009dfcfb7573f56f9fc66493",
+            "492d13123153965669bd6bea3356ca5959be9ac7a879f2872fdc61bc238d3bf8",
+        ),
+        (
+            "campaign",
+            5,
+            "n31-f5-q21-three-crash-pair-v4",
+            "a83ffc00c2ebd0293fc0aeabd1bafbf42eb0c52f009dfcfb7573f56f9fc66493",
+            "492d13123153965669bd6bea3356ca5959be9ac7a879f2872fdc61bc238d3bf8",
+        ),
+    ),
+)
+def test_cli_preflight_defaults_to_the_exact_v4_profile_and_proof(
+    mode: str,
+    pairs: int,
+    profile_id: str,
+    profile_sha256: str,
+    proof_sha256: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    captured: list[Mapping[str, object]] = []
+
+    def preflight(**kwargs: object) -> dict[str, object]:
+        captured.append(kwargs)
+        return {"profile_sha256": kwargs["profile"].profile_sha256}
+
+    monkeypatch.setattr(runner, "prepare_focused_preflight", preflight)
+    monkeypatch.setattr(runner, "_write_cli_result", lambda _value: None)
+
+    assert (
+        runner.main(
+            [
+                "preflight",
+                "--mode",
+                mode,
+                "--pairs",
+                str(pairs),
+                "--output",
+                str(tmp_path / "results"),
+            ]
+        )
+        == 0
+    )
+
+    profile = captured[0]["profile"]
+    assert profile.profile_id == profile_id
+    assert profile.profile_sha256 == profile_sha256
+    assert profile.topology_proof_sha256 == proof_sha256
+
+
+@pytest.mark.parametrize(
     ("mode", "profile_path", "pairs"),
     (
         ("smoke", runtime_fixture.N7_PROFILE, 1),
         ("smoke", runtime_fixture.N7_PROFILE_V2, 1),
+        ("smoke", runtime_fixture.N7_PROFILE_V3, 1),
         ("pair", runtime_fixture.N31_PROFILE, 1),
         ("pair", runtime_fixture.N31_PROFILE_V2, 1),
+        ("pair", runtime_fixture.N31_PROFILE_V3, 1),
         ("campaign", runtime_fixture.N31_PROFILE, 5),
         ("campaign", runtime_fixture.N31_PROFILE_V2, 5),
+        ("campaign", runtime_fixture.N31_PROFILE_V3, 5),
     ),
 )
-def test_cli_rejects_archived_v1_and_v2_profiles_for_new_execution(
+def test_cli_rejects_archived_v1_to_v3_profiles_for_new_execution(
     mode: str,
     profile_path: Path,
     pairs: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Archived v1/v2 evidence remains readable but cannot authorize a new run."""
+    """Archived v1-v3 evidence remains readable but cannot authorize a new run."""
 
     runner = _runner()
     _execution_sentinels(runner, monkeypatch)
@@ -1039,7 +1119,7 @@ def test_default_preflight_persists_and_execution_reloads_pair_issuer_material(
                 "--mode",
                 "campaign",
                 "--profile",
-                str(runtime_fixture.N31_PROFILE_V3),
+                str(N31_PROFILE_V4),
                 "--pairs",
                 "5",
                 "--output",

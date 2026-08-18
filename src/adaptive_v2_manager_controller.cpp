@@ -506,6 +506,20 @@ struct AdaptiveV2ManagerController::State
     AdaptiveV2ManagerControllerStatus select_successor(
         std::uint64_t cutoff)
     {
+        if (config.selection.fault_window_arm_required &&
+            !fault_window_arm.has_value())
+            return AdaptiveV2ManagerControllerStatus::awaiting_guarded_selection;
+        if (fault_window_arm.has_value())
+        {
+            const auto coverage = evaluate_adaptive_v2_fault_containment_coverage(
+                ingress.ledger().accepted(), epoch, cutoff,
+                fault_window_arm->evidence_start_monotonic_ns,
+                fault_window_arm->required_tree_ids);
+            if (coverage.status == AdaptiveV2FaultContainmentCoverageStatus::incomplete)
+                return AdaptiveV2ManagerControllerStatus::awaiting_guarded_selection;
+            if (coverage.status != AdaptiveV2FaultContainmentCoverageStatus::ready)
+                return fail_operational();
+        }
         if (cutoff < selector.current_cutoff())
             return fail_operational();
         if (cutoff == selector.current_cutoff())
@@ -577,6 +591,7 @@ struct AdaptiveV2ManagerController::State
     std::uint64_t last_baseline_examined_cutoff{0};
     bool baseline_examined{false};
     bool factory_attempted{false};
+    std::optional<AdaptiveV2FaultWindowArm> fault_window_arm;
     bool locally_healthy{true};
     std::optional<AdaptiveV2ManagerControllerFailureDetail> failure;
 };
@@ -611,6 +626,30 @@ AdaptiveV2ManagerController::evaluate() noexcept
     {
         return state.fail_operational();
     }
+}
+
+bool AdaptiveV2ManagerController::arm_fault_window(
+    AdaptiveV2FaultWindowArm arm) noexcept
+{
+    auto &state = *state_;
+    if (!state.operational() || !state.config.selection.fault_window_arm_required ||
+        state.fault_window_arm.has_value() || state.baseline_snapshot == nullptr ||
+        state.selector.current_cutoff() != state.selector.baseline_cutoff() ||
+        state.latest_selection != nullptr || state.factory_attempted ||
+        state.successor != nullptr || arm.predecessor_epoch_number != state.epoch.epoch_number ||
+        arm.predecessor_epoch_digest != state.epoch.epoch_digest ||
+        arm.required_tree_ids.empty() || arm.required_tree_ids.front() != arm.prefault_tree_id)
+        return false;
+    const auto tree_count = state.ingress.current_epoch().trees().size();
+    if (tree_count == 0 || arm.required_tree_ids.size() > tree_count)
+        return false;
+    for (std::size_t i = 0; i < arm.required_tree_ids.size(); ++i)
+        if (arm.required_tree_ids[i] != (arm.prefault_tree_id + i) % tree_count)
+            return false;
+    if (!state.selector.arm_fault_window(arm))
+        return false;
+    state.fault_window_arm = std::move(arm);
+    return true;
 }
 
 const AdaptationSnapshot *

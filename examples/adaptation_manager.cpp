@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -30,6 +31,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <sys/stat.h>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -45,6 +47,7 @@
 
 #include "hotstuff/adaptation_manager.h"
 #include "hotstuff/adaptation_manager_profile.h"
+#include "hotstuff/crypto.h"
 #include "hotstuff/adaptive_v2_convergence_ack_wire.h"
 #include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/adaptive_v2_response_evidence.h"
@@ -112,6 +115,7 @@ constexpr double kConvergenceAckDrainSeconds = 1.1;
 constexpr std::size_t kMaximumTransitionRequestBytes = 16 * 1024;
 constexpr std::size_t kMaximumTransitionArtifactIdBytes = 128;
 constexpr std::size_t kMaximumTransitionPathBytes = 4096;
+constexpr std::size_t kMaximumFaultWindowArmBytes = 16 * 1024;
 constexpr std::uint32_t kMaximumPredecessorResidencyMs = 3'600'000;
 constexpr opcode_t kCommittedObservationOpcode =
     MsgAdaptiveV2EpochChangeCommittedObservation::opcode;
@@ -159,6 +163,31 @@ struct CycleAuditContext
     bool cross_commit_retention_ready_emitted{false};
 };
 
+struct FaultWindowArmBindings
+{
+    std::string path;
+    std::uint32_t schema_version{0};
+    std::string domain;
+    std::string run_id;
+    std::string profile_id;
+    std::string profile_sha256;
+    std::string topology_proof_sha256;
+    std::string request_sha256;
+    std::uint32_t epoch_number{0};
+    std::string epoch_digest;
+    std::uint32_t prefault_tree_id{0};
+    std::uint32_t required_tree_positions{0};
+    std::uint32_t tree_count{0};
+    std::uint64_t deadline_seconds{0};
+};
+
+struct FaultWindowArmDocument
+{
+    hotstuff::AdaptiveV2FaultWindowArm arm;
+    std::string sha256;
+    hotstuff::FaultWindowArmedStructuredEvent event;
+};
+
 struct ManagerOptions
 {
     NetAddr listen_address;
@@ -188,6 +217,7 @@ struct ManagerOptions
     bool shape_adaptation_enabled{false};
     std::uint64_t fault_containment_evidence_start_monotonic_ns{0};
     std::uint32_t fault_containment_required_tree_coverage{0};
+    std::optional<FaultWindowArmBindings> fault_window_arm;
     std::uint64_t cycle_1_selection_not_before_monotonic_ns{0};
     bool cycle_1_inherited_wait_exempt_eligibility_gate{false};
     bool cycle_1_responsive_cross_commit_retention_readiness_gate{false};
@@ -229,6 +259,191 @@ Value parse_unsigned(
     }
     return value;
 }
+
+bytearray_t parse_hex(
+    const std::string &text, const char *field,
+    std::size_t exact_hex_characters);
+
+std::string fault_window_sha256(const std::string &bytes)
+{
+    hotstuff::SHA256 hasher;
+    hasher.update(reinterpret_cast<const std::uint8_t *>(bytes.data()),
+                  bytes.size());
+    return salticidae::get_hex(hasher.digest());
+}
+
+class FaultWindowArmJsonParser final
+{
+public:
+    FaultWindowArmJsonParser(const std::string &text,
+                             const FaultWindowArmBindings &bindings)
+        : text_(text), bindings_(bindings)
+    {
+        if (text_.empty() || text_.size() > kMaximumFaultWindowArmBytes)
+            fail("size is invalid");
+    }
+
+    FaultWindowArmDocument parse()
+    {
+        FaultWindowArmDocument result;
+        expect("{\"epoch_digest\":");
+        const auto epoch_digest = string();
+        expect(",\"epoch_number\":");
+        const auto epoch_number = u32();
+        expect(",\"evidence_start_monotonic_ns\":");
+        const auto evidence_start = u64();
+        expect(",\"fault_receipt_sha256\":");
+        const auto receipt_sha = string();
+        expect(",\"kind\":");
+        const auto kind = string();
+        expect(",\"prefault_tree_id\":");
+        const auto prefault_tree_id = u32();
+        expect(",\"profile_id\":");
+        const auto profile_id = string();
+        expect(",\"profile_sha256\":");
+        const auto profile_sha = string();
+        expect(",\"required_tree_ids\":[");
+        std::vector<std::uint32_t> trees;
+        if (!consume(']'))
+        {
+            for (;;)
+            {
+                trees.push_back(u32());
+                if (consume(']'))
+                    break;
+                expect(",");
+            }
+        }
+        expect(",\"required_tree_positions\":");
+        const auto positions = u32();
+        expect(",\"request_sha256\":");
+        const auto request_sha = string();
+        expect(",\"run_id\":");
+        const auto run_id = string();
+        expect(",\"schema_version\":");
+        const auto schema_version = u32();
+        expect(",\"topology_proof_sha256\":");
+        const auto proof_sha = string();
+        expect("}\n");
+        if (position_ != text_.size())
+            fail("trailing bytes");
+        if (schema_version != bindings_.schema_version ||
+            kind != bindings_.domain || run_id != bindings_.run_id ||
+            profile_id != bindings_.profile_id ||
+            profile_sha != bindings_.profile_sha256 ||
+            proof_sha != bindings_.topology_proof_sha256 ||
+            request_sha != bindings_.request_sha256 ||
+            epoch_number != bindings_.epoch_number ||
+            epoch_digest != bindings_.epoch_digest || evidence_start == 0 ||
+            prefault_tree_id != bindings_.prefault_tree_id ||
+            receipt_sha.size() != 64 || positions == 0 ||
+            positions != bindings_.required_tree_positions ||
+            positions != trees.size() || bindings_.tree_count == 0)
+        {
+            fail("bindings are invalid");
+        }
+        for (const auto &digest : {receipt_sha, profile_sha, proof_sha,
+                                   request_sha, epoch_digest})
+        {
+            if (digest.size() != 64 ||
+                !std::all_of(digest.begin(), digest.end(),
+                             [](unsigned char value) {
+                                 return (value >= '0' && value <= '9') ||
+                                     (value >= 'a' && value <= 'f');
+                             }))
+                fail("digest is invalid");
+        }
+        for (std::size_t index = 0; index < trees.size(); ++index)
+        {
+            if (trees[index] !=
+                (prefault_tree_id + index) % bindings_.tree_count)
+                fail("required trees are not the canonical prefix");
+        }
+        result.arm.predecessor_epoch_number = epoch_number;
+        result.arm.predecessor_epoch_digest = hotstuff::uint256_t(
+            parse_hex(epoch_digest, "fault-window epoch digest", 64));
+        result.arm.evidence_start_monotonic_ns = evidence_start;
+        result.arm.prefault_tree_id = prefault_tree_id;
+        result.arm.required_tree_ids = std::move(trees);
+        result.sha256 = fault_window_sha256(text_);
+        result.event.schema_version = schema_version;
+        result.event.kind = kind;
+        result.event.run_id = run_id;
+        result.event.profile_id = profile_id;
+        result.event.profile_sha256 = profile_sha;
+        result.event.topology_proof_sha256 = proof_sha;
+        result.event.request_sha256 = request_sha;
+        result.event.epoch_number = epoch_number;
+        result.event.epoch_digest = result.arm.predecessor_epoch_digest;
+        result.event.fault_receipt_sha256 = receipt_sha;
+        result.event.evidence_start_monotonic_ns = evidence_start;
+        result.event.prefault_tree_id = prefault_tree_id;
+        result.event.required_tree_positions = positions;
+        result.event.required_tree_ids = result.arm.required_tree_ids;
+        result.event.fault_window_arm_sha256 = result.sha256;
+        return result;
+    }
+
+private:
+    [[noreturn]] void fail(const char *reason) const
+    {
+        throw std::invalid_argument(
+            std::string("invalid fault-window arm JSON: ") + reason);
+    }
+    void expect(const char *literal)
+    {
+        const auto length = std::strlen(literal);
+        if (text_.compare(position_, length, literal) != 0)
+            fail("noncanonical field order or value");
+        position_ += length;
+    }
+    bool consume(char expected)
+    {
+        if (position_ < text_.size() && text_[position_] == expected)
+        {
+            ++position_;
+            return true;
+        }
+        return false;
+    }
+    std::string string()
+    {
+        if (!consume('"'))
+            fail("expected string");
+        const auto start = position_;
+        while (position_ < text_.size() && text_[position_] != '"')
+        {
+            const auto value = static_cast<unsigned char>(text_[position_++]);
+            if (value < 0x20 || value == '\\')
+                fail("noncanonical string");
+        }
+        if (!consume('"') || position_ - start > kMaximumTransitionPathBytes)
+            fail("unterminated string");
+        return text_.substr(start, position_ - start - 1);
+    }
+    std::uint64_t u64()
+    {
+        const auto start = position_;
+        while (position_ < text_.size() &&
+               std::isdigit(static_cast<unsigned char>(text_[position_])) != 0)
+            ++position_;
+        if (start == position_ ||
+            (position_ - start > 1 && text_[start] == '0'))
+            fail("expected canonical integer");
+        return parse_unsigned<std::uint64_t>(
+            text_.substr(start, position_ - start), "fault-window integer", false);
+    }
+    std::uint32_t u32()
+    {
+        const auto value = u64();
+        if (value > std::numeric_limits<std::uint32_t>::max())
+            fail("integer is out of range");
+        return static_cast<std::uint32_t>(value);
+    }
+    const std::string &text_;
+    const FaultWindowArmBindings &bindings_;
+    std::size_t position_{0};
+};
 
 class TransitionJsonParser final
 {
@@ -891,6 +1106,8 @@ AdaptiveV2ManagerControllerConfig manager_controller_config(
         options.fault_containment_evidence_start_monotonic_ns;
     config.selection.fault_containment_required_tree_coverage =
         options.fault_containment_required_tree_coverage;
+    config.selection.fault_window_arm_required =
+        options.fault_window_arm.has_value();
     config.reputation_limits.maximum_audit_updates =
         options.runtime_shape.ingress_limits.evidence_store
             .maximum_accepted_records;
@@ -1241,6 +1458,19 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValStr::create("0");
     auto opt_fault_containment_required_tree_coverage =
         Config::OptValStr::create("0");
+    auto opt_fault_window_arm_path = Config::OptValStr::create();
+    auto opt_fault_window_arm_schema_version = Config::OptValStr::create();
+    auto opt_fault_window_arm_domain = Config::OptValStr::create();
+    auto opt_fault_window_arm_run_id = Config::OptValStr::create();
+    auto opt_fault_window_arm_profile_id = Config::OptValStr::create();
+    auto opt_fault_window_arm_profile_sha256 = Config::OptValStr::create();
+    auto opt_fault_window_arm_topology_proof_sha256 = Config::OptValStr::create();
+    auto opt_fault_window_arm_request_sha256 = Config::OptValStr::create();
+    auto opt_fault_window_arm_epoch_number = Config::OptValStr::create();
+    auto opt_fault_window_arm_epoch_digest = Config::OptValStr::create();
+    auto opt_fault_window_arm_prefault_tree_id = Config::OptValStr::create();
+    auto opt_fault_window_arm_required_tree_positions = Config::OptValStr::create();
+    auto opt_fault_window_arm_deadline_seconds = Config::OptValStr::create();
     auto opt_cycle_1_selection_not_before_monotonic_ns =
         Config::OptValStr::create("0");
     auto opt_cycle_1_inherited_wait_exempt_eligibility_gate =
@@ -1333,6 +1563,32 @@ ManagerOptions parse_options(int argc, char **argv)
         "fault-containment-required-tree-coverage",
         opt_fault_containment_required_tree_coverage,
         Config::SET_VAL);
+    config.add_opt("fault-window-arm-path", opt_fault_window_arm_path,
+                   Config::SET_VAL);
+    config.add_opt("fault-window-arm-schema-version",
+                   opt_fault_window_arm_schema_version, Config::SET_VAL);
+    config.add_opt("fault-window-arm-domain", opt_fault_window_arm_domain,
+                   Config::SET_VAL);
+    config.add_opt("fault-window-arm-run-id", opt_fault_window_arm_run_id,
+                   Config::SET_VAL);
+    config.add_opt("fault-window-arm-profile-id",
+                   opt_fault_window_arm_profile_id, Config::SET_VAL);
+    config.add_opt("fault-window-arm-profile-sha256",
+                   opt_fault_window_arm_profile_sha256, Config::SET_VAL);
+    config.add_opt("fault-window-arm-topology-proof-sha256",
+                   opt_fault_window_arm_topology_proof_sha256, Config::SET_VAL);
+    config.add_opt("fault-window-arm-request-sha256",
+                   opt_fault_window_arm_request_sha256, Config::SET_VAL);
+    config.add_opt("fault-window-arm-epoch-number",
+                   opt_fault_window_arm_epoch_number, Config::SET_VAL);
+    config.add_opt("fault-window-arm-epoch-digest",
+                   opt_fault_window_arm_epoch_digest, Config::SET_VAL);
+    config.add_opt("fault-window-arm-prefault-tree-id",
+                   opt_fault_window_arm_prefault_tree_id, Config::SET_VAL);
+    config.add_opt("fault-window-arm-required-tree-positions",
+                   opt_fault_window_arm_required_tree_positions, Config::SET_VAL);
+    config.add_opt("fault-window-arm-deadline-seconds",
+                   opt_fault_window_arm_deadline_seconds, Config::SET_VAL);
     config.add_opt(
         "cycle-1-selection-not-before-monotonic-ns",
         opt_cycle_1_selection_not_before_monotonic_ns,
@@ -1560,6 +1816,61 @@ ManagerOptions parse_options(int argc, char **argv)
             opt_fault_containment_required_tree_coverage->get(),
             "fault containment required tree coverage",
             false);
+    const std::array<const std::string *, 13> arm_values{
+        &opt_fault_window_arm_path->get(),
+        &opt_fault_window_arm_schema_version->get(),
+        &opt_fault_window_arm_domain->get(),
+        &opt_fault_window_arm_run_id->get(),
+        &opt_fault_window_arm_profile_id->get(),
+        &opt_fault_window_arm_profile_sha256->get(),
+        &opt_fault_window_arm_topology_proof_sha256->get(),
+        &opt_fault_window_arm_request_sha256->get(),
+        &opt_fault_window_arm_epoch_number->get(),
+        &opt_fault_window_arm_epoch_digest->get(),
+        &opt_fault_window_arm_prefault_tree_id->get(),
+        &opt_fault_window_arm_required_tree_positions->get(),
+        &opt_fault_window_arm_deadline_seconds->get()};
+    const auto has_arm = std::any_of(
+        arm_values.begin(), arm_values.end(),
+        [](const auto *value) { return !value->empty(); });
+    if (has_arm && !std::all_of(
+                       arm_values.begin(), arm_values.end(),
+                       [](const auto *value) { return !value->empty(); }))
+        throw std::invalid_argument("fault-window arm options are incomplete");
+    if (has_arm)
+    {
+        FaultWindowArmBindings arm;
+        arm.path = opt_fault_window_arm_path->get();
+        arm.schema_version = parse_unsigned<std::uint32_t>(
+            opt_fault_window_arm_schema_version->get(),
+            "fault-window arm schema version", true);
+        arm.domain = opt_fault_window_arm_domain->get();
+        arm.run_id = opt_fault_window_arm_run_id->get();
+        arm.profile_id = opt_fault_window_arm_profile_id->get();
+        arm.profile_sha256 = opt_fault_window_arm_profile_sha256->get();
+        arm.topology_proof_sha256 = opt_fault_window_arm_topology_proof_sha256->get();
+        arm.request_sha256 = opt_fault_window_arm_request_sha256->get();
+        arm.epoch_number = parse_unsigned<std::uint32_t>(
+            opt_fault_window_arm_epoch_number->get(), "fault-window arm epoch", false);
+        arm.epoch_digest = opt_fault_window_arm_epoch_digest->get();
+        arm.prefault_tree_id = parse_unsigned<std::uint32_t>(
+            opt_fault_window_arm_prefault_tree_id->get(),
+            "fault-window arm prefault tree", false);
+        arm.required_tree_positions = parse_unsigned<std::uint32_t>(
+            opt_fault_window_arm_required_tree_positions->get(),
+            "fault-window arm required tree positions", true);
+        arm.tree_count = static_cast<std::uint32_t>(options.membership.size());
+        arm.deadline_seconds = parse_unsigned<std::uint64_t>(
+            opt_fault_window_arm_deadline_seconds->get(), "fault-window arm deadline", true);
+        if (arm.schema_version != 1 ||
+            arm.domain != "kauri-focused-fault-window-arm-v1" ||
+            arm.path.empty() || arm.path.front() != '/' || arm.run_id.empty() ||
+            arm.profile_id.empty() ||
+            arm.prefault_tree_id >= arm.tree_count ||
+            arm.required_tree_positions > arm.tree_count)
+            throw std::invalid_argument("fault-window arm options are invalid");
+        options.fault_window_arm = std::move(arm);
+    }
     options.cycle_1_selection_not_before_monotonic_ns =
         parse_unsigned<std::uint64_t>(
             opt_cycle_1_selection_not_before_monotonic_ns->get(),
@@ -1597,6 +1908,9 @@ ManagerOptions parse_options(int argc, char **argv)
         throw std::invalid_argument(
             "fault containment coverage requires a nonzero timestamp and the exact predecessor tree count");
     }
+    if (options.fault_window_arm.has_value() && fault_coverage_enabled)
+        throw std::invalid_argument(
+            "fault-window arm conflicts with legacy static coverage");
 
     const auto &raw_transition_requests =
         opt_transition_requests->get();
@@ -1823,6 +2137,40 @@ ManagerOptions parse_options(int argc, char **argv)
         throw std::invalid_argument(
             "structured-event and artifact outputs must be distinct");
     }
+    if (options.fault_window_arm.has_value())
+    {
+        const auto &arm = *options.fault_window_arm;
+        const auto parent_of = [](const std::string &path) {
+            const auto separator = path.find_last_of('/');
+            return separator == std::string::npos ? std::string{} :
+                path.substr(0, separator);
+        };
+        const auto arm_parent = parent_of(arm.path);
+        const auto event_parent = parent_of(options.structured_event_output);
+        const auto valid_digest = [](const std::string &value) {
+            return value.size() == 64 && std::all_of(
+                value.begin(), value.end(), [](unsigned char character) {
+                    return (character >= '0' && character <= '9') ||
+                        (character >= 'a' && character <= 'f');
+                });
+        };
+        struct stat metadata {};
+        if (arm_parent.empty() || event_parent.empty() ||
+            parent_of(arm_parent) != parent_of(event_parent) ||
+            arm_parent.substr(arm_parent.find_last_of('/') + 1) != "runtime" ||
+            event_parent.substr(event_parent.find_last_of('/') + 1) != "raw" ||
+            arm.path.substr(arm.path.find_last_of('/') + 1) !=
+                "fault-window-arm.json" || arm.run_id != options.structured_event_run_id ||
+            !valid_digest(arm.profile_sha256) ||
+            !valid_digest(arm.topology_proof_sha256) ||
+            !valid_digest(arm.request_sha256) ||
+            !valid_digest(arm.epoch_digest) ||
+            ::lstat(arm.path.c_str(), &metadata) == 0 || errno != ENOENT)
+        {
+            throw std::invalid_argument(
+                "fault-window arm path or bindings are invalid at launch");
+        }
+    }
     if (!opt_experiment_drop_bundle_attempt->get().empty())
     {
         options.experiment_drop_bundle_attempt =
@@ -1920,6 +2268,19 @@ public:
             [this](salticidae::TimerEvent &) {
                 handle_evaluation_timer();
             });
+        fault_window_arm_timer = salticidae::TimerEvent(
+            event_context_, [this](salticidae::TimerEvent &) {
+                handle_fault_window_arm_timer();
+            });
+        if (options_.fault_window_arm.has_value())
+        {
+            const auto seconds = options_.fault_window_arm->deadline_seconds;
+            if (seconds > static_cast<std::uint64_t>(
+                              std::numeric_limits<std::chrono::seconds::rep>::max()))
+                throw std::invalid_argument("fault-window arm deadline is out of range");
+            fault_window_arm_deadline_ = std::chrono::steady_clock::now() +
+                std::chrono::seconds(seconds);
+        }
         register_handlers();
     }
 
@@ -3049,11 +3410,16 @@ private:
         }
     }
 
-    void fail(const char *reason) noexcept
+    void fail(
+        const char *reason,
+        AdaptiveV2ManagerCycleTerminalReason terminal_reason =
+            AdaptiveV2ManagerCycleTerminalReason::caller_failed) noexcept
     {
         cancel_pending_evaluation();
         cancel_post_baseline_observation();
         cancel_cycle_1_selection_gate();
+        fault_window_arm_timer.del();
+        fault_window_arm_timer_pending_ = false;
         const auto convergence = session_.convergence_status();
         if (convergence.has_value() && !convergence_failure_emitted_)
         {
@@ -3067,8 +3433,7 @@ private:
                 reason);
         }
         refresh_cycle_audit();
-        static_cast<void>(session_.finalize_failed_cycle(
-            AdaptiveV2ManagerCycleTerminalReason::caller_failed));
+        static_cast<void>(session_.finalize_failed_cycle(terminal_reason));
         emit_new_session_terminals();
         failed_ = true;
         HOTSTUFF_LOG_WARN(
@@ -3193,6 +3558,159 @@ private:
     {
         evaluation_timer.del();
         evaluation_timer_pending_ = false;
+    }
+
+    bool try_arm_fault_window() noexcept
+    {
+        if (!options_.fault_window_arm.has_value() || fault_window_armed_)
+            return true;
+        const auto &bindings = *options_.fault_window_arm;
+        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+        int descriptor = ::open(bindings.path.c_str(), flags);
+        if (descriptor < 0)
+        {
+            if (errno == ENOENT)
+                return false;
+            fail("fault_window_arm_open_failed",
+                 AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure);
+            return false;
+        }
+        bool io_failure = false;
+        try
+        {
+            struct stat metadata {};
+            if (::fstat(descriptor, &metadata) != 0)
+            {
+                io_failure = true;
+                throw std::invalid_argument("fault-window arm file is invalid");
+            }
+            if (!S_ISREG(metadata.st_mode) || metadata.st_size <= 0 ||
+                static_cast<std::uint64_t>(metadata.st_size) >
+                    kMaximumFaultWindowArmBytes)
+                throw std::invalid_argument("fault-window arm file is invalid");
+            std::string bytes(static_cast<std::size_t>(metadata.st_size), '\0');
+            std::size_t offset = 0;
+            while (offset < bytes.size())
+            {
+                const auto read = ::read(descriptor, bytes.data() + offset,
+                                         bytes.size() - offset);
+                if (read < 0 && errno == EINTR)
+                    continue;
+                if (read <= 0)
+                {
+                    io_failure = true;
+                    throw std::invalid_argument("fault-window arm is truncated");
+                }
+                offset += static_cast<std::size_t>(read);
+            }
+            char trailing = 0;
+            for (;;)
+            {
+                const auto read = ::read(descriptor, &trailing, 1);
+                if (read < 0 && errno == EINTR)
+                    continue;
+                if (read != 0)
+                {
+                    io_failure = true;
+                    throw std::invalid_argument(
+                        "fault-window arm changed while being read");
+                }
+                break;
+            }
+            const auto document = FaultWindowArmJsonParser(bytes, bindings).parse();
+            if (!session_.arm_fault_window(document.arm))
+                throw std::logic_error("manager session rejected fault-window arm");
+            io_failure = true;
+            structured_event_sink_.emit_audit(
+                hotstuff::AuditStructuredEventPayload{document.event});
+            structured_event_sink_.drain();
+            if (!structured_event_sink_.health().healthy)
+                throw std::runtime_error("fault-window arm audit failed");
+            const auto close_result = ::close(descriptor);
+            descriptor = -1;
+            if (close_result != 0)
+                throw std::system_error(errno, std::generic_category(),
+                                        "cannot close fault-window arm");
+            fault_window_armed_ = true;
+            // Force one post-arm evaluation even if the waiting poll already
+            // observed the same readiness and evidence cutoff.
+            last_evaluated_ready_members_.reset();
+            last_evaluated_evidence_cutoff_.reset();
+            fault_window_arm_device_ = metadata.st_dev;
+            fault_window_arm_inode_ = metadata.st_ino;
+            fault_window_arm_size_ = metadata.st_size;
+            fault_window_arm_mtime_ = metadata.st_mtime;
+            fault_window_arm_timer.del();
+            fault_window_arm_timer_pending_ = false;
+            return true;
+        }
+        catch (...)
+        {
+            if (descriptor >= 0)
+                ::close(descriptor);
+            fail(io_failure ? "fault_window_arm_io_failure" :
+                              "fault_window_arm_invalid",
+                 io_failure
+                     ? AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure
+                     : AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_invalid);
+            return false;
+        }
+    }
+
+    bool consumed_fault_window_arm_is_unchanged() noexcept
+    {
+        if (!fault_window_armed_)
+            return true;
+        struct stat metadata {};
+        if (!options_.fault_window_arm.has_value() ||
+            ::lstat(options_.fault_window_arm->path.c_str(), &metadata) != 0 ||
+            !S_ISREG(metadata.st_mode) ||
+            metadata.st_dev != fault_window_arm_device_ ||
+            metadata.st_ino != fault_window_arm_inode_ ||
+            metadata.st_size != fault_window_arm_size_ ||
+            metadata.st_mtime != fault_window_arm_mtime_)
+        {
+            fail("fault_window_arm_replaced",
+                 AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_invalid);
+            return false;
+        }
+        return true;
+    }
+
+    void schedule_fault_window_arm() noexcept
+    {
+        if (!options_.fault_window_arm.has_value() || fault_window_armed_ ||
+            fault_window_arm_timer_pending_)
+            return;
+        try
+        {
+            fault_window_arm_timer_pending_ = true;
+            fault_window_arm_timer.add(kEvaluationCoalescingSeconds);
+        }
+        catch (...) { fail("fault_window_arm_schedule_failed",
+                           AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure); }
+    }
+
+    void handle_fault_window_arm_timer() noexcept
+    {
+        if (!fault_window_arm_timer_pending_ || failed_ || fault_window_armed_)
+            return;
+        if (try_arm_fault_window())
+        {
+            schedule_evaluation();
+            return;
+        }
+        if (failed_)
+            return;
+        if (std::chrono::steady_clock::now() >= fault_window_arm_deadline_)
+        {
+            fail("fault_window_arm_deadline_expired",
+                 AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_missing);
+            return;
+        }
+        try { fault_window_arm_timer.add(kEvaluationCoalescingSeconds); }
+        catch (...) { fail("fault_window_arm_timer_failed",
+                           AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure); }
     }
 
     void cancel_post_baseline_observation() noexcept
@@ -3460,6 +3978,17 @@ private:
             return;
         }
         if (controller.has_value() && controller->baseline_frozen &&
+            options_.fault_window_arm.has_value() && !fault_window_armed_)
+        {
+            return;
+        }
+        // The one-shot arm gates only cycle-zero fault containment.  Once
+        // that cycle advances, later optimization is deliberately arm-free;
+        // the sealed validator still binds the persisted arm bytes/hash.
+        if (request_sequence_.cursor() == 0 &&
+            !consumed_fault_window_arm_is_unchanged())
+            return;
+        if (controller.has_value() && controller->baseline_frozen &&
             !cycle_1_selection_gate_ready())
         {
             return;
@@ -3512,6 +4041,11 @@ private:
         if (status ==
             AdaptiveV2ManagerControllerStatus::baseline_frozen)
         {
+            if (options_.fault_window_arm.has_value())
+            {
+                schedule_fault_window_arm();
+                return;
+            }
             const auto *request = current_transition_request();
             if (request == nullptr ||
                 !schedule_post_baseline_observation(*request))
@@ -4294,10 +4828,12 @@ private:
     salticidae::TimerEvent post_baseline_observation_timer;
     salticidae::TimerEvent cycle_1_selection_gate_timer;
     salticidae::TimerEvent evaluation_timer;
+    salticidae::TimerEvent fault_window_arm_timer;
     std::chrono::steady_clock::time_point
         predecessor_residency_deadline_{};
     std::chrono::steady_clock::time_point
         post_baseline_observation_deadline_{};
+    std::chrono::steady_clock::time_point fault_window_arm_deadline_{};
     std::uint64_t convergence_tick_{0};
     std::optional<std::size_t> last_evaluated_ready_members_;
     std::optional<std::uint64_t> last_evaluated_evidence_cutoff_;
@@ -4316,6 +4852,12 @@ private:
     bool post_baseline_observation_pending_{false};
     bool cycle_1_selection_gate_pending_{false};
     bool evaluation_timer_pending_{false};
+    bool fault_window_arm_timer_pending_{false};
+    bool fault_window_armed_{false};
+    dev_t fault_window_arm_device_{0};
+    ino_t fault_window_arm_inode_{0};
+    off_t fault_window_arm_size_{0};
+    time_t fault_window_arm_mtime_{0};
     bool experiment_bundle_drop_consumed_{false};
     bool experiment_activation_ack_drop_consumed_{false};
     bool failed_{false};
@@ -4323,6 +4865,7 @@ private:
 
 } // namespace
 
+#ifndef KAURI_ADAPTATION_MANAGER_TESTING
 int main(int argc, char **argv)
 {
     std::signal(SIGPIPE, SIG_IGN);
@@ -4376,3 +4919,4 @@ int main(int argc, char **argv)
         return 2;
     }
 }
+#endif // KAURI_ADAPTATION_MANAGER_TESTING

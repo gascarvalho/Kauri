@@ -617,6 +617,87 @@ struct Fixture
         REQUIRE(result.accepted_observations == 1);
     }
 
+    void anchor_timeout_proposal(const ResponseObservation &timeout)
+    {
+        const auto &trees = session.ingress().current_epoch().trees();
+        const auto tree = std::find_if(
+            trees.begin(), trees.end(), [&timeout](const auto &entry) {
+                return entry.tree_id == timeout.configuration.tree_id;
+            });
+        REQUIRE(tree != trees.end());
+        const auto first_leaf = first_leaf_index(
+            tree->members_breadth_first.size(), tree->fanout);
+        for (std::size_t position = first_leaf;
+             position < tree->members_breadth_first.size(); ++position)
+        {
+            const auto parent = (position - 1U) / tree->fanout;
+            const auto reporter = tree->members_breadth_first[parent];
+            const auto observed = tree->members_breadth_first[position];
+            if (reporter == timeout.reporter_id &&
+                observed == timeout.observed_replica_id)
+            {
+                continue;
+            }
+            ResponseObservation anchor;
+            anchor.reporter_id = reporter;
+            anchor.observed_replica_id = observed;
+            anchor.configuration = timeout.configuration;
+            anchor.block_hash = timeout.block_hash;
+            anchor.expected_message_type = ExpectedMessageType::direct_vote;
+            anchor.outcome = ResponseOutcome::on_time;
+            anchor.response_duration_us = 20;
+            anchor.deadline_duration_us = timeout.deadline_duration_us;
+            anchor.reporter_sequence = ++evidence_sequences[reporter];
+            anchor.reporter_monotonic_ns = anchor.reporter_sequence * 1'000;
+            anchor.signer_set = {observed};
+            anchor.observation_id = hotstuff::compute_response_observation_id(
+                anchor.attempt_identity());
+            const auto result = route_evidence(
+                session,
+                AuthenticatedReporter{anchor.reporter_id},
+                hotstuff::encode_evidence_batch(
+                    ResponseObservationBatch{
+                        hotstuff::kEvidenceBatchSchemaVersion, {anchor}},
+                    session_config().ingress_limits.evidence_wire));
+            REQUIRE(result.status == AdaptiveV2ManagerIngressStatus::processed);
+            REQUIRE(result.accepted_observations == 1);
+            return;
+        }
+        FAIL("fixture tree lacks a distinct direct-vote anchor");
+    }
+
+    void cover_tree(std::uint32_t tree_id)
+    {
+        const auto &trees = session.ingress().current_epoch().trees();
+        const auto tree = std::find_if(
+            trees.begin(), trees.end(), [tree_id](const auto &entry) {
+                return entry.tree_id == tree_id;
+            });
+        REQUIRE(tree != trees.end());
+        const auto position = first_leaf_index(
+            tree->members_breadth_first.size(), tree->fanout);
+        const auto parent = (position - 1U) / tree->fanout;
+        ResponseObservation anchor;
+        anchor.reporter_id = tree->members_breadth_first[parent];
+        anchor.observed_replica_id = tree->members_breadth_first[position];
+        anchor.configuration = ConfigurationId{
+            session.ingress().current_epoch().epoch_number(),
+            tree_id,
+            session.ingress().current_epoch().epoch_digest()};
+        anchor.block_hash = digest(
+            "v4-coverage-" + std::to_string(++proposal_counter));
+        anchor.expected_message_type = ExpectedMessageType::direct_vote;
+        anchor.outcome = ResponseOutcome::on_time;
+        anchor.response_duration_us = 20;
+        anchor.deadline_duration_us = 100;
+        anchor.reporter_sequence = ++evidence_sequences[anchor.reporter_id];
+        anchor.reporter_monotonic_ns = anchor.reporter_sequence * 1'000;
+        anchor.signer_set = {anchor.observed_replica_id};
+        anchor.observation_id = hotstuff::compute_response_observation_id(
+            anchor.attempt_identity());
+        record(std::move(anchor));
+    }
+
     void responsive_baseline()
     {
         for (const auto target : kMembers)
@@ -2092,6 +2173,97 @@ TEST_CASE(
     "[intentional-red]")
 {
     verify_bounded_execution_audit_contract<AdaptiveV2ManagerSession>();
+}
+
+TEST_CASE(
+    "v4 arm gates only cycle-zero containment before later optimization",
+    "[adaptive-v2][manager-session][fault-window-arm][v4][recurring]")
+{
+    auto config = session_config();
+    config.controller.selection.fault_window_arm_required = true;
+    Fixture fixture(std::move(config));
+    auto &session = fixture.session;
+
+    REQUIRE(session.begin_cycle(containment_policy()));
+    fixture.ready_all();
+    fixture.responsive_baseline();
+    REQUIRE(session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    fixture.evidence_sequences.fill(200);
+
+    hotstuff::AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = 0;
+    arm.predecessor_epoch_digest =
+        session.ingress().current_epoch().epoch_digest();
+    arm.evidence_start_monotonic_ns = 1;
+    arm.prefault_tree_id = 0;
+    arm.required_tree_ids = {0, 1, 2, 3, 4, 5, 6};
+    REQUIRE(session.arm_fault_window(arm));
+    CHECK_FALSE(session.arm_fault_window(arm));
+    for (std::uint32_t tree_id = 0; tree_id < 7; ++tree_id)
+        fixture.cover_tree(tree_id);
+
+    for (const auto target : std::array<ReplicaID, 2>{0, 1})
+    {
+        for (std::size_t reporter = 0; reporter < 3; ++reporter)
+        {
+            for (std::size_t attempt = 0; attempt < 2; ++attempt)
+            {
+                const auto timeout = fixture.make_observation(
+                    target, reporter, ResponseOutcome::timeout, "v4-timeout");
+                fixture.record(timeout);
+                fixture.anchor_timeout_proposal(timeout);
+            }
+        }
+    }
+    REQUIRE(session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(session.successor_bundle() != nullptr);
+    const auto identity = identity_for(
+        *session.successor_bundle(), 1'900, "v4-cycle-zero");
+    REQUIRE(session.start_convergence(190));
+    for (const auto source : kSurvivors)
+    {
+        CHECK(session.observe_commit(
+                  source,
+                  AdaptiveV2EpochChangeCommittedObservation{
+                      hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      source,
+                      identity}) == AdaptiveV2ManagerConvergenceDisposition::accepted);
+        CHECK(session.observe_activation(
+                  source,
+                  AdaptiveV2EpochActivatedObservation{
+                      hotstuff::kAdaptiveV2ConvergenceObservationSchemaVersionV1,
+                      source,
+                      identity,
+                      identity.successor_epoch_number,
+                      identity.successor_epoch_digest}) ==
+              AdaptiveV2ManagerConvergenceDisposition::accepted);
+    }
+    REQUIRE(session.consume_ready_and_rotate());
+    REQUIRE(session.ingress().current_epoch().epoch_number() == 1);
+
+    // The fixed v4 arm is E0 containment-only. E1 optimization must begin
+    // and evaluate without a second arm.
+    REQUIRE(session.begin_cycle(optimization_policy()));
+    fixture.ready_all();
+    for (const auto target : kSurvivors)
+    {
+        for (std::size_t attempt = 0; attempt < 2; ++attempt)
+        {
+            fixture.record(fixture.make_observation(
+                target, 0, ResponseOutcome::on_time, "v4-e1-baseline"));
+        }
+    }
+    REQUIRE(session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    fixture.responsive_optimization_suffix();
+    CHECK_FALSE(session.arm_fault_window(arm));
+    REQUIRE(session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(session.successor_bundle() != nullptr);
+    CHECK(session.successor_bundle()->command().payload.successor_epoch_number ==
+          2);
 }
 
 TEST_CASE(

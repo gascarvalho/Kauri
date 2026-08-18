@@ -303,6 +303,26 @@ struct AdaptiveV2CrossCommitRetentionReadyStructuredEvent
     std::vector<uint256_t> admitted_observation_ids;
 };
 
+/** Immutable manager acknowledgement of the v4 local fault-window arm. */
+struct FaultWindowArmedStructuredEvent
+{
+    std::uint32_t schema_version{0};
+    std::string kind;
+    std::string run_id;
+    std::string profile_id;
+    std::string profile_sha256;
+    std::string topology_proof_sha256;
+    std::string request_sha256;
+    std::uint32_t epoch_number{0};
+    uint256_t epoch_digest;
+    std::string fault_receipt_sha256;
+    std::uint64_t evidence_start_monotonic_ns{0};
+    std::uint32_t prefault_tree_id{0};
+    std::uint32_t required_tree_positions{0};
+    std::vector<std::uint32_t> required_tree_ids;
+    std::string fault_window_arm_sha256;
+};
+
 /** Canonical JSON object containing every independently scored candidate. */
 std::string serialize_adaptive_v2_shape_decision_payload(
     const AdaptiveV2ShapeDecisionStructuredEvent &event,
@@ -355,7 +375,8 @@ using AuditStructuredEventPayload = std::variant<
     FaultContributionOpportunityStructuredEvent,
     RootQcQueueBlockedStructuredEvent,
     AdaptiveV2FaultContainmentCoverageReadyStructuredEvent,
-    AdaptiveV2CrossCommitRetentionReadyStructuredEvent>;
+    AdaptiveV2CrossCommitRetentionReadyStructuredEvent,
+    FaultWindowArmedStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -459,6 +480,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_fault_containment_coverage_ready,
     block_commit_identity_unavailable,
     adaptive_v2_cross_commit_retention_ready,
+    fault_window_armed,
 };
 
 StructuredEventType structured_event_type(

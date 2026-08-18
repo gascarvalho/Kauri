@@ -422,6 +422,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
             type = StructuredEventType::
                 adaptive_v2_cross_commit_retention_ready;
             return true;
+        case 11:
+            type = StructuredEventType::fault_window_armed;
+            return true;
         default:
             return false;
     }
@@ -479,6 +482,12 @@ const char *manager_cycle_reason_name(
             return "evidence_window_reset_failed";
         case AdaptiveV2ManagerCycleTerminalReason::caller_failed:
             return "caller_failed";
+        case AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_missing:
+            return "fault_window_arm_missing";
+        case AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_invalid:
+            return "fault_window_arm_invalid";
+        case AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure:
+            return "fault_window_arm_io_failure";
     }
     return nullptr;
 }
@@ -1322,6 +1331,33 @@ bool valid_cross_commit_retention_ready_payload(
     return true;
 }
 
+bool valid_fault_window_armed_payload(
+    const FaultWindowArmedStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    const auto valid_digest = [](const std::string &value) {
+        return value.size() == 64 && std::all_of(
+            value.begin(), value.end(), [](unsigned char character) {
+                return (character >= '0' && character <= '9') ||
+                    (character >= 'a' && character <= 'f');
+            });
+    };
+    return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
+        event.schema_version == 1 &&
+        event.kind == "kauri-focused-fault-window-arm-v1" &&
+        !event.run_id.empty() && !event.profile_id.empty() &&
+        event.epoch_digest != uint256_t{} &&
+        event.evidence_start_monotonic_ns != 0 &&
+        event.required_tree_positions != 0 &&
+        event.required_tree_positions == event.required_tree_ids.size() &&
+        !event.required_tree_ids.empty() &&
+        valid_digest(event.profile_sha256) &&
+        valid_digest(event.topology_proof_sha256) &&
+        valid_digest(event.request_sha256) &&
+        valid_digest(event.fault_receipt_sha256) &&
+        valid_digest(event.fault_window_arm_sha256);
+}
+
 bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                          const StructuredEventConfig &config) noexcept
 {
@@ -1388,6 +1424,9 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                     AdaptiveV2CrossCommitRetentionReadyStructuredEvent>(
                         payload),
                 config);
+        case 11:
+            return valid_fault_window_armed_payload(
+                std::get<FaultWindowArmedStructuredEvent>(payload), config);
         default:
             return false;
     }
@@ -1950,6 +1989,28 @@ void append_cross_commit_retention_ready_payload(
     builder.append("]}");
 }
 
+void append_fault_window_armed_payload(
+    JsonLineBuilder &builder, const FaultWindowArmedStructuredEvent &event)
+{
+    builder.append("{\"schema_version\":");
+    builder.append_integer(event.schema_version);
+    builder.append(",\"kind\":"); builder.append_escaped(event.kind);
+    builder.append(",\"run_id\":"); builder.append_escaped(event.run_id);
+    builder.append(",\"profile_id\":"); builder.append_escaped(event.profile_id);
+    builder.append(",\"profile_sha256\":"); builder.append_escaped(event.profile_sha256);
+    builder.append(",\"topology_proof_sha256\":"); builder.append_escaped(event.topology_proof_sha256);
+    builder.append(",\"request_sha256\":"); builder.append_escaped(event.request_sha256);
+    builder.append(",\"epoch_number\":"); builder.append_integer(event.epoch_number);
+    builder.append(",\"epoch_digest\":"); builder.append_escaped(event.epoch_digest.to_hex());
+    builder.append(",\"fault_receipt_sha256\":"); builder.append_escaped(event.fault_receipt_sha256);
+    builder.append(",\"evidence_start_monotonic_ns\":"); builder.append_integer(event.evidence_start_monotonic_ns);
+    builder.append(",\"prefault_tree_id\":"); builder.append_integer(event.prefault_tree_id);
+    builder.append(",\"required_tree_positions\":"); builder.append_integer(event.required_tree_positions);
+    builder.append(",\"required_tree_ids\":"); append_u32_ids(builder, event.required_tree_ids);
+    builder.append(",\"fault_window_arm_sha256\":"); builder.append_escaped(event.fault_window_arm_sha256);
+    builder.append('}');
+}
+
 void append_evidence_snapshot_payload(
     JsonLineBuilder &builder,
     const AdaptiveV2EvidenceSnapshotStructuredEvent &event)
@@ -2441,7 +2502,11 @@ std::string serialize_audit_event(
                 builder,
                 std::get<
                     AdaptiveV2CrossCommitRetentionReadyStructuredEvent>(
-                        event));
+                event));
+            break;
+        case 11:
+            append_fault_window_armed_payload(
+                builder, std::get<FaultWindowArmedStructuredEvent>(event));
             break;
         default:
             throw std::bad_variant_access{};
@@ -2951,6 +3016,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
         case StructuredEventType::
             adaptive_v2_cross_commit_retention_ready:
             return "adaptive_v2.cross_commit_retention_ready";
+        case StructuredEventType::fault_window_armed:
+            return "fault_window_armed";
         default:
             break;
     }

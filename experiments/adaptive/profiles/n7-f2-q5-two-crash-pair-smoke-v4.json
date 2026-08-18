@@ -1,0 +1,132 @@
+{
+  "blinding": {
+    "forbidden": [
+      "crash_ids",
+      "target_pids",
+      "target_pgids",
+      "process_state",
+      "performance_labels"
+    ],
+    "manager_input_source": "authenticated_runtime_evidence_plus_bound_fault_window_arm"
+  },
+  "campaign": {
+    "automatic_retries": 0,
+    "claim_slot_count": 0,
+    "outcome_dependent_order": false,
+    "pair_count": 1,
+    "replacement_policy": "none"
+  },
+  "campaign_member": false,
+  "evidence_guard": {
+    "horizon_tree_positions": 6,
+    "minimum_score_drop": 6,
+    "minimum_timeouts_per_reporter": 2,
+    "required_postfault_tree_positions": 6,
+    "required_qualifying_reporters": 3,
+    "schedule": "native_cyclic_epoch_zero",
+    "tree_switch_period_blocks": 2
+  },
+  "execution_class": "excluded_n7_smoke",
+  "fault": {
+    "automatic_retries": 0,
+    "kind": "atomic_process_group_sigkill",
+    "replacement_policy": "none",
+    "signal_number": 9,
+    "target_count": 2
+  },
+  "fault_window_arm": {
+    "domain": "epoch_zero_native_cyclic_tree_positions",
+    "manager_visibility": "target-identity/process-state blind; intervention-boundary aware",
+    "ordered_tree_prefix": [
+      6,
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "required_for_new_executions": true,
+    "required_postfault_tree_positions": 6,
+    "schema_version": 1
+  },
+  "figure_eligible": false,
+  "frozen": true,
+  "matched_inputs": {
+    "shared_build": true,
+    "shared_epoch1_structure": true,
+    "shared_pair_seed": true,
+    "shared_revision": true,
+    "shared_workload": true
+  },
+  "measurement": {
+    "authoritative_replica_id": 2,
+    "bucket_width_seconds": 5,
+    "commit_event_type": "block.committed",
+    "phase_names": [
+      "baseline",
+      "fault",
+      "epoch1",
+      "late"
+    ]
+  },
+  "performance": {
+    "initial_root_top_ranked": false,
+    "labels_or_fault_truth_manager_visible": false,
+    "responsive_tiers": [
+      "fast",
+      "medium",
+      "slow"
+    ]
+  },
+  "ports": {
+    "base": 18000,
+    "require_available": true,
+    "stride": 1
+  },
+  "profile_id": "n7-f2-q5-two-crash-pair-smoke-v4",
+  "protocol": {
+    "N": 7,
+    "Q": 5,
+    "f": 2,
+    "fanout": 2,
+    "pipeline_stretch": 2,
+    "transactions_per_block": 1000
+  },
+  "schema_version": 2,
+  "thresholds": {
+    "adaptive_ratio_min_ppm": 1100000,
+    "containment_over_baseline_min_ppm": 800000,
+    "paired_ratio_min_ppm": 1100000
+  },
+  "timers": {
+    "adaptation_interval_seconds": 30,
+    "arm_hard_deadline_seconds": 330,
+    "containment_activation_deadline_seconds": 180,
+    "manager_convergence_timeout_seconds": 60,
+    "nonresponse_evidence_deadline_seconds": 120,
+    "optimization_activation_deadline_seconds": 90,
+    "readiness_timeout_seconds": 60,
+    "stable_phase_seconds": 30
+  },
+  "topology": {
+    "active_tree_id": 6,
+    "epoch_zero_digest": "f550407e56cc54a8fd4e93d1997ebe658b75699f4f2a9e955f4cc829b52bec81",
+    "proof_path": "topology-proofs/n7-f2-q5-two-crash-pair-smoke-v4-topology-proof.json",
+    "proof_sha256": "b41d040b0233790b27ea5d66f5ebe870c444fcecc4aa5d4f3222585bdcbab900",
+    "reviewed_target_replica_ids": [
+      0,
+      1
+    ]
+  },
+  "transitions": {
+    "adaptive": [
+      "epoch1",
+      "epoch2"
+    ],
+    "common_commit_quorum": 5,
+    "control": [
+      "epoch1"
+    ],
+    "survivor_barrier_count": 5
+  }
+}

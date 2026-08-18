@@ -2549,7 +2549,7 @@ def test_raw_terminal_failure_detail_is_required_only_for_v4_profiles(
     v4._profile = replace(v4._profile, profile_id="n7-f2-q5-two-crash-pair-smoke-v4")
     with pytest.raises(
         runtime_fixture._runtime().FocusedCrashPairRuntimeError,
-        match="manager terminal controller failure drifted",
+        match="manager terminal schema drifted",
     ):
         v4._events()
 

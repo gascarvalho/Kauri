@@ -1913,3 +1913,67 @@ TEST_CASE(
               fixture.config.placement.shape.pipeline_stretch);
     }
 }
+
+TEST_CASE(
+    "fault-window arm cannot be preseeded before baseline",
+    "[adaptive-v2][manager-controller][fault-window-arm]")
+{
+    Fixture fixture;
+    hotstuff::AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = 0;
+    arm.predecessor_epoch_digest = fixture.ingress.current_epoch().epoch_digest();
+    arm.evidence_start_monotonic_ns = 1;
+    arm.prefault_tree_id = 0;
+    arm.required_tree_ids = {0};
+    fixture.config.selection.fault_window_arm = arm;
+    CHECK_THROWS_AS(
+        AdaptiveV2ManagerController(fixture.ingress, fixture.config),
+        std::invalid_argument);
+}
+
+TEST_CASE(
+    "v4 arm releases already-complete guarded evidence exactly once",
+    "[adaptive-v2][manager-controller][fault-window-arm][v4][n7]")
+{
+    Fixture fixture(5, 4096, 1);
+    fixture.controller.reset();
+    fixture.config.selection.minimum_score_drop = 1;
+    fixture.config.selection.minimum_timeouts_per_reporter = 1;
+    fixture.config.selection.fault_window_arm_required = true;
+    fixture.controller = std::make_unique<AdaptiveV2ManagerController>(
+        fixture.ingress, fixture.config);
+    fixture.freeze_baseline();
+
+    for (std::uint32_t tree_id = 0; tree_id < 7; ++tree_id)
+        fixture.cover_tree(tree_id);
+    for (const auto reporter : std::vector<std::size_t>{0, 1, 2})
+    {
+        const auto timeout = fixture.record(
+            6, reporter, ResponseOutcome::timeout, "v4-complete");
+        fixture.anchor_timeout_proposal(timeout);
+    }
+
+    // A complete ledger cannot cause a legacy unfiltered selection before the
+    // one-shot prospective arm is accepted.
+    CHECK(fixture.controller->evaluate() ==
+          AdaptiveV2ManagerControllerStatus::awaiting_guarded_selection);
+    CHECK(fixture.controller->successor_bundle() == nullptr);
+
+    hotstuff::AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number =
+        fixture.ingress.current_epoch().epoch_number();
+    arm.predecessor_epoch_digest =
+        fixture.ingress.current_epoch().epoch_digest();
+    arm.evidence_start_monotonic_ns = 1;
+    arm.prefault_tree_id = 0;
+    arm.required_tree_ids = {0, 1, 2, 3, 4, 5, 6};
+    REQUIRE(fixture.controller->arm_fault_window(arm));
+    CHECK_FALSE(fixture.controller->arm_fault_window(arm));
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    CHECK(fixture.controller->selection_audit()->metadata.timeout_audit_basis ==
+          AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered);
+}

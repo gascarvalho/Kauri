@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <memory>
 #include <vector>
 
@@ -17,6 +18,16 @@ namespace hotstuff
 {
 
 constexpr std::uint32_t kAdaptiveV2SelectionSchemaVersion = 1;
+
+/** Immutable local manager gate; it is not consensus or fault-target input. */
+struct AdaptiveV2FaultWindowArm
+{
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::uint64_t evidence_start_monotonic_ns{0};
+    std::uint32_t prefault_tree_id{0};
+    std::vector<std::uint32_t> required_tree_ids;
+};
 
 struct AdaptiveV2SelectionConfig
 {
@@ -35,6 +46,9 @@ struct AdaptiveV2SelectionConfig
      */
     std::uint64_t fault_containment_evidence_start_monotonic_ns{0};
     std::uint32_t fault_containment_required_tree_coverage{0};
+    bool fault_window_arm_required{false};
+    /** v4 one-shot arm supersedes the legacy count/timestamp pair. */
+    std::optional<AdaptiveV2FaultWindowArm> fault_window_arm;
 };
 
 enum class AdaptiveV2FaultContainmentCoverageStatus : std::uint8_t
@@ -223,6 +237,13 @@ public:
 
     AdaptiveV2SelectionStatus freeze_baseline(
         std::uint64_t evidence_cutoff) noexcept;
+
+    /**
+     * Bind the prospective, experiment-control arm after the baseline has
+     * frozen.  It is deliberately one-shot: changing the qualifying window
+     * after observing post-baseline evidence would make the ranking mutable.
+     */
+    bool arm_fault_window(AdaptiveV2FaultWindowArm arm) noexcept;
 
     AdaptiveV2SelectionResult select_through(
         std::uint64_t evidence_cutoff) noexcept;

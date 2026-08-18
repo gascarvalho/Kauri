@@ -47,6 +47,9 @@ enum class AdaptiveV2ManagerCycleTerminalReason : std::uint8_t
     successor_rotation_failed,
     evidence_window_reset_failed,
     caller_failed,
+    fault_window_arm_missing,
+    fault_window_arm_invalid,
+    fault_window_arm_io_failure,
 };
 
 /**
@@ -149,6 +152,7 @@ public:
     bool begin_cycle(
         const AdaptiveV2TransitionPolicy &policy) noexcept;
     AdaptiveV2ManagerControllerStatus evaluate() noexcept;
+    bool arm_fault_window(AdaptiveV2FaultWindowArm arm) noexcept;
     const AdaptiveV2EpochChangeBundle *successor_bundle() const noexcept;
 
     bool start_convergence(std::uint64_t logical_start_tick) noexcept;

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 from experiments.adaptive import run_n31_crash_pair_campaign as campaign_contracts
 
 from . import factorial_validation
+from . import focused_crash_pair_runtime
 from .profiled_fault_archive import EvidenceSealError, verify_evidence_seal
 
 _PROFILE_KEYS = {
@@ -35,12 +37,21 @@ _PROFILE_KEYS = {
     "blinding",
 }
 _PROFILE_KEYS_V2 = _PROFILE_KEYS | {"evidence_guard"}
+_PROFILE_KEYS_V4 = _PROFILE_KEYS_V2 | {"fault_window_arm"}
 _FCRASH_H_V3_PROFILE_IDS = frozenset(
     {
         "n7-f2-q5-two-crash-pair-smoke-v3",
         "n31-f5-q21-three-crash-pair-v3",
     }
 )
+_FCRASH_H_V4_PROFILE_IDS = frozenset(
+    {
+        "n7-f2-q5-two-crash-pair-smoke-v4",
+        "n31-f5-q21-three-crash-pair-v4",
+    }
+)
+_FAULT_WINDOW_ARM_DOMAIN = "kauri-focused-fault-window-arm-v1"
+_FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
 _EVENT_KEYS = {
     "event_schema_version",
     "run_id",
@@ -114,7 +125,15 @@ def _validate_controller_failure_terminal(
 ) -> bool:
     """Validate the sealed diagnostic controller-failure projection."""
 
-    unhealthy = payload.get("reason") == "controller_unhealthy"
+    reason = payload.get("reason")
+    arm_diagnostics = {
+        "fault_window_arm_missing",
+        "fault_window_arm_invalid",
+        "fault_window_arm_io_failure",
+    }
+    if isinstance(reason, str) and reason.startswith("fault_window_arm_"):
+        return reason in arm_diagnostics and payload.get("controller_failure") is None
+    unhealthy = reason == "controller_unhealthy"
     present = "controller_failure" in payload
     detail = payload.get("controller_failure")
     if (
@@ -177,6 +196,116 @@ def _validate_controller_failure_terminal(
     )
 
 
+def _validate_v4_manager_terminal_payload(payload: Mapping[str, Any]) -> bool:
+    """Validate the complete v4 terminal projection, including arm failures."""
+
+    keys = {
+        "cycle_ordinal",
+        "policy_intent",
+        "outcome",
+        "reason",
+        "transition_artifact_id",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "winning_activation",
+        "evidence_window_activation_generation",
+        "baseline_evidence_cutoff",
+        "current_evidence_cutoff",
+        "controller_failure",
+    }
+    if set(payload) != keys:
+        return False
+
+    def uint(value: object, maximum: int) -> bool:
+        return type(value) is int and 0 <= value <= maximum
+
+    def digest(value: object, *, nonzero: bool = False) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            and (not nonzero or value != "0" * 64)
+        )
+
+    if (
+        not uint(payload["cycle_ordinal"], (1 << 64) - 1)
+        or payload["policy_intent"]
+        not in {"fault_containment", "performance_optimization"}
+        or payload["outcome"] not in {"advanced", "no_op", "failed"}
+        or payload["reason"]
+        not in {
+            "successor_converged",
+            "explicit_no_op",
+            "controller_unhealthy",
+            "convergence_start_failed",
+            "convergence_retry_exhausted",
+            "convergence_conflicting_observation",
+            "invalid_terminal_identity",
+            "successor_rotation_failed",
+            "evidence_window_reset_failed",
+            "caller_failed",
+            "fault_window_arm_missing",
+            "fault_window_arm_invalid",
+            "fault_window_arm_io_failure",
+        }
+        or payload["transition_artifact_id"]
+        not in {"e0-to-e1-containment", "e1-to-e2-optimization"}
+        or not uint(payload["predecessor_epoch_number"], (1 << 32) - 1)
+        or not digest(payload["predecessor_epoch_digest"], nonzero=True)
+        or not uint(payload["evidence_window_activation_generation"], (1 << 64) - 1)
+        or payload["evidence_window_activation_generation"] == 0
+        or not uint(payload["baseline_evidence_cutoff"], (1 << 64) - 1)
+        or not uint(payload["current_evidence_cutoff"], (1 << 64) - 1)
+        or payload["baseline_evidence_cutoff"] > payload["current_evidence_cutoff"]
+    ):
+        return False
+
+    successor = (
+        payload["successor_epoch_number"],
+        payload["successor_epoch_digest"],
+        payload["command_payload_digest"],
+    )
+    if successor != (None, None, None) and not (
+        uint(successor[0], (1 << 32) - 1)
+        and digest(successor[1], nonzero=True)
+        and digest(successor[2], nonzero=True)
+    ):
+        return False
+    if payload["winning_activation"] is not None and not isinstance(
+        payload["winning_activation"], Mapping
+    ):
+        return False
+
+    if payload["reason"] in {
+        "fault_window_arm_missing",
+        "fault_window_arm_invalid",
+        "fault_window_arm_io_failure",
+    }:
+        cutoff_shape_is_valid = (
+            payload["current_evidence_cutoff"] == payload["baseline_evidence_cutoff"]
+            if payload["reason"] == "fault_window_arm_missing"
+            else payload["current_evidence_cutoff"]
+            >= payload["baseline_evidence_cutoff"]
+        )
+        return (
+            payload["outcome"] == "failed"
+            and payload["cycle_ordinal"] == 0
+            and payload["policy_intent"] == "fault_containment"
+            and payload["transition_artifact_id"] == "e0-to-e1-containment"
+            and payload["predecessor_epoch_number"] == 0
+            and payload["evidence_window_activation_generation"] == 1
+            and payload["baseline_evidence_cutoff"] > 0
+            and cutoff_shape_is_valid
+            and successor == (None, None, None)
+            and payload["winning_activation"] is None
+            and payload["controller_failure"] is None
+        )
+    return True
+
+
 def _authoritative_lifecycle_instance(
     events: Sequence[Mapping[str, Any]], expected_source: str
 ) -> str:
@@ -223,6 +352,10 @@ def _hash(value: object) -> str:
 
 def _sha_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _is_v4_contract(contract: Mapping[str, object]) -> bool:
+    return contract.get("profile_id") in _FCRASH_H_V4_PROFILE_IDS
 
 
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
@@ -306,7 +439,7 @@ def _derive_reporter_coverage_plan(
         "minimum_timeouts_per_reporter",
         "minimum_score_drop",
     }
-    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS:
         expected_guard_keys.add("required_postfault_tree_positions")
     expected_timer_keys = {
         "adaptation_interval_seconds",
@@ -362,7 +495,11 @@ def _derive_reporter_coverage_plan(
     common_ids = sorted(common)
     for row in target_rows:
         row["authenticated_reporter_ids"] = common_ids
-    expected_period = 2 if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS else count
+    expected_period = (
+        2
+        if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+        else count
+    )
     expected_guard = {
         "schedule": "native_cyclic_epoch_zero",
         "tree_switch_period_blocks": expected_period,
@@ -371,7 +508,7 @@ def _derive_reporter_coverage_plan(
         "minimum_timeouts_per_reporter": 2,
         "minimum_score_drop": 2 * required,
     }
-    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS:
         expected_guard["required_postfault_tree_positions"] = horizon
     if dict(guard) != expected_guard:
         _error("FCRASH-H frozen evidence guard differs from topology derivation")
@@ -414,7 +551,8 @@ def _derive_reporter_coverage_plan(
                 "required_postfault_tree_positions": horizon,
                 "nominal_commit_horizon": horizon * expected_period,
             }
-            if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS
+            if profile["profile_id"]
+            in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
             else {}
         ),
         "deadlines_seconds": deadlines,
@@ -605,6 +743,17 @@ def validate_fcrash_h_evidence(
             )
         ):
             _error("FCRASH-H post-fault authoritative progress is incomplete")
+        start_tree = _integer(progress.get("starting_tree_id"), "progress start tree")
+        observed_trees = tuple(
+            _integer(tree, "progress observed tree")
+            for tree in _sequence(progress.get("observed_tree_ids"), "progress trees")
+        )
+        expected_trees = tuple(
+            (start_tree + offset) % len(tuple(contract["members"]))
+            for offset in range(len(observed_trees))
+        )
+        if observed_trees != expected_trees:
+            _error("FCRASH-H post-fault progress is not the exact cyclic prefix")
 
 
 def _fcrash_h_postfault_progress(
@@ -808,6 +957,224 @@ def _fcrash_h_postfault_progress(
     }
 
 
+def _v4_replay_fault_window_anchors(
+    contract: Mapping[str, object],
+    events: Sequence[Mapping[str, Any]],
+    *,
+    baseline_cutoff: int,
+    current_cutoff: int,
+    audit: Mapping[str, Any],
+) -> tuple[list[dict[str, object]], dict[str, int], int]:
+    """Replay the v4 arm's source-blind post-fault proposal boundary.
+
+    The arm establishes only a finite, intervention-boundary-aware proposal
+    domain.  Timeout evidence remains useful only when its exact ProposalKey
+    was first anchored by an on-time direct vote in that domain.  This replay
+    intentionally does not use the manager's selected ranking.
+    """
+
+    armed = [
+        event
+        for event in events
+        if event["source_kind"] == "adaptation_manager"
+        and event["source_id"] == "adaptive-manager"
+        and event["event_type"] == "fault_window_armed"
+    ]
+    if len(armed) != 1:
+        _error("v4 proposal-anchor replay lacks one armed boundary")
+    arm = _mapping(armed[0]["payload"], "fault-window armed payload")
+    start_ns = _integer(
+        arm.get("evidence_start_monotonic_ns"), "fault-window evidence start", 1
+    )
+    prefix = tuple(
+        _integer(tree, "fault-window required tree")
+        for tree in _sequence(arm.get("required_tree_ids"), "fault-window trees")
+    )
+    if not prefix or len(prefix) != len(set(prefix)):
+        _error("v4 proposal-anchor replay arm prefix is malformed")
+    expected_digest = _digest(contract.get("epoch_zero_digest"), "epoch-zero digest")
+    audit_ns = _integer(audit.get("source_monotonic_ns"), "snapshot audit timestamp")
+    audit_sequence = _integer(
+        audit.get("source_sequence"), "snapshot audit sequence", 1
+    )
+
+    accepted: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
+    anchors: dict[int, set[tuple[int, int, str, str]]] = {
+        tree: set() for tree in prefix
+    }
+    for event in events:
+        if (
+            event["source_kind"] != "adaptation_manager"
+            or event["source_id"] != "adaptive-manager"
+            or event["event_type"] != "evidence.observation_accepted"
+        ):
+            continue
+        payload = _mapping(event["payload"], "accepted evidence")
+        sequence = _integer(
+            payload.get("ingestion_sequence"), "evidence ingestion sequence", 1
+        )
+        if sequence > current_cutoff:
+            continue
+        if (
+            _integer(event["source_monotonic_ns"], "evidence acceptance time")
+            > audit_ns
+            or _integer(event["source_sequence"], "evidence acceptance sequence", 1)
+            >= audit_sequence
+        ):
+            _error("v4 accepted evidence does not precede predecessor-0 audit")
+        observation = _mapping(payload.get("observation"), "accepted observation")
+        configuration = _mapping(
+            observation.get("configuration"), "observation configuration"
+        )
+        configuration_epoch = _integer(
+            configuration.get("epoch_number"), "observation epoch"
+        )
+        if (
+            configuration_epoch != 0
+            or configuration.get("epoch_digest") != expected_digest
+        ):
+            continue
+        tree_id = _integer(configuration.get("tree_id"), "observation tree")
+        block_hash = _digest(observation.get("block_hash"), "observation block hash")
+        key = (0, tree_id, expected_digest, block_hash)
+        if (
+            observation.get("outcome") == "on_time"
+            and observation.get("expected_message_type") == "direct_vote"
+            and tree_id in anchors
+            and factorial_validation._conservative_attempt_started_at_or_after(
+                reporter_monotonic_ns=_integer(
+                    observation.get("reporter_monotonic_ns"), "evidence reporter time"
+                ),
+                duration_us=_integer(
+                    observation.get("response_duration_us"),
+                    "evidence response duration",
+                ),
+                lower_bound_ns=start_ns,
+            )
+        ):
+            anchors[tree_id].add(key)
+        if sequence > baseline_cutoff:
+            accepted.append((sequence, observation, event))
+    if any(not keys for keys in anchors.values()):
+        _error("v4 proposal-anchor replay lacks an exact post-fault prefix anchor")
+    anchored_keys = frozenset(key for keys in anchors.values() for key in keys)
+
+    coverage = _mapping(
+        contract.get("reporter_coverage_plan"), "reporter coverage plan"
+    )
+    expected_trees = {
+        (
+            int(row["target_replica_id"]),
+            _integer(reporter["reporter_id"], "coverage reporter"),
+        ): _integer(reporter["tree_id"], "coverage tree")
+        for row in _sequence(coverage.get("targets"), "coverage targets")
+        for reporter in _sequence(
+            _mapping(row, "coverage target").get("first_qualifying_reporters"),
+            "first qualifying reporters",
+        )
+    }
+    filtered_outstanding: dict[str, tuple[int, int, tuple[int, int, str, str], int]] = (
+        {}
+    )
+    filtered_completed: set[str] = set()
+    global_outstanding: dict[str, tuple[int, int, tuple[int, int, str, str]]] = {}
+    global_drawdowns = {
+        int(row["target_replica_id"])
+        for row in _sequence(coverage.get("targets"), "coverage targets")
+    }
+    drawdowns = {target: 0 for target in global_drawdowns}
+    for _ingestion_sequence, observation, event in sorted(
+        accepted, key=lambda row: row[0]
+    ):
+        outcome = observation.get("outcome")
+        if outcome not in {"on_time", "timeout", "late"}:
+            _error("v4 replay observation outcome is malformed")
+        configuration = _mapping(
+            observation.get("configuration"), "observation configuration"
+        )
+        key = (
+            0,
+            _integer(configuration.get("tree_id"), "observation tree"),
+            expected_digest,
+            _digest(observation.get("block_hash"), "observation block hash"),
+        )
+        observation_id = observation.get("observation_id")
+        reporter = observation.get("reporter_id")
+        target = observation.get("observed_replica_id")
+        if (
+            not isinstance(observation_id, str)
+            or type(reporter) is not int
+            or type(target) is not int
+        ):
+            _error("v4 replay observation identity is malformed")
+        identity = (reporter, target, key)
+        if outcome == "timeout":
+            if observation_id in global_outstanding:
+                _error("v4 replay timeout observation ID is reused")
+            global_outstanding[observation_id] = identity
+            if target in drawdowns:
+                drawdowns[target] -= 1
+        elif outcome == "on_time":
+            if target in drawdowns and drawdowns[target] < 0:
+                drawdowns[target] += 1
+        else:
+            previous = global_outstanding.pop(observation_id, None)
+            if previous is not None and previous != identity:
+                _error("v4 late observation changed its attempt identity")
+            if previous is not None and target in drawdowns and drawdowns[target] < 0:
+                drawdowns[target] += 1
+        if key not in anchored_keys or outcome == "on_time":
+            continue
+        if outcome == "timeout":
+            if (
+                observation_id in filtered_outstanding
+                or observation_id in filtered_completed
+            ):
+                _error("v4 filtered timeout observation ID is reused")
+            filtered_outstanding[observation_id] = (
+                reporter,
+                target,
+                key,
+                max(
+                    _integer(event["source_monotonic_ns"], "evidence acceptance time"),
+                    _integer(
+                        observation.get("reporter_monotonic_ns"),
+                        "evidence reporter time",
+                    ),
+                ),
+            )
+            continue
+        previous = filtered_outstanding.pop(observation_id, None)
+        if previous is None:
+            # A timeout can legitimately originate before the suffix cutoff;
+            # the late observation is then irrelevant to this filtered guard.
+            continue
+        if previous[:3] != identity:
+            _error("v4 late observation does not exactly compensate its timeout")
+        filtered_completed.add(observation_id)
+
+    rows: list[dict[str, object]] = []
+    for reporter, target, key, timestamp in filtered_outstanding.values():
+        if expected_trees.get((target, reporter)) != key[1]:
+            continue
+        rows.append(
+            {
+                "epoch_number": 0,
+                "tree_id": key[1],
+                "observed_replica_id": target,
+                "reporter_id": reporter,
+                "outcome": "timeout",
+                "compensated": False,
+                "source_monotonic_ns": timestamp,
+            }
+        )
+    return (
+        rows,
+        {str(target): drawdowns[target] for target in sorted(drawdowns)},
+        max((int(row["source_monotonic_ns"]) for row in rows), default=0),
+    )
+
+
 def _fcrash_h_witness_from_events(
     contract: Mapping[str, object],
     events: Sequence[Mapping[str, Any]],
@@ -857,6 +1224,48 @@ def _fcrash_h_witness_from_events(
         _mapping(audits[0]["payload"], "snapshot audit").get("baseline_cutoff"),
         "snapshot baseline cutoff",
     )
+    if _is_v4_contract(contract):
+        rows, guard_drawdowns, nonresponse_ns = _v4_replay_fault_window_anchors(
+            contract,
+            events,
+            baseline_cutoff=baseline_cutoff,
+            current_cutoff=cutoff,
+            audit=audits[0],
+        )
+        if not rows:
+            _error("FCRASH-H contains no qualifying timeout evidence")
+        witness = {
+            "fault_monotonic_ns": fault_ns,
+            "nonresponse_monotonic_ns": nonresponse_ns,
+            "snapshot_audit_monotonic_ns": _integer(
+                audits[0]["source_monotonic_ns"], "snapshot audit timestamp"
+            ),
+            "epoch1_activation_monotonic_ns": max(
+                _integer(event["source_monotonic_ns"], "Epoch 1 activation time")
+                for event in activations1
+            ),
+            "epoch2_activation_monotonic_ns": (
+                None
+                if not activations2
+                else max(
+                    _integer(event["source_monotonic_ns"], "Epoch 2 activation time")
+                    for event in activations2
+                )
+            ),
+            "timeout_observations": rows,
+            "guard_drawdowns": guard_drawdowns,
+        }
+        if coverage.get("required_postfault_tree_positions") is not None:
+            witness["postfault_progress"] = _fcrash_h_postfault_progress(
+                contract,
+                events,
+                fault_ns=fault_ns,
+                prefault_ns=prefault_ns,
+                audit_ns=_integer(
+                    audits[0]["source_monotonic_ns"], "snapshot audit timestamp"
+                ),
+            )
+        return witness
     accepted: list[tuple[int, Mapping[str, Any]]] = []
     latest: dict[str, tuple[int, Mapping[str, Any], int, int]] = {}
     for event in events:
@@ -1059,7 +1468,11 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
 
     profile = _read_json(root / "profile.json", "focused profile")
     schema_version = profile.get("schema_version")
-    expected_keys = _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
+    expected_keys = (
+        _PROFILE_KEYS_V4
+        if profile.get("profile_id") in _FCRASH_H_V4_PROFILE_IDS
+        else _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
+    )
     if (
         set(profile) != expected_keys
         or schema_version not in {1, 2}
@@ -1074,8 +1487,56 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "n31-f5-q21-three-crash-pair-v2",
         "n7-f2-q5-two-crash-pair-smoke-v3",
         "n31-f5-q21-three-crash-pair-v3",
+        "n7-f2-q5-two-crash-pair-smoke-v4",
+        "n31-f5-q21-three-crash-pair-v4",
     }:
         _error("focused profile identity is not reviewed")
+    if profile_id in _FCRASH_H_V4_PROFILE_IDS:
+        arm_metadata = _mapping(
+            profile.get("fault_window_arm"), "fault-window arm metadata"
+        )
+        blinding_metadata = _mapping(profile.get("blinding"), "profile blinding")
+        positions = _integer(
+            arm_metadata.get("required_postfault_tree_positions"),
+            "fault-window metadata tree positions",
+            1,
+        )
+        topology_metadata = _mapping(profile.get("topology"), "profile topology")
+        count_metadata = _integer(
+            _mapping(profile.get("protocol"), "profile protocol").get("N"),
+            "profile replica count",
+            1,
+        )
+        prefix_metadata = arm_metadata.get("ordered_tree_prefix")
+        if (
+            set(arm_metadata)
+            != {
+                "schema_version",
+                "domain",
+                "manager_visibility",
+                "ordered_tree_prefix",
+                "required_for_new_executions",
+                "required_postfault_tree_positions",
+            }
+            or type(arm_metadata.get("schema_version")) is not int
+            or arm_metadata.get("schema_version") != 1
+            or arm_metadata.get("domain") != "epoch_zero_native_cyclic_tree_positions"
+            or arm_metadata.get("manager_visibility")
+            != "target-identity/process-state blind; intervention-boundary aware"
+            or arm_metadata.get("required_for_new_executions") is not True
+            or blinding_metadata.get("manager_input_source")
+            != "authenticated_runtime_evidence_plus_bound_fault_window_arm"
+            or positions > count_metadata
+            or not isinstance(prefix_metadata, list)
+            or any(type(tree) is not int for tree in prefix_metadata)
+            or len(prefix_metadata) != len(set(prefix_metadata))
+            or prefix_metadata
+            != [
+                (int(topology_metadata["active_tree_id"]) + offset) % count_metadata
+                for offset in range(positions)
+            ]
+        ):
+            _error("fault-window arm metadata drifted")
     protocol = _mapping(profile.get("protocol"), "profile protocol")
     count = _integer(protocol.get("N"), "profile replica count", 1)
     threshold = _integer(protocol.get("f"), "profile fault threshold")
@@ -1339,7 +1800,7 @@ def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) 
         "tree-switch-period": str(
             2
             if _mapping(contract.get("profile"), "focused profile").get("profile_id")
-            in _FCRASH_H_V3_PROFILE_IDS
+            in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
             else len(tuple(contract["members"]))
         ),
         "epoch-protocol-mode": "adaptive_v2",
@@ -1438,11 +1899,15 @@ def _validate_sources(
     if recorded_inventory.get("sources") != recorded_sources:
         _error("recorded source inventory differs from raw envelopes")
     for event in events:
-        if event[
-            "event_type"
-        ] == "adaptive_v2_session_terminal" and not _validate_controller_failure_terminal(
-            _mapping(event["payload"], "manager terminal"),
-            require_for_unhealthy=require_controller_failure,
+        if event["event_type"] != "adaptive_v2_session_terminal":
+            continue
+        payload = _mapping(event["payload"], "manager terminal")
+        if require_controller_failure and not _validate_v4_manager_terminal_payload(
+            payload
+        ):
+            _error("manager terminal schema drifted")
+        if not _validate_controller_failure_terminal(
+            payload, require_for_unhealthy=require_controller_failure
         ):
             _error("manager terminal controller failure detail drifted")
     return events, inventory
@@ -1494,7 +1959,7 @@ def _validate_trees(
         _error(f"{label} roots drifted")
     is_v3 = (
         _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
     )
     members = tuple(_integer(member, "tree member") for member in contract["members"])
     first_leaf = (len(members) - 2) // int(contract["fanout"]) + 1
@@ -1907,7 +2372,7 @@ def _ranking(
     if (
         audited_eligible_ranking is not None
         and _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
     ):
         expected_audit_roots = (
             _containment_roots(ranked, contract)
@@ -2010,7 +2475,9 @@ def _commit_reconstruction(
     if len(authoritative_commits) < 4:
         _error("raw evidence lacks the minimum authoritative commit chain")
     profile = _mapping(contract.get("profile"), "focused profile")
-    is_v3 = profile.get("profile_id") in _FCRASH_H_V3_PROFILE_IDS
+    is_v3 = (
+        profile.get("profile_id") in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+    )
     configurations_by_source_epoch: dict[
         tuple[str, int], list[tuple[tuple[int, int], int]]
     ] = {}
@@ -2295,6 +2762,19 @@ _MANAGER_SINGLETON_OPTIONS = {
     "--structured-event-run-id",
     "--structured-event-source-instance",
     "--structured-event-output",
+    "--fault-window-arm-path",
+    "--fault-window-arm-schema-version",
+    "--fault-window-arm-domain",
+    "--fault-window-arm-run-id",
+    "--fault-window-arm-profile-id",
+    "--fault-window-arm-profile-sha256",
+    "--fault-window-arm-topology-proof-sha256",
+    "--fault-window-arm-request-sha256",
+    "--fault-window-arm-epoch-number",
+    "--fault-window-arm-epoch-digest",
+    "--fault-window-arm-prefault-tree-id",
+    "--fault-window-arm-required-tree-positions",
+    "--fault-window-arm-deadline-seconds",
 }
 _MANAGER_REPEATABLE_OPTIONS = {"--transition-request", "--bundle-output", "--replica"}
 
@@ -2337,17 +2817,305 @@ def _validate_manager_boundary(
     expected_transition_count = (
         transition_count
         if _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
         else int(contract["adaptive_transition_count"])
     )
     if counts.get("--transition-request") != expected_transition_count:
         _error("manager launch boundary transition cardinality drifted")
     if counts.get("--bundle-output") != counts.get("--transition-request"):
         _error("manager launch boundary bundle output cardinality drifted")
+    arm_options = {
+        option
+        for option in _MANAGER_SINGLETON_OPTIONS
+        if option.startswith("--fault-window-arm-")
+    }
+    if _is_v4_contract(contract):
+        if any(counts.get(option) != 1 for option in arm_options):
+            _error("v4 manager launch lacks exact fault-window arm bindings")
+    elif any(counts.get(option, 0) for option in arm_options):
+        _error("legacy manager launch contains a prospective fault-window arm")
     try:
         factorial_validation.validate_manager_blinding(arguments, manager_events)
     except factorial_validation.FactorialValidationError as exc:
         raise FocusedCrashPairValidationError("manager boundary is not blind") from exc
+
+
+def _validate_fault_window_arm(
+    root: Path,
+    contract: Mapping[str, object],
+    argv: Sequence[Any],
+    fault_receipt: Mapping[str, Any],
+    confirmations: Mapping[int, int],
+    events: Sequence[Mapping[str, Any]],
+    *,
+    snapshot_audit_ns: int | None,
+) -> None:
+    """Independently bind the persisted v4 arm; it is never evidence itself."""
+
+    if not _is_v4_contract(contract):
+        return
+    path = (root / "runtime" / _FAULT_WINDOW_ARM_FILENAME).resolve()
+    if (
+        path.parent != (root / "runtime").resolve()
+        or path.is_symlink()
+        or not path.is_file()
+    ):
+        _error("v4 fault-window arm is absent or escapes the child root")
+    arm = _read_json(path, "fault-window arm")
+    arm_bytes = path.read_bytes()
+    if arm_bytes != _canonical(arm):
+        _error("v4 fault-window arm bytes are not canonical")
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "profile_id",
+        "profile_sha256",
+        "topology_proof_sha256",
+        "request_sha256",
+        "epoch_number",
+        "epoch_digest",
+        "fault_receipt_sha256",
+        "evidence_start_monotonic_ns",
+        "prefault_tree_id",
+        "required_tree_positions",
+        "required_tree_ids",
+    }
+    if (
+        set(arm) != expected_keys
+        or arm.get("schema_version") != 1
+        or arm.get("kind") != _FAULT_WINDOW_ARM_DOMAIN
+    ):
+        _error("v4 fault-window arm schema drifted")
+    _integer(arm.get("schema_version"), "fault-window schema version", 1)
+    _integer(arm.get("epoch_number"), "fault-window epoch number")
+    _integer(arm.get("evidence_start_monotonic_ns"), "fault-window evidence start", 1)
+    for key in (
+        "profile_sha256",
+        "topology_proof_sha256",
+        "request_sha256",
+        "epoch_digest",
+        "fault_receipt_sha256",
+    ):
+        _digest(arm.get(key), f"fault-window {key}")
+    profile = _mapping(contract["profile"], "focused profile")
+    coverage = _mapping(contract["reporter_coverage_plan"], "reporter coverage plan")
+    parent_request_path = root / "runtime" / "parent-authorization-request.json"
+    parent_receipt_path = root / "runtime" / "parent-authorization-receipt.json"
+    parent_request = _read_json(parent_request_path, "parent authorization request")
+    parent_receipt = _read_json(parent_receipt_path, "parent authorization receipt")
+    parent_request_bytes = parent_request_path.read_bytes()
+    parent_receipt_bytes = parent_receipt_path.read_bytes()
+    if parent_request_bytes != _canonical(
+        parent_request
+    ) or parent_receipt_bytes != _canonical(parent_receipt):
+        _error("parent authorization provenance is not canonical")
+    request_keys = set(parent_request)
+    expected_request_keys = {
+        "schema_version",
+        "mode",
+        "pair_count",
+        "profile_sha256",
+        "topology_proof_sha256",
+        "output_root",
+        "automatic_retries",
+        "replacement_policy",
+        "authorization_nonce",
+    }
+    if request_keys == expected_request_keys | {"execution_context_sha256"}:
+        _digest(
+            parent_request.get("execution_context_sha256"),
+            "parent execution-context digest",
+        )
+    elif request_keys != expected_request_keys:
+        _error("parent authorization request schema drifted")
+    parent_request_sha = _sha_bytes(parent_request_bytes)
+    expected_receipt_keys = request_keys | {
+        "request_sha256",
+        "approval_reference",
+        "approved_utc",
+    }
+    if (
+        set(parent_receipt) != expected_receipt_keys
+        or any(
+            parent_receipt.get(key) != parent_request.get(key) for key in request_keys
+        )
+        or parent_receipt.get("request_sha256") != parent_request_sha
+        or parent_request.get("schema_version") != 1
+        or parent_request.get("mode") not in {"pair", "smoke", "campaign"}
+        or type(parent_request.get("pair_count")) is not int
+        or parent_request["pair_count"] < 1
+        or parent_request.get("profile_sha256") != contract["profile_sha256"]
+        or parent_request.get("topology_proof_sha256")
+        != contract["topology_proof_sha256"]
+        or parent_request.get("automatic_retries") != 0
+        or parent_request.get("replacement_policy") != "none"
+        or not isinstance(parent_request.get("output_root"), str)
+        or not Path(parent_request["output_root"]).is_absolute()
+        or not isinstance(parent_request.get("authorization_nonce"), str)
+        or not parent_request["authorization_nonce"]
+    ):
+        _error("parent authorization provenance binding drifted")
+    expected_pairs = (
+        {"smoke": 1}
+        if len(tuple(contract["members"])) == 7
+        else {"pair": 1, "campaign": 5}
+    )
+    mode = str(parent_request["mode"])
+    if expected_pairs.get(mode) != parent_request["pair_count"] or parent_request[
+        "authorization_nonce"
+    ] != _sha_bytes(
+        f"{mode}:{parent_request['pair_count']}:{parent_request['output_root']}".encode(
+            "utf-8"
+        )
+    ):
+        _error("parent authorization mode, pair count, or nonce drifted")
+    approval_reference = parent_receipt.get("approval_reference")
+    approved_utc = parent_receipt.get("approved_utc")
+    if (
+        not isinstance(approval_reference, str)
+        or not 1 <= len(approval_reference) <= 200
+        or any(not 32 <= ord(character) <= 126 for character in approval_reference)
+        or not isinstance(approved_utc, str)
+        or not 1 <= len(approved_utc) <= 64
+        or any(not 32 <= ord(character) <= 126 for character in approved_utc)
+    ):
+        _error("parent authorization approval metadata drifted")
+    try:
+        parsed_approved = datetime.fromisoformat(approved_utc)
+    except ValueError as exc:
+        raise FocusedCrashPairValidationError(
+            "parent authorization approval time is invalid"
+        ) from exc
+    offset = parsed_approved.utcoffset()
+    if offset is None or offset.total_seconds() != 0:
+        _error("parent authorization approval time is not UTC")
+    pair_receipt = _read_json(root / "pair-receipt.json", "pair receipt")
+    pair_id = pair_receipt.get("pair_id")
+    if (
+        not isinstance(pair_id, str)
+        or not pair_id.startswith("pair-")
+        or not pair_id[5:].isdigit()
+        or not 1 <= int(pair_id[5:]) <= int(parent_request["pair_count"])
+        or root.parent.name != pair_id
+        or root.name not in {"control", "adaptive"}
+    ):
+        _error("parent authorization output or pair binding drifted")
+    historical_arm_path = (
+        Path(parent_request["output_root"])
+        / pair_id
+        / root.name
+        / "runtime"
+        / _FAULT_WINDOW_ARM_FILENAME
+    )
+    receipt_path = root / "raw" / "fault-receipt.json"
+    receipt_bytes = receipt_path.read_bytes()
+    if receipt_bytes != _canonical(fault_receipt):
+        _error("v4 fault receipt bytes are not canonical")
+    run_ids = {event.get("run_id") for event in events}
+    if len(run_ids) != 1 or arm.get("run_id") != next(iter(run_ids)):
+        _error("v4 fault-window arm run identity drifted")
+    prefault_tree = _integer(arm.get("prefault_tree_id"), "fault-window pre-fault tree")
+    positions = _integer(
+        arm.get("required_tree_positions"), "fault-window required positions", 1
+    )
+    required_ids = tuple(
+        _integer(value, "fault-window required tree")
+        for value in _sequence(
+            arm.get("required_tree_ids"), "fault-window required trees"
+        )
+    )
+    if (
+        arm.get("profile_id") != contract["profile_id"]
+        or arm.get("profile_sha256") != contract["profile_sha256"]
+        or arm.get("topology_proof_sha256") != contract["topology_proof_sha256"]
+        or arm.get("request_sha256") != parent_request_sha
+        or arm.get("epoch_number") != 0
+        or arm.get("epoch_digest") != contract["epoch_zero_digest"]
+        or arm.get("fault_receipt_sha256") != _sha_bytes(receipt_bytes)
+        or arm.get("evidence_start_monotonic_ns") != max(confirmations.values())
+        or prefault_tree
+        != _mapping(coverage, "reporter coverage plan").get("active_tree_id")
+        or positions != coverage.get("required_postfault_tree_positions")
+        or required_ids
+        != tuple(
+            (prefault_tree + offset) % len(tuple(contract["members"]))
+            for offset in range(positions)
+        )
+    ):
+        _error("v4 fault-window arm binding drifted")
+    pairs = dict(zip(argv[1::2], argv[2::2], strict=True))
+    expected_argv = {
+        "--fault-window-arm-path": str(historical_arm_path),
+        "--fault-window-arm-schema-version": "1",
+        "--fault-window-arm-domain": _FAULT_WINDOW_ARM_DOMAIN,
+        "--fault-window-arm-run-id": str(arm["run_id"]),
+        "--fault-window-arm-profile-id": str(arm["profile_id"]),
+        "--fault-window-arm-profile-sha256": str(arm["profile_sha256"]),
+        "--fault-window-arm-topology-proof-sha256": str(arm["topology_proof_sha256"]),
+        "--fault-window-arm-request-sha256": str(arm["request_sha256"]),
+        "--fault-window-arm-epoch-number": "0",
+        "--fault-window-arm-epoch-digest": str(arm["epoch_digest"]),
+        "--fault-window-arm-prefault-tree-id": str(arm["prefault_tree_id"]),
+        "--fault-window-arm-required-tree-positions": str(
+            arm["required_tree_positions"]
+        ),
+        "--fault-window-arm-deadline-seconds": str(
+            _mapping(coverage["deadlines_seconds"], "coverage deadlines")[
+                "arm_hard_seconds"
+            ]
+        ),
+    }
+    if any(pairs.get(key) != value for key, value in expected_argv.items()):
+        _error("v4 manager arm bindings differ from the persisted arm")
+    arm_sha = _sha_bytes(arm_bytes)
+    all_armed = [
+        event for event in events if event["event_type"] == "fault_window_armed"
+    ]
+    armed = [
+        event
+        for event in events
+        if event["event_type"] == "fault_window_armed"
+        and event["source_kind"] == "adaptation_manager"
+        and event["source_id"] == "adaptive-manager"
+    ]
+    if len(all_armed) != 1 or len(armed) != 1 or snapshot_audit_ns is None:
+        _error("v4 fault-window armed event is absent or ambiguous")
+    event = armed[0]
+    manager_instances = {
+        candidate["source_instance"]
+        for candidate in events
+        if candidate["source_kind"] == "adaptation_manager"
+        and candidate["source_id"] == "adaptive-manager"
+    }
+    if len(manager_instances) != 1 or event["source_instance"] not in manager_instances:
+        _error("v4 fault-window armed event manager instance drifted")
+    payload = _mapping(event["payload"], "fault-window armed payload")
+    _integer(payload.get("schema_version"), "armed event schema version", 1)
+    _integer(payload.get("epoch_number"), "armed event epoch number")
+    _integer(
+        payload.get("evidence_start_monotonic_ns"), "armed event evidence start", 1
+    )
+    _integer(payload.get("prefault_tree_id"), "armed event pre-fault tree")
+    _integer(payload.get("required_tree_positions"), "armed event tree positions", 1)
+    for key in (
+        "profile_sha256",
+        "topology_proof_sha256",
+        "request_sha256",
+        "epoch_digest",
+        "fault_receipt_sha256",
+        "fault_window_arm_sha256",
+    ):
+        _digest(payload.get(key), f"armed event {key}")
+    tuple(
+        _integer(value, "armed event required tree")
+        for value in _sequence(payload.get("required_tree_ids"), "armed event trees")
+    )
+    if dict(payload) != {**dict(arm), "fault_window_arm_sha256": arm_sha}:
+        _error("v4 fault-window armed event payload drifted")
+    armed_ns = _integer(event["source_monotonic_ns"], "fault-window armed timestamp")
+    if not int(arm["evidence_start_monotonic_ns"]) <= armed_ns < snapshot_audit_ns:
+        _error("v4 fault-window arm was not accepted before snapshot audit")
 
 
 def _aggregate_child_provenance(
@@ -2570,6 +3338,100 @@ def _validate_atomic_fault_receipt(
             _error("fault journal identity or terminal outcome drifted")
 
 
+def _validate_v4_pass_terminals(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    contract: Mapping[str, object],
+    epoch1: Any,
+    epoch2: Any | None,
+    commands1: Sequence[Mapping[str, Any]],
+    commands2: Sequence[Mapping[str, Any]],
+    activations1: Sequence[Mapping[str, Any]],
+    activations2: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind a v4 PASS to exactly the successful manager-terminal chain."""
+
+    terminals = sorted(
+        (
+            event
+            for event in events
+            if event["source_kind"] == "adaptation_manager"
+            and event["event_type"] == "adaptive_v2_session_terminal"
+        ),
+        key=lambda event: _integer(event["source_sequence"], "terminal sequence", 1),
+    )
+    expected_epochs = ((1, epoch1, commands1, activations1),)
+    if epoch2 is not None:
+        expected_epochs += ((2, epoch2, commands2, activations2),)
+    if len(terminals) != len(expected_epochs):
+        _error("v4 PASS manager terminal cardinality drifted")
+
+    for ordinal, (epoch_number, epoch, commands, activations) in enumerate(
+        expected_epochs
+    ):
+        if not commands or not activations:
+            _error("v4 PASS terminal lacks a committed transition")
+        payload = _mapping(terminals[ordinal]["payload"], "v4 PASS manager terminal")
+        if not _validate_v4_manager_terminal_payload(payload):
+            _error("v4 PASS manager terminal schema drifted")
+        command = _mapping(commands[0]["payload"], "terminal command")
+        activation = _mapping(activations[0]["payload"], "terminal activation")
+        predecessor_digest = (
+            str(contract["epoch_zero_digest"])
+            if epoch_number == 1
+            else str(epoch1.epoch_digest)
+        )
+        artifact = (
+            "e0-to-e1-containment" if epoch_number == 1 else "e1-to-e2-optimization"
+        )
+        snapshot = next(
+            (
+                _mapping(event["payload"], "terminal evidence snapshot")
+                for event in events
+                if event["source_kind"] == "adaptation_manager"
+                and event["event_type"] == "adaptive_v2_evidence_snapshot"
+                and event["payload"].get("predecessor_epoch_number") == epoch_number - 1
+            ),
+            None,
+        )
+        if snapshot is None:
+            _error("v4 PASS terminal lacks its evidence snapshot")
+        winning = {
+            "predecessor_epoch_number": command.get("predecessor_epoch_number"),
+            "predecessor_epoch_digest": command.get("predecessor_epoch_digest"),
+            "successor_epoch_number": command.get("successor_epoch_number"),
+            "successor_epoch_digest": command.get("successor_epoch_digest"),
+            "command_payload_digest": command.get("payload_digest"),
+            "command_block_height": command.get("command_block_height"),
+            "command_block_hash": command.get("command_block_hash"),
+            "activation_delay_blocks": command.get("activation_delay_blocks"),
+            "activation_height": activation.get("activation_height"),
+        }
+        expected = {
+            "cycle_ordinal": ordinal,
+            "policy_intent": (
+                "fault_containment" if epoch_number == 1 else "performance_optimization"
+            ),
+            "outcome": "advanced",
+            "reason": "successor_converged",
+            "transition_artifact_id": artifact,
+            "predecessor_epoch_number": epoch_number - 1,
+            "predecessor_epoch_digest": predecessor_digest,
+            "successor_epoch_number": epoch_number,
+            "successor_epoch_digest": epoch.epoch_digest,
+            "command_payload_digest": epoch.command.payload_digest,
+            "winning_activation": winning,
+            "controller_failure": None,
+            "evidence_window_activation_generation": snapshot.get(
+                "activation_generation"
+            ),
+            "baseline_evidence_cutoff": snapshot.get("baseline_evidence_cutoff"),
+            "current_evidence_cutoff": snapshot.get("current_evidence_cutoff"),
+        }
+        if dict(payload) != expected:
+            _error("v4 PASS manager terminal identity drifted")
+
+
 def validate_sealed_arm(
     run_directory: Path,
     *,
@@ -2651,7 +3513,7 @@ def validate_sealed_arm(
     epoch1_roots = (
         _containment_roots(containment_ranked_ids, contract)
         if _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
         else tuple(range(int(contract["quorum"])))
     )
     _validate_trees(epoch1, epoch1_roots, "Epoch 1", contract)
@@ -2751,6 +3613,19 @@ def validate_sealed_arm(
             <= epoch2_audit_ns
         ):
             _error("Epoch 2 command precedes the fresh common-commit window")
+    if str(_mapping(contract["profile"], "focused profile").get("profile_id")).endswith(
+        "-v4"
+    ):
+        _validate_v4_pass_terminals(
+            events,
+            contract=contract,
+            epoch1=epoch1,
+            epoch2=epoch2,
+            commands1=commands1,
+            commands2=commands2,
+            activations1=activations1,
+            activations2=activations2,
+        )
     if epoch2 is None:
         ranked_ids = containment_ranked_ids
         observation_ids = containment_observation_ids
@@ -2848,6 +3723,15 @@ def validate_sealed_arm(
         manager_input,
         [event for event in events if event["source_kind"] == "adaptation_manager"],
         transition_count=1 if epoch2 is None else 2,
+    )
+    _validate_fault_window_arm(
+        root,
+        contract,
+        _sequence(observed.get("argv"), "observed manager argv"),
+        fault_receipt,
+        confirmations,
+        events,
+        snapshot_audit_ns=epoch1_audit_ns,
     )
 
     cleanup = _read_json(root / "cleanup.json", "cleanup result")

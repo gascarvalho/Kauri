@@ -538,6 +538,8 @@ bool AdaptiveV2ManagerSession::begin_cycle(
                 .fault_containment_evidence_start_monotonic_ns = 0;
             controller_config.selection
                 .fault_containment_required_tree_coverage = 0;
+            controller_config.selection.fault_window_arm_required = false;
+            controller_config.selection.fault_window_arm.reset();
         }
         controller_config.shape_adaptation_enabled =
             frozen_policy.apply_shape_selection;
@@ -583,6 +585,15 @@ AdaptiveV2ManagerSession::evaluate() noexcept
         state.phase = State::Phase::successor_available;
     }
     return result;
+}
+
+bool AdaptiveV2ManagerSession::arm_fault_window(
+    AdaptiveV2FaultWindowArm arm) noexcept
+{
+    auto &state = *state_;
+    return state.phase == State::Phase::collecting_cycle &&
+        state.controller != nullptr && state.convergence == nullptr &&
+        state.controller->arm_fault_window(std::move(arm));
 }
 
 const AdaptiveV2EpochChangeBundle *
@@ -961,6 +972,9 @@ bool AdaptiveV2ManagerSession::finalize_failed_cycle(
     case AdaptiveV2ManagerCycleTerminalReason::
         evidence_window_reset_failed:
     case AdaptiveV2ManagerCycleTerminalReason::caller_failed:
+    case AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_missing:
+    case AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_invalid:
+    case AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure:
         break;
     case AdaptiveV2ManagerCycleTerminalReason::successor_converged:
     case AdaptiveV2ManagerCycleTerminalReason::explicit_no_op:

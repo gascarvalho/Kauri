@@ -378,6 +378,13 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;adaptation-manager;m12"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_fault_window_arm_parser
+    test_fault_window_arm_parser.cpp)
+set_tests_properties(
+    test_fault_window_arm_parser PROPERTIES
+    LABELS "unit;adaptive;adaptation-manager;fault-window-arm;v4"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_adaptation_manager_profile
     test_adaptation_manager_profile.cpp)
 set_tests_properties(

@@ -27,6 +27,7 @@ using hotstuff::AdaptiveV2SelectionConstraintBasis;
 using hotstuff::AdaptiveV2SelectionStatus;
 using hotstuff::AdaptiveV2TimeoutAuditBasis;
 using hotstuff::AdaptiveV2FaultContainmentCoverageStatus;
+using hotstuff::AdaptiveV2FaultWindowArm;
 using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AuthenticatedReporter;
 using hotstuff::ConfigurationId;
@@ -801,6 +802,102 @@ TEST_CASE(
     CHECK(compensated.status ==
           AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
     CHECK(compensated.eligible_candidates.empty());
+}
+
+TEST_CASE(
+    "v4 fault-window arm is one-shot and binds the wrapped predecessor prefix",
+    "[adaptive-v2][selection][fault-window-arm][v4][n7]")
+{
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture;
+    fixture.baseline_all();
+
+    auto config = selection_config(1, 1, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    // Evidence that would ordinarily be sufficient remains unusable until
+    // the immutable prospective boundary has been armed.
+    // The conservative direct-vote start lower bound subtracts the deadline
+    // interval, so leave an ample post-boundary margin.
+    fixture.advance_monotonic_clock(kEvidenceStartNs + 1'000'000);
+    for (const auto tree_id : std::vector<std::uint32_t>{6, 0, 1, 2, 3, 4})
+        fixture.cover_tree(tree_id);
+    for (const auto reporter : std::vector<ReplicaID>{2, 3, 4})
+    {
+        for (std::size_t attempt = 0; attempt < 2; ++attempt)
+        {
+            const auto timeout = fixture.timeout(reporter, 0);
+            fixture.anchor_timeout_proposal(timeout);
+        }
+    }
+    const auto pre_arm = selector.select_through(fixture.ledger->high_watermark());
+    CHECK(pre_arm.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 6;
+    arm.required_tree_ids = {6, 0, 1, 2, 3, 4};
+
+    SECTION("reject malformed or noncanonical arms")
+    {
+        auto malformed = arm;
+        malformed.required_tree_ids = {6, 0, 1, 2, 3, 3};
+        CHECK_FALSE(selector.arm_fault_window(malformed));
+
+        malformed = arm;
+        malformed.required_tree_ids = {6, 1, 0, 2, 3, 4};
+        CHECK_FALSE(selector.arm_fault_window(malformed));
+
+        malformed = arm;
+        malformed.prefault_tree_id = 5;
+        CHECK_FALSE(selector.arm_fault_window(malformed));
+
+        malformed = arm;
+        malformed.predecessor_epoch_number++;
+        CHECK_FALSE(selector.arm_fault_window(malformed));
+
+        malformed = arm;
+        malformed.evidence_start_monotonic_ns = 0;
+        CHECK_FALSE(selector.arm_fault_window(malformed));
+
+        malformed = arm;
+        malformed.required_tree_ids = {6, 0, 1, 2, 3, 4, 5, 6};
+        CHECK_FALSE(selector.arm_fault_window(malformed));
+    }
+
+    SECTION("accept exact arm once and select already-complete coverage")
+    {
+        CHECK(selector.arm_fault_window(arm));
+        CHECK_FALSE(selector.arm_fault_window(arm));
+
+        // The arm happens after all prefix coverage is already accepted. It
+        // must inspect that frozen prefix immediately rather than waiting for
+        // another observation to arrive.
+        const auto coverage =
+            hotstuff::evaluate_adaptive_v2_fault_containment_coverage(
+                fixture.ledger->accepted(),
+                fixture.epoch,
+                fixture.ledger->high_watermark(),
+                kEvidenceStartNs,
+                arm.required_tree_ids);
+        REQUIRE(coverage.status ==
+                AdaptiveV2FaultContainmentCoverageStatus::ready);
+        const auto replayed = selector.select_through(
+            fixture.ledger->high_watermark());
+        CHECK(replayed.status ==
+              AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+        CHECK(replayed.eligible_candidates.empty());
+        CHECK(replayed.metadata.timeout_audit_basis ==
+              AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered);
+    }
 }
 
 TEST_CASE(

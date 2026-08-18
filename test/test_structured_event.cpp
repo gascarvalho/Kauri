@@ -2010,7 +2010,7 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 11,
+        std::variant_size<AuditStructuredEventPayload>::value == 12,
         "the audit capability appends cross-commit readiness evidence");
     static_assert(
         std::is_same<
@@ -2959,6 +2959,17 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         invalid.reason =
             AdaptiveV2ManagerCycleTerminalReason::caller_failed;
         CHECK(rejects(manager_event_config(), invalid));
+
+        auto arm_failure = manager_terminal_event();
+        arm_failure.outcome = AdaptiveV2ManagerCycleOutcome::failed;
+        arm_failure.reason =
+            AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_missing;
+        arm_failure.successor_epoch_number.reset();
+        arm_failure.successor_epoch_digest.reset();
+        arm_failure.command_payload_digest.reset();
+        arm_failure.winning_activation.reset();
+        arm_failure.controller_failure.reset();
+        CHECK(!rejects(manager_event_config(), arm_failure));
 
         invalid = manager_terminal_event();
         invalid.outcome = AdaptiveV2ManagerCycleOutcome::failed;

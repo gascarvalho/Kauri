@@ -65,6 +65,7 @@ _PROFILE_KEYS = {
     "blinding",
 }
 _PROFILE_KEYS_V2 = _PROFILE_KEYS | {"evidence_guard"}
+_PROFILE_KEYS_V4 = _PROFILE_KEYS_V2 | {"fault_window_arm"}
 _FCRASH_H_V3_PROFILE_IDS = frozenset(
     {
         "n7-f2-q5-two-crash-pair-smoke-v3",
@@ -107,6 +108,8 @@ _RUNTIME_EVENT_KEYS = {
     "event_type",
     "payload",
 }
+_FAULT_WINDOW_ARM_DOMAIN = "kauri-focused-fault-window-arm-v1"
+_FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
 
 
 class FocusedCrashPairRuntimeError(RuntimeError):
@@ -161,6 +164,80 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _is_v4_profile(profile: FocusedProfile | object) -> bool:
+    return str(getattr(profile, "profile_id", "")).endswith("-v4")
+
+
+def _fault_window_arm_path(run_directory: Path) -> Path:
+    """Return the one prospective arm path, confined to this child root."""
+
+    root = run_directory.resolve()
+    path = (root / "runtime" / _FAULT_WINDOW_ARM_FILENAME).resolve()
+    if path.parent != (root / "runtime").resolve():
+        _error("fault-window arm path escapes the child runtime root")
+    return path
+
+
+def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
+    """Publish one canonical arm without exposing a partial or replacement file."""
+
+    expected = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "profile_id",
+        "profile_sha256",
+        "topology_proof_sha256",
+        "request_sha256",
+        "epoch_number",
+        "epoch_digest",
+        "fault_receipt_sha256",
+        "evidence_start_monotonic_ns",
+        "prefault_tree_id",
+        "required_tree_positions",
+        "required_tree_ids",
+    }
+    if set(arm) != expected:
+        _error("fault-window arm schema drifted")
+    payload = _canonical_json(arm)
+    parent = path.parent
+    if (
+        not path.is_absolute()
+        or path.exists()
+        or path.is_symlink()
+        or not parent.is_dir()
+    ):
+        _error("fault-window arm destination is not an absent regular child path")
+    temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # link(2) is atomic and fails with EEXIST, unlike replace(2).
+        os.link(temporary, path)
+        directory = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except FileExistsError as exc:
+        raise FocusedCrashPairRuntimeError(
+            "fault-window arm cannot replace an existing destination"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return _sha256(payload)
+
+
 def _document(value: object, label: str) -> Mapping[str, Any]:
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
@@ -174,7 +251,15 @@ def _validate_controller_failure_terminal(
 ) -> bool:
     """Validate the diagnostic-only controller failure projection."""
 
-    unhealthy = payload.get("reason") == "controller_unhealthy"
+    reason = payload.get("reason")
+    arm_diagnostics = {
+        "fault_window_arm_missing",
+        "fault_window_arm_invalid",
+        "fault_window_arm_io_failure",
+    }
+    if isinstance(reason, str) and reason.startswith("fault_window_arm_"):
+        return reason in arm_diagnostics and payload.get("controller_failure") is None
+    unhealthy = reason == "controller_unhealthy"
     present = "controller_failure" in payload
     detail = payload.get("controller_failure")
     if (
@@ -235,6 +320,116 @@ def _validate_controller_failure_terminal(
         and selection == "selected"
         and factory in factory_statuses
     )
+
+
+def _validate_v4_manager_terminal_payload(payload: Mapping[str, Any]) -> bool:
+    """Validate the complete v4 terminal projection, including arm failures."""
+
+    keys = {
+        "cycle_ordinal",
+        "policy_intent",
+        "outcome",
+        "reason",
+        "transition_artifact_id",
+        "predecessor_epoch_number",
+        "predecessor_epoch_digest",
+        "successor_epoch_number",
+        "successor_epoch_digest",
+        "command_payload_digest",
+        "winning_activation",
+        "evidence_window_activation_generation",
+        "baseline_evidence_cutoff",
+        "current_evidence_cutoff",
+        "controller_failure",
+    }
+    if set(payload) != keys:
+        return False
+
+    def uint(value: object, maximum: int) -> bool:
+        return type(value) is int and 0 <= value <= maximum
+
+    def digest(value: object, *, nonzero: bool = False) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            and (not nonzero or value != "0" * 64)
+        )
+
+    if (
+        not uint(payload["cycle_ordinal"], (1 << 64) - 1)
+        or payload["policy_intent"]
+        not in {"fault_containment", "performance_optimization"}
+        or payload["outcome"] not in {"advanced", "no_op", "failed"}
+        or payload["reason"]
+        not in {
+            "successor_converged",
+            "explicit_no_op",
+            "controller_unhealthy",
+            "convergence_start_failed",
+            "convergence_retry_exhausted",
+            "convergence_conflicting_observation",
+            "invalid_terminal_identity",
+            "successor_rotation_failed",
+            "evidence_window_reset_failed",
+            "caller_failed",
+            "fault_window_arm_missing",
+            "fault_window_arm_invalid",
+            "fault_window_arm_io_failure",
+        }
+        or payload["transition_artifact_id"]
+        not in {"e0-to-e1-containment", "e1-to-e2-optimization"}
+        or not uint(payload["predecessor_epoch_number"], (1 << 32) - 1)
+        or not digest(payload["predecessor_epoch_digest"], nonzero=True)
+        or not uint(payload["evidence_window_activation_generation"], (1 << 64) - 1)
+        or payload["evidence_window_activation_generation"] == 0
+        or not uint(payload["baseline_evidence_cutoff"], (1 << 64) - 1)
+        or not uint(payload["current_evidence_cutoff"], (1 << 64) - 1)
+        or payload["baseline_evidence_cutoff"] > payload["current_evidence_cutoff"]
+    ):
+        return False
+
+    successor = (
+        payload["successor_epoch_number"],
+        payload["successor_epoch_digest"],
+        payload["command_payload_digest"],
+    )
+    if successor != (None, None, None) and not (
+        uint(successor[0], (1 << 32) - 1)
+        and digest(successor[1], nonzero=True)
+        and digest(successor[2], nonzero=True)
+    ):
+        return False
+    if payload["winning_activation"] is not None and not isinstance(
+        payload["winning_activation"], Mapping
+    ):
+        return False
+
+    if payload["reason"] in {
+        "fault_window_arm_missing",
+        "fault_window_arm_invalid",
+        "fault_window_arm_io_failure",
+    }:
+        cutoff_shape_is_valid = (
+            payload["current_evidence_cutoff"] == payload["baseline_evidence_cutoff"]
+            if payload["reason"] == "fault_window_arm_missing"
+            else payload["current_evidence_cutoff"]
+            >= payload["baseline_evidence_cutoff"]
+        )
+        return (
+            payload["outcome"] == "failed"
+            and payload["cycle_ordinal"] == 0
+            and payload["policy_intent"] == "fault_containment"
+            and payload["transition_artifact_id"] == "e0-to-e1-containment"
+            and payload["predecessor_epoch_number"] == 0
+            and payload["evidence_window_activation_generation"] == 1
+            and payload["baseline_evidence_cutoff"] > 0
+            and cutoff_shape_is_valid
+            and successor == (None, None, None)
+            and payload["winning_activation"] is None
+            and payload["controller_failure"] is None
+        )
+    return True
 
 
 def _integer(value: object, label: str, minimum: int = 0) -> int:
@@ -473,7 +668,11 @@ def load_focused_profile(path: Path) -> FocusedProfile:
         raise FocusedCrashPairRuntimeError("focused profile is invalid JSON") from exc
     profile = _document(raw, "focused profile")
     schema_version = profile.get("schema_version")
-    expected_keys = _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
+    expected_keys = (
+        _PROFILE_KEYS_V4
+        if str(profile.get("profile_id", "")).endswith("-v4")
+        else _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
+    )
     if set(profile) != expected_keys or schema_version not in {1, 2}:
         _error("focused profile schema drifted")
     if profile.get("frozen") is not True:
@@ -481,6 +680,50 @@ def load_focused_profile(path: Path) -> FocusedProfile:
     profile_id = profile.get("profile_id")
     if not isinstance(profile_id, str) or not profile_id:
         _error("focused profile ID is invalid")
+    if _is_v4_profile(SimpleNamespace(profile_id=profile_id)):
+        arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
+        blinding = _document(profile.get("blinding"), "profile blinding")
+        topology = _document(profile.get("topology"), "profile topology")
+        positions = _integer(
+            arm.get("required_postfault_tree_positions"),
+            "fault-window metadata tree positions",
+            1,
+        )
+        replica_count = _integer(
+            _document(profile.get("protocol"), "profile protocol").get("N"),
+            "replica count",
+            1,
+        )
+        prefix = arm.get("ordered_tree_prefix")
+        if (
+            set(arm)
+            != {
+                "schema_version",
+                "domain",
+                "manager_visibility",
+                "ordered_tree_prefix",
+                "required_for_new_executions",
+                "required_postfault_tree_positions",
+            }
+            or type(arm.get("schema_version")) is not int
+            or arm.get("schema_version") != 1
+            or arm.get("domain") != "epoch_zero_native_cyclic_tree_positions"
+            or arm.get("manager_visibility")
+            != "target-identity/process-state blind; intervention-boundary aware"
+            or arm.get("required_for_new_executions") is not True
+            or blinding.get("manager_input_source")
+            != "authenticated_runtime_evidence_plus_bound_fault_window_arm"
+            or positions > replica_count
+            or not isinstance(prefix, list)
+            or any(type(tree) is not int for tree in prefix)
+            or len(prefix) != len(set(prefix))
+            or prefix
+            != [
+                (topology.get("active_tree_id") + offset) % replica_count
+                for offset in range(positions)
+            ]
+        ):
+            _error("fault-window arm metadata drifted")
     protocol = _document(profile.get("protocol"), "profile protocol")
     topology = _document(profile.get("topology"), "profile topology")
     replica_count = _integer(protocol.get("N"), "replica count", 1)
@@ -603,7 +846,9 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         "minimum_timeouts_per_reporter",
         "minimum_score_drop",
     }
-    if getattr(profile, "profile_id", None) in _FCRASH_H_V3_PROFILE_IDS:
+    if getattr(
+        profile, "profile_id", None
+    ) in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(profile):
         expected_guard_keys.add("required_postfault_tree_positions")
     expected_timer_keys = {
         "adaptation_interval_seconds",
@@ -666,7 +911,9 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
     for row in target_rows:
         row["authenticated_reporter_ids"] = ordered_common
     expected_period = (
-        2 if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS else replica_count
+        2
+        if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(profile)
+        else replica_count
     )
     expected_guard = {
         "schedule": "native_cyclic_epoch_zero",
@@ -676,7 +923,7 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         "minimum_timeouts_per_reporter": minimum_timeouts,
         "minimum_score_drop": minimum_timeouts * required,
     }
-    if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS:
+    if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(profile):
         expected_guard["required_postfault_tree_positions"] = horizon
     if dict(guard) != expected_guard:
         _error("FCRASH-H frozen evidence guard differs from topology derivation")
@@ -718,7 +965,7 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
                 "required_postfault_tree_positions": horizon,
                 "nominal_commit_horizon": horizon * expected_period,
             }
-            if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+            if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(profile)
             else {}
         ),
         "deadlines_seconds": deadlines,
@@ -726,6 +973,70 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         "readiness_timeout_seconds": readiness,
         "manager_convergence_timeout_seconds": convergence,
         "targets": target_rows,
+    }
+
+
+def _fault_window_arm_document(
+    configuration: Mapping[str, object],
+    receipt: Mapping[str, object],
+    barrier: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Bind the one-shot manager arm to finalized fault and pre-fault state."""
+
+    profile = configuration.get("profile")
+    if not isinstance(profile, FocusedProfile) or not _is_v4_profile(profile):
+        _error("fault-window arm requires a v4 focused profile")
+    if not has_exact_active_configuration_barrier(profile, barrier):
+        _error("fault-window arm lacks the exact pre-fault configuration")
+    coverage = derive_reporter_coverage_plan(profile)
+    first = _document(barrier[0], "pre-fault active configuration")
+    configuration_row = _document(first.get("configuration"), "pre-fault configuration")
+    prefault_tree_id = _integer(configuration_row.get("tree_id"), "pre-fault tree")
+    epoch_number = _integer(configuration_row.get("epoch_number"), "pre-fault epoch")
+    epoch_digest = _digest(
+        configuration_row.get("epoch_digest"), "pre-fault epoch digest"
+    )
+    confirmations = [
+        _integer(
+            _document(outcome, "fault outcome").get("confirmed_monotonic_ns"),
+            "fault confirmation",
+        )
+        for outcome in _sequence(receipt.get("sigkill_outcomes"), "SIGKILL outcomes")
+    ]
+    if not confirmations:
+        _error("fault-window arm has no finalized confirmations")
+    receipt_path = Path(configuration["run_directory"]) / "raw" / "fault-receipt.json"
+    receipt_bytes = receipt_path.read_bytes()
+    if receipt_bytes != _canonical_json(receipt):
+        _error("fault-window arm receipt bytes are not canonical")
+    positions = _integer(
+        coverage.get("required_postfault_tree_positions"),
+        "fault-window required tree positions",
+        1,
+    )
+    required_ids = [
+        (prefault_tree_id + offset) % len(profile.replica_ids)
+        for offset in range(positions)
+    ]
+    if len(set(required_ids)) != len(required_ids):
+        _error("fault-window required tree prefix is not unique")
+    return {
+        "schema_version": 1,
+        "kind": _FAULT_WINDOW_ARM_DOMAIN,
+        "run_id": str(configuration["run_id"]),
+        "profile_id": profile.profile_id,
+        "profile_sha256": profile.profile_sha256,
+        "topology_proof_sha256": profile.topology_proof_sha256,
+        "request_sha256": _digest(
+            configuration.get("parent_request_sha256"), "parent request digest"
+        ),
+        "epoch_number": epoch_number,
+        "epoch_digest": epoch_digest,
+        "fault_receipt_sha256": _sha256(receipt_bytes),
+        "evidence_start_monotonic_ns": max(confirmations),
+        "prefault_tree_id": prefault_tree_id,
+        "required_tree_positions": positions,
+        "required_tree_ids": required_ids,
     }
 
 
@@ -1544,7 +1855,9 @@ def _drive_arm_state_machine(
         or tuple(fault.get("survivor_replica_ids", ())) != survivors
     ):
         _error("fault receipt or survivor projection drifted")
-    if getattr(profile, "profile_id", None) in _FCRASH_H_V3_PROFILE_IDS:
+    if getattr(
+        profile, "profile_id", None
+    ) in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(profile):
         latched = fault.get("prefault_active_configuration_barrier")
         if (
             not isinstance(latched, Sequence)
@@ -2120,7 +2433,12 @@ class FocusedRawEvidenceSource:
             if event["event_type"] != "adaptive_v2_session_terminal":
                 continue
             payload = _document(event["payload"], "manager terminal")
-            if set(payload) not in (
+            if (
+                requires_controller_failure
+                and not _validate_v4_manager_terminal_payload(payload)
+            ):
+                _error("manager terminal schema drifted")
+            if not requires_controller_failure and set(payload) not in (
                 terminal_keys,
                 terminal_keys | {"controller_failure"},
             ):
@@ -2903,7 +3221,10 @@ class FocusedRawEvidenceSource:
             }
             _uint64(payload.get("transaction_count"), "commit transactions")
             _uint64(payload.get("commit_batch_index"), "commit batch index")
-            if self._profile.profile_id in _FCRASH_H_V3_PROFILE_IDS and _uint64(
+            if (
+                self._profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+                or _is_v4_profile(self._profile)
+            ) and _uint64(
                 payload.get("transaction_count"), "commit transactions"
             ) not in {
                 0,
@@ -2977,7 +3298,9 @@ class FocusedRawEvidenceSource:
             self._profile.raw.get("measurement"), "profile measurement"
         )
         authoritative_source = f"replica-{_integer(measurement.get('authoritative_replica_id'), 'authoritative observer', 0)}"
-        is_v3 = self._profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+        is_v3 = self._profile.profile_id in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(
+            self._profile
+        )
         configurations: list[tuple[tuple[int, int], int]] = []
         if is_v3:
             tree_ids = tuple(tree.tree_id for tree in decoded.trees)
@@ -4232,6 +4555,19 @@ def _validate_manager_launch_boundary(
         "--structured-event-run-id",
         "--structured-event-source-instance",
         "--structured-event-output",
+        "--fault-window-arm-path",
+        "--fault-window-arm-schema-version",
+        "--fault-window-arm-domain",
+        "--fault-window-arm-run-id",
+        "--fault-window-arm-profile-id",
+        "--fault-window-arm-profile-sha256",
+        "--fault-window-arm-topology-proof-sha256",
+        "--fault-window-arm-request-sha256",
+        "--fault-window-arm-epoch-number",
+        "--fault-window-arm-epoch-digest",
+        "--fault-window-arm-prefault-tree-id",
+        "--fault-window-arm-required-tree-positions",
+        "--fault-window-arm-deadline-seconds",
         "--replica",
     }
     if len(requested) % 2 == 0:
@@ -4524,6 +4860,8 @@ def _focused_manager_command(
     run_directory: Path,
     run_id: str,
     source_instance: str,
+    fault_window_arm_path: Path | None = None,
+    request_sha256: str | None = None,
 ) -> tuple[str, ...]:
     count = len(profile.replica_ids)
     policy = _NATIVE_RESPONSIVENESS_POLICY
@@ -4568,6 +4906,49 @@ def _focused_manager_command(
         "--responsiveness-latency-percentile-basis-points",
         str(policy["latency_percentile_basis_points"]),
     ]
+    if _is_v4_profile(profile):
+        if (
+            fault_window_arm_path is None
+            or request_sha256 is None
+            or not fault_window_arm_path.is_absolute()
+            or fault_window_arm_path.exists()
+        ):
+            _error("v4 manager requires one absent absolute fault-window arm path")
+        coverage = derive_reporter_coverage_plan(profile)
+        command.extend(
+            (
+                "--fault-window-arm-path",
+                str(fault_window_arm_path),
+                "--fault-window-arm-schema-version",
+                "1",
+                "--fault-window-arm-domain",
+                _FAULT_WINDOW_ARM_DOMAIN,
+                "--fault-window-arm-run-id",
+                run_id,
+                "--fault-window-arm-profile-id",
+                profile.profile_id,
+                "--fault-window-arm-profile-sha256",
+                profile.profile_sha256,
+                "--fault-window-arm-topology-proof-sha256",
+                profile.topology_proof_sha256,
+                "--fault-window-arm-request-sha256",
+                request_sha256,
+                "--fault-window-arm-epoch-number",
+                "0",
+                "--fault-window-arm-epoch-digest",
+                str(profile.raw["topology"]["epoch_zero_digest"]),
+                "--fault-window-arm-prefault-tree-id",
+                str(profile.raw["topology"]["active_tree_id"]),
+                "--fault-window-arm-required-tree-positions",
+                str(coverage["required_postfault_tree_positions"]),
+                "--fault-window-arm-deadline-seconds",
+                str(
+                    _document(coverage["deadlines_seconds"], "coverage deadlines")[
+                        "arm_hard_seconds"
+                    ]
+                ),
+            )
+        )
     for request, output in _focused_transition_requests(run_directory, arm):
         command.extend(
             (
@@ -4839,23 +5220,6 @@ class FocusedLaunchBackend:
             run_directory / "treegen.conf",
             _focused_client_default_epoch(profile, adapter),
         )
-        manager = _focused_manager_command(
-            profile,
-            adapter,
-            arm=arm,
-            manager_binary=Path(binaries["manager"]),
-            tls=tls,
-            issuer=issuer,
-            run_directory=run_directory,
-            run_id=run_id,
-            source_instance=instances[profiled_fault_runtime.MANAGER_SOURCE_ID],
-        )
-        preflight = _document(
-            context.get("preflight_receipt"), "parent preflight receipt"
-        )
-        authorization = _document(
-            context.get("authorization_receipt"), "parent authorization receipt"
-        )
         request = {
             "schema_version": 1,
             "profile_sha256": source_profile.profile_sha256,
@@ -4870,7 +5234,38 @@ class FocusedLaunchBackend:
             "automatic_retries": 0,
             "replacement_policy": "none",
         }
-        request_sha = _sha256(_canonical_json(request))
+        preflight = _document(
+            context.get("preflight_receipt"), "parent preflight receipt"
+        )
+        authorization = _document(
+            context.get("authorization_receipt"), "parent authorization receipt"
+        )
+        child_request_sha = _sha256(_canonical_json(request))
+        parent_request_sha: str | None = None
+        if _is_v4_profile(profile):
+            parent_request = build_focused_authorization_request(preflight)
+            verified_parent = verify_focused_authorization_receipt(
+                parent_request, authorization
+            )
+            parent_request_sha = _sha256(parent_request)
+            if verified_parent.get("request_sha256") != parent_request_sha:
+                _error("v4 parent authorization request digest drifted")
+        arm_path = (
+            _fault_window_arm_path(run_directory) if _is_v4_profile(profile) else None
+        )
+        manager = _focused_manager_command(
+            profile,
+            adapter,
+            arm=arm,
+            manager_binary=Path(binaries["manager"]),
+            tls=tls,
+            issuer=issuer,
+            run_directory=run_directory,
+            run_id=run_id,
+            source_instance=instances[profiled_fault_runtime.MANAGER_SOURCE_ID],
+            fault_window_arm_path=arm_path,
+            request_sha256=parent_request_sha,
+        )
         build_record_path = (
             Path(context["build_directory"])
             / profiled_fault_runtime.BUILD_PROVENANCE_FILENAME
@@ -4882,13 +5277,13 @@ class FocusedLaunchBackend:
         documents = {
             "preflight.json": {
                 **request,
-                "request_sha256": request_sha,
+                "request_sha256": child_request_sha,
                 "execution_authorized": False,
                 "launch_permitted": False,
             },
             "authorization.json": {
                 **request,
-                "request_sha256": request_sha,
+                "request_sha256": child_request_sha,
                 "approval_reference": authorization.get("approval_reference"),
                 "approved_utc": authorization.get("approved_utc"),
             },
@@ -4921,8 +5316,19 @@ class FocusedLaunchBackend:
             "derived/phase-windows.json": {"phases": []},
             "derived/throughput.json": {"rows": []},
         }
+        if _is_v4_profile(profile):
+            assert parent_request_sha is not None
+            documents["runtime/parent-authorization-request.json"] = json.loads(
+                parent_request
+            )
+            documents["runtime/parent-authorization-receipt.json"] = dict(authorization)
         for relative, value in documents.items():
-            (run_directory / relative).write_bytes(_canonical_json(value))
+            destination = run_directory / relative
+            payload = _canonical_json(value)
+            if relative.startswith("runtime/parent-authorization-"):
+                profiled_fault_runtime.write_exclusive(destination, payload)
+            else:
+                destination.write_bytes(payload)
         (run_directory / "raw" / "issuer-public-key.txt").write_text(
             f"{issuer['pub']}\n", encoding="utf-8"
         )
@@ -4968,6 +5374,9 @@ class FocusedLaunchBackend:
             "issuer": issuer,
             "fault_plan": plan,
             "runtime_artifacts": artifacts,
+            "fault_window_arm_path": arm_path,
+            "child_request_sha256": child_request_sha,
+            "parent_request_sha256": parent_request_sha,
         }
 
     def spawn_processes(self, configuration: Mapping[str, object]) -> _FocusedProcesses:
@@ -5274,7 +5683,10 @@ class FocusedLaunchBackend:
             if (
                 self._poll_snapshot is None
                 and isinstance(profile, FocusedProfile)
-                and profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+                and (
+                    profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+                    or _is_v4_profile(profile)
+                )
             ):
                 latch_deadline = min(
                     float(hard_deadline),
@@ -5300,6 +5712,18 @@ class FocusedLaunchBackend:
                 _error("observed fault receipt differs from the atomic outcome")
             if latched_barrier is not None:
                 outcome["prefault_active_configuration_barrier"] = latched_barrier
+            if _is_v4_profile(profile):
+                root = Path(configuration["run_directory"])
+                receipt = self._fault_receipts.get(str(root.resolve()))
+                arm_path = configuration.get("fault_window_arm_path")
+                if receipt is None or not isinstance(arm_path, Path):
+                    _error("v4 fault-window arm lacks its finalized receipt or path")
+                arm_document = _fault_window_arm_document(
+                    configuration, receipt, latched_barrier or ()
+                )
+                outcome["fault_window_arm_sha256"] = _publish_fault_window_arm(
+                    arm_path, arm_document
+                )
             return outcome
 
         hooks = ArmRuntimeHooks(

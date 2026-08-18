@@ -86,6 +86,7 @@ public:
         AdaptiveV2ManagerController &&) = delete;
 
     AdaptiveV2ManagerControllerStatus evaluate() noexcept;
+    bool arm_fault_window(AdaptiveV2FaultWindowArm arm) noexcept;
 
     const AdaptationSnapshot *baseline_audit_snapshot() const noexcept;
     const AdaptiveV2SelectionResult *selection_audit() const noexcept;

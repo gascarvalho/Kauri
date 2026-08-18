@@ -78,6 +78,13 @@ ValidatedSelectionInputs validate_inputs(
         throw std::invalid_argument(
             "adaptive-v2 fault-containment coverage bounds are invalid");
     }
+    if (config.fault_window_arm.has_value())
+        throw std::invalid_argument(
+            "adaptive-v2 fault-window arm must be bound after baseline");
+    if (config.fault_window_arm_required &&
+        (config.fault_containment_evidence_start_monotonic_ns != 0 ||
+         config.fault_containment_required_tree_coverage != 0))
+        throw std::invalid_argument("fault-window arm mode conflicts with static coverage");
 
     // Reuse the authoritative snapshot builder's membership, epoch, and
     // policy validation instead of maintaining a divergent validation copy.
@@ -144,7 +151,8 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
     const AdaptationEpochId &current_epoch,
     std::uint64_t evidence_cutoff,
     std::uint64_t fault_evidence_start_monotonic_ns,
-    const std::vector<std::uint32_t> &required_tree_ids)
+    const std::vector<std::uint32_t> &required_tree_ids,
+    bool restrict_proposal_keys_to_required_trees)
 {
     PostFaultProposalCoverage result;
     result.audit.fault_evidence_start_monotonic_ns =
@@ -161,12 +169,9 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
         required_tree_ids.empty() ||
         required_tree_ids.size() > kMaximumAdaptationEvidenceRecords ||
         current_epoch.epoch_digest == uint256_t{} ||
-        std::adjacent_find(
-            required_tree_ids.begin(),
-            required_tree_ids.end(),
-            [](std::uint32_t left, std::uint32_t right) {
-                return left >= right;
-            }) != required_tree_ids.end())
+        std::set<std::uint32_t>(required_tree_ids.begin(),
+                                required_tree_ids.end()).size() !=
+            required_tree_ids.size())
     {
         result.audit.status =
             AdaptiveV2FaultContainmentCoverageStatus::invalid;
@@ -194,23 +199,26 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
         {
             continue;
         }
-        result.proposal_keys.insert(observation.proposal_key());
-        if (std::binary_search(
-                required_tree_ids.begin(),
-                required_tree_ids.end(),
-                observation.configuration.tree_id))
+        const auto required_tree =
+            std::find(required_tree_ids.begin(), required_tree_ids.end(),
+                      observation.configuration.tree_id) !=
+            required_tree_ids.end();
+        if (!restrict_proposal_keys_to_required_trees || required_tree)
+            result.proposal_keys.insert(observation.proposal_key());
+        if (required_tree)
         {
             observed_tree_ids.insert(
                 observation.configuration.tree_id);
         }
     }
-    result.audit.observed_tree_ids.assign(
-        observed_tree_ids.begin(), observed_tree_ids.end());
-    result.audit.status =
-        result.audit.observed_tree_ids ==
-                result.audit.required_tree_ids
-            ? AdaptiveV2FaultContainmentCoverageStatus::ready
-            : AdaptiveV2FaultContainmentCoverageStatus::incomplete;
+    for (const auto tree_id : required_tree_ids)
+    {
+        if (observed_tree_ids.count(tree_id) != 0)
+            result.audit.observed_tree_ids.push_back(tree_id);
+    }
+    result.audit.status = result.audit.observed_tree_ids == required_tree_ids
+        ? AdaptiveV2FaultContainmentCoverageStatus::ready
+        : AdaptiveV2FaultContainmentCoverageStatus::incomplete;
     return result;
 }
 
@@ -707,7 +715,8 @@ evaluate_adaptive_v2_fault_containment_coverage(
                    current_epoch,
                    evidence_cutoff,
                    fault_evidence_start_monotonic_ns,
-                   required_tree_ids)
+                   required_tree_ids,
+                   false)
             .audit;
     }
     catch (...)
@@ -737,7 +746,8 @@ evaluate_adaptive_v2_fault_containment_coverage(
                    current_epoch,
                    evidence_cutoff,
                    fault_evidence_start_monotonic_ns,
-                   required_tree_ids)
+                   required_tree_ids,
+                   false)
             .audit;
     }
     catch (...)
@@ -788,7 +798,8 @@ struct AdaptiveV2ByzantineSelection::State
             config.minimum_score_drop,
             baseline_cutoff,
             evidence_cutoff,
-            config.fault_containment_evidence_start_monotonic_ns == 0
+            config.fault_containment_evidence_start_monotonic_ns == 0 &&
+                !config.fault_window_arm.has_value()
                 ? AdaptiveV2TimeoutAuditBasis::
                       unfiltered_post_baseline
                 : AdaptiveV2TimeoutAuditBasis::
@@ -1176,6 +1187,43 @@ AdaptiveV2ByzantineSelection::freeze_baseline(
     return AdaptiveV2SelectionStatus::baseline_frozen;
 }
 
+bool AdaptiveV2ByzantineSelection::arm_fault_window(
+    AdaptiveV2FaultWindowArm arm) noexcept
+{
+    auto &state = *state_;
+    if (!state.healthy || !state.baseline_frozen ||
+        !state.config.fault_window_arm_required ||
+        state.config.fault_window_arm.has_value() ||
+        state.current_cutoff != state.baseline_cutoff ||
+        arm.predecessor_epoch_number !=
+            state.current_epoch.epoch_number ||
+        arm.predecessor_epoch_digest !=
+            state.current_epoch.epoch_digest ||
+        arm.evidence_start_monotonic_ns == 0 ||
+        arm.required_tree_ids.empty() ||
+        arm.required_tree_ids.size() > kMaximumAdaptationEvidenceRecords ||
+        arm.required_tree_ids.front() != arm.prefault_tree_id)
+    {
+        return false;
+    }
+    const auto tree_count = state.membership.size();
+    if (arm.required_tree_ids.size() > tree_count)
+        return false;
+    std::set<std::uint32_t> seen;
+    for (std::size_t index = 0; index < arm.required_tree_ids.size();
+         ++index)
+    {
+        if (arm.required_tree_ids[index] !=
+                (arm.prefault_tree_id + index) % tree_count ||
+            !seen.insert(arm.required_tree_ids[index]).second)
+        {
+            return false;
+        }
+    }
+    state.config.fault_window_arm = std::move(arm);
+    return true;
+}
+
 AdaptiveV2SelectionResult
 AdaptiveV2ByzantineSelection::select_through(
     std::uint64_t evidence_cutoff) noexcept
@@ -1212,27 +1260,46 @@ AdaptiveV2ByzantineSelection::select_through(
             selection_status(prefix.status), evidence_cutoff);
     }
 
+    // A v4 fault-window is a prospective, one-shot experiment-control
+    // boundary.  Until it is bound, no post-baseline evidence may advance
+    // the selection projection through the legacy unfiltered path.
+    if (state.config.fault_window_arm_required &&
+        !state.config.fault_window_arm.has_value())
+    {
+        return state.result(
+            AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
+            evidence_cutoff);
+    }
+
     PostFaultProposalCoverage fault_coverage;
     try
     {
         std::vector<std::uint32_t> required_tree_ids;
-        required_tree_ids.reserve(
-            state.config
-                .fault_containment_required_tree_coverage);
-        for (std::uint32_t tree_id = 0;
-             tree_id < state.config
-                           .fault_containment_required_tree_coverage;
-             ++tree_id)
+        const auto *const arm = state.config.fault_window_arm
+            ? &*state.config.fault_window_arm : nullptr;
+        if (arm != nullptr)
         {
-            required_tree_ids.push_back(tree_id);
+            if (arm->predecessor_epoch_number != state.current_epoch.epoch_number ||
+                arm->predecessor_epoch_digest != state.current_epoch.epoch_digest)
+                return state.result(AdaptiveV2SelectionStatus::invalid_state, evidence_cutoff);
+            required_tree_ids = arm->required_tree_ids;
+        }
+        else
+        {
+            required_tree_ids.reserve(state.config.fault_containment_required_tree_coverage);
+            for (std::uint32_t tree_id = 0;
+                 tree_id < state.config.fault_containment_required_tree_coverage;
+                 ++tree_id)
+                required_tree_ids.push_back(tree_id);
         }
         fault_coverage = evaluate_post_fault_proposal_coverage(
             accepted,
             state.current_epoch,
             evidence_cutoff,
-            state.config
-                .fault_containment_evidence_start_monotonic_ns,
-            required_tree_ids);
+            arm != nullptr ? arm->evidence_start_monotonic_ns :
+                state.config.fault_containment_evidence_start_monotonic_ns,
+            required_tree_ids,
+            arm != nullptr);
     }
     catch (...)
     {
