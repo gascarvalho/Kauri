@@ -442,7 +442,7 @@ def _validate_runtime_configuration(
         "fan-out": str(contract["fanout"]),
         "async_blocks": str(contract["pipeline_stretch"]),
         "aggregation-timeout": "1.0",
-        "leader-progress-timeout": "6.0",
+        "leader-progress-timeout": "8.0",
         "leader-activation-grace": "1.0",
         "tree-generation": "default",
         "tree-switch-period": str(len(tuple(contract["members"]))),

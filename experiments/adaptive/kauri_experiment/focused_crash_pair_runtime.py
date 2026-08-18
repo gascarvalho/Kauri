@@ -2565,11 +2565,11 @@ def _profiled_adapter(profile: FocusedProfile, pair_seed: int) -> FrozenProfile:
         minimum_positive_postfault_buckets=3,
         minimum_mean_throughput_retention=0.0,
         aggregation_timeout_s=1.0,
-        # Both frozen topologies have a two-edge deepest tree.  The native
-        # fallback horizon is twice the level-aware maximum: 2 * (2 + 1) * 1s
-        # = 6s.  Suspicion therefore needs strictly more than 6s once the
-        # 1s activation grace is included.
-        leader_progress_timeout_s=6.0,
+        # Both frozen topologies have a two-edge deepest tree, whose native
+        # get_max_level() value is the three-level count. The fallback horizon
+        # is therefore 2 * (3 + 1) * 1s = 8s. Suspicion must remain strictly
+        # after it once the 1s activation grace is included.
+        leader_progress_timeout_s=8.0,
         leader_activation_grace_s=1.0,
         activation_delay_blocks=5,
         maximum_stall_s=float(timers.get("containment_deadline_seconds", 60)),

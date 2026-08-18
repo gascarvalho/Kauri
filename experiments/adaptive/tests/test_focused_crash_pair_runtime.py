@@ -159,8 +159,10 @@ def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
     runtime = _runtime()
     profile = runtime.load_focused_profile(profile_path)
     adapter = runtime._profiled_adapter(profile, 41_720)
-    maximum_tree_depth = 2
-    fallback_horizon = 2 * (maximum_tree_depth + 1) * adapter.aggregation_timeout_s
+    maximum_tree_level_count = 3
+    fallback_horizon = (
+        2 * (maximum_tree_level_count + 1) * adapter.aggregation_timeout_s
+    )
 
     assert fallback_horizon < (
         adapter.leader_activation_grace_s + adapter.leader_progress_timeout_s

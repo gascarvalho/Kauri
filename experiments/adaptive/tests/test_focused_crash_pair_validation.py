@@ -291,7 +291,7 @@ def _complete_child(child: dict[str, object]) -> None:
                 "base-timeout = 2.0",
                 "prop-delay = 0.1",
                 "aggregation-timeout = 1.0",
-                "leader-progress-timeout = 6.0",
+                "leader-progress-timeout = 8.0",
                 "leader-activation-grace = 1.0",
                 "client-ip = 127.0.0.1",
                 "tree-generation = default",
@@ -471,14 +471,14 @@ def _complete_child(child: dict[str, object]) -> None:
         ("treegen.conf", "fan:5 pipe:2 20", "fan:1 pipe:0 20"),
         (
             "config/main.conf",
-            "leader-progress-timeout = 6.0",
+            "leader-progress-timeout = 8.0",
             "leader-progress-timeout = 2.0",
         ),
         ("config/main.conf", "fan-out = 5", "fan-out = 2"),
         (
             "config/main.conf",
-            "leader-progress-timeout = 6.0",
-            "leader-progress-timeout = 6.0\n leader-progress-timeout = 2.0",
+            "leader-progress-timeout = 8.0",
+            "leader-progress-timeout = 8.0\n leader-progress-timeout = 2.0",
         ),
         (
             "config/main.conf",
