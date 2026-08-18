@@ -47,9 +47,9 @@ std::string canonical_arm()
         "\",\"kind\":\"kauri-focused-fault-window-arm-v1\","
         "\"prefault_tree_id\":6,\"profile_id\":\"n7-f2-q5-two-crash-pair-smoke-v4\","
         "\"profile_sha256\":\"" + kDigestA +
+        "\",\"request_sha256\":\"" + kDigestC +
         "\",\"required_tree_ids\":[6,0,1,2,3,4],"
-        "\"required_tree_positions\":6,\"request_sha256\":\"" +
-        kDigestC + "\",\"run_id\":\"run-v4\",\"schema_version\":1,"
+        "\"required_tree_positions\":6,\"run_id\":\"run-v4\",\"schema_version\":1,"
         "\"topology_proof_sha256\":\"" + kDigestB + "\"}\n";
 }
 

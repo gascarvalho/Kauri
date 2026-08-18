@@ -302,6 +302,8 @@ public:
         const auto profile_id = string();
         expect(",\"profile_sha256\":");
         const auto profile_sha = string();
+        expect(",\"request_sha256\":");
+        const auto request_sha = string();
         expect(",\"required_tree_ids\":[");
         std::vector<std::uint32_t> trees;
         if (!consume(']'))
@@ -316,8 +318,6 @@ public:
         }
         expect(",\"required_tree_positions\":");
         const auto positions = u32();
-        expect(",\"request_sha256\":");
-        const auto request_sha = string();
         expect(",\"run_id\":");
         const auto run_id = string();
         expect(",\"schema_version\":");
