@@ -1400,6 +1400,51 @@ def test_raw_readiness_accepts_exact_native_emitters_without_client_lifecycle(
     assert _raw_source(directory).poll("readiness") == {"ready": True}
 
 
+def test_raw_nonresponse_waits_for_its_first_native_snapshot_audit(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    events = _add_complete_ready_barrier(directory, include_client=False)
+    source = _raw_source(directory)
+    assert source.poll("nonresponse") is not None
+    assert source.poll("ranking") is not None
+
+    for predecessor, phase in ((0, "nonresponse"), (1, "ranking")):
+        missing_audit = [
+            deepcopy(event)
+            for event in events
+            if not (
+                event["source_id"] == "adaptive-manager"
+                and event["event_type"] == "adaptive_v2_evidence_snapshot"
+                and event["payload"]["predecessor_epoch_number"] == predecessor
+            )
+        ]
+        removed_sequence = next(
+            int(event["source_sequence"])
+            for event in events
+            if event["source_id"] == "adaptive-manager"
+            and event["event_type"] == "adaptive_v2_evidence_snapshot"
+            and event["payload"]["predecessor_epoch_number"] == predecessor
+        )
+        for event in missing_audit:
+            if (
+                event["source_id"] == "adaptive-manager"
+                and int(event["source_sequence"]) > removed_sequence
+            ):
+                event["source_sequence"] = int(event["source_sequence"]) - 1
+        _write_events(directory, missing_audit)
+        assert source.poll(phase) is None
+
+        _write_events(directory, events)
+        assert source.poll(phase) is not None
+
+
 def test_epoch_request_timestamp_is_exact_manager_bundle_production_event(
     tmp_path: Path,
 ) -> None:

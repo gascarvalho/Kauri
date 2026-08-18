@@ -1963,6 +1963,31 @@ class FocusedRawEvidenceSource:
             if replica in confirmations and int(event["source_monotonic_ns"]) > confirmations[replica]:
                 _error("crashed replica emitted raw evidence after confirmed SIGKILL")
 
+    @staticmethod
+    def _snapshot_predecessors(
+        events: Sequence[Mapping[str, Any]],
+    ) -> tuple[int, ...]:
+        predecessors: list[int] = []
+        for event in events:
+            if event["event_type"] != "adaptive_v2_evidence_snapshot":
+                continue
+            if (
+                event["source_kind"] != "adaptation_manager"
+                or event["source_id"] != "adaptive-manager"
+            ):
+                _error("raw ranking audit source identity or kind drifted")
+            predecessor = _integer(
+                _document(event["payload"], "raw ranking audit").get(
+                    "predecessor_epoch_number"
+                ),
+                "ranking predecessor epoch",
+                0,
+            )
+            if predecessor not in {0, 1}:
+                _error("raw ranking audit predecessor drifted")
+            predecessors.append(predecessor)
+        return tuple(predecessors)
+
     def poll(self, name: str) -> Mapping[str, object] | None:
         events = self._events()
         self._reject_post_fault_target_events(events)
@@ -2053,6 +2078,9 @@ class FocusedRawEvidenceSource:
             return self.atomic_fault_outcome()
         if name == "nonresponse":
             fault = self.atomic_fault_outcome()
+            snapshot_predecessors = self._snapshot_predecessors(events)
+            if 0 not in snapshot_predecessors:
+                return None
             ranking = self._ranking(events, predecessor_epoch=0)
             timeout_events = [
                 event
@@ -2166,6 +2194,8 @@ class FocusedRawEvidenceSource:
             }
         if name == "ranking":
             if self._arm != "A":
+                return None
+            if 1 not in self._snapshot_predecessors(events):
                 return None
             return self._ranking(events, predecessor_epoch=1)
         if name == "epoch2":
