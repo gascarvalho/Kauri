@@ -29,6 +29,7 @@ N7_PROFILE_V2 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v2.json"
 N31_PROFILE_V2 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v2.json"
 N7_PROFILE_V3 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v3.json"
 N31_PROFILE_V3 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v3.json"
+N31_PROFILE_V4 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v4.json"
 
 
 _CONTROLLER_FAILURE_MUTATIONS = (
@@ -1598,6 +1599,178 @@ def _write_exact_live_tail_set(
     source._expected_run_id = run_id
     source._expected_source_instances = instances
     return source
+
+
+def _append_v4_authoritative_configurations(
+    root: Path, source: object, profile: object, tree_ids: Sequence[int]
+) -> None:
+    authoritative = profile.raw["measurement"]["authoritative_replica_id"]
+    path = root / "raw" / f"replica-{authoritative}.jsonl"
+    existing = path.read_text(encoding="utf-8").splitlines()
+    initial = json.loads(existing[-1])
+    previous_sequence = initial["source_sequence"]
+    previous_timestamp = initial["source_monotonic_ns"]
+    with path.open("a", encoding="utf-8") as stream:
+        for offset, tree_id in enumerate(tree_ids, start=1):
+            event = deepcopy(initial)
+            event["source_sequence"] = previous_sequence + offset
+            event["source_monotonic_ns"] = max(100, previous_timestamp) + offset
+            event["payload"]["tree_id"] = tree_id
+            stream.write(json.dumps(event) + "\n")
+
+
+def test_v4_authoritative_postfault_prefix_waits_for_latched_cyclic_coverage(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V4)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    prefix = profile.raw["fault_window_arm"]["ordered_tree_prefix"]
+    assert len(prefix) == 16
+    _append_v4_authoritative_configurations(root, source, profile, prefix[1:-1])
+    assert not source.postfault_authoritative_configuration_prefix_complete(
+        evidence_start_monotonic_ns=100,
+        prefault_tree_id=prefix[0],
+        required_tree_ids=prefix,
+    )
+    _append_v4_authoritative_configurations(root, source, profile, [prefix[-1]])
+    assert source.postfault_authoritative_configuration_prefix_complete(
+        evidence_start_monotonic_ns=100,
+        prefault_tree_id=prefix[0],
+        required_tree_ids=prefix,
+    )
+
+
+@pytest.mark.parametrize("mutation", ("wrong", "skipped", "malformed"))
+def test_v4_authoritative_postfault_prefix_rejects_invalid_configuration(
+    mutation: str, tmp_path: Path
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V4)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    prefix = profile.raw["fault_window_arm"]["ordered_tree_prefix"]
+    values = list(prefix[1:])
+    if mutation == "wrong":
+        values[0] = prefix[2]
+    elif mutation == "skipped":
+        values.pop(0)
+    _append_v4_authoritative_configurations(root, source, profile, values)
+    path = (
+        root
+        / "raw"
+        / f"replica-{profile.raw['measurement']['authoritative_replica_id']}.jsonl"
+    )
+    if mutation == "malformed":
+        rows = path.read_text(encoding="utf-8").splitlines()
+        event = json.loads(rows[-1])
+        del event["payload"]["epoch_digest"]
+        rows[-1] = json.dumps(event)
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="configuration"):
+        source.postfault_authoritative_configuration_prefix_complete(
+            evidence_start_monotonic_ns=100,
+            prefault_tree_id=prefix[0],
+            required_tree_ids=prefix,
+        )
+
+
+@pytest.mark.parametrize("unexpected", ((20,), (-1,), (-2,)))
+def test_v4_postfault_configuration_wait_rejects_nonexempt_exit_before_arm(
+    unexpected: tuple[int, ...],
+) -> None:
+    runtime = _runtime()
+    driver = object.__new__(runtime.FocusedLaunchBackend)
+    driver._poll_interval_s = 0
+    source = SimpleNamespace(
+        unexpected_exit_ids=lambda _events: unexpected,
+        postfault_authoritative_configuration_prefix_complete=lambda **_kwargs: pytest.fail(
+            "a dead process must prevent arm coverage polling"
+        ),
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="process exited"):
+        driver._wait_for_v4_fault_window_coverage(
+            source,
+            SimpleNamespace(records=()),
+            {
+                "evidence_start_monotonic_ns": 100,
+                "prefault_tree_id": 20,
+                "required_tree_ids": list(range(20, 31)) + list(range(5)),
+            },
+            deadline_monotonic=float("inf"),
+        )
+
+
+def test_v4_postfault_configuration_wait_allows_receipt_exempt_sigkill() -> None:
+    runtime = _runtime()
+    driver = object.__new__(runtime.FocusedLaunchBackend)
+    driver._poll_interval_s = 0
+    source = SimpleNamespace(
+        unexpected_exit_ids=lambda _events: (),
+        postfault_authoritative_configuration_prefix_complete=lambda **_kwargs: True,
+    )
+    driver._wait_for_v4_fault_window_coverage(
+        source,
+        SimpleNamespace(records=()),
+        {
+            "evidence_start_monotonic_ns": 100,
+            "prefault_tree_id": 20,
+            "required_tree_ids": list(range(20, 31)) + list(range(5)),
+        },
+        deadline_monotonic=float("inf"),
+    )
+
+
+def test_v4_postfault_configuration_rejects_malformed_record_after_coverage(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V4)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    prefix = profile.raw["fault_window_arm"]["ordered_tree_prefix"]
+    _append_v4_authoritative_configurations(root, source, profile, prefix[1:])
+    path = (
+        root
+        / "raw"
+        / f"replica-{profile.raw['measurement']['authoritative_replica_id']}.jsonl"
+    )
+    rows = path.read_text(encoding="utf-8").splitlines()
+    malformed = json.loads(rows[-1])
+    malformed["source_sequence"] += 1
+    malformed["source_monotonic_ns"] += 1
+    malformed["payload"] = {"epoch_number": 0, "tree_id": prefix[0]}
+    rows.append(json.dumps(malformed))
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="configuration"):
+        source.postfault_authoritative_configuration_prefix_complete(
+            evidence_start_monotonic_ns=100,
+            prefault_tree_id=prefix[0],
+            required_tree_ids=prefix,
+        )
+
+
+def test_v4_postfault_configuration_accepts_valid_rotation_after_coverage(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V4)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    prefix = profile.raw["fault_window_arm"]["ordered_tree_prefix"]
+    _append_v4_authoritative_configurations(
+        root, source, profile, [*prefix[1:], prefix[0]]
+    )
+    assert source.postfault_authoritative_configuration_prefix_complete(
+        evidence_start_monotonic_ns=100,
+        prefault_tree_id=prefix[0],
+        required_tree_ids=prefix,
+    )
 
 
 def test_n31_prefault_tail_latch_handles_large_high_rate_prefix(

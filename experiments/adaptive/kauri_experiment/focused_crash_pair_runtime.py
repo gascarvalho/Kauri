@@ -2341,6 +2341,149 @@ class FocusedRawEvidenceSource:
             return None
         return rows
 
+    def postfault_authoritative_configuration_prefix_complete(
+        self,
+        *,
+        evidence_start_monotonic_ns: int,
+        prefault_tree_id: int,
+        required_tree_ids: Sequence[object],
+    ) -> bool:
+        """Incrementally verify the bounded authoritative post-fault tree prefix.
+
+        The pre-fault latch supplies position one.  This cursor retains only the
+        authoritative stream position and parser continuity state; it never
+        reconstructs the aggregate evidence graph.
+        """
+
+        profile = self._profile
+        if not _is_v4_profile(profile):
+            _error("post-fault configuration prefix requires a v4 profile")
+        expected = tuple(
+            _integer(tree_id, "post-fault required tree ID")
+            for tree_id in required_tree_ids
+        )
+        if (
+            not expected
+            or len(set(expected)) != len(expected)
+            or expected[0] != prefault_tree_id
+            or expected
+            != tuple(
+                (prefault_tree_id + offset) % len(profile.replica_ids)
+                for offset in range(len(expected))
+            )
+        ):
+            _error("post-fault configuration prefix is not exact cyclic coverage")
+        evidence_start_monotonic_ns = _integer(
+            evidence_start_monotonic_ns, "fault-window evidence start", 1
+        )
+        authoritative = _integer(
+            profile.raw["measurement"].get("authoritative_replica_id"),
+            "authoritative replica ID",
+        )
+        state = getattr(self, "_postfault_authoritative_tail_state", None)
+        if state is None:
+            state = {
+                "offset": 0,
+                "partial": b"",
+                "previous_sequence": None,
+                "previous_timestamp": None,
+                "position": 1,
+            }
+            self._postfault_authoritative_tail_state = state
+        path = self._root / "raw" / f"replica-{authoritative}.jsonl"
+        if path.is_symlink() or not path.is_file():
+            _error("live authoritative replica tail is absent")
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            offset = _integer(state["offset"], "authoritative tail offset")
+            if size < offset:
+                _error("live authoritative replica tail was truncated")
+            initial = offset == 0
+            start = max(0, size - 1_048_576) if initial else offset
+            stream.seek(start)
+            appended = stream.read(size - start)
+        if len(appended) != size - start:
+            _error("live authoritative replica tail changed below the captured cutoff")
+        state["offset"] = size
+        payload = bytes(state["partial"]) + appended
+        if initial and start > 0:
+            if b"\n" not in payload:
+                _error("live authoritative replica tail has no complete record")
+            payload = payload.split(b"\n", 1)[1]
+        final_newline = payload.rfind(b"\n")
+        if final_newline < 0:
+            if len(payload) > 1_048_576:
+                _error(
+                    "live authoritative replica tail record exceeds the bounded cursor"
+                )
+            state["partial"] = payload
+            complete = b""
+        else:
+            complete = payload[: final_newline + 1]
+            state["partial"] = payload[final_newline + 1 :]
+        expected_run_id = getattr(self, "_expected_run_id", None)
+        expected_instances = getattr(self, "_expected_source_instances", {})
+        for line in complete.splitlines():
+            try:
+                event = _document(json.loads(line), "authoritative tail event")
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise FocusedCrashPairRuntimeError(
+                    "authoritative post-fault configuration is malformed"
+                ) from exc
+            source_id = f"replica-{authoritative}"
+            if (
+                set(event) != _RUNTIME_EVENT_KEYS
+                or event.get("event_schema_version") != 1
+                or event.get("source_kind") != "replica"
+                or event.get("source_id") != source_id
+                or not isinstance(event.get("run_id"), str)
+                or not isinstance(event.get("source_instance"), str)
+                or not isinstance(event.get("event_type"), str)
+                or not isinstance(event.get("payload"), Mapping)
+                or (expected_run_id is not None and event["run_id"] != expected_run_id)
+                or (
+                    expected_instances
+                    and event["source_instance"] != expected_instances.get(source_id)
+                )
+            ):
+                _error("authoritative post-fault tail identity or schema drifted")
+            sequence = _integer(
+                event.get("source_sequence"), "authoritative tail sequence", 1
+            )
+            timestamp = _integer(
+                event.get("source_monotonic_ns"), "authoritative tail timestamp"
+            )
+            previous_sequence = state["previous_sequence"]
+            previous_timestamp = state["previous_timestamp"]
+            if previous_sequence is not None and (
+                sequence != int(previous_sequence) + 1
+                or timestamp < int(previous_timestamp)
+            ):
+                _error("authoritative post-fault tail sequence or timestamp drifted")
+            state["previous_sequence"] = sequence
+            state["previous_timestamp"] = timestamp
+            if event["event_type"] != "adaptive.configuration_active":
+                continue
+            if timestamp <= evidence_start_monotonic_ns:
+                continue
+            configuration = _document(event["payload"], "post-fault configuration")
+            if not {"epoch_number", "tree_id", "epoch_digest"}.issubset(configuration):
+                _error("authoritative post-fault configuration is malformed")
+            position = _integer(state["position"], "post-fault tree position", 1)
+            if (
+                _integer(configuration.get("epoch_number"), "post-fault epoch") != 0
+                or _integer(configuration.get("tree_id"), "post-fault tree")
+                != expected[position % len(expected)]
+                or _digest(configuration.get("epoch_digest"), "post-fault epoch digest")
+                != profile.raw["topology"]["epoch_zero_digest"]
+            ):
+                _error("authoritative post-fault configuration prefix drifted")
+            state["position"] = position + 1
+        return _integer(state["position"], "post-fault tree position", 1) >= len(
+            expected
+        )
+
     def _events(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         raw_root = self._root / "raw"
@@ -5577,6 +5720,45 @@ class FocusedLaunchBackend:
             if self._poll_interval_s:
                 time.sleep(self._poll_interval_s)
 
+    def _wait_for_v4_fault_window_coverage(
+        self,
+        source: FocusedRawEvidenceSource,
+        processes: object,
+        arm_document: Mapping[str, object],
+        *,
+        deadline_monotonic: float,
+    ) -> None:
+        """Wait for the live authoritative cyclic prefix before publishing v4 arm."""
+
+        def require_live_processes() -> None:
+            unexpected = source.unexpected_exit_ids(())
+            if unexpected:
+                _error("process exited while awaiting post-fault configuration")
+
+        while True:
+            require_live_processes()
+            if source.postfault_authoritative_configuration_prefix_complete(
+                evidence_start_monotonic_ns=_integer(
+                    arm_document.get("evidence_start_monotonic_ns"),
+                    "fault-window evidence start",
+                    1,
+                ),
+                prefault_tree_id=_integer(
+                    arm_document.get("prefault_tree_id"), "pre-fault tree"
+                ),
+                required_tree_ids=_sequence(
+                    arm_document.get("required_tree_ids"), "fault-window tree IDs"
+                ),
+            ):
+                require_live_processes()
+                if time.monotonic() >= deadline_monotonic:
+                    _error("timed out waiting for post-fault configuration coverage")
+                return
+            if time.monotonic() >= deadline_monotonic:
+                _error("timed out waiting for post-fault configuration coverage")
+            if self._poll_interval_s:
+                time.sleep(self._poll_interval_s)
+
     def run_arm(
         self,
         configuration: Mapping[str, object],
@@ -5726,6 +5908,18 @@ class FocusedLaunchBackend:
                     _error("v4 fault-window arm lacks its finalized receipt or path")
                 arm_document = _fault_window_arm_document(
                     configuration, receipt, latched_barrier or ()
+                )
+                if self._poll_snapshot is not None:
+                    _error("v4 fault-window coverage requires live raw evidence")
+                self._wait_for_v4_fault_window_coverage(
+                    source,
+                    processes,
+                    arm_document,
+                    deadline_monotonic=(
+                        float(hard_deadline)
+                        if hard_deadline is not None
+                        else time.monotonic() + self._readiness_timeout_s
+                    ),
                 )
                 outcome["fault_window_arm_sha256"] = _publish_fault_window_arm(
                     arm_path, arm_document

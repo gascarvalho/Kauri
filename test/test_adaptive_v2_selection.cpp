@@ -269,6 +269,39 @@ struct Fixture
         return value;
     }
 
+    ResponseObservation timeout_in_tree(
+        ReplicaID target, std::uint32_t tree_id)
+    {
+        const auto &definition = tree(tree_id);
+        const auto target_position = std::find(
+            definition.members_breadth_first.begin(),
+            definition.members_breadth_first.end(), target);
+        REQUIRE(target_position != definition.members_breadth_first.end());
+        const auto position = static_cast<std::size_t>(
+            target_position - definition.members_breadth_first.begin());
+        REQUIRE(position != 0);
+        const auto reporter = definition.members_breadth_first[
+            (position - 1) / definition.fanout];
+        ResponseObservation value;
+        value.reporter_id = reporter;
+        value.observed_replica_id = target;
+        value.configuration = {
+            epoch.epoch_number, tree_id, epoch.epoch_digest};
+        value.block_hash = digest(
+            "adaptive-v2-tree-timeout-" +
+            std::to_string(++attempt_number));
+        value.expected_message_type = ExpectedMessageType::direct_vote;
+        value.outcome = ResponseOutcome::timeout;
+        value.deadline_duration_us = 100;
+        value.reporter_monotonic_ns = ++monotonic_clock * 1'000;
+        value.reporter_sequence = ++reporter_sequences[reporter];
+        value.observation_id = hotstuff::compute_response_observation_id(
+            value.attempt_identity());
+        window.admit(value.proposal_key());
+        ingest(value);
+        return value;
+    }
+
     ResponseObservation timeout_v2(
         ReplicaID reporter, ReplicaID target)
     {
@@ -898,6 +931,50 @@ TEST_CASE(
         CHECK(replayed.metadata.timeout_audit_basis ==
               AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered);
     }
+}
+
+TEST_CASE(
+    "v4 selector permits crashed prefix gaps but filters unanchored timeouts",
+    "[adaptive-v2][selection][fault-window-arm][v4][n7][guard]")
+{
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture;
+    fixture.baseline_all();
+    auto config = selection_config(1, 1, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    fixture.advance_monotonic_clock(kEvidenceStartNs + 1'000'000);
+    // Tree 6 models the crashed-root prefix position and intentionally has no
+    // post-boundary direct-vote anchor. Responsive positions 0..4 do.
+    for (const auto tree : std::vector<std::uint32_t>{0, 1, 2, 3, 4})
+        fixture.cover_tree(tree);
+    for (const auto tree : std::vector<std::uint32_t>{0, 1, 3})
+    {
+        const auto timeout = fixture.timeout_in_tree(6, tree);
+        fixture.anchor_timeout_proposal(timeout);
+    }
+    const auto unanchored = fixture.timeout_in_tree(5, 4);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 6;
+    arm.required_tree_ids = {6, 0, 1, 2, 3, 4};
+    REQUIRE(selector.arm_fault_window(arm));
+
+    const auto selected = selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(selected.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(selected.selected_replicas == std::vector<ReplicaID>{6});
+    CHECK(candidate(selected.eligible_candidates, 5) == nullptr);
+    CHECK(selected.metadata.timeout_audit_basis ==
+          AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered);
+    (void)unanchored;
 }
 
 TEST_CASE(

@@ -152,7 +152,8 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
     std::uint64_t evidence_cutoff,
     std::uint64_t fault_evidence_start_monotonic_ns,
     const std::vector<std::uint32_t> &required_tree_ids,
-    bool restrict_proposal_keys_to_required_trees)
+    bool restrict_proposal_keys_to_required_trees,
+    bool require_all_required_tree_anchors)
 {
     PostFaultProposalCoverage result;
     result.audit.fault_evidence_start_monotonic_ns =
@@ -216,7 +217,10 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
         if (observed_tree_ids.count(tree_id) != 0)
             result.audit.observed_tree_ids.push_back(tree_id);
     }
-    result.audit.status = result.audit.observed_tree_ids == required_tree_ids
+    result.audit.status =
+        (require_all_required_tree_anchors
+             ? result.audit.observed_tree_ids == required_tree_ids
+             : !result.proposal_keys.empty())
         ? AdaptiveV2FaultContainmentCoverageStatus::ready
         : AdaptiveV2FaultContainmentCoverageStatus::incomplete;
     return result;
@@ -716,7 +720,8 @@ evaluate_adaptive_v2_fault_containment_coverage(
                    evidence_cutoff,
                    fault_evidence_start_monotonic_ns,
                    required_tree_ids,
-                   false)
+                   false,
+                   true)
             .audit;
     }
     catch (...)
@@ -747,7 +752,8 @@ evaluate_adaptive_v2_fault_containment_coverage(
                    evidence_cutoff,
                    fault_evidence_start_monotonic_ns,
                    required_tree_ids,
-                   false)
+                   false,
+                   true)
             .audit;
     }
     catch (...)
@@ -1299,7 +1305,8 @@ AdaptiveV2ByzantineSelection::select_through(
             arm != nullptr ? arm->evidence_start_monotonic_ns :
                 state.config.fault_containment_evidence_start_monotonic_ns,
             required_tree_ids,
-            arm != nullptr);
+            arm != nullptr,
+            arm == nullptr);
     }
     catch (...)
     {

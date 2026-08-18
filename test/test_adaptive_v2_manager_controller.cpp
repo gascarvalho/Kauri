@@ -1944,8 +1944,8 @@ TEST_CASE(
         fixture.ingress, fixture.config);
     fixture.freeze_baseline();
 
-    for (std::uint32_t tree_id = 0; tree_id < 7; ++tree_id)
-        fixture.cover_tree(tree_id);
+    // Crashed prefix positions have no direct-vote observation. The arm
+    // admits the responsive proposal anchors below; selection owns readiness.
     for (const auto reporter : std::vector<std::size_t>{0, 1, 2})
     {
         const auto timeout = fixture.record(

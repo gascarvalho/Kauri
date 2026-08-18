@@ -1055,13 +1055,25 @@ def _v4_replay_fault_window_anchors(
             anchors[tree_id].add(key)
         if sequence > baseline_cutoff:
             accepted.append((sequence, observation, event))
-    if any(not keys for keys in anchors.values()):
-        _error("v4 proposal-anchor replay lacks an exact post-fault prefix anchor")
-    anchored_keys = frozenset(key for keys in anchors.values() for key in keys)
-
     coverage = _mapping(
         contract.get("reporter_coverage_plan"), "reporter coverage plan"
     )
+    frozen_anchor_trees = {
+        _integer(reporter.get("tree_id"), "coverage anchor tree")
+        for row in _sequence(coverage.get("targets"), "coverage targets")
+        for reporter in _sequence(
+            _mapping(row, "coverage target").get("first_qualifying_reporters"),
+            "first qualifying reporters",
+        )
+    }
+    if (
+        not frozen_anchor_trees
+        or not frozen_anchor_trees.issubset(anchors)
+        or any(not anchors[tree] for tree in frozen_anchor_trees)
+    ):
+        _error("v4 proposal-anchor replay lacks a frozen eligible-tree anchor")
+    anchored_keys = frozenset(key for keys in anchors.values() for key in keys)
+
     expected_trees = {
         (
             int(row["target_replica_id"]),
@@ -3116,6 +3128,33 @@ def _validate_fault_window_arm(
     armed_ns = _integer(event["source_monotonic_ns"], "fault-window armed timestamp")
     if not int(arm["evidence_start_monotonic_ns"]) <= armed_ns < snapshot_audit_ns:
         _error("v4 fault-window arm was not accepted before snapshot audit")
+    requests = [
+        _integer(
+            _mapping(outcome, "SIGKILL outcome").get("requested_monotonic_ns"),
+            "fault request",
+            1,
+        )
+        for outcome in _sequence(
+            fault_receipt.get("sigkill_outcomes"), "SIGKILL outcomes"
+        )
+    ]
+    if not requests:
+        _error("v4 fault-window arm lacks fault requests")
+    prearm_progress = _fcrash_h_postfault_progress(
+        contract,
+        events,
+        fault_ns=max(confirmations.values()),
+        prefault_ns=min(requests),
+        audit_ns=armed_ns,
+    )
+    observed_before_arm = tuple(
+        _integer(tree, "pre-arm observed tree")
+        for tree in _sequence(
+            prearm_progress.get("observed_tree_ids"), "pre-arm observed trees"
+        )
+    )
+    if observed_before_arm[:positions] != required_ids:
+        _error("v4 fault-window arm preceded its authoritative tree horizon")
 
 
 def _aggregate_child_provenance(

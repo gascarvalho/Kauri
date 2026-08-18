@@ -509,17 +509,6 @@ struct AdaptiveV2ManagerController::State
         if (config.selection.fault_window_arm_required &&
             !fault_window_arm.has_value())
             return AdaptiveV2ManagerControllerStatus::awaiting_guarded_selection;
-        if (fault_window_arm.has_value())
-        {
-            const auto coverage = evaluate_adaptive_v2_fault_containment_coverage(
-                ingress.ledger().accepted(), epoch, cutoff,
-                fault_window_arm->evidence_start_monotonic_ns,
-                fault_window_arm->required_tree_ids);
-            if (coverage.status == AdaptiveV2FaultContainmentCoverageStatus::incomplete)
-                return AdaptiveV2ManagerControllerStatus::awaiting_guarded_selection;
-            if (coverage.status != AdaptiveV2FaultContainmentCoverageStatus::ready)
-                return fail_operational();
-        }
         if (cutoff < selector.current_cutoff())
             return fail_operational();
         if (cutoff == selector.current_cutoff())

@@ -52,8 +52,8 @@ def _arm_fixture(
     (root / "raw").mkdir()
     receipt = {
         "sigkill_outcomes": [
-            {"confirmed_monotonic_ns": 80},
-            {"confirmed_monotonic_ns": 90},
+            {"requested_monotonic_ns": 70, "confirmed_monotonic_ns": 80},
+            {"requested_monotonic_ns": 71, "confirmed_monotonic_ns": 90},
         ]
     }
     receipt_bytes = _canonical(receipt)
@@ -110,6 +110,36 @@ def _arm_fixture(
     events = [
         {
             "run_id": "run-v4",
+            "source_kind": "replica",
+            "source_id": "replica-0",
+            "source_instance": "replica-0-v4",
+            "source_sequence": sequence,
+            "source_monotonic_ns": monotonic_ns,
+            "event_type": event_type,
+            "payload": payload,
+        }
+        for sequence, monotonic_ns, event_type, payload in [
+            (1, 1, "process.started", {}),
+            (2, 2, "process.ready", {}),
+            *[
+                (
+                    tree + 3,
+                    tree + 3,
+                    "adaptive.configuration_active",
+                    {"epoch_number": 0, "tree_id": tree, "epoch_digest": "d" * 64},
+                )
+                for tree in range(7)
+            ],
+            (
+                10,
+                92,
+                "adaptive.configuration_active",
+                {"epoch_number": 0, "tree_id": 0, "epoch_digest": "d" * 64},
+            ),
+        ]
+    ] + [
+        {
+            "run_id": "run-v4",
             "source_kind": "adaptation_manager",
             "source_id": "adaptive-manager",
             "source_instance": "manager-v4",
@@ -125,6 +155,8 @@ def _arm_fixture(
         "epoch_zero_digest": arm["epoch_digest"],
         "profile": {},
         "members": tuple(range(7)),
+        "authoritative_replica_id": 0,
+        "transactions_per_block": 1_000,
         "reporter_coverage_plan": {
             "active_tree_id": 6,
             "required_postfault_tree_positions": 2,
@@ -205,6 +237,34 @@ def test_v4_arm_validation_is_relocation_safe(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("mutation", ("missing-position", "skipped-position"))
+def test_v4_arm_requires_the_full_authoritative_horizon_before_publication(
+    tmp_path: Path, mutation: str
+) -> None:
+    validation, root, _arm, events, contract, argv = _arm_fixture(tmp_path)
+    postfault = next(
+        event
+        for event in events
+        if event["source_id"] == "replica-0"
+        and event["event_type"] == "adaptive.configuration_active"
+        and event["source_monotonic_ns"] == 92
+    )
+    if mutation == "missing-position":
+        events.remove(postfault)
+    else:
+        postfault["payload"]["tree_id"] = 1
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._validate_fault_window_arm(
+            root,
+            contract,
+            argv,
+            json.loads((root / "raw" / "fault-receipt.json").read_bytes()),
+            {0: 80, 1: 90},
+            events,
+            snapshot_audit_ns=100,
+        )
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -267,7 +327,11 @@ def test_v4_arm_rejects_armed_event_provenance_and_time(
     tmp_path: Path, event_mutation: str
 ) -> None:
     validation, root, _arm, events, contract, argv = _arm_fixture(tmp_path)
-    event = events[0]
+    event = next(
+        candidate
+        for candidate in events
+        if candidate["event_type"] == "fault_window_armed"
+    )
     if event_mutation == "wrong-source":
         event["source_id"] = "shadow-manager"
     elif event_mutation == "wrong-instance":
@@ -413,6 +477,29 @@ def test_v4_anchor_replay_requires_exact_prefix_and_replays_outstanding_timeouts
     assert {(row["reporter_id"], row["tree_id"]) for row in rows} == {(2, 6), (3, 0)}
     assert drawdowns == {"1": -2}
     assert latest_ns == 1_121
+
+
+def test_v4_anchor_replay_does_not_require_an_unreachable_root_anchor(
+    tmp_path: Path,
+) -> None:
+    validation, contract, events, audit = _anchor_replay_fixture(tmp_path)
+    coverage = contract["reporter_coverage_plan"]
+    coverage["targets"][0]["first_qualifying_reporters"] = [
+        {"reporter_id": 2, "tree_id": 6}
+    ]
+    events[:] = [
+        event
+        for event in events
+        if event["event_type"] != "evidence.observation_accepted"
+        or event["payload"]["observation"]["configuration"]["tree_id"] != 0
+    ]
+    audit["payload"]["current_cutoff"] = 3
+    rows, drawdowns, latest_ns = validation._v4_replay_fault_window_anchors(
+        contract, events, baseline_cutoff=0, current_cutoff=3, audit=audit
+    )
+    assert {(row["reporter_id"], row["tree_id"]) for row in rows} == {(2, 6)}
+    assert drawdowns == {"1": -1}
+    assert latest_ns == 1_111
 
 
 @pytest.mark.parametrize(
