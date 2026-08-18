@@ -329,17 +329,12 @@ def test_default_cli_executes_the_injectable_focused_launch_backend(
     assert len(captured) == 1
     assert captured[0]["validation_status"] == "PROVISIONAL"
     assert captured[0]["trusted_provenance_required"] is True
-    assert pair_calls == [
-        (
-            output / f"pair-{pair_ordinal:02d}",
-            {"schema_version": 1, "children": {}},
-        )
-        for pair_ordinal in range(1, pair_count + 1)
-    ]
-    assert campaign_calls == (
-        [(output, {"schema_version": 1, "children": {}})]
-        if command == "campaign"
-        else []
+    assert pair_calls == []
+    assert campaign_calls == []
+    assert all(
+        validation["trusted_provenance_supplied"] is False
+        and validation["pending_external_provenance"]["children"]
+        for validation in captured[0]["pair_validations"]
     )
 
 
@@ -380,83 +375,42 @@ def test_default_execution_writes_one_canonical_sealed_parent_evidence_tree(
         assert (output / "campaign-summary.json").is_file()
         assert (output / "evidence-seal.json").is_file()
         assert not any(path.is_dir() for path in output.glob("*ledger*"))
-        assert result["campaign_validation"]["verdict"] == "PASS"
+        assert result["campaign_validation"]["verdict"] == "PROVISIONAL"
     else:
-        assert result["pair_validations"] == [
-            {"pair_id": "pair-01", "verdict": "PASS"}
-        ]
-    assert pair_calls == [
-        (
-            output / f"pair-{ordinal:02d}",
-            {"schema_version": 1, "children": {}},
-        )
-        for ordinal in range(1, pair_count + 1)
-    ]
-    assert campaign_calls == (
-        [(output, {"schema_version": 1, "children": {}})]
-        if mode == "campaign"
-        else []
-    )
+        assert result["pair_validations"][0]["verdict"] == "PROVISIONAL"
+    assert result["validation_status"] == "PROVISIONAL"
+    assert pair_calls == []
+    assert campaign_calls == []
 
 
-@pytest.mark.parametrize(
-    ("scope", "failure", "expected_status"),
-    (
-        ("pair", "exception", "INCOMPLETE"),
-        ("pair", "rejection", "FAIL"),
-        ("campaign", "exception", "INCOMPLETE"),
-        ("campaign", "rejection", "FAIL"),
-    ),
-)
-def test_aggregate_validation_failure_is_never_promoted_to_pass(
-    scope: str,
-    failure: str,
-    expected_status: str,
+def test_execution_never_invokes_or_self_promotes_aggregate_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner()
-    mode = "campaign" if scope == "campaign" else "pair"
-    output = tmp_path / f"{scope}-{failure}"
-    invocation = _direct_focused_invocation(output, mode=mode)
+    output = tmp_path / "external-provenance-required"
+    invocation = _direct_focused_invocation(output, mode="campaign")
     backend = _RecordingLaunchBackend()
 
-    def pass_pair(directory: Path, **_kwargs: object) -> Mapping[str, object]:
-        return {"pair_id": Path(directory).name, "verdict": "PASS"}
-
-    monkeypatch.setattr(runner, "validate_sealed_pair", pass_pair)
+    monkeypatch.setattr(
+        runner,
+        "validate_sealed_pair",
+        lambda *_args, **_kwargs: pytest.fail("execution supplied aggregate provenance"),
+    )
     monkeypatch.setattr(
         runner,
         "validate_sealed_campaign",
-        lambda *_args, **_kwargs: {"verdict": "PASS"},
+        lambda *_args, **_kwargs: pytest.fail("execution supplied aggregate provenance"),
     )
-    target = (
-        "validate_sealed_pair" if scope == "pair" else "validate_sealed_campaign"
-    )
-    if failure == "exception":
-        def reject(*_args: object, **_kwargs: object) -> Mapping[str, object]:
-            raise runner.FocusedCrashPairValidationError(
-                f"{scope} aggregate validation failed"
-            )
-    else:
-        def reject(*_args: object, **_kwargs: object) -> Mapping[str, object]:
-            return {"verdict": "FAIL"}
-    monkeypatch.setattr(runner, target, reject)
 
-    try:
-        result = runner._execute_focused(invocation, backend=backend)
-    except (
-        runner.FocusedCrashPairCliError,
-        runner.FocusedCrashPairValidationError,
-    ):
-        return
-    assert result["validation_status"] == expected_status
-    aggregate = (
-        result["campaign_validation"]
-        if scope == "campaign"
-        else result["pair_validations"][0]
-    )
-    assert aggregate["verdict"] == expected_status
+    result = runner._execute_focused(invocation, backend=backend)
+
+    assert result["validation_status"] == "PROVISIONAL"
+    for validation in [*result["pair_validations"], result["campaign_validation"]]:
+        assert validation["verdict"] == "PROVISIONAL"
+        assert validation["trusted_provenance_required"] is True
+        assert validation["trusted_provenance_supplied"] is False
+        assert validation["pending_external_provenance"]["evidence_tree_sha256"]
 
 
 @pytest.mark.parametrize(
@@ -576,28 +530,23 @@ def test_campaign_has_one_canonical_ledger_authority(
     assert not tuple(output.glob("**/slot-*.json"))
 
 
-def test_campaign_executes_prederived_slots_and_invokes_sealed_validators(
+def test_campaign_executes_prederived_slots_without_self_validating(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner()
     output = tmp_path / "results"
     backend = _RecordingLaunchBackend()
-    pair_calls: list[Path] = []
-    campaign_calls: list[Path] = []
-
-    def validate_pair(pair_directory: Path, **_kwargs: object) -> Mapping[str, object]:
-        pair_calls.append(Path(pair_directory))
-        return {"verdict": "PASS"}
-
-    def validate_campaign(
-        campaign_directory: Path, **_kwargs: object
-    ) -> Mapping[str, object]:
-        campaign_calls.append(Path(campaign_directory))
-        return {"verdict": "PASS"}
-
-    monkeypatch.setattr(runner, "validate_sealed_pair", validate_pair)
-    monkeypatch.setattr(runner, "validate_sealed_campaign", validate_campaign)
+    monkeypatch.setattr(
+        runner,
+        "validate_sealed_pair",
+        lambda *_args, **_kwargs: pytest.fail("execution self-validated a pair"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_sealed_campaign",
+        lambda *_args, **_kwargs: pytest.fail("execution self-validated a campaign"),
+    )
     runner._execute_focused(
         {
             "mode": "campaign",
@@ -631,15 +580,13 @@ def test_campaign_executes_prederived_slots_and_invokes_sealed_validators(
             if children_root.is_dir()
             else []
         ),
-        "pair_validator_calls": pair_calls,
-        "campaign_validator_calls": campaign_calls,
+        "pair_validator_calls": [],
+        "campaign_validator_calls": [],
     } == {
         "execution_slots": expected_slots,
         "child_slots": [f"slot-{ordinal:02d}" for ordinal in range(1, 11)],
-        "pair_validator_calls": [
-            output / f"pair-{ordinal:02d}" for ordinal in range(1, 6)
-        ],
-        "campaign_validator_calls": [output],
+        "pair_validator_calls": [],
+        "campaign_validator_calls": [],
     }
 
 

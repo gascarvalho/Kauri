@@ -65,6 +65,36 @@ _NATIVE_RESPONSIVENESS_POLICY = {
     "trailing_timeout_streak": 2,
     "latency_percentile_basis_points": 5_000,
 }
+_MAIN_CONFIG_KEYS = {
+    "aggregation-timeout",
+    "async_blocks",
+    "base-timeout",
+    "block-size",
+    "client-ip",
+    "epoch-change-issuer-id",
+    "epoch-change-issuer-public-key",
+    "epoch-change-maximum-activation-delay",
+    "epoch-change-maximum-ancestry-blocks",
+    "epoch-change-maximum-block-extra-bytes",
+    "epoch-change-minimum-activation-delay",
+    "epoch-manager-address",
+    "epoch-manager-tls-cert",
+    "epoch-protocol-mode",
+    "fan-out",
+    "leader-activation-grace",
+    "leader-progress-timeout",
+    "max-rep-msg",
+    "nworker",
+    "pace-maker",
+    "piped_latency",
+    "prop-delay",
+    "proposer",
+    "replica",
+    "repnworker",
+    "stat-period",
+    "tree-generation",
+    "tree-switch-period",
+}
 
 
 class FocusedCrashPairValidationError(ValueError):
@@ -349,6 +379,83 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         ),
         "figure_eligible": profile.get("figure_eligible") is True,
     }
+
+
+def _expected_treegen_payload(contract: Mapping[str, object]) -> bytes:
+    members = tuple(int(member) for member in contract["members"])
+    fanout = int(contract["fanout"])
+    pipeline = int(contract["pipeline_stretch"])
+    lines = [
+        " ".join(
+            (
+                f"fan:{fanout}",
+                f"pipe:{pipeline}",
+                *(str(replica) for replica in members[offset:] + members[:offset]),
+            )
+        )
+        for offset in range(len(members))
+    ]
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def _validate_runtime_configuration(
+    root: Path, contract: Mapping[str, object]
+) -> None:
+    treegen_path = root / "treegen.conf"
+    if treegen_path.is_symlink() or not treegen_path.is_file():
+        _error("client tree configuration is absent")
+    if treegen_path.read_bytes() != _expected_treegen_payload(contract):
+        _error("client tree configuration differs from the frozen topology")
+
+    main_path = root / "config" / "main.conf"
+    if main_path.is_symlink() or not main_path.is_file():
+        _error("main runtime configuration is absent")
+    try:
+        payload = main_path.read_bytes().decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise FocusedCrashPairValidationError(
+            "main runtime configuration is not canonical ASCII"
+        ) from exc
+    if not payload.endswith("\n"):
+        _error("main runtime configuration is not newline terminated")
+    options: dict[str, list[str]] = {}
+    for line in payload.splitlines():
+        if " = " not in line:
+            _error("main runtime configuration contains a malformed line")
+        key, value = line.split(" = ", 1)
+        normalized_key = key.strip()
+        normalized_value = value.strip()
+        if (
+            not normalized_key
+            or not normalized_value
+            or line != f"{normalized_key} = {normalized_value}"
+        ):
+            _error("main runtime configuration is not canonical")
+        key, value = normalized_key, normalized_value
+        options.setdefault(key, []).append(value)
+    if set(options) != _MAIN_CONFIG_KEYS:
+        _error("main runtime configuration key set drifted")
+    if any(key != "replica" and len(values) != 1 for key, values in options.items()):
+        _error("main runtime configuration duplicates a singleton option")
+    required = {
+        "block-size": str(contract["transactions_per_block"]),
+        "fan-out": str(contract["fanout"]),
+        "async_blocks": str(contract["pipeline_stretch"]),
+        "aggregation-timeout": "1.0",
+        "leader-progress-timeout": "6.0",
+        "leader-activation-grace": "1.0",
+        "tree-generation": "default",
+        "tree-switch-period": str(len(tuple(contract["members"]))),
+        "epoch-protocol-mode": "adaptive_v2",
+        "epoch-change-minimum-activation-delay": "5",
+        "epoch-change-maximum-activation-delay": "5",
+    }
+    if any(options.get(key) != [value] for key, value in required.items()):
+        _error("main runtime topology or timer configuration drifted")
+    if {"conf", "default_epoch"}.intersection(options):
+        _error("main runtime overrides the sealed client tree configuration")
+    if len(options.get("replica", ())) != len(tuple(contract["members"])):
+        _error("main runtime replica membership cardinality drifted")
 
 
 def _validated_profile(root: Path) -> tuple[Mapping[str, Any], str, str]:
@@ -1292,6 +1399,7 @@ def validate_sealed_arm(
     }
     if dict(trusted_provenance) != expected_provenance:
         _error("trusted provenance is not exact or child-seal-bound")
+    _validate_runtime_configuration(root, contract)
     events, source_inventory = _validate_sources(root)
 
     issuer_path = root / "raw" / "issuer-public-key.txt"

@@ -152,6 +152,21 @@ def _assert_complete_topology_proof(
     assert derivation["pairwise_disjoint"] is True
 
 
+@pytest.mark.parametrize("profile_path", (N7_PROFILE, N31_PROFILE))
+def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
+    profile_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(profile_path)
+    adapter = runtime._profiled_adapter(profile, 41_720)
+    maximum_tree_depth = 2
+    fallback_horizon = 2 * (maximum_tree_depth + 1) * adapter.aggregation_timeout_s
+
+    assert fallback_horizon < (
+        adapter.leader_activation_grace_s + adapter.leader_progress_timeout_s
+    )
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     (
@@ -1289,6 +1304,11 @@ def test_default_backend_materializes_pair_issuer_without_secret_artifact(
     assert private_key not in (
         run_directory / "runtime/launch-arguments.json"
     ).read_text(encoding="utf-8")
+    assert (run_directory / "treegen.conf").read_text(encoding="ascii").splitlines() == [
+        "fan:2 pipe:2 "
+        + " ".join(str(replica) for replica in (*range(offset, 7), *range(offset)))
+        for offset in range(7)
+    ]
 
 
 @pytest.mark.parametrize("arm", ("C", "A"))
@@ -1521,6 +1541,135 @@ def test_manager_actual_argv_and_input_are_blind(tmp_path: Path) -> None:
     cmdline.unlink()
     with pytest.raises(runtime.FocusedCrashPairRuntimeError):
         runtime._capture_process_argv(record, proc_root, platform_system="Linux")
+
+
+def test_spawn_boundary_allows_run_identity_but_not_fault_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pair/arm labels are routing identity, not hidden fault-plan truth."""
+
+    runtime = _runtime()
+    requested, _manager_input = native_fixture._safe_manager_boundary()
+    (tmp_path / "runtime").mkdir()
+    requested = tuple(
+        "pair-01-control" if value == native_fixture.RUN_ID else value
+        for value in requested
+    )
+    cleanup_calls: list[float] = []
+
+    class Registry:
+        def cleanup(self, *, timeout_s: float) -> tuple[object, ...]:
+            cleanup_calls.append(timeout_s)
+            return ()
+
+    class Evidence:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class Log:
+        def close(self) -> None:
+            return None
+
+    registry = Registry()
+    monkeypatch.setattr(runtime, "ProcessRegistry", lambda **_kwargs: registry)
+    monkeypatch.setattr(runtime, "FaultEvidence", lambda *_args, **_kwargs: Evidence())
+    monkeypatch.setattr(runtime, "_capture_process_argv", lambda _record: requested)
+
+    def spawn(
+        _registry: object,
+        *,
+        name: str,
+        replica_id: int,
+        command: Sequence[str],
+        **_kwargs: object,
+    ) -> tuple[object, object]:
+        assert tuple(command) == requested if name == "adaptive-manager" else True
+        return SimpleNamespace(name=name, replica_id=replica_id, pid=10, pgid=10), Log()
+
+    backend = runtime.FocusedLaunchBackend(spawn=spawn)
+    processes = backend.spawn_processes(
+        {
+            "run_directory": tmp_path,
+            "profile": SimpleNamespace(replica_ids=(), target_replica_ids=(22,)),
+            "fault_plan": object(),
+            "manager_command": requested,
+            "replica_commands": (),
+            "client_command": ("client",),
+            "pair_id": "pair-01",
+            "arm": "control",
+        }
+    )
+
+    assert len(processes.records) == 2
+    assert cleanup_calls == []
+
+
+def test_spawn_boundary_failure_cleans_up_every_owned_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    requested, _manager_input = native_fixture._safe_manager_boundary()
+    cleanup_calls: list[float] = []
+    closed_logs: list[str] = []
+    exited: list[tuple[object, object, object]] = []
+
+    class Registry:
+        def cleanup(self, *, timeout_s: float) -> tuple[object, ...]:
+            cleanup_calls.append(timeout_s)
+            return ()
+
+    class Evidence:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *args: object) -> None:
+            exited.append(args)
+
+    class Log:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            closed_logs.append(self.name)
+
+    registry = Registry()
+    monkeypatch.setattr(runtime, "ProcessRegistry", lambda **_kwargs: registry)
+    monkeypatch.setattr(runtime, "FaultEvidence", lambda *_args, **_kwargs: Evidence())
+    monkeypatch.setattr(runtime, "_capture_process_argv", lambda _record: ("wrong",))
+
+    def spawn(
+        _registry: object,
+        *,
+        name: str,
+        replica_id: int,
+        **_kwargs: object,
+    ) -> tuple[object, object]:
+        return SimpleNamespace(name=name, replica_id=replica_id, pid=10, pgid=10), Log(name)
+
+    backend = runtime.FocusedLaunchBackend(spawn=spawn)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="argv differ"):
+        backend.spawn_processes(
+            {
+                "run_directory": tmp_path,
+                "profile": SimpleNamespace(replica_ids=(), target_replica_ids=(22,)),
+                "fault_plan": object(),
+                "manager_command": requested,
+                "replica_commands": (),
+                "client_command": ("client",),
+                "pair_id": "pair-01",
+                "arm": "control",
+            }
+        )
+
+    assert cleanup_calls == [2.0]
+    assert closed_logs == ["adaptive-manager", "workload-client"]
+    assert len(exited) == 1
+    assert exited[0][0] is runtime.FocusedCrashPairRuntimeError
 
 
 @pytest.mark.parametrize("arm", ("C", "A"))

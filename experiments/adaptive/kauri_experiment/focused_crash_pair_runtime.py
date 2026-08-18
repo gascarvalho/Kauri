@@ -2567,7 +2567,11 @@ def _profiled_adapter(profile: FocusedProfile, pair_seed: int) -> FrozenProfile:
         minimum_positive_postfault_buckets=3,
         minimum_mean_throughput_retention=0.0,
         aggregation_timeout_s=1.0,
-        leader_progress_timeout_s=2.0,
+        # Both frozen topologies have a two-edge deepest tree.  The native
+        # fallback horizon is twice the level-aware maximum: 2 * (2 + 1) * 1s
+        # = 6s.  Suspicion therefore needs strictly more than 6s once the
+        # 1s activation grace is included.
+        leader_progress_timeout_s=6.0,
         leader_activation_grace_s=1.0,
         activation_delay_blocks=5,
         maximum_stall_s=float(timers.get("containment_deadline_seconds", 60)),
@@ -2670,6 +2674,29 @@ def _focused_transition_requests(
         output.parent.mkdir(parents=True, exist_ok=True)
         requests.append((request, output))
     return tuple(requests)
+
+
+def _focused_client_default_epoch(profile: FocusedProfile, adapter: FrozenProfile) -> bytes:
+    """Mirror the replica default-tree schedule for the standalone client.
+
+    The client does not read ``main.conf`` and defaults to ``treegen.conf`` in
+    its working directory.  Materialize the same cyclic initial epoch used by
+    ``tree-generation = default`` so client routing cannot fall back to a
+    repository-relative file.
+    """
+
+    members = tuple(profile.replica_ids)
+    lines = [
+        " ".join(
+            (
+                f"fan:{adapter.fanout}",
+                f"pipe:{adapter.pipeline_depth}",
+                *(str(replica) for replica in members[offset:] + members[:offset]),
+            )
+        )
+        for offset in range(len(members))
+    ]
+    return ("\n".join(lines) + "\n").encode("ascii")
 
 
 def _focused_manager_command(
@@ -3000,6 +3027,10 @@ class FocusedLaunchBackend:
                 include_issuer_identity_artifact=False,
             )
         )
+        profiled_fault_runtime.write_exclusive(
+            run_directory / "treegen.conf",
+            _focused_client_default_epoch(profile, adapter),
+        )
         manager = _focused_manager_command(
             profile,
             adapter,
@@ -3167,47 +3198,46 @@ class FocusedLaunchBackend:
                 )
                 records.append(record)
                 logs.append(log)
+            manager = records[0]
+            observed = _capture_process_argv(manager)
+            requested = tuple(configuration["manager_command"])
+            manager_input = {
+                "input_source": "normalized_manager_launch_boundary_v1",
+                "requested_argv": list(requested),
+                "observed_argv": list(observed),
+                "stdin": "closed",
+            }
+            _validate_manager_launch_boundary(
+                requested,
+                observed,
+                manager_input=manager_input,
+                forbidden_values=tuple(
+                    f"crash-replica-{replica}"
+                    for replica in configuration["profile"].target_replica_ids
+                ),
+            )
+            root = Path(configuration["run_directory"])
+            normalized_requested = profiled_fault_runtime.normalized_manager_argv(requested)
+            normalized_observed = profiled_fault_runtime.normalized_manager_argv(observed)
+            (root / "runtime" / "manager-observed-argv.json").write_bytes(
+                _canonical_json({"argv": normalized_observed})
+            )
+            (root / "runtime" / "manager-input.json").write_bytes(
+                _canonical_json(
+                    {
+                        **manager_input,
+                        "requested_argv": normalized_requested,
+                        "observed_argv": normalized_observed,
+                    }
+                )
+            )
+            return _FocusedProcesses(registry, records, logs, evidence, lifecycle)
         except BaseException as exc:
             registry.cleanup(timeout_s=2.0)
             for log in logs:
                 log.close()
             evidence.__exit__(type(exc), exc, exc.__traceback__)
             raise
-        manager = records[0]
-        observed = _capture_process_argv(manager)
-        requested = tuple(configuration["manager_command"])
-        manager_input = {
-            "input_source": "normalized_manager_launch_boundary_v1",
-            "requested_argv": list(requested),
-            "observed_argv": list(observed),
-            "stdin": "closed",
-        }
-        _validate_manager_launch_boundary(
-            requested,
-            observed,
-            manager_input=manager_input,
-            forbidden_values=tuple(
-                f"crash-replica-{replica}"
-                for replica in configuration["profile"].target_replica_ids
-            )
-            + (str(configuration["pair_id"]), str(configuration["arm"])),
-        )
-        root = Path(configuration["run_directory"])
-        normalized_requested = profiled_fault_runtime.normalized_manager_argv(requested)
-        normalized_observed = profiled_fault_runtime.normalized_manager_argv(observed)
-        (root / "runtime" / "manager-observed-argv.json").write_bytes(
-            _canonical_json({"argv": normalized_observed})
-        )
-        (root / "runtime" / "manager-input.json").write_bytes(
-            _canonical_json(
-                {
-                    **manager_input,
-                    "requested_argv": normalized_requested,
-                    "observed_argv": normalized_observed,
-                }
-            )
-        )
-        return _FocusedProcesses(registry, records, logs, evidence, lifecycle)
 
     def execute_atomic_fault_batch(
         self,

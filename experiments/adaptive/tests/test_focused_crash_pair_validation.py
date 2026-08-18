@@ -258,6 +258,60 @@ def _complete_child(child: dict[str, object]) -> None:
         directory / "runtime" / "effective-runtime.json",
         {"profile_sha256": profile_sha256, "pair_seed": pair_seed},
     )
+    members = tuple(range(profile["protocol"]["N"]))
+    fanout = profile["protocol"]["fanout"]
+    pipeline = profile["protocol"]["pipeline_stretch"]
+    (directory / "treegen.conf").write_text(
+        "".join(
+            " ".join(
+                (
+                    f"fan:{fanout}",
+                    f"pipe:{pipeline}",
+                    *(str(replica) for replica in members[offset:] + members[:offset]),
+                )
+            )
+            + "\n"
+            for offset in range(len(members))
+        ),
+        encoding="ascii",
+    )
+    (directory / "config").mkdir(parents=True, exist_ok=True)
+    (directory / "config" / "main.conf").write_text(
+        "\n".join(
+            (
+                f"block-size = {profile['protocol']['transactions_per_block']}",
+                "nworker = 2",
+                "repnworker = 2",
+                "stat-period = 210.0",
+                "pace-maker = dummy",
+                "proposer = 0",
+                f"fan-out = {fanout}",
+                "piped_latency = 1",
+                f"async_blocks = {pipeline}",
+                "base-timeout = 2.0",
+                "prop-delay = 0.1",
+                "aggregation-timeout = 1.0",
+                "leader-progress-timeout = 6.0",
+                "leader-activation-grace = 1.0",
+                "client-ip = 127.0.0.1",
+                "tree-generation = default",
+                f"tree-switch-period = {len(members)}",
+                "epoch-protocol-mode = adaptive_v2",
+                "epoch-change-issuer-id = 7",
+                f"epoch-change-issuer-public-key = {native_fixture.ISSUER_PUBLIC_KEY}",
+                "epoch-change-minimum-activation-delay = 5",
+                "epoch-change-maximum-activation-delay = 5",
+                "epoch-change-maximum-block-extra-bytes = 65536",
+                "epoch-change-maximum-ancestry-blocks = 4096",
+                "epoch-manager-address = 127.0.0.1:20062",
+                "epoch-manager-tls-cert = 00",
+                "max-rep-msg = 8388608",
+                *(f"replica = replica-{replica}" for replica in members),
+            )
+        )
+        + "\n",
+        encoding="ascii",
+    )
     manager_argv, manager_input = native_fixture._safe_manager_boundary()
     _write_json(
         directory / "runtime" / "launch-arguments.json",
@@ -372,6 +426,8 @@ def _complete_child(child: dict[str, object]) -> None:
     _write_json(directory / "cleanup.json", {"complete": True})
     seal = fixture._archive().create_evidence_seal(directory)
     required = {
+        "config/main.conf",
+        "treegen.conf",
         "profile.json",
         proof_relative.as_posix(),
         "preflight.json",
@@ -407,6 +463,76 @@ def _complete_child(child: dict[str, object]) -> None:
     assert actual == required
     child["child_tree_sha256"] = seal.tree_sha256
     child["child_seal_sha256"] = seal.seal_sha256
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "old", "new"),
+    (
+        ("treegen.conf", "fan:5 pipe:2 20", "fan:1 pipe:0 20"),
+        (
+            "config/main.conf",
+            "leader-progress-timeout = 6.0",
+            "leader-progress-timeout = 2.0",
+        ),
+        ("config/main.conf", "fan-out = 5", "fan-out = 2"),
+        (
+            "config/main.conf",
+            "leader-progress-timeout = 6.0",
+            "leader-progress-timeout = 6.0\n leader-progress-timeout = 2.0",
+        ),
+        (
+            "config/main.conf",
+            "epoch-protocol-mode = adaptive_v2",
+            "epoch-protocol-mode = adaptive_v2\ndefault_epoch = alternate.conf",
+        ),
+        (
+            "config/main.conf",
+            "epoch-protocol-mode = adaptive_v2",
+            "epoch-protocol-mode = adaptive_v2\nconf = alternate.conf",
+        ),
+        (
+            "config/main.conf",
+            "fan-out = 5",
+            "fan-out = 5\nF = 2",
+        ),
+        (
+            "config/main.conf",
+            "epoch-protocol-mode = adaptive_v2",
+            "epoch-protocol-mode = adaptive_v2\nc = alternate.conf",
+        ),
+    ),
+)
+def test_sealed_arm_rejects_client_topology_or_timer_configuration_drift(
+    relative_path: str,
+    old: str,
+    new: str,
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    assert _validation().validate_sealed_arm(
+        directory,
+        trusted_provenance=_trusted_provenance(directory),
+    )["verdict"] == "PASS"
+    path = directory / relative_path
+    path.write_text(
+        path.read_text(encoding="ascii").replace(old, new, 1),
+        encoding="ascii",
+    )
+    _reseal(directory)
+    with pytest.raises(
+        _validation().FocusedCrashPairValidationError,
+        match="configuration",
+    ):
+        _validation().validate_sealed_arm(
+            directory,
+            trusted_provenance=_trusted_provenance(directory),
+        )
 
 
 def _trusted_provenance(directory: Path) -> dict[str, object]:

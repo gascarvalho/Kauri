@@ -86,6 +86,31 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _pending_external_provenance(
+    directory: Path,
+    *,
+    seal: object,
+    children: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Describe the sealed aggregate that an independent validator must bind.
+
+    Execution cannot know the seal digests before the child evidence exists.
+    It must therefore never fabricate trusted provenance for its own output.
+    """
+
+    return {
+        "verdict": "PROVISIONAL",
+        "trusted_provenance_required": True,
+        "trusted_provenance_supplied": False,
+        "pending_external_provenance": {
+            "directory": str(directory),
+            "evidence_tree_sha256": str(getattr(seal, "tree_sha256")),
+            "evidence_seal_sha256": str(getattr(seal, "seal_sha256")),
+            "children": [dict(child) for child in children],
+        },
+    }
+
+
 def _execute_focused(
     invocation: Mapping[str, object], *, backend: object
 ) -> Mapping[str, object]:
@@ -239,16 +264,17 @@ def _execute_focused(
                 "children": entries,
             },
         )
-        create_evidence_seal(pair_root)
-        aggregate = validate_sealed_pair(
-            pair_root,
-            trusted_provenance={"schema_version": 1, "children": {}},
+        pair_seal = create_evidence_seal(pair_root)
+        pair_validations.append(
+            {
+                "pair_id": pair_id,
+                **_pending_external_provenance(
+                    pair_root,
+                    seal=pair_seal,
+                    children=entries,
+                ),
+            }
         )
-        if aggregate.get("pair_id", pair_id) != pair_id:
-            raise FocusedCrashPairCliError(
-                "pair validator relabelled the aggregate identity"
-            )
-        pair_validations.append({"pair_id": pair_id, **aggregate})
 
     campaign_validation: Mapping[str, object] | None = None
     if plan is not None:
@@ -302,10 +328,20 @@ def _execute_focused(
         _write_exclusive_json(
             output_root / "campaign-summary.json", campaign_summary
         )
-        create_evidence_seal(output_root)
-        campaign_validation = validate_sealed_campaign(
+        campaign_seal = create_evidence_seal(output_root)
+        campaign_validation = _pending_external_provenance(
             output_root,
-            trusted_provenance={"schema_version": 1, "children": {}},
+            seal=campaign_seal,
+            children=[
+                {
+                    "pair_id": validation["pair_id"],
+                    "verdict": validation["verdict"],
+                    "pending_external_provenance": validation[
+                        "pending_external_provenance"
+                    ],
+                }
+                for validation in pair_validations
+            ],
         )
 
     validation_status = "PASS"
