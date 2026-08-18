@@ -711,6 +711,17 @@ def _write_exact_live_tail_set(
                 "epoch_number": 0,
                 "tree_id": profile.raw["topology"]["active_tree_id"],
                 "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+                "block_hash": None,
+                "context_generation": None,
+                "observer_replica": replica,
+                "wait_exempt_signers": [],
+                "accepted_signers": [],
+                "absent_direct_children": [],
+                "missing_optional_signers": [],
+                "required_branch_gaps": [],
+                "root_signer_count": 0,
+                "global_quorum": profile.quorum,
+                "rejection_reason": None,
             },
         }
         (root / "raw" / f"replica-{replica}.jsonl").write_text(

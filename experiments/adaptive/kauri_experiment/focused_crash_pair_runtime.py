@@ -1932,10 +1932,13 @@ class FocusedRawEvidenceSource:
         rows = [
             {
                 "replica_id": replica,
-                "configuration": _document(
-                    states[replica]["latest_configuration"]["payload"],
-                    "tail configuration",
-                ),
+                "configuration": {
+                    key: _document(
+                        states[replica]["latest_configuration"]["payload"],
+                        "tail configuration",
+                    ).get(key)
+                    for key in ("epoch_number", "tree_id", "epoch_digest")
+                },
             }
             for replica in self._profile.replica_ids
             if states[replica]["latest_configuration"] is not None
