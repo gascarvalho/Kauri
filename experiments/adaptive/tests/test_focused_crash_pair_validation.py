@@ -2412,6 +2412,151 @@ def _append_benign_post_terminal_activation_acknowledgements(
     return acknowledgements
 
 
+def _append_final_cycle_commit_and_activation_ack_pairs(
+    directory: Path,
+) -> list[dict[str, object]]:
+    """Model the native final-cycle commit and activation acknowledgment drain."""
+
+    events = _load_events(directory)
+    manager_events = [
+        event for event in events if event["source_kind"] == "adaptation_manager"
+    ]
+    terminal = [
+        event
+        for event in manager_events
+        if event["event_type"] == "adaptive_v2_session_terminal"
+    ][-1]
+    stopping = next(
+        event for event in manager_events if event["event_type"] == "process.stopping"
+    )
+    stopped = next(
+        event for event in manager_events if event["event_type"] == "process.stopped"
+    )
+    events.remove(stopping)
+    events.remove(stopped)
+    winning = deepcopy(terminal["payload"]["winning_activation"])
+    sequence = int(terminal["source_sequence"])
+    timestamp = int(terminal["source_monotonic_ns"])
+    drain: list[dict[str, object]] = []
+    for event_type, replica_id, digest in (
+        ("adaptive_v2_commit_observed", 30, "c" * 64),
+        ("adaptive_v2_activation_observed", 21, "a" * 64),
+    ):
+        for disposition in ("duplicate", "ack_sent"):
+            sequence += 1
+            timestamp += 1
+            drain.append(
+                {
+                    **terminal,
+                    "source_sequence": sequence,
+                    "source_monotonic_ns": timestamp,
+                    "event_type": event_type,
+                    "payload": {
+                        "replica_id": replica_id,
+                        "delivery_attempt": None,
+                        "disposition": disposition,
+                        "identity": deepcopy(winning),
+                        "accepted_commit_count": 28,
+                        "accepted_activation_count": 21,
+                        "required_activation_count": 21,
+                        "canonical_payload_digest": digest,
+                        "failure_reason": None,
+                    },
+                }
+            )
+    events.extend(drain)
+    for tail in (stopping, stopped):
+        sequence += 1
+        timestamp += 1
+        tail["source_sequence"] = sequence
+        tail["source_monotonic_ns"] = timestamp
+        events.append(tail)
+    _write_events(directory, events)
+    return drain
+
+
+def test_adaptive_manager_clean_exit_allows_final_cycle_commit_and_activation_drain(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory, epochs=(1, 2))
+    drain = _append_final_cycle_commit_and_activation_ack_pairs(directory)
+    assert [event["event_type"] for event in drain] == [
+        "adaptive_v2_commit_observed",
+        "adaptive_v2_commit_observed",
+        "adaptive_v2_activation_observed",
+        "adaptive_v2_activation_observed",
+    ]
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager", replica_id=-1, process=process
+            ),
+        ),
+    )
+    assert source.unexpected_exit_ids() == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("cross-kind", "accepted", "identity", "count", "digest"),
+)
+def test_adaptive_manager_clean_exit_rejects_final_cycle_commit_drain_drift(
+    mutation: str, tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory, epochs=(1, 2))
+    _append_final_cycle_commit_and_activation_ack_pairs(directory)
+    events = _load_events(directory)
+    drain = [
+        event
+        for event in events
+        if event["event_type"]
+        in {"adaptive_v2_commit_observed", "adaptive_v2_activation_observed"}
+    ]
+    if mutation == "cross-kind":
+        drain[1]["event_type"] = "adaptive_v2_activation_observed"
+    elif mutation == "accepted":
+        drain[0]["payload"]["disposition"] = "accepted"
+    elif mutation == "identity":
+        drain[0]["payload"]["identity"]["successor_epoch_digest"] = "f" * 64
+    elif mutation == "count":
+        drain[0]["payload"]["accepted_commit_count"] = 27
+    else:
+        drain[1]["payload"]["canonical_payload_digest"] = "f" * 64
+    _write_events(directory, events)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager", replica_id=-1, process=process
+            ),
+        ),
+    )
+    assert source.unexpected_exit_ids() == (-1,)
+
+
 def test_manager_clean_exit_allows_only_benign_activation_ack_drain(
     tmp_path: Path,
 ) -> None:

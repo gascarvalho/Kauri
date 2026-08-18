@@ -3958,17 +3958,21 @@ class FocusedRawEvidenceSource:
                     for index in range(0, len(acknowledgement_tail), 2):
                         duplicate = acknowledgement_tail[index]
                         acknowledged = acknowledgement_tail[index + 1]
+                        observed_event_type = duplicate["event_type"]
                         if (
-                            duplicate["event_type"] != "adaptive_v2_activation_observed"
-                            or acknowledged["event_type"]
-                            != "adaptive_v2_activation_observed"
+                            observed_event_type
+                            not in {
+                                "adaptive_v2_activation_observed",
+                                "adaptive_v2_commit_observed",
+                            }
+                            or acknowledged["event_type"] != observed_event_type
                         ):
                             return False
                         normalized_payloads: list[dict[str, object]] = []
                         for observed in (duplicate, acknowledged):
                             observed_payload = _document(
                                 observed["payload"],
-                                "manager post-terminal activation acknowledgement",
+                                "manager post-terminal convergence acknowledgement",
                             )
                             if set(observed_payload) != {
                                 "replica_id",
@@ -3984,12 +3988,12 @@ class FocusedRawEvidenceSource:
                                 return False
                             replica_id = _integer(
                                 observed_payload.get("replica_id"),
-                                "manager post-terminal activation replica",
+                                "manager post-terminal convergence replica",
                                 0,
                             )
                             identity = _document(
                                 observed_payload.get("identity"),
-                                "manager post-terminal activation identity",
+                                "manager post-terminal convergence identity",
                             )
                             if set(identity) != winning_keys:
                                 return False
@@ -3997,7 +4001,7 @@ class FocusedRawEvidenceSource:
                                 key: (
                                     _integer(
                                         identity.get(key),
-                                        f"manager post-terminal activation {key}",
+                                        f"manager post-terminal convergence {key}",
                                         0,
                                     )
                                     if key
@@ -4010,7 +4014,7 @@ class FocusedRawEvidenceSource:
                                     }
                                     else _digest(
                                         identity.get(key),
-                                        f"manager post-terminal activation {key}",
+                                        f"manager post-terminal convergence {key}",
                                     )
                                 )
                                 for key in winning_keys
