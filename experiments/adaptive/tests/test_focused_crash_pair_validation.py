@@ -1292,17 +1292,24 @@ def test_raw_source_barriers_are_event_derived_and_span_configured_windows(
     source = _raw_source(directory)
     assert source.poll("readiness") == {"ready": True}
     if mutation == "missing-ready":
-        events = [
-            event
+        partial_events = [
+            deepcopy(event)
             for event in events
             if not (
                 event["source_id"] == "replica-30"
                 and event["event_type"] == "process.ready"
             )
         ]
+        for event in partial_events:
+            if (
+                event["source_id"] == "replica-30"
+                and int(event["source_sequence"]) > 2
+            ):
+                event["source_sequence"] = int(event["source_sequence"]) - 1
+        _write_events(directory, partial_events)
+        assert source.poll("readiness") is None
         _write_events(directory, events)
-        with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
-            source.poll("readiness")
+        assert source.poll("readiness") == {"ready": True}
     elif mutation.startswith("short-"):
         phase = mutation.removeprefix("short-")
         assert source.poll(phase) is None

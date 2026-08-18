@@ -2003,8 +2003,6 @@ class FocusedRawEvidenceSource:
             and set(expected_lifecycle).issubset(started_sources)
             and ready_sources == started_sources
         )
-        if ready_sources and not readiness_complete:
-            _error("raw readiness barrier does not cover every native emitter")
         if name == "readiness":
             return {"ready": True} if readiness_complete else None
         if not readiness_complete and name in {
