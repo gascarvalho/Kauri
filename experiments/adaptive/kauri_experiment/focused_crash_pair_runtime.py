@@ -1814,30 +1814,56 @@ class FocusedRawEvidenceSource:
     def latch_prefault_active_configuration_barrier(
         self,
     ) -> list[dict[str, object]] | None:
-        """Read only recent native replica tails for the fault-boundary latch."""
+        """Incrementally drain native replica tails for the fault-boundary latch."""
 
-        latest: dict[int, Mapping[str, Any]] = {}
+        states = getattr(self, "_prefault_tail_states", None)
+        if states is None:
+            states = {}
+            self._prefault_tail_states = states
         for replica in self._profile.replica_ids:
             path = self._root / "raw" / f"replica-{replica}.jsonl"
             if path.is_symlink() or not path.is_file():
                 _error("live replica tail is absent")
+            state = states.setdefault(
+                replica,
+                {
+                    "offset": 0,
+                    "partial": b"",
+                    "previous_sequence": None,
+                    "previous_timestamp": None,
+                    "run_id": None,
+                    "source_instance": None,
+                    "latest_configuration": None,
+                },
+            )
             with path.open("rb") as stream:
                 stream.seek(0, os.SEEK_END)
                 size = stream.tell()
-                stream.seek(max(0, size - 1_048_576))
-                payload = stream.read()
-            if not payload.endswith(b"\n"):
-                return None
-            if size > len(payload):
+                offset = int(state["offset"])
+                if size < offset:
+                    _error("live replica tail was truncated")
+                initial = offset == 0
+                start = max(0, size - 1_048_576) if initial else offset
+                stream.seek(start)
+                appended = stream.read(size - start)
+            if len(appended) != size - start:
+                _error("live replica tail changed below the captured cutoff")
+            state["offset"] = size
+            payload = bytes(state["partial"]) + appended
+            if initial and start > 0:
                 if b"\n" not in payload:
                     _error("live replica tail has no complete record")
                 payload = payload.split(b"\n", 1)[1]
-            selected: Mapping[str, Any] | None = None
-            expected_run_id: str | None = None
-            expected_instance: str | None = None
-            previous_sequence: int | None = None
-            previous_timestamp: int | None = None
-            for line in payload.splitlines():
+            final_newline = payload.rfind(b"\n")
+            if final_newline < 0:
+                if len(payload) > 1_048_576:
+                    _error("live replica tail record exceeds the bounded cursor")
+                state["partial"] = payload
+                complete = b""
+            else:
+                complete = payload[: final_newline + 1]
+                state["partial"] = payload[final_newline + 1 :]
+            for line in complete.splitlines():
                 try:
                     event = _document(json.loads(line), "raw replica tail event")
                 except (json.JSONDecodeError, UnicodeError) as exc:
@@ -1863,21 +1889,25 @@ class FocusedRawEvidenceSource:
                 timestamp = _integer(
                     event.get("source_monotonic_ns"), "tail source timestamp"
                 )
+                expected_run_id = state["run_id"]
+                expected_instance = state["source_instance"]
                 if expected_run_id is None:
-                    expected_run_id = str(event["run_id"])
-                    expected_instance = str(event["source_instance"])
+                    state["run_id"] = str(event["run_id"])
+                    state["source_instance"] = str(event["source_instance"])
                 elif (
                     event["run_id"] != expected_run_id
                     or event["source_instance"] != expected_instance
                 ):
                     _error("live replica tail spans multiple source identities")
+                previous_sequence = state["previous_sequence"]
+                previous_timestamp = state["previous_timestamp"]
                 if previous_sequence is not None and (
-                    sequence != previous_sequence + 1
+                    sequence != int(previous_sequence) + 1
                     or timestamp < int(previous_timestamp)
                 ):
                     _error("live replica tail sequence or timestamp drifted")
-                previous_sequence = sequence
-                previous_timestamp = timestamp
+                state["previous_sequence"] = sequence
+                state["previous_timestamp"] = timestamp
                 launched_run_id = getattr(self, "_expected_run_id", None)
                 launched_instances = getattr(self, "_expected_source_instances", {})
                 if (
@@ -1890,6 +1920,7 @@ class FocusedRawEvidenceSource:
                     _error("live replica tail differs from the launched identity")
                 if event["event_type"] != "adaptive.configuration_active":
                     continue
+                selected = state["latest_configuration"]
                 if selected is None or (
                     int(event["source_sequence"]),
                     int(event["source_monotonic_ns"]),
@@ -1897,19 +1928,17 @@ class FocusedRawEvidenceSource:
                     int(selected["source_sequence"]),
                     int(selected["source_monotonic_ns"]),
                 ):
-                    selected = event
-            if selected is None:
-                _error("live replica tail lacks an active configuration")
-            latest[replica] = selected
+                    state["latest_configuration"] = event
         rows = [
             {
                 "replica_id": replica,
                 "configuration": _document(
-                    latest[replica]["payload"], "tail configuration"
+                    states[replica]["latest_configuration"]["payload"],
+                    "tail configuration",
                 ),
             }
             for replica in self._profile.replica_ids
-            if replica in latest
+            if states[replica]["latest_configuration"] is not None
         ]
         if not has_exact_active_configuration_barrier(self._profile, rows):
             return None
@@ -4263,14 +4292,26 @@ class FocusedLaunchBackend:
         *,
         deadline_monotonic: float,
     ) -> list[dict[str, object]]:
-        while True:
+        def require_live_processes() -> None:
             for record in getattr(processes, "records", ()):
                 process = getattr(record, "process", None)
                 if process is not None and process.poll() is not None:
                     _error("process exited while awaiting the pre-fault configuration")
+
+        while True:
+            require_live_processes()
             latched = source.latch_prefault_active_configuration_barrier()
             if latched is not None:
-                return latched
+                if self._poll_interval_s:
+                    time.sleep(self._poll_interval_s)
+                confirmed = source.latch_prefault_active_configuration_barrier()
+                if confirmed == latched:
+                    require_live_processes()
+                    if time.monotonic() >= deadline_monotonic:
+                        _error(
+                            "timed out waiting for the exact pre-fault configuration"
+                        )
+                    return confirmed
             if time.monotonic() >= deadline_monotonic:
                 _error("timed out waiting for the exact pre-fault configuration")
             if self._poll_interval_s:

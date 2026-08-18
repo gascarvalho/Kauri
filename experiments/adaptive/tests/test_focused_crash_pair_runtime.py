@@ -609,7 +609,7 @@ def test_v3_raw_progress_ignores_configuration_after_signal_request() -> None:
     assert progress["starting_tree_id"] == 6
 
 
-def test_prefault_tail_latch_keeps_tree_six_when_later_full_stream_rotates(
+def test_prefault_tail_latch_rejects_rewrite_after_initial_drain(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime()
@@ -684,9 +684,8 @@ def test_prefault_tail_latch_keeps_tree_six_when_later_full_stream_rotates(
             json.dumps(exact) + "\n" + json.dumps(ordinary) + "\n",
             encoding="utf-8",
         )
-    assert runtime.has_exact_active_configuration_barrier(
-        profile, source.latch_prefault_active_configuration_barrier()
-    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="truncated"):
+        source.latch_prefault_active_configuration_barrier()
 
 
 def _write_exact_live_tail_set(
@@ -792,6 +791,9 @@ def test_prefault_tail_latch_rejects_source_history_drift(
     source = _write_exact_live_tail_set(root, profile)
     path = root / "raw" / "replica-0.jsonl"
     first = json.loads(path.read_text())
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
     second = {
         **first,
         "source_sequence": 2,
@@ -805,15 +807,13 @@ def test_prefault_tail_latch_rejects_source_history_drift(
         second["source_monotonic_ns"] = 0
     else:
         second["source_instance"] = "foreign-uuid"
-    path.write_text(
-        json.dumps(first) + "\n" + json.dumps(second) + "\n",
-        encoding="utf-8",
-    )
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(second) + "\n")
     with pytest.raises(runtime.FocusedCrashPairRuntimeError):
         source.latch_prefault_active_configuration_barrier()
 
 
-def test_prefault_tail_latch_waits_for_partial_suffix_and_accepts_large_prefix(
+def test_prefault_tail_latch_accepts_complete_prefix_before_partial_suffix(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime()
@@ -824,11 +824,89 @@ def test_prefault_tail_latch_waits_for_partial_suffix_and_accepts_large_prefix(
     path = root / "raw" / "replica-0.jsonl"
     exact = path.read_bytes()
     path.write_bytes(exact + b'{"event_schema_version":1')
-    assert source.latch_prefault_active_configuration_barrier() is None
-    path.write_bytes(b"x" * 1_048_577 + b"\n" + exact)
     assert runtime.has_exact_active_configuration_barrier(
         profile, source.latch_prefault_active_configuration_barrier()
     )
+
+
+def test_prefault_tail_latch_rejects_truncation_after_initial_drain(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    path = root / "raw" / "replica-0.jsonl"
+    exact = path.read_bytes()
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
+    path.write_bytes(exact[:-1])
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="truncated"):
+        source.latch_prefault_active_configuration_barrier()
+
+
+def test_prefault_tail_cursor_does_not_consume_beyond_captured_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    target = root / "raw" / "replica-0.jsonl"
+    first = json.loads(target.read_text(encoding="utf-8"))
+    appended = {
+        **first,
+        "source_sequence": 2,
+        "source_monotonic_ns": 2,
+        "event_type": "block.committed",
+        "payload": {},
+    }
+    original_open = Path.open
+    grew = False
+
+    class GrowingReader:
+        def __init__(self, stream: object) -> None:
+            self._stream = stream
+
+        def __enter__(self) -> "GrowingReader":
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self._stream.__exit__(*args)
+
+        def seek(self, *args: object) -> object:
+            return self._stream.seek(*args)
+
+        def tell(self) -> int:
+            return self._stream.tell()
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal grew
+            if not grew:
+                grew = True
+                with original_open(target, "ab") as writer:
+                    writer.write((json.dumps(appended) + "\n").encode("utf-8"))
+            return self._stream.read(size)
+
+    def open_with_growth(path: Path, *args: object, **kwargs: object) -> object:
+        stream = original_open(path, *args, **kwargs)
+        if path == target and args and args[0] == "rb":
+            return GrowingReader(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "open", open_with_growth)
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
+    assert source._prefault_tail_states[0]["previous_sequence"] == 2
 
 
 def test_prefault_wait_reaches_exact_barrier_before_returning() -> None:
@@ -860,7 +938,72 @@ def test_prefault_wait_reaches_exact_barrier_before_returning() -> None:
         )
         == barrier
     )
-    assert trace == ["poll", "poll"]
+    assert trace == ["poll", "poll", "poll"]
+
+
+def test_prefault_wait_rechecks_process_health_after_confirmation() -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    configuration = {
+        "epoch_number": 0,
+        "tree_id": profile.raw["topology"]["active_tree_id"],
+        "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+    }
+    barrier = [
+        {"replica_id": replica, "configuration": dict(configuration)}
+        for replica in profile.replica_ids
+    ]
+
+    class Source:
+        def latch_prefault_active_configuration_barrier(self) -> object:
+            return barrier
+
+    polls = iter((None, 1))
+    processes = SimpleNamespace(
+        records=[SimpleNamespace(process=SimpleNamespace(poll=lambda: next(polls)))]
+    )
+    backend = runtime.FocusedLaunchBackend(poll_interval_s=0)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="process exited"):
+        backend._wait_for_prefault_configuration(
+            Source(), processes, deadline_monotonic=10**30
+        )
+
+
+def test_prefault_wait_rejects_tree_drift_during_confirmation(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+
+    class CandidateThenDrift:
+        calls = 0
+
+        def latch_prefault_active_configuration_barrier(self) -> object:
+            self.calls += 1
+            if self.calls == 2:
+                for replica in profile.replica_ids:
+                    path = root / "raw" / f"replica-{replica}.jsonl"
+                    event = json.loads(path.read_text())
+                    event["source_sequence"] = 2
+                    event["payload"] = {**event["payload"], "tree_id": 0}
+                    with path.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(event) + "\n")
+            return source.latch_prefault_active_configuration_barrier()
+
+    polls = iter((None, 1))
+    processes = SimpleNamespace(
+        records=[SimpleNamespace(process=SimpleNamespace(poll=lambda: next(polls)))]
+    )
+    backend = runtime.FocusedLaunchBackend(poll_interval_s=0)
+    candidate = CandidateThenDrift()
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="process exited"):
+        backend._wait_for_prefault_configuration(
+            candidate, processes, deadline_monotonic=10**30
+        )
+    assert candidate.calls == 2
 
 
 @pytest.mark.parametrize("mutation", ("timeout", "process-exit"))
