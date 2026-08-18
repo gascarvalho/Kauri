@@ -326,6 +326,23 @@ def _complete_child(
         encoding="ascii",
     )
     manager_argv, manager_input = native_fixture._safe_manager_boundary()
+    if (
+        child["arm"] == "control"
+        and profile.get("profile_id") in _validation()._FCRASH_H_V3_PROFILE_IDS
+    ):
+        arguments = list(manager_argv)
+        second_request = [
+            index
+            for index, argument in enumerate(arguments)
+            if argument == "--transition-request"
+        ][1]
+        del arguments[second_request : second_request + 4]
+        manager_argv = tuple(arguments)
+        manager_input = {
+            **manager_input,
+            "requested_argv": list(manager_argv),
+            "observed_argv": list(manager_argv),
+        }
     _write_json(
         directory / "runtime" / "launch-arguments.json",
         {"manager_argv": list(manager_argv)},
@@ -574,10 +591,14 @@ def _aggregate_trusted_provenance(
     children: list[Mapping[str, object]],
 ) -> dict[str, object]:
     entries: dict[str, object] = {}
+    pair_arms = [str(child.get("arm")) for child in children]
+    pair_receipt = len(children) == 2 and set(pair_arms) == {"control", "adaptive"}
     for child in children:
         directory = child["sealed_child_directory"]
         assert isinstance(directory, Path)
-        relative = str(directory.relative_to(root))
+        relative = (
+            str(child["arm"]) if pair_receipt else str(directory.relative_to(root))
+        )
         provenance = _trusted_provenance(directory)
         entries[relative] = {
             "tree_sha256": provenance["evidence_tree_sha256"],
@@ -1150,6 +1171,26 @@ def test_ranking_reconstruction_calls_native_replay_with_minimum_attempts(
             seed=native_fixture.NATIVE_SNAPSHOT_SEED,
             suffix_only=True,
         )
+
+
+def test_v3_containment_roots_preserve_eligible_baselines_before_replacement() -> None:
+    validation = _validation()
+
+    # N7 native scorer order differs from containment roots: healthy baseline
+    # roots retain their tree slots while failed slots consume replacements.
+    assert validation._containment_roots(  # type: ignore[attr-defined]
+        [2, 6, 3, 4, 5], {"quorum": 5}
+    ) == (6, 5, 2, 3, 4)
+
+    # The same rule must not collapse an N31-style mixed placement into the
+    # first Q ranked members.
+    ranked = [member for member in range(21) if member not in {1, 7}] + [25, 26]
+    expected = list(range(21))
+    expected[1] = 25
+    expected[7] = 26
+    assert validation._containment_roots(  # type: ignore[attr-defined]
+        ranked, {"quorum": 21}
+    ) == tuple(expected)
 
 
 def test_trusted_provenance_is_exact_and_bound_to_the_sealed_child(
@@ -3821,6 +3862,19 @@ def _v3_epoch_packed_commit_fixture(
         }
         for sequence, event_type in ((1, "process.started"), (2, "process.ready"))
     ]
+    replica1_instance = f"{run_id}-replica-1-uuid"
+    events.extend(
+        {
+            "source_kind": "replica",
+            "source_id": "replica-1",
+            "source_instance": replica1_instance,
+            "source_sequence": sequence,
+            "source_monotonic_ns": sequence,
+            "event_type": event_type,
+            "payload": {},
+        }
+        for sequence, event_type in ((1, "process.started"), (2, "process.ready"))
+    )
     configurations = (
         (0, 0, e0_digest),
         (1, 0, e1_digest),
@@ -4290,6 +4344,21 @@ def test_pair_and_campaign_consume_full_ledger_without_retry_and_keep_unfavorabl
     assert pair["verdict"] == "PASS"
     assert pair["scientific_outcome"] == "UNFAVORABLE"
     assert pair["retained"] is True
+    for mutation in ("extra", "renamed", "swapped"):
+        malformed = deepcopy(pair_trusted)
+        entries = malformed["children"]
+        assert isinstance(entries, dict)
+        if mutation == "extra":
+            entries["unrelated"] = deepcopy(entries["control"])
+        elif mutation == "renamed":
+            entries["renamed"] = entries.pop("control")
+        else:
+            entries["control"], entries["adaptive"] = (
+                entries["adaptive"],
+                entries["control"],
+            )
+        with pytest.raises(validation.FocusedCrashPairValidationError):
+            validation.validate_sealed_pair(pair_root, trusted_provenance=malformed)
 
     campaign_root = tmp_path / "campaign"
     copied_children = [

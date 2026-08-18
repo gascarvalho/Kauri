@@ -442,7 +442,12 @@ def validate_fcrash_h_evidence(
         _error("FCRASH-H causal timestamp or deadline drifted")
     expected = {
         int(row["target_replica_id"]): {
-            int(reporter) for reporter in row["authenticated_reporter_ids"]
+            _integer(reporter["reporter_id"], "coverage reporter"): _integer(
+                reporter["tree_id"], "coverage first qualifying tree"
+            )
+            for reporter in _sequence(
+                row["first_qualifying_reporters"], "first qualifying reporters"
+            )
         }
         for row in _sequence(coverage.get("targets"), "coverage targets")
     }
@@ -826,7 +831,12 @@ def _fcrash_h_witness_from_events(
         accepted.append((sequence, observation))
     expected = {
         int(row["target_replica_id"]): {
-            int(reporter) for reporter in row["authenticated_reporter_ids"]
+            _integer(reporter["reporter_id"], "coverage reporter"): _integer(
+                reporter["tree_id"], "coverage first qualifying tree"
+            )
+            for reporter in _sequence(
+                row["first_qualifying_reporters"], "first qualifying reporters"
+            )
         }
         for row in _sequence(coverage.get("targets"), "coverage targets")
     }
@@ -868,6 +878,13 @@ def _fcrash_h_witness_from_events(
             or type(reporter) is not int
             or target not in expected
             or reporter not in expected[target]
+            or _integer(
+                _mapping(
+                    observation.get("configuration"), "observation configuration"
+                ).get("tree_id"),
+                "observation tree",
+            )
+            != expected[target][reporter]
         ):
             continue
         rows.append(
@@ -1397,14 +1414,61 @@ def _validate_trees(
         _error(f"{label} tree IDs drifted")
     if tuple(tree.members[0] for tree in decoded.trees) != tuple(roots):
         _error(f"{label} roots drifted")
+    is_v3 = (
+        _mapping(contract["profile"], "focused profile").get("profile_id")
+        in _FCRASH_H_V3_PROFILE_IDS
+    )
+    members = tuple(_integer(member, "tree member") for member in contract["members"])
+    first_leaf = (len(members) - 2) // int(contract["fanout"]) + 1
     for tree, root in zip(decoded.trees, roots, strict=True):
         if (
             tree.fanout != contract["fanout"]
             or tree.pipeline_stretch != contract["pipeline_stretch"]
             or tuple(tree.wait_exempt) != tuple(contract["targets"])
-            or tuple(tree.members) != _canonical_tree_members(root, contract)
         ):
             _error(f"{label} native placement structure drifted")
+        if is_v3:
+            if (
+                len(tree.members) != len(members)
+                or set(tree.members) != set(members)
+                or tuple(tree.members[:1]) != (root,)
+                or any(
+                    target not in tree.members[first_leaf:]
+                    for target in contract["targets"]
+                )
+            ):
+                _error(f"{label} native placement structure drifted")
+        elif tuple(tree.members) != _canonical_tree_members(root, contract):
+            _error(f"{label} native placement structure drifted")
+
+
+def _containment_roots(
+    ranked_ids: Sequence[int], contract: Mapping[str, object]
+) -> tuple[int, ...]:
+    """Mirror native containment placement without reordering healthy roots."""
+
+    baseline = tuple(range(int(contract["quorum"])))
+    eligible = tuple(
+        _integer(replica, "containment ranked replica") for replica in ranked_ids
+    )
+    if len(set(eligible)) != len(eligible):
+        _error("containment ranking duplicates an eligible replica")
+    preserved = {root for root in baseline if root in eligible}
+    replacements = iter(replica for replica in eligible if replica not in preserved)
+    roots: list[int] = []
+    for root in baseline:
+        if root in preserved:
+            roots.append(root)
+            continue
+        try:
+            roots.append(next(replacements))
+        except StopIteration as exc:
+            raise FocusedCrashPairValidationError(
+                "containment ranking cannot fill every baseline root slot"
+            ) from exc
+    if len(set(roots)) != len(roots):
+        _error("containment placement repeats a root")
+    return tuple(roots)
 
 
 def _command_payload(decoded: Any, payload: Mapping[str, Any]) -> dict[str, object]:
@@ -1550,7 +1614,9 @@ def reconstruct_focused_ranking(
         policy.get("minimum_attempts"), "ranking minimum attempts", 1
     )
     if any(
-        _integer(row.get("attempt_count"), "ranking attempt count") < minimum_attempts
+        row.get("eligible") is True
+        and _integer(row.get("attempt_count"), "ranking attempt count")
+        < minimum_attempts
         for row in ranking
     ):
         _error("ranking contains a replica below the minimum attempt count")
@@ -1618,6 +1684,7 @@ def _ranking(
     replay_snapshot_id: str | None = None
     replay_cutoff: int | None = None
     replay_audit_ns: int | None = None
+    audited_eligible_ranking: tuple[int, ...] | None = None
     if has_snapshot_audit:
         all_audit_events = [
             event
@@ -1635,6 +1702,12 @@ def _ranking(
         if len(audit_events) != 1:
             _error("ranking evidence lacks one audit for the selected predecessor")
         audit = _mapping(audit_events[0]["payload"], "native ranking audit")
+        audited_eligible_ranking = tuple(
+            _integer(replica, "native audit eligible replica")
+            for replica in _sequence(
+                audit.get("eligible_ranking"), "native audit eligible ranking"
+            )
+        )
         replay_audit_ns = _integer(
             audit_events[0]["source_monotonic_ns"], "native ranking audit timestamp"
         )
@@ -1753,6 +1826,18 @@ def _ranking(
     timeout_targets = tuple(sorted(set(members) - set(ranked)))
     if len(ranked) != len(survivors) or timeout_targets != expected_targets:
         _error("ranking eligibility does not identify exactly the focused nonresponses")
+    if (
+        audited_eligible_ranking is not None
+        and _mapping(contract["profile"], "focused profile").get("profile_id")
+        in _FCRASH_H_V3_PROFILE_IDS
+    ):
+        expected_audit_roots = (
+            _containment_roots(ranked, contract)
+            if predecessor_epoch == 0
+            else tuple(ranked[: int(contract["quorum"])])
+        )
+        if audited_eligible_ranking != expected_audit_roots:
+            _error("native audit eligible ranking drifted")
     observation_ids = sorted(
         str(
             _mapping(
@@ -1835,32 +1920,32 @@ def _commit_reconstruction(
 ) -> tuple[list[Mapping[str, Any]], dict[str, object]]:
     commits = [event for event in events if event["event_type"] == "block.committed"]
     authoritative_source = str(contract["authoritative_source_id"])
-    if len(commits) < 4 or any(
-        event["source_kind"] != "replica" or event["source_id"] != authoritative_source
+    member_sources = {f"replica-{member}" for member in contract["members"]}
+    if any(
+        event["source_kind"] != "replica" or event["source_id"] not in member_sources
         for event in commits
     ):
+        _error("raw evidence contains a non-member committed block")
+    authoritative_commits = [
+        event for event in commits if event["source_id"] == authoritative_source
+    ]
+    if len(authoritative_commits) < 4:
         _error("raw evidence lacks the minimum authoritative commit chain")
     profile = _mapping(contract.get("profile"), "focused profile")
     is_v3 = profile.get("profile_id") in _FCRASH_H_V3_PROFILE_IDS
-    configurations_by_epoch: dict[int, list[tuple[tuple[int, int], int]]] = {}
+    configurations_by_source_epoch: dict[
+        tuple[str, int], list[tuple[tuple[int, int], int]]
+    ] = {}
     if is_v3:
-        instance = _authoritative_lifecycle_instance(events, authoritative_source)
-        if any(event.get("source_instance") != instance for event in commits):
-            _error("authoritative commit chain is not lifecycle-bound")
-        config_events = sorted(
-            [
-                event
-                for event in events
-                if event["event_type"] == "adaptive.configuration_active"
-                and event["source_kind"] == "replica"
-                and event["source_id"] == contract["authoritative_source_id"]
-                and event.get("source_instance") == instance
-            ],
-            key=lambda event: (
-                _integer(event["source_sequence"], "configuration sequence", 1),
-                _integer(event["source_monotonic_ns"], "configuration timestamp"),
-            ),
-        )
+        instances = {
+            source: _authoritative_lifecycle_instance(events, source)
+            for source in member_sources
+        }
+        if any(
+            event.get("source_instance") != instances[str(event["source_id"])]
+            for event in commits
+        ):
+            _error("committed block is not lifecycle-bound")
         epoch_trees = {
             0: tuple(range(len(tuple(contract["members"])))),
             1: tuple(tree.tree_id for tree in epoch1.trees),
@@ -1873,19 +1958,37 @@ def _commit_reconstruction(
         }
         if epoch2 is not None:
             allowed_digests[2] = epoch2.epoch_digest
-        expected_indexes = {epoch: 0 for epoch in allowed_digests}
+        expected_indexes = {
+            (source, epoch): 0 for source in member_sources for epoch in allowed_digests
+        }
+        config_events = sorted(
+            [
+                event
+                for event in events
+                if event["event_type"] == "adaptive.configuration_active"
+                and event["source_kind"] == "replica"
+                and event["source_id"] in member_sources
+                and event.get("source_instance") == instances[str(event["source_id"])]
+            ],
+            key=lambda event: (
+                str(event["source_id"]),
+                _integer(event["source_sequence"], "configuration sequence", 1),
+                _integer(event["source_monotonic_ns"], "configuration timestamp"),
+            ),
+        )
         for event in config_events:
-            payload = _mapping(event["payload"], "authoritative configuration")
+            source = str(event["source_id"])
+            payload = _mapping(event["payload"], "committed-block configuration")
             epoch = _integer(payload.get("epoch_number"), "configuration epoch")
             tree = _integer(payload.get("tree_id"), "configuration tree")
             if (
                 epoch not in allowed_digests
                 or payload.get("epoch_digest") != allowed_digests[epoch]
                 or not epoch_trees[epoch]
-                or tree != epoch_trees[epoch][expected_indexes[epoch]]
+                or tree != epoch_trees[epoch][expected_indexes[(source, epoch)]]
             ):
-                _error("authoritative cyclic configuration drifted")
-            configurations_by_epoch.setdefault(epoch, []).append(
+                _error("committed-block cyclic configuration drifted")
+            configurations_by_source_epoch.setdefault((source, epoch), []).append(
                 (
                     (
                         _integer(event["source_sequence"], "configuration sequence", 1),
@@ -1896,10 +1999,14 @@ def _commit_reconstruction(
                     tree,
                 )
             )
-            expected_indexes[epoch] = (expected_indexes[epoch] + 1) % len(
-                epoch_trees[epoch]
-            )
-        if set(configurations_by_epoch) != set(allowed_digests):
+            expected_indexes[(source, epoch)] = (
+                expected_indexes[(source, epoch)] + 1
+            ) % len(epoch_trees[epoch])
+        if {
+            epoch
+            for source, epoch in configurations_by_source_epoch
+            if source == authoritative_source
+        } != set(allowed_digests):
             _error("v3 authoritative commit chain lacks active epoch configurations")
     commits.sort(
         key=(
@@ -1921,6 +2028,7 @@ def _commit_reconstruction(
     prior_epoch = 0
     prior_sequence: int | None = None
     for event in commits:
+        is_authoritative = event["source_id"] == authoritative_source
         payload = _mapping(event["payload"], "authoritative commit")
         if set(payload) != {
             "block_height",
@@ -1954,13 +2062,24 @@ def _commit_reconstruction(
             _error("authoritative commit decision proof schema drifted")
         sequence = _integer(event["source_sequence"], "commit source sequence", 1)
         if (
-            (is_v3 and prior_sequence is not None and sequence <= prior_sequence)
+            (
+                is_authoritative
+                and is_v3
+                and prior_sequence is not None
+                and sequence <= prior_sequence
+            )
             or (
-                prior_height is not None
+                is_authoritative
+                and prior_height is not None
                 and (height != prior_height + 1 if is_v3 else height <= prior_height)
             )
-            or (prior_hash is not None and payload.get("parent_hash") != prior_hash)
-            or payload.get("designated_observer") is not True
+            or (
+                is_authoritative
+                and prior_hash is not None
+                and payload.get("parent_hash") != prior_hash
+            )
+            or payload.get("designated_observer")
+            is not (event["source_id"] == authoritative_source)
             or (not is_v3 and commit_batch_index != 0)
             or (not is_v3 and view_generation != 1)
             or (
@@ -1980,7 +2099,7 @@ def _commit_reconstruction(
             allowed_digests[2] = epoch2.epoch_digest
         if (
             expected_epoch not in allowed_digests
-            or expected_epoch < prior_epoch
+            or (is_authoritative and expected_epoch < prior_epoch)
             or proof.get("epoch_digest") != allowed_digests[expected_epoch]
         ):
             _error("authoritative commit decision proof drifted")
@@ -1992,7 +2111,11 @@ def _commit_reconstruction(
                 sequence,
                 _integer(event["source_monotonic_ns"], "commit timestamp"),
             )
-            timeline = configurations_by_epoch[expected_epoch]
+            timeline = configurations_by_source_epoch.get(
+                (str(event["source_id"]), expected_epoch)
+            )
+            if timeline is None:
+                _error("committed block lacks an active epoch configuration")
             generation_base = (expected_epoch << 32) + 1
             if view_generation < generation_base:
                 _error("authoritative commit generation is not activated")
@@ -2005,17 +2128,18 @@ def _commit_reconstruction(
                 or generation_configuration[1] != tree
             ):
                 _error("authoritative commit is not bound to its active generation")
-        prior_epoch = expected_epoch
-        prior_hash = block_hash
-        prior_height = height
-        prior_sequence = sequence
+        if is_authoritative:
+            prior_epoch = expected_epoch
+            prior_hash = block_hash
+            prior_height = height
+            prior_sequence = sequence
     observations = [
         event
         for event in events
         if event["event_type"] == "block.commit_observed"
         and event["source_kind"] == "replica"
     ]
-    _select_latest_common_commit(commits, observations, contract)
+    _select_latest_common_commit(authoritative_commits, observations, contract)
     phase_document = _read_json(
         root / "derived" / "phase-windows.json", "phase windows"
     )
@@ -2036,7 +2160,9 @@ def _commit_reconstruction(
         if any(right[1] != left[2] for left, right in zip(windows, windows[1:])):
             _error("phase windows are not contiguous")
     else:
-        first_ns = min(int(event["source_monotonic_ns"]) for event in commits)
+        first_ns = min(
+            int(event["source_monotonic_ns"]) for event in authoritative_commits
+        )
         origin = first_ns - (first_ns % width_ns)
         windows = [
             (name, origin + index * width_ns, origin + (index + 1) * width_ns)
@@ -2046,7 +2172,7 @@ def _commit_reconstruction(
     for phase, start, end in windows:
         transaction_count = sum(
             int(event["payload"]["transaction_count"])
-            for event in commits
+            for event in authoritative_commits
             if start <= int(event["source_monotonic_ns"]) < end
         )
         if transaction_count <= 0:
@@ -2062,7 +2188,7 @@ def _commit_reconstruction(
                 // (end - start),
             }
         )
-    return commits, {
+    return authoritative_commits, {
         "phases": phase_rows,
         "late_window_throughput_milli_tps": phase_rows[-1]["mean_milli_tps"],
     }
@@ -2100,6 +2226,8 @@ def _validate_manager_boundary(
     argv: Sequence[Any],
     manager_input: Mapping[str, Any],
     manager_events: Sequence[Mapping[str, Any]],
+    *,
+    transition_count: int,
 ) -> None:
     arguments = tuple(argv)
     if (
@@ -2128,7 +2256,13 @@ def _validate_manager_boundary(
         _error("manager launch boundary repeats a singleton option")
     if counts.get("--replica") != len(tuple(contract["members"])):
         _error("manager launch boundary does not contain the exact membership")
-    if counts.get("--transition-request") != int(contract["adaptive_transition_count"]):
+    expected_transition_count = (
+        transition_count
+        if _mapping(contract["profile"], "focused profile").get("profile_id")
+        in _FCRASH_H_V3_PROFILE_IDS
+        else int(contract["adaptive_transition_count"])
+    )
+    if counts.get("--transition-request") != expected_transition_count:
         _error("manager launch boundary transition cardinality drifted")
     if counts.get("--bundle-output") != counts.get("--transition-request"):
         _error("manager launch boundary bundle output cardinality drifted")
@@ -2139,7 +2273,7 @@ def _validate_manager_boundary(
 
 
 def _aggregate_child_provenance(
-    trusted_provenance: object, directory: Path
+    trusted_provenance: object, directory: Path, *, expected_arm: str | None = None
 ) -> Mapping[str, Any]:
     aggregate = _mapping(trusted_provenance, "aggregate trusted provenance")
     if (
@@ -2148,6 +2282,29 @@ def _aggregate_child_provenance(
     ):
         _error("aggregate trusted provenance schema drifted")
     children = _mapping(aggregate.get("children"), "trusted child provenance")
+    if expected_arm is not None:
+        if expected_arm not in {"control", "adaptive"} or set(children) != {
+            "control",
+            "adaptive",
+        }:
+            _error("aggregate trusted provenance arm binding drifted")
+        raw_entry = children[expected_arm]
+        entry = _mapping(raw_entry, "trusted child entry")
+        if set(entry) != {"tree_sha256", "seal_sha256", "provenance"}:
+            _error("trusted child entry schema drifted")
+        seal = verify_evidence_seal(directory)
+        if (
+            entry.get("tree_sha256") != seal.tree_sha256
+            or entry.get("seal_sha256") != seal.seal_sha256
+        ):
+            _error("trusted provenance arm entry does not bind its child")
+        provenance = _mapping(entry.get("provenance"), "child provenance")
+        if (
+            provenance.get("evidence_tree_sha256") != seal.tree_sha256
+            or provenance.get("evidence_seal_sha256") != seal.seal_sha256
+        ):
+            _error("trusted child provenance seal binding drifted")
+        return provenance
     seal = verify_evidence_seal(directory)
     matches: list[Mapping[str, Any]] = []
     for raw_entry in children.values():
@@ -2386,7 +2543,6 @@ def validate_sealed_arm(
     )
     if epoch1.previous_epoch_digest != contract["epoch_zero_digest"]:
         _error("Epoch 1 predecessor identity drifted")
-    _validate_trees(epoch1, tuple(range(int(contract["quorum"]))), "Epoch 1", contract)
     epoch2_path = root / "raw" / "epoch2.bundle"
     epoch2_wire: bytes | None = None
     epoch2: Any | None = None
@@ -2409,6 +2565,13 @@ def validate_sealed_arm(
         or epoch1.evidence_cutoff != epoch1_cutoff
     ):
         _error("Epoch 1 bundle is not bound to its native snapshot audit")
+    epoch1_roots = (
+        _containment_roots(containment_ranked_ids, contract)
+        if _mapping(contract["profile"], "focused profile").get("profile_id")
+        in _FCRASH_H_V3_PROFILE_IDS
+        else tuple(range(int(contract["quorum"])))
+    )
+    _validate_trees(epoch1, epoch1_roots, "Epoch 1", contract)
     if epoch2 is None:
         if any(
             event["event_type"] in {"epoch.command_committed", "epoch.activated"}
@@ -2453,10 +2616,23 @@ def validate_sealed_arm(
             <= epoch2_audit_ns
         ):
             _error("Epoch 2 command does not follow its native snapshot audit")
+        if epoch2_audit_ns is None:
+            _error("Epoch 2 native snapshot audit is absent")
+        authoritative_source = str(contract["authoritative_source_id"])
+        activation1_ns = max(
+            _integer(event["source_monotonic_ns"], "Epoch 1 activation timestamp")
+            for event in activations1
+        )
         predecessor_commits = [
             event
             for event in events
             if event["event_type"] == "block.committed"
+            and event["source_kind"] == "replica"
+            and event["source_id"] == authoritative_source
+            and _integer(event["source_monotonic_ns"], "predecessor commit timestamp")
+            > activation1_ns
+            and _integer(event["source_monotonic_ns"], "predecessor commit timestamp")
+            < epoch2_audit_ns
             and _mapping(
                 _mapping(event["payload"], "predecessor commit").get("decision_proof"),
                 "predecessor decision proof",
@@ -2469,11 +2645,27 @@ def validate_sealed_arm(
                 event
                 for event in events
                 if event["event_type"] == "block.commit_observed"
+                and _integer(
+                    event["source_monotonic_ns"], "common commit observation timestamp"
+                )
+                < epoch2_audit_ns
             ],
             contract,
         )
-        if min(int(event["source_monotonic_ns"]) for event in commands2) <= max(
-            int(event["source_monotonic_ns"]) for event in predecessor_observations
+        observation_times = [
+            _integer(
+                event["source_monotonic_ns"], "common commit observation timestamp"
+            )
+            for event in predecessor_observations
+        ]
+        if (
+            min(observation_times) <= activation1_ns
+            or max(observation_times) >= epoch2_audit_ns
+            or min(
+                _integer(event["source_monotonic_ns"], "Epoch 2 command timestamp")
+                for event in commands2
+            )
+            <= epoch2_audit_ns
         ):
             _error("Epoch 2 command precedes the fresh common-commit window")
     if epoch2 is None:
@@ -2572,6 +2764,7 @@ def validate_sealed_arm(
         _sequence(observed.get("argv"), "observed manager argv"),
         manager_input,
         [event for event in events if event["source_kind"] == "adaptation_manager"],
+        transition_count=1 if epoch2 is None else 2,
     )
 
     cleanup = _read_json(root / "cleanup.json", "cleanup result")
@@ -2673,13 +2866,13 @@ def validate_sealed_pair(
             or entry.get("arm") not in {"control", "adaptive"}
         ):
             _error("pair child path or arm is invalid")
+        arm = str(entry["arm"])
         result = validate_sealed_arm(
             root / relative,
             trusted_provenance=_aggregate_child_provenance(
-                trusted_provenance, root / relative
+                trusted_provenance, root / relative, expected_arm=arm
             ),
         )
-        arm = str(entry["arm"])
         if (
             result["arm"] != arm
             or result["pair_id"] != receipt.get("pair_id")
