@@ -2000,7 +2000,7 @@ def test_raw_common_commit_joins_exact_authoritative_identity_for_each_epoch(
         "parent_hash": f"{2:064x}",
         "transaction_count": 450,
     }
-    with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
+    assert (
         source._common_commit(
             [
                 event
@@ -2012,8 +2012,46 @@ def test_raw_common_commit_joins_exact_authoritative_identity_for_each_epoch(
             ],
             1,
         )
-    with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
-        source._common_commit(events, 2)
+        is None
+    )
+    assert source._common_commit(events, 2) is None
+
+
+def test_raw_common_commit_rejects_ambiguous_quorum_witnessed_identity(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    source = _raw_source(directory)
+    events = source._events()
+    original = next(
+        event
+        for event in events
+        if event["event_type"] == "block.committed"
+        and event["payload"]["decision_proof"]["epoch_number"] == 1
+    )
+    conflicting = deepcopy(original)
+    conflicting["payload"]["block_hash"] = "f" * 64
+    conflicting["payload"]["decision_proof"]["block_hash"] = "f" * 64
+    events.append(conflicting)
+    for observed in [
+        event
+        for event in events
+        if event["event_type"] == "block.commit_observed"
+        and event["payload"]["block_height"] == original["payload"]["block_height"]
+    ]:
+        conflicting_observation = deepcopy(observed)
+        conflicting_observation["payload"]["block_hash"] = "f" * 64
+        events.append(conflicting_observation)
+    with pytest.raises(
+        runtime_fixture._runtime().FocusedCrashPairRuntimeError, match="ambiguous"
+    ):
+        source._common_commit(events, 1)
 
 
 @pytest.mark.parametrize("layer", ("runtime", "sealed-validator"))
@@ -2912,6 +2950,181 @@ def test_raw_n31_v2_nonresponse_and_epoch1_share_the_native_audit(
         nonresponse["snapshot_audit_monotonic_ns"]
     )
     assert epoch1["source_monotonic_ns"] == nonresponse["snapshot_audit_monotonic_ns"]
+
+
+def _renumber_raw_sources(events: list[dict[str, object]]) -> None:
+    grouped: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    for event in events:
+        grouped.setdefault(
+            (
+                str(event["source_kind"]),
+                str(event["source_id"]),
+                str(event["source_instance"]),
+            ),
+            [],
+        ).append(event)
+    for source_events in grouped.values():
+        source_events.sort(key=lambda event: int(event["source_sequence"]))
+        for sequence, event in enumerate(source_events, start=1):
+            event["source_sequence"] = sequence
+    events.sort(
+        key=lambda event: (
+            str(event["source_kind"]),
+            str(event["source_id"]),
+            str(event["source_instance"]),
+            int(event["source_sequence"]),
+        )
+    )
+
+
+@pytest.mark.parametrize("mode", ("zero", "subset"))
+def test_raw_epoch1_commands_remain_pending_until_full_survivor_witness_set(
+    mode: str, tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    events = _load_events(directory)
+    commands = [
+        event
+        for event in events
+        if event["event_type"] == "epoch.command_committed"
+        and event["payload"]["successor_epoch_number"] == 1
+    ]
+    assert commands
+    removed = set(id(event) for event in (commands if mode == "zero" else commands[:1]))
+    events = [event for event in events if id(event) not in removed]
+    _renumber_raw_sources(events)
+    _write_events(directory, events)
+    assert _raw_source(directory).poll("commands1") is None
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "wrong-payload", "wrong-source"))
+def test_raw_epoch1_commands_reject_malformed_complete_witness_sets(
+    mutation: str, tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    events = _load_events(directory)
+    command = next(
+        event
+        for event in events
+        if event["event_type"] == "epoch.command_committed"
+        and event["payload"]["successor_epoch_number"] == 1
+    )
+    if mutation == "duplicate":
+        duplicate = deepcopy(command)
+        source_events = [
+            event for event in events if event["source_id"] == command["source_id"]
+        ]
+        duplicate["source_sequence"] = (
+            max(int(event["source_sequence"]) for event in source_events) + 1
+        )
+        duplicate["source_monotonic_ns"] = (
+            max(int(event["source_monotonic_ns"]) for event in source_events) + 1
+        )
+        events.append(duplicate)
+    elif mutation == "wrong-payload":
+        command["payload"]["successor_epoch_digest"] = "f" * 64
+    else:
+        command["source_id"] = "replica-999"
+    _renumber_raw_sources(events)
+    _write_events(directory, events)
+    with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
+        _raw_source(directory).poll("commands1")
+
+
+def test_raw_epoch1_activations_return_exact_full_native_snapshot(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    activation = _raw_source(directory).poll("activations1")
+    assert activation is not None
+    assert activation["successor_epoch_number"] == 1
+    assert activation["witness_count"] == len(activation["survivor_replica_ids"])
+
+
+@pytest.mark.parametrize("mode", ("zero", "subset"))
+def test_raw_epoch1_activations_remain_pending_until_full_survivor_witness_set(
+    mode: str, tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    events = _load_events(directory)
+    activations = [
+        event
+        for event in events
+        if event["event_type"] == "epoch.activated"
+        and event["payload"]["epoch_number"] == 1
+    ]
+    assert activations
+    removed = set(
+        id(event) for event in (activations if mode == "zero" else activations[:1])
+    )
+    events = [event for event in events if id(event) not in removed]
+    _renumber_raw_sources(events)
+    _write_events(directory, events)
+    assert _raw_source(directory).poll("activations1") is None
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "wrong-payload", "wrong-source"))
+def test_raw_epoch1_activations_reject_malformed_complete_witness_sets(
+    mutation: str, tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    events = _load_events(directory)
+    activation = next(
+        event
+        for event in events
+        if event["event_type"] == "epoch.activated"
+        and event["payload"]["epoch_number"] == 1
+    )
+    if mutation == "duplicate":
+        duplicate = deepcopy(activation)
+        source_events = [
+            event for event in events if event["source_id"] == activation["source_id"]
+        ]
+        duplicate["source_sequence"] = (
+            max(int(event["source_sequence"]) for event in source_events) + 1
+        )
+        duplicate["source_monotonic_ns"] = (
+            max(int(event["source_monotonic_ns"]) for event in source_events) + 1
+        )
+        events.append(duplicate)
+    elif mutation == "wrong-payload":
+        activation["payload"]["successor_epoch_digest"] = "f" * 64
+    else:
+        activation["source_id"] = "replica-999"
+    _renumber_raw_sources(events)
+    _write_events(directory, events)
+    with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
+        _raw_source(directory).poll("activations1")
 
 
 @pytest.mark.parametrize(("epoch", "phase"), ((1, "epoch1"), (2, "epoch2")))

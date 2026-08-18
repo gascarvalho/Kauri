@@ -657,6 +657,212 @@ def test_v3_raw_progress_rejects_any_member_configuration_in_fault_batch(
         )
 
 
+def _v3_common_commit_fixture(tmp_path: Path) -> tuple[object, list[dict[str, object]]]:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    _control_wire, _control, epoch1_wire, epoch1 = (
+        native_fixture._independent_epoch1_bundles()
+    )
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    (root / "raw" / "epoch1.bundle").write_bytes(epoch1_wire)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._root = root
+    source._profile = replace(
+        profile, issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY
+    )
+    observer = int(profile.raw["measurement"]["authoritative_replica_id"])
+    payload = {
+        "block_height": 1,
+        "block_hash": "1" * 64,
+        "parent_hash": "0" * 64,
+        "transaction_count": 1000,
+        "commit_batch_index": 0,
+        "designated_observer": True,
+        "view_generation": (1 << 32) + 1,
+        "decision_proof": {
+            "epoch_number": 1,
+            "epoch_digest": epoch1.epoch_digest,
+            "block_hash": "1" * 64,
+            "tree_id": 0,
+        },
+    }
+    events: list[dict[str, object]] = [
+        {
+            "source_kind": "replica",
+            "source_id": f"replica-{observer}",
+            "source_instance": "v3-authoritative-uuid",
+            "source_sequence": sequence,
+            "source_monotonic_ns": sequence,
+            "event_type": event_type,
+            "payload": {},
+        }
+        for sequence, event_type in ((1, "process.started"), (2, "process.ready"))
+    ]
+    events.append(
+        {
+            "source_kind": "replica",
+            "source_id": f"replica-{observer}",
+            "source_instance": "v3-authoritative-uuid",
+            "source_sequence": 3,
+            "source_monotonic_ns": 3,
+            "event_type": "adaptive.configuration_active",
+            "payload": {
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": epoch1.epoch_digest,
+            },
+        }
+    )
+    events.append(
+        {
+            "source_kind": "replica",
+            "source_id": f"replica-{observer}",
+            "source_instance": "v3-authoritative-uuid",
+            "source_sequence": 4,
+            "source_monotonic_ns": 4,
+            "event_type": "block.committed",
+            "payload": payload,
+        }
+    )
+    identity = {
+        key: payload[key]
+        for key in (
+            "block_height",
+            "block_hash",
+            "parent_hash",
+            "transaction_count",
+            "commit_batch_index",
+        )
+    }
+    survivors = [
+        replica
+        for replica in profile.replica_ids
+        if replica not in profile.target_replica_ids
+    ]
+    for replica in survivors[: profile.quorum]:
+        instance = f"v3-replica-{replica}-uuid"
+        if replica != observer:
+            events.extend(
+                {
+                    "source_kind": "replica",
+                    "source_id": f"replica-{replica}",
+                    "source_instance": instance,
+                    "source_sequence": sequence,
+                    "source_monotonic_ns": sequence,
+                    "event_type": event_type,
+                    "payload": {},
+                }
+                for sequence, event_type in (
+                    (1, "process.started"),
+                    (2, "process.ready"),
+                )
+            )
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": f"replica-{replica}",
+                "source_instance": (
+                    "v3-authoritative-uuid" if replica == observer else instance
+                ),
+                "source_sequence": 5 if replica == observer else 3,
+                "source_monotonic_ns": 5 if replica == observer else 3,
+                "event_type": "block.commit_observed",
+                "payload": dict(identity),
+            }
+        )
+    return source, events
+
+
+def test_v3_raw_common_commit_accepts_full_and_pends_for_insufficient_witnesses(
+    tmp_path: Path,
+) -> None:
+    source, events = _v3_common_commit_fixture(tmp_path)
+    assert source._common_commit(events, 1) is not None
+    assert source._common_commit(events[:-1], 1) is None
+
+
+def test_v3_raw_common_commit_accepts_zero_transaction_workload(
+    tmp_path: Path,
+) -> None:
+    source, events = _v3_common_commit_fixture(tmp_path)
+    for event in events:
+        if event["event_type"] in {"block.committed", "block.commit_observed"}:
+            event["payload"]["transaction_count"] = 0
+    snapshot = source._common_commit(events, 1)
+    assert snapshot is not None
+    assert snapshot["transaction_count"] == 0
+
+
+def test_v3_raw_common_commit_caches_lifecycle_identity_per_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime()
+    source, events = _v3_common_commit_fixture(tmp_path)
+    repeated = [deepcopy(events[-1]) for _ in range(1_000)]
+    for event in repeated:
+        event["payload"]["block_hash"] = "f" * 64
+    events.extend(repeated)
+    original = runtime._authoritative_lifecycle_instance
+    calls: list[str] = []
+
+    def counted(raw_events: Sequence[Mapping[str, object]], source_id: str) -> str:
+        calls.append(source_id)
+        return original(raw_events, source_id)
+
+    monkeypatch.setattr(runtime, "_authoritative_lifecycle_instance", counted)
+    assert source._common_commit(events, 1) is not None
+    configured_sources = {
+        str(event["source_id"])
+        for event in events
+        if event["event_type"] in {"block.committed", "block.commit_observed"}
+    }
+    assert len(calls) <= len(configured_sources)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "transactions",
+        "view-overflow",
+        "batch-overflow",
+        "unactivated-tree-generation",
+        "client-spoof",
+        "nonmember-spoof",
+    ),
+)
+def test_v3_raw_common_commit_rejects_invalid_raw_commit_or_observation(
+    mutation: str, tmp_path: Path
+) -> None:
+    runtime = _runtime()
+    source, events = _v3_common_commit_fixture(tmp_path)
+    commit = next(event for event in events if event["event_type"] == "block.committed")
+    if mutation == "transactions":
+        commit["payload"]["transaction_count"] = 13
+        for event in events[1:]:
+            event["payload"]["transaction_count"] = 13
+    elif mutation == "view-overflow":
+        commit["payload"]["view_generation"] = 1 << 64
+    elif mutation == "batch-overflow":
+        commit["payload"]["commit_batch_index"] = 1 << 64
+        for event in events[1:]:
+            event["payload"]["commit_batch_index"] = 1 << 64
+    elif mutation == "unactivated-tree-generation":
+        commit["payload"]["decision_proof"]["tree_id"] = 99
+        commit["payload"]["view_generation"] = (1 << 32) + 2
+    else:
+        spoof = deepcopy(events[-1])
+        spoof["payload"]["block_hash"] = "f" * 64
+        if mutation == "client-spoof":
+            spoof["source_kind"] = "client"
+            spoof["source_id"] = "client-0"
+        else:
+            spoof["source_id"] = "replica-999"
+        events.append(spoof)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        source._common_commit(events, 1)
+
+
 def test_prefault_tail_latch_rejects_rewrite_after_initial_drain(
     tmp_path: Path,
 ) -> None:

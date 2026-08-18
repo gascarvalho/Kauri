@@ -2000,6 +2000,18 @@ class FocusedRawEvidenceSource:
             return []
         if len({event["run_id"] for event in events}) != 1:
             _error("raw event streams span multiple runs")
+        expected_run_id = getattr(self, "_expected_run_id", None)
+        expected_instances = getattr(self, "_expected_source_instances", {})
+        if expected_run_id is not None and events[0]["run_id"] != expected_run_id:
+            _error("raw event streams differ from the launched run")
+        if expected_instances:
+            for event in events:
+                source_id = str(event["source_id"])
+                if (
+                    source_id not in expected_instances
+                    or event["source_instance"] != expected_instances[source_id]
+                ):
+                    _error("raw event streams differ from launched source identities")
         grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         source_ids: set[tuple[str, str]] = set()
         for event in events:
@@ -2597,30 +2609,132 @@ class FocusedRawEvidenceSource:
         epoch: int,
         *,
         activation: bool,
-    ) -> dict[str, object]:
+    ) -> dict[str, object] | None:
         wire, decoded = self._bundle(epoch)
         event_type = "epoch.activated" if activation else "epoch.command_committed"
         number_key = "epoch_number" if activation else "successor_epoch_number"
-        selected = [
-            event
-            for event in events
-            if event["event_type"] == event_type
-            and _document(event["payload"], "transition payload").get(number_key)
-            == epoch
-        ]
+        expected_payload_keys = (
+            {
+                "epoch_number",
+                "tree_id",
+                "epoch_digest",
+                "activation_height",
+            }
+            if activation
+            else {
+                "command_block_height",
+                "command_block_hash",
+                "payload_digest",
+                "predecessor_epoch_number",
+                "predecessor_epoch_digest",
+                "successor_epoch_number",
+                "successor_epoch_digest",
+                "activation_delay_blocks",
+                "activation_height",
+            }
+        )
+        selected: list[Mapping[str, Any]] = []
+        for event in events:
+            if event["event_type"] != event_type:
+                continue
+            payload = _document(event["payload"], "transition payload")
+            if set(payload) != expected_payload_keys:
+                _error(f"raw Epoch {epoch} transition payload schema drifted")
+            reported_epoch = _integer(
+                payload.get(number_key), "transition epoch number", 0
+            )
+            if reported_epoch == epoch:
+                selected.append(event)
         survivors = tuple(
             replica
             for replica in self._profile.replica_ids
             if replica not in self._profile.target_replica_ids
         )
         expected_sources = {f"replica-{replica}" for replica in survivors}
-        payloads = {_canonical_json(event["payload"]) for event in selected}
-        if (
-            len(selected) != len(survivors)
-            or {event["source_id"] for event in selected} != expected_sources
-            or len(payloads) != 1
-        ):
+        if not selected:
+            return None
+        if len(selected) > len(survivors):
             _error(f"raw Epoch {epoch} transition lacks every survivor")
+        source_ids: set[str] = set()
+        payloads: set[str] = set()
+        launched_instances = getattr(self, "_expected_source_instances", {})
+        for event in selected:
+            source_id = str(event["source_id"])
+            if event["source_kind"] != "replica" or source_id not in expected_sources:
+                _error(f"raw Epoch {epoch} transition source drifted")
+            if launched_instances and event.get(
+                "source_instance"
+            ) != launched_instances.get(source_id):
+                _error(f"raw Epoch {epoch} transition launch identity drifted")
+            if source_id in source_ids:
+                _error(f"raw Epoch {epoch} transition duplicates a survivor")
+            source_ids.add(source_id)
+            payload = _document(event["payload"], "transition payload")
+            if set(payload) != expected_payload_keys:
+                _error(f"raw Epoch {epoch} transition payload schema drifted")
+            activation_height = _integer(
+                payload.get("activation_height"), "transition activation height", 1
+            )
+            if activation:
+                if (
+                    _integer(payload.get("epoch_number"), "transition epoch number", 0)
+                    != epoch
+                    or _integer(payload.get("tree_id"), "transition tree") != 0
+                    or _digest(payload.get("epoch_digest"), "transition epoch digest")
+                    != decoded.epoch_digest
+                ):
+                    _error(f"raw Epoch {epoch} transition payload drifted")
+            else:
+                command_height = _integer(
+                    payload.get("command_block_height"),
+                    "transition command height",
+                    1,
+                )
+                activation_delay = _integer(
+                    payload.get("activation_delay_blocks"),
+                    "transition activation delay",
+                    1,
+                )
+                if (
+                    _digest(
+                        payload.get("command_block_hash"), "transition command hash"
+                    )
+                    == "0" * 64
+                    or _digest(
+                        payload.get("payload_digest"), "transition payload digest"
+                    )
+                    != decoded.command.payload_digest
+                    or _integer(
+                        payload.get("predecessor_epoch_number"),
+                        "transition predecessor epoch",
+                        0,
+                    )
+                    != epoch - 1
+                    or _digest(
+                        payload.get("predecessor_epoch_digest"),
+                        "transition predecessor digest",
+                    )
+                    != decoded.previous_epoch_digest
+                    or _integer(
+                        payload.get("successor_epoch_number"),
+                        "transition successor epoch",
+                        1,
+                    )
+                    != epoch
+                    or _digest(
+                        payload.get("successor_epoch_digest"),
+                        "transition successor digest",
+                    )
+                    != decoded.epoch_digest
+                    or activation_delay != decoded.command.activation_delay_blocks
+                    or activation_height != command_height + activation_delay
+                ):
+                    _error(f"raw Epoch {epoch} transition payload drifted")
+            payloads.add(_canonical_json(payload))
+        if len(payloads) != 1:
+            _error(f"raw Epoch {epoch} transition payloads conflict")
+        if source_ids != expected_sources:
+            return None
         payload = _document(selected[0]["payload"], "transition payload")
         snapshot = {
             "survivor_replica_ids": list(survivors),
@@ -2644,45 +2758,299 @@ class FocusedRawEvidenceSource:
 
     def _common_commit(
         self, events: Sequence[Mapping[str, Any]], epoch: int
-    ) -> dict[str, object]:
+    ) -> dict[str, object] | None:
         _wire, decoded = self._bundle(epoch)
-        commits = [
-            event
-            for event in events
-            if event["event_type"] == "block.committed"
-            and _document(event["payload"], "commit payload")
-            .get("decision_proof", {})
-            .get("epoch_number")
-            == epoch
-        ]
-        observers = [
-            event for event in events if event["event_type"] == "block.commit_observed"
-        ]
+        authoritative_keys = {
+            "block_height",
+            "block_hash",
+            "parent_hash",
+            "transaction_count",
+            "commit_batch_index",
+            "designated_observer",
+            "view_generation",
+            "decision_proof",
+        }
+        proof_keys = {"epoch_number", "tree_id", "epoch_digest", "block_hash"}
+        observation_keys = {
+            "block_height",
+            "block_hash",
+            "parent_hash",
+            "transaction_count",
+            "commit_batch_index",
+        }
+
+        def commit_identity(event: Mapping[str, Any]) -> tuple[int, dict[str, object]]:
+            payload = _document(event["payload"], "authoritative commit")
+            proof = _document(payload.get("decision_proof"), "commit decision proof")
+            proof_epoch = _integer(proof.get("epoch_number"), "commit proof epoch", 0)
+            if proof_epoch != epoch:
+                return proof_epoch, {}
+            if set(payload) != authoritative_keys or set(proof) != proof_keys:
+                _error("raw authoritative commit schema drifted")
+            identity = {
+                "block_height": _integer(
+                    payload.get("block_height"), "commit height", 1
+                ),
+                "block_hash": _digest(payload.get("block_hash"), "commit hash"),
+                "parent_hash": _digest(
+                    payload.get("parent_hash"), "commit parent hash"
+                ),
+                "transaction_count": _integer(
+                    payload.get("transaction_count"), "commit transactions", 0
+                ),
+                "commit_batch_index": _integer(
+                    payload.get("commit_batch_index"), "commit batch index", 0
+                ),
+            }
+            _uint64(payload.get("transaction_count"), "commit transactions")
+            _uint64(payload.get("commit_batch_index"), "commit batch index")
+            if self._profile.profile_id in _FCRASH_H_V3_PROFILE_IDS and _uint64(
+                payload.get("transaction_count"), "commit transactions"
+            ) not in {
+                0,
+                _integer(
+                    _document(
+                        self._profile.raw.get("protocol"), "profile protocol"
+                    ).get("transactions_per_block"),
+                    "profile transactions per block",
+                    1,
+                ),
+            }:
+                _error("raw authoritative commit workload drifted")
+            if (
+                _uint64(payload.get("view_generation"), "commit view generation", 1) < 1
+                or _integer(proof.get("tree_id"), "commit proof tree", 0) < 0
+                or _digest(proof.get("epoch_digest"), "commit proof epoch digest")
+                != decoded.epoch_digest
+                or _digest(proof.get("block_hash"), "commit proof hash")
+                != identity["block_hash"]
+            ):
+                _error("raw authoritative commit invariants drifted")
+            return proof_epoch, identity
+
+        replica_instances: dict[str, str] = {}
+
+        def expected_replica_instance(source_id: str) -> str:
+            cached = replica_instances.get(source_id)
+            if cached is not None:
+                return cached
+            launched = getattr(self, "_expected_source_instances", {})
+            if launched:
+                instance = launched.get(source_id)
+                if not isinstance(instance, str) or not instance:
+                    _error("raw common commit witness launch identity is absent")
+                lifecycle = [
+                    event
+                    for event in events
+                    if event.get("event_type") in {"process.started", "process.ready"}
+                    and event.get("source_id") == source_id
+                ]
+                if (
+                    lifecycle
+                    and _authoritative_lifecycle_instance(events, source_id) != instance
+                ):
+                    _error("raw common commit witness lifecycle drifted")
+                replica_instances[source_id] = instance
+                return instance
+            lifecycle = [
+                event
+                for event in events
+                if event.get("event_type") in {"process.started", "process.ready"}
+                and event.get("source_id") == source_id
+            ]
+            if lifecycle:
+                instance = _authoritative_lifecycle_instance(events, source_id)
+                replica_instances[source_id] = instance
+                return instance
+            instances = {
+                event.get("source_instance")
+                for event in events
+                if event.get("source_kind") == "replica"
+                and event.get("source_id") == source_id
+            }
+            if len(instances) != 1 or not isinstance(next(iter(instances)), str):
+                _error("raw common commit witness lifecycle is ambiguous")
+            instance = str(next(iter(instances)))
+            replica_instances[source_id] = instance
+            return instance
+
+        measurement = _document(
+            self._profile.raw.get("measurement"), "profile measurement"
+        )
+        authoritative_source = f"replica-{_integer(measurement.get('authoritative_replica_id'), 'authoritative observer', 0)}"
+        is_v3 = self._profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+        configurations: list[tuple[tuple[int, int], int]] = []
+        if is_v3:
+            tree_ids = tuple(tree.tree_id for tree in decoded.trees)
+            for event in events:
+                if (
+                    event.get("event_type") != "adaptive.configuration_active"
+                    or event.get("source_kind") != "replica"
+                    or event.get("source_id") != authoritative_source
+                    or event.get("source_instance")
+                    != expected_replica_instance(authoritative_source)
+                ):
+                    continue
+                payload = _document(event.get("payload"), "authoritative configuration")
+                if (
+                    _integer(payload.get("epoch_number"), "configuration epoch", 0)
+                    != epoch
+                ):
+                    continue
+                tree = _integer(payload.get("tree_id"), "configuration tree", 0)
+                if (
+                    _digest(payload.get("epoch_digest"), "configuration epoch digest")
+                    != decoded.epoch_digest
+                    or tree != tree_ids[len(configurations) % len(tree_ids)]
+                ):
+                    _error("raw authoritative cyclic configuration drifted")
+                configurations.append(
+                    (
+                        (
+                            _integer(
+                                event.get("source_sequence"),
+                                "configuration sequence",
+                                1,
+                            ),
+                            _integer(
+                                event.get("source_monotonic_ns"),
+                                "configuration timestamp",
+                            ),
+                        ),
+                        tree,
+                    )
+                )
+            configurations.sort()
+        commits: list[Mapping[str, Any]] = []
+        for event in events:
+            if event["event_type"] != "block.committed":
+                continue
+            proof_epoch, _identity = commit_identity(event)
+            if proof_epoch == epoch:
+                source_id = str(event["source_id"])
+                if (
+                    event["source_kind"] != "replica"
+                    or not source_id.startswith("replica-")
+                    or not source_id.removeprefix("replica-").isdigit()
+                    or int(source_id.removeprefix("replica-"))
+                    not in self._profile.replica_ids
+                    or event.get("source_instance")
+                    != expected_replica_instance(source_id)
+                ):
+                    _error("raw authoritative commit source drifted")
+                designated = _document(event["payload"], "authoritative commit").get(
+                    "designated_observer"
+                )
+                if type(designated) is not bool or designated != (
+                    source_id == authoritative_source
+                ):
+                    _error("raw authoritative commit observer drifted")
+                if source_id == authoritative_source:
+                    if is_v3:
+                        payload = _document(event["payload"], "authoritative commit")
+                        generation = _uint64(
+                            payload.get("view_generation"), "commit view generation", 1
+                        )
+                        ordinal = generation - ((epoch << 32) + 1)
+                        proof_tree = _integer(
+                            _document(
+                                payload.get("decision_proof"), "commit decision proof"
+                            ).get("tree_id"),
+                            "commit proof tree",
+                            0,
+                        )
+                        key = (
+                            _integer(
+                                event["source_sequence"], "commit source sequence", 1
+                            ),
+                            _integer(event["source_monotonic_ns"], "commit timestamp"),
+                        )
+                        if (
+                            ordinal < 0
+                            or ordinal >= len(configurations)
+                            or configurations[ordinal][0] > key
+                            or configurations[ordinal][1] != proof_tree
+                        ):
+                            _error(
+                                "raw authoritative commit is not bound to its active generation"
+                            )
+                    commits.append(event)
+        if not commits:
+            return None
+        observers: list[tuple[Mapping[str, Any], dict[str, object]]] = []
+        for event in events:
+            if event["event_type"] != "block.commit_observed":
+                continue
+            payload = _document(event["payload"], "common commit observation")
+            if set(payload) != observation_keys:
+                _error("raw common commit observation schema drifted")
+            source_id = str(event["source_id"])
+            if (
+                event["source_kind"] != "replica"
+                or not source_id.startswith("replica-")
+                or not source_id.removeprefix("replica-").isdigit()
+                or int(source_id.removeprefix("replica-"))
+                not in self._profile.replica_ids
+                or event.get("source_instance") != expected_replica_instance(source_id)
+            ):
+                _error("raw common commit witness source drifted")
+            observers.append(
+                (
+                    event,
+                    {
+                        "block_height": _integer(
+                            payload.get("block_height"), "observation height", 1
+                        ),
+                        "block_hash": _digest(
+                            payload.get("block_hash"), "observation hash"
+                        ),
+                        "parent_hash": _digest(
+                            payload.get("parent_hash"), "observation parent hash"
+                        ),
+                        "transaction_count": _integer(
+                            payload.get("transaction_count"),
+                            "observation transactions",
+                            0,
+                        ),
+                        "commit_batch_index": _integer(
+                            payload.get("commit_batch_index"),
+                            "observation commit batch index",
+                            0,
+                        ),
+                    },
+                )
+            )
         survivors = set(self._profile.replica_ids) - set(
             self._profile.target_replica_ids
         )
+
         matches: list[tuple[Mapping[str, Any], list[Mapping[str, Any]]]] = []
         for commit in commits:
-            payload = _document(commit["payload"], "authoritative commit")
-            identity = {
-                key: payload.get(key)
-                for key in (
-                    "block_height",
-                    "block_hash",
-                    "parent_hash",
-                    "transaction_count",
-                    "commit_batch_index",
-                )
-            }
-            witnessed = [
+            _proof_epoch, identity = commit_identity(commit)
+            identity_matching = [
                 event
-                for event in observers
-                if dict(_document(event["payload"], "common commit observation"))
-                == identity
-                and event["source_kind"] == "replica"
-                and str(event["source_id"]).startswith("replica-")
-                and int(str(event["source_id"]).removeprefix("replica-")) in survivors
+                for event, observed_identity in observers
+                if observed_identity == identity
             ]
+            witnessed: list[Mapping[str, Any]] = []
+            witnessed_sources: set[int] = set()
+            for event in identity_matching:
+                source_id = str(event["source_id"])
+                if (
+                    event["source_kind"] != "replica"
+                    or not source_id.startswith("replica-")
+                    or not source_id.removeprefix("replica-").isdigit()
+                ):
+                    _error("raw common commit witness source drifted")
+                replica = int(source_id.removeprefix("replica-"))
+                if replica not in survivors:
+                    _error("raw common commit witness is outside survivors")
+                if event.get("source_instance") != expected_replica_instance(source_id):
+                    _error("raw common commit witness lifecycle drifted")
+                if replica in witnessed_sources:
+                    _error("raw common commit witness duplicates a survivor")
+                witnessed_sources.add(replica)
+                witnessed.append(event)
             witness_ids = {
                 int(str(event["source_id"]).removeprefix("replica-"))
                 for event in witnessed
@@ -2690,7 +3058,7 @@ class FocusedRawEvidenceSource:
             if len(witness_ids) >= self._profile.quorum:
                 matches.append((commit, witnessed))
         if not matches:
-            _error(f"raw Epoch {epoch} common commit is absent or ambiguous")
+            return None
         latest_height = max(
             _integer(
                 _document(commit["payload"], "authoritative commit").get(
@@ -2728,7 +3096,7 @@ class FocusedRawEvidenceSource:
             "block_hash": _digest(payload.get("block_hash"), "commit hash"),
             "parent_hash": payload.get("parent_hash"),
             "transaction_count": _integer(
-                payload.get("transaction_count"), "commit transactions", 1
+                payload.get("transaction_count"), "commit transactions", 0
             ),
             "commit_batch_index": _integer(
                 payload.get("commit_batch_index"), "commit batch index"
@@ -3123,6 +3491,8 @@ class FocusedRawEvidenceSource:
             return self._common_commit(events, 1)
         if name == "containment":
             commit = self._common_commit(events, 1)
+            if commit is None:
+                return None
             stable_duration_ns = (
                 _integer(
                     _document(self._profile.raw["timers"], "profile timers").get(
@@ -3183,14 +3553,10 @@ class FocusedRawEvidenceSource:
         if name == "activations2":
             return self._transition(events, 2, activation=True)
         if name == "commit2":
-            try:
-                return self._common_commit(events, 2)
-            except FocusedCrashPairRuntimeError:
-                return None
+            return self._common_commit(events, 2)
         if name == "late":
-            try:
-                final = self._common_commit(events, 2 if self._arm == "A" else 1)
-            except FocusedCrashPairRuntimeError:
+            final = self._common_commit(events, 2 if self._arm == "A" else 1)
+            if final is None:
                 return None
             stable_duration_ns = (
                 _integer(
