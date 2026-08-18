@@ -175,6 +175,13 @@ def _integer(value: object, label: str, minimum: int = 0) -> int:
     return value
 
 
+def _uint64(value: object, label: str, minimum: int = 0) -> int:
+    result = _integer(value, label, minimum)
+    if result > (1 << 64) - 1:
+        _error(f"{label} exceeds uint64")
+    return result
+
+
 def _digest(value: object, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -551,7 +558,21 @@ def _fcrash_h_postfault_progress(
     expected_source = f"replica-{observer}"
     expected_instance = _authoritative_lifecycle_instance(events, expected_source)
     expected_digest = str(contract["epoch_zero_digest"])
+    transactions_per_block = _integer(
+        contract.get("transactions_per_block"), "transactions per block", 1
+    )
     members = tuple(int(member) for member in contract["members"])
+    member_sources = {f"replica-{member}" for member in members}
+    if any(
+        event["source_kind"] == "replica"
+        and event["source_id"] in member_sources
+        and event["event_type"] == "adaptive.configuration_active"
+        and prefault_ns
+        <= _integer(event["source_monotonic_ns"], "configuration timestamp")
+        <= fault_ns
+        for event in events
+    ):
+        _error("configuration changed during the atomic fault batch")
     start_events = [
         event
         for event in events
@@ -564,6 +585,23 @@ def _fcrash_h_postfault_progress(
     ]
     if not start_events:
         _error("sealed authoritative progress lacks a pre-fault configuration")
+    historical_configurations = sorted(
+        start_events,
+        key=lambda event: (
+            _integer(event["source_sequence"], "configuration sequence", 1),
+            _integer(event["source_monotonic_ns"], "configuration timestamp"),
+        ),
+    )
+    for position, event in enumerate(historical_configurations):
+        payload = _mapping(event["payload"], "pre-fault configuration")
+        epoch = _integer(payload.get("epoch_number"), "configuration epoch")
+        tree = _integer(payload.get("tree_id"), "configuration tree")
+        if (
+            epoch != 0
+            or payload.get("epoch_digest") != expected_digest
+            or tree != members[position % len(members)]
+        ):
+            _error("sealed authoritative progress historical configuration drifted")
     start = max(
         start_events,
         key=lambda event: (
@@ -574,7 +612,7 @@ def _fcrash_h_postfault_progress(
     start_payload = _mapping(start["payload"], "pre-fault configuration")
     starting_tree = _integer(start_payload.get("tree_id"), "starting tree")
     if (
-        start_payload.get("epoch_number") != 0
+        _integer(start_payload.get("epoch_number"), "starting epoch") != 0
         or start_payload.get("epoch_digest") != expected_digest
         or starting_tree != int(coverage["active_tree_id"])
     ):
@@ -603,7 +641,7 @@ def _fcrash_h_postfault_progress(
         payload = _mapping(event["payload"], "post-fault configuration")
         tree = _integer(payload.get("tree_id"), "activated tree")
         if (
-            payload.get("epoch_number") != 0
+            _integer(payload.get("epoch_number"), "activated epoch") != 0
             or payload.get("epoch_digest") != expected_digest
             or tree != members[(members.index(starting_tree) + position) % len(members)]
         ):
@@ -611,15 +649,16 @@ def _fcrash_h_postfault_progress(
         observed_trees.append(tree)
     if len(observed_trees) < required_positions:
         _error("FCRASH-H post-fault tree positions are incomplete")
-    # Commit proofs may lag the current configuration by one tree while the
-    # pipeline drains.  They must nevertheless be causally bound to either
-    # the configuration active at the commit or its immediately preceding one.
     configurations = [
         (
-            _integer(start["source_sequence"], "configuration sequence", 1),
-            _integer(start["source_monotonic_ns"], "configuration timestamp"),
-            starting_tree,
+            _integer(event["source_sequence"], "configuration sequence", 1),
+            _integer(event["source_monotonic_ns"], "configuration timestamp"),
+            _integer(
+                _mapping(event["payload"], "pre-fault configuration").get("tree_id"),
+                "configuration tree",
+            ),
         )
+        for event in historical_configurations
     ] + [
         (
             _integer(event["source_sequence"], "configuration sequence", 1),
@@ -653,17 +692,26 @@ def _fcrash_h_postfault_progress(
             "view_generation",
         }:
             _error("sealed authoritative progress commit schema drifted")
+        if set(proof) != {
+            "epoch_number",
+            "tree_id",
+            "epoch_digest",
+            "block_hash",
+        }:
+            _error("sealed authoritative progress proof schema drifted")
         block_hash = _digest(payload.get("block_hash"), "progress commit hash")
         proof_tree = _integer(proof.get("tree_id"), "progress proof tree")
+        proof_epoch = _integer(proof.get("epoch_number"), "progress proof epoch")
+        _uint64(payload.get("commit_batch_index"), "progress commit batch index")
+        view_generation = _uint64(
+            payload.get("view_generation"), "progress view generation", 1
+        )
         if (
             payload.get("designated_observer") is not True
-            or payload.get("commit_batch_index") != 0
-            or payload.get("view_generation") != 1
-            or _integer(payload.get("transaction_count"), "progress transactions", 1)
-            % 5
-            != 0
+            or _uint64(payload.get("transaction_count"), "progress transactions")
+            not in {0, transactions_per_block}
             or proof.get("block_hash") != block_hash
-            or proof.get("epoch_number") != 0
+            or proof_epoch != 0
             or proof.get("epoch_digest") != expected_digest
         ):
             _error("sealed authoritative progress commit invariants drifted")
@@ -671,18 +719,13 @@ def _fcrash_h_postfault_progress(
             _integer(event["source_sequence"], "progress source sequence", 1),
             timestamp,
         )
-        active_index = max(
-            (
-                index
-                for index, row in enumerate(configurations)
-                if row[:2] <= commit_key
-            ),
-            default=-1,
-        )
-        if active_index < 0 or proof_tree not in {
-            configurations[active_index][2],
-            *([configurations[active_index - 1][2]] if active_index else []),
-        }:
+        if view_generation > len(configurations):
+            _error("sealed authoritative progress commit generation is not activated")
+        generation_configuration = configurations[view_generation - 1]
+        if (
+            generation_configuration[:2] > commit_key
+            or generation_configuration[2] != proof_tree
+        ):
             _error("sealed authoritative progress commit is not causally activated")
     return {
         "required_tree_positions": required_positions,
@@ -1894,8 +1937,21 @@ def _commit_reconstruction(
         block_hash = _digest(payload.get("block_hash"), "commit hash")
         if is_v3:
             _digest(payload.get("parent_hash"), "commit parent hash")
-        transactions = _integer(payload.get("transaction_count"), "transactions", 1)
+        transactions = _uint64(payload.get("transaction_count"), "transactions")
+        commit_batch_index = _uint64(
+            payload.get("commit_batch_index"), "commit batch index"
+        )
+        view_generation = _uint64(
+            payload.get("view_generation"), "commit view generation", 1
+        )
         proof = _mapping(payload.get("decision_proof"), "decision proof")
+        if set(proof) != {
+            "epoch_number",
+            "tree_id",
+            "epoch_digest",
+            "block_hash",
+        }:
+            _error("authoritative commit decision proof schema drifted")
         sequence = _integer(event["source_sequence"], "commit source sequence", 1)
         if (
             (is_v3 and prior_sequence is not None and sequence <= prior_sequence)
@@ -1904,10 +1960,14 @@ def _commit_reconstruction(
                 and (height != prior_height + 1 if is_v3 else height <= prior_height)
             )
             or (prior_hash is not None and payload.get("parent_hash") != prior_hash)
-            or payload.get("commit_batch_index") != 0
             or payload.get("designated_observer") is not True
-            or payload.get("view_generation") != 1
-            or transactions % 5 != 0
+            or (not is_v3 and commit_batch_index != 0)
+            or (not is_v3 and view_generation != 1)
+            or (
+                transactions not in {0, int(contract["transactions_per_block"])}
+                if is_v3
+                else transactions % 5 != 0
+            )
             or proof.get("block_hash") != block_hash
         ):
             _error("authoritative commit chain or workload identity drifted")
@@ -1933,17 +1993,18 @@ def _commit_reconstruction(
                 _integer(event["source_monotonic_ns"], "commit timestamp"),
             )
             timeline = configurations_by_epoch[expected_epoch]
-            active_index = max(
-                (index for index, row in enumerate(timeline) if row[0] <= commit_key),
-                default=-1,
-            )
-            if active_index < 0 or tree not in {
-                timeline[active_index][1],
-                *([timeline[active_index - 1][1]] if active_index else []),
-            }:
-                _error(
-                    "authoritative commit is not bound to an active or draining tree"
-                )
+            generation_base = (expected_epoch << 32) + 1
+            if view_generation < generation_base:
+                _error("authoritative commit generation is not activated")
+            rotation_ordinal = view_generation - generation_base
+            if rotation_ordinal >= len(timeline):
+                _error("authoritative commit generation is not activated")
+            generation_configuration = timeline[rotation_ordinal]
+            if (
+                generation_configuration[0] > commit_key
+                or generation_configuration[1] != tree
+            ):
+                _error("authoritative commit is not bound to its active generation")
         prior_epoch = expected_epoch
         prior_hash = block_hash
         prior_height = height

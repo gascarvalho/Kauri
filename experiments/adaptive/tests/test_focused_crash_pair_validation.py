@@ -11,6 +11,7 @@ import inspect
 import json
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import pytest
@@ -781,18 +782,30 @@ def _v3_progress_events(contract: Mapping[str, object]) -> list[dict[str, object
             "source_id": source_id,
             "source_instance": instance,
             "source_sequence": 3 + position,
-            "source_monotonic_ns": 90 if position == 0 else 100 + position,
+            "source_monotonic_ns": 88 + position,
             "event_type": "adaptive.configuration_active",
             "payload": {
                 "epoch_number": 0,
-                "tree_id": members[
-                    (members.index(starting_tree) + position) % len(members)
-                ],
+                "tree_id": members[position % len(members)],
                 "epoch_digest": digest,
             },
         }
-        for position in range(6)
+        for position in range(len(members))
     ]
+    configurations.extend(
+        {
+            **configuration,
+            "source_sequence": 3 + len(members) + position,
+            "source_monotonic_ns": 101 + position,
+            "payload": {
+                **configuration["payload"],
+                "tree_id": members[
+                    (members.index(starting_tree) + position + 1) % len(members)
+                ],
+            },
+        }
+        for position, configuration in enumerate(configurations[:5])
+    )
     commits = [
         {
             "event_schema_version": 1,
@@ -800,22 +813,22 @@ def _v3_progress_events(contract: Mapping[str, object]) -> list[dict[str, object
             "source_kind": "replica",
             "source_id": source_id,
             "source_instance": instance,
-            "source_sequence": index + 10,
+            "source_sequence": index + 16,
             "source_monotonic_ns": 120 + index,
             "event_type": "block.committed",
             "payload": {
                 "block_height": index + 1,
                 "block_hash": f"{index + 1:064x}",
                 "parent_hash": "00" * 32 if index == 0 else f"{index:064x}",
-                "transaction_count": 1000,
-                "commit_batch_index": 0,
+                "transaction_count": 0 if index % 2 == 0 else 1000,
+                "commit_batch_index": index % 3,
                 "designated_observer": True,
-                "view_generation": 1,
+                "view_generation": 6 if index == 0 else 12 if index == 1 else 5,
                 "decision_proof": {
                     "epoch_number": 0,
                     "epoch_digest": digest,
                     "block_hash": f"{index + 1:064x}",
-                    "tree_id": 4,
+                    "tree_id": 5 if index == 0 else 4,
                 },
             },
         }
@@ -844,7 +857,7 @@ def test_v3_progress_witness_is_recomputed_from_exact_authoritative_commits(
     }
 
 
-def test_v3_progress_ignores_configuration_after_signal_request(
+def test_v3_sealed_progress_rejects_configuration_after_signal_request(
     tmp_path: Path,
 ) -> None:
     validation = _validation()
@@ -854,10 +867,47 @@ def test_v3_progress_ignores_configuration_after_signal_request(
     between_request_and_confirmation["source_sequence"] = 4
     between_request_and_confirmation["source_monotonic_ns"] = 99
     events.append(between_request_and_confirmation)
-    progress = validation._fcrash_h_postfault_progress(
-        contract, events, fault_ns=100, prefault_ns=95, audit_ns=200
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="fault batch"):
+        validation._fcrash_h_postfault_progress(
+            contract, events, fault_ns=100, prefault_ns=95, audit_ns=200
+        )
+
+
+@pytest.mark.parametrize(
+    ("boundary_ns", "foreign_source"),
+    ((100, False), (110, False), (105, True)),
+)
+def test_v3_sealed_progress_rejects_any_member_configuration_in_fault_batch(
+    boundary_ns: int,
+    foreign_source: bool,
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    contract = _v3_progress_contract(tmp_path)
+    events = _v3_progress_events(contract)
+    postfault = [
+        event
+        for event in events
+        if event["event_type"] == "adaptive.configuration_active"
+        and event["source_monotonic_ns"] > 100
+    ]
+    for position, event in enumerate(postfault, start=1):
+        event["source_monotonic_ns"] = 110 + position
+    injected = deepcopy(postfault[0])
+    if foreign_source:
+        injected["source_id"] = "replica-0"
+        injected["source_instance"] = "v3-progress-run-replica-0-foreign-uuid"
+    injected.update(
+        {
+            "source_sequence": 1,
+            "source_monotonic_ns": boundary_ns,
+        }
     )
-    assert progress["starting_tree_id"] == 6
+    events.append(injected)
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="fault batch"):
+        validation._fcrash_h_postfault_progress(
+            contract, events, fault_ns=110, prefault_ns=100, audit_ns=200
+        )
 
 
 @pytest.mark.parametrize(
@@ -871,7 +921,25 @@ def test_v3_progress_ignores_configuration_after_signal_request(
         "multiple-lifecycle-instances",
         "wrong-proof-hash",
         "wrong-proof-tree",
+        "extra-proof-key",
+        "proof-epoch-bool",
+        "historical-config-epoch-bool",
+        "historical-config-tree-bool",
         "out-of-order",
+        "view-generation-zero",
+        "view-generation-noninteger",
+        "view-generation-overflow",
+        "view-generation-future",
+        "view-generation-wrong-epoch-packed",
+        "view-generation-wrong-existing",
+        "activation-after-commit",
+        "batch-negative",
+        "batch-noninteger",
+        "batch-overflow",
+        "transactions-negative",
+        "transactions-noninteger",
+        "transactions-overflow",
+        "transactions-unexpected-workload",
     ),
 )
 def test_v3_progress_witness_rejects_non_authoritative_or_insufficient_raw_commits(
@@ -896,9 +964,75 @@ def test_v3_progress_witness_rejects_non_authoritative_or_insufficient_raw_commi
     elif mutation == "wrong-proof-hash":
         target["payload"]["decision_proof"]["block_hash"] = "ff" * 32  # type: ignore[index]
     elif mutation == "wrong-proof-tree":
-        target["payload"]["decision_proof"]["tree_id"] = 1  # type: ignore[index]
+        target["payload"]["decision_proof"]["tree_id"] = 99  # type: ignore[index]
+    elif mutation == "extra-proof-key":
+        target["payload"]["decision_proof"]["extra"] = True  # type: ignore[index]
+    elif mutation == "proof-epoch-bool":
+        target["payload"]["decision_proof"]["epoch_number"] = False  # type: ignore[index]
+    elif mutation == "historical-config-epoch-bool":
+        next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive.configuration_active"
+            and event["source_monotonic_ns"] < 100
+        )["payload"][
+            "epoch_number"
+        ] = False  # type: ignore[index]
+    elif mutation == "historical-config-tree-bool":
+        next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive.configuration_active"
+            and event["source_monotonic_ns"] < 100
+        )["payload"][
+            "tree_id"
+        ] = False  # type: ignore[index]
     elif mutation == "out-of-order":
         target["source_sequence"] = 1
+    else:
+        payload = target["payload"]
+        if mutation == "view-generation-zero":
+            payload["view_generation"] = 0
+        elif mutation == "view-generation-noninteger":
+            payload["view_generation"] = "132"
+        elif mutation == "view-generation-overflow":
+            payload["view_generation"] = 1 << 64
+        elif mutation == "view-generation-future":
+            payload["view_generation"] = 13
+        elif mutation == "view-generation-wrong-epoch-packed":
+            payload["view_generation"] = (1 << 32) + 1
+        elif mutation == "view-generation-wrong-existing":
+            payload["view_generation"] = 6
+        elif mutation == "activation-after-commit":
+            target = next(
+                event
+                for event in events
+                if event["event_type"] == "block.committed"
+                and event["payload"]["view_generation"] == 12
+            )
+            activation = next(
+                event
+                for event in events
+                if event["event_type"] == "adaptive.configuration_active"
+                and event["payload"]["tree_id"] == 4
+                and event["source_sequence"] == 14
+            )
+            activation["source_sequence"] = int(target["source_sequence"]) + 1
+            activation["source_monotonic_ns"] = int(target["source_monotonic_ns"]) + 1
+        elif mutation == "batch-negative":
+            payload["commit_batch_index"] = -1
+        elif mutation == "batch-noninteger":
+            payload["commit_batch_index"] = "2"
+        elif mutation == "batch-overflow":
+            payload["commit_batch_index"] = 1 << 64
+        elif mutation == "transactions-negative":
+            payload["transaction_count"] = -1
+        elif mutation == "transactions-noninteger":
+            payload["transaction_count"] = "1000"
+        elif mutation == "transactions-overflow":
+            payload["transaction_count"] = 1 << 64
+        else:
+            payload["transaction_count"] = 5
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation._fcrash_h_postfault_progress(
             contract, events, fault_ns=100, prefault_ns=100, audit_ns=200
@@ -911,9 +1045,19 @@ def test_v3_progress_witness_rejects_duplicate_cyclic_configuration(
     validation = _validation()
     contract = _v3_progress_contract(tmp_path)
     events = _v3_progress_events(contract)
-    duplicate = deepcopy(events[7])
-    duplicate["source_sequence"] = 22
-    duplicate["source_monotonic_ns"] = 110
+    duplicate = deepcopy(
+        next(
+            event
+            for event in reversed(events)
+            if event["event_type"] == "adaptive.configuration_active"
+        )
+    )
+    duplicate["source_sequence"] = (
+        max(int(event["source_sequence"]) for event in events) + 1
+    )
+    duplicate["source_monotonic_ns"] = (
+        max(int(event["source_monotonic_ns"]) for event in events) + 1
+    )
     events.append(duplicate)
     with pytest.raises(validation.FocusedCrashPairValidationError, match="cyclic"):
         validation._fcrash_h_postfault_progress(
@@ -2555,6 +2699,92 @@ def _fcrash_h_v2_child(child: dict[str, object]) -> Path:
     return directory
 
 
+def _add_same_predecessor_acceptance_relative_to_audit(
+    directory: Path,
+    *,
+    placement: str,
+) -> None:
+    """Add one well-formed cutoff+1 acceptance without changing its audit."""
+
+    assert placement in {"after", "before", "at"}
+    events = _load_events(directory)
+    audit = next(
+        event
+        for event in events
+        if event["source_kind"] == "adaptation_manager"
+        and event["event_type"] == "adaptive_v2_evidence_snapshot"
+        and event["payload"]["predecessor_epoch_number"] == 0
+    )
+    accepted = next(
+        event
+        for event in events
+        if event["source_kind"] == "adaptation_manager"
+        and event["event_type"] == "evidence.observation_accepted"
+        and event["payload"]["observation"]["configuration"]["epoch_number"] == 0
+    )
+    manager = [
+        event for event in events if event["source_kind"] == "adaptation_manager"
+    ]
+    audit_sequence = int(audit["source_sequence"])
+    audit_timestamp = int(audit["source_monotonic_ns"])
+    extra = deepcopy(accepted)
+    payload = extra["payload"]
+    observation = payload["observation"]
+    configuration = observation["configuration"]
+    cutoff = int(audit["payload"]["current_cutoff"])
+    reporter = int(observation["reporter_id"])
+    observation["block_hash"] = hashlib.sha256(
+        f"post-audit-{placement}-{cutoff}".encode("ascii")
+    ).hexdigest()
+    observation["reporter_sequence"] = 1 + max(
+        int(candidate["payload"]["observation"]["reporter_sequence"])
+        for candidate in manager
+        if candidate["event_type"] == "evidence.observation_accepted"
+        and int(candidate["payload"]["observation"]["reporter_id"]) == reporter
+    )
+    observation["reporter_monotonic_ns"] = 1 + max(
+        int(candidate["payload"]["observation"]["reporter_monotonic_ns"])
+        for candidate in manager
+        if candidate["event_type"] == "evidence.observation_accepted"
+        and int(candidate["payload"]["observation"]["reporter_id"]) == reporter
+    )
+    observation["observation_id"] = native_fixture._observation_id(
+        reporter_id=reporter,
+        observed_replica_id=int(observation["observed_replica_id"]),
+        epoch_number=int(configuration["epoch_number"]),
+        tree_id=int(configuration["tree_id"]),
+        block_hash=str(observation["block_hash"]),
+        epoch_digest=str(configuration["epoch_digest"]),
+    )
+    payload["ingestion_sequence"] = cutoff + 1
+    if placement == "after":
+        extra["source_sequence"] = 1 + max(
+            int(event["source_sequence"]) for event in manager
+        )
+        extra["source_monotonic_ns"] = 1 + max(
+            int(event["source_monotonic_ns"]) for event in manager
+        )
+    else:
+        for event in manager:
+            if int(event["source_sequence"]) >= audit_sequence:
+                event["source_sequence"] = int(event["source_sequence"]) + 1
+        extra["source_sequence"] = audit_sequence
+        extra["source_monotonic_ns"] = (
+            audit_timestamp - 1 if placement == "before" else audit_timestamp
+        )
+    events.append(extra)
+    events.sort(
+        key=lambda event: (
+            str(event["source_kind"]),
+            str(event["source_id"]),
+            str(event["source_instance"]),
+            int(event["source_sequence"]),
+        )
+    )
+    _write_events(directory, events)
+    _reseal(directory)
+
+
 def test_sealed_n31_v2_fcrash_h_native_fixture_passes(
     tmp_path: Path,
 ) -> None:
@@ -2569,6 +2799,98 @@ def test_sealed_n31_v2_fcrash_h_native_fixture_passes(
         )["verdict"]
         == "PASS"
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), (("commit_batch_index", 1), ("view_generation", 2))
+)
+def test_sealed_n31_v2_rejects_noncanonical_legacy_commit_scalars(
+    field: str, value: int, tmp_path: Path
+) -> None:
+    validation = _validation()
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    events = _load_events(directory)
+    next(event for event in events if event["event_type"] == "block.committed")[
+        "payload"
+    ][field] = value
+    _write_events(directory, events)
+    _reseal(directory)
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation.validate_sealed_arm(
+            directory, trusted_provenance=_trusted_provenance(directory)
+        )
+
+
+def test_native_audit_replay_ignores_later_same_predecessor_acceptance(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    _add_same_predecessor_acceptance_relative_to_audit(directory, placement="after")
+    assert _raw_source(directory).poll("nonresponse") is not None
+    assert (
+        _validation().validate_sealed_arm(
+            directory, trusted_provenance=_trusted_provenance(directory)
+        )["verdict"]
+        == "PASS"
+    )
+
+
+def test_native_audit_replay_rejects_corrupted_later_acceptance(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    _add_same_predecessor_acceptance_relative_to_audit(directory, placement="after")
+    events = _load_events(directory)
+    extra = max(
+        (
+            event
+            for event in events
+            if event["source_kind"] == "adaptation_manager"
+            and event["event_type"] == "evidence.observation_accepted"
+            and event["payload"]["observation"]["configuration"]["epoch_number"] == 0
+        ),
+        key=lambda event: int(event["source_sequence"]),
+    )
+    extra["payload"]["observation"]["observation_id"] = "0" * 64
+    _write_events(directory, events)
+    _reseal(directory)
+    with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
+        _raw_source(directory).poll("nonresponse")
+    with pytest.raises(_validation().FocusedCrashPairValidationError):
+        _validation().validate_sealed_arm(
+            directory, trusted_provenance=_trusted_provenance(directory)
+        )
+
+
+@pytest.mark.parametrize("placement", ("before", "at"))
+def test_native_audit_replay_rejects_cutoff_plus_one_acceptance_in_prefix(
+    placement: str,
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    directory = _fcrash_h_v2_child(child)
+    _add_same_predecessor_acceptance_relative_to_audit(directory, placement=placement)
+    with pytest.raises(runtime_fixture._runtime().FocusedCrashPairRuntimeError):
+        _raw_source(directory).poll("nonresponse")
+    with pytest.raises(_validation().FocusedCrashPairValidationError):
+        _validation().validate_sealed_arm(
+            directory, trusted_provenance=_trusted_provenance(directory)
+        )
 
 
 def test_raw_n31_v2_nonresponse_and_epoch1_share_the_native_audit(
@@ -2937,6 +3259,161 @@ def test_commit_reconstruction_uses_profile_windows_and_fault_lifetime(
                 directory,
                 trusted_provenance=trusted,
             )
+
+
+def _v3_epoch_packed_commit_fixture(
+    tmp_path: Path,
+) -> tuple[Path, list[dict[str, object]], object, object, dict[str, object]]:
+    """Small direct v3 replay with exact Epoch 1/2 packed generations."""
+
+    root = tmp_path / "reconstruction"
+    _write_json(root / "derived" / "phase-windows.json", {"phases": []})
+    e0_digest, e1_digest, e2_digest = ("0" * 64, "1" * 64, "2" * 64)
+    e1 = SimpleNamespace(
+        epoch_digest=e1_digest,
+        trees=(SimpleNamespace(tree_id=0), SimpleNamespace(tree_id=1)),
+    )
+    e2 = SimpleNamespace(
+        epoch_digest=e2_digest,
+        trees=(SimpleNamespace(tree_id=0), SimpleNamespace(tree_id=1)),
+    )
+    run_id = "packed-generation-run"
+    instance = f"{run_id}-replica-0-uuid"
+    events: list[dict[str, object]] = [
+        {
+            "source_kind": "replica",
+            "source_id": "replica-0",
+            "source_instance": instance,
+            "source_sequence": sequence,
+            "source_monotonic_ns": sequence,
+            "event_type": event_type,
+            "payload": {},
+        }
+        for sequence, event_type in ((1, "process.started"), (2, "process.ready"))
+    ]
+    configurations = (
+        (0, 0, e0_digest),
+        (1, 0, e1_digest),
+        (1, 1, e1_digest),
+        (2, 0, e2_digest),
+        (2, 1, e2_digest),
+    )
+    for sequence, (epoch, tree, digest) in enumerate(configurations, start=3):
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": "replica-0",
+                "source_instance": instance,
+                "source_sequence": sequence,
+                "source_monotonic_ns": sequence,
+                "event_type": "adaptive.configuration_active",
+                "payload": {
+                    "epoch_number": epoch,
+                    "tree_id": tree,
+                    "epoch_digest": digest,
+                },
+            }
+        )
+    commits = (
+        (0, 0, 1),
+        (1, 0, (1 << 32) + 1),
+        (1, 1, (1 << 32) + 2),
+        (2, 0, (2 << 32) + 1),
+    )
+    for height, (epoch, tree, generation) in enumerate(commits, start=1):
+        block_hash = f"{height:064x}"
+        payload = {
+            "block_height": height,
+            "block_hash": block_hash,
+            "parent_hash": "0" * 64 if height == 1 else f"{height - 1:064x}",
+            "transaction_count": 1000,
+            "commit_batch_index": 0,
+            "designated_observer": True,
+            "view_generation": generation,
+            "decision_proof": {
+                "epoch_number": epoch,
+                "epoch_digest": (e0_digest, e1_digest, e2_digest)[epoch],
+                "block_hash": block_hash,
+                "tree_id": tree,
+            },
+        }
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": "replica-0",
+                "source_instance": instance,
+                "source_sequence": height + 7,
+                "source_monotonic_ns": height + 7,
+                "event_type": "block.committed",
+                "payload": payload,
+            }
+        )
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": "replica-0",
+                "source_instance": instance,
+                "source_sequence": height + 20,
+                "source_monotonic_ns": height + 20,
+                "event_type": "block.commit_observed",
+                "payload": {
+                    key: payload[key]
+                    for key in (
+                        "block_height",
+                        "block_hash",
+                        "parent_hash",
+                        "transaction_count",
+                        "commit_batch_index",
+                    )
+                },
+            }
+        )
+    contract = {
+        "authoritative_source_id": "replica-0",
+        "profile": {"profile_id": "n7-f2-q5-two-crash-pair-smoke-v3"},
+        "members": (0, 1),
+        "survivors": (0,),
+        "quorum": 1,
+        "epoch_zero_digest": e0_digest,
+        "transactions_per_block": 1000,
+        "phase_names": ("baseline",),
+        "bucket_width_seconds": 1,
+    }
+    return root, events, e1, e2, contract
+
+
+def test_v3_commit_reconstruction_accepts_epoch_packed_rotations(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    root, events, epoch1, epoch2, contract = _v3_epoch_packed_commit_fixture(tmp_path)
+    commits, _measurements = validation._commit_reconstruction(
+        root, events, epoch1, epoch2, contract
+    )
+    assert len(commits) == 4
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("wrong-epoch", "future-rotation", "tree-generation-mismatch", "extra-proof-key"),
+)
+def test_v3_commit_reconstruction_rejects_epoch_packed_generation_drift(
+    mutation: str, tmp_path: Path
+) -> None:
+    validation = _validation()
+    root, events, epoch1, epoch2, contract = _v3_epoch_packed_commit_fixture(tmp_path)
+    commits = [event for event in events if event["event_type"] == "block.committed"]
+    epoch1_commit = commits[1]
+    if mutation == "wrong-epoch":
+        epoch1_commit["payload"]["view_generation"] = (2 << 32) + 1
+    elif mutation == "future-rotation":
+        epoch1_commit["payload"]["view_generation"] = (1 << 32) + 3
+    elif mutation == "extra-proof-key":
+        epoch1_commit["payload"]["decision_proof"]["extra"] = True
+    else:
+        commits[2]["payload"]["view_generation"] = (1 << 32) + 1
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._commit_reconstruction(root, events, epoch1, epoch2, contract)
 
 
 def test_commit_reconstruction_accepts_all_unique_authoritative_commits(

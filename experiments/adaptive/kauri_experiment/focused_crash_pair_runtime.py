@@ -175,6 +175,13 @@ def _integer(value: object, label: str, minimum: int = 0) -> int:
     return value
 
 
+def _uint64(value: object, label: str, minimum: int = 0) -> int:
+    result = _integer(value, label, minimum)
+    if result > (1 << 64) - 1:
+        _error(f"{label} exceeds uint64")
+    return result
+
+
 def _digest(value: object, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -2395,6 +2402,24 @@ class FocusedRawEvidenceSource:
         expected_digest = _document(
             self._profile.raw.get("topology"), "profile topology"
         ).get("epoch_zero_digest")
+        transactions_per_block = _integer(
+            _document(self._profile.raw.get("protocol"), "profile protocol").get(
+                "transactions_per_block"
+            ),
+            "profile transactions per block",
+            1,
+        )
+        member_sources = {f"replica-{member}" for member in self._profile.replica_ids}
+        if any(
+            event.get("source_kind") == "replica"
+            and event.get("source_id") in member_sources
+            and event.get("event_type") == "adaptive.configuration_active"
+            and prefault_ns
+            <= _integer(event.get("source_monotonic_ns"), "configuration timestamp")
+            <= fault_ns
+            for event in events
+        ):
+            _error("configuration changed during the atomic fault batch")
         start_events = [
             event
             for event in events
@@ -2407,6 +2432,24 @@ class FocusedRawEvidenceSource:
         ]
         if not start_events:
             _error("raw authoritative progress lacks a pre-fault configuration")
+        historical_configurations = sorted(
+            start_events,
+            key=lambda event: (
+                _integer(event.get("source_sequence"), "configuration sequence", 1),
+                _integer(event.get("source_monotonic_ns"), "configuration timestamp"),
+            ),
+        )
+        for position, event in enumerate(historical_configurations):
+            payload = _document(event.get("payload"), "pre-fault configuration")
+            epoch = _integer(payload.get("epoch_number"), "configuration epoch")
+            tree = _integer(payload.get("tree_id"), "configuration tree")
+            if (
+                epoch != 0
+                or payload.get("epoch_digest") != expected_digest
+                or tree
+                != self._profile.replica_ids[position % len(self._profile.replica_ids)]
+            ):
+                _error("raw authoritative progress historical configuration drifted")
         start = max(
             start_events,
             key=lambda event: (
@@ -2417,7 +2460,7 @@ class FocusedRawEvidenceSource:
         start_payload = _document(start.get("payload"), "pre-fault configuration")
         starting_tree = _integer(start_payload.get("tree_id"), "starting tree")
         if (
-            start_payload.get("epoch_number") != 0
+            _integer(start_payload.get("epoch_number"), "starting epoch") != 0
             or start_payload.get("epoch_digest") != expected_digest
             or starting_tree
             != _integer(
@@ -2450,7 +2493,7 @@ class FocusedRawEvidenceSource:
             payload = _document(event.get("payload"), "post-fault configuration")
             tree = _integer(payload.get("tree_id"), "activated tree")
             if (
-                payload.get("epoch_number") != 0
+                _integer(payload.get("epoch_number"), "activated epoch") != 0
                 or payload.get("epoch_digest") != expected_digest
                 or tree
                 != members[(members.index(starting_tree) + position) % len(members)]
@@ -2461,10 +2504,16 @@ class FocusedRawEvidenceSource:
             return None
         configurations = [
             (
-                _integer(start.get("source_sequence"), "configuration sequence", 1),
-                _integer(start.get("source_monotonic_ns"), "configuration timestamp"),
-                starting_tree,
+                _integer(event.get("source_sequence"), "configuration sequence", 1),
+                _integer(event.get("source_monotonic_ns"), "configuration timestamp"),
+                _integer(
+                    _document(event.get("payload"), "pre-fault configuration").get(
+                        "tree_id"
+                    ),
+                    "configuration tree",
+                ),
             )
+            for event in historical_configurations
         ] + [
             (
                 _integer(event.get("source_sequence"), "configuration sequence", 1),
@@ -2500,19 +2549,26 @@ class FocusedRawEvidenceSource:
                 "view_generation",
             }:
                 _error("raw authoritative progress commit schema drifted")
+            if set(proof) != {
+                "epoch_number",
+                "tree_id",
+                "epoch_digest",
+                "block_hash",
+            }:
+                _error("raw authoritative progress proof schema drifted")
             block_hash = _digest(payload.get("block_hash"), "progress commit hash")
             proof_tree = _integer(proof.get("tree_id"), "progress proof tree")
+            proof_epoch = _integer(proof.get("epoch_number"), "progress proof epoch")
+            _uint64(payload.get("commit_batch_index"), "progress commit batch index")
+            view_generation = _uint64(
+                payload.get("view_generation"), "progress view generation", 1
+            )
             if (
                 payload.get("designated_observer") is not True
-                or payload.get("commit_batch_index") != 0
-                or payload.get("view_generation") != 1
-                or _integer(
-                    payload.get("transaction_count"), "progress transactions", 1
-                )
-                % 5
-                != 0
+                or _uint64(payload.get("transaction_count"), "progress transactions")
+                not in {0, transactions_per_block}
                 or proof.get("block_hash") != block_hash
-                or proof.get("epoch_number") != 0
+                or proof_epoch != 0
                 or proof.get("epoch_digest") != expected_digest
             ):
                 _error("raw authoritative progress commit invariants drifted")
@@ -2520,18 +2576,13 @@ class FocusedRawEvidenceSource:
                 _integer(event.get("source_sequence"), "progress source sequence", 1),
                 timestamp,
             )
-            active_index = max(
-                (
-                    index
-                    for index, row in enumerate(configurations)
-                    if row[:2] <= commit_key
-                ),
-                default=-1,
-            )
-            if active_index < 0 or proof_tree not in {
-                configurations[active_index][2],
-                *([configurations[active_index - 1][2]] if active_index else []),
-            }:
+            if view_generation > len(configurations):
+                _error("raw authoritative progress commit generation is not activated")
+            generation_configuration = configurations[view_generation - 1]
+            if (
+                generation_configuration[:2] > commit_key
+                or generation_configuration[2] != proof_tree
+            ):
                 _error("raw authoritative progress commit is not causally activated")
         return {
             "required_tree_positions": required_count,

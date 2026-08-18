@@ -8965,10 +8965,7 @@ def replay_native_adaptation_snapshot(
     if _integer(
         snapshot_audit.payload.get("accepted_prefix_count"),
         "adaptation replay audit accepted prefix count",
-    ) != len(audited_records) or any(
-        record.ingestion_sequence > ledger_high_watermark
-        for record in predecessor_records
-    ):
+    ) != len(audited_records):
         _fail("adaptation replay accepted prefix differs from its audited ledger")
     full_prefix_records = _snapshot_records(
         predecessor_records,

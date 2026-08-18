@@ -535,18 +535,30 @@ def _v3_raw_progress_events(profile: object) -> list[dict[str, object]]:
             "source_id": source_id,
             "source_instance": instance,
             "source_sequence": 3 + position,
-            "source_monotonic_ns": 90 if position == 0 else 100 + position,
+            "source_monotonic_ns": 88 + position,
             "event_type": "adaptive.configuration_active",
             "payload": {
                 "epoch_number": 0,
-                "tree_id": members[
-                    (members.index(starting_tree) + position) % len(members)
-                ],
+                "tree_id": members[position % len(members)],
                 "epoch_digest": digest,
             },
         }
-        for position in range(6)
+        for position in range(len(members))
     ]
+    configurations.extend(
+        {
+            **configuration,
+            "source_sequence": 3 + len(members) + position,
+            "source_monotonic_ns": 101 + position,
+            "payload": {
+                **configuration["payload"],
+                "tree_id": members[
+                    (members.index(starting_tree) + position + 1) % len(members)
+                ],
+            },
+        }
+        for position, configuration in enumerate(configurations[:5])
+    )
     commits = [
         {
             "run_id": run_id,
@@ -554,21 +566,21 @@ def _v3_raw_progress_events(profile: object) -> list[dict[str, object]]:
             "source_id": source_id,
             "source_instance": instance,
             "event_type": "block.committed",
-            "source_sequence": index + 10,
+            "source_sequence": index + 16,
             "source_monotonic_ns": 120 + index,
             "payload": {
                 "block_height": index + 1,
                 "block_hash": f"{index + 1:064x}",
                 "parent_hash": "00" * 32 if index == 0 else f"{index:064x}",
-                "transaction_count": 1000,
-                "commit_batch_index": 0,
+                "transaction_count": 0 if index % 2 == 0 else 1000,
+                "commit_batch_index": index % 3,
                 "designated_observer": True,
-                "view_generation": 1,
+                "view_generation": 6 if index == 0 else 12 if index == 1 else 5,
                 "decision_proof": {
                     "epoch_number": 0,
                     "epoch_digest": digest,
                     "block_hash": f"{index + 1:064x}",
-                    "tree_id": 4,
+                    "tree_id": 5 if index == 0 else 4,
                 },
             },
         }
@@ -592,7 +604,7 @@ def test_v3_raw_progress_binds_native_uuid_lifecycle_instance() -> None:
     }
 
 
-def test_v3_raw_progress_ignores_configuration_after_signal_request() -> None:
+def test_v3_raw_progress_rejects_configuration_after_signal_request() -> None:
     runtime = _runtime()
     profile = _fcrash_h_profile(N7_PROFILE_V3)
     source = object.__new__(runtime.FocusedRawEvidenceSource)
@@ -602,11 +614,47 @@ def test_v3_raw_progress_ignores_configuration_after_signal_request() -> None:
     between_request_and_confirmation["source_sequence"] = 4
     between_request_and_confirmation["source_monotonic_ns"] = 99
     events.append(between_request_and_confirmation)
-    progress = source._postfault_authoritative_progress(
-        events, fault_ns=100, prefault_ns=95, audit_ns=200
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="fault batch"):
+        source._postfault_authoritative_progress(
+            events, fault_ns=100, prefault_ns=95, audit_ns=200
+        )
+
+
+@pytest.mark.parametrize(
+    ("boundary_ns", "foreign_source"),
+    ((100, False), (110, False), (105, True)),
+)
+def test_v3_raw_progress_rejects_any_member_configuration_in_fault_batch(
+    boundary_ns: int, foreign_source: bool
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    events = _v3_raw_progress_events(profile)
+    postfault = [
+        event
+        for event in events
+        if event["event_type"] == "adaptive.configuration_active"
+        and event["source_monotonic_ns"] > 100
+    ]
+    for position, event in enumerate(postfault, start=1):
+        event["source_monotonic_ns"] = 110 + position
+    injected = deepcopy(postfault[0])
+    if foreign_source:
+        injected["source_id"] = "replica-0"
+        injected["source_instance"] = "v3-progress-run-replica-0-foreign-uuid"
+    injected.update(
+        {
+            "source_sequence": 1,
+            "source_monotonic_ns": boundary_ns,
+        }
     )
-    assert progress is not None
-    assert progress["starting_tree_id"] == 6
+    events.append(injected)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="fault batch"):
+        source._postfault_authoritative_progress(
+            events, fault_ns=110, prefault_ns=100, audit_ns=200
+        )
 
 
 def test_prefault_tail_latch_rejects_rewrite_after_initial_drain(
@@ -1104,7 +1152,29 @@ def test_v3_raw_progress_rejects_unbound_or_mixed_lifecycle_instances(
 
 @pytest.mark.parametrize(
     "mutation",
-    ("wrong-proof-hash", "wrong-proof-tree", "out-of-order"),
+    (
+        "wrong-proof-hash",
+        "wrong-proof-tree",
+        "extra-proof-key",
+        "proof-epoch-bool",
+        "historical-config-epoch-bool",
+        "historical-config-tree-bool",
+        "out-of-order",
+        "view-generation-zero",
+        "view-generation-noninteger",
+        "view-generation-overflow",
+        "view-generation-future",
+        "view-generation-wrong-epoch-packed",
+        "view-generation-wrong-existing",
+        "activation-after-commit",
+        "batch-negative",
+        "batch-noninteger",
+        "batch-overflow",
+        "transactions-negative",
+        "transactions-noninteger",
+        "transactions-overflow",
+        "transactions-unexpected-workload",
+    ),
 )
 def test_v3_raw_progress_requires_one_consecutive_authoritative_commit_chain(
     mutation: str,
@@ -1118,9 +1188,71 @@ def test_v3_raw_progress_requires_one_consecutive_authoritative_commit_chain(
     if mutation == "wrong-proof-hash":
         target["payload"]["decision_proof"]["block_hash"] = "ff" * 32
     elif mutation == "wrong-proof-tree":
-        target["payload"]["decision_proof"]["tree_id"] = 1
+        target["payload"]["decision_proof"]["tree_id"] = 99
+    elif mutation == "extra-proof-key":
+        target["payload"]["decision_proof"]["extra"] = True
+    elif mutation == "proof-epoch-bool":
+        target["payload"]["decision_proof"]["epoch_number"] = False
+    elif mutation == "historical-config-epoch-bool":
+        next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive.configuration_active"
+            and event["source_monotonic_ns"] < 100
+        )["payload"]["epoch_number"] = False
+    elif mutation == "historical-config-tree-bool":
+        next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive.configuration_active"
+            and event["source_monotonic_ns"] < 100
+        )["payload"]["tree_id"] = False
     else:
-        target["source_sequence"] = 1
+        payload = target["payload"]
+        if mutation == "out-of-order":
+            target["source_sequence"] = 1
+        elif mutation == "view-generation-zero":
+            payload["view_generation"] = 0
+        elif mutation == "view-generation-noninteger":
+            payload["view_generation"] = "132"
+        elif mutation == "view-generation-overflow":
+            payload["view_generation"] = 1 << 64
+        elif mutation == "view-generation-future":
+            payload["view_generation"] = 13
+        elif mutation == "view-generation-wrong-epoch-packed":
+            payload["view_generation"] = (1 << 32) + 1
+        elif mutation == "view-generation-wrong-existing":
+            payload["view_generation"] = 6
+        elif mutation == "activation-after-commit":
+            target = next(
+                event
+                for event in events
+                if event["event_type"] == "block.committed"
+                and event["payload"]["view_generation"] == 12
+            )
+            activation = next(
+                event
+                for event in events
+                if event["event_type"] == "adaptive.configuration_active"
+                and event["payload"]["tree_id"] == 4
+                and event["source_sequence"] == 14
+            )
+            activation["source_sequence"] = int(target["source_sequence"]) + 1
+            activation["source_monotonic_ns"] = int(target["source_monotonic_ns"]) + 1
+        elif mutation == "batch-negative":
+            payload["commit_batch_index"] = -1
+        elif mutation == "batch-noninteger":
+            payload["commit_batch_index"] = "2"
+        elif mutation == "batch-overflow":
+            payload["commit_batch_index"] = 1 << 64
+        elif mutation == "transactions-negative":
+            payload["transaction_count"] = -1
+        elif mutation == "transactions-noninteger":
+            payload["transaction_count"] = "1000"
+        elif mutation == "transactions-overflow":
+            payload["transaction_count"] = 1 << 64
+        else:
+            payload["transaction_count"] = 5
     with pytest.raises(runtime.FocusedCrashPairRuntimeError):
         source._postfault_authoritative_progress(
             events, fault_ns=100, prefault_ns=100, audit_ns=200
