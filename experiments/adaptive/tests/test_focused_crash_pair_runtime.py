@@ -942,6 +942,168 @@ def test_prefault_tail_latch_rejects_rewrite_after_initial_drain(
         source.latch_prefault_active_configuration_barrier()
 
 
+def test_n31_baseline_cache_refreshes_only_the_incremental_prefault_barrier() -> None:
+    """Stable baseline replay is immutable; the barrier must remain live/raw."""
+
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V3)
+    active = {
+        "epoch_number": 0,
+        "tree_id": profile.raw["topology"]["active_tree_id"],
+        "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+    }
+    barrier = [
+        {"replica_id": replica, "configuration": dict(active)}
+        for replica in profile.replica_ids
+    ]
+    events: list[dict[str, object]] = []
+    for replica in profile.replica_ids:
+        for event_type in ("process.started", "process.ready"):
+            events.append(
+                {
+                    "source_kind": "replica",
+                    "source_id": f"replica-{replica}",
+                    "event_type": event_type,
+                    "payload": {},
+                }
+            )
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": f"replica-{replica}",
+                "event_type": "adaptive.configuration_active",
+                "payload": dict(active),
+            }
+        )
+    for event_type in ("process.started", "process.ready"):
+        events.append(
+            {
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "event_type": event_type,
+                "payload": {},
+            }
+        )
+    stable_seconds = int(profile.raw["timers"]["stable_phase_seconds"])
+    for timestamp in (1, stable_seconds * 1_000_000_000 + 1):
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": "replica-0",
+                "event_type": "block.committed",
+                "source_monotonic_ns": timestamp,
+                "payload": {"decision_proof": {"epoch_number": 0}},
+            }
+        )
+
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    source._process_records = ()
+    calls: list[str] = []
+    source._events = lambda: calls.append("events") or events
+    source._reject_post_fault_target_events = lambda _events: None
+    source.unexpected_exit_ids = lambda _events: ()
+    source.latch_prefault_active_configuration_barrier = (
+        lambda: calls.append("latch") or barrier
+    )
+
+    first = source.poll("baseline")
+    second = source.poll("baseline")
+
+    assert first is not None and second is not None
+    assert first["active_configuration_barrier"] == barrier
+    assert second["active_configuration_barrier"] == barrier
+    assert calls == ["events", "latch", "latch"]
+    assert not hasattr(source, "_baseline_stable_events")
+
+
+def test_n31_cached_baseline_waits_for_an_exact_live_barrier() -> None:
+    """A cached stable baseline must not accept tree zero or malformed latches."""
+
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V3)
+    active = {
+        "epoch_number": 0,
+        "tree_id": profile.raw["topology"]["active_tree_id"],
+        "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+    }
+    exact = [
+        {"replica_id": replica, "configuration": dict(active)}
+        for replica in profile.replica_ids
+    ]
+    tree_zero = deepcopy(exact)
+    tree_zero[0]["configuration"]["tree_id"] = 0
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    source._process_records = ()
+    source._baseline_stable_result = {
+        "stable": True,
+        "authoritative_commit_count": 2,
+        "source_monotonic_ns": 30_000_000_001,
+    }
+    source._events = lambda: pytest.fail("cached baseline reparsed aggregate events")
+    latches = iter((tree_zero, None, exact))
+    source.latch_prefault_active_configuration_barrier = lambda: next(latches)
+
+    assert source.poll("baseline") is None
+    assert source.poll("baseline") is None
+    snapshot = source.poll("baseline")
+    assert snapshot is not None
+    assert snapshot["active_configuration_barrier"] == exact
+
+
+@pytest.mark.parametrize("replica_id", (-2, -1, 0))
+def test_n31_cached_baseline_keeps_live_process_exit_checks(replica_id: int) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V3)
+    polls = iter((None, 1))
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    source._process_records = (
+        SimpleNamespace(
+            replica_id=replica_id,
+            process=SimpleNamespace(poll=lambda: next(polls)),
+        ),
+    )
+    source._baseline_stable_result = {
+        "stable": True,
+        "authoritative_commit_count": 2,
+        "source_monotonic_ns": 30_000_000_001,
+    }
+    source._events = lambda: pytest.fail("cached baseline reparsed aggregate events")
+    source.latch_prefault_active_configuration_barrier = lambda: None
+
+    assert source.poll("baseline") is None
+    with pytest.raises(
+        runtime.FocusedCrashPairRuntimeError, match="unexpected process exit"
+    ):
+        source.poll("baseline")
+
+
+def test_n31_cached_baseline_rejects_spoofed_live_barrier_identity(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    source._process_records = ()
+    source._baseline_stable_result = {
+        "stable": True,
+        "authoritative_commit_count": 2,
+        "source_monotonic_ns": 30_000_000_001,
+    }
+    source._events = lambda: pytest.fail("cached baseline reparsed aggregate events")
+    path = root / "raw" / "replica-0.jsonl"
+    event = json.loads(path.read_text(encoding="utf-8"))
+    event["run_id"] = "spoofed-run"
+    path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="identity"):
+        source.poll("baseline")
+
+
 def _write_exact_live_tail_set(
     root: Path, profile: object, *, run_id: str = "run-a"
 ) -> object:
@@ -987,6 +1149,41 @@ def _write_exact_live_tail_set(
     source._expected_run_id = run_id
     source._expected_source_instances = instances
     return source
+
+
+def test_n31_prefault_tail_latch_handles_large_high_rate_prefix(
+    tmp_path: Path,
+) -> None:
+    """The bounded cursor still finds the complete current configuration line."""
+
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    for replica in profile.replica_ids:
+        path = root / "raw" / f"replica-{replica}.jsonl"
+        configuration = json.loads(path.read_text(encoding="utf-8"))
+        leading = [
+            {
+                **configuration,
+                "source_sequence": sequence,
+                "source_monotonic_ns": sequence,
+                "event_type": "block.committed",
+                "payload": {"high_rate_padding": "x" * 16_384},
+            }
+            for sequence in range(1, 81)
+        ]
+        configuration["source_sequence"] = 81
+        configuration["source_monotonic_ns"] = 81
+        path.write_text(
+            "\n".join(json.dumps(event) for event in (*leading, configuration)) + "\n",
+            encoding="utf-8",
+        )
+
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
 
 
 def test_prefault_tail_latch_accepts_exact_launched_uuid_streams(

@@ -3509,6 +3509,19 @@ class FocusedRawEvidenceSource:
                     unexpected.add(replica)
         return tuple(sorted(unexpected))
 
+    def _prefault_unexpected_exit_ids(self) -> tuple[int, ...]:
+        """Fail closed on any live process exit before the injected fault."""
+
+        return tuple(
+            sorted(
+                replica
+                for record in self._process_records
+                if type(replica := getattr(record, "replica_id", None)) is int
+                and (process := getattr(record, "process", None)) is not None
+                and process.poll() is not None
+            )
+        )
+
     def _reject_post_fault_target_events(
         self, events: Sequence[Mapping[str, Any]]
     ) -> None:
@@ -3562,6 +3575,24 @@ class FocusedRawEvidenceSource:
         return tuple(predecessors)
 
     def poll(self, name: str) -> Mapping[str, object] | None:
+        # Once a full native replay has proved the immutable baseline predicate,
+        # keep sampling only the live per-replica configuration tails.  Replaying
+        # the aggregate stream here can otherwise miss a short all-member
+        # configuration span while the manager's ingress continues to fill.
+        cached_baseline = getattr(self, "_baseline_stable_result", None)
+        if name == "baseline" and cached_baseline is not None:
+            unexpected = self._prefault_unexpected_exit_ids()
+            if unexpected:
+                _error("raw process health contains an unexpected process exit")
+            barrier = self.latch_prefault_active_configuration_barrier()
+            if barrier is None or not has_exact_active_configuration_barrier(
+                self._profile, barrier
+            ):
+                return None
+            return {
+                **cached_baseline,
+                "active_configuration_barrier": barrier,
+            }
         events = self._events()
         self._reject_post_fault_target_events(events)
         unexpected = self.unexpected_exit_ids(events)
@@ -3644,38 +3675,11 @@ class FocusedRawEvidenceSource:
                 "source_monotonic_ns": last_commit_ns,
             }
             if self._profile.raw.get("schema_version") == 2:
-                active: dict[int, Mapping[str, Any]] = {}
-                for event in events:
-                    source_id = str(event["source_id"])
-                    if (
-                        event["source_kind"] != "replica"
-                        or not source_id.startswith("replica-")
-                        or event["event_type"] != "adaptive.configuration_active"
-                    ):
-                        continue
-                    replica = int(source_id.removeprefix("replica-"))
-                    if replica not in self._profile.replica_ids:
-                        _error("active configuration source is outside membership")
-                    previous = active.get(replica)
-                    if previous is None or int(event["source_monotonic_ns"]) > int(
-                        previous["source_monotonic_ns"]
-                    ):
-                        active[replica] = event
-                barrier = [
-                    {
-                        "replica_id": replica,
-                        "configuration": {
-                            key: _document(
-                                active[replica]["payload"],
-                                "active configuration payload",
-                            ).get(key)
-                            for key in ("epoch_number", "tree_id", "epoch_digest")
-                        },
-                    }
-                    for replica in self._profile.replica_ids
-                    if replica in active
-                ]
-                if not has_exact_active_configuration_barrier(self._profile, barrier):
+                self._baseline_stable_result = dict(result)
+                barrier = self.latch_prefault_active_configuration_barrier()
+                if barrier is None or not has_exact_active_configuration_barrier(
+                    self._profile, barrier
+                ):
                     return None
                 result["active_configuration_barrier"] = barrier
             return result
