@@ -409,6 +409,11 @@ def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, obj
     snapshots["fault"] = {
         **snapshots["fault"],
         "source_monotonic_ns": fault_ns,
+        "pre_signal_monotonic_ns": fault_ns - 1,
+        "prefault_active_configuration_barrier": [
+            {"replica_id": replica, "configuration": dict(configuration)}
+            for replica in profile.replica_ids
+        ],
     }
     timeout_observations: list[dict[str, object]] = []
     for target in plan["targets"]:
@@ -443,10 +448,14 @@ def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, obj
         **(
             {
                 "postfault_progress": {
-                    "required_tree_positions": plan["required_postfault_tree_positions"],
+                    "required_tree_positions": plan[
+                        "required_postfault_tree_positions"
+                    ],
                     "actual_tree_positions": plan["required_postfault_tree_positions"],
                     "starting_tree_id": plan["active_tree_id"],
-                    "observed_tree_ids": list(range(plan["required_postfault_tree_positions"])),
+                    "observed_tree_ids": list(
+                        range(plan["required_postfault_tree_positions"])
+                    ),
                 }
             }
             if "required_postfault_tree_positions" in plan
@@ -530,7 +539,9 @@ def _v3_raw_progress_events(profile: object) -> list[dict[str, object]]:
             "event_type": "adaptive.configuration_active",
             "payload": {
                 "epoch_number": 0,
-                "tree_id": members[(members.index(starting_tree) + position) % len(members)],
+                "tree_id": members[
+                    (members.index(starting_tree) + position) % len(members)
+                ],
                 "epoch_digest": digest,
             },
         }
@@ -572,13 +583,340 @@ def test_v3_raw_progress_binds_native_uuid_lifecycle_instance() -> None:
     source = object.__new__(runtime.FocusedRawEvidenceSource)
     source._profile = profile
     assert source._postfault_authoritative_progress(
-        _v3_raw_progress_events(profile), fault_ns=100, audit_ns=200
+        _v3_raw_progress_events(profile), fault_ns=100, prefault_ns=100, audit_ns=200
     ) == {
         "required_tree_positions": 6,
         "actual_tree_positions": 6,
         "starting_tree_id": 6,
         "observed_tree_ids": [6, 0, 1, 2, 3, 4],
     }
+
+
+def test_v3_raw_progress_ignores_configuration_after_signal_request() -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    events = _v3_raw_progress_events(profile)
+    between_request_and_confirmation = deepcopy(events[3])
+    between_request_and_confirmation["source_sequence"] = 4
+    between_request_and_confirmation["source_monotonic_ns"] = 99
+    events.append(between_request_and_confirmation)
+    progress = source._postfault_authoritative_progress(
+        events, fault_ns=100, prefault_ns=95, audit_ns=200
+    )
+    assert progress is not None
+    assert progress["starting_tree_id"] == 6
+
+
+def test_prefault_tail_latch_keeps_tree_six_when_later_full_stream_rotates(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    events = []
+    for replica in profile.replica_ids:
+        events.append(
+            {
+                "event_schema_version": 1,
+                "run_id": "tail-run",
+                "source_kind": "replica",
+                "source_id": f"replica-{replica}",
+                "source_instance": f"tail-run-replica-{replica}-uuid",
+                "source_sequence": 1,
+                "source_monotonic_ns": 1,
+                "event_type": "adaptive.configuration_active",
+                "payload": {
+                    "epoch_number": 0,
+                    "tree_id": 6,
+                    "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+                },
+            }
+        )
+        events.append(
+            {
+                "event_schema_version": 1,
+                "run_id": "tail-run",
+                "source_kind": "replica",
+                "source_id": f"replica-{replica}",
+                "source_instance": f"tail-run-replica-{replica}-uuid",
+                "source_sequence": 2,
+                "source_monotonic_ns": 2,
+                "event_type": "adaptive.configuration_active",
+                "payload": {
+                    "epoch_number": 0,
+                    "tree_id": 0,
+                    "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+                },
+            }
+        )
+    for replica in profile.replica_ids:
+        (root / "raw" / f"replica-{replica}.jsonl").write_text(
+            "\n".join(
+                json.dumps(event)
+                for event in events
+                if event["source_id"] == f"replica-{replica}"
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._root = root
+    source._profile = profile
+    assert source.latch_prefault_active_configuration_barrier() is None
+    for replica in profile.replica_ids:
+        exact = next(
+            event
+            for event in events
+            if event["source_id"] == f"replica-{replica}"
+            and event["source_sequence"] == 1
+        )
+        ordinary = {
+            **exact,
+            "source_sequence": 2,
+            "source_monotonic_ns": 2,
+            "event_type": "block.committed",
+            "payload": {},
+        }
+        (root / "raw" / f"replica-{replica}.jsonl").write_text(
+            json.dumps(exact) + "\n" + json.dumps(ordinary) + "\n",
+            encoding="utf-8",
+        )
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
+
+
+def _write_exact_live_tail_set(
+    root: Path, profile: object, *, run_id: str = "run-a"
+) -> object:
+    runtime = _runtime()
+    instances = {}
+    for replica in profile.replica_ids:
+        source_instance = (
+            f"{run_id}-replica-{replica}-550e8400-e29b-41d4-a716-446655440000"
+        )
+        instances[f"replica-{replica}"] = source_instance
+        event = {
+            "event_schema_version": 1,
+            "run_id": run_id,
+            "source_kind": "replica",
+            "source_id": f"replica-{replica}",
+            "source_instance": source_instance,
+            "source_sequence": 1,
+            "source_monotonic_ns": 1,
+            "event_type": "adaptive.configuration_active",
+            "payload": {
+                "epoch_number": 0,
+                "tree_id": profile.raw["topology"]["active_tree_id"],
+                "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+            },
+        }
+        (root / "raw" / f"replica-{replica}.jsonl").write_text(
+            json.dumps(event) + "\n", encoding="utf-8"
+        )
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._root = root
+    source._profile = profile
+    source._expected_run_id = run_id
+    source._expected_source_instances = instances
+    return source
+
+
+def test_prefault_tail_latch_accepts_exact_launched_uuid_streams(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
+
+
+def test_prefault_tail_latch_uses_source_sequence_when_timestamps_tie(
+    tmp_path: Path,
+) -> None:
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    for replica in profile.replica_ids:
+        path = root / "raw" / f"replica-{replica}.jsonl"
+        first = json.loads(path.read_text())
+        later = {
+            **first,
+            "source_sequence": 2,
+            "source_monotonic_ns": first["source_monotonic_ns"],
+            "payload": {
+                **first["payload"],
+                "tree_id": 0,
+            },
+        }
+        path.write_text(
+            json.dumps(first) + "\n" + json.dumps(later) + "\n",
+            encoding="utf-8",
+        )
+    assert source.latch_prefault_active_configuration_barrier() is None
+
+
+@pytest.mark.parametrize("mode", ("foreign", "mixed"))
+def test_prefault_tail_latch_rejects_foreign_or_cross_replica_run_ids(
+    mode: str, tmp_path: Path
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    path = root / "raw" / "replica-0.jsonl"
+    event = json.loads(path.read_text())
+    event["run_id"] = "foreign" if mode == "foreign" else "run-b"
+    path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        source.latch_prefault_active_configuration_barrier()
+
+
+@pytest.mark.parametrize("mutation", ("sequence-gap", "time-regression", "uuid-drift"))
+def test_prefault_tail_latch_rejects_source_history_drift(
+    mutation: str, tmp_path: Path
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    path = root / "raw" / "replica-0.jsonl"
+    first = json.loads(path.read_text())
+    second = {
+        **first,
+        "source_sequence": 2,
+        "source_monotonic_ns": 2,
+        "event_type": "block.committed",
+        "payload": {},
+    }
+    if mutation == "sequence-gap":
+        second["source_sequence"] = 3
+    elif mutation == "time-regression":
+        second["source_monotonic_ns"] = 0
+    else:
+        second["source_instance"] = "foreign-uuid"
+    path.write_text(
+        json.dumps(first) + "\n" + json.dumps(second) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        source.latch_prefault_active_configuration_barrier()
+
+
+def test_prefault_tail_latch_waits_for_partial_suffix_and_accepts_large_prefix(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    path = root / "raw" / "replica-0.jsonl"
+    exact = path.read_bytes()
+    path.write_bytes(exact + b'{"event_schema_version":1')
+    assert source.latch_prefault_active_configuration_barrier() is None
+    path.write_bytes(b"x" * 1_048_577 + b"\n" + exact)
+    assert runtime.has_exact_active_configuration_barrier(
+        profile, source.latch_prefault_active_configuration_barrier()
+    )
+
+
+def test_prefault_wait_reaches_exact_barrier_before_returning() -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    configuration = {
+        "epoch_number": 0,
+        "tree_id": profile.raw["topology"]["active_tree_id"],
+        "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+    }
+    barrier = [
+        {"replica_id": replica, "configuration": dict(configuration)}
+        for replica in profile.replica_ids
+    ]
+    trace = []
+
+    class Source:
+        def latch_prefault_active_configuration_barrier(self) -> object:
+            trace.append("poll")
+            return None if len(trace) == 1 else barrier
+
+    processes = SimpleNamespace(
+        records=[SimpleNamespace(process=SimpleNamespace(poll=lambda: None))]
+    )
+    backend = runtime.FocusedLaunchBackend(poll_interval_s=0)
+    assert (
+        backend._wait_for_prefault_configuration(
+            Source(), processes, deadline_monotonic=10**30
+        )
+        == barrier
+    )
+    assert trace == ["poll", "poll"]
+
+
+@pytest.mark.parametrize("mutation", ("timeout", "process-exit"))
+def test_prefault_wait_fails_before_fault_when_no_exact_barrier(
+    mutation: str,
+) -> None:
+    runtime = _runtime()
+    calls = []
+
+    class Source:
+        def latch_prefault_active_configuration_barrier(self) -> None:
+            calls.append("poll")
+            return None
+
+    returncode = 1 if mutation == "process-exit" else None
+    processes = SimpleNamespace(
+        records=[SimpleNamespace(process=SimpleNamespace(poll=lambda: returncode))]
+    )
+    backend = runtime.FocusedLaunchBackend(poll_interval_s=0)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        backend._wait_for_prefault_configuration(
+            Source(),
+            processes,
+            deadline_monotonic=-1 if mutation == "timeout" else 10**30,
+        )
+    assert calls == ([] if mutation == "process-exit" else ["poll"])
+
+
+@pytest.mark.parametrize("mutation", ("malformed", "spoofed"))
+def test_prefault_tail_latch_rejects_malformed_or_spoofed_configuration(
+    mutation: str, tmp_path: Path
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    if mutation == "malformed":
+        payload = "not-json\n"
+    else:
+        payload = (
+            json.dumps(
+                {
+                    "source_kind": "replica",
+                    "source_id": "spoof",
+                    "event_type": "adaptive.configuration_active",
+                    "payload": {},
+                }
+            )
+            + "\n"
+        )
+    (root / "raw" / "replica-0.jsonl").write_text(payload, encoding="utf-8")
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._root = root
+    source._profile = profile
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        source.latch_prefault_active_configuration_barrier()
 
 
 @pytest.mark.parametrize("mutation", ("unbound", "mixed", "multiple"))
@@ -597,13 +935,16 @@ def test_v3_raw_progress_rejects_unbound_or_mixed_lifecycle_instances(
     else:
         events[1]["source_instance"] = "other-uuid"
     if mutation == "mixed":
-        assert source._postfault_authoritative_progress(
-            events, fault_ns=100, audit_ns=200
-        ) is not None
+        assert (
+            source._postfault_authoritative_progress(
+                events, fault_ns=100, prefault_ns=100, audit_ns=200
+            )
+            is not None
+        )
     else:
         with pytest.raises(runtime.FocusedCrashPairRuntimeError):
             source._postfault_authoritative_progress(
-                events, fault_ns=100, audit_ns=200
+                events, fault_ns=100, prefault_ns=100, audit_ns=200
             )
 
 
@@ -627,7 +968,9 @@ def test_v3_raw_progress_requires_one_consecutive_authoritative_commit_chain(
     else:
         target["source_sequence"] = 1
     with pytest.raises(runtime.FocusedCrashPairRuntimeError):
-        source._postfault_authoritative_progress(events, fault_ns=100, audit_ns=200)
+        source._postfault_authoritative_progress(
+            events, fault_ns=100, prefault_ns=100, audit_ns=200
+        )
 
 
 @pytest.mark.parametrize("profile_path", (N7_PROFILE_V3, N31_PROFILE_V3))
@@ -655,9 +998,7 @@ def test_fcrash_h_state_machine_requires_exact_barrier_and_guarded_timeouts(
         "missing-reporter": lambda: snapshots["nonresponse"][
             "qualifying_timeout_counts"
         ][str(profile.target_replica_ids[0])].popitem(),
-        "missing-progress": lambda: snapshots["nonresponse"].pop(
-            "postfault_progress"
-        ),
+        "missing-progress": lambda: snapshots["nonresponse"].pop("postfault_progress"),
         "healed-score": lambda: snapshots["nonresponse"]["guard_drawdowns"].update(
             {str(profile.target_replica_ids[0]): 0}
         ),
@@ -1279,6 +1620,50 @@ def test_atomic_fault_batch_is_one_call_and_terminalizes_partial_failure(
     ]
 
 
+def test_backend_atomic_fault_projection_preserves_pre_signal_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    plan = _fault_plan((0, 1))
+    outcomes = (_outcome(0, 100), _outcome(1, 101))
+    monkeypatch.setattr(
+        runtime,
+        "_execute_atomic_fault_batch",
+        lambda *_args, **_kwargs: outcomes,
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "fault-orchestrator.jsonl").write_text("{}\n", encoding="utf-8")
+    configuration = {
+        "profile": SimpleNamespace(
+            replica_ids=tuple(range(7)),
+            target_replica_ids=(0, 1),
+        ),
+        "fault_plan": plan,
+        "run_directory": tmp_path,
+    }
+    processes_state = SimpleNamespace(
+        registry=object(),
+        lifecycle=object(),
+        records=(),
+    )
+
+    projected = runtime.FocusedLaunchBackend().execute_atomic_fault_batch(
+        configuration,
+        processes_state,
+    )
+
+    assert projected["pre_signal_monotonic_ns"] == min(
+        outcome.requested_monotonic_ns for outcome in outcomes
+    )
+    assert projected["source_monotonic_ns"] == max(
+        outcome.confirmed_monotonic_ns for outcome in outcomes
+    )
+    receipt = json.loads((raw / "fault-receipt.json").read_text(encoding="utf-8"))
+    assert projected["sigkill_outcomes"] == receipt["sigkill_outcomes"]
+
+
 def _membership_digest(replica_count: int) -> str:
     payload = b"kauri-membership-v1" + native_fixture._u(replica_count, 4)
     payload += b"".join(
@@ -1513,6 +1898,7 @@ def _arm_snapshots(replicas: int, arm: str) -> dict[str, Mapping[str, object]]:
             "confirmed_target_ids": list(targets),
             "survivor_replica_ids": list(survivors),
             "source_monotonic_ns": 2_000,
+            "pre_signal_monotonic_ns": 1_999,
         },
         "nonresponse": {
             "detected_target_ids": list(targets),

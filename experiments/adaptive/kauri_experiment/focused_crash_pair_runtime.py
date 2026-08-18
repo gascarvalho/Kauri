@@ -128,9 +128,10 @@ def _authoritative_lifecycle_instance(
         if event.get("event_type") in {"process.started", "process.ready"}
         and event.get("source_id") == expected_source
     ]
-    if len(lifecycle) != 2 or {
-        event.get("event_type") for event in lifecycle
-    } != {"process.started", "process.ready"}:
+    if len(lifecycle) != 2 or {event.get("event_type") for event in lifecycle} != {
+        "process.started",
+        "process.ready",
+    }:
         _error("authoritative progress lacks an exact lifecycle binding")
     if any(event.get("source_kind") != "replica" for event in lifecycle):
         _error("authoritative progress lifecycle kind drifted")
@@ -527,7 +528,7 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         "minimum_timeouts_per_reporter",
         "minimum_score_drop",
     }
-    if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS:
+    if getattr(profile, "profile_id", None) in _FCRASH_H_V3_PROFILE_IDS:
         expected_guard_keys.add("required_postfault_tree_positions")
     expected_timer_keys = {
         "adaptation_interval_seconds",
@@ -589,7 +590,9 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
     ordered_common = sorted(common_reporters)
     for row in target_rows:
         row["authenticated_reporter_ids"] = ordered_common
-    expected_period = 2 if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS else replica_count
+    expected_period = (
+        2 if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS else replica_count
+    )
     expected_guard = {
         "schedule": "native_cyclic_epoch_zero",
         "tree_switch_period_blocks": expected_period,
@@ -636,8 +639,10 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         "minimum_timeouts_per_reporter": minimum_timeouts,
         "minimum_score_drop": minimum_timeouts * required,
         **(
-            {"required_postfault_tree_positions": horizon,
-             "nominal_commit_horizon": horizon * expected_period}
+            {
+                "required_postfault_tree_positions": horizon,
+                "nominal_commit_horizon": horizon * expected_period,
+            }
             if profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
             else {}
         ),
@@ -1464,6 +1469,14 @@ def _drive_arm_state_machine(
         or tuple(fault.get("survivor_replica_ids", ())) != survivors
     ):
         _error("fault receipt or survivor projection drifted")
+    if getattr(profile, "profile_id", None) in _FCRASH_H_V3_PROFILE_IDS:
+        latched = fault.get("prefault_active_configuration_barrier")
+        if (
+            not isinstance(latched, Sequence)
+            or isinstance(latched, (str, bytes))
+            or not has_exact_active_configuration_barrier(profile, latched)
+        ):
+            _error("fault boundary lacks the exact latched active configuration")
     nonresponse = hooks.wait_for_nonresponse()
     nonresponse_ns = _timestamp(nonresponse, "nonresponse")
     if (
@@ -1519,13 +1532,21 @@ def _drive_arm_state_machine(
                 required_progress, "required post-fault commit horizon", 1
             )
             if set(progress) != expected_progress_keys or (
-                _integer(progress.get("required_tree_positions"), "progress required count", 1)
+                _integer(
+                    progress.get("required_tree_positions"),
+                    "progress required count",
+                    1,
+                )
                 != required_count
-                or _integer(progress.get("actual_tree_positions"), "progress actual count", 1)
+                or _integer(
+                    progress.get("actual_tree_positions"), "progress actual count", 1
+                )
                 < required_count
                 or not isinstance(progress.get("observed_tree_ids"), list)
                 or len(progress["observed_tree_ids"])
-                != _integer(progress.get("actual_tree_positions"), "progress actual count", 1)
+                != _integer(
+                    progress.get("actual_tree_positions"), "progress actual count", 1
+                )
             ):
                 _error("runtime nonresponse lacks the frozen post-fault progress")
 
@@ -1719,11 +1740,15 @@ class FocusedRawEvidenceSource:
         poll_interval_s: float = 0.05,
         timeout_s: float = 60.0,
         process_records: Sequence[object] = (),
+        expected_run_id: str | None = None,
+        expected_source_instances: Mapping[str, str] | None = None,
     ) -> None:
         self._root = Path(run_directory)
         self._poll_interval_s = max(0.0, float(poll_interval_s))
         self._timeout_s = float(timeout_s)
         self._process_records = tuple(process_records)
+        self._expected_run_id = expected_run_id
+        self._expected_source_instances = dict(expected_source_instances or {})
         if self._timeout_s <= 0:
             _error("raw evidence polling timeout must be positive")
         profile_path = self._root / "profile.json"
@@ -1785,6 +1810,110 @@ class FocusedRawEvidenceSource:
 
     def pair_id(self) -> str:
         return self._pair_id
+
+    def latch_prefault_active_configuration_barrier(
+        self,
+    ) -> list[dict[str, object]] | None:
+        """Read only recent native replica tails for the fault-boundary latch."""
+
+        latest: dict[int, Mapping[str, Any]] = {}
+        for replica in self._profile.replica_ids:
+            path = self._root / "raw" / f"replica-{replica}.jsonl"
+            if path.is_symlink() or not path.is_file():
+                _error("live replica tail is absent")
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - 1_048_576))
+                payload = stream.read()
+            if not payload.endswith(b"\n"):
+                return None
+            if size > len(payload):
+                if b"\n" not in payload:
+                    _error("live replica tail has no complete record")
+                payload = payload.split(b"\n", 1)[1]
+            selected: Mapping[str, Any] | None = None
+            expected_run_id: str | None = None
+            expected_instance: str | None = None
+            previous_sequence: int | None = None
+            previous_timestamp: int | None = None
+            for line in payload.splitlines():
+                try:
+                    event = _document(json.loads(line), "raw replica tail event")
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise FocusedCrashPairRuntimeError(
+                        "raw replica tail is malformed"
+                    ) from exc
+                if (
+                    set(event) != _RUNTIME_EVENT_KEYS
+                    or event.get("event_schema_version") != 1
+                    or event.get("source_kind") != "replica"
+                    or event.get("source_id") != f"replica-{replica}"
+                    or not isinstance(event.get("run_id"), str)
+                    or not event.get("run_id")
+                    or not isinstance(event.get("source_instance"), str)
+                    or not event.get("source_instance")
+                    or not isinstance(event.get("event_type"), str)
+                    or not isinstance(event.get("payload"), Mapping)
+                ):
+                    _error("live replica tail envelope or identity drifted")
+                sequence = _integer(
+                    event.get("source_sequence"), "tail source sequence", 1
+                )
+                timestamp = _integer(
+                    event.get("source_monotonic_ns"), "tail source timestamp"
+                )
+                if expected_run_id is None:
+                    expected_run_id = str(event["run_id"])
+                    expected_instance = str(event["source_instance"])
+                elif (
+                    event["run_id"] != expected_run_id
+                    or event["source_instance"] != expected_instance
+                ):
+                    _error("live replica tail spans multiple source identities")
+                if previous_sequence is not None and (
+                    sequence != previous_sequence + 1
+                    or timestamp < int(previous_timestamp)
+                ):
+                    _error("live replica tail sequence or timestamp drifted")
+                previous_sequence = sequence
+                previous_timestamp = timestamp
+                launched_run_id = getattr(self, "_expected_run_id", None)
+                launched_instances = getattr(self, "_expected_source_instances", {})
+                if (
+                    launched_run_id is not None and event["run_id"] != launched_run_id
+                ) or (
+                    launched_instances
+                    and event["source_instance"]
+                    != launched_instances.get(f"replica-{replica}")
+                ):
+                    _error("live replica tail differs from the launched identity")
+                if event["event_type"] != "adaptive.configuration_active":
+                    continue
+                if selected is None or (
+                    int(event["source_sequence"]),
+                    int(event["source_monotonic_ns"]),
+                ) > (
+                    int(selected["source_sequence"]),
+                    int(selected["source_monotonic_ns"]),
+                ):
+                    selected = event
+            if selected is None:
+                _error("live replica tail lacks an active configuration")
+            latest[replica] = selected
+        rows = [
+            {
+                "replica_id": replica,
+                "configuration": _document(
+                    latest[replica]["payload"], "tail configuration"
+                ),
+            }
+            for replica in self._profile.replica_ids
+            if replica in latest
+        ]
+        if not has_exact_active_configuration_barrier(self._profile, rows):
+            return None
+        return rows
 
     def _events(self) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -1906,6 +2035,10 @@ class FocusedRawEvidenceSource:
             _integer(outcome.get("confirmed_monotonic_ns"), "fault confirmation")
             for outcome in outcomes
         ]
+        requested = [
+            _integer(outcome.get("requested_monotonic_ns"), "fault request")
+            for outcome in outcomes
+        ]
         survivors = tuple(
             replica for replica in self._profile.replica_ids if replica not in targets
         )
@@ -1915,6 +2048,7 @@ class FocusedRawEvidenceSource:
             "confirmed_target_ids": list(targets),
             "survivor_replica_ids": list(survivors),
             "source_monotonic_ns": max(confirmations),
+            "pre_signal_monotonic_ns": min(requested),
             "sigkill_outcomes": [dict(outcome) for outcome in outcomes],
         }
 
@@ -2208,6 +2342,7 @@ class FocusedRawEvidenceSource:
         events: Sequence[Mapping[str, Any]],
         *,
         fault_ns: int,
+        prefault_ns: int,
         audit_ns: int,
     ) -> dict[str, int] | None:
         """Derive the v3 progress gate solely from authoritative raw commits."""
@@ -2224,29 +2359,36 @@ class FocusedRawEvidenceSource:
             measurement.get("authoritative_replica_id"), "authoritative observer", 0
         )
         expected_source = f"replica-{observer}"
-        expected_instance = _authoritative_lifecycle_instance(
-            events, expected_source
-        )
+        expected_instance = _authoritative_lifecycle_instance(events, expected_source)
         expected_digest = _document(
             self._profile.raw.get("topology"), "profile topology"
         ).get("epoch_zero_digest")
         start_events = [
-            event for event in events
+            event
+            for event in events
             if event.get("source_kind") == "replica"
             and event.get("source_id") == expected_source
             and event.get("source_instance") == expected_instance
             and event.get("event_type") == "adaptive.configuration_active"
-            and _integer(event.get("source_monotonic_ns"), "configuration timestamp") < fault_ns
+            and _integer(event.get("source_monotonic_ns"), "configuration timestamp")
+            < prefault_ns
         ]
         if not start_events:
             _error("raw authoritative progress lacks a pre-fault configuration")
-        start = max(start_events, key=lambda event: _integer(event.get("source_monotonic_ns"), "configuration timestamp"))
+        start = max(
+            start_events,
+            key=lambda event: (
+                _integer(event.get("source_sequence"), "configuration sequence", 1),
+                _integer(event.get("source_monotonic_ns"), "configuration timestamp"),
+            ),
+        )
         start_payload = _document(start.get("payload"), "pre-fault configuration")
         starting_tree = _integer(start_payload.get("tree_id"), "starting tree")
         if (
             start_payload.get("epoch_number") != 0
             or start_payload.get("epoch_digest") != expected_digest
-            or starting_tree != _integer(
+            or starting_tree
+            != _integer(
                 derive_reporter_coverage_plan(self._profile).get("active_tree_id"),
                 "active tree",
             )
@@ -2255,12 +2397,15 @@ class FocusedRawEvidenceSource:
         members = tuple(self._profile.replica_ids)
         activations = sorted(
             [
-                event for event in events
+                event
+                for event in events
                 if event.get("source_kind") == "replica"
                 and event.get("source_id") == expected_source
                 and event.get("source_instance") == expected_instance
                 and event.get("event_type") == "adaptive.configuration_active"
-                and fault_ns < _integer(event.get("source_monotonic_ns"), "configuration timestamp") < audit_ns
+                and fault_ns
+                < _integer(event.get("source_monotonic_ns"), "configuration timestamp")
+                < audit_ns
             ],
             key=lambda event: (
                 _integer(event.get("source_sequence"), "configuration sequence", 1),
@@ -2275,22 +2420,26 @@ class FocusedRawEvidenceSource:
             if (
                 payload.get("epoch_number") != 0
                 or payload.get("epoch_digest") != expected_digest
-                or tree != members[(members.index(starting_tree) + position) % len(members)]
+                or tree
+                != members[(members.index(starting_tree) + position) % len(members)]
             ):
                 _error("raw authoritative progress cyclic configuration drifted")
             observed_trees.append(tree)
         if len(observed_trees) < required_count:
             return None
-        configurations = [(
-            _integer(start.get("source_sequence"), "configuration sequence", 1),
-            _integer(start.get("source_monotonic_ns"), "configuration timestamp"),
-            starting_tree,
-        )] + [
+        configurations = [
+            (
+                _integer(start.get("source_sequence"), "configuration sequence", 1),
+                _integer(start.get("source_monotonic_ns"), "configuration timestamp"),
+                starting_tree,
+            )
+        ] + [
             (
                 _integer(event.get("source_sequence"), "configuration sequence", 1),
                 _integer(event.get("source_monotonic_ns"), "configuration timestamp"),
                 tree,
-            ) for event, tree in zip(activations, observed_trees[1:], strict=True)
+            )
+            for event, tree in zip(activations, observed_trees[1:], strict=True)
         ]
         for event in events:
             if event.get("event_type") != "block.committed":
@@ -2325,7 +2474,9 @@ class FocusedRawEvidenceSource:
                 payload.get("designated_observer") is not True
                 or payload.get("commit_batch_index") != 0
                 or payload.get("view_generation") != 1
-                or _integer(payload.get("transaction_count"), "progress transactions", 1)
+                or _integer(
+                    payload.get("transaction_count"), "progress transactions", 1
+                )
                 % 5
                 != 0
                 or proof.get("block_hash") != block_hash
@@ -2333,9 +2484,16 @@ class FocusedRawEvidenceSource:
                 or proof.get("epoch_digest") != expected_digest
             ):
                 _error("raw authoritative progress commit invariants drifted")
-            commit_key = (_integer(event.get("source_sequence"), "progress source sequence", 1), timestamp)
+            commit_key = (
+                _integer(event.get("source_sequence"), "progress source sequence", 1),
+                timestamp,
+            )
             active_index = max(
-                (index for index, row in enumerate(configurations) if row[:2] <= commit_key),
+                (
+                    index
+                    for index, row in enumerate(configurations)
+                    if row[:2] <= commit_key
+                ),
                 default=-1,
             )
             if active_index < 0 or proof_tree not in {
@@ -2794,7 +2952,13 @@ class FocusedRawEvidenceSource:
                 }
                 progress = self._postfault_authoritative_progress(
                     events,
-                    fault_ns=_integer(fault.get("source_monotonic_ns"), "fault timestamp"),
+                    fault_ns=_integer(
+                        fault.get("source_monotonic_ns"), "fault timestamp"
+                    ),
+                    prefault_ns=_integer(
+                        fault.get("pre_signal_monotonic_ns"),
+                        "fault pre-signal timestamp",
+                    ),
                     audit_ns=_integer(
                         ranking.get("audit_source_monotonic_ns"),
                         "ranking audit timestamp",
@@ -3922,6 +4086,7 @@ class FocusedLaunchBackend:
             "pair_seed": pair_seed,
             "arm": arm,
             "run_id": run_id,
+            "source_instances": instances,
             "run_directory": run_directory,
             "manager_command": manager,
             "replica_commands": replicas,
@@ -4036,6 +4201,9 @@ class FocusedLaunchBackend:
             "source_monotonic_ns": max(
                 outcome.confirmed_monotonic_ns for outcome in outcomes
             ),
+            "pre_signal_monotonic_ns": min(
+                outcome.requested_monotonic_ns for outcome in outcomes
+            ),
             "sigkill_outcomes": outcome_documents,
         }
         target_ids = set(configuration["profile"].target_replica_ids)
@@ -4088,6 +4256,26 @@ class FocusedLaunchBackend:
             if self._poll_interval_s:
                 time.sleep(self._poll_interval_s)
 
+    def _wait_for_prefault_configuration(
+        self,
+        source: FocusedRawEvidenceSource,
+        processes: object,
+        *,
+        deadline_monotonic: float,
+    ) -> list[dict[str, object]]:
+        while True:
+            for record in getattr(processes, "records", ()):
+                process = getattr(record, "process", None)
+                if process is not None and process.poll() is not None:
+                    _error("process exited while awaiting the pre-fault configuration")
+            latched = source.latch_prefault_active_configuration_barrier()
+            if latched is not None:
+                return latched
+            if time.monotonic() >= deadline_monotonic:
+                _error("timed out waiting for the exact pre-fault configuration")
+            if self._poll_interval_s:
+                time.sleep(self._poll_interval_s)
+
     def run_arm(
         self,
         configuration: Mapping[str, object],
@@ -4101,6 +4289,11 @@ class FocusedLaunchBackend:
                 poll_interval_s=self._poll_interval_s,
                 timeout_s=self._readiness_timeout_s,
                 process_records=tuple(getattr(processes, "records", ())),
+                expected_run_id=str(configuration["run_id"]),
+                expected_source_instances=_document(
+                    configuration.get("source_instances"),
+                    "focused source instances",
+                ),
             )
             poll = source.poll
             unexpected_exits = source.unexpected_exit_ids
@@ -4191,6 +4384,21 @@ class FocusedLaunchBackend:
 
         def inject() -> Mapping[str, object]:
             nonlocal fault_wall
+            latched_barrier: list[dict[str, object]] | None = None
+            if (
+                self._poll_snapshot is None
+                and isinstance(profile, FocusedProfile)
+                and profile.profile_id in _FCRASH_H_V3_PROFILE_IDS
+            ):
+                latch_deadline = min(
+                    float(hard_deadline),
+                    time.monotonic() + self._readiness_timeout_s,
+                )
+                latched_barrier = self._wait_for_prefault_configuration(
+                    source,
+                    processes,
+                    deadline_monotonic=latch_deadline,
+                )
             execute = self._execute_fault
             if execute is not None:
                 outcome = dict(execute(configuration, processes))
@@ -4204,6 +4412,8 @@ class FocusedLaunchBackend:
             observed = wait("fault")
             if dict(observed) != outcome:
                 _error("observed fault receipt differs from the atomic outcome")
+            if latched_barrier is not None:
+                outcome["prefault_active_configuration_barrier"] = latched_barrier
             return outcome
 
         hooks = ArmRuntimeHooks(

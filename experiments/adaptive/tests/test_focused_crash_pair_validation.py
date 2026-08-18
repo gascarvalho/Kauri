@@ -785,7 +785,9 @@ def _v3_progress_events(contract: Mapping[str, object]) -> list[dict[str, object
             "event_type": "adaptive.configuration_active",
             "payload": {
                 "epoch_number": 0,
-                "tree_id": members[(members.index(starting_tree) + position) % len(members)],
+                "tree_id": members[
+                    (members.index(starting_tree) + position) % len(members)
+                ],
                 "epoch_digest": digest,
             },
         }
@@ -828,7 +830,11 @@ def test_v3_progress_witness_is_recomputed_from_exact_authoritative_commits(
     validation = _validation()
     contract = _v3_progress_contract(tmp_path)
     progress = validation._fcrash_h_postfault_progress(
-        contract, _v3_progress_events(contract), fault_ns=100, audit_ns=200
+        contract,
+        _v3_progress_events(contract),
+        fault_ns=100,
+        prefault_ns=100,
+        audit_ns=200,
     )
     assert progress == {
         "required_tree_positions": 6,
@@ -836,6 +842,22 @@ def test_v3_progress_witness_is_recomputed_from_exact_authoritative_commits(
         "starting_tree_id": 6,
         "observed_tree_ids": [6, 0, 1, 2, 3, 4],
     }
+
+
+def test_v3_progress_ignores_configuration_after_signal_request(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    contract = _v3_progress_contract(tmp_path)
+    events = _v3_progress_events(contract)
+    between_request_and_confirmation = deepcopy(events[3])
+    between_request_and_confirmation["source_sequence"] = 4
+    between_request_and_confirmation["source_monotonic_ns"] = 99
+    events.append(between_request_and_confirmation)
+    progress = validation._fcrash_h_postfault_progress(
+        contract, events, fault_ns=100, prefault_ns=95, audit_ns=200
+    )
+    assert progress["starting_tree_id"] == 6
 
 
 @pytest.mark.parametrize(
@@ -879,7 +901,7 @@ def test_v3_progress_witness_rejects_non_authoritative_or_insufficient_raw_commi
         target["source_sequence"] = 1
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation._fcrash_h_postfault_progress(
-            contract, events, fault_ns=100, audit_ns=200
+            contract, events, fault_ns=100, prefault_ns=100, audit_ns=200
         )
 
 
@@ -895,8 +917,35 @@ def test_v3_progress_witness_rejects_duplicate_cyclic_configuration(
     events.append(duplicate)
     with pytest.raises(validation.FocusedCrashPairValidationError, match="cyclic"):
         validation._fcrash_h_postfault_progress(
-            contract, events, fault_ns=100, audit_ns=200
+            contract, events, fault_ns=100, prefault_ns=100, audit_ns=200
         )
+
+
+def test_sealed_prefault_barrier_uses_source_sequence_when_timestamps_tie(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    contract = _v3_progress_contract(tmp_path)
+    events: list[dict[str, object]] = []
+    active_tree = int(contract["reporter_coverage_plan"]["active_tree_id"])
+    for replica in contract["members"]:
+        for sequence, tree in ((1, active_tree), (2, 0)):
+            events.append(
+                {
+                    "source_kind": "replica",
+                    "source_id": f"replica-{replica}",
+                    "source_monotonic_ns": 1,
+                    "source_sequence": sequence,
+                    "event_type": "adaptive.configuration_active",
+                    "payload": {
+                        "epoch_number": 0,
+                        "tree_id": tree,
+                        "epoch_digest": contract["epoch_zero_digest"],
+                    },
+                }
+            )
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._validate_prefault_active_configuration(contract, events, fault_ns=2)
 
 
 def test_validator_uses_no_n31_specific_fault_or_blinding_helper() -> None:

@@ -120,9 +120,10 @@ def _authoritative_lifecycle_instance(
         if event.get("event_type") in {"process.started", "process.ready"}
         and event.get("source_id") == expected_source
     ]
-    if len(lifecycle) != 2 or {
-        event.get("event_type") for event in lifecycle
-    } != {"process.started", "process.ready"}:
+    if len(lifecycle) != 2 or {event.get("event_type") for event in lifecycle} != {
+        "process.started",
+        "process.ready",
+    }:
         _error("sealed authoritative progress lacks an exact lifecycle binding")
     if any(event.get("source_kind") != "replica" for event in lifecycle):
         _error("sealed authoritative progress lifecycle kind drifted")
@@ -334,8 +335,10 @@ def _derive_reporter_coverage_plan(
         "minimum_timeouts_per_reporter": 2,
         "minimum_score_drop": 2 * required,
         **(
-            {"required_postfault_tree_positions": horizon,
-             "nominal_commit_horizon": horizon * expected_period}
+            {
+                "required_postfault_tree_positions": horizon,
+                "nominal_commit_horizon": horizon * expected_period,
+            }
             if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS
             else {}
         ),
@@ -507,12 +510,17 @@ def validate_fcrash_h_evidence(
             "starting_tree_id",
             "observed_tree_ids",
         } or (
-            _integer(progress.get("required_tree_positions"), "progress required count", 1)
+            _integer(
+                progress.get("required_tree_positions"), "progress required count", 1
+            )
             != required_count
-            or _integer(progress.get("actual_tree_positions"), "progress actual count", 1)
+            or _integer(
+                progress.get("actual_tree_positions"), "progress actual count", 1
+            )
             < required_count
             or not isinstance(progress.get("observed_tree_ids"), list)
-            or len(progress["observed_tree_ids"]) != _integer(
+            or len(progress["observed_tree_ids"])
+            != _integer(
                 progress.get("actual_tree_positions"), "progress actual count", 1
             )
         ):
@@ -524,6 +532,7 @@ def _fcrash_h_postfault_progress(
     events: Sequence[Mapping[str, Any]],
     *,
     fault_ns: int,
+    prefault_ns: int,
     audit_ns: int,
 ) -> dict[str, object]:
     """Independently reconstruct the v3 progress witness from sealed raw events."""
@@ -544,16 +553,24 @@ def _fcrash_h_postfault_progress(
     expected_digest = str(contract["epoch_zero_digest"])
     members = tuple(int(member) for member in contract["members"])
     start_events = [
-        event for event in events
+        event
+        for event in events
         if event["source_kind"] == "replica"
         and event["source_id"] == expected_source
         and event["source_instance"] == expected_instance
         and event["event_type"] == "adaptive.configuration_active"
-        and _integer(event["source_monotonic_ns"], "configuration timestamp") < fault_ns
+        and _integer(event["source_monotonic_ns"], "configuration timestamp")
+        < prefault_ns
     ]
     if not start_events:
         _error("sealed authoritative progress lacks a pre-fault configuration")
-    start = max(start_events, key=lambda event: int(event["source_monotonic_ns"]))
+    start = max(
+        start_events,
+        key=lambda event: (
+            _integer(event["source_sequence"], "configuration sequence", 1),
+            _integer(event["source_monotonic_ns"], "configuration timestamp"),
+        ),
+    )
     start_payload = _mapping(start["payload"], "pre-fault configuration")
     starting_tree = _integer(start_payload.get("tree_id"), "starting tree")
     if (
@@ -564,14 +581,20 @@ def _fcrash_h_postfault_progress(
         _error("sealed authoritative progress pre-fault configuration drifted")
     activations = sorted(
         [
-            event for event in events
+            event
+            for event in events
             if event["source_kind"] == "replica"
             and event["source_id"] == expected_source
             and event["source_instance"] == expected_instance
             and event["event_type"] == "adaptive.configuration_active"
-            and fault_ns < _integer(event["source_monotonic_ns"], "configuration timestamp") < audit_ns
+            and fault_ns
+            < _integer(event["source_monotonic_ns"], "configuration timestamp")
+            < audit_ns
         ],
-        key=lambda event: (_integer(event["source_sequence"], "configuration sequence", 1), _integer(event["source_monotonic_ns"], "configuration timestamp")),
+        key=lambda event: (
+            _integer(event["source_sequence"], "configuration sequence", 1),
+            _integer(event["source_monotonic_ns"], "configuration timestamp"),
+        ),
     )
     # The frozen horizon starts with the configuration already active at the
     # fault boundary; only H-1 later activations are required.
@@ -591,11 +614,13 @@ def _fcrash_h_postfault_progress(
     # Commit proofs may lag the current configuration by one tree while the
     # pipeline drains.  They must nevertheless be causally bound to either
     # the configuration active at the commit or its immediately preceding one.
-    configurations = [(
-        _integer(start["source_sequence"], "configuration sequence", 1),
-        _integer(start["source_monotonic_ns"], "configuration timestamp"),
-        starting_tree,
-    )] + [
+    configurations = [
+        (
+            _integer(start["source_sequence"], "configuration sequence", 1),
+            _integer(start["source_monotonic_ns"], "configuration timestamp"),
+            starting_tree,
+        )
+    ] + [
         (
             _integer(event["source_sequence"], "configuration sequence", 1),
             _integer(event["source_monotonic_ns"], "configuration timestamp"),
@@ -642,14 +667,21 @@ def _fcrash_h_postfault_progress(
             or proof.get("epoch_digest") != expected_digest
         ):
             _error("sealed authoritative progress commit invariants drifted")
-        commit_key = (_integer(event["source_sequence"], "progress source sequence", 1), timestamp)
+        commit_key = (
+            _integer(event["source_sequence"], "progress source sequence", 1),
+            timestamp,
+        )
         active_index = max(
-            (index for index, row in enumerate(configurations) if row[:2] <= commit_key),
+            (
+                index
+                for index, row in enumerate(configurations)
+                if row[:2] <= commit_key
+            ),
             default=-1,
         )
         if active_index < 0 or proof_tree not in {
             configurations[active_index][2],
-            *( [configurations[active_index - 1][2]] if active_index else [] ),
+            *([configurations[active_index - 1][2]] if active_index else []),
         }:
             _error("sealed authoritative progress commit is not causally activated")
     return {
@@ -680,6 +712,15 @@ def _fcrash_h_witness_from_events(
         )
     ]
     fault_ns = max(confirmations)
+    prefault_ns = min(
+        _integer(
+            _mapping(outcome, "SIGKILL outcome").get("requested_monotonic_ns"),
+            "fault request",
+        )
+        for outcome in _sequence(
+            fault_receipt.get("sigkill_outcomes"), "SIGKILL outcomes"
+        )
+    )
     audits = [
         event
         for event in events
@@ -835,6 +876,7 @@ def _fcrash_h_witness_from_events(
             contract,
             events,
             fault_ns=fault_ns,
+            prefault_ns=prefault_ns,
             audit_ns=_integer(
                 audits[0]["source_monotonic_ns"], "snapshot audit timestamp"
             ),
@@ -859,8 +901,12 @@ def _validate_prefault_active_configuration(
             continue
         replica = int(source_id.removeprefix("replica-"))
         previous = latest.get(replica)
-        if previous is None or int(event["source_monotonic_ns"]) > int(
-            previous["source_monotonic_ns"]
+        if previous is None or (
+            _integer(event["source_sequence"], "configuration sequence", 1),
+            _integer(event["source_monotonic_ns"], "configuration timestamp"),
+        ) > (
+            _integer(previous["source_sequence"], "configuration sequence", 1),
+            _integer(previous["source_monotonic_ns"], "configuration timestamp"),
         ):
             latest[replica] = event
     members = tuple(int(member) for member in contract["members"])
@@ -1747,8 +1793,7 @@ def _commit_reconstruction(
     commits = [event for event in events if event["event_type"] == "block.committed"]
     authoritative_source = str(contract["authoritative_source_id"])
     if len(commits) < 4 or any(
-        event["source_kind"] != "replica"
-        or event["source_id"] != authoritative_source
+        event["source_kind"] != "replica" or event["source_id"] != authoritative_source
         for event in commits
     ):
         _error("raw evidence lacks the minimum authoritative commit chain")
@@ -1761,7 +1806,8 @@ def _commit_reconstruction(
             _error("authoritative commit chain is not lifecycle-bound")
         config_events = sorted(
             [
-                event for event in events
+                event
+                for event in events
                 if event["event_type"] == "adaptive.configuration_active"
                 and event["source_kind"] == "replica"
                 and event["source_id"] == contract["authoritative_source_id"]
@@ -1796,13 +1842,17 @@ def _commit_reconstruction(
                 or tree != epoch_trees[epoch][expected_indexes[epoch]]
             ):
                 _error("authoritative cyclic configuration drifted")
-            configurations_by_epoch.setdefault(epoch, []).append((
+            configurations_by_epoch.setdefault(epoch, []).append(
                 (
-                    _integer(event["source_sequence"], "configuration sequence", 1),
-                    _integer(event["source_monotonic_ns"], "configuration timestamp"),
-                ),
-                tree,
-            ))
+                    (
+                        _integer(event["source_sequence"], "configuration sequence", 1),
+                        _integer(
+                            event["source_monotonic_ns"], "configuration timestamp"
+                        ),
+                    ),
+                    tree,
+                )
+            )
             expected_indexes[epoch] = (expected_indexes[epoch] + 1) % len(
                 epoch_trees[epoch]
             )
@@ -1810,9 +1860,17 @@ def _commit_reconstruction(
             _error("v3 authoritative commit chain lacks active epoch configurations")
     commits.sort(
         key=(
-            (lambda event: _integer(event["source_sequence"], "commit source sequence", 1))
+            (
+                lambda event: _integer(
+                    event["source_sequence"], "commit source sequence", 1
+                )
+            )
             if is_v3
-            else (lambda event: _integer(event["payload"].get("block_height"), "commit height", 1))
+            else (
+                lambda event: _integer(
+                    event["payload"].get("block_height"), "commit height", 1
+                )
+            )
         )
     )
     prior_hash: str | None = None
@@ -1883,7 +1941,9 @@ def _commit_reconstruction(
                 timeline[active_index][1],
                 *([timeline[active_index - 1][1]] if active_index else []),
             }:
-                _error("authoritative commit is not bound to an active or draining tree")
+                _error(
+                    "authoritative commit is not bound to an active or draining tree"
+                )
         prior_epoch = expected_epoch
         prior_hash = block_hash
         prior_height = height
@@ -2406,7 +2466,16 @@ def validate_sealed_arm(
     _validate_atomic_fault_receipt(contract, fault_receipt)
     if "reporter_coverage_plan" in contract:
         fault_ns = max(confirmations.values())
-        _validate_prefault_active_configuration(contract, events, fault_ns)
+        prefault_ns = min(
+            _integer(
+                _mapping(outcome, "SIGKILL outcome").get("requested_monotonic_ns"),
+                "fault request",
+            )
+            for outcome in _sequence(
+                fault_receipt["sigkill_outcomes"], "SIGKILL outcomes"
+            )
+        )
+        _validate_prefault_active_configuration(contract, events, prefault_ns)
         coverage_witness = _fcrash_h_witness_from_events(
             contract,
             events,
