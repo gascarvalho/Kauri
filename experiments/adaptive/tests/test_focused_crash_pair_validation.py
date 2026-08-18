@@ -2352,6 +2352,97 @@ def test_manager_clean_exit_requires_completed_native_transition_and_exact_tail(
     assert source.unexpected_exit_ids() == (-1,)
 
 
+def _clean_manager_source(directory: Path, *, returncode: int) -> object:
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = returncode
+    return runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager", replica_id=-1, process=process
+            ),
+        ),
+    )
+
+
+def test_manager_clean_exit_refreshes_one_stale_authenticated_snapshot(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    events = _load_events(directory)
+    terminal_sequence = next(
+        int(event["source_sequence"])
+        for event in events
+        if event["source_kind"] == "adaptation_manager"
+        and event["event_type"] == "adaptive_v2_session_terminal"
+    )
+    stale_events = [
+        event
+        for event in events
+        if not (
+            event["source_kind"] == "adaptation_manager"
+            and int(event["source_sequence"]) >= terminal_sequence
+        )
+    ]
+    assert (
+        _clean_manager_source(directory, returncode=0).unexpected_exit_ids(stale_events)
+        == ()
+    )
+
+
+@pytest.mark.parametrize("mutation", ("malformed-refresh", "nonzero-manager"))
+def test_manager_clean_exit_stale_snapshot_refresh_remains_fail_closed(
+    mutation: str, tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    events = _load_events(directory)
+    terminal_sequence = next(
+        int(event["source_sequence"])
+        for event in events
+        if event["source_kind"] == "adaptation_manager"
+        and event["event_type"] == "adaptive_v2_session_terminal"
+    )
+    stale_events = [
+        event
+        for event in events
+        if not (
+            event["source_kind"] == "adaptation_manager"
+            and int(event["source_sequence"]) >= terminal_sequence
+        )
+    ]
+    if mutation == "malformed-refresh":
+        stopped = next(
+            event
+            for event in events
+            if event["source_kind"] == "adaptation_manager"
+            and event["event_type"] == "process.stopped"
+        )
+        stopped["payload"] = {"exit_status": 0}
+        _write_events(directory, events)
+        returncode = 0
+    else:
+        returncode = 1
+    assert _clean_manager_source(directory, returncode=returncode).unexpected_exit_ids(
+        stale_events
+    ) == (-1,)
+
+
 def _append_benign_post_terminal_activation_acknowledgements(
     directory: Path,
 ) -> list[dict[str, object]]:

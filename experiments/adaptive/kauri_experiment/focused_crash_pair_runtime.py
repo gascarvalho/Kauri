@@ -4159,8 +4159,23 @@ class FocusedRawEvidenceSource:
             if returncode is None:
                 continue
             if replica == -1:
-                if not self._manager_clean_exit_is_expected(events, record):
-                    unexpected.add(replica)
+                if self._manager_clean_exit_is_expected(events, record):
+                    continue
+                # The aggregate replay reads the manager stream before the
+                # replica streams.  The manager can finish its acknowledged
+                # drain while that replay is still parsing the remaining
+                # sources, leaving this otherwise authenticated snapshot short
+                # of the terminal drain or final process lifecycle.  Refresh
+                # once at the exact rc=0 manager boundary and validate the
+                # entire raw graph again.  Nonzero exits and malformed
+                # refreshed evidence remain fatal.
+                if returncode == 0:
+                    refreshed = self._events()
+                    self._reject_post_fault_target_events(refreshed)
+                    if self._manager_clean_exit_is_expected(refreshed, record):
+                        unexpected.update(self.unexpected_exit_ids(refreshed))
+                        continue
+                unexpected.add(replica)
                 continue
             if replica < 0 or replica not in self._profile.target_replica_ids:
                 unexpected.add(replica)
