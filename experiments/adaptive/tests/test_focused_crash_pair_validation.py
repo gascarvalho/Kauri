@@ -2352,6 +2352,257 @@ def test_manager_clean_exit_requires_completed_native_transition_and_exact_tail(
     assert source.unexpected_exit_ids() == (-1,)
 
 
+def _append_benign_post_terminal_activation_acknowledgements(
+    directory: Path,
+) -> list[dict[str, object]]:
+    """Model the native post-terminal acknowledgment drain without new evidence."""
+
+    events = _load_events(directory)
+    manager_events = [
+        event for event in events if event["source_kind"] == "adaptation_manager"
+    ]
+    terminal = [
+        event
+        for event in manager_events
+        if event["event_type"] == "adaptive_v2_session_terminal"
+    ][-1]
+    stopping = next(
+        event for event in manager_events if event["event_type"] == "process.stopping"
+    )
+    stopped = next(
+        event for event in manager_events if event["event_type"] == "process.stopped"
+    )
+    events.remove(stopping)
+    events.remove(stopped)
+    winning = deepcopy(terminal["payload"]["winning_activation"])
+    sequence = int(terminal["source_sequence"])
+    timestamp = int(terminal["source_monotonic_ns"])
+    acknowledgements: list[dict[str, object]] = []
+    for replica_id in (30, 21, 5, 29, 3, 4, 0, 7, 6):
+        for disposition in ("duplicate", "ack_sent"):
+            sequence += 1
+            timestamp += 1
+            acknowledgements.append(
+                {
+                    **terminal,
+                    "source_sequence": sequence,
+                    "source_monotonic_ns": timestamp,
+                    "event_type": "adaptive_v2_activation_observed",
+                    "payload": {
+                        "replica_id": replica_id,
+                        "delivery_attempt": None,
+                        "disposition": disposition,
+                        "identity": deepcopy(winning),
+                        "accepted_commit_count": 28,
+                        "accepted_activation_count": 21,
+                        "required_activation_count": 21,
+                        "canonical_payload_digest": "e" * 64,
+                        "failure_reason": None,
+                    },
+                }
+            )
+    events.extend(acknowledgements)
+    for tail in (stopping, stopped):
+        sequence += 1
+        timestamp += 1
+        tail["source_sequence"] = sequence
+        tail["source_monotonic_ns"] = timestamp
+        events.append(tail)
+    _write_events(directory, events)
+    return acknowledgements
+
+
+def test_manager_clean_exit_allows_only_benign_activation_ack_drain(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    acknowledgements = _append_benign_post_terminal_activation_acknowledgements(
+        directory
+    )
+    assert len(acknowledgements) == 18
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager", replica_id=-1, process=process
+            ),
+        ),
+    )
+    assert source.unexpected_exit_ids() == ()
+
+
+def test_manager_clean_exit_allows_repeated_partial_and_failed_ack_drain(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    _append_benign_post_terminal_activation_acknowledgements(directory)
+    events = _load_events(directory)
+    suffix = [
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v2_activation_observed"
+    ]
+    for event in suffix:
+        event["payload"]["accepted_commit_count"] = 0
+    for event in suffix[2:4]:
+        event["payload"]["replica_id"] = suffix[0]["payload"]["replica_id"]
+    suffix[1]["payload"]["disposition"] = "ack_send_failed"
+    _write_events(directory, events)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager", replica_id=-1, process=process
+            ),
+        ),
+    )
+    assert source.unexpected_exit_ids() == ()
+
+
+def test_adaptive_manager_clean_exit_allows_final_cycle_activation_ack_drain(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory, epochs=(1, 2))
+    _append_benign_post_terminal_activation_acknowledgements(directory)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager", replica_id=-1, process=process
+            ),
+        ),
+    )
+    assert source.unexpected_exit_ids() == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "malformed",
+        "new-identity",
+        "accepted",
+        "target-replica",
+        "count-overflow",
+        "pair-mismatch",
+        "converged",
+        "snapshot",
+        "evidence",
+        "terminal",
+    ),
+)
+def test_manager_clean_exit_rejects_substantive_post_terminal_events(
+    mutation: str, tmp_path: Path
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    acknowledgements = _append_benign_post_terminal_activation_acknowledgements(
+        directory
+    )
+    events = _load_events(directory)
+    suffix = [
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v2_activation_observed"
+    ]
+    if mutation == "malformed":
+        del suffix[0]["payload"]["identity"]
+    elif mutation == "new-identity":
+        suffix[0]["payload"]["identity"]["successor_epoch_digest"] = "f" * 64
+    elif mutation == "accepted":
+        suffix[0]["payload"]["disposition"] = "accepted"
+    elif mutation == "target-replica":
+        for event in suffix[:2]:
+            event["payload"]["replica_id"] = 22
+    elif mutation == "count-overflow":
+        for event in suffix[:2]:
+            event["payload"]["accepted_commit_count"] = 29
+    elif mutation == "pair-mismatch":
+        suffix[1]["payload"]["canonical_payload_digest"] = "f" * 64
+    else:
+        terminal = next(
+            event
+            for event in events
+            if event["event_type"] == "adaptive_v2_session_terminal"
+        )
+        injected = deepcopy(terminal)
+        injected["source_sequence"] = (
+            max(
+                int(event["source_sequence"])
+                for event in events
+                if event["source_kind"] == "adaptation_manager"
+            )
+            + 1
+        )
+        injected["source_monotonic_ns"] = (
+            max(
+                int(event["source_monotonic_ns"])
+                for event in events
+                if event["source_kind"] == "adaptation_manager"
+            )
+            + 1
+        )
+        injected["event_type"] = {
+            "converged": "adaptive_v2_converged",
+            "snapshot": "adaptive_v2_evidence_snapshot",
+            "evidence": "evidence.observation_accepted",
+            "terminal": "adaptive_v2_session_terminal",
+        }[mutation]
+        events.append(injected)
+    _write_events(directory, events)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    source = runtime_fixture._runtime().FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager", replica_id=-1, process=process
+            ),
+        ),
+    )
+    assert source.unexpected_exit_ids() == (-1,)
+
+
 def test_raw_poll_reuses_its_single_event_read_for_exit_health(tmp_path: Path) -> None:
     plan = fixture._plan(fixture._runner())
     child = next(

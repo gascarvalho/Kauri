@@ -3764,8 +3764,7 @@ class FocusedRawEvidenceSource:
             ]
             if len(terminals) != len(expected_epochs):
                 return False
-            if [event["event_type"] for event in manager_events[-3:]] != [
-                "adaptive_v2_session_terminal",
+            if [event["event_type"] for event in manager_events[-2:]] != [
                 "process.stopping",
                 "process.stopped",
             ]:
@@ -3776,15 +3775,23 @@ class FocusedRawEvidenceSource:
                 for event in manager_events[-2:]
             ):
                 return False
-            if [int(event["source_sequence"]) for event in manager_events[-3:]] != list(
+            final_terminal = terminals[-1]
+            final_terminal_index = next(
+                index
+                for index, event in enumerate(manager_events)
+                if event is final_terminal
+            )
+            terminal_tail = manager_events[final_terminal_index:]
+            if [int(event["source_sequence"]) for event in terminal_tail] != list(
                 range(
-                    int(manager_events[-3]["source_sequence"]),
-                    int(manager_events[-3]["source_sequence"]) + 3,
+                    int(final_terminal["source_sequence"]),
+                    int(final_terminal["source_sequence"]) + len(terminal_tail),
                 )
             ):
                 return False
+            acknowledgement_tail = terminal_tail[1:-2]
             for epoch, terminal in zip(expected_epochs, terminals, strict=True):
-                if epoch == expected_epochs[-1] and terminal != manager_events[-3]:
+                if epoch == expected_epochs[-1] and terminal is not final_terminal:
                     return False
                 payload = _document(terminal["payload"], "manager terminal")
                 if (
@@ -3924,6 +3931,150 @@ class FocusedRawEvidenceSource:
                     )
                 ):
                     return False
+                if epoch == expected_epochs[-1]:
+                    if len(acknowledgement_tail) % 2 != 0:
+                        return False
+                    expected_winning = {
+                        **{
+                            key: (
+                                _digest(
+                                    winning.get(key),
+                                    f"manager winning {key}",
+                                )
+                                if key
+                                in {
+                                    "predecessor_epoch_digest",
+                                    "successor_epoch_digest",
+                                    "command_payload_digest",
+                                    "command_block_hash",
+                                }
+                                else winning.get(key)
+                            )
+                            for key in winning_keys
+                            if key not in winning_numeric
+                        },
+                        **winning_numeric,
+                    }
+                    for index in range(0, len(acknowledgement_tail), 2):
+                        duplicate = acknowledgement_tail[index]
+                        acknowledged = acknowledgement_tail[index + 1]
+                        if (
+                            duplicate["event_type"] != "adaptive_v2_activation_observed"
+                            or acknowledged["event_type"]
+                            != "adaptive_v2_activation_observed"
+                        ):
+                            return False
+                        normalized_payloads: list[dict[str, object]] = []
+                        for observed in (duplicate, acknowledged):
+                            observed_payload = _document(
+                                observed["payload"],
+                                "manager post-terminal activation acknowledgement",
+                            )
+                            if set(observed_payload) != {
+                                "replica_id",
+                                "delivery_attempt",
+                                "disposition",
+                                "identity",
+                                "accepted_commit_count",
+                                "accepted_activation_count",
+                                "required_activation_count",
+                                "canonical_payload_digest",
+                                "failure_reason",
+                            }:
+                                return False
+                            replica_id = _integer(
+                                observed_payload.get("replica_id"),
+                                "manager post-terminal activation replica",
+                                0,
+                            )
+                            identity = _document(
+                                observed_payload.get("identity"),
+                                "manager post-terminal activation identity",
+                            )
+                            if set(identity) != winning_keys:
+                                return False
+                            normalized_identity = {
+                                key: (
+                                    _integer(
+                                        identity.get(key),
+                                        f"manager post-terminal activation {key}",
+                                        0,
+                                    )
+                                    if key
+                                    in {
+                                        "predecessor_epoch_number",
+                                        "successor_epoch_number",
+                                        "command_block_height",
+                                        "activation_delay_blocks",
+                                        "activation_height",
+                                    }
+                                    else _digest(
+                                        identity.get(key),
+                                        f"manager post-terminal activation {key}",
+                                    )
+                                )
+                                for key in winning_keys
+                            }
+                            normalized_payloads.append(
+                                {
+                                    "replica_id": replica_id,
+                                    "delivery_attempt": observed_payload.get(
+                                        "delivery_attempt"
+                                    ),
+                                    "disposition": observed_payload.get("disposition"),
+                                    "identity": normalized_identity,
+                                    "accepted_commit_count": _integer(
+                                        observed_payload.get("accepted_commit_count"),
+                                        "manager post-terminal accepted commits",
+                                        0,
+                                    ),
+                                    "accepted_activation_count": _integer(
+                                        observed_payload.get(
+                                            "accepted_activation_count"
+                                        ),
+                                        "manager post-terminal accepted activations",
+                                        0,
+                                    ),
+                                    "required_activation_count": _integer(
+                                        observed_payload.get(
+                                            "required_activation_count"
+                                        ),
+                                        "manager post-terminal required activations",
+                                        1,
+                                    ),
+                                    "canonical_payload_digest": _digest(
+                                        observed_payload.get(
+                                            "canonical_payload_digest"
+                                        ),
+                                        "manager post-terminal payload digest",
+                                    ),
+                                    "failure_reason": observed_payload.get(
+                                        "failure_reason"
+                                    ),
+                                }
+                            )
+                        first, second = normalized_payloads
+                        replica_id = int(first["replica_id"])
+                        if (
+                            first["disposition"] != "duplicate"
+                            or second["disposition"]
+                            not in {"ack_sent", "ack_send_failed"}
+                            or {**first, "disposition": None}
+                            != {**second, "disposition": None}
+                            or replica_id not in self._profile.replica_ids
+                            or replica_id in self._profile.target_replica_ids
+                            or first["delivery_attempt"] is not None
+                            or first["identity"] != expected_winning
+                            or first["accepted_commit_count"]
+                            > len(self._profile.replica_ids)
+                            - len(self._profile.target_replica_ids)
+                            or first["accepted_activation_count"]
+                            != self._profile.quorum
+                            or first["required_activation_count"]
+                            != self._profile.quorum
+                            or first["failure_reason"] is not None
+                        ):
+                            return False
                 command_payload = {
                     key: command[key]
                     for key in (
