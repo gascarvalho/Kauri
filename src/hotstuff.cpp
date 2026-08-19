@@ -3149,6 +3149,8 @@ namespace hotstuff
                     }
 
                     bool relay_exposure_attempted = false;
+                    RetainedCommitEventIdentityRollback
+                        retained_identity_rollback{};
                     try
                     {
                         const auto gate =
@@ -3214,14 +3216,16 @@ namespace hotstuff
                             owner.relay_once(deferred);
                         }
 
-                        const bool proposal_accepted =
-                            owner.on_receive_proposal(parsed);
                         if (owner.epoch_protocol_mode ==
                             EpochProtocolMode::adaptive_v2)
                             static_cast<void>(
-                                owner.retain_commit_event_identity(
-                                    metadata.key,
-                                    deferred.view_generation));
+                                owner.
+                                    retain_authenticated_proposal_commit_event_identities(
+                                        parsed,
+                                        deferred.view_generation,
+                                        &retained_identity_rollback));
+                        const bool proposal_accepted =
+                            owner.on_receive_proposal(parsed);
                         if (proposal_accepted)
                         {
                             owner.pmaker->record_verified_progress(
@@ -3262,6 +3266,8 @@ namespace hotstuff
                     }
                     catch (const std::exception &error)
                     {
+                        owner.rollback_retained_commit_event_identity_mutations(
+                            retained_identity_rollback);
                         if (relay_exposure_attempted)
                             owner.mark_adaptive_v2_convergence_evidence_unhealthy(
                                 "proposal_processing_failed_after_exposure");
@@ -3279,6 +3285,8 @@ namespace hotstuff
                     }
                     catch (...)
                     {
+                        owner.rollback_retained_commit_event_identity_mutations(
+                            retained_identity_rollback);
                         if (relay_exposure_attempted)
                             owner.mark_adaptive_v2_convergence_evidence_unhealthy(
                                 "proposal_processing_failed_after_exposure");
@@ -12761,6 +12769,130 @@ namespace hotstuff
             // Retention is evidence-only. Consensus remains live while the
             // later commit event fails closed as unavailable/conflicting.
             return false;
+        }
+    }
+
+    bool HotStuffBase::has_adjacent_proposal_commit_event_bridge_heights(
+        std::uint32_t alternate_height,
+        std::uint32_t skipped_height,
+        std::uint32_t certifier_height) noexcept
+    {
+        return alternate_height !=
+                   std::numeric_limits<std::uint32_t>::max() &&
+               skipped_height == alternate_height + 1 &&
+               skipped_height !=
+                   std::numeric_limits<std::uint32_t>::max() &&
+               certifier_height == skipped_height + 1;
+    }
+
+    bool HotStuffBase::retain_authenticated_proposal_commit_event_identities(
+        const Proposal &proposal,
+        std::uint64_t generation,
+        RetainedCommitEventIdentityRollback *rollback) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            generation == 0 || proposal.blk == nullptr ||
+            proposal.key().block_hash != proposal.blk->get_hash())
+            return false;
+
+        const auto retain_owned = [this, generation, rollback](
+            const ProposalKey &key) noexcept {
+            const bool absent_before =
+                retained_commit_event_identities.find(key.block_hash) ==
+                retained_commit_event_identities.end();
+            if (!retain_commit_event_identity(key, generation))
+                return false;
+            if (absent_before && rollback != nullptr &&
+                rollback->owned_mutation_count <
+                    rollback->owned_mutations.size())
+                rollback->owned_mutations[
+                    rollback->owned_mutation_count++] =
+                    RetainedCommitEventIdentityOwnedMutation{
+                        key.block_hash, key, generation};
+            return true;
+        };
+
+        if (!retain_owned(proposal.key()))
+            return false;
+
+        try
+        {
+            const auto &certifier = proposal.blk;
+            if (certifier->parents.size() != 1)
+                return true;
+            const auto &skipped = certifier->parents.front();
+            if (skipped == nullptr || skipped->parents.size() != 1)
+                return true;
+            const auto &alternate = skipped->parents.front();
+            if (alternate == nullptr || certifier->qc_ref != alternate ||
+                !has_adjacent_proposal_commit_event_bridge_heights(
+                    alternate->height,
+                    skipped->height,
+                    certifier->height) ||
+                !has_verified_legal_qc_skip(certifier, skipped))
+                return true;
+
+            const auto &alternate_key =
+                certifier->qc->get_proposal_key();
+            const auto &certifier_key = proposal.key();
+            const auto alternate_ingress =
+                authenticated_proposal_ingress.find(alternate_key);
+            const auto certifier_ingress =
+                authenticated_proposal_ingress.find(certifier_key);
+            if (alternate_ingress == authenticated_proposal_ingress.end() ||
+                certifier_ingress == authenticated_proposal_ingress.end() ||
+                alternate_key.configuration !=
+                    certifier_key.configuration ||
+                alternate_ingress->second.view_generation != generation ||
+                certifier_ingress->second.view_generation != generation)
+                return true;
+
+            const ProposalKey skipped_key{
+                certifier_key.configuration,
+                skipped->get_hash()};
+            // This bridge is deliberately evidence-only. The verified QC
+            // carries the alternate's exact key, while both endpoints still
+            // have authenticated ingress for the same configuration and
+            // generation. The recovered key never enters proposal admission,
+            // cadence, rotation, or consensus identity state.
+            return retain_owned(skipped_key);
+        }
+        catch (...)
+        {
+            // The outer authenticated proposal remains retained. Failure to
+            // recover its skipped parent only reduces event completeness.
+            return true;
+        }
+    }
+
+    void HotStuffBase::rollback_retained_commit_event_identity_mutations(
+        const RetainedCommitEventIdentityRollback &rollback) noexcept
+    {
+        try
+        {
+            for (std::size_t index = 0;
+                 index < rollback.owned_mutation_count &&
+                 index < rollback.owned_mutations.size();
+                 ++index)
+            {
+                const auto &owned = rollback.owned_mutations[index];
+                const auto retained = retained_commit_event_identities.find(
+                    owned.block_hash);
+                if (retained == retained_commit_event_identities.end() ||
+                    !retained->second.key.has_value() ||
+                    !retained->second.view_generation.has_value() ||
+                    *retained->second.key != owned.key ||
+                    *retained->second.view_generation !=
+                        owned.view_generation)
+                    continue;
+                retained_commit_event_identities.erase(retained);
+            }
+        }
+        catch (...)
+        {
+            // Rollback is evidence-only. A failure can only leave bounded
+            // retained state that remains subject to normal capacity and
+            // epoch-retirement rules.
         }
     }
 

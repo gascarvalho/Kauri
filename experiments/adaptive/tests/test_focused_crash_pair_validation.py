@@ -813,6 +813,52 @@ def test_validator_contract_is_derived_from_each_focused_profile(
 
 
 @pytest.mark.parametrize(
+    ("version", "coverage_schema"),
+    (
+        (1, "absent"),
+        (2, "first_qualifying_reporters"),
+        (3, "first_qualifying_reporters"),
+        (4, "first_qualifying_reporters"),
+        (5, "first_qualifying_reporters"),
+        (6, "first_qualifying_reporters"),
+        (7, "first_qualifying_reporters"),
+        (8, "eligible_reporters"),
+    ),
+)
+def test_archived_n7_reporter_coverage_schema_is_preserved(
+    version: int,
+    coverage_schema: str,
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    profile_path = (
+        runtime_fixture.PROFILE_ROOT
+        / f"n7-f2-q5-two-crash-pair-smoke-v{version}.json"
+    )
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    proof_source = runtime_fixture._topology_proof_path(profile_path, profile)
+    root = tmp_path / f"v{version}"
+    proof_path = root / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True, exist_ok=True)
+    proof_path.write_bytes(proof_source.read_bytes())
+    _write_json(root / "profile.json", profile)
+
+    contract = _document(validation.validation_contract_from_profile(root))
+    if coverage_schema == "absent":
+        assert "reporter_coverage_plan" not in contract
+        return
+    targets = contract["reporter_coverage_plan"]["targets"]
+    assert targets
+    assert all(coverage_schema in target for target in targets)
+    rejected_schema = (
+        "eligible_reporters"
+        if coverage_schema == "first_qualifying_reporters"
+        else "first_qualifying_reporters"
+    )
+    assert all(rejected_schema not in target for target in targets)
+
+
+@pytest.mark.parametrize(
     "profile_path",
     (
         runtime_fixture.N31_PROFILE_V5,
@@ -1859,6 +1905,75 @@ def _n7_v6_mixed_timeout_guard_fixture() -> (
                 }
             )
     return contract, events, {"source_monotonic_ns": 40_000, "source_sequence": 100}
+
+
+@pytest.mark.parametrize(
+    "profile_path", (runtime_fixture.N7_PROFILE_V9, runtime_fixture.N7_PROFILE_V10)
+)
+def test_v9_v10_source_blind_replay_uses_proof_bound_guarded_relations(
+    profile_path: Path,
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    proof_source = runtime_fixture._topology_proof_path(profile_path, profile)
+    root = tmp_path / profile_path.stem
+    proof_path = root / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True, exist_ok=True)
+    proof_path.write_bytes(proof_source.read_bytes())
+    _write_json(root / "profile.json", profile)
+    contract = _document(validation.validation_contract_from_profile(root))
+    coverage = contract["reporter_coverage_plan"]
+    assert coverage["reporter_coverage_capacity"] == profile["topology"][
+        "reporter_coverage_capacity"
+    ]
+    assert all(
+        "first_qualifying_reporters" not in target for target in coverage["targets"]
+    )
+
+    _archived_contract, events, audit = _n7_v6_mixed_timeout_guard_fixture()
+    rows, drawdowns, _latest = validation._v4_replay_fault_window_anchors(
+        contract,
+        events,
+        baseline_cutoff=0,
+        current_cutoff=12,
+        audit=audit,
+        guarded_targets=(0, 1),
+    )
+    assert len(rows) == 12
+    assert drawdowns == {"0": -6, "1": -6}
+
+    # A topology-valid relation that is absent from the proof-bound coverage
+    # document cannot enter the source-blind witness.
+    rebound = deepcopy(contract)
+    target_zero = next(
+        target
+        for target in rebound["reporter_coverage_plan"]["targets"]
+        if target["target_replica_id"] == 0
+    )
+    target_zero["eligible_reporters"] = [
+        reporter
+        for reporter in target_zero["eligible_reporters"]
+        if reporter["reporter_id"] != 6
+    ]
+    rows, _drawdowns, _latest = validation._v4_replay_fault_window_anchors(
+        rebound,
+        events,
+        baseline_cutoff=0,
+        current_cutoff=12,
+        audit=audit,
+        guarded_targets=(0, 1),
+    )
+    assert len(rows) == 10
+    assert (0, 6, 6, "aggregate_relay") not in {
+        (
+            row["observed_replica_id"],
+            row["reporter_id"],
+            row["tree_id"],
+            row["expected_message_type"],
+        )
+        for row in rows
+    }
 
 
 def test_sealed_v6_witness_replays_profile_targets_without_contract_key_drift(

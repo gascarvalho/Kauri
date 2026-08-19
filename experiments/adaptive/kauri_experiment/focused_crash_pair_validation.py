@@ -1659,14 +1659,14 @@ def _v4_replay_fault_window_anchors(
         _error("v4 proposal-anchor replay lacks a frozen eligible-tree anchor")
     anchored_keys = frozenset(key for keys in anchors.values() for key in keys)
 
-    v8_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
-    if is_v8 and not is_v9:
+    proof_bound_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
+    if is_v8:
         for row in _sequence(coverage.get("targets"), "coverage targets"):
             target = _integer(
                 _mapping(row, "coverage target").get("target_replica_id"),
                 "coverage target",
             )
-            v8_relations[target] = {
+            proof_bound_relations[target] = {
                 _integer(reporter.get("reporter_id"), "coverage reporter"): {
                     (
                         _integer(relation.get("tree_id"), "coverage tree"),
@@ -1923,9 +1923,8 @@ def _v4_replay_fault_window_anchors(
             )
             or (
                 is_v8
-                and not is_v9
                 and (key[1], expected_message_type)
-                not in v8_relations.get(target, {}).get(reporter, set())
+                not in proof_bound_relations.get(target, {}).get(reporter, set())
             )
             or (not is_v8 and expected_trees.get((target, reporter)) != key[1])
         ):

@@ -16,6 +16,9 @@ namespace hotstuff
 class ExperimentByzantineRuntimeIntegrationTestAccess final
 {
 public:
+    using RetainedIdentityRollback =
+        HotStuffBase::RetainedCommitEventIdentityRollback;
+
     struct CachedCommitIdentity
     {
         std::optional<ProposalKey> key;
@@ -76,6 +79,91 @@ public:
         return runtime.retain_commit_event_identity(key, generation);
     }
 
+    static bool retain_authenticated_proposal_commit_event_identities(
+        HotStuffBase &runtime,
+        const Proposal &proposal,
+        std::uint64_t generation,
+        RetainedIdentityRollback *rollback = nullptr)
+    {
+        return runtime.retain_authenticated_proposal_commit_event_identities(
+            proposal, generation, rollback);
+    }
+
+    static void rollback_retained_commit_event_identity_mutations(
+        HotStuffBase &runtime,
+        const RetainedIdentityRollback &rollback)
+    {
+        runtime.rollback_retained_commit_event_identity_mutations(rollback);
+    }
+
+    static std::size_t retained_commit_event_identity_count(
+        const HotStuffBase &runtime)
+    {
+        return runtime.retained_commit_event_identities.size();
+    }
+
+    static void replace_retained_commit_event_identity(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::uint64_t generation)
+    {
+        runtime.retained_commit_event_identities.insert_or_assign(
+            key.block_hash,
+            HotStuffBase::RetainedCommitEventIdentity{
+                key,
+                generation,
+                key.configuration.epoch_number});
+    }
+
+    static bool retained_commit_event_identity_is_exact(
+        const HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::uint64_t generation)
+    {
+        const auto retained = runtime.retained_commit_event_identities.find(
+            key.block_hash);
+        return retained != runtime.retained_commit_event_identities.end() &&
+               retained->second.key == key &&
+               retained->second.view_generation == generation;
+    }
+
+    static bool retained_commit_event_identity_is_conflict(
+        const HotStuffBase &runtime,
+        const uint256_t &block_hash)
+    {
+        const auto retained = runtime.retained_commit_event_identities.find(
+            block_hash);
+        return retained != runtime.retained_commit_event_identities.end() &&
+               !retained->second.key.has_value() &&
+               !retained->second.view_generation.has_value();
+    }
+
+    static std::size_t rollback_owned_mutation_count(
+        const RetainedIdentityRollback &rollback)
+    {
+        return rollback.owned_mutation_count;
+    }
+
+    static bool has_retained_commit_event_identity(
+        const HotStuffBase &runtime,
+        const uint256_t &block_hash)
+    {
+        return runtime.retained_commit_event_identities.find(block_hash) !=
+               runtime.retained_commit_event_identities.end();
+    }
+
+    static bool has_adjacent_proposal_commit_event_bridge_heights(
+        std::uint32_t alternate_height,
+        std::uint32_t skipped_height,
+        std::uint32_t certifier_height)
+    {
+        return HotStuffBase::
+            has_adjacent_proposal_commit_event_bridge_heights(
+                alternate_height,
+                skipped_height,
+                certifier_height);
+    }
+
     static void forget_retained_commit_event_identities_before_epoch(
         HotStuffBase &runtime,
         std::uint32_t first_live_epoch)
@@ -101,6 +189,19 @@ public:
     {
         runtime.proposal_view_generations.insert_or_assign(
             key, generation);
+    }
+
+    static void seed_authenticated_proposal_ingress(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::uint64_t generation,
+        ReplicaID authenticated_proposal_source_replica)
+    {
+        runtime.authenticated_proposal_ingress.insert_or_assign(
+            key,
+            HotStuffBase::AuthenticatedProposalIngress{
+                generation,
+                authenticated_proposal_source_replica});
     }
 
     static void seed_physical_parent_ingress(
@@ -697,12 +798,60 @@ public:
         runtime.do_post_block_commit(block, commit_batch_index);
     }
 
+    static void verified_consensus_and_post(
+        HotStuffBase &runtime,
+        const block_t &block,
+        const quorum_cert_bt &verified_direct_certifier,
+        std::uint64_t commit_batch_index = 0)
+    {
+        runtime.do_consensus(block, verified_direct_certifier);
+        runtime.do_post_block_commit(block, commit_batch_index);
+    }
+
+    static block_t add_custom_commit_rule_block(
+        HotStuffBase &runtime,
+        const block_t &parent,
+        const block_t &qc_reference,
+        quorum_cert_bt certificate,
+        const std::string &label,
+        std::uint32_t height,
+        std::size_t transaction_count = 1,
+        int8_t decision = 0)
+    {
+        if (parent == nullptr || qc_reference == nullptr ||
+            certificate == nullptr || transaction_count == 0)
+            throw std::invalid_argument(
+                "custom commit-rule block is incomplete");
+        std::vector<uint256_t> commands;
+        commands.reserve(transaction_count);
+        for (std::size_t index = 0; index < transaction_count; ++index)
+            commands.push_back(DataStream(
+                label + "-" + std::to_string(index)).get_hash());
+        block_t block = new Block(
+            std::vector<block_t>{parent},
+            std::move(commands),
+            std::move(certificate),
+            bytearray_t{},
+            height,
+            qc_reference,
+            nullptr,
+            decision);
+        runtime.storage->add_blk(block);
+        if (!runtime.HotStuffCore::on_deliver_blk(block))
+            throw std::runtime_error(
+                "custom commit-rule block delivery failed");
+        return block;
+    }
+
     static block_t add_commit_rule_block(
         HotStuffBase &runtime,
         const ConfigurationId &configuration,
         const block_t &parent,
         const block_t &qc_reference,
-        const std::string &label)
+        const std::string &label,
+        std::size_t transaction_count = 1,
+        std::size_t signer_count = 3,
+        int8_t decision = 0)
     {
         if (parent == nullptr || qc_reference == nullptr)
             throw std::invalid_argument(
@@ -711,20 +860,17 @@ public:
             ? genesis_parent_certificate(runtime)
             : direct_certifier(
                   runtime,
-                  ProposalKey{configuration, qc_reference->get_hash()});
-        block_t block = new Block(
-            std::vector<block_t>{parent},
-            std::vector<uint256_t>{DataStream(label).get_hash()},
-            std::move(certificate),
-            bytearray_t{},
-            parent->get_height() + 1,
+                  ProposalKey{configuration, qc_reference->get_hash()},
+                  signer_count);
+        return add_custom_commit_rule_block(
+            runtime,
+            parent,
             qc_reference,
-            nullptr);
-        runtime.storage->add_blk(block);
-        if (!runtime.HotStuffCore::on_deliver_blk(block))
-            throw std::runtime_error(
-                "commit-rule block delivery failed");
-        return block;
+            std::move(certificate),
+            label,
+            parent->get_height() + 1,
+            transaction_count,
+            decision);
     }
 
     static void apply_update(HotStuffBase &runtime, const block_t &block)
@@ -2205,6 +2351,625 @@ TEST_CASE(
                 CHECK(*committed->parent_hash == blocks[index - 1]->get_hash());
             }
         }
+    }
+}
+
+TEST_CASE(
+    "committed alternate authentication survives synchronous skipped-parent recovery",
+    "[adaptive-v2][evidence][commit][identity-unavailable][qc-skip][proposal-bridge][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    EventContext event_context;
+    RelayRecordingHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    const bytearray_t issuer_secret(32, 1);
+    const PrivKeySecp256k1 issuer_key(issuer_secret);
+    runtime.configure_epoch_change_pre_vote_gate(
+        EpochChangeIssuer{17, PubKeySecp256k1(issuer_key)},
+        EpochChangeDelayBounds{1, 20},
+        4U * 1024U * 1024U,
+        64);
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    Access::reset_reporting_outbox(runtime, 4);
+    RecordingProtocolEmitter emitter;
+    runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+
+    const auto genesis = runtime.get_genesis();
+    const auto alternate = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        genesis,
+        genesis,
+        "live-order-alternate",
+        1,
+        3,
+        1);
+    const auto skipped = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        alternate,
+        genesis,
+        "live-order-skipped",
+        1000);
+    const auto certifier = Access::add_commit_rule_block(
+        runtime, configuration, skipped, alternate, "live-order-certifier");
+    const ProposalKey alternate_key{configuration, alternate->get_hash()};
+    const ProposalKey skipped_key{configuration, skipped->get_hash()};
+    constexpr std::uint64_t generation = 77;
+
+    Access::seed_view_generation(runtime, alternate_key, generation, 2);
+    REQUIRE(Access::retain_commit_event_identity(
+        runtime, alternate_key, generation));
+    REQUIRE(Access::admit_exact_context(runtime, alternate_key));
+    Access::seed_runtime_initialization(runtime, alternate_key);
+    Access::verified_consensus_and_post(
+        runtime,
+        alternate,
+        Access::direct_certifier(runtime, alternate_key));
+
+    // The exact alternate commit consumes both retained event state and the
+    // protocol generation index. Only authenticated ingress deliberately
+    // preserved through the response-evidence deadline remains available
+    // when the next proposal synchronously commits its skipped parent.
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, alternate->get_hash()));
+    CHECK_FALSE(Access::view_generation(runtime, alternate_key).has_value());
+    CHECK(Access::has_authenticated_proposal_ingress(
+        runtime, alternate_key));
+
+    // Exercise the production remote callback. It authenticates the
+    // certifier ingress and retains the evidence bridge before entering
+    // on_receive_proposal, so an immediately following commit can consume it.
+    const auto admitted = Access::receive_delayed_proposal(
+        runtime,
+        configuration,
+        0,
+        certifier,
+        generation);
+    REQUIRE(admitted.disposition == ProposalDisposition::admitted_active);
+    CHECK(runtime.relay_count() == 1);
+
+    REQUIRE(Access::has_authenticated_proposal_ingress(
+        runtime, ProposalKey{configuration, certifier->get_hash()}));
+    REQUIRE(Access::has_retained_commit_event_identity(
+        runtime, skipped_key.block_hash));
+
+    // Evidence-only recovery never populates the protocol/cadence generation
+    // index. The commit consumes only the retained event projection.
+    CHECK_FALSE(Access::view_generation(runtime, skipped_key).has_value());
+    const auto cached = Access::resolve_and_cache_commit(
+        runtime, skipped, {}, nullptr, true);
+    CHECK(cached.unavailable);
+    CHECK_FALSE(cached.conflicted);
+    REQUIRE(cached.event_key == skipped_key);
+    CHECK(cached.event_generation == generation);
+    CHECK_FALSE(cached.event_unavailable);
+    CHECK_FALSE(cached.event_conflicted);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, skipped_key.block_hash));
+    Access::report_and_post_commit(runtime, skipped);
+    REQUIRE(emitter.events.size() == 4);
+    CHECK(std::get_if<CommitObservedStructuredEvent>(&emitter.events[2]) !=
+          nullptr);
+    const auto *committed =
+        std::get_if<CommitStructuredEvent>(&emitter.events[3]);
+    REQUIRE(committed != nullptr);
+    CHECK(committed->decision_proof == skipped_key);
+    CHECK(committed->view_generation == generation);
+    CHECK(committed->transaction_count == 1000);
+}
+
+TEST_CASE(
+    "proposal evidence retention rolls back only its exact unconsumed mutations after processing throws",
+    "[adaptive-v2][evidence][commit][identity-unavailable][qc-skip][proposal-bridge][rollback][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    EventContext event_context;
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    const auto genesis = runtime.get_genesis();
+    constexpr std::uint64_t generation = 91;
+
+    const auto make_chain = [&](const std::string &label) {
+        const auto alternate = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            genesis,
+            genesis,
+            label + "-alternate");
+        const auto skipped = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            alternate,
+            genesis,
+            label + "-skipped");
+        const auto certifier = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            skipped,
+            alternate,
+            label + "-certifier");
+        return std::array<block_t, 3>{alternate, skipped, certifier};
+    };
+    const auto authenticate_endpoints = [&](
+        const std::array<block_t, 3> &chain) {
+        Access::seed_view_generation(
+            runtime,
+            ProposalKey{configuration, chain[0]->get_hash()},
+            generation,
+            2);
+        Access::seed_view_generation(
+            runtime,
+            ProposalKey{configuration, chain[2]->get_hash()},
+            generation,
+            3);
+    };
+    const auto proposal_for = [&](const block_t &certifier) {
+        return Proposal(
+            0,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            certifier,
+            nullptr);
+    };
+    const auto rollback_after_processing_exception = [&](
+        const Access::RetainedIdentityRollback &rollback) {
+        bool caught = false;
+        try
+        {
+            throw std::runtime_error(
+                "injected on_receive_proposal failure");
+        }
+        catch (const std::runtime_error &)
+        {
+            caught = true;
+            Access::rollback_retained_commit_event_identity_mutations(
+                runtime, rollback);
+        }
+        REQUIRE(caught);
+    };
+
+    const auto fresh = make_chain("rollback-fresh");
+    authenticate_endpoints(fresh);
+    const ProposalKey fresh_skipped{
+        configuration, fresh[1]->get_hash()};
+    const ProposalKey fresh_certifier{
+        configuration, fresh[2]->get_hash()};
+    Access::RetainedIdentityRollback fresh_rollback;
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        proposal_for(fresh[2]),
+        generation,
+        &fresh_rollback));
+    REQUIRE(Access::has_retained_commit_event_identity(
+        runtime, fresh_skipped.block_hash));
+    REQUIRE(Access::has_retained_commit_event_identity(
+        runtime, fresh_certifier.block_hash));
+    rollback_after_processing_exception(fresh_rollback);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, fresh_skipped.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, fresh_certifier.block_hash));
+    CHECK(Access::retained_commit_event_identity_count(runtime) == 0);
+
+    const auto prior = make_chain("rollback-prior");
+    authenticate_endpoints(prior);
+    const ProposalKey prior_skipped{
+        configuration, prior[1]->get_hash()};
+    const ProposalKey prior_certifier{
+        configuration, prior[2]->get_hash()};
+    REQUIRE(Access::retain_commit_event_identity(
+        runtime, prior_skipped, generation));
+    Access::RetainedIdentityRollback prior_rollback;
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        proposal_for(prior[2]),
+        generation,
+        &prior_rollback));
+    rollback_after_processing_exception(prior_rollback);
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, prior_skipped.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, prior_certifier.block_hash));
+    CHECK(Access::retained_commit_event_identity_count(runtime) == 1);
+
+    const auto consumed = make_chain("rollback-consumed");
+    authenticate_endpoints(consumed);
+    const ProposalKey consumed_skipped{
+        configuration, consumed[1]->get_hash()};
+    const ProposalKey consumed_certifier{
+        configuration, consumed[2]->get_hash()};
+    Access::RetainedIdentityRollback consumed_rollback;
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        proposal_for(consumed[2]),
+        generation,
+        &consumed_rollback));
+    const auto cached = Access::resolve_and_cache_commit(
+        runtime, consumed[1], {}, nullptr, true);
+    REQUIRE(cached.event_key == consumed_skipped);
+    REQUIRE(cached.event_generation == generation);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, consumed_skipped.block_hash));
+    rollback_after_processing_exception(consumed_rollback);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, consumed_skipped.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, consumed_certifier.block_hash));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, prior_skipped.block_hash));
+    CHECK(Access::retained_commit_event_identity_count(runtime) == 1);
+
+    const auto tombstoned = make_chain("rollback-tombstone");
+    authenticate_endpoints(tombstoned);
+    const ProposalKey tombstoned_certifier{
+        configuration, tombstoned[2]->get_hash()};
+    const ProposalKey conflicting_certifier{
+        ConfigurationId{
+            configuration.epoch_number,
+            configuration.tree_id,
+            digest("rollback-tombstone-conflict")},
+        tombstoned_certifier.block_hash};
+    REQUIRE(Access::retain_commit_event_identity(
+        runtime, tombstoned_certifier, generation));
+    CHECK_FALSE(Access::retain_commit_event_identity(
+        runtime, conflicting_certifier, generation + 1));
+    REQUIRE(Access::retained_commit_event_identity_is_conflict(
+        runtime, tombstoned_certifier.block_hash));
+
+    Access::RetainedIdentityRollback tombstone_rollback;
+    CHECK_FALSE(
+        Access::retain_authenticated_proposal_commit_event_identities(
+            runtime,
+            proposal_for(tombstoned[2]),
+            generation,
+            &tombstone_rollback));
+    CHECK(Access::rollback_owned_mutation_count(tombstone_rollback) == 0);
+    rollback_after_processing_exception(tombstone_rollback);
+    CHECK(Access::retained_commit_event_identity_is_conflict(
+        runtime, tombstoned_certifier.block_hash));
+
+    const auto tombstone_cached = Access::resolve_and_cache_commit(
+        runtime, tombstoned[2], {}, nullptr, true);
+    CHECK_FALSE(tombstone_cached.event_key.has_value());
+    CHECK_FALSE(tombstone_cached.event_generation.has_value());
+    CHECK(tombstone_cached.event_conflicted);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, tombstoned_certifier.block_hash));
+    CHECK(Access::retained_commit_event_identity_count(runtime) == 1);
+
+    const auto replaced = make_chain("rollback-replaced");
+    authenticate_endpoints(replaced);
+    const ProposalKey replaced_skipped{
+        configuration, replaced[1]->get_hash()};
+    const ProposalKey replaced_certifier{
+        configuration, replaced[2]->get_hash()};
+    Access::RetainedIdentityRollback replaced_rollback;
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        proposal_for(replaced[2]),
+        generation,
+        &replaced_rollback));
+    const ProposalKey successor_exact_state{
+        ConfigurationId{
+            configuration.epoch_number + 1,
+            configuration.tree_id,
+            digest("rollback-successor-exact-state")},
+        replaced_certifier.block_hash};
+    Access::replace_retained_commit_event_identity(
+        runtime, successor_exact_state, generation + 1);
+    rollback_after_processing_exception(replaced_rollback);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, replaced_skipped.block_hash));
+    CHECK(Access::retained_commit_event_identity_is_exact(
+        runtime, successor_exact_state, generation + 1));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, prior_skipped.block_hash));
+    CHECK(Access::retained_commit_event_identity_count(runtime) == 2);
+
+    Access::forget_retained_commit_event_identities_before_epoch(
+        runtime, configuration.epoch_number + 2);
+    CHECK(Access::retained_commit_event_identity_count(runtime) == 0);
+
+    const auto capacity = make_chain("rollback-capacity");
+    authenticate_endpoints(capacity);
+    const ProposalKey capacity_skipped{
+        configuration, capacity[1]->get_hash()};
+    const ProposalKey capacity_certifier{
+        configuration, capacity[2]->get_hash()};
+    for (std::size_t index = 0;
+         index + 1 < Access::maximum_retained_commit_event_identities();
+         ++index)
+    {
+        const ProposalKey retained{
+            configuration,
+            digest("rollback-capacity-retained-" +
+                   std::to_string(index))};
+        REQUIRE(Access::retain_commit_event_identity(
+            runtime, retained, index + 1));
+    }
+    Access::RetainedIdentityRollback capacity_rollback;
+    CHECK_FALSE(
+        Access::retain_authenticated_proposal_commit_event_identities(
+            runtime,
+            proposal_for(capacity[2]),
+            generation,
+            &capacity_rollback));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, capacity_certifier.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, capacity_skipped.block_hash));
+    CHECK(Access::retained_commit_event_identity_count(runtime) ==
+          Access::maximum_retained_commit_event_identities());
+    rollback_after_processing_exception(capacity_rollback);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, capacity_certifier.block_hash));
+    CHECK(Access::retained_commit_event_identity_count(runtime) + 1 ==
+          Access::maximum_retained_commit_event_identities());
+}
+
+TEST_CASE(
+    "proposal QC bridge rejects every unauthenticated or ambiguous inference",
+    "[adaptive-v2][evidence][commit][identity-unavailable][qc-skip][proposal-bridge][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    EventContext event_context;
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    const auto genesis = runtime.get_genesis();
+    const auto predecessor = Access::add_commit_rule_block(
+        runtime, configuration, genesis, genesis, "guard-predecessor");
+    const auto alternate = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        predecessor,
+        predecessor,
+        "guard-alternate");
+    const auto skipped = Access::add_commit_rule_block(
+        runtime, configuration, alternate, predecessor, "guard-skipped");
+    const ProposalKey predecessor_key{
+        configuration, predecessor->get_hash()};
+    const ProposalKey alternate_key{configuration, alternate->get_hash()};
+    const ProposalKey skipped_key{configuration, skipped->get_hash()};
+    constexpr std::uint64_t generation = 77;
+
+    const auto assert_unavailable = [&](
+        const Proposal &proposal,
+        std::uint64_t proposal_generation) {
+        REQUIRE(
+            Access::retain_authenticated_proposal_commit_event_identities(
+                runtime, proposal, proposal_generation));
+        CHECK_FALSE(
+            Access::view_generation(runtime, skipped_key).has_value());
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, skipped, {}, nullptr, true);
+        CHECK(cached.unavailable);
+        CHECK_FALSE(cached.event_key.has_value());
+        CHECK(cached.event_unavailable);
+        CHECK_FALSE(cached.event_conflicted);
+    };
+
+    SECTION("a sub-quorum QC cannot authenticate the bridge")
+    {
+        const auto certifier = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            skipped,
+            alternate,
+            "guard-bad-qc",
+            1,
+            2);
+        const ProposalKey certifier_key{
+            configuration, certifier->get_hash()};
+        Access::seed_view_generation(runtime, alternate_key, generation, 2);
+        Access::seed_view_generation(runtime, certifier_key, generation, 3);
+        assert_unavailable(
+            Proposal(
+                0,
+                configuration.epoch_number,
+                configuration.tree_id,
+                configuration.epoch_digest,
+                certifier,
+                nullptr),
+            generation);
+    }
+
+    SECTION("a QC key for the wrong block cannot authenticate the bridge")
+    {
+        const auto certifier = Access::add_custom_commit_rule_block(
+            runtime,
+            skipped,
+            alternate,
+            Access::direct_certifier(runtime, skipped_key),
+            "guard-wrong-qc-key",
+            skipped->get_height() + 1);
+        const ProposalKey certifier_key{
+            configuration, certifier->get_hash()};
+        Access::seed_view_generation(runtime, alternate_key, generation, 2);
+        Access::seed_authenticated_proposal_ingress(
+            runtime, skipped_key, generation, 2);
+        Access::seed_view_generation(runtime, certifier_key, generation, 3);
+        assert_unavailable(
+            Proposal(
+                0,
+                configuration.epoch_number,
+                configuration.tree_id,
+                configuration.epoch_digest,
+                certifier,
+                nullptr),
+            generation);
+    }
+
+    SECTION("a non-parent QC reference cannot authenticate the bridge")
+    {
+        const auto certifier = Access::add_custom_commit_rule_block(
+            runtime,
+            skipped,
+            predecessor,
+            Access::direct_certifier(runtime, predecessor_key),
+            "guard-wrong-qc-reference",
+            skipped->get_height() + 1);
+        const ProposalKey certifier_key{
+            configuration, certifier->get_hash()};
+        Access::seed_view_generation(runtime, predecessor_key, generation, 2);
+        Access::seed_view_generation(runtime, certifier_key, generation, 3);
+        assert_unavailable(
+            Proposal(
+                0,
+                configuration.epoch_number,
+                configuration.tree_id,
+                configuration.epoch_digest,
+                certifier,
+                nullptr),
+            generation);
+    }
+
+    SECTION("a non-adjacent physical chain cannot authenticate the bridge")
+    {
+        const auto alternate_height = alternate->get_height();
+        CHECK(Access::has_adjacent_proposal_commit_event_bridge_heights(
+            alternate_height,
+            alternate_height + 1,
+            alternate_height + 2));
+        CHECK_FALSE(
+            Access::has_adjacent_proposal_commit_event_bridge_heights(
+                alternate_height,
+                alternate_height + 2,
+                alternate_height + 3));
+        CHECK_FALSE(
+            Access::has_adjacent_proposal_commit_event_bridge_heights(
+                std::numeric_limits<std::uint32_t>::max(),
+                0,
+                1));
+    }
+
+    SECTION("configuration drift cannot authenticate the bridge")
+    {
+        const auto certifier = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            skipped,
+            alternate,
+            "guard-config-drift");
+        const ConfigurationId drifted_configuration{
+            configuration.epoch_number + 1,
+            configuration.tree_id,
+            DataStream("guard-config-drift").get_hash()};
+        const Proposal drifted_proposal(
+            0,
+            drifted_configuration.epoch_number,
+            drifted_configuration.tree_id,
+            drifted_configuration.epoch_digest,
+            certifier,
+            nullptr);
+        Access::seed_view_generation(runtime, alternate_key, generation, 2);
+        Access::seed_view_generation(
+            runtime, drifted_proposal.key(), generation, 3);
+        assert_unavailable(drifted_proposal, generation);
+    }
+
+    SECTION("generation drift cannot authenticate the bridge")
+    {
+        const auto certifier = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            skipped,
+            alternate,
+            "guard-generation-drift");
+        const ProposalKey certifier_key{
+            configuration, certifier->get_hash()};
+        Access::seed_view_generation(runtime, alternate_key, generation - 1, 2);
+        Access::seed_view_generation(runtime, certifier_key, generation, 3);
+        assert_unavailable(
+            Proposal(
+                0,
+                configuration.epoch_number,
+                configuration.tree_id,
+                configuration.epoch_digest,
+                certifier,
+                nullptr),
+            generation);
+    }
+
+    SECTION("missing alternate authenticated ingress remains unavailable")
+    {
+        const auto certifier = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            skipped,
+            alternate,
+            "guard-missing-alternate-ingress");
+        const ProposalKey certifier_key{
+            configuration, certifier->get_hash()};
+        Access::seed_view_generation(runtime, certifier_key, generation, 3);
+        assert_unavailable(
+            Proposal(
+                0,
+                configuration.epoch_number,
+                configuration.tree_id,
+                configuration.epoch_digest,
+                certifier,
+                nullptr),
+            generation);
+    }
+
+    SECTION("missing certifier authenticated ingress remains unavailable")
+    {
+        const auto certifier = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            skipped,
+            alternate,
+            "guard-missing-certifier-ingress");
+        Access::seed_view_generation(runtime, alternate_key, generation, 2);
+        assert_unavailable(
+            Proposal(
+                0,
+                configuration.epoch_number,
+                configuration.tree_id,
+                configuration.epoch_digest,
+                certifier,
+                nullptr),
+            generation);
+    }
+
+    SECTION("certifier ingress generation drift remains unavailable")
+    {
+        const auto certifier = Access::add_commit_rule_block(
+            runtime,
+            configuration,
+            skipped,
+            alternate,
+            "guard-certifier-generation-drift");
+        const ProposalKey certifier_key{
+            configuration, certifier->get_hash()};
+        Access::seed_view_generation(runtime, alternate_key, generation, 2);
+        Access::seed_view_generation(
+            runtime, certifier_key, generation - 1, 3);
+        assert_unavailable(
+            Proposal(
+                0,
+                configuration.epoch_number,
+                configuration.tree_id,
+                configuration.epoch_digest,
+                certifier,
+                nullptr),
+            generation);
     }
 }
 

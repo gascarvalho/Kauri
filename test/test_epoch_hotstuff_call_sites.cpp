@@ -2003,8 +2003,19 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
         "bool HotStuffBase::observe_proposal_view_generation(");
     const auto local_proposal = function_body(
         implementation, "void HotStuffBase::do_broadcast_proposal(");
+    const auto local_admission = function_body(
+        implementation, "bool HotStuffBase::admit_local(");
     const auto remote_proposal = function_body(
         implementation, "bool HotStuffBase::process_active(");
+    const auto retain_proposal_bridge = function_body(
+        implementation,
+        "bool HotStuffBase::retain_authenticated_proposal_commit_event_identities(");
+    const auto rollback_proposal_bridge = function_body(
+        implementation,
+        "void HotStuffBase::rollback_retained_commit_event_identity_mutations(");
+    const auto bridge_heights = function_body(
+        implementation,
+        "bool HotStuffBase::has_adjacent_proposal_commit_event_bridge_heights(");
     const auto do_consensus = hotstuff_consensus_body(implementation);
     const auto retire_before_epoch = function_body(
         implementation,
@@ -2037,7 +2048,8 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "CommittedProposalIdentityDisposition identity_disposition",
          "std::optional<ProposalKey> event_committed_key",
          "std::optional<std::uint64_t> event_view_generation",
-         "CommittedProposalIdentityDisposition event_identity_disposition"}));
+         "CommittedProposalIdentityDisposition event_identity_disposition",
+         "retain_authenticated_proposal_commit_event_identities("}));
     CHECK(contains_in_order(
         consensus_header,
         {"do_post_block_commit(",
@@ -2134,6 +2146,67 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "prop.key(), *generation"}));
     CHECK(count_occurrences(
               local_proposal, "retain_commit_event_identity(") == 1);
+    REQUIRE_FALSE(local_admission.empty());
+    CHECK(local_admission.find(
+              "retain_authenticated_proposal_commit_event_identities(") ==
+          std::string::npos);
+    REQUIRE_FALSE(retain_proposal_bridge.empty());
+    CHECK(contains_all(
+        retain_proposal_bridge,
+        {"EpochProtocolMode::adaptive_v2",
+         "generation == 0",
+         "proposal.key().block_hash != proposal.blk->get_hash()",
+         "retain_owned(proposal.key())",
+         "certifier->parents.size() != 1",
+         "skipped->parents.size() != 1",
+         "certifier->qc_ref != alternate",
+         "has_adjacent_proposal_commit_event_bridge_heights(",
+         "has_verified_legal_qc_skip(certifier, skipped)",
+         "certifier->qc->get_proposal_key()",
+         "const auto alternate_ingress",
+         "const auto certifier_ingress",
+         "authenticated_proposal_ingress.find(alternate_key)",
+         "authenticated_proposal_ingress.find(certifier_key)",
+         "alternate_key.configuration !=",
+         "certifier_key.configuration",
+         "alternate_ingress->second.view_generation != generation",
+         "certifier_ingress->second.view_generation != generation",
+         "return retain_owned(skipped_key)"}));
+    REQUIRE_FALSE(bridge_heights.empty());
+    CHECK(contains_all(
+        bridge_heights,
+        {"alternate_height !=",
+         "std::numeric_limits<std::uint32_t>::max()",
+         "skipped_height == alternate_height + 1",
+         "skipped_height !=",
+         "certifier_height == skipped_height + 1"}));
+    CHECK(retain_proposal_bridge.find("observe_proposal_view_generation(") ==
+          std::string::npos);
+    CHECK(retain_proposal_bridge.find("proposal_view_generations") ==
+          std::string::npos);
+    CHECK(retain_proposal_bridge.find("proposal_admission") ==
+          std::string::npos);
+    CHECK(retain_proposal_bridge.find("pending_adaptive_v2_commit") ==
+          std::string::npos);
+    CHECK(retain_proposal_bridge.find("rotate_adaptive_v2_after_commit") ==
+          std::string::npos);
+    REQUIRE_FALSE(rollback_proposal_bridge.empty());
+    CHECK(contains_all(
+        rollback_proposal_bridge,
+        {"rollback.owned_mutation_count",
+         "rollback.owned_mutations.size()",
+         "!retained->second.key.has_value()",
+         "!retained->second.view_generation.has_value()",
+         "*retained->second.key != owned.key",
+         "*retained->second.view_generation !=",
+         "owned.view_generation",
+         "retained_commit_event_identities.erase(retained)"}));
+    CHECK(rollback_proposal_bridge.find("proposal_view_generations") ==
+          std::string::npos);
+    CHECK(rollback_proposal_bridge.find("proposal_admission") ==
+          std::string::npos);
+    CHECK(rollback_proposal_bridge.find("pending_adaptive_v2_commit") ==
+          std::string::npos);
     REQUIRE_FALSE(remote_proposal.empty());
     CHECK(contains_in_order(
         remote_proposal,
@@ -2147,15 +2220,22 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "if (delivered == nullptr || !delivered->delivered)",
          "delivery_hash_mismatch",
          "proposal_retired",
+         "RetainedCommitEventIdentityRollback",
          "pre_vote_epoch_change_gate(parsed)",
          "EpochChangeProposalDisposition::defer",
          "EpochChangeProposalDisposition::rejected",
          "admit_exact_context(",
-         "const bool proposal_accepted =\n                            owner.on_receive_proposal(parsed);",
-         "retain_commit_event_identity(",
-         "metadata.key,\n                                    deferred.view_generation"}));
+         "retain_authenticated_proposal_commit_event_identities(",
+         "parsed,",
+         "deferred.view_generation",
+         "&retained_identity_rollback",
+         "const bool proposal_accepted =\n                            owner.on_receive_proposal(parsed);"}));
     CHECK(count_occurrences(
-              remote_proposal, "retain_commit_event_identity(") == 1);
+              remote_proposal,
+              "retain_authenticated_proposal_commit_event_identities(") == 1);
+    CHECK(count_occurrences(
+              remote_proposal,
+              "rollback_retained_commit_event_identity_mutations(") == 2);
 
     REQUIRE_FALSE(cache_commit.empty());
     CHECK(contains_all(

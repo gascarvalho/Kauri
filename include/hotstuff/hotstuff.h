@@ -18,6 +18,7 @@
 #ifndef _HOTSTUFF_CORE_H
 #define _HOTSTUFF_CORE_H
 
+#include <array>
 #include <atomic>
 #include <deque>
 #include <queue>
@@ -1390,6 +1391,18 @@ namespace hotstuff
             std::optional<std::uint64_t> view_generation;
             std::uint32_t max_observed_epoch{0};
         };
+        struct RetainedCommitEventIdentityOwnedMutation
+        {
+            uint256_t block_hash;
+            ProposalKey key;
+            std::uint64_t view_generation{0};
+        };
+        struct RetainedCommitEventIdentityRollback
+        {
+            std::array<RetainedCommitEventIdentityOwnedMutation, 2>
+                owned_mutations{};
+            std::size_t owned_mutation_count{0};
+        };
         // Evidence-only block-hash projection captured after proposal
         // authentication. A disengaged key/generation is a permanent
         // conflict tombstone and is never usable by protocol state.
@@ -1611,6 +1624,16 @@ namespace hotstuff
         bool retain_commit_event_identity(
             const ProposalKey &key,
             std::uint64_t generation) noexcept;
+        static bool has_adjacent_proposal_commit_event_bridge_heights(
+            std::uint32_t alternate_height,
+            std::uint32_t skipped_height,
+            std::uint32_t certifier_height) noexcept;
+        bool retain_authenticated_proposal_commit_event_identities(
+            const Proposal &proposal,
+            std::uint64_t generation,
+            RetainedCommitEventIdentityRollback *rollback = nullptr) noexcept;
+        void rollback_retained_commit_event_identity_mutations(
+            const RetainedCommitEventIdentityRollback &rollback) noexcept;
         void forget_retained_commit_event_identities_before_epoch(
             std::uint32_t first_live_epoch) noexcept;
         std::optional<std::uint64_t> proposal_view_generation(
