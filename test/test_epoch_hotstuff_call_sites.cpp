@@ -2927,6 +2927,38 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "fault-window arm CLI partitions schema-specific evidence bindings",
+    "[adaptive-v2][fault-window-arm][v7][cli][wiring]")
+{
+    const auto manager = source("examples/adaptation_manager.cpp");
+    CHECK(contains_in_order(
+        manager,
+        {"opt_fault_window_arm_snapshot_evidence_basis",
+         "\"fault-window-arm-snapshot-evidence-basis\"",
+         "const std::array<const std::string *, 13> common_arm_values",
+         "const std::array<const std::string *, 4> extended_arm_values",
+         "const auto timeout_evidence_basis =",
+         "const auto required_observation_schema =",
+         "const auto clock_domain =",
+         "const auto snapshot_evidence_basis =",
+         "if (arm.schema_version == 2 || arm.schema_version == 3)"}));
+    CHECK(contains_all(
+        manager,
+        {"arm.schema_version == 1 &&",
+         "!timeout_evidence_basis.empty()",
+         "!required_observation_schema.empty()",
+         "!clock_domain.empty()",
+         "!snapshot_evidence_basis.empty()",
+         "common_arm_values",
+         "extended_arm_values",
+         "extended_arm_values.begin(), extended_arm_values.end()",
+         "arm.schema_version == 2 && (arm.domain != \"kauri-focused-fault-window-arm-v2\" ||",
+         "!arm.snapshot_evidence_basis.empty()",
+         "arm.schema_version == 3 && (arm.domain != \"kauri-focused-fault-window-arm-v3\" ||",
+         "arm.snapshot_evidence_basis != \"exact_post_fault_attempt_start_v1\""}));
+}
+
+TEST_CASE(
     "retention v2 shares one reporter-local commit sample with rich audit",
     "[adaptive-v2][evidence][retention-v2][commit][wiring][v40]")
 {

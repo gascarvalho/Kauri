@@ -565,6 +565,92 @@ TimeoutReplayStatus replay_post_baseline_timeouts(
     return TimeoutReplayStatus::replayed;
 }
 
+/**
+ * v7 arm-mode causal projection.  This deliberately replays observations,
+ * rather than the global reputation audit, because the latter has already
+ * discarded the immutable attempt-start needed to exclude delayed pre-arm
+ * facts.  It is local selection bookkeeping only.
+ */
+TimeoutReplayStatus replay_causal_attempt_domain(
+    const std::vector<AcceptedEvidenceRecord> &accepted,
+    const AdaptationEpochId &current_epoch,
+    std::uint64_t evidence_cutoff,
+    std::uint64_t start_monotonic_ns,
+    const std::vector<ReplicaID> &membership,
+    std::size_t capacity,
+    std::vector<int> &scores,
+    std::vector<std::int64_t> &drawdowns) noexcept
+{
+    try
+    {
+        if (start_monotonic_ns == 0 || scores.size() != membership.size() ||
+            drawdowns.size() != membership.size())
+            return TimeoutReplayStatus::invalid_transition;
+        std::map<uint256_t, OutstandingTimeout> outstanding;
+        for (const auto &record : accepted)
+        {
+            if (record.ingestion_sequence == 0 ||
+                record.ingestion_sequence > evidence_cutoff)
+                continue;
+            const auto &observation = record.observation;
+            if (observation.schema_version != kResponseObservationSchemaVersionV3 ||
+                observation.configuration.epoch_number != current_epoch.epoch_number ||
+                observation.configuration.epoch_digest != current_epoch.epoch_digest ||
+                observation.attempt_start_monotonic_ns < start_monotonic_ns)
+                continue;
+            const auto member = std::lower_bound(
+                membership.begin(), membership.end(), observation.observed_replica_id);
+            if (member == membership.end() || *member != observation.observed_replica_id)
+                return TimeoutReplayStatus::invalid_transition;
+            const auto index = static_cast<std::size_t>(
+                std::distance(membership.begin(), member));
+            if (observation.outcome == ResponseOutcome::timeout)
+            {
+                if (outstanding.size() >= capacity ||
+                    drawdowns[index] <= -static_cast<std::int64_t>(capacity) ||
+                    scores[index] == std::numeric_limits<int>::min())
+                    return TimeoutReplayStatus::capacity_exceeded;
+                if (!outstanding.emplace(observation.observation_id,
+                                         OutstandingTimeout{observation.reporter_id,
+                                                            observation.observed_replica_id}).second)
+                    return TimeoutReplayStatus::invalid_transition;
+                --scores[index];
+                if (drawdowns[index] > 0)
+                    return TimeoutReplayStatus::invalid_transition;
+                --drawdowns[index];
+                continue;
+            }
+            if (observation.outcome == ResponseOutcome::on_time)
+            {
+                if (scores[index] == std::numeric_limits<int>::max())
+                    return TimeoutReplayStatus::capacity_exceeded;
+                ++scores[index];
+                if (drawdowns[index] < 0)
+                    ++drawdowns[index];
+                continue;
+            }
+            if (observation.outcome != ResponseOutcome::late)
+                return TimeoutReplayStatus::invalid_transition;
+            const auto found = outstanding.find(observation.observation_id);
+            if (found == outstanding.end())
+                return TimeoutReplayStatus::invalid_transition;
+            if (found->second.reporter_id != observation.reporter_id ||
+                found->second.target_id != observation.observed_replica_id ||
+                scores[index] == std::numeric_limits<int>::max())
+                return TimeoutReplayStatus::invalid_transition;
+            outstanding.erase(found);
+            ++scores[index];
+            if (drawdowns[index] < 0)
+                ++drawdowns[index];
+        }
+    }
+    catch (...)
+    {
+        return TimeoutReplayStatus::capacity_exceeded;
+    }
+    return TimeoutReplayStatus::replayed;
+}
+
 enum class DrawdownReplayStatus : std::uint8_t
 {
     replayed = 1,
@@ -888,7 +974,9 @@ struct AdaptiveV2ByzantineSelection::State
     AdaptiveV2SelectionResult select_candidates(
         std::unique_ptr<AdaptationSnapshot> snapshot,
         const TargetTimeoutCounts &timeout_counts,
-        std::uint64_t evidence_cutoff)
+        std::uint64_t evidence_cutoff,
+        const std::vector<int> *causal_scores = nullptr,
+        const std::vector<std::int64_t> *causal_drawdowns = nullptr)
     {
         auto output = result(
             AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
@@ -902,6 +990,15 @@ struct AdaptiveV2ByzantineSelection::State
                 snapshot_by_replica.emplace(entry.replica_id, &entry);
 
             output.eligible_candidates.reserve(membership.size());
+            if ((causal_scores == nullptr) != (causal_drawdowns == nullptr) ||
+                (causal_scores != nullptr &&
+                 (causal_scores->size() != membership.size() ||
+                  causal_drawdowns->size() != membership.size())))
+            {
+                healthy = false;
+                output.status = AdaptiveV2SelectionStatus::snapshot_failed;
+                return output;
+            }
             for (std::size_t index = 0;
                  index < membership.size();
                  ++index)
@@ -922,12 +1019,15 @@ struct AdaptiveV2ByzantineSelection::State
                 audit.replica_id = replica_id;
                 audit.snapshot_classification =
                     snapshot_found->second->classification;
-                audit.baseline_score = baseline_scores[index].score;
-                audit.current_score = reputation.score(replica_id);
+                audit.baseline_score = causal_scores == nullptr
+                    ? baseline_scores[index].score : 0;
+                audit.current_score = causal_scores == nullptr
+                    ? reputation.score(replica_id) : (*causal_scores)[index];
                 audit.baseline_score_delta =
                     static_cast<std::int64_t>(audit.current_score) -
                     static_cast<std::int64_t>(audit.baseline_score);
-                audit.guard_drawdown = guard_drawdowns[index];
+                audit.guard_drawdown = causal_drawdowns == nullptr
+                    ? guard_drawdowns[index] : (*causal_drawdowns)[index];
 
                 const auto target_found = timeout_counts.find(replica_id);
                 if (target_found != timeout_counts.end())
@@ -1255,6 +1355,13 @@ bool AdaptiveV2ByzantineSelection::arm_fault_window(
     {
         return false;
     }
+    if (arm.snapshot_evidence_basis ==
+            AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                exact_post_fault_attempt_start_v1 &&
+        arm.evidence_basis !=
+            AdaptiveV2FaultWindowEvidenceBasis::
+                exact_timeout_attempt_id_v1)
+        return false;
     const auto tree_count = state.membership.size();
     if (arm.required_tree_ids.size() > tree_count)
         return false;
@@ -1321,16 +1428,19 @@ AdaptiveV2ByzantineSelection::select_through(
     }
 
     PostFaultProposalCoverage fault_coverage;
+    const auto *const arm = state.config.fault_window_arm
+        ? &*state.config.fault_window_arm : nullptr;
     const bool exact_timeout_attempt_basis =
-        state.config.fault_window_arm.has_value() &&
-        state.config.fault_window_arm->evidence_basis ==
+        arm != nullptr && arm->evidence_basis ==
             AdaptiveV2FaultWindowEvidenceBasis::
                 exact_timeout_attempt_id_v1;
+    const bool causal_snapshot_basis =
+        arm != nullptr && arm->snapshot_evidence_basis ==
+            AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                exact_post_fault_attempt_start_v1;
     try
     {
         std::vector<std::uint32_t> required_tree_ids;
-        const auto *const arm = state.config.fault_window_arm
-            ? &*state.config.fault_window_arm : nullptr;
         if (arm != nullptr)
         {
             if (arm->predecessor_epoch_number != state.current_epoch.epoch_number ||
@@ -1404,10 +1514,83 @@ AdaptiveV2ByzantineSelection::select_through(
     }
 
     std::unique_ptr<AdaptationSnapshot> snapshot;
+    std::vector<int> causal_scores;
+    std::vector<std::int64_t> causal_drawdowns;
     try
     {
-        snapshot = state.build_snapshot(
-            accepted, prefix.size, evidence_cutoff);
+        if (causal_snapshot_basis)
+        {
+            std::vector<AcceptedEvidenceRecord> causal_accepted;
+            causal_accepted.reserve(accepted.size());
+            for (const auto &record : accepted)
+            {
+                if (record.ingestion_sequence == 0 ||
+                    record.ingestion_sequence > evidence_cutoff)
+                    continue;
+                const auto &observation = record.observation;
+                if (observation.configuration.epoch_number ==
+                        state.current_epoch.epoch_number &&
+                    observation.configuration.epoch_digest ==
+                        state.current_epoch.epoch_digest &&
+                    observation.schema_version !=
+                        kResponseObservationSchemaVersionV3)
+                {
+                    state.healthy = false;
+                    return state.result(
+                        AdaptiveV2SelectionStatus::projection_failed,
+                        evidence_cutoff);
+                }
+                if (observation.schema_version ==
+                        kResponseObservationSchemaVersionV3 &&
+                    observation.configuration.epoch_number ==
+                        state.current_epoch.epoch_number &&
+                    observation.configuration.epoch_digest ==
+                        state.current_epoch.epoch_digest &&
+                    observation.attempt_start_monotonic_ns >=
+                        arm->evidence_start_monotonic_ns)
+                {
+                    if (causal_accepted.size() >=
+                        kMaximumAdaptationEvidenceRecords)
+                        return state.result(
+                            AdaptiveV2SelectionStatus::capacity_exceeded,
+                            evidence_cutoff);
+                    causal_accepted.push_back(record);
+                }
+            }
+            snapshot = std::make_unique<AdaptationSnapshot>(
+                build_adaptation_snapshot(
+                    state.membership,
+                    state.current_epoch,
+                    AcceptedEvidenceView{causal_accepted.empty() ? nullptr :
+                                             causal_accepted.data(),
+                                         causal_accepted.size()},
+                    evidence_cutoff,
+                    state.config.responsiveness_policy,
+                    state.config.snapshot_seed));
+            causal_scores.assign(state.membership.size(), 0);
+            causal_drawdowns.assign(state.membership.size(), 0);
+            const auto causal_replay = replay_causal_attempt_domain(
+                causal_accepted,
+                state.current_epoch,
+                evidence_cutoff,
+                arm->evidence_start_monotonic_ns,
+                state.membership,
+                state.config.maximum_post_baseline_timeout_attempts,
+                causal_scores,
+                causal_drawdowns);
+            if (causal_replay != TimeoutReplayStatus::replayed)
+            {
+                state.healthy = false;
+                return state.result(
+                    causal_replay == TimeoutReplayStatus::capacity_exceeded
+                        ? AdaptiveV2SelectionStatus::capacity_exceeded
+                        : AdaptiveV2SelectionStatus::projection_failed,
+                    evidence_cutoff);
+            }
+        }
+        else
+            snapshot = state.build_snapshot(
+                accepted, prefix.size, evidence_cutoff);
     }
     catch (...)
     {
@@ -1428,6 +1611,14 @@ AdaptiveV2ByzantineSelection::select_through(
                    : AdaptiveV2SelectionStatus::projection_failed,
             evidence_cutoff);
     }
+    if (causal_snapshot_basis)
+    {
+        state.current_cutoff = evidence_cutoff;
+        return state.select_candidates(
+            std::move(snapshot), timeout_counts, evidence_cutoff,
+            &causal_scores, &causal_drawdowns);
+    }
+
     std::vector<std::int64_t> planned_drawdowns;
     std::map<uint256_t, OutstandingTimeout>
         planned_outstanding_timeouts;

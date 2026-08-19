@@ -4944,6 +4944,165 @@ def test_native_replay_v3_is_opt_in_and_recomputes_exact_attempt_identity() -> N
         _replay_snapshot(events, suffix_only=False)
 
 
+def test_v7_causal_snapshot_keeps_unfiltered_audit_commitment() -> None:
+    """The v7 selector filters scores, never the audited full prefix."""
+
+    events, records = _mixed_schema_v1_v3_native_replay()
+    first_event = next(
+        event
+        for event in events
+        if event["event_type"] == "evidence.observation_accepted"
+        and event["payload"]["ingestion_sequence"] == 1
+    )
+    first_observation = first_event["payload"]["observation"]
+    assert isinstance(first_observation, dict)
+    first = records[0]
+    first_start = 1_000_000
+    first_observation.update(
+        schema_version=3,
+        attempt_start_monotonic_ns=first_start,
+        reporter_local_commit_monotonic_ns=0,
+        reporter_monotonic_ns=first_start
+        + (
+            first.deadline_duration_us
+            if first.outcome == "timeout"
+            else first.response_duration_us
+        )
+        * 1_000,
+    )
+    first_observation["observation_id"] = hashlib.sha256(
+        b"kauri-response-observation-v3"
+        + first.reporter_id.to_bytes(2, "big")
+        + first.target_id.to_bytes(2, "big")
+        + first.epoch_number.to_bytes(4, "big")
+        + first.tree_id.to_bytes(4, "big")
+        + bytes.fromhex(first.epoch_digest)
+        + bytes.fromhex(first.block_hash)
+        + (1).to_bytes(1, "big")
+        + first_start.to_bytes(8, "big")
+        + first.deadline_duration_us.to_bytes(8, "big")
+    ).hexdigest()
+    records = (
+        replace(
+            first,
+            observation_id=str(first_observation["observation_id"]),
+            schema_version=3,
+            attempt_start_monotonic_ns=first_start,
+            reporter_local_commit_monotonic_ns=0,
+            reporter_monotonic_ns=int(first_observation["reporter_monotonic_ns"]),
+        ),
+        *records[1:],
+    )
+    rebound: list[validation._EvidenceRecord] = []
+    for event in events:
+        if event["event_type"] != "evidence.observation_accepted":
+            continue
+        observation = event["payload"]["observation"]
+        assert isinstance(observation, dict)
+        configuration = observation["configuration"]
+        assert isinstance(configuration, dict)
+        configuration["epoch_number"] = 0
+        original = next(
+            record
+            for record in records
+            if record.ingestion_sequence == event["payload"]["ingestion_sequence"]
+        )
+        start = int(observation["attempt_start_monotonic_ns"])
+        observation["observation_id"] = hashlib.sha256(
+            b"kauri-response-observation-v3"
+            + original.reporter_id.to_bytes(2, "big")
+            + original.target_id.to_bytes(2, "big")
+            + (0).to_bytes(4, "big")
+            + original.tree_id.to_bytes(4, "big")
+            + bytes.fromhex(original.epoch_digest)
+            + bytes.fromhex(original.block_hash)
+            + (1).to_bytes(1, "big")
+            + start.to_bytes(8, "big")
+            + original.deadline_duration_us.to_bytes(8, "big")
+        ).hexdigest()
+        rebound.append(
+            replace(
+                original,
+                observation_id=str(observation["observation_id"]),
+                epoch_number=0,
+            )
+        )
+    records = tuple(sorted(rebound, key=lambda record: record.ingestion_sequence))
+    audit = next(
+        event["payload"]
+        for event in events
+        if event["event_type"] == "adaptive_v2_evidence_snapshot"
+    )
+    assert isinstance(audit, dict)
+    audit["predecessor_epoch_number"] = 0
+    audit["activation_generation"] = 1
+    _rebind_native_replay_audit(
+        events,
+        records,
+        baseline_cutoff=4,
+        current_cutoff=14,
+        suffix_only=False,
+        predecessor_epoch=0,
+    )
+    causal_start = 5_000_000
+    selected = tuple(
+        record
+        for record in records
+        if record.schema_version == 3
+        and record.attempt_start_monotonic_ns is not None
+        and record.attempt_start_monotonic_ns >= causal_start
+    )
+    full_id = audit["full_prefix_snapshot_id"]
+    full_count = audit["accepted_prefix_count"]
+    audit["evidence_snapshot_id"] = _native_snapshot_id_reference(
+        selected,
+        replica_count=3,
+        epoch_number=0,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+    replay = _replay_document(
+        validation.replay_native_adaptation_snapshot(
+            events,
+            membership_replica_ids=(0, 1, 2),
+            predecessor_epoch_number=0,
+            predecessor_epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+            baseline_evidence_cutoff=4,
+            current_evidence_cutoff=14,
+            policy=_NATIVE_REPLAY_POLICY,
+            seed=_NATIVE_REPLAY_SEED,
+            suffix_only=False,
+            allowed_schema_versions=frozenset({3}),
+            minimum_attempt_start_monotonic_ns=causal_start,
+        )
+    )
+    assert audit["accepted_prefix_count"] == full_count == len(records)
+    assert audit["full_prefix_snapshot_id"] == full_id
+    assert replay["accepted_ingestion_sequences"] == [
+        record.ingestion_sequence for record in selected
+    ]
+    assert replay["snapshot_id"] == audit["evidence_snapshot_id"]
+
+
+def test_causal_attempt_start_selection_rejects_predecessor_epoch_one() -> None:
+    events, _records = _mixed_schema_v1_v3_native_replay()
+    with pytest.raises(validation.FactorialValidationError, match="predecessor-0"):
+        validation.replay_native_adaptation_snapshot(
+            events,
+            membership_replica_ids=(0, 1, 2),
+            predecessor_epoch_number=1,
+            predecessor_epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+            baseline_evidence_cutoff=4,
+            current_evidence_cutoff=14,
+            policy=_NATIVE_REPLAY_POLICY,
+            seed=_NATIVE_REPLAY_SEED,
+            suffix_only=False,
+            allowed_schema_versions=frozenset({1, 3}),
+            minimum_attempt_start_monotonic_ns=1,
+        )
+
+
 def test_native_replay_v3_accepts_delayed_on_time_callback() -> None:
     events, records = _mixed_schema_v1_v3_native_replay()
     accepted = next(
@@ -5066,6 +5225,7 @@ def _rebind_native_replay_audit(
     policy: dict[str, object] = _NATIVE_REPLAY_POLICY,
     seed: int = _NATIVE_REPLAY_SEED,
     suffix_only: bool = False,
+    predecessor_epoch: int = 1,
 ) -> None:
     prefix = tuple(
         record for record in records if record.ingestion_sequence <= current_cutoff
@@ -5084,7 +5244,7 @@ def _rebind_native_replay_audit(
     audit["full_prefix_snapshot_id"] = _native_snapshot_id_reference(  # type: ignore[index]
         prefix,
         replica_count=3,
-        epoch_number=1,
+        epoch_number=predecessor_epoch,
         epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
         cutoff=current_cutoff,
         policy=policy,
@@ -5093,7 +5253,7 @@ def _rebind_native_replay_audit(
     audit["evidence_snapshot_id"] = _native_snapshot_id_reference(  # type: ignore[index]
         selected,
         replica_count=3,
-        epoch_number=1,
+        epoch_number=predecessor_epoch,
         epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
         cutoff=current_cutoff,
         policy=policy,

@@ -73,6 +73,24 @@ std::string canonical_v2_arm()
         "\",\"required_observation_schema\":3,\"required_tree_ids\":[6,0,1,2,3,4],\"required_tree_positions\":6,\"run_id\":\"run-v4\",\"schema_version\":2,\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"topology_proof_sha256\":\"" + kDigestB + "\"}\n";
 }
 
+FaultWindowArmBindings v3_bindings()
+{
+    auto result = v2_bindings();
+    result.schema_version = 3;
+    result.domain = "kauri-focused-fault-window-arm-v3";
+    result.snapshot_evidence_basis = "exact_post_fault_attempt_start_v1";
+    return result;
+}
+
+std::string canonical_v3_arm()
+{
+    return std::string{"{\"clock_domain\":\"same_host_clock_monotonic_raw\",\"epoch_digest\":\""} + kDigestD +
+        "\",\"epoch_number\":0,\"evidence_start_monotonic_ns\":42,\"fault_receipt_sha256\":\"" + kDigestE +
+        "\",\"kind\":\"kauri-focused-fault-window-arm-v3\",\"prefault_tree_id\":6,\"profile_id\":\"n7-f2-q5-two-crash-pair-smoke-v4\",\"profile_sha256\":\"" + kDigestA +
+        "\",\"request_sha256\":\"" + kDigestC +
+        "\",\"required_observation_schema\":3,\"required_tree_ids\":[6,0,1,2,3,4],\"required_tree_positions\":6,\"run_id\":\"run-v4\",\"schema_version\":3,\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"topology_proof_sha256\":\"" + kDigestB + "\"}\n";
+}
+
 FaultWindowArmBindings n31_bindings()
 {
     auto result = bindings();
@@ -88,6 +106,14 @@ void require_invalid(const std::string &document)
 {
     CHECK_THROWS_AS(
         FaultWindowArmJsonParser(document, bindings()).parse(),
+        std::invalid_argument);
+}
+
+void require_invalid(const std::string &document,
+                     const FaultWindowArmBindings &arm_bindings)
+{
+    CHECK_THROWS_AS(
+        FaultWindowArmJsonParser(document, arm_bindings).parse(),
         std::invalid_argument);
 }
 
@@ -128,11 +154,58 @@ TEST_CASE("fault-window v2 parser binds exact evidence fields",
     CHECK(document.event.timeout_evidence_basis == "exact_timeout_attempt_id_v1");
     for (const auto &bad : {replace_once(text, "same_host_clock_monotonic_raw", "unknown"),
                             replace_once(text, "\"required_observation_schema\":3", "\"required_observation_schema\":2"),
-                            replace_once(text, "exact_timeout_attempt_id_v1", "unknown")})
+                            replace_once(text, "exact_timeout_attempt_id_v1", "unknown"),
+                            replace_once(text, "\"schema_version\":2,", "\"schema_version\":2,\"snapshot_evidence_basis\":\"\",")})
     {
-        CHECK_THROWS_AS(FaultWindowArmJsonParser(bad, v2_bindings()).parse(),
-                        std::invalid_argument);
+        require_invalid(bad, v2_bindings());
     }
+    auto contaminated = v2_bindings();
+    contaminated.snapshot_evidence_basis =
+        "exact_post_fault_attempt_start_v1";
+    require_invalid(text, contaminated);
+}
+
+TEST_CASE("fault-window v3 parser binds the causal snapshot basis",
+          "[adaptive-v2][fault-window-arm][v7][parser]")
+{
+    const auto text = canonical_v3_arm();
+    const auto document = FaultWindowArmJsonParser(text, v3_bindings()).parse();
+    CHECK(document.arm.snapshot_evidence_basis ==
+          hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+              exact_post_fault_attempt_start_v1);
+    CHECK(document.event.snapshot_evidence_basis ==
+          "exact_post_fault_attempt_start_v1");
+    CHECK_THROWS_AS(FaultWindowArmJsonParser(
+                        replace_once(text, "exact_post_fault_attempt_start_v1", "unknown"),
+                        v3_bindings()).parse(), std::invalid_argument);
+    require_invalid(replace_once(
+                        text,
+                        ",\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\"",
+                        ""),
+                    v3_bindings());
+    require_invalid(replace_once(
+                        text,
+                        ",\"schema_version\":3,\"snapshot_evidence_basis\"",
+                        ",\"snapshot_evidence_basis\",\"schema_version\":3"),
+                    v3_bindings());
+}
+
+TEST_CASE("fault-window v1 parser rejects newer binding contamination",
+          "[adaptive-v2][fault-window-arm][v4][parser][partition]")
+{
+    auto contaminated = bindings();
+    contaminated.clock_domain = "same_host_clock_monotonic_raw";
+    require_invalid(canonical_arm(), contaminated);
+    contaminated = bindings();
+    contaminated.required_observation_schema = 3;
+    require_invalid(canonical_arm(), contaminated);
+    contaminated = bindings();
+    contaminated.timeout_evidence_basis = "exact_timeout_attempt_id_v1";
+    require_invalid(canonical_arm(), contaminated);
+    contaminated = bindings();
+    contaminated.snapshot_evidence_basis =
+        "exact_post_fault_attempt_start_v1";
+    require_invalid(canonical_arm(), contaminated);
 }
 
 TEST_CASE("fault-window parser rejects noncanonical JSON syntax",

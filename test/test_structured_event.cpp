@@ -569,6 +569,7 @@ using hotstuff::ExperimentOmissionCohort;
 using hotstuff::ExperimentReplicaRole;
 using hotstuff::ExclusiveFileStructuredEventOutput;
 using hotstuff::ExpectedMessageType;
+using hotstuff::FaultWindowArmedStructuredEvent;
 using hotstuff::FaultContributionOpportunityStructuredEvent;
 using hotstuff::MonotonicRawStructuredEventClock;
 using hotstuff::ProcessLifecycleEvent;
@@ -895,6 +896,43 @@ fault_containment_coverage_ready_event()
     event.evidence_cutoff = 313;
     event.required_tree_ids = {3, 7, 12, 29, 30};
     event.observed_tree_ids = {3, 7, 12, 29, 30};
+    return event;
+}
+
+FaultWindowArmedStructuredEvent fault_window_armed_event(
+    std::uint32_t schema_version = 1)
+{
+    FaultWindowArmedStructuredEvent event;
+    event.schema_version = schema_version;
+    event.kind = schema_version == 1
+        ? "kauri-focused-fault-window-arm-v1"
+        : schema_version == 2
+              ? "kauri-focused-fault-window-arm-v2"
+              : "kauri-focused-fault-window-arm-v3";
+    event.run_id = "run-fault-window-arm";
+    event.profile_id = "n7-f2-q5-two-crash-pair-smoke-v7";
+    event.profile_sha256 = digest("fault-window-profile").to_hex();
+    event.topology_proof_sha256 = digest("fault-window-proof").to_hex();
+    event.request_sha256 = digest("fault-window-request").to_hex();
+    event.epoch_number = 0;
+    event.epoch_digest = digest("fault-window-epoch");
+    event.fault_receipt_sha256 = digest("fault-window-receipt").to_hex();
+    event.evidence_start_monotonic_ns = 42;
+    event.prefault_tree_id = 6;
+    event.required_tree_positions = 6;
+    event.required_tree_ids = {6, 0, 1, 2, 3, 4};
+    event.fault_window_arm_sha256 = digest("fault-window-arm").to_hex();
+    if (schema_version >= 2)
+    {
+        event.clock_domain = "same_host_clock_monotonic_raw";
+        event.required_observation_schema = 3;
+        event.timeout_evidence_basis = "exact_timeout_attempt_id_v1";
+    }
+    if (schema_version == 3)
+    {
+        event.snapshot_evidence_basis =
+            "exact_post_fault_attempt_start_v1";
+    }
     return event;
 }
 
@@ -3034,6 +3072,68 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
         invalid.successor_epoch_number = 0;
         CHECK(rejects(manager_event_config(), invalid));
     }
+}
+
+TEST_CASE("fault-window armed events partition schema-only fields",
+          "[adaptive-v2][structured-event][fault-window-arm][v7]")
+{
+    const auto rejects = [](FaultWindowArmedStructuredEvent event) {
+        FakeClock clock({8'100});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{std::move(event)});
+        const auto health = sink.health();
+        return !health.healthy && health.stopped &&
+               health.first_failure == StructuredEventFailure::invalid_payload &&
+               output.bytes().empty();
+    };
+
+    for (const auto schema : {std::uint32_t{1}, std::uint32_t{2},
+                              std::uint32_t{3}})
+    {
+        auto event = fault_window_armed_event(schema);
+        FakeClock clock({8'101 + schema});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+        CHECK(sink.health().healthy);
+        const auto text = rendered(output);
+        if (schema == 1)
+        {
+            CHECK(text.find("\"clock_domain\"") == std::string::npos);
+            CHECK(text.find("\"snapshot_evidence_basis\"") ==
+                  std::string::npos);
+        }
+        else if (schema == 2)
+        {
+            CHECK(text.find("\"clock_domain\":\"same_host_clock_monotonic_raw\"") !=
+                  std::string::npos);
+            CHECK(text.find("\"snapshot_evidence_basis\"") ==
+                  std::string::npos);
+        }
+        else
+        {
+            CHECK(text.find("\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\"") !=
+                  std::string::npos);
+        }
+    }
+
+    auto invalid = fault_window_armed_event(1);
+    invalid.snapshot_evidence_basis = "exact_post_fault_attempt_start_v1";
+    CHECK(rejects(std::move(invalid)));
+    invalid = fault_window_armed_event(1);
+    invalid.clock_domain = "same_host_clock_monotonic_raw";
+    CHECK(rejects(std::move(invalid)));
+    invalid = fault_window_armed_event(2);
+    invalid.snapshot_evidence_basis = "exact_post_fault_attempt_start_v1";
+    CHECK(rejects(std::move(invalid)));
+    invalid = fault_window_armed_event(3);
+    invalid.snapshot_evidence_basis.clear();
+    CHECK(rejects(std::move(invalid)));
+    invalid = fault_window_armed_event(3);
+    invalid.snapshot_evidence_basis = "wrong";
+    CHECK(rejects(std::move(invalid)));
 }
 
 template<typename Event>

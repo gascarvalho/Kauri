@@ -231,12 +231,16 @@ TEST_CASE(
         "structured-event-output",
         "structured-event-commit-observer-id",
         "structured-event-commit-observer-instance"}};
-    const std::array<const char *, 5> manager_options{{
+    const std::array<const char *, 9> manager_options{{
         "structured-event-run-id",
         "structured-event-source-instance",
         "structured-event-output",
         "fault-containment-evidence-start-monotonic-ns",
-        "fault-containment-required-tree-coverage"}};
+        "fault-containment-required-tree-coverage",
+        "fault-window-arm-timeout-evidence-basis",
+        "fault-window-arm-required-observation-schema",
+        "fault-window-arm-clock-domain",
+        "fault-window-arm-snapshot-evidence-basis"}};
 
     const auto app_help = run_program(KAURI_HOTSTUFF_APP_PATH, {"--help"});
     REQUIRE(app_help.status == 0);

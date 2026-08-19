@@ -12,6 +12,7 @@ import ctypes
 from dataclasses import asdict, dataclass, field, is_dataclass
 import errno
 import hashlib
+from itertools import combinations
 import json
 import os
 from pathlib import Path
@@ -110,6 +111,7 @@ _RUNTIME_EVENT_KEYS = {
 }
 _FAULT_WINDOW_ARM_DOMAIN_V1 = "kauri-focused-fault-window-arm-v1"
 _FAULT_WINDOW_ARM_DOMAIN_V2 = "kauri-focused-fault-window-arm-v2"
+_FAULT_WINDOW_ARM_DOMAIN_V3 = "kauri-focused-fault-window-arm-v3"
 _FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
 _V6_TIMEOUT_OBSERVATION_DOMAIN = b"kauri-response-observation-v3"
 
@@ -206,15 +208,21 @@ def _v6_timeout_observation_id(
 
 
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith(("-v4", "-v5", "-v6"))
+    return str(getattr(profile, "profile_id", "")).endswith(
+        ("-v4", "-v5", "-v6", "-v7")
+    )
 
 
 def _is_v5_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith(("-v5", "-v6"))
+    return str(getattr(profile, "profile_id", "")).endswith(("-v5", "-v6", "-v7"))
 
 
 def _is_v6_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith("-v6")
+
+
+def _is_v7_profile(profile: FocusedProfile | object) -> bool:
+    return str(getattr(profile, "profile_id", "")).endswith("-v7")
 
 
 def _fault_window_arm_path(run_directory: Path) -> Path:
@@ -247,17 +255,26 @@ def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
         "required_tree_ids",
     }
     schema_version = arm.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
         _error("fault-window arm schema version drifted")
     v2 = {
         "clock_domain",
         "required_observation_schema",
         "timeout_evidence_basis",
     }
-    if set(arm) != common | (v2 if schema_version == 2 else set()):
+    v3 = v2 | {"snapshot_evidence_basis"}
+    if set(arm) != common | (
+        v3 if schema_version == 3 else v2 if schema_version == 2 else set()
+    ):
         _error("fault-window arm schema drifted")
     if arm.get("kind") != (
-        _FAULT_WINDOW_ARM_DOMAIN_V2 if schema_version == 2 else _FAULT_WINDOW_ARM_DOMAIN_V1
+        _FAULT_WINDOW_ARM_DOMAIN_V3
+        if schema_version == 3
+        else (
+            _FAULT_WINDOW_ARM_DOMAIN_V2
+            if schema_version == 2
+            else _FAULT_WINDOW_ARM_DOMAIN_V1
+        )
     ):
         _error("fault-window arm kind drifted")
     for key in (
@@ -289,13 +306,18 @@ def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
         or len(set(required_ids)) != len(required_ids)
     ):
         _error("fault-window arm required tree IDs drifted")
-    if schema_version == 2 and (
+    if schema_version in {2, 3} and (
         arm.get("clock_domain") != "same_host_clock_monotonic_raw"
         or arm.get("timeout_evidence_basis") != "exact_timeout_attempt_id_v1"
         or type(arm.get("required_observation_schema")) is not int
         or arm.get("required_observation_schema") != 3
     ):
         _error("fault-window arm v2 timeout evidence contract drifted")
+    if (
+        schema_version == 3
+        and arm.get("snapshot_evidence_basis") != "exact_post_fault_attempt_start_v1"
+    ):
+        _error("fault-window arm v3 snapshot evidence contract drifted")
     payload = _canonical_json(arm)
     parent = path.parent
     if (
@@ -645,6 +667,58 @@ def _profile_identity(raw: Mapping[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def _v7_n31_target_selection_metric() -> dict[str, object]:
+    """Independently derive the frozen N31 survivor-path score table."""
+
+    replica_count = 31
+    fanout = 5
+    candidates = (21, 22, 23, 24, 25)
+    prefix = (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 0, 1, 2, 3, 4)
+    rows: list[tuple[tuple[int, int, int], int, int, int]] = []
+    for targets in combinations(candidates, 3):
+        per_tree: list[int] = []
+        for root in prefix:
+            shadow = 0
+            for member in range(replica_count):
+                if member in targets:
+                    continue
+                position = (member - root) % replica_count
+                while True:
+                    if (root + position) % replica_count in targets:
+                        shadow += 1
+                        break
+                    if position == 0:
+                        break
+                    position = (position - 1) // fanout
+            per_tree.append(shadow)
+        fixed = sum(per_tree[prefix.index(target)] for target in targets)
+        rows.append((targets, sum(per_tree), fixed, max(per_tree)))
+    minimum = min(total for _targets, total, _fixed, _maximum in rows)
+    selected = min(
+        targets for targets, total, _fixed, _maximum in rows if total == minimum
+    )
+    return {
+        "schema_version": 1,
+        "domain": "kauri-topology-survivor-path-shadow-v1",
+        "candidate_internal_replica_ids": list(candidates),
+        "prefix_tree_ids": list(prefix),
+        "fanout": fanout,
+        "bfs_member_order": list(range(20, 31)) + list(range(20)),
+        "triple_scores": [
+            {
+                "target_replica_ids": list(targets),
+                "total_survivor_path_shadow": total,
+                "fixed_root_shadow": fixed,
+                "collateral_survivor_path_shadow": total - fixed,
+                "maximum_per_tree_survivor_path_shadow": maximum,
+            }
+            for targets, total, fixed, maximum in rows
+        ],
+        "selected_target_replica_ids": list(selected),
+        "tie_break": "lexicographic_replica_id",
+    }
+
+
 def _validate_topology_proof(
     proof: Mapping[str, Any],
     *,
@@ -743,15 +817,25 @@ def _validate_topology_proof(
         for index, left in enumerate(target_descendants)
         for right in target_descendants[index + 1 :]
     )
+    expected_derivation: dict[str, object] = {
+        "deepest_member_ids": deepest,
+        "selected_target_replica_ids": list(targets),
+        "pairwise_disjoint": True,
+    }
+    if profile.get("profile_id") == "n31-f5-q21-three-crash-pair-v7":
+        metric = topology.get("target_selection_metric")
+        expected_metric = _v7_n31_target_selection_metric()
+        if metric != expected_metric:
+            _error("v7 topology target selection metric is absent")
+        expected_derivation["target_selection_metric"] = expected_metric
+    elif (
+        "target_selection_metric" in topology or "target_selection_metric" in derivation
+    ):
+        _error("archived topology contains a prospective target selection metric")
     if (
         members != expected_members
         or descendants != expected_descendants
-        or derivation
-        != {
-            "deepest_member_ids": deepest,
-            "selected_target_replica_ids": list(targets),
-            "pairwise_disjoint": True,
-        }
+        or derivation != expected_derivation
         or not set(targets).issubset(deepest)
         or order[0] in targets
         or not pairwise_disjoint
@@ -808,17 +892,25 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             "required_for_new_executions",
             "required_postfault_tree_positions",
         }
-        if _is_v6_profile(SimpleNamespace(profile_id=profile_id)):
+        if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) or _is_v7_profile(
+            SimpleNamespace(profile_id=profile_id)
+        ):
             expected_arm_keys |= {
                 "clock_domain",
                 "required_observation_schema",
                 "timeout_evidence_basis",
             }
+        if _is_v7_profile(SimpleNamespace(profile_id=profile_id)):
+            expected_arm_keys.add("snapshot_evidence_basis")
         if (
             set(arm) != expected_arm_keys
             or type(arm.get("schema_version")) is not int
             or arm.get("schema_version")
-            != (2 if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) else 1)
+            != (
+                3
+                if _is_v7_profile(SimpleNamespace(profile_id=profile_id))
+                else 2 if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) else 1
+            )
             or arm.get("domain") != "epoch_zero_native_cyclic_tree_positions"
             or arm.get("manager_visibility")
             != "target-identity/process-state blind; intervention-boundary aware"
@@ -836,12 +928,21 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             ]
         ):
             _error("fault-window arm metadata drifted")
-        if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) and (
+        if (
+            _is_v6_profile(SimpleNamespace(profile_id=profile_id))
+            or _is_v7_profile(SimpleNamespace(profile_id=profile_id))
+        ) and (
             arm.get("clock_domain") != "same_host_clock_monotonic_raw"
             or arm.get("required_observation_schema") != 3
             or arm.get("timeout_evidence_basis") != "exact_timeout_attempt_id_v1"
         ):
             _error("v6 fault-window timeout evidence metadata drifted")
+        if (
+            _is_v7_profile(SimpleNamespace(profile_id=profile_id))
+            and arm.get("snapshot_evidence_basis")
+            != "exact_post_fault_attempt_start_v1"
+        ):
+            _error("v7 fault-window snapshot evidence metadata drifted")
     protocol = _document(profile.get("protocol"), "profile protocol")
     topology = _document(profile.get("topology"), "profile topology")
     replica_count = _integer(protocol.get("N"), "replica count", 1)
@@ -1178,11 +1279,17 @@ def _fault_window_arm_document(
     if len(set(required_ids)) != len(required_ids):
         _error("fault-window required tree prefix is not unique")
     arm = {
-        "schema_version": 2 if _is_v6_profile(profile) else 1,
+        "schema_version": (
+            3 if _is_v7_profile(profile) else 2 if _is_v6_profile(profile) else 1
+        ),
         "kind": (
-            _FAULT_WINDOW_ARM_DOMAIN_V2
-            if _is_v6_profile(profile)
-            else _FAULT_WINDOW_ARM_DOMAIN_V1
+            _FAULT_WINDOW_ARM_DOMAIN_V3
+            if _is_v7_profile(profile)
+            else (
+                _FAULT_WINDOW_ARM_DOMAIN_V2
+                if _is_v6_profile(profile)
+                else _FAULT_WINDOW_ARM_DOMAIN_V1
+            )
         ),
         "run_id": str(configuration["run_id"]),
         "profile_id": profile.profile_id,
@@ -1199,7 +1306,7 @@ def _fault_window_arm_document(
         "required_tree_positions": positions,
         "required_tree_ids": required_ids,
     }
-    if _is_v6_profile(profile):
+    if _is_v6_profile(profile) or _is_v7_profile(profile):
         arm.update(
             {
                 "clock_domain": "same_host_clock_monotonic_raw",
@@ -1207,6 +1314,8 @@ def _fault_window_arm_document(
                 "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
             }
         )
+    if _is_v7_profile(profile):
+        arm["snapshot_evidence_basis"] = "exact_post_fault_attempt_start_v1"
     return arm
 
 
@@ -2904,6 +3013,22 @@ class FocusedRawEvidenceSource:
             or audit.get("predecessor_epoch_digest") != expected_digest
         ):
             _error("raw ranking audit predecessor drifted")
+        causal_start_ns: int | None = None
+        if _is_v7_profile(self._profile) and predecessor == 0:
+            armed = [
+                event
+                for event in manager
+                if event["event_type"] == "fault_window_armed"
+            ]
+            if len(armed) != 1:
+                _error("raw v7 ranking lacks one armed causal boundary")
+            causal_start_ns = _integer(
+                _document(armed[0]["payload"], "raw fault-window arm").get(
+                    "evidence_start_monotonic_ns"
+                ),
+                "raw v7 ranking causal boundary",
+                1,
+            )
         try:
             replay = factorial_validation.replay_native_adaptation_snapshot(
                 manager,
@@ -2920,8 +3045,11 @@ class FocusedRawEvidenceSource:
                 seed=_integer(epoch1.generation_seed, "ranking seed"),
                 suffix_only=predecessor == 1,
                 allowed_schema_versions=(
-                    frozenset({3}) if _is_v6_profile(self._profile) else frozenset({1})
+                    frozenset({3})
+                    if _is_v6_profile(self._profile) or _is_v7_profile(self._profile)
+                    else frozenset({1})
                 ),
+                minimum_attempt_start_monotonic_ns=causal_start_ns,
             )
         except factorial_validation.FactorialValidationError as exc:
             raise FocusedCrashPairRuntimeError(
@@ -2994,7 +3122,7 @@ class FocusedRawEvidenceSource:
         baseline_cutoff: int,
         current_cutoff: int,
     ) -> tuple[dict[str, dict[str, int]], dict[str, int], int] | None:
-        if _is_v6_profile(self._profile):
+        if _is_v6_profile(self._profile) or _is_v7_profile(self._profile):
             return self._qualifying_v6_timeout_counts(
                 events,
                 fault_ns=fault_ns,
@@ -3276,24 +3404,25 @@ class FocusedRawEvidenceSource:
                 )
             ):
                 _error("v6 accepted observation timing or signer drifted")
-            if outcome == "timeout":
-                if observation_id in raw_outstanding:
-                    _error("v6 raw timeout attempt is duplicated")
-                raw_outstanding[observation_id] = (reporter, target)
-                if target in raw_drawdowns:
-                    raw_drawdowns[target] -= 1
-            elif outcome == "on_time":
-                if target in raw_drawdowns and raw_drawdowns[target] < 0:
-                    raw_drawdowns[target] += 1
-            else:
-                raw_previous = raw_outstanding.pop(observation_id, None)
-                if raw_previous is not None:
-                    if raw_previous != (reporter, target):
-                        _error(
-                            "v6 raw late evidence changed its exact attempt identity"
-                        )
+            if not _is_v7_profile(self._profile) or attempt_start >= fault_ns:
+                if outcome == "timeout":
+                    if observation_id in raw_outstanding:
+                        _error("v6 raw timeout attempt is duplicated")
+                    raw_outstanding[observation_id] = (reporter, target)
+                    if target in raw_drawdowns:
+                        raw_drawdowns[target] -= 1
+                elif outcome == "on_time":
                     if target in raw_drawdowns and raw_drawdowns[target] < 0:
                         raw_drawdowns[target] += 1
+                else:
+                    raw_previous = raw_outstanding.pop(observation_id, None)
+                    if raw_previous is not None:
+                        if raw_previous != (reporter, target):
+                            _error(
+                                "v6 raw late evidence changed its exact attempt identity"
+                            )
+                        if target in raw_drawdowns and raw_drawdowns[target] < 0:
+                            raw_drawdowns[target] += 1
             if (
                 attempt_start < fault_ns
                 or tree_id not in prefix
@@ -6040,12 +6169,20 @@ def _focused_manager_command(
                 "--fault-window-arm-path",
                 str(fault_window_arm_path),
                 "--fault-window-arm-schema-version",
-                "2" if _is_v6_profile(profile) else "1",
+                (
+                    "3"
+                    if _is_v7_profile(profile)
+                    else "2" if _is_v6_profile(profile) else "1"
+                ),
                 "--fault-window-arm-domain",
                 (
-                    _FAULT_WINDOW_ARM_DOMAIN_V2
-                    if _is_v6_profile(profile)
-                    else _FAULT_WINDOW_ARM_DOMAIN_V1
+                    _FAULT_WINDOW_ARM_DOMAIN_V3
+                    if _is_v7_profile(profile)
+                    else (
+                        _FAULT_WINDOW_ARM_DOMAIN_V2
+                        if _is_v6_profile(profile)
+                        else _FAULT_WINDOW_ARM_DOMAIN_V1
+                    )
                 ),
                 "--fault-window-arm-run-id",
                 run_id,
@@ -6073,7 +6210,7 @@ def _focused_manager_command(
                 ),
             )
         )
-        if _is_v6_profile(profile):
+        if _is_v6_profile(profile) or _is_v7_profile(profile):
             command.extend(
                 (
                     "--fault-window-arm-clock-domain",
@@ -6082,6 +6219,13 @@ def _focused_manager_command(
                     "3",
                     "--fault-window-arm-timeout-evidence-basis",
                     "exact_timeout_attempt_id_v1",
+                )
+            )
+        if _is_v7_profile(profile):
+            command.extend(
+                (
+                    "--fault-window-arm-snapshot-evidence-basis",
+                    "exact_post_fault_attempt_start_v1",
                 )
             )
     for request, output in _focused_transition_requests(run_directory, arm):
@@ -6351,7 +6495,7 @@ class FocusedLaunchBackend:
                 include_issuer_identity_artifact=False,
             )
         )
-        if _is_v6_profile(profile):
+        if _is_v6_profile(profile) or _is_v7_profile(profile):
             _enable_v6_timeout_attempt_evidence(run_directory, profile.replica_ids)
             artifacts = [
                 (

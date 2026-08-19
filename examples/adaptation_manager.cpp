@@ -182,6 +182,7 @@ struct FaultWindowArmBindings
     std::string timeout_evidence_basis;
     std::uint32_t required_observation_schema{0};
     std::string clock_domain;
+    std::string snapshot_evidence_basis;
 };
 
 struct FaultWindowArmDocument
@@ -308,14 +309,29 @@ public:
             expect(",\"required_tree_positions\":"); const auto positions = u32();
             expect(",\"run_id\":"); const auto run = string();
             expect(",\"schema_version\":"); const auto schema = u32();
+            std::string snapshot_basis;
+            const bool snapshot_basis_present =
+                text_.compare(position_, std::strlen(",\"snapshot_evidence_basis\":"),
+                              ",\"snapshot_evidence_basis\":") == 0
+                ;
+            if (snapshot_basis_present)
+            {
+                expect(",\"snapshot_evidence_basis\":");
+                snapshot_basis = string();
+            }
             expect(",\"timeout_evidence_basis\":"); const auto basis = string();
             expect(",\"topology_proof_sha256\":"); const auto proof = string();
             expect("}\n");
-            if (position_ != text_.size() || schema != 2 ||
+            if (position_ != text_.size() || (schema != 2 && schema != 3) ||
                 schema != bindings_.schema_version || kind != bindings_.domain ||
-                bindings_.domain != "kauri-focused-fault-window-arm-v2" ||
+                (schema == 2 && bindings_.domain != "kauri-focused-fault-window-arm-v2") ||
+                (schema == 3 && bindings_.domain != "kauri-focused-fault-window-arm-v3") ||
                 clock != "same_host_clock_monotonic_raw" ||
                 basis != "exact_timeout_attempt_id_v1" || obs_schema != 3 ||
+                (schema == 3 && (!snapshot_basis_present || snapshot_basis != "exact_post_fault_attempt_start_v1")) ||
+                (schema == 3 && snapshot_basis != bindings_.snapshot_evidence_basis) ||
+                (schema == 2 && (snapshot_basis_present ||
+                                 !bindings_.snapshot_evidence_basis.empty())) ||
                 clock != bindings_.clock_domain || basis != bindings_.timeout_evidence_basis ||
                 obs_schema != bindings_.required_observation_schema || run != bindings_.run_id ||
                 profile != bindings_.profile_id || profile_sha != bindings_.profile_sha256 ||
@@ -328,7 +344,8 @@ public:
                 if (digest.size() != 64 || !std::all_of(digest.begin(), digest.end(), [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) fail("digest is invalid");
             for (std::size_t i = 0; i < trees.size(); ++i)
                 if (trees[i] != (prefault + i) % bindings_.tree_count) fail("required trees are not the canonical prefix");
-            result.arm = {epoch_number, hotstuff::uint256_t(parse_hex(epoch_digest, "fault-window epoch digest", 64)), start, prefault, std::move(trees), hotstuff::AdaptiveV2FaultWindowEvidenceBasis::exact_timeout_attempt_id_v1};
+            result.arm = {epoch_number, hotstuff::uint256_t(parse_hex(epoch_digest, "fault-window epoch digest", 64)), start, prefault, std::move(trees), hotstuff::AdaptiveV2FaultWindowEvidenceBasis::exact_timeout_attempt_id_v1,
+                schema == 3 ? hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::exact_post_fault_attempt_start_v1 : hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::legacy_all_accepted_v1};
             result.sha256 = fault_window_sha256(text_);
             result.event.schema_version = schema; result.event.kind = kind; result.event.run_id = run;
             result.event.profile_id = profile; result.event.profile_sha256 = profile_sha;
@@ -339,6 +356,7 @@ public:
             result.event.required_tree_ids = result.arm.required_tree_ids; result.event.fault_window_arm_sha256 = result.sha256;
             result.event.clock_domain = clock; result.event.required_observation_schema = obs_schema;
             result.event.timeout_evidence_basis = basis;
+            result.event.snapshot_evidence_basis = snapshot_basis;
             return result;
         }
         expect("{\"epoch_digest\":");
@@ -393,7 +411,11 @@ public:
             prefault_tree_id != bindings_.prefault_tree_id ||
             receipt_sha.size() != 64 || positions == 0 ||
             positions != bindings_.required_tree_positions ||
-            positions != trees.size() || bindings_.tree_count == 0)
+            positions != trees.size() || bindings_.tree_count == 0 ||
+            !bindings_.timeout_evidence_basis.empty() ||
+            bindings_.required_observation_schema != 0 ||
+            !bindings_.clock_domain.empty() ||
+            !bindings_.snapshot_evidence_basis.empty())
         {
             fail("bindings are invalid");
         }
@@ -1529,6 +1551,7 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_fault_window_arm_timeout_evidence_basis = Config::OptValStr::create();
     auto opt_fault_window_arm_required_observation_schema = Config::OptValStr::create();
     auto opt_fault_window_arm_clock_domain = Config::OptValStr::create();
+    auto opt_fault_window_arm_snapshot_evidence_basis = Config::OptValStr::create();
     auto opt_cycle_1_selection_not_before_monotonic_ns =
         Config::OptValStr::create("0");
     auto opt_cycle_1_inherited_wait_exempt_eligibility_gate =
@@ -1653,6 +1676,8 @@ ManagerOptions parse_options(int argc, char **argv)
                    opt_fault_window_arm_required_observation_schema, Config::SET_VAL);
     config.add_opt("fault-window-arm-clock-domain",
                    opt_fault_window_arm_clock_domain, Config::SET_VAL);
+    config.add_opt("fault-window-arm-snapshot-evidence-basis",
+                   opt_fault_window_arm_snapshot_evidence_basis, Config::SET_VAL);
     config.add_opt(
         "cycle-1-selection-not-before-monotonic-ns",
         opt_cycle_1_selection_not_before_monotonic_ns,
@@ -1880,7 +1905,7 @@ ManagerOptions parse_options(int argc, char **argv)
             opt_fault_containment_required_tree_coverage->get(),
             "fault containment required tree coverage",
             false);
-    const std::array<const std::string *, 13> arm_values{
+    const std::array<const std::string *, 13> common_arm_values{
         &opt_fault_window_arm_path->get(),
         &opt_fault_window_arm_schema_version->get(),
         &opt_fault_window_arm_domain->get(),
@@ -1894,11 +1919,19 @@ ManagerOptions parse_options(int argc, char **argv)
         &opt_fault_window_arm_prefault_tree_id->get(),
         &opt_fault_window_arm_required_tree_positions->get(),
         &opt_fault_window_arm_deadline_seconds->get()};
+    const std::array<const std::string *, 4> extended_arm_values{
+        &opt_fault_window_arm_timeout_evidence_basis->get(),
+        &opt_fault_window_arm_required_observation_schema->get(),
+        &opt_fault_window_arm_clock_domain->get(),
+        &opt_fault_window_arm_snapshot_evidence_basis->get()};
     const auto has_arm = std::any_of(
-        arm_values.begin(), arm_values.end(),
+        common_arm_values.begin(), common_arm_values.end(),
+        [](const auto *value) { return !value->empty(); }) ||
+        std::any_of(
+        extended_arm_values.begin(), extended_arm_values.end(),
         [](const auto *value) { return !value->empty(); });
     if (has_arm && !std::all_of(
-                       arm_values.begin(), arm_values.end(),
+                       common_arm_values.begin(), common_arm_values.end(),
                        [](const auto *value) { return !value->empty(); }))
         throw std::invalid_argument("fault-window arm options are incomplete");
     if (has_arm)
@@ -1926,19 +1959,37 @@ ManagerOptions parse_options(int argc, char **argv)
         arm.tree_count = static_cast<std::uint32_t>(options.membership.size());
         arm.deadline_seconds = parse_unsigned<std::uint64_t>(
             opt_fault_window_arm_deadline_seconds->get(), "fault-window arm deadline", true);
-        if (arm.schema_version == 2)
+        const auto timeout_evidence_basis =
+            opt_fault_window_arm_timeout_evidence_basis->get();
+        const auto required_observation_schema =
+            opt_fault_window_arm_required_observation_schema->get();
+        const auto clock_domain = opt_fault_window_arm_clock_domain->get();
+        const auto snapshot_evidence_basis =
+            opt_fault_window_arm_snapshot_evidence_basis->get();
+        if (arm.schema_version == 2 || arm.schema_version == 3)
         {
-            arm.timeout_evidence_basis = opt_fault_window_arm_timeout_evidence_basis->get();
+            arm.timeout_evidence_basis = timeout_evidence_basis;
             arm.required_observation_schema = parse_unsigned<std::uint32_t>(
-                opt_fault_window_arm_required_observation_schema->get(), "fault-window arm observation schema", true);
-            arm.clock_domain = opt_fault_window_arm_clock_domain->get();
+                required_observation_schema, "fault-window arm observation schema", true);
+            arm.clock_domain = clock_domain;
+            arm.snapshot_evidence_basis = snapshot_evidence_basis;
         }
-        if ((arm.schema_version != 1 && arm.schema_version != 2) ||
+        if ((arm.schema_version != 1 && arm.schema_version != 2 && arm.schema_version != 3) ||
             (arm.schema_version == 1 && arm.domain != "kauri-focused-fault-window-arm-v1") ||
+            (arm.schema_version == 1 &&
+             (!timeout_evidence_basis.empty() ||
+              !required_observation_schema.empty() || !clock_domain.empty() ||
+              !snapshot_evidence_basis.empty())) ||
             (arm.schema_version == 2 && (arm.domain != "kauri-focused-fault-window-arm-v2" ||
                 arm.timeout_evidence_basis != "exact_timeout_attempt_id_v1" ||
                 arm.required_observation_schema != 3 ||
-                arm.clock_domain != "same_host_clock_monotonic_raw")) ||
+                arm.clock_domain != "same_host_clock_monotonic_raw" ||
+                !arm.snapshot_evidence_basis.empty())) ||
+            (arm.schema_version == 3 && (arm.domain != "kauri-focused-fault-window-arm-v3" ||
+                arm.timeout_evidence_basis != "exact_timeout_attempt_id_v1" ||
+                arm.required_observation_schema != 3 ||
+                arm.clock_domain != "same_host_clock_monotonic_raw" ||
+                arm.snapshot_evidence_basis != "exact_post_fault_attempt_start_v1")) ||
             arm.path.empty() || arm.path.front() != '/' || arm.run_id.empty() ||
             arm.profile_id.empty() ||
             arm.prefault_tree_id >= arm.tree_count ||

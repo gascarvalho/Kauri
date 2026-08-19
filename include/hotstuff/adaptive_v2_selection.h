@@ -25,6 +25,13 @@ enum class AdaptiveV2FaultWindowEvidenceBasis : std::uint8_t
     exact_timeout_attempt_id_v1,
 };
 
+/** Evidence domain used to construct the arm-mode responsiveness snapshot. */
+enum class AdaptiveV2FaultWindowSnapshotEvidenceBasis : std::uint8_t
+{
+    legacy_all_accepted_v1 = 1,
+    exact_post_fault_attempt_start_v1,
+};
+
 /** Immutable local manager gate; it is not consensus or fault-target input. */
 struct AdaptiveV2FaultWindowArm
 {
@@ -35,6 +42,8 @@ struct AdaptiveV2FaultWindowArm
     std::vector<std::uint32_t> required_tree_ids;
     AdaptiveV2FaultWindowEvidenceBasis evidence_basis{
         AdaptiveV2FaultWindowEvidenceBasis::legacy_proposal_key_v1};
+    AdaptiveV2FaultWindowSnapshotEvidenceBasis snapshot_evidence_basis{
+        AdaptiveV2FaultWindowSnapshotEvidenceBasis::legacy_all_accepted_v1};
 };
 
 struct AdaptiveV2SelectionConfig

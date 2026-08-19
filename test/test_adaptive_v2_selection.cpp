@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "catch.hpp"
+#include "hotstuff/adaptation.h"
 #include "hotstuff/adaptive_v2_selection.h"
 #include "hotstuff/configuration.h"
 #include "hotstuff/epoch_store.h"
@@ -354,6 +355,60 @@ struct Fixture
         value.reporter_sequence = ++reporter_sequences[reporter];
         value.observation_id = hotstuff::compute_response_observation_id(value);
         window.admit(value.proposal_key()); ingest(value); return value;
+    }
+
+    ResponseObservation on_time_v3_in_tree(
+        ReplicaID target, std::uint32_t tree_id,
+        std::uint64_t attempt_start_monotonic_ns)
+    {
+        const auto &definition = tree(tree_id);
+        const auto position = static_cast<std::size_t>(
+            std::find(definition.members_breadth_first.begin(),
+                      definition.members_breadth_first.end(), target) -
+            definition.members_breadth_first.begin());
+        REQUIRE(position != 0);
+        REQUIRE(position < definition.members_breadth_first.size());
+        const auto reporter = definition.members_breadth_first[
+            (position - 1) / definition.fanout];
+        ResponseObservation value;
+        value.schema_version = hotstuff::kResponseObservationSchemaVersionV3;
+        value.reporter_id = reporter;
+        value.observed_replica_id = target;
+        value.configuration = {epoch.epoch_number, tree_id, epoch.epoch_digest};
+        value.block_hash = digest("adaptive-v2-v3-on-time-" +
+                                  std::to_string(++attempt_number));
+        value.expected_message_type = ExpectedMessageType::direct_vote;
+        value.outcome = ResponseOutcome::on_time;
+        value.response_duration_us = 50;
+        value.deadline_duration_us = 100;
+        value.attempt_start_monotonic_ns = attempt_start_monotonic_ns;
+        value.reporter_monotonic_ns = attempt_start_monotonic_ns + 50'000U;
+        value.reporter_sequence = ++reporter_sequences[reporter];
+        value.signer_set = {target};
+        value.observation_id = hotstuff::compute_response_observation_id(value);
+        window.admit(value.proposal_key());
+        ingest(value);
+        return value;
+    }
+
+    ResponseObservation late_v3(
+        const ResponseObservation &timeout_observation,
+        std::uint64_t reporter_monotonic_ns)
+    {
+        auto value = timeout_observation;
+        REQUIRE(value.schema_version ==
+                hotstuff::kResponseObservationSchemaVersionV3);
+        REQUIRE(reporter_monotonic_ns >= value.attempt_start_monotonic_ns);
+        value.outcome = ResponseOutcome::late;
+        value.reporter_monotonic_ns = reporter_monotonic_ns;
+        value.response_duration_us =
+            (reporter_monotonic_ns - value.attempt_start_monotonic_ns) / 1'000U;
+        value.reporter_sequence = ++reporter_sequences[value.reporter_id];
+        value.signer_set = {value.observed_replica_id};
+        REQUIRE(hotstuff::compute_response_observation_id(value) ==
+                timeout_observation.observation_id);
+        ingest(value);
+        return value;
     }
 
     void on_time_in_tree(ReplicaID target, std::uint32_t tree_id)
@@ -1126,6 +1181,10 @@ TEST_CASE(
     arm.evidence_basis =
         hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
             exact_timeout_attempt_id_v1;
+    // Schema-2/v6 arms retain the legacy all-accepted snapshot basis.
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            legacy_all_accepted_v1;
     REQUIRE(selector.arm_fault_window(arm));
 
     fixture.advance_monotonic_clock(kEvidenceStartNs / 1'000U + 1'000U);
@@ -1349,6 +1408,206 @@ TEST_CASE(
           AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
     CHECK(matching_late.selected_replicas.empty());
     CHECK(matching_late.eligible_candidates.empty());
+}
+
+TEST_CASE(
+    "v7 causal selection replays only post-arm schema3 attempts",
+    "[adaptive-v2][selection][fault-window-arm][v7][causal]")
+{
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture(256, true);
+    // These accepted schema3 observations establish the frozen baseline, but
+    // v7 must not allow them to heal a target or enter the causal snapshot.
+    for (const auto [target, tree] :
+         std::vector<std::pair<ReplicaID, std::uint32_t>>{
+             {0, 2}, {1, 3}, {2, 6}, {3, 6}, {4, 6}, {5, 6}, {6, 0}})
+    {
+        fixture.on_time_v3_in_tree(target, tree, kEvidenceStartNs - 10'000U);
+    }
+
+    auto config = selection_config(1, 1, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 6;
+    arm.required_tree_ids = {6, 0, 1, 2, 3, 4};
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            exact_post_fault_attempt_start_v1;
+    REQUIRE(selector.arm_fault_window(arm));
+
+    // This fact arrives after arming, but its immutable start precedes R.
+    // It must leave no trace in the causal snapshot, score, or drawdown.
+    fixture.on_time_v3_in_tree(0, 2, kEvidenceStartNs - 1'000U);
+
+    // Every survivor is only responsive in the causal, all-tree domain.
+    // The prefix guard remains narrower: its three timeout witnesses for
+    // target 0 are two direct-vote leaves plus tree-6 aggregate relay.
+    for (const auto [target, tree] :
+         std::vector<std::pair<ReplicaID, std::uint32_t>>{
+             {1, 2}, {2, 3}, {3, 4}, {4, 5}, {5, 6}, {6, 0},
+             {4, 1}})
+    {
+        fixture.on_time_v3_in_tree(target, tree, kEvidenceStartNs + 1'000U);
+    }
+    const auto first = fixture.timeout_v3_in_tree(
+        0, 2, kEvidenceStartNs + 2'000U);
+    const auto second = fixture.timeout_v3_in_tree(
+        0, 4, kEvidenceStartNs + 3'000U);
+    const auto third = fixture.aggregate_timeout_in_tree(
+        6, 0, 6, kEvidenceStartNs + 100'000U, 1);
+
+    const auto selected = selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(selected.status == AdaptiveV2SelectionStatus::selected);
+    REQUIRE(selected.snapshot != nullptr);
+    CHECK(selected.selected_replicas == std::vector<ReplicaID>{0});
+    CHECK(selected.snapshot->accepted_record_count() == 10);
+    const auto *const target = candidate(selected.eligible_candidates, 0);
+    REQUIRE(target != nullptr);
+    CHECK(target->snapshot_nonresponsive);
+    CHECK(target->guard_drawdown == -3);
+    CHECK(target->current_score == -3);
+
+    // The filtered vector preserves its original accepted ingestion sequence
+    // numbers and the original cutoff.  Renumbering its intentional gaps is
+    // a distinct snapshot identity.
+    std::vector<AcceptedEvidenceRecord> causal_records;
+    for (const auto &record : fixture.ledger->accepted())
+    {
+        if (record.observation.schema_version ==
+                hotstuff::kResponseObservationSchemaVersionV3 &&
+            record.observation.attempt_start_monotonic_ns >= kEvidenceStartNs)
+        {
+            causal_records.push_back(record);
+        }
+    }
+    const auto expected = hotstuff::build_adaptation_snapshot(
+        fixture.members, fixture.epoch,
+        hotstuff::AcceptedEvidenceView{causal_records.data(),
+                                       causal_records.size()},
+        fixture.ledger->high_watermark(), config.responsiveness_policy,
+        config.snapshot_seed);
+    CHECK(selected.snapshot->snapshot_id() == expected.snapshot_id());
+    for (std::size_t index = 0; index < causal_records.size(); ++index)
+        causal_records[index].ingestion_sequence = index + 1U;
+    const auto renumbered = hotstuff::build_adaptation_snapshot(
+        fixture.members, fixture.epoch,
+        hotstuff::AcceptedEvidenceView{causal_records.data(),
+                                       causal_records.size()},
+        fixture.ledger->high_watermark(), config.responsiveness_policy,
+        config.snapshot_seed);
+    CHECK(selected.snapshot->snapshot_id() != renumbered.snapshot_id());
+
+    // A single post-R timeout for an otherwise-live replica is causal
+    // snapshot evidence even though it cannot meet the f+1 prefix guard.
+    // It leaves an unselected nonresponsive survivor and therefore blocks
+    // successor roots without changing the selected fault target.
+    fixture.timeout_v3_in_tree(6, 0, kEvidenceStartNs + 200'000U);
+    const auto pending = selector.select_through(fixture.ledger->high_watermark());
+    CHECK(pending.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    CHECK(pending.selected_replicas.empty());
+    CHECK(pending.eligible_roots.empty());
+
+    // The exact late shares the timeout ID and compensates only that causal
+    // attempt.  It removes the guard rather than reviving the pre-R baseline.
+    const auto late = fixture.late_v3(third, kEvidenceStartNs + 102'000U);
+    REQUIRE(late.observation_id == third.observation_id);
+    const auto compensated = selector.select_through(fixture.ledger->high_watermark());
+    CHECK(compensated.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    REQUIRE(compensated.snapshot != nullptr);
+    CHECK(compensated.snapshot->accepted_record_count() == 12);
+
+    // A late fact without its exact timeout and a target-mutated late sharing
+    // another timeout's ID are both stopped at the evidence boundary; neither
+    // can enter the causal selector replay.
+    const auto accepted_before = fixture.ledger->accepted().size();
+    auto missing_late = third;
+    missing_late.block_hash = digest("v7-missing-timeout");
+    missing_late.outcome = ResponseOutcome::late;
+    missing_late.reporter_monotonic_ns = kEvidenceStartNs + 300'000U;
+    missing_late.response_duration_us =
+        (missing_late.reporter_monotonic_ns -
+         missing_late.attempt_start_monotonic_ns) / 1'000U;
+    missing_late.reporter_sequence =
+        ++fixture.reporter_sequences[missing_late.reporter_id];
+    missing_late.signer_set = {missing_late.observed_replica_id};
+    missing_late.observation_id =
+        hotstuff::compute_response_observation_id(missing_late);
+    fixture.window.admit(missing_late.proposal_key());
+    fixture.ledger->ingest(
+        AuthenticatedReporter{missing_late.reporter_id}, missing_late);
+    CHECK(fixture.ledger->accepted().size() == accepted_before);
+    REQUIRE_FALSE(fixture.ledger->rejected().empty());
+    CHECK(fixture.ledger->rejected().back().reason ==
+          hotstuff::EvidenceRejectionReason::invalid_transition);
+
+    auto mismatched_late = third;
+    mismatched_late.observed_replica_id = 1;
+    mismatched_late.outcome = ResponseOutcome::late;
+    mismatched_late.reporter_monotonic_ns = kEvidenceStartNs + 301'000U;
+    mismatched_late.response_duration_us =
+        (mismatched_late.reporter_monotonic_ns -
+         mismatched_late.attempt_start_monotonic_ns) / 1'000U;
+    mismatched_late.reporter_sequence =
+        ++fixture.reporter_sequences[mismatched_late.reporter_id];
+    mismatched_late.signer_set = {mismatched_late.observed_replica_id};
+    // Deliberately retain third's ID: v3 binds target/start/deadline.
+    fixture.ledger->ingest(
+        AuthenticatedReporter{mismatched_late.reporter_id}, mismatched_late);
+    CHECK(fixture.ledger->accepted().size() == accepted_before);
+    CHECK(fixture.ledger->rejected().back().reason ==
+          hotstuff::EvidenceRejectionReason::observation_id_mismatch);
+    (void)first;
+    (void)second;
+}
+
+TEST_CASE(
+    "v7 causal arm rejects any legacy current-epoch record",
+    "[adaptive-v2][selection][fault-window-arm][v7][schema3][poison]")
+{
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture;
+    fixture.baseline_all(); // Deliberately schema1: valid archive, invalid v7 arm input.
+
+    auto config = selection_config(1, 1, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 0;
+    arm.required_tree_ids = {0};
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            exact_post_fault_attempt_start_v1;
+    REQUIRE(selector.arm_fault_window(arm));
+
+    fixture.timeout_v3_in_tree(3, 0, kEvidenceStartNs + 1'000U);
+    const auto poisoned = selector.select_through(fixture.ledger->high_watermark());
+    CHECK(poisoned.status == AdaptiveV2SelectionStatus::projection_failed);
+    CHECK_FALSE(selector.healthy());
 }
 
 TEST_CASE(

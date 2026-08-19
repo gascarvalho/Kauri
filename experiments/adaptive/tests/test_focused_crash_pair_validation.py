@@ -663,6 +663,32 @@ def _aggregate_trusted_provenance(
                 "adaptive_transition_count": 2,
             },
         ),
+        (
+            runtime_fixture.N31_PROFILE_V7,
+            {
+                "members": tuple(range(31)),
+                "quorum": 21,
+                "targets": (21, 22, 23),
+                "survivors": tuple((*range(21), *range(24, 31))),
+                "authoritative_source_id": "replica-0",
+                "fault_target_count": 3,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
+        (
+            runtime_fixture.N7_PROFILE_V7,
+            {
+                "members": tuple(range(7)),
+                "quorum": 5,
+                "targets": (0, 1),
+                "survivors": (2, 3, 4, 5, 6),
+                "authoritative_source_id": "replica-2",
+                "fault_target_count": 2,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
     ),
 )
 def test_validator_contract_is_derived_from_each_focused_profile(
@@ -698,16 +724,16 @@ def test_validator_contract_is_derived_from_each_focused_profile(
         runtime_fixture.N31_PROFILE_V5,
         runtime_fixture.N7_PROFILE_V6,
         runtime_fixture.N31_PROFILE_V6,
+        runtime_fixture.N7_PROFILE_V7,
+        runtime_fixture.N31_PROFILE_V7,
     ),
 )
-def test_validator_rejects_rebound_noncanonical_v5_v6_profile(
+def test_validator_rejects_rebound_noncanonical_v5_v7_profile(
     tmp_path: Path, profile_path: Path
 ) -> None:
     validation = _validation()
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    source_proof = runtime_fixture._topology_proof_path(
-        profile_path, profile
-    )
+    source_proof = runtime_fixture._topology_proof_path(profile_path, profile)
     proof = json.loads(source_proof.read_text(encoding="utf-8"))
     profile["timers"]["arm_hard_deadline_seconds"] = 481
     proof["profile_sha256"] = runtime_fixture._canonical_profile_sha256(profile)
@@ -730,7 +756,120 @@ def test_focused_profile_version_sets_are_disjoint() -> None:
     assert validation._FCRASH_H_V5_PROFILE_IDS.isdisjoint(
         validation._FCRASH_H_V6_PROFILE_IDS
     )
-    assert validation._FCRASH_H_V6_PROFILE_IDS <= validation._REVIEWED_FOCUSED_PROFILE_IDS
+    assert (
+        validation._FCRASH_H_V6_PROFILE_IDS <= validation._REVIEWED_FOCUSED_PROFILE_IDS
+    )
+    assert (
+        validation._FCRASH_H_V7_PROFILE_IDS <= validation._REVIEWED_FOCUSED_PROFILE_IDS
+    )
+    assert validation._FCRASH_H_V6_PROFILE_IDS.isdisjoint(
+        validation._FCRASH_H_V7_PROFILE_IDS
+    )
+
+
+def test_v7_validator_metric_is_independently_recomputed() -> None:
+    validation = _validation()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    metric = validation._v7_n31_target_selection_metric()
+    assert metric == runtime._v7_n31_target_selection_metric()
+    for key, value in (
+        ("bfs_member_order", []),
+        ("fanout", 4),
+        ("prefix_tree_ids", []),
+        ("selected_target_replica_ids", [21, 22, 24]),
+    ):
+        mutated = deepcopy(metric)
+        mutated[key] = value
+        assert mutated != validation._v7_n31_target_selection_metric()
+    mutated = deepcopy(metric)
+    mutated["triple_scores"][0]["total_survivor_path_shadow"] += 1
+    assert mutated != validation._v7_n31_target_selection_metric()
+
+
+def test_v7_validator_contract_rejects_mutated_metric_recomputation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validation = _validation()
+    profile = json.loads(runtime_fixture.N31_PROFILE_V7.read_text(encoding="utf-8"))
+    proof = runtime_fixture._topology_proof_path(
+        runtime_fixture.N31_PROFILE_V7, profile
+    )
+    destination = tmp_path / profile["topology"]["proof_path"]
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(proof.read_bytes())
+    _write_json(tmp_path / "profile.json", profile)
+    mutated = deepcopy(validation._v7_n31_target_selection_metric())
+    mutated["triple_scores"][0]["total_survivor_path_shadow"] += 1
+    monkeypatch.setattr(validation, "_v7_n31_target_selection_metric", lambda: mutated)
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation.validation_contract_from_profile(tmp_path)
+
+
+def test_v7_ranking_replays_epoch_zero_sibling_with_arm_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An E1 ranking audit must replay its E0 sibling under the same v7 R."""
+
+    validation = _validation()
+    profile = json.loads(runtime_fixture.N7_PROFILE_V7.read_text(encoding="utf-8"))
+    proof = runtime_fixture._topology_proof_path(runtime_fixture.N7_PROFILE_V7, profile)
+    destination = tmp_path / profile["topology"]["proof_path"]
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(proof.read_bytes())
+    _write_json(tmp_path / "profile.json", profile)
+    contract = _document(validation.validation_contract_from_profile(tmp_path))
+    digest0 = contract["epoch_zero_digest"]
+    digest1 = "11" * 32
+    observed: list[tuple[int, int | None]] = []
+
+    def replay(_events: object, **kwargs: object) -> dict[str, object]:
+        observed.append(
+            (
+                kwargs["predecessor_epoch_number"],
+                kwargs.get("minimum_attempt_start_monotonic_ns"),
+            )
+        )
+        return {"snapshot_id": "a" * 64, "ranked_ids": [2, 3, 4, 5, 6]}
+
+    monkeypatch.setattr(validation, "reconstruct_focused_ranking", replay)
+    events = [
+        {
+            "source_kind": "adaptation_manager",
+            "event_type": "fault_window_armed",
+            "source_monotonic_ns": 1,
+            "payload": {"evidence_start_monotonic_ns": 100},
+        },
+    ]
+    for epoch, digest, sequence in ((0, digest0, 2), (1, digest1, 3)):
+        events.extend(
+            (
+                {
+                    "source_kind": "adaptation_manager",
+                    "event_type": "evidence.observation_accepted",
+                    "source_monotonic_ns": sequence,
+                    "payload": {
+                        "observation": {"configuration": {"epoch_number": epoch}}
+                    },
+                },
+                {
+                    "source_kind": "adaptation_manager",
+                    "event_type": "adaptive_v2_evidence_snapshot",
+                    "source_monotonic_ns": sequence + 10,
+                    "payload": {
+                        "predecessor_epoch_number": epoch,
+                        "predecessor_epoch_digest": digest,
+                        "baseline_cutoff": 0,
+                        "current_cutoff": 1,
+                        "eligible_ranking": [2, 3, 4, 5, 6],
+                    },
+                },
+            )
+        )
+    epoch1 = SimpleNamespace(epoch_digest=digest1, generation_seed=1)
+    validation._ranking(events, epoch1, contract, predecessor_epoch=1)
+    assert observed == [(1, None), (0, 100)]
 
 
 @pytest.mark.parametrize(
@@ -937,13 +1076,13 @@ def _source_blind_postfault_attempt_fixture(
     unrelated ProposalKey anchor.
     """
 
-    assert profile_version == "v6"
+    assert profile_version in {"v6", "v7"}
     validation = _validation()
     digest = "ab" * 32
     start_ns = 10_000
     contract: dict[str, object] = {
         "profile_version": profile_version,
-        "profile_id": "n7-f2-q5-two-crash-pair-smoke-v6",
+        "profile_id": f"n7-f2-q5-two-crash-pair-smoke-{profile_version}",
         "epoch_zero_digest": digest,
         "reporter_coverage_plan": {
             "targets": [
@@ -1154,6 +1293,25 @@ def test_source_blind_postfault_aggregate_late_observation_compensates_same_atte
     )
 
     assert rows == []
+    assert latest == 0
+
+
+def test_v7_source_blind_raw_drawdown_excludes_pre_arm_attempts() -> None:
+    validation = _validation()
+    contract, events, audit = _source_blind_postfault_attempt_fixture(
+        "v7", compensate=True
+    )
+    events = [
+        event
+        for event in events
+        if event.get("event_type") != "evidence.observation_accepted"
+        or event["payload"]["observation"]["block_hash"] != "04" * 32
+    ]
+    rows, drawdowns, latest = validation._v4_replay_fault_window_anchors(
+        contract, events, baseline_cutoff=0, current_cutoff=5, audit=audit
+    )
+    assert rows == []
+    assert drawdowns == {"2": 0}
     assert latest == 0
 
 

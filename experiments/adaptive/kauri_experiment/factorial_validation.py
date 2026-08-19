@@ -8785,6 +8785,7 @@ def replay_native_adaptation_snapshot(
     seed: int,
     suffix_only: bool,
     allowed_schema_versions: Collection[int] = frozenset({1, 2}),
+    minimum_attempt_start_monotonic_ns: int | None = None,
 ) -> dict[str, Any]:
     """Replay one native adaptation snapshot from authenticated envelopes.
 
@@ -8827,6 +8828,16 @@ def replay_native_adaptation_snapshot(
         or type(suffix_only) is not bool
     ):
         _fail("adaptation replay cutoff, seed, or suffix mode is invalid")
+    if minimum_attempt_start_monotonic_ns is not None:
+        _integer(
+            minimum_attempt_start_monotonic_ns,
+            "adaptation replay minimum attempt start",
+            1,
+        )
+        if epoch_number != 0:
+            _fail(
+                "adaptation replay causal attempt-start selection is predecessor-0 only"
+            )
     normalized_policy = _native_snapshot_policy(
         _mapping(policy, "adaptation replay policy")
     )
@@ -8983,10 +8994,19 @@ def replay_native_adaptation_snapshot(
     expected_epoch = (epoch_number, epoch_digest)
     if expected_epoch not in grouped:
         _fail("adaptation replay evidence is not the exact predecessor stream")
-    predecessor_records = grouped[expected_epoch]
+    all_predecessor_records = grouped[expected_epoch]
+    predecessor_records = all_predecessor_records
+    if minimum_attempt_start_monotonic_ns is not None:
+        predecessor_records = tuple(
+            record
+            for record in predecessor_records
+            if record.schema_version == 3
+            and record.attempt_start_monotonic_ns is not None
+            and record.attempt_start_monotonic_ns >= minimum_attempt_start_monotonic_ns
+        )
     audited_records = tuple(
         record
-        for record in predecessor_records
+        for record in all_predecessor_records
         if record.ingestion_sequence <= ledger_high_watermark
     )
     if _integer(
@@ -8995,14 +9015,14 @@ def replay_native_adaptation_snapshot(
     ) != len(audited_records):
         _fail("adaptation replay accepted prefix differs from its audited ledger")
     full_prefix_records = _snapshot_records(
-        predecessor_records,
+        all_predecessor_records,
         baseline_cutoff=baseline_cutoff,
         current_cutoff=current_cutoff,
         suffix_only=False,
         allow_high_watermark_gaps=True,
     )
     suffix_records = _snapshot_records(
-        predecessor_records,
+        all_predecessor_records,
         baseline_cutoff=baseline_cutoff,
         current_cutoff=current_cutoff,
         suffix_only=True,
@@ -9017,8 +9037,19 @@ def replay_native_adaptation_snapshot(
         policy=normalized_policy,
         seed=snapshot_seed,
     )
-    suffix_snapshot_id = _snapshot_id(
-        suffix_records,
+    selected_records = (
+        _snapshot_records(
+            predecessor_records,
+            baseline_cutoff=baseline_cutoff,
+            current_cutoff=current_cutoff,
+            suffix_only=False,
+            allow_high_watermark_gaps=True,
+        )
+        if minimum_attempt_start_monotonic_ns is not None
+        else suffix_records if suffix_only else full_prefix_records
+    )
+    selected_snapshot_id = _snapshot_id(
+        selected_records,
         replica_count=len(membership),
         epoch_number=epoch_number,
         epoch_digest=epoch_digest,
@@ -9030,9 +9061,7 @@ def replay_native_adaptation_snapshot(
         snapshot_audit.payload.get("evidence_snapshot_id"),
         "adaptation replay selected snapshot commitment",
     )
-    expected_selected_snapshot_id = (
-        suffix_snapshot_id if suffix_only else full_prefix_snapshot_id
-    )
+    expected_selected_snapshot_id = selected_snapshot_id
     if recorded_selected_snapshot_id != expected_selected_snapshot_id:
         _fail("adaptation replay selected snapshot commitment does not recompute")
     _validate_compact_snapshot_commitments(
@@ -9042,10 +9071,10 @@ def replay_native_adaptation_snapshot(
         full_prefix_snapshot_id=full_prefix_snapshot_id,
         evidence_snapshot_id=expected_selected_snapshot_id,
     )
-    records = suffix_records if suffix_only else full_prefix_records
+    records = selected_records
     return {
         "schema_version": 1,
-        "snapshot_id": suffix_snapshot_id if suffix_only else full_prefix_snapshot_id,
+        "snapshot_id": selected_snapshot_id,
         "predecessor_epoch_number": epoch_number,
         "predecessor_epoch_digest": epoch_digest,
         "baseline_evidence_cutoff": baseline_cutoff,

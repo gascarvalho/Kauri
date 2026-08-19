@@ -35,6 +35,51 @@ N7_PROFILE_V5 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v5.json"
 N31_PROFILE_V5 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v5.json"
 N7_PROFILE_V6 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v6.json"
 N31_PROFILE_V6 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v6.json"
+N7_PROFILE_V7 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v7.json"
+N31_PROFILE_V7 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v7.json"
+
+
+def test_v7_profiles_bind_arm_v3_and_independently_recomputed_n31_metric() -> None:
+    runtime = _runtime()
+    validator = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+    )
+    n7 = runtime.load_focused_profile(N7_PROFILE_V7)
+    n31 = runtime.load_focused_profile(N31_PROFILE_V7)
+    assert n7.raw["fault_window_arm"] == {
+        **n7.raw["fault_window_arm"],
+        "schema_version": 3,
+        "required_observation_schema": 3,
+        "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+        "clock_domain": "same_host_clock_monotonic_raw",
+        "snapshot_evidence_basis": "exact_post_fault_attempt_start_v1",
+    }
+    metric = runtime._v7_n31_target_selection_metric()
+    assert metric == validator._v7_n31_target_selection_metric()
+    assert n31.raw["topology"]["target_selection_metric"] == metric
+    assert metric["selected_target_replica_ids"] == [21, 22, 23]
+    for key in ("bfs_member_order", "fanout", "prefix_tree_ids"):
+        mutated = deepcopy(metric)
+        mutated[key] = [] if key != "fanout" else 4
+        assert mutated != runtime._v7_n31_target_selection_metric()
+    for row in metric["triple_scores"]:
+        mutated = deepcopy(metric)
+        mutated["triple_scores"][0]["total_survivor_path_shadow"] += 1
+        assert mutated != runtime._v7_n31_target_selection_metric()
+    mutated = deepcopy(metric)
+    mutated["selected_target_replica_ids"] = [21, 22, 24]
+    assert mutated != runtime._v7_n31_target_selection_metric()
+
+
+def test_v7_runtime_loader_rejects_mutated_metric_recomputation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    mutated = deepcopy(runtime._v7_n31_target_selection_metric())
+    mutated["triple_scores"][0]["total_survivor_path_shadow"] += 1
+    monkeypatch.setattr(runtime, "_v7_n31_target_selection_metric", lambda: mutated)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime.load_focused_profile(N31_PROFILE_V7)
 
 
 def test_v6_replica_configs_enable_exact_timeout_attempt_evidence(
@@ -228,6 +273,33 @@ def test_v6_runtime_exact_timeout_guard_replays_mixed_native_attempts() -> None:
         "1": {"4": 2, "5": 2, "6": 2},
     }
     assert raw_drawdowns == {"0": -6, "1": -6}
+
+
+def test_v7_runtime_raw_drawdown_excludes_pre_arm_timeout() -> None:
+    runtime = _runtime()
+    v6 = runtime.load_focused_profile(N7_PROFILE_V6)
+    v7 = runtime.load_focused_profile(N7_PROFILE_V7)
+    events = _v6_runtime_timeout_events(v6)
+    # Keep the pre-R timeout but remove its separate on-time compensation.
+    events = [
+        event
+        for event in events
+        if event["payload"]["observation"]["attempt_start_monotonic_ns"] != 9_100
+    ]
+    legacy = object.__new__(runtime.FocusedRawEvidenceSource)
+    legacy._profile = v6
+    causal = object.__new__(runtime.FocusedRawEvidenceSource)
+    causal._profile = v7
+    cutoff = max(event["payload"]["ingestion_sequence"] for event in events)
+    legacy_result = legacy._qualifying_timeout_counts(
+        events, fault_ns=10_000, baseline_cutoff=0, current_cutoff=cutoff
+    )
+    causal_result = causal._qualifying_timeout_counts(
+        events, fault_ns=10_000, baseline_cutoff=0, current_cutoff=cutoff
+    )
+    assert legacy_result is not None and causal_result is not None
+    assert legacy_result[1] == {"0": -7, "1": -6}
+    assert causal_result[1] == {"0": -6, "1": -6}
 
 
 def test_v6_runtime_exact_timeout_guard_rejects_cross_attempt_late_bleed() -> None:

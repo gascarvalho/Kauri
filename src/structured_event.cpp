@@ -1342,14 +1342,26 @@ bool valid_fault_window_armed_payload(
             });
     };
     const bool v1 = event.schema_version == 1 &&
-        event.kind == "kauri-focused-fault-window-arm-v1";
+        event.kind == "kauri-focused-fault-window-arm-v1" &&
+        event.clock_domain.empty() &&
+        event.required_observation_schema == 0 &&
+        event.timeout_evidence_basis.empty() &&
+        event.snapshot_evidence_basis.empty();
     const bool v2 = event.schema_version == 2 &&
         event.kind == "kauri-focused-fault-window-arm-v2" &&
         event.clock_domain == "same_host_clock_monotonic_raw" &&
         event.required_observation_schema == 3 &&
-        event.timeout_evidence_basis == "exact_timeout_attempt_id_v1";
+        event.timeout_evidence_basis == "exact_timeout_attempt_id_v1" &&
+        event.snapshot_evidence_basis.empty();
+    const bool v3 = event.schema_version == 3 &&
+        event.kind == "kauri-focused-fault-window-arm-v3" &&
+        event.clock_domain == "same_host_clock_monotonic_raw" &&
+        event.required_observation_schema == 3 &&
+        event.timeout_evidence_basis == "exact_timeout_attempt_id_v1" &&
+        event.snapshot_evidence_basis ==
+            "exact_post_fault_attempt_start_v1";
     return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
-        (v1 || v2) &&
+        (v1 || v2 || v3) &&
         !event.run_id.empty() && !event.profile_id.empty() &&
         event.epoch_digest != uint256_t{} &&
         event.evidence_start_monotonic_ns != 0 &&
@@ -2014,10 +2026,15 @@ void append_fault_window_armed_payload(
     builder.append(",\"prefault_tree_id\":"); builder.append_integer(event.prefault_tree_id);
     builder.append(",\"required_tree_positions\":"); builder.append_integer(event.required_tree_positions);
     builder.append(",\"required_tree_ids\":"); append_u32_ids(builder, event.required_tree_ids);
-    if (event.schema_version == 2)
+    if (event.schema_version == 2 || event.schema_version == 3)
     {
         builder.append(",\"clock_domain\":"); builder.append_escaped(event.clock_domain);
         builder.append(",\"required_observation_schema\":"); builder.append_integer(event.required_observation_schema);
+        if (event.schema_version == 3)
+        {
+            builder.append(",\"snapshot_evidence_basis\":");
+            builder.append_escaped(event.snapshot_evidence_basis);
+        }
         builder.append(",\"timeout_evidence_basis\":"); builder.append_escaped(event.timeout_evidence_basis);
     }
     builder.append(",\"fault_window_arm_sha256\":"); builder.append_escaped(event.fault_window_arm_sha256);
